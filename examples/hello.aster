@@ -1,8 +1,7 @@
 public class Program
 {
-    public static int Main()
+    public static void Main()
     {
         Log("Hello, Aster!");
-        return 42;
     }
 }
