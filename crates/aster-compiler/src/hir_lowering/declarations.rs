@@ -266,7 +266,7 @@ impl Lowerer<'_> {
                     let initializer = field
                         .initializer
                         .as_ref()
-                        .map(|value| self.expression(value));
+                        .map(|value| self.field_initializer(declaration, field, value));
                     fields.push(hir::Field {
                         symbol,
                         name: field.name.clone(),

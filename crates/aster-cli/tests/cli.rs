@@ -146,6 +146,41 @@ public class Program {
 }
 
 #[test]
+fn field_initializer_construction_runs_without_panicking() {
+    let directory = temporary_directory("field-initializer-construction");
+    let main = directory.join("main.aster");
+    fs::write(
+        &main,
+        "public class Dependency { public int Get() { return 42; } } public class Service { private Dependency dependency = new Dependency(); public int Read() { return dependency.Get(); } } public class Program { public static int Main() { Service service = new Service(); return service.Read(); } }",
+    )
+    .expect("write field initializer program");
+    let check_output = aster(["check", main.to_str().expect("UTF-8 temporary path")]);
+    let run_output = aster(["run", main.to_str().expect("UTF-8 temporary path")]);
+    fs::remove_dir_all(&directory).expect("remove temporary directory");
+    assert!(check_output.status.success(), "{}", stderr(&check_output));
+    assert!(run_output.status.success(), "{}", stderr(&run_output));
+    assert_eq!(stdout(&run_output).trim(), "42");
+}
+
+#[test]
+fn invalid_field_initializer_construction_is_a_diagnostic_not_a_panic() {
+    let directory = temporary_directory("invalid-field-initializer-construction");
+    let main = directory.join("main.aster");
+    fs::write(
+        &main,
+        "public class Service { private Missing dependency = new Missing(); public Service() {} } public class Program { public static int Main() { return 0; } }",
+    )
+    .expect("write invalid field initializer program");
+    let output = aster(["check", main.to_str().expect("UTF-8 temporary path")]);
+    fs::remove_dir_all(&directory).expect("remove temporary directory");
+    assert!(!output.status.success());
+    let error = stderr(&output);
+    assert!(error.contains("unknown type `Missing`"), "{error}");
+    assert!(!error.contains("panicked at"), "{error}");
+    assert!(!error.contains("stack backtrace"), "{error}");
+}
+
+#[test]
 fn absolute_source_path_and_embedded_stdlib_work_outside_the_repository() {
     let directory = temporary_directory("outside-repository");
     let source = directory.join("main.aster");

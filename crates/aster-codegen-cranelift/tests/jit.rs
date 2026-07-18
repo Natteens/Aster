@@ -229,6 +229,60 @@ fn field_initializers_create_structs_and_arrays_before_constructor_body() {
 }
 
 #[test]
+fn field_initializer_constructs_an_object_with_an_explicit_constructor() {
+    let source = "public class Dependency { public int Get() { return 42; } } public class Service { private Dependency dependency = new Dependency(); private int value; public Service() { value = dependency.Get(); } public int Read() { return value; } } public int Run() { Service service = new Service(); return service.Read(); }";
+    assert_eq!(run(source, "Run"), Ok(ExecutionValue::Int(42)));
+}
+
+#[test]
+fn field_initializer_constructs_an_object_with_a_synthesized_constructor() {
+    let source = "public class Dependency { public int Get() { return 42; } } public class Service { private Dependency dependency = new Dependency(); public int Read() { return dependency.Get(); } } public int Run() { Service service = new Service(); return service.Read(); }";
+    assert_eq!(run(source, "Run"), Ok(ExecutionValue::Int(42)));
+}
+
+#[test]
+fn field_initializer_constructs_a_distinct_object_per_instance() {
+    let source = "public class Dependency { private int value; public Dependency() { value = 0; } public int Get() { return value; } public void Set(int next) { value = next; } } public class Holder { private Dependency dependency = new Dependency(); public Dependency Item() { return dependency; } } public int Run() { Holder a = new Holder(); Holder b = new Holder(); a.Item().Set(41); b.Item().Set(1); return a.Item().Get() + b.Item().Get(); }";
+    assert_eq!(run(source, "Run"), Ok(ExecutionValue::Int(42)));
+}
+
+#[test]
+fn field_initializer_constructs_a_nested_object_with_constructor_arguments() {
+    let source = "public class Item { public int value; public Item() { value = 42; } } public class Container { private Item item; public Container(Item item) { this.item = item; } public int Get() { return item.value; } } public class Holder { private Container container = new Container(new Item()); public int Read() { return container.Get(); } } public int Run() { Holder holder = new Holder(); return holder.Read(); }";
+    assert_eq!(run(source, "Run"), Ok(ExecutionValue::Int(42)));
+}
+
+#[test]
+fn field_initializer_construction_resolves_across_namespace_files() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("aster-field-initializer-{nonce}"));
+    std::fs::create_dir_all(root.join("app")).expect("create namespace directory");
+    let main = root.join("main.aster");
+    std::fs::write(
+        &main,
+        "using app; public int Run() { Holder holder = new Holder(); return holder.Read(); }",
+    )
+    .expect("write main source");
+    std::fs::write(
+        root.join("app/holder.aster"),
+        "namespace app; public class Dependency { public int Get() { return 42; } } public class Holder { private Dependency dependency = new Dependency(); public int Read() { return dependency.Get(); } }",
+    )
+    .expect("write namespaced source");
+    let compilation = compile_project(&main).map_err(|diagnostics| format!("{diagnostics:#?}"));
+    std::fs::remove_dir_all(&root).expect("remove temporary project");
+    let compilation = compilation.expect("multifile project");
+    assert_eq!(
+        execute(&compilation.compilation.mir, "Run"),
+        Ok(ExecutionValue::Int(42))
+    );
+}
+
+#[test]
 fn executes_explicit_equality_rules() {
     let source = "public interface I { int Get(); } public struct P { public int x; public string name; } public class C : I { private int value; public C(int value) { this.value = value; } public int Get() { return value; } } public int Run() { P a = P { x: 1, name: \"A\" }; P b = P { x: 1, name: \"A\" }; P different = P { x: 1, name: \"B\" }; int[] values = [1]; int[] alias = values; C first = new C(1); C second = first; I left = first; I right = second; if (a == b && a != different && values == alias && first == second && left == right) { return 42; } return 0; }";
     assert_eq!(run(source, "Run"), Ok(ExecutionValue::Int(42)));

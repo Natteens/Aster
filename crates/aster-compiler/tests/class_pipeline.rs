@@ -63,6 +63,21 @@ fn classes_without_a_declared_constructor_get_an_implicit_default_one() {
 }
 
 #[test]
+fn field_initializer_constructing_an_object_reaches_a_synthesized_constructor() {
+    let source = "public class Dependency { public int Get() { return 42; } } public class Service { private Dependency dependency = new Dependency(); } public int Run() { Service service = new Service(); return 42; }";
+    let compilation =
+        aster_compiler::compile(source).expect("field initializer construction must compile");
+    assert!(
+        compilation
+            .mir
+            .functions
+            .iter()
+            .any(|function| function.constructor && function.name == "Service"),
+        "synthesized constructor must reach MIR"
+    );
+}
+
+#[test]
 fn static_context_calling_an_instance_method_reports_one_focused_diagnostic() {
     let source = "public class Program { public static int Main() { return Run(); } private int Run() { return 1; } }";
     let diagnostics = aster_compiler::compile(source).expect_err("static context must fail");
@@ -124,6 +139,10 @@ fn invalid_class_programs_have_specific_diagnostics() {
         (
             "public class C { public C() {} public int Get() { return 1; } } public int Run() { return Get(); }",
             "instance method `Get` requires an object",
+        ),
+        (
+            "public class C { private Missing value = new Missing(); public C() {} } public int Run() { return 0; }",
+            "unknown type `Missing`",
         ),
     ] {
         let diagnostics = aster_compiler::compile(source).expect_err("must fail");
