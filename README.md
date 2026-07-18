@@ -80,10 +80,8 @@ Aster is a Cargo workspace: the compiler, syntax tree, IRs, runtime, CLI, and Cr
 separate crates. The VS Code extension lives in [`editors/vscode`](editors/vscode/README.md).
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before proposing language behavior or architectural changes.
-The official project is maintained at [Natteens/Aster](https://github.com/Natteens/Aster); forks
-should follow the [project identity policy](TRADEMARKS.md) when they are distributed.
+The official project is maintained at [Natteens/Aster](https://github.com/Natteens/Aster).
 
 ## License
 
-Aster is currently available under either the [MIT License](LICENSE-MIT) or the
-[Apache License 2.0](LICENSE-APACHE), at your option.
+Aster is licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.

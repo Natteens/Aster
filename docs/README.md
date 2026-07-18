@@ -55,5 +55,4 @@ These pages use the present tense for behavior accepted by the current compiler.
 - [Release process](releasing.md)
 - [VS Code extension development](../editors/vscode/DEVELOPMENT.md)
 
-The official repository is [Natteens/Aster](https://github.com/Natteens/Aster). See the
-[project identity policy](../TRADEMARKS.md) for clear attribution of forks and derived work.
+The official repository is [Natteens/Aster](https://github.com/Natteens/Aster).

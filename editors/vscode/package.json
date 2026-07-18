@@ -4,7 +4,7 @@
     "description": "Syntax highlighting, snippets, and editing support for the Aster programming language.",
     "version": "0.1.0",
     "publisher": "aster-lang",
-    "license": "MIT OR Apache-2.0",
+    "license": "Apache-2.0",
     "repository": {
         "type": "git",
         "url": "https://github.com/Natteens/Aster"
@@ -54,7 +54,7 @@
     },
     "scripts": {
         "validate": "vsce ls",
-        "package": "vsce package --skip-license",
+        "package": "vsce package",
         "version:check": "node ./scripts/sync-version.mjs --check",
         "version:sync": "node ./scripts/sync-version.mjs --write"
     },
