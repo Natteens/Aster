@@ -7,11 +7,12 @@ Aster releases automatically from `main`. There is no release branch and no Rele
 1. Develop on a feature branch.
 2. Use [Conventional Commits](https://www.conventionalcommits.org/), for example `feat: add enum cases`.
 3. Make CI green and merge the change into `main`.
-4. The Release workflow validates Rust, then runs semantic-release.
+4. The `release` job in the CI workflow runs after every validation job, then invokes
+   semantic-release.
 5. semantic-release either finds no releasable commits or creates the version, `v<version>` tag,
    GitHub Release, changelog entry, and one synchronization commit on `main`.
 
-The release workflow only runs on `main`; feature branches and pull requests cannot publish. It
+The release job only runs on pushes to `main`; feature branches and pull requests cannot publish. It
 passes the repository `GITHUB_TOKEN` explicitly to semantic-release and grants the job
 `contents: write`, `issues: write`, and `pull-requests: write`. Branch protection must allow GitHub
 Actions to push the generated release commit, or exempt the `github-actions[bot]` actor from that
@@ -43,13 +44,13 @@ calculated by semantic-release and updates:
 - `CHANGELOG.md`;
 - `editors/vscode/package.json` and its root entries in `package-lock.json`.
 
-`Cargo.lock` is included in the release commit when Cargo changes it. It normally does not contain a
-workspace package version, so a version-only release often leaves it untouched. The release workflow
-does not publish any crate to crates.io.
+The synchronization script asks Cargo to refresh the workspace package versions recorded in
+`Cargo.lock` without upgrading dependencies. The lockfile is included in the release commit. The
+release job does not publish any crate to crates.io.
 
 The VS Code extension package reads the synchronized `package.json`; a later manual
 `npm run package` therefore produces `aster-language-<version>.vsix`. This workflow deliberately
-does not build or attach a VSIX.
+does not build or attach a VSIX and does not publish to the VS Code Marketplace or npm.
 
 ## Checking configuration locally
 
@@ -71,5 +72,5 @@ npm run release:dry-run
 ```
 
 The dry run needs the same full Git history and repository access as the workflow to calculate an
-accurate next version. Do not run `npm run release` from a development machine; the GitHub Actions
-workflow is the only publisher.
+accurate next version. Do not run `npm run release` from a development machine; the `release` job in
+the GitHub Actions CI workflow is the only publisher.

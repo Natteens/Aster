@@ -1,5 +1,6 @@
 export default {
     branches: ["main"],
+    repositoryUrl: "https://github.com/Natteens/Aster",
     tagFormat: "v${version}",
     plugins: [
         [

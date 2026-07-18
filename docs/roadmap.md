@@ -107,13 +107,12 @@ Not yet implemented:
   open; the JIT arena intentionally defines only per-execution lifetime.
 - Package/dependency manifests, external dependencies, aliases, selective usings, or reexports.
 - Ownership, borrowing, class memory management, unsafe/FFI, and concurrency semantics.
-- Final ECS/query/schedule/resource/event syntax or any ECS runtime behavior.
+- Any ECS package, syntax, or runtime behavior; ECS is an unscheduled optional-library proposal.
 - MIR analyses and optimization passes, AOT/object generation, executable linking, and
   general program execution.
 - String interpolation, indexing, conversion APIs, and mutable string buffers.
 - Executable decimal arithmetic and conversions (requires decimal runtime layout, operations,
   overflow policy, and ABI).
-- Named/default arguments and constructor/operator overloads.
 
 ## First planned release (`0.1.0`)
 

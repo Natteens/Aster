@@ -17,7 +17,7 @@ introduced entirely inside the backend when needed.
 ## Stable function identity
 
 `SymbolId` values are stable only within one compilation. Reload needs an identity that
-survives recompilation: a fully qualified path (`module.Function`) plus a signature hash.
+survives recompilation: a fully qualified path (`namespace.Function`) plus a signature hash.
 Matching identities map old slots to new code; unmatched old identities keep their previous
 code until unreachable; new identities get new slots.
 

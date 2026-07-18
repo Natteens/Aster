@@ -66,3 +66,9 @@ execFileSync(process.execPath, [extensionSyncScript, "--write"], {
     cwd: repositoryRoot,
     stdio: "inherit",
 });
+
+// Refresh workspace package versions in Cargo.lock without upgrading dependencies.
+execFileSync("cargo", ["metadata", "--format-version", "1", "--no-deps"], {
+    cwd: repositoryRoot,
+    stdio: "ignore",
+});

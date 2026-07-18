@@ -11,7 +11,7 @@ the responsibilities of Aster’s product layers.
 
 The language is the source grammar, type system, semantic rules, memory-safety model, and required
 compile-time diagnostics. `class`, `struct`, `interface`, variables, functions, and control flow
-belong here. Proposed ECS keywords belong here only if ultimately accepted as syntax.
+belong here. No ECS keywords are currently accepted or scheduled.
 
 ### Standard library
 
@@ -40,17 +40,17 @@ The SDK is the developer distribution: compiler, CLI, formatter, documentation, 
 sources/artifacts, target support, package/build tools, and debugging integration. SDK tools do not
 change program semantics without a corresponding language or library specification.
 
-### Optional `aster.ecs`
+### Potential optional ECS package
 
-ECS is an optional module/library plus any documented runtime scheduler support. It is neither an
-implicit game engine nor a requirement for ordinary Aster programs.
+ECS is only a research proposal for a possible future library and documented runtime hooks. It is
+not present in the compiler or SDK, and it is neither an implicit game engine nor a requirement for
+ordinary Aster programs.
 
 ## Proposed syntax and ownership examples
 
 ```aster
 int count = 1;                 // language
 Log.Warning("Low count");      // standard library
-using aster.ecs;               // optional library namespace
 ```
 
 The allocator or scheduler implementation behind an operation may involve the runtime. Building,
@@ -76,7 +76,7 @@ This uses a normal standard-library API; `Log` is not parsed as a keyword.
 log "Hello";                  // no logging statement exists
 ```
 
-Importing or using ECS does not create an implicit program entry point or engine lifecycle.
+No library import creates an implicit program entry point or engine lifecycle.
 
 ## OPEN QUESTIONS
 
@@ -105,8 +105,9 @@ allow optional packages such as higher-level libraries to version independently 
 2. **Ship it as an official SDK package** — optional and independently evolvable; package tooling is required.
 3. **Build it into the runtime** — easy scheduler integration; couples all programs to ECS machinery.
 
-**Recommendation:** PROPOSED — distribute `aster.ecs` as an official optional SDK package, with narrowly
-specified runtime hooks only where measurements prove them useful.
+**Recommendation:** PROPOSED — if this research is resumed, prefer an official optional SDK package
+with narrowly specified runtime hooks only where measurements prove them useful. No package or
+implementation schedule is currently accepted.
 
 ### PROPOSED — Compiler knowledge of library features
 
@@ -114,5 +115,6 @@ specified runtime hooks only where measurements prove them useful.
 2. **Recognized attributes/intrinsics** — controlled optimization and validation; creates privileged APIs.
 3. **Dedicated syntax lowering to library/runtime contracts** — best diagnostics; strongest coupling.
 
-**Recommendation:** PROPOSED — permit a small, documented intrinsic/metadata boundary. Accept dedicated
-ECS syntax only if it materially improves safety or clarity beyond a library API.
+**Recommendation:** PROPOSED — keep library-specific compiler behavior out of the current roadmap.
+Reconsider a small, documented intrinsic or metadata boundary only if future measurements establish
+a need that an ordinary library API cannot meet.

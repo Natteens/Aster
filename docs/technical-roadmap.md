@@ -102,16 +102,16 @@ for shared mutable data. No unsafe automatic parallelization and no implicit eng
 contracts; task lifetime and error propagation are specified; stress tests run under supported
 platforms.
 
-## H — Optional ECS
+## H — Unscheduled ECS research
 
 **Depends on:** G and stable library/runtime boundaries.
 
-Build `aster.ecs` as an optional library/runtime: entities, components, queries, resources, events,
-schedules, and read/write conflict analysis. Systems run in parallel only when their declared
-access is compatible and measurement says it is useful.
+Investigate whether an ECS can remain an ordinary optional library before considering compiler or
+runtime support. Entities, components, queries, resources, events, schedules, and read/write
+conflict analysis are research questions, not scheduled implementation work.
 
-**Done when:** ordinary Aster programs remain independent of ECS; ECS data access is checked;
-scheduling is deterministic where promised; runtime behavior and costs are documented.
+**Done for research:** a proposal explains why an ordinary library is or is not sufficient, keeps
+ordinary Aster programs independent, and documents any proposed runtime behavior and costs.
 
 ## I — GPU and optional engine direction
 
@@ -120,7 +120,7 @@ scheduling is deterministic where promised; runtime behavior and costs are docum
 GPU programs require a separate target and restricted language subset. Normal Aster code is never
 silently treated as shader or compute code. Future paths may include explicit shader modules,
 compute kernels, and `wgpu` integration. A future Aster Engine would be an optional library/runtime
-assembled from the language, `aster.math`, `aster.tasks`, and `aster.ecs`.
+assembled from the language and optional libraries; no fixed engine package set exists today.
 
 **Done for planning:** the compiler boundary, restricted subset questions, data-transfer model, and
 candidate `wgpu` integration are documented. No GPU or engine implementation is claimed.

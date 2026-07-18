@@ -19,9 +19,9 @@ proposal in the document, not necessarily accepted by the current compiler.
 - A small, learnable core suitable for a hand-written compiler.
 - Future support for Windows, Linux, x86-64, and ARM64.
 
-ECS is an optional library/runtime architecture under `aster.ecs`, with selected syntax
-that may receive compiler support. It is not the definition of Aster itself. Game-engine
-facilities and lifecycle conventions are outside this core-language specification.
+ECS remains an unscheduled research topic for a possible optional library. No ECS syntax,
+package, compiler support, or runtime is currently part of Aster. Game-engine facilities and
+lifecycle conventions are outside this core-language specification.
 
 ## Proposed syntax character
 
