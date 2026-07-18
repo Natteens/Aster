@@ -45,8 +45,11 @@ calculated by semantic-release and updates:
 - `editors/vscode/package.json` and its root entries in `package-lock.json`.
 
 The synchronization script asks Cargo to refresh the workspace package versions recorded in
-`Cargo.lock` without upgrading dependencies. The lockfile is included in the release commit. The
-release job does not publish any crate to crates.io.
+`Cargo.lock` without upgrading dependencies, then verifies every local crate's lockfile entry
+matches the new version. The lockfile is included in the release commit alongside the manifests.
+Immediately afterward, the release runs `cargo check --workspace --locked`; a lockfile that is
+still out of date fails the release before the commit and tag are created. The release job does
+not publish any crate to crates.io.
 
 The VS Code extension package reads the synchronized `package.json`; a later manual
 `npm run package` therefore produces `aster-language-<version>.vsix`. This workflow deliberately

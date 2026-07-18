@@ -41,6 +41,7 @@ const updatedRootManifest = replaceOne(
 );
 writeIfChanged(cargoManifestPath, updatedRootManifest);
 
+const localPackageNames = [];
 for (const entry of readdirSync(cratesDirectory, { withFileTypes: true })) {
     if (!entry.isDirectory()) {
         continue;
@@ -55,6 +56,10 @@ for (const entry of readdirSync(cratesDirectory, { withFileTypes: true })) {
         }
         throw error;
     }
+
+    const packageName = readPackageName(manifest, manifestPath);
+    localPackageNames.push(packageName);
+
     const updatedManifest = manifest.replace(
         /(aster-[\w-]+\s*=\s*\{[^}\n]*\bversion\s*=\s*)"[^"]+"/g,
         `$1"${version}"`,
@@ -67,8 +72,54 @@ execFileSync(process.execPath, [extensionSyncScript, "--write"], {
     stdio: "inherit",
 });
 
-// Refresh workspace package versions in Cargo.lock without upgrading dependencies.
-execFileSync("cargo", ["metadata", "--format-version", "1", "--no-deps"], {
+// Ask Cargo to re-resolve the workspace so Cargo.lock picks up the new local
+// package versions. `--no-deps` must NOT be used here: it makes `cargo
+// metadata` skip lock-file resolution entirely, so the lock keeps recording
+// the previous versions for every workspace member even though the manifests
+// were just rewritten above. Without `--no-deps`, Cargo still resolves
+// strictly against the existing lock entries for every external dependency,
+// so nothing outside the workspace is upgraded.
+execFileSync("cargo", ["metadata", "--format-version", "1"], {
     cwd: repositoryRoot,
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", "inherit"],
 });
+
+verifyLockfileVersions(resolve(repositoryRoot, "Cargo.lock"), localPackageNames, version);
+
+function readPackageName(manifest, manifestPath) {
+    const lines = manifest.split(/\r?\n/);
+    let inPackageSection = false;
+    for (const line of lines) {
+        const section = line.match(/^\s*\[([^\]]+)]\s*$/);
+        if (section) {
+            inPackageSection = section[1] === "package";
+            continue;
+        }
+        if (inPackageSection) {
+            const name = line.match(/^\s*name\s*=\s*"([^"]+)"\s*$/);
+            if (name) {
+                return name[1];
+            }
+        }
+    }
+    throw new Error(`[package].name was not found in ${manifestPath}`);
+}
+
+function verifyLockfileVersions(lockfilePath, packageNames, expectedVersion) {
+    const lockfile = readFileSync(lockfilePath, "utf8");
+    const versionsByName = new Map();
+    for (const block of lockfile.split("[[package]]")) {
+        const name = block.match(/^\s*name\s*=\s*"([^"]+)"\s*$/m)?.[1];
+        const packageVersion = block.match(/^\s*version\s*=\s*"([^"]+)"\s*$/m)?.[1];
+        if (name && packageVersion) {
+            versionsByName.set(name, packageVersion);
+        }
+    }
+
+    const stale = packageNames.filter((name) => versionsByName.get(name) !== expectedVersion);
+    if (stale.length > 0) {
+        throw new Error(
+            `Cargo.lock is out of sync with version ${expectedVersion} for: ${stale.join(", ")}`,
+        );
+    }
+}

@@ -29,6 +29,12 @@ export default {
             },
         ],
         [
+            "@semantic-release/exec",
+            {
+                prepareCmd: "cargo check --workspace --locked",
+            },
+        ],
+        [
             "@semantic-release/git",
             {
                 assets: [
