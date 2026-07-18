@@ -64,6 +64,17 @@ pub enum TokenKind {
     DecimalLiteral(String),
     StringLiteral(String),
     CharacterLiteral(char),
+    /// `$"` — opens an interpolated string.
+    InterpolatedStringStart,
+    /// A literal text run inside an interpolated string, with escapes and
+    /// `{{`/`}}` already resolved.
+    InterpolatedStringText(String),
+    /// The `{` that opens an interpolated expression slot.
+    InterpolatedExpressionStart,
+    /// The `}` that closes an interpolated expression slot.
+    InterpolatedExpressionEnd,
+    /// The closing `"` of an interpolated string.
+    InterpolatedStringEnd,
     LeftBrace,
     RightBrace,
     LeftParen,
@@ -157,8 +168,11 @@ impl TokenKind {
             Self::DecimalLiteral(_) => "decimal literal",
             Self::StringLiteral(_) => "string literal",
             Self::CharacterLiteral(_) => "character literal",
-            Self::LeftBrace => "`{`",
-            Self::RightBrace => "`}`",
+            Self::InterpolatedStringStart => "`$\"`",
+            Self::InterpolatedStringText(_) => "interpolated string text",
+            Self::InterpolatedExpressionStart | Self::LeftBrace => "`{`",
+            Self::InterpolatedExpressionEnd | Self::RightBrace => "`}`",
+            Self::InterpolatedStringEnd => "closing `\"`",
             Self::LeftParen => "`(`",
             Self::RightParen => "`)`",
             Self::LeftBracket => "`[`",

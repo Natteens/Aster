@@ -478,6 +478,190 @@ fn distinct_instances_keep_separate_field_storage() {
 }
 
 #[test]
+fn interpolates_a_literal_integer() {
+    let source = r#"public string Run() { return $"Sum: {1234}"; }"#;
+    assert_eq!(
+        run(source, "Run"),
+        Ok(ExecutionValue::String("Sum: 1234".to_owned()))
+    );
+}
+
+#[test]
+fn interpolates_a_variable_and_an_arithmetic_expression() {
+    let source = r#"
+        public string Run() {
+            int quantity = 4;
+            int price = 15;
+            return $"Total: {quantity * price}";
+        }
+    "#;
+    assert_eq!(
+        run(source, "Run"),
+        Ok(ExecutionValue::String("Total: 60".to_owned()))
+    );
+}
+
+#[test]
+fn interpolates_bool_char_float_and_double() {
+    let source = r#"
+        public string Run() {
+            bool ok = true;
+            char letter = 'x';
+            float small = 1.5f;
+            double big = 2.5d;
+            return $"{ok} {letter} {small} {big}";
+        }
+    "#;
+    assert_eq!(
+        run(source, "Run"),
+        Ok(ExecutionValue::String("true x 1.5 2.5".to_owned()))
+    );
+}
+
+#[test]
+fn interpolates_every_integer_width_signed_and_unsigned() {
+    let source = r#"
+        public string Run() {
+            sbyte a = -1;
+            byte b = 255;
+            short c = -2;
+            ushort d = 65535;
+            int e = -3;
+            uint f = 4000000000;
+            long g = -9223372036854775808;
+            ulong h = 18446744073709551615ul;
+            return $"{a} {b} {c} {d} {e} {f} {g} {h}";
+        }
+    "#;
+    assert_eq!(
+        run(source, "Run"),
+        Ok(ExecutionValue::String(
+            "-1 255 -2 65535 -3 4000000000 -9223372036854775808 18446744073709551615".to_owned()
+        ))
+    );
+}
+
+#[test]
+fn interpolates_a_call_result_and_multiple_segments() {
+    let source = r#"
+        public int Calculate(int a, int b) { return a + b; }
+        public string Run() {
+            return $"{Calculate(1, 2)}-{Calculate(3, 4)}-{Calculate(5, 6)}";
+        }
+    "#;
+    assert_eq!(
+        run(source, "Run"),
+        Ok(ExecutionValue::String("3-7-11".to_owned()))
+    );
+}
+
+#[test]
+fn receiver_and_getter_are_each_evaluated_exactly_once() {
+    // If the receiver were evaluated per interpolated segment instead of once
+    // per method call, or if `Next()` reordered, the result would not be
+    // "1-2-3": it would be "6" (three fresh counters) or an out-of-order
+    // sequence.
+    let source = r#"
+        public class Tracker {
+            private int value = 0;
+            public int Next() {
+                value = value + 1;
+                return value;
+            }
+            public string Build() {
+                return $"{Next()}-{Next()}-{Next()}";
+            }
+        }
+        public string Run() {
+            Tracker tracker = new Tracker();
+            return tracker.Build();
+        }
+    "#;
+    assert_eq!(
+        run(source, "Run"),
+        Ok(ExecutionValue::String("1-2-3".to_owned()))
+    );
+}
+
+#[test]
+fn literal_braces_are_preserved() {
+    let source = r#"public string Run() { return $"{{value}}"; }"#;
+    assert_eq!(
+        run(source, "Run"),
+        Ok(ExecutionValue::String("{value}".to_owned()))
+    );
+}
+
+#[test]
+fn two_distinct_interpolated_strings_do_not_share_storage() {
+    let source = r#"
+        public string Run() {
+            int a = 1;
+            int b = 2;
+            string first = $"first: {a}";
+            string second = $"second: {b}";
+            return first + " / " + second;
+        }
+    "#;
+    assert_eq!(
+        run(source, "Run"),
+        Ok(ExecutionValue::String("first: 1 / second: 2".to_owned()))
+    );
+}
+
+#[test]
+fn interpolated_string_can_be_stored_and_passed_as_an_argument() {
+    let source = r#"
+        public class Holder {
+            public string message = "";
+        }
+        public int Length(string value) { return value.Length; }
+        public string Run() {
+            Holder holder = new Holder();
+            holder.message = $"n={41 + 1}";
+            return $"len={Length(holder.message)}";
+        }
+    "#;
+    assert_eq!(
+        run(source, "Run"),
+        Ok(ExecutionValue::String("len=4".to_owned()))
+    );
+}
+
+#[test]
+fn interpolated_string_instances_from_different_objects_do_not_collide() {
+    let source = r#"
+        public class Box {
+            private int value = 0;
+            public void Set(int next) { value = next; }
+            public string Describe() { return $"value={value}"; }
+        }
+        public string Run() {
+            Box first = new Box();
+            Box second = new Box();
+            first.Set(1);
+            second.Set(2);
+            return first.Describe() + " / " + second.Describe();
+        }
+    "#;
+    assert_eq!(
+        run(source, "Run"),
+        Ok(ExecutionValue::String("value=1 / value=2".to_owned()))
+    );
+}
+
+#[test]
+fn interpolation_is_correct_across_repeated_executions_in_fresh_contexts() {
+    let source = r#"public string Run() { int value = 40; return $"{value + 2}"; }"#;
+    for _ in 0..3 {
+        assert_eq!(
+            run(source, "Run"),
+            Ok(ExecutionValue::String("42".to_owned()))
+        );
+    }
+}
+
+#[test]
 fn executes_direct_calls_with_parameters() {
     let source = "public int Add(int left, int right) { return left + right; } public int Calculate() { return Add(20, 22); }";
     assert_eq!(run(source, "Calculate"), Ok(ExecutionValue::Int(42)));

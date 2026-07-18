@@ -109,6 +109,43 @@ fn void_main_prints_only_program_logs_and_no_artificial_value() {
 }
 
 #[test]
+fn string_interpolation_runs_and_reports_syntax_errors_cleanly() {
+    let directory = temporary_directory("interpolation");
+    let main = directory.join("main.aster");
+    fs::write(
+        &main,
+        r#"public class Calculator {
+    private int x = 1233;
+    private int y = 1;
+    public int Run() { return Sum(x, y); }
+    private int Sum(int a, int b) { return a + b; }
+}
+public class Program {
+    public static void Main() {
+        Calculator calculator = new Calculator();
+        int result = calculator.Run();
+        Log($"Sum: {result}");
+    }
+}"#,
+    )
+    .expect("write interpolation program");
+    let output = aster(["run", main.to_str().expect("UTF-8 temporary path")]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "[log] Sum: 1234");
+
+    let bad = directory.join("bad.aster");
+    fs::write(
+        &bad,
+        r#"public class Program { public static void Main() { Log($"{value:00}"); } }"#,
+    )
+    .expect("write malformed interpolation program");
+    let bad_output = aster(["check", bad.to_str().expect("UTF-8 temporary path")]);
+    fs::remove_dir_all(&directory).expect("remove temporary directory");
+    assert!(!bad_output.status.success());
+    assert!(stderr(&bad_output).contains("format specifier"));
+}
+
+#[test]
 fn absolute_source_path_and_embedded_stdlib_work_outside_the_repository() {
     let directory = temporary_directory("outside-repository");
     let source = directory.join("main.aster");

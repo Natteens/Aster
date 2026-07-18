@@ -9,7 +9,11 @@ use crate::context::{aster_rt_array_element, aster_rt_array_length, aster_rt_arr
 use crate::log::aster_rt_log;
 use crate::math::aster_rt_math_domain_error;
 use crate::object::aster_rt_object_new;
-use crate::string::{aster_rt_string_concat, aster_rt_string_eq, aster_rt_string_length};
+use crate::string::{
+    aster_rt_string_concat, aster_rt_string_eq, aster_rt_string_from_bool,
+    aster_rt_string_from_char, aster_rt_string_from_double, aster_rt_string_from_long,
+    aster_rt_string_from_ulong, aster_rt_string_join, aster_rt_string_length,
+};
 
 /// Backend-neutral value type used in runtime signatures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,8 +22,10 @@ pub enum RuntimeType {
     I8,
     /// 32-bit signed integer.
     I32,
-    /// 64-bit signed integer.
+    /// 64-bit signed integer; `ulong` crosses the ABI as this same bit pattern.
     I64,
+    /// 64-bit floating point.
+    F64,
     /// Target-width pointer, e.g. `*const AsterStrHeader` for `string`.
     Pointer,
 }
@@ -43,6 +49,7 @@ pub struct RuntimeFunction {
 
 /// Every runtime function, in a stable order.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn runtime_functions() -> Vec<RuntimeFunction> {
     vec![
         RuntimeFunction {
@@ -111,6 +118,54 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             signature: RuntimeSignature {
                 parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
                 result: Some(RuntimeType::I32),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_from_long",
+            address: aster_rt_string_from_long as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::I64],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_from_ulong",
+            address: aster_rt_string_from_ulong as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::I64],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_from_double",
+            address: aster_rt_string_from_double as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::F64],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_from_bool",
+            address: aster_rt_string_from_bool as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::I8],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_from_char",
+            address: aster_rt_string_from_char as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::I32],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_join",
+            address: aster_rt_string_join as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer, RuntimeType::I32],
+                result: Some(RuntimeType::Pointer),
             },
         },
         RuntimeFunction {

@@ -32,82 +32,258 @@ struct Lexer<'a> {
 impl Lexer<'_> {
     fn run(&mut self) {
         while self.cursor < self.source.len() {
-            let start = self.cursor;
-            let character = self.bump().expect("cursor is within source");
-            match character {
-                c if c.is_whitespace() => {}
-                '/' if self.peek() == Some('/') => self.skip_line_comment(),
-                c if c == '_' || c.is_alphabetic() => self.identifier(start),
-                c if c.is_ascii_digit() => self.number(start),
-                '"' => self.string(start),
-                '\'' => self.character(start),
-                '{' => self.token(TokenKind::LeftBrace, start),
-                '}' => self.token(TokenKind::RightBrace, start),
-                '(' => self.token(TokenKind::LeftParen, start),
-                ')' => self.token(TokenKind::RightParen, start),
-                '[' => self.token(TokenKind::LeftBracket, start),
-                ']' => self.token(TokenKind::RightBracket, start),
-                ',' => self.token(TokenKind::Comma, start),
-                ':' => self.token(TokenKind::Colon, start),
-                '?' => self.token(TokenKind::Question, start),
-                ';' => self.token(TokenKind::Semicolon, start),
-                '.' => self.token(TokenKind::Dot, start),
-                '+' => match self.peek() {
-                    Some('+') => {
-                        self.bump();
-                        self.token(TokenKind::PlusPlus, start);
-                    }
-                    Some('=') => {
-                        self.bump();
-                        self.token(TokenKind::PlusEqual, start);
-                    }
-                    _ => self.token(TokenKind::Plus, start),
-                },
-                '-' => match self.peek() {
-                    Some('-') => {
-                        self.bump();
-                        self.token(TokenKind::MinusMinus, start);
-                    }
-                    Some('=') => {
-                        self.bump();
-                        self.token(TokenKind::MinusEqual, start);
-                    }
-                    _ => self.token(TokenKind::Minus, start),
-                },
-                '*' => self.two_character(start, '=', TokenKind::StarEqual, TokenKind::Star),
-                '/' => self.two_character(start, '=', TokenKind::SlashEqual, TokenKind::Slash),
-                '%' => self.token(TokenKind::Percent, start),
-                '!' => self.two_character(start, '=', TokenKind::BangEqual, TokenKind::Bang),
-                '=' => self.two_character(start, '=', TokenKind::EqualEqual, TokenKind::Equal),
-                '<' => self.two_character(start, '=', TokenKind::LessEqual, TokenKind::Less),
-                '>' => self.two_character(start, '=', TokenKind::GreaterEqual, TokenKind::Greater),
-                '&' if self.peek() == Some('&') => {
-                    self.bump();
-                    self.token(TokenKind::AndAnd, start);
-                }
-                '|' if self.peek() == Some('|') => {
-                    self.bump();
-                    self.token(TokenKind::OrOr, start);
-                }
-                '&' | '|' => self.diagnostics.push(
-                    Diagnostic::error(
-                        format!("unexpected operator `{character}`"),
-                        Span::new(start, self.cursor),
-                    )
-                    .with_help(format!(
-                        "use `{character}{character}` for a logical operator"
-                    )),
-                ),
-                _ => self.diagnostics.push(Diagnostic::error(
-                    format!("unexpected character `{character}`"),
-                    Span::new(start, self.cursor),
-                )),
-            }
+            self.step();
         }
         self.tokens.push(Token {
             kind: TokenKind::Eof,
             span: Span::new(self.cursor, self.cursor),
         });
+    }
+
+    /// Lex exactly one token (or comment/whitespace, which push nothing).
+    /// Reused verbatim to lex the expression slots inside an interpolated
+    /// string, so `{expr}` supports the full normal expression grammar
+    /// rather than a separate mini-grammar.
+    fn step(&mut self) {
+        let start = self.cursor;
+        let character = self.bump().expect("cursor is within source");
+        match character {
+            c if c.is_whitespace() => {}
+            '/' if self.peek() == Some('/') => self.skip_line_comment(),
+            c if c == '_' || c.is_alphabetic() => self.identifier(start),
+            c if c.is_ascii_digit() => self.number(start),
+            '$' if self.peek() == Some('"') => {
+                self.bump();
+                self.interpolated_string(start);
+            }
+            '"' => self.string(start),
+            '\'' => self.character(start),
+            '{' => self.token(TokenKind::LeftBrace, start),
+            '}' => self.token(TokenKind::RightBrace, start),
+            '(' => self.token(TokenKind::LeftParen, start),
+            ')' => self.token(TokenKind::RightParen, start),
+            '[' => self.token(TokenKind::LeftBracket, start),
+            ']' => self.token(TokenKind::RightBracket, start),
+            ',' => self.token(TokenKind::Comma, start),
+            ':' => self.token(TokenKind::Colon, start),
+            '?' => self.token(TokenKind::Question, start),
+            ';' => self.token(TokenKind::Semicolon, start),
+            '.' => self.token(TokenKind::Dot, start),
+            '+' => match self.peek() {
+                Some('+') => {
+                    self.bump();
+                    self.token(TokenKind::PlusPlus, start);
+                }
+                Some('=') => {
+                    self.bump();
+                    self.token(TokenKind::PlusEqual, start);
+                }
+                _ => self.token(TokenKind::Plus, start),
+            },
+            '-' => match self.peek() {
+                Some('-') => {
+                    self.bump();
+                    self.token(TokenKind::MinusMinus, start);
+                }
+                Some('=') => {
+                    self.bump();
+                    self.token(TokenKind::MinusEqual, start);
+                }
+                _ => self.token(TokenKind::Minus, start),
+            },
+            '*' => self.two_character(start, '=', TokenKind::StarEqual, TokenKind::Star),
+            '/' => self.two_character(start, '=', TokenKind::SlashEqual, TokenKind::Slash),
+            '%' => self.token(TokenKind::Percent, start),
+            '!' => self.two_character(start, '=', TokenKind::BangEqual, TokenKind::Bang),
+            '=' => self.two_character(start, '=', TokenKind::EqualEqual, TokenKind::Equal),
+            '<' => self.two_character(start, '=', TokenKind::LessEqual, TokenKind::Less),
+            '>' => self.two_character(start, '=', TokenKind::GreaterEqual, TokenKind::Greater),
+            '&' if self.peek() == Some('&') => {
+                self.bump();
+                self.token(TokenKind::AndAnd, start);
+            }
+            '|' if self.peek() == Some('|') => {
+                self.bump();
+                self.token(TokenKind::OrOr, start);
+            }
+            '&' | '|' => self.diagnostics.push(
+                Diagnostic::error(
+                    format!("unexpected operator `{character}`"),
+                    Span::new(start, self.cursor),
+                )
+                .with_help(format!(
+                    "use `{character}{character}` for a logical operator"
+                )),
+            ),
+            _ => self.diagnostics.push(Diagnostic::error(
+                format!("unexpected character `{character}`"),
+                Span::new(start, self.cursor),
+            )),
+        }
+    }
+
+    /// Lex the body of an interpolated string after `$"` has been consumed.
+    /// `start` is the offset of `$`. Alternates between scanning literal text
+    /// (with the same escapes as a normal string, plus `{{`/`}}`) and, on an
+    /// unescaped `{`, delegating to `step` to lex the embedded expression
+    /// with the ordinary grammar — no separate mini-grammar, no reparsing of
+    /// source text.
+    #[allow(clippy::too_many_lines)]
+    fn interpolated_string(&mut self, start: usize) {
+        self.tokens.push(Token {
+            kind: TokenKind::InterpolatedStringStart,
+            span: Span::new(start, self.cursor),
+        });
+        loop {
+            let text_start = self.cursor;
+            let mut text = String::new();
+            loop {
+                let Some(character) = self.peek() else {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "unterminated interpolated string literal",
+                            Span::new(start, self.cursor),
+                        )
+                        .with_help("close the literal with `\"`"),
+                    );
+                    self.cursor = self.source.len();
+                    return;
+                };
+                if character == '\n' || character == '\r' {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "unterminated interpolated string literal",
+                            Span::new(start, self.cursor),
+                        )
+                        .with_help("close the literal with `\"`"),
+                    );
+                    self.cursor = self.source.len();
+                    return;
+                }
+                if character == '"' {
+                    self.bump();
+                    self.tokens.push(Token {
+                        kind: TokenKind::InterpolatedStringText(text),
+                        span: Span::new(text_start, self.cursor - 1),
+                    });
+                    self.tokens.push(Token {
+                        kind: TokenKind::InterpolatedStringEnd,
+                        span: Span::new(self.cursor - 1, self.cursor),
+                    });
+                    return;
+                }
+                if character == '{' {
+                    let brace_start = self.cursor;
+                    self.bump();
+                    if self.peek() == Some('{') {
+                        self.bump();
+                        text.push('{');
+                        continue;
+                    }
+                    self.tokens.push(Token {
+                        kind: TokenKind::InterpolatedStringText(text),
+                        span: Span::new(text_start, brace_start),
+                    });
+                    self.tokens.push(Token {
+                        kind: TokenKind::InterpolatedExpressionStart,
+                        span: Span::new(brace_start, self.cursor),
+                    });
+                    break;
+                }
+                if character == '}' {
+                    let brace_start = self.cursor;
+                    self.bump();
+                    if self.peek() == Some('}') {
+                        self.bump();
+                        text.push('}');
+                        continue;
+                    }
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "unmatched `}` in interpolated string",
+                            Span::new(brace_start, self.cursor),
+                        )
+                        .with_help("use `}}` for a literal `}`, or `{` to start an expression"),
+                    );
+                    self.cursor = self.source.len();
+                    return;
+                }
+                if character == '\\' {
+                    self.bump();
+                    let Some(escaped) = self.bump() else {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "unterminated interpolated string literal",
+                                Span::new(start, self.cursor),
+                            )
+                            .with_help("close the literal with `\"`"),
+                        );
+                        self.cursor = self.source.len();
+                        return;
+                    };
+                    match escaped {
+                        'n' => text.push('\n'),
+                        'r' => text.push('\r'),
+                        't' => text.push('\t'),
+                        '\\' => text.push('\\'),
+                        '"' => text.push('"'),
+                        '\'' => text.push('\''),
+                        _ => {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    format!("unsupported escape sequence `\\{escaped}`"),
+                                    Span::new(self.cursor - escaped.len_utf8() - 1, self.cursor),
+                                )
+                                .with_help(
+                                    "use one of `\\n`, `\\r`, `\\t`, `\\\\`, `\\\"`, or `\\'`",
+                                ),
+                            );
+                            text.push(escaped);
+                        }
+                    }
+                    continue;
+                }
+                self.bump();
+                text.push(character);
+            }
+            // Lex the embedded expression with the ordinary grammar, tracking
+            // brace depth so a nested `{`/`}` (struct literals, blocks that
+            // cannot otherwise appear in an expression, etc.) does not end
+            // the slot early. Depth 1 is "inside the slot with no unmatched
+            // inner brace"; an unescaped `}` there closes the slot.
+            let mut depth = 1i32;
+            loop {
+                if self.cursor >= self.source.len() {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "unterminated interpolated string literal",
+                            Span::new(start, self.cursor),
+                        )
+                        .with_help("close the literal with `\"`"),
+                    );
+                    self.cursor = self.source.len();
+                    return;
+                }
+                if depth == 1 && self.peek() == Some('}') {
+                    let end_start = self.cursor;
+                    self.bump();
+                    self.tokens.push(Token {
+                        kind: TokenKind::InterpolatedExpressionEnd,
+                        span: Span::new(end_start, self.cursor),
+                    });
+                    break;
+                }
+                let before = self.tokens.len();
+                self.step();
+                if self.tokens.len() > before {
+                    match self.tokens[self.tokens.len() - 1].kind {
+                        TokenKind::LeftBrace => depth += 1,
+                        TokenKind::RightBrace => depth -= 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 
     fn identifier(&mut self, start: usize) {
@@ -492,5 +668,165 @@ mod tests {
     fn reports_unknown_characters() {
         let diagnostics = lex("value @").expect_err("@ is not valid syntax");
         assert_eq!(diagnostics[0].span.start, 6);
+    }
+
+    #[test]
+    fn lexes_a_simple_interpolation() {
+        let tokens = lex(r#"$"Sum: {result}""#).expect("valid interpolation");
+        let kinds = tokens
+            .into_iter()
+            .map(|token| token.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::InterpolatedStringStart,
+                TokenKind::InterpolatedStringText("Sum: ".into()),
+                TokenKind::InterpolatedExpressionStart,
+                TokenKind::Identifier("result".into()),
+                TokenKind::InterpolatedExpressionEnd,
+                TokenKind::InterpolatedStringText(String::new()),
+                TokenKind::InterpolatedStringEnd,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lexes_multiple_segments_and_a_complex_expression() {
+        let tokens = lex(r#"$"{a} + {b} = {a + b}""#).expect("valid interpolation");
+        let kinds = tokens
+            .into_iter()
+            .map(|token| token.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::InterpolatedStringStart,
+                TokenKind::InterpolatedStringText(String::new()),
+                TokenKind::InterpolatedExpressionStart,
+                TokenKind::Identifier("a".into()),
+                TokenKind::InterpolatedExpressionEnd,
+                TokenKind::InterpolatedStringText(" + ".into()),
+                TokenKind::InterpolatedExpressionStart,
+                TokenKind::Identifier("b".into()),
+                TokenKind::InterpolatedExpressionEnd,
+                TokenKind::InterpolatedStringText(" = ".into()),
+                TokenKind::InterpolatedExpressionStart,
+                TokenKind::Identifier("a".into()),
+                TokenKind::Plus,
+                TokenKind::Identifier("b".into()),
+                TokenKind::InterpolatedExpressionEnd,
+                TokenKind::InterpolatedStringText(String::new()),
+                TokenKind::InterpolatedStringEnd,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lexes_escapes_inside_interpolated_text() {
+        let tokens = lex(r#"$"Line 1\nQuote: \"{value}\"""#).expect("valid interpolation");
+        assert_eq!(
+            tokens[1].kind,
+            TokenKind::InterpolatedStringText("Line 1\nQuote: \"".into())
+        );
+        assert_eq!(tokens[2].kind, TokenKind::InterpolatedExpressionStart);
+        assert_eq!(tokens[3].kind, TokenKind::Identifier("value".into()));
+        assert_eq!(tokens[4].kind, TokenKind::InterpolatedExpressionEnd);
+        assert_eq!(
+            tokens[5].kind,
+            TokenKind::InterpolatedStringText("\"".into())
+        );
+    }
+
+    #[test]
+    fn resolves_doubled_braces_to_literal_braces() {
+        let tokens = lex(r#"$"{{value}} {a} end""#).expect("valid interpolation");
+        assert_eq!(
+            tokens[1].kind,
+            TokenKind::InterpolatedStringText("{value} ".into())
+        );
+        assert_eq!(tokens[2].kind, TokenKind::InterpolatedExpressionStart);
+        assert_eq!(tokens[3].kind, TokenKind::Identifier("a".into()));
+        assert_eq!(tokens[4].kind, TokenKind::InterpolatedExpressionEnd);
+        assert_eq!(
+            tokens[5].kind,
+            TokenKind::InterpolatedStringText(" end".into())
+        );
+    }
+
+    #[test]
+    fn nests_delimiters_inside_an_interpolated_expression() {
+        let tokens = lex(r#"$"{items[index]}""#).expect("valid interpolation");
+        let kinds = tokens
+            .into_iter()
+            .map(|token| token.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::InterpolatedStringStart,
+                TokenKind::InterpolatedStringText(String::new()),
+                TokenKind::InterpolatedExpressionStart,
+                TokenKind::Identifier("items".into()),
+                TokenKind::LeftBracket,
+                TokenKind::Identifier("index".into()),
+                TokenKind::RightBracket,
+                TokenKind::InterpolatedExpressionEnd,
+                TokenKind::InterpolatedStringText(String::new()),
+                TokenKind::InterpolatedStringEnd,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn nests_a_struct_literal_brace_inside_an_interpolated_expression() {
+        // The struct literal's own `{`/`}` must not be mistaken for the end
+        // of the interpolation slot.
+        let tokens = lex(r#"$"{P { x: 1 }}""#).expect("valid interpolation");
+        let kinds = tokens
+            .into_iter()
+            .map(|token| token.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::InterpolatedStringStart,
+                TokenKind::InterpolatedStringText(String::new()),
+                TokenKind::InterpolatedExpressionStart,
+                TokenKind::Identifier("P".into()),
+                TokenKind::LeftBrace,
+                TokenKind::Identifier("x".into()),
+                TokenKind::Colon,
+                TokenKind::IntegerLiteral("1".into()),
+                TokenKind::RightBrace,
+                TokenKind::InterpolatedExpressionEnd,
+                TokenKind::InterpolatedStringText(String::new()),
+                TokenKind::InterpolatedStringEnd,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn dollar_outside_a_string_is_still_rejected() {
+        let diagnostics = lex("value $ 1").expect_err("bare $ is not valid syntax");
+        assert!(diagnostics[0].message.contains("unexpected character `$`"));
+    }
+
+    #[test]
+    fn reports_unterminated_interpolated_string_without_cascading() {
+        let diagnostics = lex(r#"$"Value: {"#).expect_err("missing closing quote");
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("unterminated"));
+    }
+
+    #[test]
+    fn reports_unmatched_closing_brace_without_cascading() {
+        let diagnostics = lex(r#"$"Value: }""#).expect_err("stray } outside an expression slot");
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("unmatched"));
     }
 }

@@ -162,6 +162,17 @@ pub enum Intrinsic {
     StringEquals,
     StringConcat,
     StringLength,
+    /// Convert a signed integer (widened to `long`) to a `string`.
+    StringFromLong,
+    /// Convert an unsigned integer (widened to `ulong`) to a `string`.
+    StringFromULong,
+    /// Convert a `float` (promoted to `double`) or `double` to a `string`.
+    StringFromDouble,
+    StringFromBool,
+    StringFromChar,
+    /// Join every argument, each already a `string`, into one new `string`,
+    /// in a single allocation. Backs string interpolation.
+    StringJoin,
     ReportRuntimeError(RuntimeErrorKind),
 }
 

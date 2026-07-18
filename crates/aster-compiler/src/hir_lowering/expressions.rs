@@ -480,6 +480,23 @@ impl Lowerer<'_> {
                     }
                 }
             }
+            ast::ExpressionKind::InterpolatedString { parts } => {
+                let parts = parts
+                    .iter()
+                    .map(|part| match part {
+                        ast::InterpolatedPart::Text(text) => {
+                            hir::InterpolatedPart::Text(text.clone())
+                        }
+                        ast::InterpolatedPart::Expression(expression) => {
+                            hir::InterpolatedPart::Expression(Box::new(self.expression(expression)))
+                        }
+                    })
+                    .collect();
+                hir::Expression {
+                    type_: hir::Type::String,
+                    kind: hir::ExpressionKind::InterpolatedString { parts },
+                }
+            }
         }
     }
 

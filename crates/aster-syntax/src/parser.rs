@@ -4,9 +4,10 @@ use aster_diagnostics::{Diagnostic, Span};
 
 use crate::{
     Accessor, AssignmentOperator, BinaryOperator, Block, EnumCase, EnumDeclaration, Expression,
-    ExpressionKind, Field, FieldInitializer, FunctionDeclaration, IncrementOperator, Item, Literal,
-    Member, Module, Parameter, Property, Statement, SwitchCase, Token, TokenKind, TypeDeclaration,
-    TypeParameter, TypeRef, UnaryOperator, VariableDeclaration, VariableKind, Visibility,
+    ExpressionKind, Field, FieldInitializer, FunctionDeclaration, IncrementOperator,
+    InterpolatedPart, Item, Literal, Member, Module, Parameter, Property, Statement, SwitchCase,
+    Token, TokenKind, TypeDeclaration, TypeParameter, TypeRef, UnaryOperator, VariableDeclaration,
+    VariableKind, Visibility,
 };
 
 /// Build an AST from a positioned token stream.
@@ -1185,6 +1186,9 @@ impl Parser {
             TokenKind::DoubleLiteral(value) => ExpressionKind::Literal(Literal::Double(value)),
             TokenKind::DecimalLiteral(value) => ExpressionKind::Literal(Literal::Decimal(value)),
             TokenKind::StringLiteral(value) => ExpressionKind::Literal(Literal::String(value)),
+            TokenKind::InterpolatedStringStart => {
+                return self.interpolated_string(token.span.start);
+            }
             TokenKind::CharacterLiteral(value) => {
                 ExpressionKind::Literal(Literal::Character(value))
             }
@@ -1246,6 +1250,104 @@ impl Parser {
             kind,
             span: token.span,
         })
+    }
+
+    /// Parses the body of an interpolated string. The lexer guarantees a
+    /// well-formed `Start (Text | ExpressionStart ... ExpressionEnd)* End`
+    /// shape (a malformed one is already a lex-time diagnostic, so `parse`
+    /// never runs on it); this only needs to validate the expression slots.
+    fn interpolated_string(&mut self, start: usize) -> Option<Expression> {
+        let mut parts = Vec::new();
+        loop {
+            match self.current().kind.clone() {
+                TokenKind::InterpolatedStringText(text) => {
+                    self.advance();
+                    if !text.is_empty() {
+                        parts.push(InterpolatedPart::Text(text));
+                    }
+                }
+                TokenKind::InterpolatedExpressionStart => {
+                    self.advance();
+                    if self.at(&TokenKind::InterpolatedExpressionEnd) {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "interpolated expression is empty",
+                                self.current().span,
+                            )
+                            .with_help("write an expression inside `{}`, or remove the braces"),
+                        );
+                        self.advance();
+                    } else if let Some(expression) = self.expression() {
+                        parts.push(InterpolatedPart::Expression(expression));
+                        self.recover_interpolated_expression_end();
+                    } else {
+                        self.recover_interpolated_expression_end();
+                    }
+                }
+                TokenKind::InterpolatedStringEnd => {
+                    let end = self.advance().span.end;
+                    return Some(Expression {
+                        kind: ExpressionKind::InterpolatedString { parts },
+                        span: Span::new(start, end),
+                    });
+                }
+                _ => {
+                    self.diagnostics.push(Diagnostic::error(
+                        "malformed interpolated string",
+                        self.current().span,
+                    ));
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// After parsing an interpolated expression slot, either consume its
+    /// closing `}` or report why it was not immediately found (an
+    /// unsupported format specifier or alignment component) and resynchronize
+    /// to the closing `}` so later interpolations in the same file are still
+    /// diagnosed independently.
+    fn recover_interpolated_expression_end(&mut self) {
+        if self.take(&TokenKind::InterpolatedExpressionEnd).is_some() {
+            return;
+        }
+        match &self.current().kind {
+            TokenKind::Colon => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "format specifiers are not supported in string interpolation",
+                        self.current().span,
+                    )
+                    .with_help(
+                        "remove the format specifier; only the expression value is supported",
+                    ),
+                );
+            }
+            TokenKind::Comma => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "alignment is not supported in string interpolation",
+                        self.current().span,
+                    )
+                    .with_help(
+                        "remove the alignment component; only the expression value is supported",
+                    ),
+                );
+            }
+            _ => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!("expected `}}`, found {}", self.current().kind.description()),
+                        self.current().span,
+                    )
+                    .with_help("close the interpolated expression with `}`"),
+                );
+            }
+        }
+        while !self.at(&TokenKind::InterpolatedExpressionEnd) && !self.at(&TokenKind::Eof) {
+            self.advance();
+        }
+        self.take(&TokenKind::InterpolatedExpressionEnd);
     }
 
     fn struct_literal(&mut self, type_name: String, start: usize) -> Option<Expression> {
@@ -1927,5 +2029,85 @@ mod tests {
         let source = "public void F() { foreach (item) { } }";
         let tokens = lex(source).expect("lexing succeeds");
         assert!(parse(tokens).is_err());
+    }
+
+    #[test]
+    fn parses_interpolated_string_parts_and_spans() {
+        let module = parse_source(r#"public string F() { return $"Sum: {result}"; }"#);
+        let Statement::Return {
+            value: Some(value), ..
+        } = &first_function_statements(&module)[0]
+        else {
+            panic!("expected a return with a value");
+        };
+        let ExpressionKind::InterpolatedString { parts } = &value.kind else {
+            panic!("expected an interpolated string");
+        };
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(&parts[0], crate::InterpolatedPart::Text(text) if text == "Sum: "));
+        let crate::InterpolatedPart::Expression(expression) = &parts[1] else {
+            panic!("expected the second part to be an expression");
+        };
+        assert!(matches!(&expression.kind, ExpressionKind::Name(name) if name == "result"));
+        // `$"Sum: {result}"` starts at byte 27 in the source above; the whole
+        // interpolated string spans through its closing quote.
+        assert_eq!(value.span, aster_diagnostics::Span::new(27, 43));
+    }
+
+    #[test]
+    fn parses_a_complex_expression_inside_an_interpolation_slot() {
+        let module = parse_source(r#"public string F() { return $"{condition ? left : right}"; }"#);
+        let Statement::Return {
+            value: Some(value), ..
+        } = &first_function_statements(&module)[0]
+        else {
+            panic!("expected a return with a value");
+        };
+        let ExpressionKind::InterpolatedString { parts } = &value.kind else {
+            panic!("expected an interpolated string");
+        };
+        assert_eq!(parts.len(), 1);
+        let crate::InterpolatedPart::Expression(expression) = &parts[0] else {
+            panic!("expected an expression part");
+        };
+        assert!(matches!(
+            expression.kind,
+            ExpressionKind::Conditional { .. }
+        ));
+    }
+
+    #[test]
+    fn empty_interpolated_expression_is_a_controlled_diagnostic() {
+        let tokens = lex(r#"public string F() { return $"Value: {}"; }"#).expect("lexing succeeds");
+        let diagnostics = parse(tokens).expect_err("empty `{}` is invalid");
+        assert!(diagnostics[0].message.contains("empty"));
+    }
+
+    #[test]
+    fn format_specifier_is_a_controlled_diagnostic() {
+        let tokens =
+            lex(r#"public string F() { return $"{value:00}"; }"#).expect("lexing succeeds");
+        let diagnostics = parse(tokens).expect_err("format specifiers are unsupported");
+        assert!(diagnostics[0].message.contains("format specifier"));
+    }
+
+    #[test]
+    fn alignment_component_is_a_controlled_diagnostic() {
+        let tokens =
+            lex(r#"public string F() { return $"{value,10}"; }"#).expect("lexing succeeds");
+        let diagnostics = parse(tokens).expect_err("alignment is unsupported");
+        assert!(diagnostics[0].message.contains("alignment"));
+    }
+
+    #[test]
+    fn multiple_invalid_interpolations_are_each_diagnosed() {
+        let tokens = lex(
+            r#"public string F() { return $"{}"; } public string G() { return $"{value:00}"; }"#,
+        )
+        .expect("lexing succeeds");
+        let diagnostics = parse(tokens).expect_err("both interpolations are invalid");
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics[0].message.contains("empty"));
+        assert!(diagnostics[1].message.contains("format specifier"));
     }
 }

@@ -1,9 +1,9 @@
 use super::{
     Analyzer, AssignmentOperator, BinaryOperator, Binding, Diagnostic, Expression, ExpressionKind,
-    HashSet, IncrementOperator, IntegerFit, Literal, Primitive, PropertyInfo, ResolvedPropagation,
-    ResolvedPropertyAssignment, ResultCases, Span, Type, TypeKind, TypeName, TypeRef,
-    UnaryOperator, UnsignedFit, Visibility, classify_integer, classify_unsigned, compatible,
-    constant_integer, evaluate, fits_long, fits_ulong, integer_value, promoted_numeric,
+    HashSet, IncrementOperator, IntegerFit, InterpolatedPart, Literal, Primitive, PropertyInfo,
+    ResolvedPropagation, ResolvedPropertyAssignment, ResultCases, Span, Type, TypeKind, TypeName,
+    TypeRef, UnaryOperator, UnsignedFit, Visibility, classify_integer, classify_unsigned,
+    compatible, constant_integer, evaluate, fits_long, fits_ulong, integer_value, promoted_numeric,
     resolve_type_readonly, zero_initializable,
 };
 
@@ -263,7 +263,65 @@ impl Analyzer<'_> {
                 operator,
                 value,
             } => self.assignment(target, *operator, value, expression.span),
+            ExpressionKind::InterpolatedString { parts } => self.interpolated_string(parts),
         }
+    }
+
+    /// Validates every embedded expression and requires each to have a
+    /// defined textual conversion. Always yields `string`; the concrete
+    /// per-type conversion is chosen later, during lowering, from each
+    /// part's own resolved type.
+    fn interpolated_string(&mut self, parts: &[InterpolatedPart]) -> Type {
+        for part in parts {
+            let InterpolatedPart::Expression(expression) = part else {
+                continue;
+            };
+            let type_ = self.expression(expression);
+            if type_ == Type::Unknown {
+                continue;
+            }
+            if type_ == Type::Void {
+                self.diagnostics.push(Diagnostic::error(
+                    "a `void` expression cannot be used in string interpolation",
+                    expression.span,
+                ));
+                continue;
+            }
+            let interpolatable = matches!(
+                type_.primitive(),
+                Some(
+                    Primitive::String
+                        | Primitive::Bool
+                        | Primitive::Char
+                        | Primitive::SByte
+                        | Primitive::Byte
+                        | Primitive::Short
+                        | Primitive::UShort
+                        | Primitive::Int
+                        | Primitive::UInt
+                        | Primitive::Long
+                        | Primitive::ULong
+                        | Primitive::Float
+                        | Primitive::Double
+                )
+            );
+            if !interpolatable {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "type `{}` cannot be used in string interpolation",
+                            type_.display()
+                        ),
+                        expression.span,
+                    )
+                    .with_help(
+                        "only `string`, `bool`, `char`, integers, and floating-point types are \
+                         accepted; convert the value explicitly",
+                    ),
+                );
+            }
+        }
+        Type::String
     }
 
     fn struct_literal(

@@ -41,7 +41,7 @@ use declarations::runtime_type;
 use execution::execute_resolved;
 use layouts::Layouts;
 use validation::{select_entry, validate_invocable_entry, validate_module};
-use values::{integer_constant_bits, is_aggregate, primitive, type_name};
+use values::{cast_value, integer_constant_bits, is_aggregate, primitive, type_name};
 
 struct Codegen {
     jit: JITModule,

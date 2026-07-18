@@ -46,6 +46,7 @@ public void Run()
     Log(name);
     Log.Warning("Aviso de teste");
     Log.Error("Erro de teste");
+    Log($"Hello, {name}! Ratio: {ratio * 2.0d}");
 
     for (int index = 0; index < 4; index++)
     {

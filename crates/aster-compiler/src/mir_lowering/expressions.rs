@@ -261,6 +261,88 @@ impl FunctionLowerer {
                 operator,
                 value,
             } => Some(self.lower_assignment(target, *operator, value)),
+            hir::ExpressionKind::InterpolatedString { parts } => {
+                Some(self.lower_interpolated_string(parts))
+            }
+        }
+    }
+
+    /// Lowers `$"..."` to: evaluate and (when needed) stringify every
+    /// embedded expression exactly once, left to right, then join every
+    /// segment in a single runtime call. Empty literal text segments (the
+    /// common case of text before the first `{` or after the last `}`) are
+    /// dropped before lowering; they carry no value and would only add an
+    /// unnecessary argument to the join call.
+    fn lower_interpolated_string(&mut self, parts: &[hir::InterpolatedPart]) -> mir::Operand {
+        let mut segments = Vec::with_capacity(parts.len());
+        for part in parts {
+            match part {
+                hir::InterpolatedPart::Text(text) => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    segments.push(mir::Operand {
+                        type_: mir::Type::String,
+                        kind: mir::OperandKind::Constant(mir::Constant::String(text.clone())),
+                    });
+                }
+                hir::InterpolatedPart::Expression(expression) => {
+                    let operand = self
+                        .lower_expression(expression)
+                        .expect("validated interpolation part produces a value");
+                    segments.push(self.stringify(operand));
+                }
+            }
+        }
+        if segments.is_empty() {
+            return mir::Operand {
+                type_: mir::Type::String,
+                kind: mir::OperandKind::Constant(mir::Constant::String(String::new())),
+            };
+        }
+        let destination = self.new_temporary(hir::Type::String);
+        let place = mir::Place::Local(destination);
+        self.instruction(mir::Instruction::CallIntrinsic {
+            destination: Some(place.clone()),
+            intrinsic: mir::Intrinsic::StringJoin,
+            arguments: segments,
+            return_type: mir::Type::String,
+        });
+        mir::Operand {
+            type_: mir::Type::String,
+            kind: mir::OperandKind::Copy(place),
+        }
+    }
+
+    /// Converts a validated, interpolation-eligible value to a `string`.
+    /// Signed widths are widened to `long` and unsigned widths to `ulong`
+    /// before the call so the runtime only needs one conversion routine per
+    /// signedness, regardless of the source width.
+    fn stringify(&mut self, operand: mir::Operand) -> mir::Operand {
+        let intrinsic = match operand.type_ {
+            mir::Type::String => return operand,
+            mir::Type::Bool => mir::Intrinsic::StringFromBool,
+            mir::Type::Char => mir::Intrinsic::StringFromChar,
+            mir::Type::SByte | mir::Type::Short | mir::Type::Int | mir::Type::Long => {
+                mir::Intrinsic::StringFromLong
+            }
+            mir::Type::Byte | mir::Type::UShort | mir::Type::UInt | mir::Type::ULong => {
+                mir::Intrinsic::StringFromULong
+            }
+            mir::Type::Float | mir::Type::Double => mir::Intrinsic::StringFromDouble,
+            _ => unreachable!("semantic analysis rejects types without a textual conversion"),
+        };
+        let destination = self.new_temporary(hir::Type::String);
+        let place = mir::Place::Local(destination);
+        self.instruction(mir::Instruction::CallIntrinsic {
+            destination: Some(place.clone()),
+            intrinsic,
+            arguments: vec![operand],
+            return_type: mir::Type::String,
+        });
+        mir::Operand {
+            type_: mir::Type::String,
+            kind: mir::OperandKind::Copy(place),
         }
     }
 

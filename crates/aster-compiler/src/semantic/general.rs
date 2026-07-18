@@ -9,8 +9,9 @@ use crate::primitives::{
 };
 use aster_syntax::{
     AssignmentOperator, BinaryOperator, Block, Expression, ExpressionKind, Field,
-    FunctionDeclaration, IncrementOperator, Item, Literal, Member, Module, Property, Statement,
-    TypeDeclaration, TypeRef, UnaryOperator, VariableDeclaration, VariableKind, Visibility,
+    FunctionDeclaration, IncrementOperator, InterpolatedPart, Item, Literal, Member, Module,
+    Property, Statement, TypeDeclaration, TypeRef, UnaryOperator, VariableDeclaration,
+    VariableKind, Visibility,
 };
 
 use super::{

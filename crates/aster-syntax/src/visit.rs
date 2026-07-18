@@ -5,9 +5,9 @@
 
 use crate::{
     Accessor, Block, EnumCase, EnumDeclaration, Expression, ExpressionKind, Field,
-    FieldInitializer, FunctionDeclaration, Item, Member, Module, NamespaceDeclaration, Parameter,
-    Property, Statement, SwitchCase, TypeDeclaration, TypeParameter, TypeRef, UsingDeclaration,
-    VariableDeclaration, VariableKind,
+    FieldInitializer, FunctionDeclaration, InterpolatedPart, Item, Member, Module,
+    NamespaceDeclaration, Parameter, Property, Statement, SwitchCase, TypeDeclaration,
+    TypeParameter, TypeRef, UsingDeclaration, VariableDeclaration, VariableKind,
 };
 
 /// A mutable syntax-tree visitor with structural defaults.
@@ -351,6 +351,13 @@ pub fn walk_expression_mut<V: AstVisitorMut + ?Sized>(
         ExpressionKind::Assignment { target, value, .. } => {
             visitor.visit_expression_mut(target);
             visitor.visit_expression_mut(value);
+        }
+        ExpressionKind::InterpolatedString { parts } => {
+            for part in parts {
+                if let InterpolatedPart::Expression(expression) = part {
+                    visitor.visit_expression_mut(expression);
+                }
+            }
         }
         ExpressionKind::Literal(_) | ExpressionKind::Name(_) | ExpressionKind::This => {}
     }

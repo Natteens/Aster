@@ -7,6 +7,9 @@
             "include": "#comments"
         },
         {
+            "include": "#interpolated-strings"
+        },
+        {
             "include": "#strings"
         },
         {
@@ -64,6 +67,41 @@
                 {
                     "name": "constant.character.escape.aster",
                     "match": "\\\\[nrt\\\\\"']"
+                },
+                {
+                    "name": "invalid.illegal.escape.aster",
+                    "match": "\\\\."
+                }
+            ]
+        },
+        "interpolated-strings": {
+            "name": "string.quoted.double.interpolated.aster",
+            "begin": "\\$\"",
+            "end": "\"|$",
+            "patterns": [
+                {
+                    "name": "constant.character.escape.aster",
+                    "match": "\\{\\{|\\}\\}|\\\\[nrt\\\\\"']"
+                },
+                {
+                    "name": "meta.interpolation.aster",
+                    "begin": "\\{",
+                    "end": "\\}|$",
+                    "beginCaptures": {
+                        "0": {
+                            "name": "punctuation.section.embedded.begin.aster"
+                        }
+                    },
+                    "endCaptures": {
+                        "0": {
+                            "name": "punctuation.section.embedded.end.aster"
+                        }
+                    },
+                    "patterns": [
+                        {
+                            "include": "$self"
+                        }
+                    ]
                 },
                 {
                     "name": "invalid.illegal.escape.aster",

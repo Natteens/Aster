@@ -13,7 +13,32 @@ int length = message.Length;
 ```
 
 Both operands of `+` must be strings. Aster does not silently turn numbers, booleans, characters,
-objects, arrays, or structs into text.
+objects, arrays, or structs into text with `+`; use string interpolation instead.
+
+## String interpolation
+
+`$"..."` builds a `string` from literal text and embedded `{expression}` slots, using the ordinary
+expression grammar — names, fields, properties, calls, operators, and more:
+
+```aster
+int quantity = 4;
+int price = 15;
+
+Log($"Total: {quantity * price}");
+```
+
+Each `{expression}` is evaluated exactly once, left to right, then converted to text and joined
+with the surrounding literal text into one new `string`. `string`, `bool`, `char`, every integer
+width, and `float`/`double` have a defined textual conversion; `true`/`false` for `bool`, and a
+locale-independent decimal representation for numbers (the separator is always `.`, never a
+regional variant). A `void` expression or any other type — classes, interfaces, structs, arrays —
+is rejected with a diagnostic naming the type.
+
+Write a literal `{` or `}` as `{{` or `}}`. Format specifiers and alignment (`{value:00}`,
+`{value,10}`) are not implemented in this version and are rejected with a specific diagnostic
+rather than silently ignored.
+
+Normal strings are unaffected: `"{like this}"` has no `$` prefix, so `{` and `}` stay literal text.
 
 ## Length and Unicode
 
@@ -54,5 +79,6 @@ dynamic concatenations allocate exactly one result for each binary `+` operation
 
 ## Current limits
 
-There is no interpolation, implicit `ToString`, indexing, substring, split, replace, regex, mutable
+There is no general implicit `ToString`, indexing, substring, split, replace, regex, mutable
 buffer, or nullable string. Strings are not collections, and Aster exposes no raw string pointers.
+Interpolation has no format specifiers, alignment, culture, or raw/verbatim form.

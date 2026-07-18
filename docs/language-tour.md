@@ -117,7 +117,8 @@ public int SumScores()
 ```
 
 Strings are immutable UTF-8 values. Concatenation creates a new string, `==` compares content, and
-`Length` counts Unicode scalar values. Aster does not silently convert numbers or objects to text.
+`Length` counts Unicode scalar values. Aster does not silently convert numbers or objects to text
+with `+`; use `$"Total: {quantity * price}"` to build text from values instead.
 
 See [arrays](reference/arrays.md) and [strings](reference/strings.md) for their runtime boundaries.
 

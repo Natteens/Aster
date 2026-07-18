@@ -2,9 +2,9 @@ use std::{collections::HashMap, fmt::Write};
 
 use aster_diagnostics::Diagnostic;
 use aster_syntax::{
-    BinaryOperator, Block, EnumDeclaration, Expression, ExpressionKind, FunctionDeclaration, Item,
-    Literal, Member, Module, Statement, SwitchCase, TypeDeclaration, TypeRef, VariableDeclaration,
-    VariableKind,
+    BinaryOperator, Block, EnumDeclaration, Expression, ExpressionKind, FunctionDeclaration,
+    InterpolatedPart, Item, Literal, Member, Module, Statement, SwitchCase, TypeDeclaration,
+    TypeRef, VariableDeclaration, VariableKind,
     visit::{AstVisitorMut, walk_expression_mut, walk_switch_case_mut},
 };
 

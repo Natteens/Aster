@@ -457,7 +457,7 @@ fn translate_float_binary(
 /// extend by the signedness of the source (two's complement) or truncate;
 /// float-to-integer casts saturate at the target range and convert NaN to
 /// zero instead of trapping.
-fn cast_value(
+pub(super) fn cast_value(
     builder: &mut FunctionBuilder<'_>,
     source: &mir::Type,
     target: &mir::Type,

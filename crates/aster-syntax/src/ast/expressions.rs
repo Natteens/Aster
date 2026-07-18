@@ -72,6 +72,18 @@ pub enum ExpressionKind {
         operator: AssignmentOperator,
         value: Box<Expression>,
     },
+    /// `$"text {expr} text"`. Always produces `string`.
+    InterpolatedString {
+        parts: Vec<InterpolatedPart>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum InterpolatedPart {
+    /// A literal run of text with escapes and `{{`/`}}` already resolved.
+    Text(String),
+    /// An embedded expression, parsed with the ordinary expression grammar.
+    Expression(Expression),
 }
 
 #[derive(Clone, Debug, PartialEq)]

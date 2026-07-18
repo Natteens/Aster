@@ -355,6 +355,54 @@ fn validate_intrinsic_shape(
                 && return_type == &mir::Type::Int
                 && matches!(arguments, [value] if value.type_ == mir::Type::String)
         }
+        mir::Intrinsic::StringFromLong => {
+            destination.is_some()
+                && return_type == &mir::Type::String
+                && matches!(
+                    arguments,
+                    [value] if matches!(
+                        value.type_,
+                        mir::Type::SByte | mir::Type::Short | mir::Type::Int | mir::Type::Long
+                    )
+                )
+        }
+        mir::Intrinsic::StringFromULong => {
+            destination.is_some()
+                && return_type == &mir::Type::String
+                && matches!(
+                    arguments,
+                    [value] if matches!(
+                        value.type_,
+                        mir::Type::Byte | mir::Type::UShort | mir::Type::UInt | mir::Type::ULong
+                    )
+                )
+        }
+        mir::Intrinsic::StringFromDouble => {
+            destination.is_some()
+                && return_type == &mir::Type::String
+                && matches!(
+                    arguments,
+                    [value] if matches!(value.type_, mir::Type::Float | mir::Type::Double)
+                )
+        }
+        mir::Intrinsic::StringFromBool => {
+            destination.is_some()
+                && return_type == &mir::Type::String
+                && matches!(arguments, [value] if value.type_ == mir::Type::Bool)
+        }
+        mir::Intrinsic::StringFromChar => {
+            destination.is_some()
+                && return_type == &mir::Type::String
+                && matches!(arguments, [value] if value.type_ == mir::Type::Char)
+        }
+        mir::Intrinsic::StringJoin => {
+            destination.is_some()
+                && return_type == &mir::Type::String
+                && !arguments.is_empty()
+                && arguments
+                    .iter()
+                    .all(|argument| argument.type_ == mir::Type::String)
+        }
         mir::Intrinsic::ReportRuntimeError(_) => {
             destination.is_none() && return_type == &mir::Type::Void && arguments.is_empty()
         }

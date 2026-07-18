@@ -1,6 +1,7 @@
 use super::{
     BinaryOperator, Block, Diagnostic, Expression, ExpressionKind, FunctionDeclaration, HashMap,
-    Member, Monomorphizer, Statement, TypeDeclaration, TypeRef, literal_type, variable_type,
+    InterpolatedPart, Member, Monomorphizer, Statement, TypeDeclaration, TypeRef, literal_type,
+    variable_type,
 };
 
 impl Monomorphizer {
@@ -259,6 +260,14 @@ impl Monomorphizer {
                 let target = self.expression(target, environment);
                 self.expression(value, environment);
                 target
+            }
+            ExpressionKind::InterpolatedString { parts } => {
+                for part in parts {
+                    if let InterpolatedPart::Expression(expression) = part {
+                        self.expression(expression, environment);
+                    }
+                }
+                "string".to_owned()
             }
         }
     }

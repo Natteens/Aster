@@ -84,6 +84,8 @@ The remaining valid programs explore narrower behavior used during compiler deve
 - `void_main` shows a `public static void Main()` entry point that produces no value, plus an
   instance created explicitly with `new` whose methods use fields and sibling methods without
   qualifying the receiver.
+- `string_interpolation` shows `$"...{expr}..."` building a `string` from an instance method's
+  result.
 - `generic_types`, `enum_payloads`, and the result-propagation variants cover concrete layouts that
   reach the JIT.
 - the `multifile*` directories are integration programs for project linking and dispatch.

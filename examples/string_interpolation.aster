@@ -1,0 +1,29 @@
+// `$"...{expr}..."` builds a `string`: each `{expr}` is evaluated once, left
+// to right, converted to text, and joined with the surrounding literal text.
+
+public class Calculator
+{
+    private int x = 1233;
+    private int y = 1;
+
+    public int Run()
+    {
+        return Sum(x, y);
+    }
+
+    private int Sum(int a, int b)
+    {
+        return a + b;
+    }
+}
+
+public class Program
+{
+    public static void Main()
+    {
+        Calculator calculator = new Calculator();
+        int result = calculator.Run();
+
+        Log($"Sum: {result}");
+    }
+}

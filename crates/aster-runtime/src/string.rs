@@ -130,6 +130,112 @@ pub extern "C" fn aster_rt_string_concat(
     context.allocate_string_parts(&[left, right])
 }
 
+/// Convert a signed integer, already widened to `long`, to a `string` owned
+/// by `context`. Backs string interpolation for `sbyte`/`short`/`int`/`long`.
+pub extern "C" fn aster_rt_string_from_long(
+    context: *mut ExecutionContext,
+    value: i64,
+) -> *const AsterStrHeader {
+    string_from_display(context, value)
+}
+
+/// Convert an unsigned integer, already widened to `ulong` (passed as the
+/// identical `i64` bit pattern), to a `string` owned by `context`. Backs
+/// string interpolation for `byte`/`ushort`/`uint`/`ulong`.
+pub extern "C" fn aster_rt_string_from_ulong(
+    context: *mut ExecutionContext,
+    value: i64,
+) -> *const AsterStrHeader {
+    string_from_display(context, u64::from_ne_bytes(value.to_ne_bytes()))
+}
+
+/// Convert a `float` (already promoted to `double`) or `double` to a
+/// `string` owned by `context`. Uses Rust's locale-independent `Display` for
+/// `f64`, so the decimal separator is always `.` regardless of the host
+/// system's regional settings.
+pub extern "C" fn aster_rt_string_from_double(
+    context: *mut ExecutionContext,
+    value: f64,
+) -> *const AsterStrHeader {
+    string_from_display(context, value)
+}
+
+/// Convert a `bool` (`0`/`1`) to `"false"`/`"true"`, owned by `context`.
+pub extern "C" fn aster_rt_string_from_bool(
+    context: *mut ExecutionContext,
+    value: i8,
+) -> *const AsterStrHeader {
+    string_from_display(context, value != 0)
+}
+
+/// Convert one Unicode scalar value to its one-character `string`, owned by
+/// `context`. An invalid scalar value produces a controlled runtime error.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_from_char(
+    context: *mut ExecutionContext,
+    value: u32,
+) -> *const AsterStrHeader {
+    if context.is_null() {
+        return ptr::null();
+    }
+    // SAFETY: generated code passes its live hidden ExecutionContext.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let Some(character) = char::from_u32(value) else {
+        context.fail("string interpolation received an invalid `char` value");
+        return ptr::null();
+    };
+    context.allocate_string_parts(&[character.encode_utf8(&mut [0; 4])])
+}
+
+fn string_from_display(
+    context: *mut ExecutionContext,
+    value: impl std::fmt::Display,
+) -> *const AsterStrHeader {
+    if context.is_null() {
+        return ptr::null();
+    }
+    // SAFETY: generated code passes its live hidden ExecutionContext.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    context.allocate_string_parts(&[&value.to_string()])
+}
+
+/// Join every part, each already a valid ABI string, into one new `string`
+/// owned by `context`. Computes the combined length and copies every part's
+/// bytes exactly once, so this is a single allocation regardless of how many
+/// parts are joined. Backs string interpolation's final concatenation.
+///
+/// # Safety
+///
+/// `parts` must point to `count` readable, correctly-aligned
+/// `*const AsterStrHeader` pointers, each valid per [`view`]'s contract.
+#[allow(unsafe_code, clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_join(
+    context: *mut ExecutionContext,
+    parts: *const *const AsterStrHeader,
+    count: i32,
+) -> *const AsterStrHeader {
+    if context.is_null() || parts.is_null() || count < 0 {
+        return ptr::null();
+    }
+    let context = unsafe { &mut *context };
+    let count = usize::try_from(count).unwrap_or(0);
+    // SAFETY: caller (generated code) provides `count` live pointers, as
+    // documented above.
+    let headers = unsafe { std::slice::from_raw_parts(parts, count) };
+    let mut views = Vec::with_capacity(count);
+    for &header in headers {
+        // SAFETY: each pointer is owned by the live context or JIT module.
+        let Some(text) = (unsafe { view(header) }) else {
+            context.fail("string interpolation received an invalid UTF-8 string reference");
+            return ptr::null();
+        };
+        views.push(text);
+    }
+    context.allocate_string_parts(&views)
+}
+
 /// Return the number of Unicode scalar values in one immutable string.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn aster_rt_string_length(

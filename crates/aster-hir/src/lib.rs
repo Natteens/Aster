@@ -286,6 +286,17 @@ pub enum ExpressionKind {
         operator: AssignmentOperator,
         value: Box<Expression>,
     },
+    /// `$"text {expr} text"`, already validated: every embedded expression
+    /// has a type with a defined textual conversion. Always typed `string`.
+    InterpolatedString {
+        parts: Vec<InterpolatedPart>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum InterpolatedPart {
+    Text(String),
+    Expression(Box<Expression>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
