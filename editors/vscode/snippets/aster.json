@@ -1,0 +1,93 @@
+{
+    "Function": {
+        "prefix": "func",
+        "body": [
+            "public ${1:void} ${2:Name}(${3})",
+            "{",
+            "    $0",
+            "}"
+        ],
+        "description": "Namespace-level function"
+    },
+    "Class": {
+        "prefix": "class",
+        "body": [
+            "public class ${1:Name}",
+            "{",
+            "    $0",
+            "}"
+        ],
+        "description": "Class declaration"
+    },
+    "Struct": {
+        "prefix": "struct",
+        "body": [
+            "public struct ${1:Name}",
+            "{",
+            "    $0",
+            "}"
+        ],
+        "description": "Struct declaration"
+    },
+    "Interface": {
+        "prefix": "interface",
+        "body": [
+            "public interface ${1:IName}",
+            "{",
+            "    $0",
+            "}"
+        ],
+        "description": "Interface declaration"
+    },
+    "If": {
+        "prefix": "if",
+        "body": [
+            "if (${1:condition})",
+            "{",
+            "    $0",
+            "}"
+        ],
+        "description": "If statement"
+    },
+    "For": {
+        "prefix": "for",
+        "body": [
+            "for (int ${1:index} = 0; ${1:index} < ${2:count}; ${1:index}++)",
+            "{",
+            "    $0",
+            "}"
+        ],
+        "description": "C-style for loop"
+    },
+    "While": {
+        "prefix": "while",
+        "body": [
+            "while (${1:condition})",
+            "{",
+            "    $0",
+            "}"
+        ],
+        "description": "While loop"
+    },
+    "Log": {
+        "prefix": "log",
+        "body": [
+            "Log(\"${1:message}\");"
+        ],
+        "description": "Standard log message"
+    },
+    "Log warning": {
+        "prefix": "logw",
+        "body": [
+            "Log.Warning(\"${1:message}\");"
+        ],
+        "description": "Warning log message"
+    },
+    "Log error": {
+        "prefix": "loge",
+        "body": [
+            "Log.Error(\"${1:message}\");"
+        ],
+        "description": "Error log message"
+    }
+}

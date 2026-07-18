@@ -1,0 +1,9 @@
+public interface IValue<T>
+{
+    T Get();
+}
+
+public T Identity<T>(T value)
+{
+    return value;
+}

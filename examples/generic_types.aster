@@ -1,0 +1,42 @@
+public T Identity<T>(T value)
+{
+    return value;
+}
+
+public class Box<T>
+{
+    private T value;
+
+    public Box(T initialValue)
+    {
+        value = initialValue;
+    }
+
+    public T Get()
+    {
+        return Identity<T>(value);
+    }
+
+    public void Set(T nextValue)
+    {
+        value = nextValue;
+    }
+}
+
+public struct Pair<T, U>
+{
+    public T First;
+    public U Second;
+}
+
+public class Program
+{
+    public static int Main()
+    {
+        Box<int> score = new Box<int>(40);
+        Box<string> name = new Box<string>("Aster");
+        Pair<int, string> pair = Pair<int, string> { First: 2, Second: name.Get() };
+        score.Set(score.Get() + pair.First);
+        return score.Get();
+    }
+}

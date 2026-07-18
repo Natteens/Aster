@@ -1,0 +1,113 @@
+// Syntax highlighting sample. Not part of the compiler test suite.
+
+namespace samples;
+
+using aster.core;
+using aster.math;
+
+const int MaxScore = 100;
+const string Title = "Aster" + " sample";
+
+public interface IDamageable
+{
+    void Damage(int amount);
+}
+
+public class Calculator
+{
+    private int total;
+
+    public int Add(int left, int right)
+    {
+        return left + right;
+    }
+}
+
+public struct Position
+{
+    public float x;
+    public float y;
+}
+
+public int Choose(bool enabled)
+{
+    return enabled ? MaxScore : (int)9.7d;
+}
+
+public void Run()
+{
+    string name = "Natte";
+    char separator = ',';
+    long wide = 4000000000L;
+    double ratio = 2.5d;
+    float speed = 1.5f;
+
+    Log("Aster iniciou");
+    Log(name);
+    Log.Warning("Aviso de teste");
+    Log.Error("Erro de teste");
+
+    for (int index = 0; index < 4; index++)
+    {
+        if (index % 2 == 0 && speed > 0f)
+        {
+            continue;
+        }
+    }
+}
+
+public enum Shape
+{
+    Circle(float radius),
+    Square(float side),
+}
+
+public float Area(Shape shape)
+{
+    switch (shape)
+    {
+        case Circle(radius):
+            return radius * radius;
+        case Square(side):
+            return side * side;
+    }
+}
+
+public class Box<T>
+{
+    private T stored;
+
+    public T Value
+    {
+        get { return stored; }
+        set { stored = value; }
+    }
+}
+
+public Result<int, string> Parse(string text)
+{
+    if (text == "42")
+    {
+        return Result<int, string>.Ok(42);
+    }
+
+    return Result<int, string>.Error("invalid");
+}
+
+public Result<int, string> Doubled(string text)
+{
+    int value = Parse(text)?;
+    return Result<int, string>.Ok(value * 2);
+}
+
+public int Sum(int[] values)
+{
+    int total = 0;
+
+    for (int index = 0; index < values.Length; index++)
+    {
+        total += values[index];
+    }
+
+    return total;
+}

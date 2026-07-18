@@ -1,0 +1,23 @@
+namespace app;
+
+using aster.core;
+
+public Result<int, string> Validate(int value)
+{
+    if (value == 42)
+    {
+        return Result<int, string>.Ok(value);
+    }
+
+    return Result<int, string>.Error("fora do intervalo");
+}
+
+public Result<int, string> Confirm(int value)
+{
+    if (value == 42)
+    {
+        return Result<int, string>.Ok(value);
+    }
+
+    return Result<int, string>.Error("nao confirmado");
+}

@@ -1,0 +1,30 @@
+internal int Add(int a, int b)
+{
+    return a + b;
+}
+
+public int Calculate()
+{
+    int total = 0;
+
+    for (int index = 0; index < 5; index += 1)
+    {
+        total += Add(index, 2);
+    }
+
+    if (total > 10)
+    {
+        total += 100;
+    }
+
+    return total;
+}
+
+public bool TestBoolean()
+{
+    return Calculate() == 120;
+}
+
+public void DoNothing()
+{
+}

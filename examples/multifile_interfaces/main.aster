@@ -1,0 +1,13 @@
+using contracts;
+using model;
+
+internal int Read(IScore score)
+{
+    return score.Value();
+}
+
+public int Run()
+{
+    Counter counter = new Counter(42);
+    return Read(counter);
+}

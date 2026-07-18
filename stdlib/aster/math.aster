@@ -1,0 +1,202 @@
+namespace aster.math;
+
+internal void __AbsIntOverflow()
+{
+}
+
+internal void __AbsLongOverflow()
+{
+}
+
+internal void __ClampInvalidRange()
+{
+}
+
+public static class Math
+{
+    public static int Abs(int value)
+    {
+        if (value == -2147483647 - 1)
+        {
+            __AbsIntOverflow();
+            return 0;
+        }
+
+        if (value < 0)
+        {
+            return -value;
+        }
+
+        return value;
+    }
+
+    public static long Abs(long value)
+    {
+        if (value == -9223372036854775807L - 1L)
+        {
+            __AbsLongOverflow();
+            return 0L;
+        }
+
+        if (value < 0L)
+        {
+            return -value;
+        }
+
+        return value;
+    }
+
+    public static int Min(int left, int right)
+    {
+        return left < right ? left : right;
+    }
+
+    public static long Min(long left, long right)
+    {
+        return left < right ? left : right;
+    }
+
+    public static float Min(float left, float right)
+    {
+        if (left != left)
+        {
+            return left;
+        }
+
+        if (right != right)
+        {
+            return right;
+        }
+
+        return left < right ? left : right;
+    }
+
+    public static double Min(double left, double right)
+    {
+        if (left != left)
+        {
+            return left;
+        }
+
+        if (right != right)
+        {
+            return right;
+        }
+
+        return left < right ? left : right;
+    }
+
+    public static int Max(int left, int right)
+    {
+        return left > right ? left : right;
+    }
+
+    public static long Max(long left, long right)
+    {
+        return left > right ? left : right;
+    }
+
+    public static float Max(float left, float right)
+    {
+        if (left != left)
+        {
+            return left;
+        }
+
+        if (right != right)
+        {
+            return right;
+        }
+
+        return left > right ? left : right;
+    }
+
+    public static double Max(double left, double right)
+    {
+        if (left != left)
+        {
+            return left;
+        }
+
+        if (right != right)
+        {
+            return right;
+        }
+
+        return left > right ? left : right;
+    }
+
+    public static int Clamp(int value, int min, int max)
+    {
+        if (min > max)
+        {
+            __ClampInvalidRange();
+            return value;
+        }
+
+        return Max(min, Min(value, max));
+    }
+
+    public static long Clamp(long value, long min, long max)
+    {
+        if (min > max)
+        {
+            __ClampInvalidRange();
+            return value;
+        }
+
+        return Max(min, Min(value, max));
+    }
+
+    public static float Clamp(float value, float min, float max)
+    {
+        if (value != value)
+        {
+            return value;
+        }
+
+        if (min != min)
+        {
+            return min;
+        }
+
+        if (max != max)
+        {
+            return max;
+        }
+
+        if (min > max)
+        {
+            __ClampInvalidRange();
+            return value;
+        }
+
+        return Max(min, Min(value, max));
+    }
+
+    public static double Clamp(double value, double min, double max)
+    {
+        if (value != value)
+        {
+            return value;
+        }
+
+        if (min != min)
+        {
+            return min;
+        }
+
+        if (max != max)
+        {
+            return max;
+        }
+
+        if (min > max)
+        {
+            __ClampInvalidRange();
+            return value;
+        }
+
+        return Max(min, Min(value, max));
+    }
+}

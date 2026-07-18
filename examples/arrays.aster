@@ -1,0 +1,14 @@
+internal void IncreaseFirst(int[] values)
+{
+    values[0] += 5;
+}
+
+public int Run()
+{
+    int[] values = [10, 20, 30];
+    int[] sameValues = values;
+
+    IncreaseFirst(sameValues);
+
+    return values[0] + values[1] + values[2] + values.Length;
+}

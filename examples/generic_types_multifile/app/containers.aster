@@ -1,0 +1,29 @@
+public class Box<T>
+{
+    private T value;
+
+    public Box(T initialValue)
+    {
+        value = initialValue;
+    }
+
+    public T Get()
+    {
+        return Identity<T>(value);
+    }
+}
+
+public class Score : IValue<int>
+{
+    private int value;
+
+    public Score(int initialValue)
+    {
+        value = initialValue;
+    }
+
+    public int Get()
+    {
+        return value;
+    }
+}

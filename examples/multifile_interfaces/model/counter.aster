@@ -1,0 +1,18 @@
+namespace model;
+
+using contracts;
+
+public class Counter : IScore
+{
+    private int score;
+
+    public Counter(int initialScore)
+    {
+        score = initialScore;
+    }
+
+    public int Value()
+    {
+        return score;
+    }
+}

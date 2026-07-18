@@ -1,0 +1,10 @@
+using aster.math;
+
+public class Program
+{
+    public static int Main()
+    {
+        int health = Math.Clamp(150, 0, 100);
+        return Math.Max(health, Math.Abs(-42));
+    }
+}

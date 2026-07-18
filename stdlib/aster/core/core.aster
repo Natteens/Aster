@@ -1,0 +1,13 @@
+namespace aster.core;
+
+public enum Option<T>
+{
+    None,
+    Some(T value),
+}
+
+public enum Result<T, E>
+{
+    Ok(T value),
+    Error(E error),
+}

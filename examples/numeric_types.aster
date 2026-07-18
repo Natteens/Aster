@@ -1,0 +1,21 @@
+// int, long, float, double, char, literal suffixes, and explicit casts.
+
+const int Threshold = 40 + 2;
+
+public int Run()
+{
+    long wide = 4000000000L;
+    float speed = 1.5f;
+    double ratio = speed * 2;
+    char separator = ',';
+
+    int truncated = (int)ratio;
+    long scaled = wide / 1000000000;
+
+    bool checks = separator == ','
+        && ratio == 3.0d
+        && scaled == 4
+        && Threshold > truncated;
+
+    return checks ? Threshold : 0;
+}

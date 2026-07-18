@@ -1,0 +1,20 @@
+public struct Position
+{
+    public int x;
+    public int y;
+}
+
+internal Position Move(Position position, int amount)
+{
+    position.x += amount;
+    return position;
+}
+
+public int Run()
+{
+    Position original = Position { x: 10, y: 20 };
+    Position moved = Move(original, 5);
+    moved.y += 2;
+
+    return original.x + moved.x + moved.y;
+}

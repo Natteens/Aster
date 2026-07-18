@@ -1,0 +1,12 @@
+using aster.math;
+
+public class Program
+{
+    public static int Main()
+    {
+        Box<int> box = new Box<int>(40);
+        Box<int> same = Identity<Box<int>>(box);
+        IValue<int> score = new Score(2);
+        return Math.Max(same.Get() + score.Get(), 0);
+    }
+}

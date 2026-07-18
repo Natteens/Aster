@@ -1,0 +1,64 @@
+{
+    "name": "aster-language",
+    "displayName": "Aster Language",
+    "description": "Syntax highlighting, snippets, and editing support for the Aster programming language.",
+    "version": "0.0.0",
+    "publisher": "aster-lang",
+    "license": "MIT OR Apache-2.0",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/Natteens/Aster"
+    },
+    "engines": {
+        "vscode": "^1.75.0"
+    },
+    "categories": [
+        "Programming Languages",
+        "Snippets",
+        "Themes"
+    ],
+    "contributes": {
+        "languages": [
+            {
+                "id": "aster",
+                "aliases": [
+                    "Aster",
+                    "aster"
+                ],
+                "extensions": [
+                    ".aster"
+                ],
+                "configuration": "./language-configuration.json"
+            }
+        ],
+        "grammars": [
+            {
+                "language": "aster",
+                "scopeName": "source.aster",
+                "path": "./syntaxes/aster.tmLanguage.json"
+            }
+        ],
+        "snippets": [
+            {
+                "language": "aster",
+                "path": "./snippets/aster.json"
+            }
+        ],
+        "themes": [
+            {
+                "label": "Aster Night",
+                "uiTheme": "vs-dark",
+                "path": "./themes/aster-night-color-theme.json"
+            }
+        ]
+    },
+    "scripts": {
+        "validate": "vsce ls",
+        "package": "vsce package --skip-license",
+        "version:check": "node ./scripts/sync-version.mjs --check",
+        "version:sync": "node ./scripts/sync-version.mjs --write"
+    },
+    "devDependencies": {
+        "@vscode/vsce": "^3.3.2"
+    }
+}

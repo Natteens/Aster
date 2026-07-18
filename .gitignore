@@ -1,0 +1,13 @@
+/target/
+**/*.rs.bk
+.claude/
+.idea/
+.vscode/
+*.aster.tmp
+*.tmp
+*.log
+.env
+.env.*
+!.env.example
+node_modules/
+editors/vscode/*.vsix

@@ -1,0 +1,16 @@
+namespace app;
+
+public class Player
+{
+    private int score;
+
+    public Player(int initialScore)
+    {
+        score = initialScore;
+    }
+
+    public int Score()
+    {
+        return score;
+    }
+}

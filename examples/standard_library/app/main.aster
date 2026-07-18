@@ -1,0 +1,13 @@
+namespace app;
+
+using aster.math;
+
+public class Program
+{
+    public static int Main()
+    {
+        int lower = Math.Min(10, 20);
+        int upper = Math.Max(90, Math.Abs(-42));
+        return Math.Clamp(lower + upper, 0, MaximumScore());
+    }
+}

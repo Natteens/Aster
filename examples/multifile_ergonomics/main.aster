@@ -1,0 +1,8 @@
+using app;
+
+public int Run()
+{
+    Score score = new Score(40);
+    score.Add(2);
+    return Score.Clamp(score.Value, 0, 100);
+}

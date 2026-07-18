@@ -1,0 +1,32 @@
+// The full set of integer widths, signed and unsigned.
+
+public int Run()
+{
+    sbyte tiny = -100;
+    byte level = 255;
+    short offset = -30000;
+    ushort port = 65535;
+    uint crowd = 4000000000u;
+    ulong distance = 18446744073709551615ul;
+
+    // Small integer arithmetic promotes to int. Narrowing is explicit.
+    level = (byte)(level + 1);
+
+    // Unsigned comparison and division use unsigned semantics.
+    bool far = distance / 2ul > 9000000000000000000ul;
+
+    // Mixing uint with int promotes both to long.
+    long mixed = crowd + offset;
+
+    // Crossing sign or shrinking needs an explicit cast.
+    byte truncated = (byte)crowd;
+
+    bool checks = level == 0
+        && far
+        && tiny < 0
+        && port > 0
+        && mixed == 3999970000L
+        && truncated == 0;
+
+    return checks ? (int)port : 0;
+}

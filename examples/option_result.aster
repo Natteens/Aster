@@ -1,0 +1,34 @@
+using aster.core;
+
+public int ValueOr(Option<int> option, int fallback)
+{
+    switch (option)
+    {
+        case Some(value):
+            return value;
+        case None:
+            return fallback;
+    }
+}
+
+public int Read(Result<int, string> result)
+{
+    switch (result)
+    {
+        case Ok(value):
+            return value;
+        case Error(message):
+            Log.Error(message);
+            return 0;
+    }
+}
+
+public class Program
+{
+    public static int Main()
+    {
+        Option<int> value = Option<int>.Some(40);
+        Result<int, string> result = Result<int, string>.Ok(ValueOr(value, 0) + 2);
+        return Read(result);
+    }
+}

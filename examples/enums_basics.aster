@@ -1,0 +1,34 @@
+public enum GameState
+{
+    Menu,
+    Playing,
+    Paused,
+}
+
+public int Read(GameState state)
+{
+    switch (state)
+    {
+        case Menu:
+            return 42;
+        case Playing:
+            return 1;
+        case Paused:
+            return 2;
+    }
+}
+
+public class Program
+{
+    public static int Main()
+    {
+        GameState first = GameState.Menu;
+        GameState second = GameState.Menu;
+        if (first == second)
+        {
+            return Read(first);
+        }
+
+        return 0;
+    }
+}

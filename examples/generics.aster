@@ -1,0 +1,15 @@
+public T Choose<T>(bool condition, T first, T second)
+{
+    return condition ? first : second;
+}
+
+public T First<T>(T[] values)
+{
+    return values[0];
+}
+
+public int Run()
+{
+    int[] values = [10, 20, 42];
+    return Choose<int>(false, First(values), 42);
+}

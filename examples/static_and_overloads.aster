@@ -1,0 +1,17 @@
+public class MathTools
+{
+    public static int Clamp(int value, int minimum, int maximum)
+    {
+        if (value < minimum) { return minimum; }
+        if (value > maximum) { return maximum; }
+        return value;
+    }
+
+    public static int Add(int left, int right) { return left + right; }
+    public static long Add(long left, long right) { return left + right; }
+}
+
+public int Run()
+{
+    return MathTools.Clamp(MathTools.Add(75, 75), 0, 100);
+}

@@ -1,0 +1,9 @@
+// Decimal values are checked and preserved exactly by the frontend.
+// `aster check` accepts this file; `aster run` rejects it until the dedicated
+// decimal runtime representation and ABI are implemented.
+
+public decimal Price()
+{
+    decimal value = 19.95m;
+    return value;
+}

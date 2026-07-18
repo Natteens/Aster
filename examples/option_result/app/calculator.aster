@@ -1,0 +1,25 @@
+namespace app;
+
+using aster.core;
+
+public Result<int, string> Divide(int left, int right)
+{
+    if (right == 0)
+    {
+        return Result<int, string>.Error("Divisao por zero");
+    }
+
+    return Result<int, string>.Ok(left / right);
+}
+
+public int Read(Result<int, string> result)
+{
+    switch (result)
+    {
+        case Ok(value):
+            return value;
+        case Error(message):
+            Log.Error(message);
+            return 0;
+    }
+}

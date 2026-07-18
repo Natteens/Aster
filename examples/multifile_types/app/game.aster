@@ -1,0 +1,16 @@
+namespace app;
+
+public class Player
+{
+    private Position position;
+
+    public Player(Position initialPosition)
+    {
+        position = initialPosition;
+    }
+
+    public int X()
+    {
+        return position.x;
+    }
+}

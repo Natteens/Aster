@@ -1,0 +1,6 @@
+namespace app;
+
+public int MaximumScore()
+{
+    return 100;
+}

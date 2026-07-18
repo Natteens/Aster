@@ -1,0 +1,8 @@
+using app;
+
+public int Run()
+{
+    Position spawn = Position { x: 9, y: 4 };
+    Player player = new Player(spawn);
+    return player.X();
+}

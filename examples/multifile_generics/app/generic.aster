@@ -1,0 +1,6 @@
+namespace app;
+
+public T Choose<T>(bool condition, T first, T second)
+{
+    return condition ? first : second;
+}

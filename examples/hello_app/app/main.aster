@@ -1,0 +1,10 @@
+namespace app;
+
+public class Program
+{
+    public static int Main()
+    {
+        Log("Ola, Aster!");
+        return Math.Add(20, 22);
+    }
+}

@@ -1,0 +1,11 @@
+[package]
+name = "aster-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Primitive type model and numeric conversion rules for Aster"
+
+[lints]
+workspace = true

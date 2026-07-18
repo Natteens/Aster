@@ -1,0 +1,23 @@
+namespace app;
+
+public class Score
+{
+    private int value = 0;
+
+    public Score(int initial) { Value = initial; }
+
+    public int Value
+    {
+        get { return value; }
+        private set { this.value = value; }
+    }
+
+    public void Add(int amount) { Value += amount; }
+
+    public static int Clamp(int value, int minimum, int maximum)
+    {
+        if (value < minimum) { return minimum; }
+        if (value > maximum) { return maximum; }
+        return value;
+    }
+}

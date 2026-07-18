@@ -1,0 +1,22 @@
+using aster.core;
+
+public Result<T, E> Forward<T, E>(Result<T, E> input)
+{
+    T value = input?;
+    return Result<T, E>.Ok(value);
+}
+
+public class Program
+{
+    public static int Main()
+    {
+        switch (Forward<int, string>(Result<int, string>.Ok(42)))
+        {
+            case Ok(value):
+                return value;
+            case Error(message):
+                Log.Error(message);
+                return 1;
+        }
+    }
+}

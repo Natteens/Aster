@@ -1,0 +1,30 @@
+public interface IScore
+{
+    int Value();
+}
+
+public class Counter : IScore
+{
+    private int score;
+
+    public Counter(int initialScore)
+    {
+        score = initialScore;
+    }
+
+    public int Value()
+    {
+        return score;
+    }
+}
+
+internal int Read(IScore item)
+{
+    return item.Value();
+}
+
+public int Run()
+{
+    Counter counter = new Counter(42);
+    return Read(counter);
+}

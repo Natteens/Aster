@@ -1,0 +1,11 @@
+using aster.math;
+using app;
+using ui;
+
+public class Program
+{
+    public static int Main()
+    {
+        return Math.Clamp(MenuScore(), 0, 100);
+    }
+}

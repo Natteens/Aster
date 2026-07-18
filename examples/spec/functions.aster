@@ -1,0 +1,21 @@
+// DESIGN EXAMPLE ONLY.
+// This file demonstrates proposed syntax and may not compile with the current compiler.
+
+int add(int left, int right)
+{
+    return left + right;
+}
+
+float average(float left, float right)
+{
+    return (left + right) / 2.0;
+}
+
+void main()
+{
+    int answer = add(20, 22);
+    float midpoint = average(10.0, 20.0);
+
+    print(answer);
+    print(midpoint);
+}

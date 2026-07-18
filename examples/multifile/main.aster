@@ -1,0 +1,8 @@
+using app;
+
+public int Run()
+{
+    int[] values = [Double(20), 2];
+    Player player = new Player(SumPair(values));
+    return player.Score();
+}

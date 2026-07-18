@@ -1,0 +1,35 @@
+public struct Position
+{
+    public int x;
+    public int y;
+}
+
+public class Player
+{
+    private int health = 100;
+    private Position position = Position { x: 1, y: 2 };
+
+    public Player(int damage)
+    {
+        Health -= damage;
+    }
+
+    public int Health
+    {
+        get { return health; }
+        private set { health = value; }
+    }
+
+    public bool IsAt(Position expected)
+    {
+        return position == expected;
+    }
+}
+
+public int Run()
+{
+    Player player = new Player(58);
+    Position expected = Position { x: 1, y: 2 };
+    if (player.IsAt(expected)) { return player.Health; }
+    return 0;
+}

@@ -1,0 +1,36 @@
+public struct Position
+{
+    public int x;
+    public int y;
+}
+
+public class Player
+{
+    public Position position;
+    private int[] scores;
+
+    public Player(Position spawn, int[] initialScores)
+    {
+        this.position = spawn;
+        scores = initialScores;
+    }
+
+    public void MoveX(int amount)
+    {
+        position.x += amount;
+    }
+
+    public int Total()
+    {
+        return scores[0] + scores[1] + position.x;
+    }
+}
+
+public int Run()
+{
+    Position spawn = Position { x: 10, y: 20 };
+    int[] scores = [5, 7];
+    Player player = new Player(spawn, scores);
+    player.MoveX(3);
+    return player.Total();
+}

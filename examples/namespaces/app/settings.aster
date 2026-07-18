@@ -1,0 +1,9 @@
+public class PlayerSettings
+{
+    public int Volume;
+
+    public PlayerSettings(int volume)
+    {
+        Volume = volume;
+    }
+}

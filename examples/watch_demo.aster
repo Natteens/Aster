@@ -1,0 +1,8 @@
+// Try: aster watch examples/watch_demo.aster --function Run
+// Edit the returned value and save; the watcher recompiles and reruns.
+
+public int Run()
+{
+    Log("watch demo executou");
+    return 3;
+}

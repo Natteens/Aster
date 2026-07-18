@@ -1,0 +1,21 @@
+namespace app;
+
+using aster.text;
+
+public class Program
+{
+    public static int Main()
+    {
+        string name = "Natte";
+        string message = "Olá, " + name + "!";
+
+        Log(message);
+
+        if (String.IsEmpty(message))
+        {
+            return 0;
+        }
+
+        return message.Length;
+    }
+}

@@ -1,0 +1,29 @@
+public enum Direction
+{
+    North,
+    South,
+    East,
+    West,
+}
+
+public int Score(Direction direction)
+{
+    switch (direction)
+    {
+        case North:
+            return 40;
+        case South:
+            return 1;
+        case East:
+            return 2;
+        case West:
+            return 3;
+    }
+}
+public class Program
+{
+    public static int Main()
+    {
+        return Score(Direction.North) + 2;
+    }
+}

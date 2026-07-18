@@ -1,0 +1,27 @@
+namespace app;
+
+using aster.core;
+
+public Result<int, string> Compute(string text)
+{
+    int parsed = Parse(text)?;
+    int validated = Validate(parsed)?;
+    int confirmed = Confirm(validated)?;
+    return Result<int, string>.Ok(confirmed);
+}
+
+public class Program
+{
+    public static int Main()
+    {
+        switch (Compute("42"))
+        {
+            case Ok(value):
+                Log("resultado propagado");
+                return value;
+            case Error(message):
+                Log.Error(message);
+                return 1;
+        }
+    }
+}

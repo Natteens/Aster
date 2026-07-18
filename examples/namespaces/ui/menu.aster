@@ -1,0 +1,7 @@
+using app;
+
+internal int MenuScore()
+{
+    PlayerSettings settings = new PlayerSettings(150);
+    return settings.Volume;
+}

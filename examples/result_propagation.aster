@@ -1,0 +1,43 @@
+using aster.core;
+
+public Result<int, string> Parse(string text)
+{
+    if (text == "42")
+    {
+        return Result<int, string>.Ok(42);
+    }
+
+    return Result<int, string>.Error("invalid value");
+}
+
+public Result<int, string> Ensure(int value)
+{
+    if (value == 42)
+    {
+        return Result<int, string>.Ok(value);
+    }
+
+    return Result<int, string>.Error("unexpected value");
+}
+
+public Result<int, string> Calculate(string text)
+{
+    int parsed = Parse(text)?;
+    int value = Ensure(parsed)?;
+    return Result<int, string>.Ok(value);
+}
+
+public class Program
+{
+    public static int Main()
+    {
+        switch (Calculate("42"))
+        {
+            case Ok(value):
+                return value;
+            case Error(message):
+                Log.Error(message);
+                return 1;
+        }
+    }
+}

@@ -1,0 +1,11 @@
+namespace app;
+
+public int Double(int value)
+{
+    return value * 2;
+}
+
+public int SumPair(int[] values)
+{
+    return values[0] + values[1];
+}

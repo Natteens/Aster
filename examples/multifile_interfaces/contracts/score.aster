@@ -1,0 +1,6 @@
+namespace contracts;
+
+public interface IScore
+{
+    int Value();
+}

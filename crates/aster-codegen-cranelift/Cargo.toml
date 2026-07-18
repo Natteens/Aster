@@ -1,0 +1,27 @@
+[package]
+name = "aster-codegen-cranelift"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cranelift JIT backend for Aster MIR"
+
+[dependencies]
+aster-mir = { path = "../aster-mir", version = "0.0.0" }
+aster-runtime = { path = "../aster-runtime", version = "0.0.0" }
+aster-types = { path = "../aster-types", version = "0.0.0" }
+cranelift-codegen = "=0.121.2"
+cranelift-frontend = "=0.121.2"
+cranelift-jit = "=0.121.2"
+cranelift-module = "=0.121.2"
+
+[dev-dependencies]
+aster-compiler = { path = "../aster-compiler", version = "0.0.0" }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

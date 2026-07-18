@@ -1,0 +1,21 @@
+// Increment/decrement, the conditional expression, and short-circuit logic.
+
+public int Run()
+{
+    int counter = 1;
+
+    counter++;
+    ++counter;
+
+    int observed = counter--;
+    int chosen = counter >= 2 ? observed : -observed;
+
+    bool guarded = counter != 0 && 10 / counter > 1;
+
+    for (int index = 0; index < 3; index++)
+    {
+        chosen += index;
+    }
+
+    return guarded ? chosen : 0;
+}

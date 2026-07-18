@@ -1,0 +1,9 @@
+namespace aster.text;
+
+public static class String
+{
+    public static bool IsEmpty(string value)
+    {
+        return value.Length == 0;
+    }
+}

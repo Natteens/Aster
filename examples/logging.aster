@@ -1,0 +1,14 @@
+// The standard logging surface: Log, Log.Warning, and Log.Error.
+
+public void Run()
+{
+    string name = "Natte";
+
+    Log("Aster iniciou");
+    Log(name);
+    Log.Warning("Aviso de teste");
+    Log.Error("Erro de teste");
+
+    string status = name == "Natte" ? "conhecido" : "desconhecido";
+    Log(status);
+}

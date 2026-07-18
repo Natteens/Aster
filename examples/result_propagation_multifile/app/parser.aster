@@ -1,0 +1,13 @@
+namespace app;
+
+using aster.core;
+
+public Result<int, string> Parse(string text)
+{
+    if (text == "42")
+    {
+        return Result<int, string>.Ok(42);
+    }
+
+    return Result<int, string>.Error("valor invalido");
+}

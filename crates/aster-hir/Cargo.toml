@@ -1,0 +1,11 @@
+[package]
+name = "aster-hir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Typed high-level intermediate representation for Aster"
+
+[lints]
+workspace = true

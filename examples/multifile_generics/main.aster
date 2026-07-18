@@ -1,0 +1,6 @@
+using app;
+
+public int Run()
+{
+    return Choose(false, 10, 42);
+}

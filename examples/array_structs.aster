@@ -1,0 +1,12 @@
+public struct Point
+{
+    public int x;
+    public int y;
+}
+
+public int Run()
+{
+    Point[] points = [Point { x: 2, y: 3 }, Point { x: 5, y: 7 }];
+    points[0].x += 10;
+    return points[0].x + points[1].y;
+}

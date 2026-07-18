@@ -1,0 +1,20 @@
+namespace app;
+
+using aster.core;
+
+public class Program
+{
+    public static int Main()
+    {
+        Option<int> answer = Option<int>.Some(Read(Divide(84, 2)));
+
+        switch (answer)
+        {
+            case Some(value):
+                Log("Resultado calculado");
+                return value;
+            case None:
+                return 0;
+        }
+    }
+}

@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aster-cli",
+    "crates/aster-codegen-cranelift",
+    "crates/aster-compiler",
+    "crates/aster-diagnostics",
+    "crates/aster-hir",
+    "crates/aster-mir",
+    "crates/aster-runtime",
+    "crates/aster-syntax",
+    "crates/aster-types",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Natteens/Aster"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

@@ -1,0 +1,9 @@
+namespace app;
+
+public class Math
+{
+    public static int Add(int left, int right)
+    {
+        return left + right;
+    }
+}

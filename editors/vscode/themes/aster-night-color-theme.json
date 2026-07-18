@@ -1,0 +1,157 @@
+{
+    "$schema": "vscode://schemas/color-theme",
+    "name": "Aster Night",
+    "type": "dark",
+    "colors": {
+        "editor.background": "#1e2024",
+        "editor.foreground": "#d4d4d4",
+        "editorLineNumber.foreground": "#5a5f6a",
+        "editorLineNumber.activeForeground": "#9aa0ab",
+        "editorCursor.foreground": "#d4d4d4",
+        "editor.selectionBackground": "#2d4f67",
+        "editor.lineHighlightBackground": "#24262b"
+    },
+    "tokenColors": [
+        {
+            "name": "Comments",
+            "scope": [
+                "comment",
+                "comment.line.double-slash.aster"
+            ],
+            "settings": {
+                "foreground": "#6b8f71",
+                "fontStyle": "italic"
+            }
+        },
+        {
+            "name": "Control keywords",
+            "scope": [
+                "keyword.control.aster"
+            ],
+            "settings": {
+                "foreground": "#c586c0"
+            }
+        },
+        {
+            "name": "Modifiers and declaration keywords",
+            "scope": [
+                "storage.modifier.aster",
+                "keyword.declaration.aster",
+                "storage.type.aster",
+                "keyword.declaration.class.aster",
+                "keyword.declaration.struct.aster",
+                "keyword.declaration.interface.aster"
+            ],
+            "settings": {
+                "foreground": "#569cd6"
+            }
+        },
+        {
+            "name": "Primitive types",
+            "scope": [
+                "storage.type.primitive.aster"
+            ],
+            "settings": {
+                "foreground": "#4fc1ff"
+            }
+        },
+        {
+            "name": "Type names",
+            "scope": [
+                "entity.name.type.class.aster",
+                "entity.name.type.struct.aster",
+                "entity.name.type.interface.aster"
+            ],
+            "settings": {
+                "foreground": "#4ec9b0"
+            }
+        },
+        {
+            "name": "Function and method names",
+            "scope": [
+                "entity.name.function.aster",
+                "entity.name.function.log.aster",
+                "entity.name.function.member.log.warning.aster",
+                "support.class.log.aster",
+                "entity.name.function.member.log.error.aster"
+            ],
+            "settings": {
+                "foreground": "#dcdcaa"
+            }
+        },
+        {
+            "name": "Strings and characters",
+            "scope": [
+                "string.quoted.double.aster",
+                "string.quoted.single.aster"
+            ],
+            "settings": {
+                "foreground": "#ce9178"
+            }
+        },
+        {
+            "name": "String escapes",
+            "scope": [
+                "constant.character.escape.aster"
+            ],
+            "settings": {
+                "foreground": "#d7ba7d"
+            }
+        },
+        {
+            "name": "Invalid escapes",
+            "scope": [
+                "invalid.illegal.escape.aster"
+            ],
+            "settings": {
+                "foreground": "#f44747"
+            }
+        },
+        {
+            "name": "Numbers",
+            "scope": [
+                "constant.numeric.decimal.aster"
+            ],
+            "settings": {
+                "foreground": "#b5cea8"
+            }
+        },
+        {
+            "name": "Language constants",
+            "scope": [
+                "constant.language.boolean.aster"
+            ],
+            "settings": {
+                "foreground": "#569cd6"
+            }
+        },
+        {
+            "name": "Operators — discreet",
+            "scope": [
+                "keyword.operator.increment-decrement.aster",
+                "keyword.operator.assignment.aster",
+                "keyword.operator.comparison.aster",
+                "keyword.operator.logical.aster",
+                "keyword.operator.arithmetic.aster",
+                "keyword.operator.conditional.aster"
+            ],
+            "settings": {
+                "foreground": "#c8ccd4"
+            }
+        },
+        {
+            "name": "Punctuation — discreet",
+            "scope": [
+                "punctuation.terminator.statement.aster",
+                "punctuation.separator.comma.aster",
+                "punctuation.accessor.dot.aster",
+                "punctuation.section.braces.aster",
+                "punctuation.section.parens.aster",
+                "punctuation.section.brackets.aster"
+            ],
+            "settings": {
+                "foreground": "#9aa0ab"
+            }
+        }
+    ]
+}

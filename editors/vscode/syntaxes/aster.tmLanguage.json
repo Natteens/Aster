@@ -1,0 +1,250 @@
+{
+    "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+    "name": "Aster",
+    "scopeName": "source.aster",
+    "patterns": [
+        {
+            "include": "#comments"
+        },
+        {
+            "include": "#strings"
+        },
+        {
+            "include": "#characters"
+        },
+        {
+            "include": "#numbers"
+        },
+        {
+            "include": "#type-declarations"
+        },
+        {
+            "include": "#modifiers"
+        },
+        {
+            "include": "#control-keywords"
+        },
+        {
+            "include": "#declaration-keywords"
+        },
+        {
+            "include": "#primitive-types"
+        },
+        {
+            "include": "#language-constants"
+        },
+        {
+            "include": "#logging"
+        },
+        {
+            "include": "#function-names"
+        },
+        {
+            "include": "#operators"
+        },
+        {
+            "include": "#punctuation"
+        }
+    ],
+    "repository": {
+        "comments": {
+            "patterns": [
+                {
+                    "name": "comment.line.double-slash.aster",
+                    "begin": "//",
+                    "end": "$"
+                }
+            ]
+        },
+        "strings": {
+            "name": "string.quoted.double.aster",
+            "begin": "\"",
+            "end": "\"|$",
+            "patterns": [
+                {
+                    "name": "constant.character.escape.aster",
+                    "match": "\\\\[nrt\\\\\"']"
+                },
+                {
+                    "name": "invalid.illegal.escape.aster",
+                    "match": "\\\\."
+                }
+            ]
+        },
+        "characters": {
+            "patterns": [
+                {
+                    "name": "string.quoted.single.aster",
+                    "match": "'(?:\\\\[nrt\\\\\"']|[^'\\\\\\n])'"
+                }
+            ]
+        },
+        "numbers": {
+            "patterns": [
+                {
+                    "name": "constant.numeric.decimal.aster",
+                    "match": "\\b[0-9]+\\.[0-9]+[fFdD]?\\b"
+                },
+                {
+                    "name": "constant.numeric.decimal.aster",
+                    "match": "\\b[0-9]+[fFdD]\\b"
+                },
+                {
+                    "name": "constant.numeric.decimal.aster",
+                    "match": "\\b[0-9]+[lL]?\\b"
+                }
+            ]
+        },
+        "type-declarations": {
+            "patterns": [
+                {
+                    "match": "\\b(class)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+                    "captures": {
+                        "1": {
+                            "name": "keyword.declaration.class.aster storage.type.class.aster"
+                        },
+                        "2": {
+                            "name": "entity.name.type.class.aster"
+                        }
+                    }
+                },
+                {
+                    "match": "\\b(struct)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+                    "captures": {
+                        "1": {
+                            "name": "keyword.declaration.struct.aster storage.type.struct.aster"
+                        },
+                        "2": {
+                            "name": "entity.name.type.struct.aster"
+                        }
+                    }
+                },
+                {
+                    "match": "\\b(interface)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+                    "captures": {
+                        "1": {
+                            "name": "keyword.declaration.interface.aster storage.type.interface.aster"
+                        },
+                        "2": {
+                            "name": "entity.name.type.interface.aster"
+                        }
+                    }
+                }
+            ]
+        },
+        "modifiers": {
+            "name": "storage.modifier.aster",
+            "match": "\\b(public|internal|protected|private|static|const|var)\\b"
+        },
+        "control-keywords": {
+            "name": "keyword.control.aster",
+            "match": "\\b(if|else|while|for|break|continue|return)\\b"
+        },
+        "declaration-keywords": {
+            "name": "keyword.declaration.aster storage.type.aster",
+            "match": "\\b(namespace|using|class|struct|interface)\\b"
+        },
+        "primitive-types": {
+            "name": "storage.type.primitive.aster",
+            "match": "\\b(void|bool|int|long|float|double|char|string)\\b"
+        },
+        "language-constants": {
+            "name": "constant.language.boolean.aster",
+            "match": "\\b(true|false)\\b"
+        },
+        "logging": {
+            "patterns": [
+                {
+                    "match": "\\b(Log)\\.(Warning)(?=\\s*\\()",
+                    "captures": {
+                        "1": {
+                            "name": "support.class.log.aster"
+                        },
+                        "2": {
+                            "name": "entity.name.function.member.log.warning.aster"
+                        }
+                    }
+                },
+                {
+                    "match": "\\b(Log)\\.(Error)(?=\\s*\\()",
+                    "captures": {
+                        "1": {
+                            "name": "support.class.log.aster"
+                        },
+                        "2": {
+                            "name": "entity.name.function.member.log.error.aster"
+                        }
+                    }
+                },
+                {
+                    "name": "entity.name.function.log.aster",
+                    "match": "\\b(Log)(?=\\s*\\()"
+                }
+            ]
+        },
+        "function-names": {
+            "patterns": [
+                {
+                    "name": "entity.name.function.aster",
+                    "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*\\()"
+                }
+            ]
+        },
+        "operators": {
+            "patterns": [
+                {
+                    "name": "keyword.operator.increment-decrement.aster",
+                    "match": "\\+\\+|--"
+                },
+                {
+                    "name": "keyword.operator.assignment.aster",
+                    "match": "\\+=|-=|\\*=|/=|=(?!=)"
+                },
+                {
+                    "name": "keyword.operator.comparison.aster",
+                    "match": "==|!=|<=|>=|<|>"
+                },
+                {
+                    "name": "keyword.operator.logical.aster",
+                    "match": "&&|\\|\\||!"
+                },
+                {
+                    "name": "keyword.operator.arithmetic.aster",
+                    "match": "[+\\-*/%]"
+                },
+                {
+                    "name": "keyword.operator.conditional.aster",
+                    "match": "\\?|:"
+                }
+            ]
+        },
+        "punctuation": {
+            "patterns": [
+                {
+                    "name": "punctuation.terminator.statement.aster",
+                    "match": ";"
+                },
+                {
+                    "name": "punctuation.separator.comma.aster",
+                    "match": ","
+                },
+                {
+                    "name": "punctuation.accessor.dot.aster",
+                    "match": "\\."
+                },
+                {
+                    "name": "punctuation.section.braces.aster",
+                    "match": "[{}]"
+                },
+                {
+                    "name": "punctuation.section.parens.aster",
+                    "match": "[()]"
+                },
+                {
+                    "name": "punctuation.section.brackets.aster",
+                    "match": "[\\[\\]]"
+                }
+            ]
+        }
+    }
+}

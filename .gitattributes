@@ -1,0 +1,14 @@
+* text=auto eol=lf
+
+*.rs text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.aster text eol=lf
+*.gitignore text eol=lf
+*.editorconfig text eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf

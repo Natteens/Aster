@@ -1,0 +1,71 @@
+# 04 — Expressions
+
+## Objective
+
+Define proposed expression forms, evaluation order, and operator categories without
+claiming precedence or overflow behavior that has not been decided.
+
+## Proposed syntax
+
+```aster
+int total = left + right * 2;
+bool allowed = active && attempts > 0;
+player.position.x = origin.x;
+int result = calculate(10, 20);
+```
+
+## Accepted additions (implemented)
+
+- `++` and `--` are accepted as prefix and postfix operators on mutable numeric variables.
+  Prefix returns the new value; postfix returns the old value. They are rejected on constants,
+  literals, temporary results, and non-numeric types.
+- The conditional expression `condition ? whenTrue : whenFalse` is accepted. The condition must
+  be `bool`, exactly one branch is evaluated, both branches need a compatible value type, and
+  the operator is right-associative. Its precedence sits between assignment (lower) and `||`
+  (higher).
+- `&&` and `||` short-circuit.
+- `==` and `!=` compare scalar and string values, comparable structs field by field, arrays and
+  classes by reference identity, and interfaces by the identity of their underlying object.
+- Implemented precedence, lowest to highest: assignment, `?:`, `||`, `&&`, equality,
+  comparison, additive, multiplicative, unary (`!`, unary `-`, prefix `++`/`--`), postfix
+  (member access, call, postfix `++`/`--`).
+
+## Proposed rules
+
+- Literals, names, member access, indexing, calls, unary operations, binary operations,
+  assignments, and parenthesized expressions are proposed expression forms.
+- Function arguments are proposed to evaluate from left to right.
+- Short-circuiting is proposed for `&&` and `||`.
+- Assignment requires a writable place expression on the left.
+- Proposed arithmetic operators are `+`, `-`, `*`, `/`, and `%`.
+- Proposed comparison operators are `==`, `!=`, `<`, `<=`, `>`, and `>=`.
+- Proposed compound assignments include `+=`, `-=`, `*=`, `/=`, and `%=`.
+- No implicit truthiness is proposed; conditions require `bool`.
+
+Operator precedence is intentionally not fixed by this draft. Parentheses should be used
+where the intended grouping would otherwise depend on an open decision.
+
+## Valid design examples
+
+```aster
+int sum = (left + right) * 2;
+bool ready = enabled && (count > 0);
+position.x += velocity.x;
+```
+
+## Invalid design examples
+
+```aster
+int value = true + 1;       // incompatible operands
+42 = value;                 // literal is not writable
+if (count) { }              // int has no proposed truthiness conversion
+```
+
+## OPEN QUESTIONS
+
+- **OPEN QUESTION:** What is the complete precedence and associativity table?
+- **OPEN QUESTION:** Are assignments expressions with values or statements only?
+- **OPEN QUESTION:** How do integer overflow, division by zero, and floating-point edge cases behave?
+- **OPEN QUESTION:** Which explicit cast syntax is used?
+- **OPEN QUESTION:** Are operator overloading, ranges, and lambdas supported? (The conditional expression `?:` is accepted above.)
+- **OPEN QUESTION:** Are method calls syntax sugar for free functions or a distinct dispatch feature?
