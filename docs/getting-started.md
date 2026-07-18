@@ -48,6 +48,9 @@ aster run examples/hello.aster
 
 The program logs `Hello, Aster!` and the CLI prints its return value, `42`.
 
+`Main` may also be declared `public static void Main()`: it executes without producing a value, so
+only the program's logs appear. See [`examples/void_main.aster`](../examples/void_main.aster).
+
 Copy the source into your own `hello.aster` file. You can check it without executing it, run it, or
 rerun it after each save:
 

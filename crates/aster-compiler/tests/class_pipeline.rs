@@ -49,15 +49,37 @@ fn class_symbols_receivers_and_allocation_reach_hir_and_mir() {
 }
 
 #[test]
+fn classes_without_a_declared_constructor_get_an_implicit_default_one() {
+    let source = "public class Counter { private int value = 40; public int Run() { Increment(); Increment(); return value; } private void Increment() { value = value + 1; } } public int Go() { Counter counter = new Counter(); return counter.Run(); }";
+    let compilation = aster_compiler::compile(source).expect("default constructor is implicit");
+    assert!(
+        compilation
+            .mir
+            .functions
+            .iter()
+            .any(|function| function.constructor && function.name == "Counter"),
+        "synthesized constructor must reach MIR"
+    );
+}
+
+#[test]
+fn static_context_calling_an_instance_method_reports_one_focused_diagnostic() {
+    let source = "public class Program { public static int Main() { return Run(); } private int Run() { return 1; } }";
+    let diagnostics = aster_compiler::compile(source).expect_err("static context must fail");
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "no duplicate overload error: {diagnostics:#?}"
+    );
+    assert!(diagnostics[0].message.contains("requires an object"));
+}
+
+#[test]
 fn invalid_class_programs_have_specific_diagnostics() {
     for (source, expected) in [
         (
             "public struct S { public int x; } public int Run() { S s = new S(); return 0; }",
             "`new` requires a class",
-        ),
-        (
-            "public class C { } public int Run() { C c = new C(); return 0; }",
-            "has no constructor",
         ),
         (
             "public class C { public C(int x) {} } public int Run() { C c = new C(); return 0; }",

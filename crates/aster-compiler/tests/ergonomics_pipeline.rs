@@ -36,7 +36,11 @@ fn ergonomic_errors_are_specific() {
         ),
         (
             "public class C { private int value; public C() {} public static int Bad() { return value; } }",
-            "unknown name `value`",
+            "instance field `value` cannot be used in a static context",
+        ),
+        (
+            "public class C { private int value; public C() { value = 1; } public int Value { get { return value; } } public static int Bad() { return Value; } }",
+            "instance property `Value` cannot be used in a static context",
         ),
         (
             "public class C { private int value = this.Read(); public C() {} public int Read() { return 1; } }",

@@ -34,7 +34,7 @@ aster run examples\jit_basics.aster --function Calculate
 ```
 
 The explicit function must be a public, parameterless namespace-level function in the root namespace. Its
-supported result is printed, and `void` prints `function completed successfully (void)`. This mode
+supported result is printed; a `void` function prints nothing beyond the program's logs. This mode
 takes precedence over `Aster.toml` and conventional `Main`; it is intended for targeted compiler
 development, tests, and debugging.
 

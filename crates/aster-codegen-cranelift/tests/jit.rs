@@ -441,6 +441,43 @@ fn executes_void_function() {
 }
 
 #[test]
+fn executes_a_void_static_main_entry_symbol_without_a_value() {
+    let compilation = compile("public class Program { public static void Main() { return; } }")
+        .expect("void application should compile");
+    let symbol = compilation
+        .hir
+        .items
+        .iter()
+        .find_map(|item| {
+            let aster_compiler::hir::Item::Class(class) = item else {
+                return None;
+            };
+            class
+                .methods
+                .iter()
+                .find(|method| method.name == "Main")
+                .map(|method| method.symbol)
+        })
+        .expect("resolved Main symbol");
+    assert_eq!(
+        execute_symbol(&compilation.mir, symbol),
+        Ok(ExecutionValue::Void)
+    );
+}
+
+#[test]
+fn implicit_default_constructor_supports_instance_calls_with_implicit_receiver() {
+    let source = "public class Counter { private int value = 40; public int Run() { Increment(); Increment(); return value; } private void Increment() { value = value + 1; } } public int Go() { Counter counter = new Counter(); return counter.Run(); }";
+    assert_eq!(run(source, "Go"), Ok(ExecutionValue::Int(42)));
+}
+
+#[test]
+fn distinct_instances_keep_separate_field_storage() {
+    let source = "public class Box { private int value = 0; public void Set(int next) { value = next; } public int Get() { return value; } } public int Go() { Box first = new Box(); Box second = new Box(); first.Set(41); second.Set(1); return first.Get() + second.Get(); }";
+    assert_eq!(run(source, "Go"), Ok(ExecutionValue::Int(42)));
+}
+
+#[test]
 fn executes_direct_calls_with_parameters() {
     let source = "public int Add(int left, int right) { return left + right; } public int Calculate() { return Add(20, 22); }";
     assert_eq!(run(source, "Calculate"), Ok(ExecutionValue::Int(42)));

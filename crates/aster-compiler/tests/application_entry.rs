@@ -133,6 +133,21 @@ fn manifest_selects_a_resolved_root_method_and_sets_project_root() {
 }
 
 #[test]
+fn manifest_selects_a_void_main_entry() {
+    let project = Project::new("manifest-void");
+    project.write(
+        "Aster.toml",
+        "[application]\nentry = \"app.Program.Main\"\n",
+    );
+    let root = project.write(
+        "app/main.aster",
+        "namespace app; public class Program { public static void Main() {} }",
+    );
+    let entry = select(&root).expect("void manifest entry is valid");
+    assert_eq!(entry.display_name, "app.Program.Main");
+}
+
+#[test]
 fn manifest_reports_invalid_toml_and_entry_format() {
     let invalid_toml = Project::new("invalid-toml");
     invalid_toml.write("Aster.toml", "[application\nentry = 1");

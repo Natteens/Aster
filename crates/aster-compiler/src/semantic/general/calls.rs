@@ -99,6 +99,28 @@ impl Analyzer<'_> {
                 .property_reads
                 .insert(self.model_key(span), getter.key.clone());
             property.type_.clone()
+        } else if !self.instance_context
+            && let Some(owner) = self.owner.clone()
+            && let Some(info) = self.context.types.get(&owner)
+            && (info.fields.contains_key(name) || info.properties.contains_key(name))
+        {
+            let member_kind = if info.fields.contains_key(name) {
+                "field"
+            } else {
+                "property"
+            };
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "instance {member_kind} `{name}` cannot be used in a static context"
+                    ),
+                    span,
+                )
+                .with_help(format!(
+                    "it requires an instance: create one with `new {owner}(...)` and access the member through it"
+                )),
+            );
+            Type::Unknown
         } else {
             self.diagnostics.push(
                 Diagnostic::error(format!("unknown name `{name}`"), span)
@@ -324,18 +346,25 @@ impl Analyzer<'_> {
                     .chain(self.context.functions.get(name).into_iter().flatten())
                     .cloned()
                     .collect::<Vec<_>>();
-                self.resolve_overload(name, &candidates, &argument_types, span)
-                    .map(|callable| {
-                        let dispatch = if callable.is_static
-                            || self.context.functions.get(name).is_some_and(|items| {
-                                items.iter().any(|item| item.key == callable.key)
-                            }) {
-                            Dispatch::Direct
-                        } else {
-                            Dispatch::Instance
-                        };
-                        (callable, dispatch)
-                    })
+                // Every candidate was an instance method filtered out by the static
+                // context: skip overload resolution so only the dedicated
+                // "requires an object" diagnostic below is reported.
+                if candidates.is_empty() && self.methods.contains_key(name) {
+                    None
+                } else {
+                    self.resolve_overload(name, &candidates, &argument_types, span)
+                        .map(|callable| {
+                            let dispatch = if callable.is_static
+                                || self.context.functions.get(name).is_some_and(|items| {
+                                    items.iter().any(|item| item.key == callable.key)
+                                }) {
+                                Dispatch::Direct
+                            } else {
+                                Dispatch::Instance
+                            };
+                            (callable, dispatch)
+                        })
+                }
             }
             ExpressionKind::Member { object, name } => {
                 if let ExpressionKind::Name(type_name) = &object.kind

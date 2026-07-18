@@ -20,8 +20,13 @@ It does not create a game loop, world, task, thread, or ECS runtime.
 
 Without a manifest, `aster run FILE` looks in the root namespace for exactly one eligible method.
 The method must be `public`, `static`, have no parameters, and return `void` or `int`. Its
-declaring class must also be public. An `int` result is printed; `void` uses the normal successful
-void message.
+declaring class must also be public. `int Main()` executes and produces an integer, which the CLI
+prints. `void Main()` executes without producing a value: only the logs the program writes appear,
+and the process ends successfully. Any other return type is rejected with a diagnostic.
+
+`Main` is `static`, so it has no current instance. Instance methods access the members of the
+current instance; to use instance members from `Main`, create an instance explicitly with `new`
+and call through it.
 
 ```aster
 public class Program

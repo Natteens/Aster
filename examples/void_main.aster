@@ -1,0 +1,36 @@
+// A `void Main()` entry point runs without producing a value: only the logs
+// the program writes appear. Instance members are reached through an explicit
+// instance; inside an instance method, fields and sibling methods of the same
+// instance are used without qualifying the receiver.
+
+public class Counter
+{
+    private int value = 40;
+
+    public int Run()
+    {
+        Increment();
+        Increment();
+
+        return value;
+    }
+
+    private void Increment()
+    {
+        value = value + 1;
+    }
+}
+
+public class Program
+{
+    public static void Main()
+    {
+        Counter counter = new Counter();
+        int result = counter.Run();
+
+        if (result == 42)
+        {
+            Log("Counter finished.");
+        }
+    }
+}

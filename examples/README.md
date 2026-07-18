@@ -81,6 +81,9 @@ The remaining valid programs explore narrower behavior used during compiler deve
 - `integer_widths`, `numeric_types`, and `expressions` exercise numeric rules and evaluation order.
 - `classes_counter`, `class_composition`, `properties_and_equality`, and `structs` show different
   value/reference combinations.
+- `void_main` shows a `public static void Main()` entry point that produces no value, plus an
+  instance created explicitly with `new` whose methods use fields and sibling methods without
+  qualifying the receiver.
 - `generic_types`, `enum_payloads`, and the result-propagation variants cover concrete layouts that
   reach the JIT.
 - the `multifile*` directories are integration programs for project linking and dispatch.

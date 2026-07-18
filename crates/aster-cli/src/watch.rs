@@ -146,7 +146,11 @@ fn build_and_run(file_name: &str, function_name: Option<&str>) -> BuildOutcome {
             frontend_time.as_secs_f64() * 1000.0,
             execution_time.as_secs_f64() * 1000.0
         );
-        println!("[watch] `{entry_name}` => {value}");
+        if matches!(value, aster_codegen_cranelift::ExecutionValue::Void) {
+            println!("[watch] `{entry_name}` completed");
+        } else {
+            println!("[watch] `{entry_name}` => {value}");
+        }
         BuildOutcome {
             succeeded: true,
             dependencies,

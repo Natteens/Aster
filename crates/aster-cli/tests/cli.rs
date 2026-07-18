@@ -77,6 +77,38 @@ fn conventional_main_and_explicit_function_remain_supported() {
 }
 
 #[test]
+fn void_main_prints_only_program_logs_and_no_artificial_value() {
+    let directory = temporary_directory("void-entry");
+    let main = directory.join("main.aster");
+    fs::write(
+        &main,
+        "public class Worker { private int value = 41; public int Next() { return Bump(value); } private int Bump(int current) { return current + 1; } } public class Program { public static void Main() { Worker worker = new Worker(); int result = worker.Next(); Log(\"done\"); } }",
+    )
+    .expect("write void entry");
+    let output = aster(["run", main.to_str().expect("UTF-8 temporary path")]);
+
+    let void_function = directory.join("function.aster");
+    fs::write(&void_function, "public void Greet() { Log(\"hi\"); }").expect("write void function");
+    let function_output = aster([
+        "run",
+        void_function.to_str().expect("UTF-8 temporary path"),
+        "--function",
+        "Greet",
+    ]);
+    fs::remove_dir_all(&directory).expect("remove temporary directory");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "[log] done");
+
+    assert!(
+        function_output.status.success(),
+        "{}",
+        stderr(&function_output)
+    );
+    assert_eq!(stdout(&function_output).trim(), "[log] hi");
+}
+
+#[test]
 fn absolute_source_path_and_embedded_stdlib_work_outside_the_repository() {
     let directory = temporary_directory("outside-repository");
     let source = directory.join("main.aster");

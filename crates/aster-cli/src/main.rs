@@ -189,7 +189,10 @@ fn run_file(file_name: &str, function_name: Option<&str>) -> Result<(), ()> {
     }
     match execute_project(&project, Path::new(file_name), function_name) {
         Ok((value, _)) => {
-            println!("{value}");
+            // A void entry point produces no Aster value; only program logs are shown.
+            if !matches!(value, aster_codegen_cranelift::ExecutionValue::Void) {
+                println!("{value}");
+            }
             Ok(())
         }
         Err(()) => Err(()),
