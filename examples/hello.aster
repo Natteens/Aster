@@ -1,14 +1,8 @@
 public class Program
 {
-    public static void Main()
+    public static int Main()
     {
         Log("Hello, Aster!");
-        Sum(1233, 1);
-    }
-
-    static void Sum(int a, int b)
-    {
-        var result = a + b;
-        Log($"Sum: {result}");
+        return 42;
     }
 }
