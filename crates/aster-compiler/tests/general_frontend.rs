@@ -18,6 +18,30 @@ fn assert_error(source: &str, expected: &str) {
 }
 
 #[test]
+fn preserves_call_diagnostic_order_spans_and_count() {
+    let source = "public int Use() { return receiver.Missing(argument); }";
+    let diagnostics = compile(source).expect_err("source should be rejected");
+    let argument_start = source.find("argument").expect("argument is present");
+    let receiver_start = source.find("receiver").expect("receiver is present");
+
+    assert_eq!(
+        diagnostics.len(),
+        2,
+        "unexpected diagnostics: {diagnostics:#?}"
+    );
+    assert_eq!(diagnostics[0].message, "unknown name `argument`");
+    assert_eq!(
+        diagnostics[0].span,
+        aster_diagnostics::Span::new(argument_start, argument_start + "argument".len())
+    );
+    assert_eq!(diagnostics[1].message, "unknown name `receiver`");
+    assert_eq!(
+        diagnostics[1].span,
+        aster_diagnostics::Span::new(receiver_start, receiver_start + "receiver".len())
+    );
+}
+
+#[test]
 fn accepts_class_with_method() {
     assert_valid("public class Calculator { public int Add(int a, int b) { return a + b; } }");
 }
