@@ -1,75 +1,68 @@
 # Getting started
 
-Aster is an early programming language with a clear C#-inspired syntax. Today it checks `.aster`
-files, compiles them in memory, and runs them through a native JIT. There is no standalone
-executable output or game engine attached.
-
-You need [Rust](https://rustup.rs) installed; everything else is in this repository.
+Aster is currently distributed as source. You build its CLI once with Cargo, then use the `aster`
+command for normal work.
 
 ## Install the CLI
 
-From the repository root, install the development build once:
+Install [stable Rust](https://rustup.rs) 1.85 or newer. From the root of a cloned Aster repository,
+run:
 
 ```console
 cargo install --path crates/aster-cli --locked --force
 ```
 
-Cargo installs an executable named `aster` in its binary directory, normally
+This compiles the Aster toolchain—the compiler, CLI, runtime, and embedded standard library—and
+installs an executable named `aster`, normally in
 `%USERPROFILE%\.cargo\bin` on Windows or `$HOME/.cargo/bin` on Unix. Make sure that directory is on
-`PATH`, then verify the installation:
+`PATH`:
 
 ```console
 aster --version
 aster --help
 ```
 
-The standard library is embedded in the executable, so normal commands work outside the repository.
+The standard library is embedded in the executable, so the CLI does not need the repository as its
+working directory after installation.
 
-## Run your first app
+## Run a program
 
-From the repository root:
+The smallest application uses a public, static, parameterless `Main` method:
+
+```aster
+public class Program
+{
+    public static int Main()
+    {
+        Log("Hello, Aster!");
+        return 42;
+    }
+}
+```
+
+Run the checked-in version:
 
 ```console
 aster run examples/hello.aster
 ```
 
-This finds `public static int Main()`, compiles it, and prints `42`. The first compiler build can
-take a while; later runs are faster.
+The program logs `Hello, Aster!` and the CLI prints its return value, `42`.
 
-## Write your own file
-
-Create `hello.aster`:
-
-```aster
-public class Program
-{
-    public static void Main()
-    {
-        Log("Hello, Aster!");
-    }
-}
-```
-
-Check it for errors without running anything:
+Copy the source into your own `hello.aster` file. You can check it without executing it, run it, or
+rerun it after each save:
 
 ```console
 aster check hello.aster
-```
-
-Run it:
-
-```console
 aster run hello.aster
+aster watch hello.aster
 ```
 
-For an application, `Main` must be public, static, parameterless, and return `void` or `int`.
-Libraries can still be checked without declaring `Main`. See the
-[application entry reference](reference/application-entry.md) for the optional manifest and the
-explicit `--function` mode.
+`Main` may return `void` or `int`. A source file that represents a library can be checked without a
+`Main`; execution requires an [application entry](reference/application-entry.md).
 
-## Organize a program with namespaces
+## Grow into a project
 
-The manifest example keeps its root source below the project directory:
+Aster projects can spread a namespace across files. The introductory project has this shape:
 
 ```text
 examples/hello_app/
@@ -79,104 +72,19 @@ examples/hello_app/
     math.aster
 ```
 
-Run it with:
+Run it by passing the root source file:
 
 ```console
 aster run examples/hello_app/app/main.aster
 ```
 
-It logs a greeting and prints `42`. Both files belong to namespace `app` because they are in the
-same folder. Use `using another.namespace;` when code lives elsewhere. See
-[namespaces and usings](reference/namespaces.md) for folder inference and visibility.
+The nearest `Aster.toml` establishes the project root and selects `app.Program.Main`. Folder names
+provide default namespaces, while `using` brings another namespace into scope. See
+[Namespaces and usings](reference/namespaces.md) for the complete loading rules.
 
-## Use the standard library
+## Continue learning
 
-Official library namespaces use the `aster.*` prefix. Use `aster.math` for scalar helpers:
-
-```aster
-using aster.math;
-
-public class Program
-{
-    public static int Main()
-    {
-        return Math.Clamp(150, 0, 100);
-    }
-}
-```
-
-Run the complete example with:
-
-```console
-aster run examples/math_basics.aster
-```
-
-The result is `100`. A manifest-based project example is also available:
-
-```console
-aster run examples/standard_library/app/main.aster
-```
-
-See the [standard library](reference/standard-library.md) and
-[`aster.math`](reference/math.md) references for the available API and numeric edge cases.
-
-For explicit absence and errors, `using aster.core;` provides `Option<T>` and `Result<T, E>`.
-The runnable example and switch syntax are in the
-[`Option` and `Result` reference](reference/option-result.md).
-
-## Work with text
-
-Strings are immutable UTF-8 values. They support concatenation, content equality, and a Unicode
-scalar `Length`:
-
-```aster
-using aster.text;
-
-string name = "Natte";
-string message = "Olá, " + name + "!";
-Log(message);
-
-if (!String.IsEmpty(message))
-{
-    int length = message.Length;
-}
-```
-
-Run the complete example with:
-
-```console
-aster run examples/standard_text/app/main.aster
-```
-
-See the [strings reference](reference/strings.md) for allocation and Unicode details.
-
-## Rerun on every save
-
-```console
-aster watch examples/hello.aster
-```
-
-`watch` reruns `Main` whenever the root file, a loaded project namespace file, or `Aster.toml`
-changes. A broken
-save reports diagnostics and keeps watching. Press `Ctrl+C` to stop it normally.
-
-## Run an explicit development function
-
-Existing examples and compiler tests can still choose a public parameterless namespace-level function:
-
-```console
-aster run examples/expressions.aster --function Run
-```
-
-`--function` takes precedence over the conventional or manifest entry.
-
-This override is intended for targeted compiler development and debugging. Public examples use
-`Program.Main` or a manifest entry instead.
-
-## Where to go next
-
-- [Examples](../examples/README.md) — the recommended runnable sequence.
-- [Language tour](language-tour.md) — the language by example.
-- [CLI reference](reference/cli.md) — checking, running, watching, and IR inspection.
-- [VS Code extension](../editors/vscode/README.md) — syntax highlighting and snippets.
-- [Compiler internals](compiler/architecture.md) — for contributors.
+- Follow the [runnable examples](../examples/README.md) from basics to generics and error values.
+- Read the [language tour](language-tour.md) for the ideas behind those programs.
+- Use the [CLI reference](reference/cli.md) for explicit function execution and IR inspection.
+- Contributors should use the separate [compiler development](compiler/development.md) workflow.

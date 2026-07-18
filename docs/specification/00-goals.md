@@ -1,69 +1,72 @@
-# 00 — Goals and status
+# Design goals
 
-## Objective
+Aster explores a native language where low-level work can remain direct without forcing every
+program to read like systems code. These goals guide design decisions; they are not a list of
+implemented features. The [language reference](../reference/) and
+[implemented grammar](../compiler/grammar.md) describe what the compiler accepts today.
 
-This directory records the initial design direction for Aster. It separates language
-design from the grammar currently accepted by the bootstrap compiler. Unless a rule is
-also documented in `docs/compiler/grammar.md`, it must not be interpreted as implemented.
+## Direct code
 
-The examples in this specification are design examples. “Valid” means valid under the
-proposal in the document, not necessarily accepted by the current compiler.
+Source should show intent without avoidable ceremony. Types appear before names, control flow uses
+familiar forms, and ordinary code should not require compiler-specific annotations merely to be
+readable. Concision is useful only when it leaves meaning intact.
 
-## Proposed design goals
+**Practical consequence:** a small function should look like the work it performs, not like setup
+for the compiler or runtime.
 
-- Native, predictable performance without a managed runtime or .NET dependency.
-- Compact, readable syntax with types written before names.
-- Memory safety inspired by Rust, with less annotation in common cases.
-- Safe concurrency by construction.
-- Explicit behavior: potentially expensive, unsafe, or lossy operations should be visible.
-- A small, learnable core suitable for a hand-written compiler.
-- Future support for Windows, Linux, x86-64, and ARM64.
+## Concrete types
 
-ECS remains an unscheduled research topic for a possible optional library. No ECS syntax,
-package, compiler support, or runtime is currently part of Aster. Game-engine facilities and
-lifecycle conventions are outside this core-language specification.
+Generics produce concrete specializations. Layouts, calls, and dispatch should not depend on
+implicit type erasure, hidden boxing, or a universal runtime object.
 
-## Proposed syntax character
+**Practical consequence:** `Box<int>` and `Box<string>` are distinct concrete types, while repeated
+uses of `Box<int>` share the same specialization.
 
-```aster
-int add(int left, int right)
-{
-    return left + right;
-}
+## Predictable behavior
 
-int answer = add(20, 22);
-```
+Evaluation order, representation, and effects must not rely on surprising rules. Value types copy
+their data; reference types preserve identity; calls evaluate receivers and arguments in a defined
+order.
 
-Functions do not use `fn`, and return types appear before function names rather than
-after `->`.
+**Practical consequence:** refactoring an expression should not silently reorder effects or change
+whether data is copied or shared.
 
-## Proposed rules
+## Explicit failure
 
-1. Types precede declared names.
-2. Mutability and ownership effects must be explicit or statically inferable without
-   changing program meaning.
-3. Compilation errors should identify a source range and explain a recovery action.
-4. Undefined behavior must not be part of safe Aster.
-5. Platform-dependent behavior must be documented where it is introduced.
+Expected absence and recoverable errors belong in the type system. `Option<T>` and `Result<T, E>`
+make those paths visible to callers without introducing implicit nulls or exception-based control
+flow.
 
-## Valid design example
+**Practical consequence:** a function signature shows when its caller must handle “no value” or an
+expected error.
 
-```aster
-int distance = 42;
-const int maxDistance = 100;
-```
+## Understandable cost
 
-## Invalid design example
+Ergonomics must not disguise relevant work. Allocation, dynamic interface dispatch, copying large
+values, lossy conversion, and future unsafe operations need semantics that a programmer can reason
+about.
 
-```aster
-fn distance() -> int { return 42; }
-```
+**Practical consequence:** the compiler may perform complex lowering internally, but it must not
+invent hidden source-level meaning or pretend an expensive operation is free.
 
-This conflicts with the proposed declaration style: Aster does not use `fn` or `->`.
+## The compiler is a tool
 
-## OPEN QUESTIONS
+Diagnostics, installation, the CLI, examples, and documentation are part of the language. A clear
+error or one-command example is as important to daily use as a well-factored compiler phase.
 
-- **OPEN QUESTION:** Which editions or language-version mechanism will stabilize syntax?
-- **OPEN QUESTION:** Which platforms and ABIs are guaranteed by the first release?
-- **OPEN QUESTION:** Is source compatibility or semantic stability promised before 1.0?
-- **OPEN QUESTION:** Which capabilities require an explicit `unsafe` context?
+**Practical consequence:** supported behavior should be checkable with `aster check`, runnable with
+`aster run`, and documented from a user's point of view.
+
+## Parallelism is research
+
+Safe, deterministic parallel execution is a long-term research direction, not a current feature.
+Aster has no automatic parallelism, thread API, GPU backend, or HVM integration today. Any future
+model must keep synchronization, scheduling cost, and observable behavior understandable. Research
+may learn from systems such as Bend and HVM without committing Aster to their architecture.
+
+## Status and open questions
+
+The compiler is experimental and does not promise source or semantic stability before 1.0.
+Platform guarantees, long-lived ownership, unsafe boundaries, concurrency, and AOT distribution
+remain design work. Accepted behavior belongs in reference documentation; unresolved proposals are
+tracked in [Open questions](10-open-questions.md) and future work in the [roadmap](../roadmap.md).

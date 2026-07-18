@@ -1,6 +1,6 @@
 # Implemented grammar
 
-This document describes only syntax implemented by the validation frontend in `0.0.0`.
+This document describes syntax implemented by the compiler frontend.
 It is intentionally narrower than `docs/specification/`.
 
 Source files are UTF-8. Whitespace and `//` line comments are ignored. Identifiers begin
@@ -46,7 +46,6 @@ type-parameters     = "<" , identifier , { "," , identifier } , ">" ;
 function-tail       = parameters , block ;
 parameters          = "(" , [ parameter , { "," , parameter } ] , ")" ;
 parameter           = type , identifier ;
-generic-call        = identifier , [ "<" , type , { "," , type } , ">" ] , arguments ;
 type-arguments      = "<" , type , { "," , type } , ">" ;
 
 namespace-variable  = variable-declaration ;
@@ -95,7 +94,8 @@ cast                = "(" , value-type , ")" , unary ;
 value-type          = "sbyte" | "byte" | "short" | "ushort" | "int" | "uint"
                     | "long" | "ulong" | "float" | "double" | "decimal" | "char" ;
 postfix             = primary , { "." , identifier | "[" , expression , "]"
-                                | arguments | "++" | "--" | try-propagation } ;
+                                | call-suffix | "++" | "--" | try-propagation } ;
+call-suffix         = [ type-arguments ] , arguments ;
 try-propagation     = "?" ;  (* Result propagation; see below *)
 arguments           = "(" , [ expression , { "," , expression } ] , ")" ;
 primary             = literal | enum-value | struct-literal | array-literal | new-array | new-object
@@ -187,7 +187,7 @@ rest of the file as invalid.
 - Non-`void` functions must return on every reachable path. Statements after `return`, `break`,
   or `continue` receive a warning for unreachable code; warnings do not invalidate compilation.
 
-## Tokenized but not implemented
+## Unsupported language features
 
 There is no class inheritance, interface inheritance, constructor/operator overloads, static
 fields, auto-properties, named/default arguments, general pattern matching, switch guards or

@@ -1,10 +1,7 @@
 # Aster examples
 
-Install the local CLI from the repository root before running these examples:
-
-```console
-cargo install --path crates/aster-cli --locked --force
-```
+Install the local CLI by following [Getting started](../docs/getting-started.md) before running these
+programs.
 
 The examples below form a short learning path. Each one uses the standard application entry point,
 so no explicit function name is needed.
@@ -76,6 +73,23 @@ the project root and application entry.
   aster run examples/namespaces/app/main.aster
   ```
 
-The remaining files under `examples/` exercise focused compiler and runtime behavior. Some retain
-namespace-level functions for targeted development with `--function`; they are regression programs,
-not the recommended starting path.
+## Focused examples
+
+The remaining valid programs explore narrower behavior used during compiler development:
+
+- `arrays`, `array_initialized`, and `array_structs` cover distinct allocation and value cases.
+- `integer_widths`, `numeric_types`, and `expressions` exercise numeric rules and evaluation order.
+- `classes_counter`, `class_composition`, `properties_and_equality`, and `structs` show different
+  value/reference combinations.
+- `generic_types`, `enum_payloads`, and the result-propagation variants cover concrete layouts that
+  reach the JIT.
+- the `multifile*` directories are integration programs for project linking and dispatch.
+
+Some focused files expose a namespace-level function for explicit execution, for example:
+
+```console
+aster run examples/expressions.aster --function Run
+```
+
+`decimal_frontend.aster` is intentionally check-only: it documents that decimal syntax and type
+checking exist while the JIT representation does not.

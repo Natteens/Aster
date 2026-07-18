@@ -11,8 +11,8 @@ public class Player
 
     public Player(Position spawn, int[] initialScores)
     {
-        this.position = spawn;
         scores = initialScores;
+        position = spawn;
     }
 
     public void MoveX(int amount)

@@ -1,87 +1,59 @@
 # Aster documentation
 
-This index separates guides to the implemented language from API reference, design specifications,
-compiler internals, and future research. Documents under `reference/` describe current behavior.
-Documents under `specification/` may also record proposals and open questions; they are not proof
-that a feature is implemented.
+Choose a path based on what you are trying to do. Guides teach through working programs; reference
+pages define current behavior; compiler documents explain implementation. Design specifications and
+research notes may describe work that the compiler does not implement.
 
-## Getting Started
+## Start using Aster
 
-- [Runnable examples](../examples/README.md) — the recommended single-file and multifile examples.
-- [Getting started](getting-started.md) — install Rust, run an application, use namespaces, and try
-  the standard library.
-- [Language tour](language-tour.md) — a compact walkthrough of the implemented language.
-- [CLI reference](reference/cli.md) — `check`, `run`, `watch`, `dump-hir`, and `dump-mir`.
-- [VS Code extension](../editors/vscode/README.md) — syntax highlighting, snippets, and local
-  installation.
+1. [Getting started](getting-started.md) — install the CLI and run a first application.
+2. [Runnable examples](../examples/README.md) — follow a short sequence of complete programs.
+3. [Language tour](language-tour.md) — understand the ideas that connect those programs.
+4. [CLI reference](reference/cli.md) — check, run, watch, and inspect IR.
 
-## Language Guide
+## Language guides and reference
 
-- [Namespaces and usings](reference/namespaces.md)
 - [Application entry points](reference/application-entry.md)
+- [Namespaces and usings](reference/namespaces.md)
+- [Primitive types](reference/types.md), [arrays](reference/arrays.md), and
+  [strings](reference/strings.md)
 - [Classes](reference/classes.md), [structs](reference/structs.md), and
   [interfaces](reference/interfaces.md)
-- [Enums and switch](reference/enums.md)
+- [Enums](reference/enums.md), [`Option<T>` and `Result<T, E>`](reference/option-result.md), and
+  [postfix `?`](reference/result-propagation.md)
 - [Generic functions](reference/generics.md) and [generic types](reference/generic-types.md)
-- [Arrays](reference/arrays.md), [strings](reference/strings.md), and
-  [primitive types](reference/types.md)
-- [Internal modules and public namespaces](reference/modules.md) — terminology and migration from
-  the removed `module`/`import` syntax.
+- [Standard library](reference/standard-library.md), [`aster.math`](reference/math.md), and
+  [logging](reference/logging.md)
+- [Implemented grammar](compiler/grammar.md)
 
-## Language Reference
+These pages use the present tense for behavior accepted by the current compiler.
 
-The [implemented grammar](compiler/grammar.md) is the concise reference for syntax currently
-accepted by the compiler. The detailed design specification is organized as follows:
+## Design and direction
 
-- [Goals and status](specification/00-goals.md),
-  [lexical structure](specification/01-lexical-structure.md), and
-  [types](specification/02-types.md)
-- [Variables and constants](specification/03-variables-and-constants.md),
-  [expressions](specification/04-expressions.md), and
-  [functions](specification/05-functions.md)
-- [Control flow](specification/06-control-flow.md),
-  [structs and type categories](specification/07-structs.md), and
-  [namespaces](specification/08-modules.md)
-- [Memory model](specification/09-memory-model.md),
-  [open questions](specification/10-open-questions.md), and
-  [generics](specification/11-generics.md)
-- [Logging](specification/12-logging.md),
-  [platform boundaries](specification/14-platform-boundaries.md),
-  [visibility](specification/15-visibility.md), and
-  [enums](specification/16-enums.md)
+- [Design goals](specification/00-goals.md) — the principles behind language decisions.
+- [Design specification](specification/) — accepted rules, proposals, and open questions. A proposal
+  is not proof of implementation.
+- [Roadmap](roadmap.md) — public direction and current boundaries.
+- [Technical roadmap](technical-roadmap.md) — dependency order for compiler work and research.
 
-## Standard Library
+## Compiler architecture
 
-- [Standard-library overview](reference/standard-library.md)
-- [`Option<T>` and `Result<T, E>`](reference/option-result.md)
-- [Postfix `?` and result propagation](reference/result-propagation.md)
-- [Strings and `aster.text`](reference/strings.md)
-- [`aster.math`](reference/math.md)
-- [Logging](reference/logging.md)
-
-## Compiler Architecture
-
-- [Compiler architecture](compiler/architecture.md) — workspace boundaries and the complete
-  frontend-to-JIT pipeline.
-- [Compiler development](compiler/development.md) and [runtime ABI](compiler/runtime-abi.md)
-- [Module resolution](compiler/module-resolution.md) and
+- [Compiler architecture](compiler/architecture.md)
+- [Project linking](compiler/module-resolution.md) and
   [monomorphization](compiler/monomorphization.md)
-- [Execution context](compiler/execution-context.md) and [watch mode](compiler/watch.md)
-- [Inspecting HIR](compiler/dump-hir.md) and [inspecting MIR](compiler/dump-mir.md)
+- [Execution context](compiler/execution-context.md) and [runtime ABI](compiler/runtime-abi.md)
+- [HIR dump](compiler/dump-hir.md), [MIR dump](compiler/dump-mir.md), and
+  [watch mode](compiler/watch.md)
 - [Hot-reload foundation](compiler/hot-reload-foundation.md) and
-  [GPU/engine direction](compiler/gpu-engine-direction.md) — future architecture research, not
-  implemented functionality.
+  [GPU/engine direction](compiler/gpu-engine-direction.md) — research, not implemented features.
 
-## Development and Releases
+## Contributing and releases
 
 - [Contributing](../CONTRIBUTING.md)
 - [Compiler development](compiler/development.md)
+- [Writing Aster documentation](contributing/writing.md)
 - [Release process](releasing.md)
-- [Developing the VS Code extension](../editors/vscode/DEVELOPMENT.md)
+- [VS Code extension development](../editors/vscode/DEVELOPMENT.md)
 
-## Roadmap
-
-- [Current roadmap](roadmap.md) — implemented surface and immediate gaps.
-- [Technical roadmap](technical-roadmap.md) — dependency order and research milestones.
-- [Future ECS package direction](future/ecs-package.md) — records the removed experiment and the
-  constraints on any future proposal.
+The official repository is [Natteens/Aster](https://github.com/Natteens/Aster). See the
+[project identity policy](../TRADEMARKS.md) for clear attribution of forks and derived work.

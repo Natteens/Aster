@@ -1,356 +1,201 @@
 # Language tour
 
-A walk through Aster as it exists today, by example. Every snippet in this page compiles,
-and unless marked otherwise it also runs with `aster run`. If you haven't run anything yet,
-start with [getting started](getting-started.md).
+Aster uses familiar, type-first syntax, but its design is built around concrete representation and
+explicit behavior. This tour explains those ideas through small excerpts. For complete programs
+you can run directly, follow the [examples](../examples/README.md).
 
-## Variables
+## Programs start at `Main`
 
-A variable declares its type first, like C#:
+An application begins at one public static `Main` method, selected by convention or by
+`Aster.toml`:
 
 ```aster
-public int Sum()
+public class Program
 {
-    int count = 3;
-    var doubled = count * 2;    // type inferred from the initializer: int
-    doubled = doubled + 1;
-    return doubled;             // 7
+    public static int Main()
+    {
+        Log("Hello, Aster!");
+        return 42;
+    }
 }
 ```
 
-`var` needs an initializer — that's where the type comes from. Variables are mutable;
-reading one before it has a value is a compile error.
+`Main` takes no parameters and returns `void` or `int`. The `int` result is useful for examples and
+command-line programs because the CLI prints it after execution.
 
-## Constants
+## Values say what they are
 
-`const` values are computed at compile time and can never be reassigned:
-
-```aster
-const int MaxScore = 100;
-
-public int Cap()
-{
-    const int Bonus = MaxScore / 10 + 2;
-    return MaxScore + Bonus;    // 112
-}
-```
-
-A constant's initializer must itself be constant: literals, other constants, operators,
-`?:`, and casts. A function call there is a compile error, and so are overflow and
-division by zero — the compiler catches `2147483647 + 1` for you.
-
-## Functions
-
-Functions declare a return type, a name, and typed parameters:
+Types appear before names. `var` can infer a local type from its initializer, while `const` keeps a
+compile-time value from changing:
 
 ```aster
-internal int Add(int left, int right)
+const int MaxItems = 100;
+
+public int LineTotal(int unitPrice, int quantity)
 {
-    return left + right;
-}
-
-public int CallIt()
-{
-    return Add(20, 22);         // 42
-}
-```
-
-A `void` function returns nothing. Any other return type must be returned on every path.
-Recursion works, including two functions calling each other:
-
-```aster
-public int Factorial(int n)
-{
-    return n <= 1 ? 1 : n * Factorial(n - 1);
-}
-```
-
-## Conditionals and loops
-
-```aster
-public int Classify(int value)
-{
-    if (value > 100)
-    {
-        return 2;
-    }
-    else if (value > 10)
-    {
-        return 1;
-    }
-    return 0;
-}
-
-public int SumBelow(int limit)
-{
-    int total = 0;
-    for (int i = 0; i < limit; i++)
-    {
-        if (i == 3)
-        {
-            continue;           // skip one iteration
-        }
-        total += i;
-    }
-    while (total > 100)
-    {
-        total -= 10;
-    }
+    int accepted = quantity > MaxItems ? MaxItems : quantity;
+    var total = unitPrice * accepted;
     return total;
 }
 ```
 
-Conditions must be `bool` — there is no "0 is false". Braces are required. `break` leaves
-the nearest loop, `continue` jumps to its next iteration.
+Variables must be initialized before use. Constant expressions are evaluated by the compiler, with
+diagnostics for overflow and division by zero. Numeric conversions are implicit only when every
+source value can be represented exactly; lossy conversions require an explicit cast.
 
-`&&` and `||` stop early: in `a && b`, `b` is only evaluated when `a` is true.
+The [types reference](reference/types.md) records the concrete primitive types and conversion rules.
 
-## The ternary expression
+## Control flow preserves evaluation order
 
-`condition ? whenTrue : whenFalse` picks one of two values, and only the chosen side runs:
+Conditions require `bool`; zero is not treated as false. `&&` and `||` short-circuit, and the
+conditional expression evaluates only its selected branch. Loops, calls, assignments, receivers,
+and arguments keep their documented order of effects.
 
-```aster
-public int Choose(bool enabled)
-{
-    return enabled ? 10 : 20;
-}
-```
-
-## Increment and decrement
-
-`++` and `--` change a variable by one. Prefix gives you the new value, postfix the old:
+This complete example adds the even values from one through six:
 
 ```aster
-public int Order()
+public class Program
 {
-    int i = 5;
-    int old = i++;              // old = 5, i = 6
-    int fresh = ++i;            // fresh = 7, i = 7
-    return old * 100 + fresh;   // 507
-}
-```
-
-They only apply to mutable numeric variables — not constants, not literals, not
-expression results like `(a + b)++`.
-
-## Strings
-
-Strings are immutable UTF-8 text. You can store them, pass them, return them, join them, and compare
-them by content:
-
-```aster
-public int Greet()
-{
-    string name = "Natte";
-    string message = "Olá, " + name + "!";
-    Log(message);
-    return message.Length;       // 11 Unicode scalar values
-}
-```
-
-`+=` creates and assigns a new string. `==` compares text rather than reference identity. There is
-no automatic conversion from numbers or objects to text. See the
-[strings reference](reference/strings.md).
-
-## Logging
-
-`Log(message)`, `Log.Warning(message)`, and `Log.Error(message)` each print one line. See
-the [logging reference](reference/logging.md) for the exact behavior.
-
-## Standard math
-
-`aster.math` is the first official standard-library namespace. It provides overloaded scalar
-`Abs`, `Min`, `Max`, and `Clamp` methods:
-
-```aster
-using aster.math;
-
-public int LimitedScore(int score)
-{
-    return Math.Clamp(score, 0, 100);
-}
-```
-
-The namespace is compiled from normal Aster code; it is not a parser special case. See the
-[`aster.math` reference](reference/math.md) for supported types and edge cases.
-
-## Enums, Option, and Result
-
-Enums may carry values. `switch` selects one case without fallthrough or a trailing `break`:
-
-```aster
-using aster.core;
-
-public int ValueOr(Option<int> option)
-{
-    switch (option)
+    public static int Main()
     {
-        case Some(value):
-            return value;
-        case None:
-            return 0;
+        int total = 0;
+        for (int value = 1; value <= 6; value++)
+        {
+            if (value % 2 == 0)
+            {
+                total += value;
+            }
+        }
+        return total;
     }
 }
 ```
 
-Cases in an enum declaration are separated by commas. See [enums](reference/enums.md) and
-[`Option` and `Result`](reference/option-result.md).
+Run it with `aster run examples/basics.aster`; it prints `12`.
 
-A `Result` can be propagated with the postfix `?` operator: `int value =
-Parse(text)?;` continues with the `Ok` payload or returns the `Error` from the
-enclosing function. See [result propagation](reference/result-propagation.md).
+## Values and references are different on purpose
 
-## Arrays
-
-Arrays have fixed length and shared reference identity. A literal supplies every initial element;
-`new T[length]` creates zero-initialized storage:
+Structs are copied by value. Classes, arrays, and strings are references owned by the current JIT
+execution. Interfaces preserve the identity of the concrete class behind them.
 
 ```aster
-public int Sum()
+public struct Position
 {
-    int[] values = [10, 20, 30];
-    int[] same = values;
-    same[1] = 25;
-    return values[0] + values[1] + values[2] + values.Length;
+    public int x;
+    public int y;
 }
-```
 
-This returns `68`. Every index is checked at runtime. See the [arrays reference](reference/arrays.md)
-for ownership and current limits.
-
-## Classes
-
-Classes are reference types allocated for one execution. Constructors have the class name and no
-written return type:
-
-```aster
 public class Counter
 {
     private int value;
 
-    public Counter(int initial) { value = initial; }
+    public Counter(int initialValue) { value = initialValue; }
     public void Add(int amount) { value += amount; }
-    public int Get() { return this.value; }
+    public int Value { get { return value; } }
 }
 ```
 
-`Counter second = first` makes both variables refer to the same object. See the
-[classes reference](reference/classes.md) for initialization and lifetime rules.
+Copying a `Position` produces independent data. Copying a `Counter` reference makes two variables
+refer to the same object. There is no implicit `null`, boxing, class inheritance, or garbage
+collector in the current runtime.
 
-## Types, literals, and casts
+The [objects example](../examples/objects.aster) is a complete class program. The
+[struct](reference/structs.md), [class](reference/classes.md), and
+[interface](reference/interfaces.md) references describe initialization, copying, and dispatch.
 
-The executable primitive types include `sbyte`, `byte`, `short`, `ushort`, `int`, `uint`,
-`long`, `ulong`, `float`, `double`, `bool`, `char`, `string`, and `void`. `decimal` is
-understood by the frontend but deliberately rejected by the JIT until it has an exact runtime
-representation. The [types reference](reference/types.md) has the full table.
+## Collections stay concrete
+
+Arrays have fixed length and checked indexing. Their element type is part of the array type:
 
 ```aster
-public bool Numbers()
+public int SumScores()
 {
-    uint mask = 4000000000u;    // u chooses uint or ulong by range
-    long wide = 4000000000L;    // L makes a long literal
-    float speed = 1.5f;         // plain 4.5 is also float
-    double precise = 2.5d;      // d makes a double literal
-    char comma = ',';
-    return wide > 0 && speed < precise && comma == ',';
+    int[] scores = [10, 20, 30];
+    scores[1] = 25;
+    return scores[0] + scores[1] + scores[2];
 }
 ```
 
-Only exact widening conversions are automatic. For example, `byte` fits in `int`, `int` fits
-exactly in `double`, and `float` fits exactly in `double`. `int` to `float` and `long` to
-`double` require casts because some values lose precision.
+Strings are immutable UTF-8 values. Concatenation creates a new string, `==` compares content, and
+`Length` counts Unicode scalar values. Aster does not silently convert numbers or objects to text.
 
-### Casts
+See [arrays](reference/arrays.md) and [strings](reference/strings.md) for their runtime boundaries.
 
-Going the other way — or converting between integers and floating point — is explicit,
-written `(type)value`:
+## Generics become concrete programs
 
-```aster
-public int Shrink()
-{
-    double measured = 9.7d;
-    return (int)measured;       // 9 — truncates toward zero
-}
-```
-
-Casts work between the numeric types. Integer-to-`char` currently requires a constant valid
-Unicode scalar; `char` otherwise casts only with integer types. `bool` and `string` never take
-part in casts. Decimal casts can be represented by the frontend but cannot execute yet.
-
-## Structs, classes, and interfaces
-
-Aster already understands declarations in the C# style:
+Generic functions and types are monomorphized before HIR and MIR. Each closed use has a concrete
+identity and layout:
 
 ```aster
-public interface IDamageable
+public T Choose<T>(bool condition, T first, T second)
 {
-    void Damage(int amount);
+    return condition ? first : second;
 }
 
-public struct Position
-{
-    public float x;
-    public float y;
-}
-
-public class DamageCounter : IDamageable
-{
-    private int total;
-
-    public DamageCounter(int initial)
-    {
-        total = initial;
-    }
-
-    public void Damage(int amount)
-    {
-        total -= amount;
-    }
-}
-```
-
-Data structs are executable and use named fields:
-
-```aster
-Position position = Position { x: 10.0f, y: 20.0f };
-Position copy = position;
-copy.x = 30.0f; // position.x remains 10.0f
-```
-
-Structs can be nested, passed and returned by value between Aster functions. Comparable structs
-use field-by-field equality; struct methods remain frontend-only. Classes are non-null references
-owned by the current execution context. A class lists its interfaces after `:`; this is nominal
-contract implementation, not class inheritance. Interface locals, parameters, fields, arrays and
-internal returns execute with dynamic dispatch. See the [struct reference](reference/structs.md),
-[class reference](reference/classes.md), and [interface reference](reference/interfaces.md).
-
-Classes support instance and `static` methods, declaration-order field initializers, explicit
-properties, and deterministic overloads. Arrays and classes compare reference identity; interfaces
-compare the identity of their underlying object. Strings and scalar values compare by value.
-
-## Generic types
-
-Use generic classes when the same reference-shaped container should hold different concrete types,
-and generic structs for reusable value-shaped data:
-
-```aster
 public class Box<T>
 {
     private T value;
     public Box(T value) { this.value = value; }
     public T Get() { return value; }
 }
-
-public struct Pair<T, U>
-{
-    public T First;
-    public U Second;
-}
-
-Box<int> answer = new Box<int>(42);
-Pair<int, string> named = Pair<int, string> { First: 42, Second: "Aster" };
 ```
 
-Every use supplies concrete arguments. The compiler generates concrete layouts and native code;
-there is no hidden boxing or runtime `object`. Generic interfaces use the same dynamic dispatch as
-ordinary interfaces. See [generic types](reference/generic-types.md).
+`Box<int>` and `Box<string>` are different nominal types. Repeated uses of `Box<int>` reuse one
+specialization; they do not introduce runtime type erasure or hidden boxing.
+
+The runnable [generics](../examples/generics.aster) and
+[generic types](../examples/generic_types.aster) examples show both forms.
+
+## Absence and errors are values
+
+The embedded `aster.core` namespace defines `Option<T>` and `Result<T, E>` as ordinary generic
+enums. Code handles their cases with an exhaustive `switch`:
+
+```aster
+using aster.core;
+
+public Result<int, string> ValidateQuantity(int quantity)
+{
+    if (quantity <= 0)
+    {
+        return Result<int, string>.Error("quantity must be positive");
+    }
+    return Result<int, string>.Ok(quantity);
+}
+```
+
+Postfix `?` returns an `Error` from the enclosing function or produces the `Ok` payload. It does not
+throw an exception or match type names in the backend.
+
+Run [Option and Result](../examples/option_result.aster) and
+[result propagation](../examples/result_propagation.aster), then use the
+[reference](reference/option-result.md) for the exact rules.
+
+## Projects use namespaces
+
+Folders establish default namespaces relative to the nearest `Aster.toml`. A `using` declaration
+loads another namespace; it does not download a package or search outside the project. Official
+`aster.*` namespaces come from the standard library embedded in the compiler.
+
+```aster
+using aster.math;
+
+public int ClampScore(int score)
+{
+    return Math.Clamp(score, 0, 100);
+}
+```
+
+The [namespace project](../examples/namespaces/app/main.aster) combines project code with
+`aster.math`. See [Namespaces and usings](reference/namespaces.md) and the
+[standard library](reference/standard-library.md) for the complete contracts.
+
+## Current boundaries
+
+Aster currently executes through a JIT. It does not produce standalone binaries, resolve external
+packages, provide long-lived object ownership, or implement threads, async, automatic parallelism,
+GPU execution, or HVM lowering. Those are design or research questions rather than syntax waiting
+to be switched on.
+
+The [roadmap](roadmap.md) separates implemented foundations, near-term work, and research. The
+[documentation index](README.md) leads to detailed language reference and compiler architecture.

@@ -1,7 +1,0 @@
-// DESIGN EXAMPLE ONLY.
-// This file demonstrates proposed syntax and may not compile with the current compiler.
-
-void main()
-{
-    print("Hello, Aster!");
-}

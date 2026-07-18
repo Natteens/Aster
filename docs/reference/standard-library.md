@@ -1,10 +1,10 @@
 # Standard library
 
-The standard library is the small set of official `aster.*` namespaces shipped with the compiler.
-It is ordinary Aster source code, so its public API follows the same type checking, overload
-resolution, HIR, MIR, and JIT pipeline as project code.
+Aster ships a small standard library embedded in the compiler. Its APIs are written in ordinary
+Aster source and pass through the same type checking, monomorphization, HIR, MIR, and JIT pipeline
+as project code.
 
-Bring an official namespace into scope by name:
+Use a standard-library namespace explicitly:
 
 ```aster
 using aster.math;
@@ -12,16 +12,15 @@ using aster.text;
 using aster.core;
 ```
 
-Official namespaces are loaded from the compiler distribution, not from the project directory. A
-project therefore cannot replace `aster.math`, `aster.text`, or `aster.core` with local files or declare its own `aster.*`
-namespace. If an official source is missing, the compiler reports an incomplete installation instead
-of silently falling back to project code.
+- [`aster.math`](math.md) contains scalar `Abs`, `Min`, `Max`, and `Clamp` overloads.
+- [`aster.text`](strings.md) contains focused text helpers such as `String.IsEmpty`.
+- [`aster.core`](option-result.md) defines the generic `Option<T>` and `Result<T, E>` enums.
+- [Logging](logging.md) exposes `Log`, `Log.Warning`, and `Log.Error` through the runtime boundary.
 
-The initial namespaces are [`aster.math`](math.md) for scalar math and
-[`aster.text`](strings.md) for `String.IsEmpty`. [`aster.core`](option-result.md) provides the
-generic `Option<T>` and `Result<T, E>` enums. Logging is also part of Aster's standard surface, but
-continues to use its existing runtime-backed `Log`, `Log.Warning`, and `Log.Error` API.
+The `aster.*` prefix is reserved for this embedded library. A project cannot shadow an official
+namespace with local source. If an expected embedded source is missing, the compiler reports an
+installation error rather than searching the project.
 
-This is deliberately a small foundation. `Option` and `Result` are value types, not collections.
-There are no collections, tasks, engine APIs, GPU APIs,
-or vector types in the standard library yet.
+The library is deliberately narrow. It has no general collection package, task API, engine API, or
+GPU surface today. Those areas require language and runtime decisions before a library can give them
+a stable contract.

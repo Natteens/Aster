@@ -74,7 +74,7 @@ behavior, executable examples, and no primitive-type exceptions for vectors.
 
 The optional minimal `Aster.toml` selects a qualified public static parameterless `Main`, while
 projects without it use the same `Main` convention in the root namespace. `--function` remains
-available for tests and examples. `Main` does not imply an engine lifecycle, remote registry, or
+available for targeted tests and compiler debugging. `Main` does not imply an engine lifecycle, remote registry, or
 package download.
 
 **Done when:** manifest discovery is deterministic, invalid entries are diagnosed with source

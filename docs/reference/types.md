@@ -43,12 +43,10 @@ See the exact tables and overflow policy in the
 
 ## What is not primitive
 
-Vectors such as `float2`, `float3`, `float4` and `int2`, as well as matrices and quaternions,
-will be ordinary value types in the future `aster.math` library. They do not belong in the
-lexer, type core or Cranelift type mapping. Arrays, generics, `object`, `dynamic` and `null`
-are also outside the primitive numeric system and are not implemented here.
+Arrays and generic specializations are implemented types, but they are not primitives. Classes,
+structs, interfaces, and [enums](enums.md) are user-defined types rather than primitives.
 
-Classes, structs, interfaces, and [enums](enums.md) are user-defined types rather than primitives.
+`object`, `dynamic`, `null`, vectors, matrices, and quaternions are not supported.
 
 `nint` and `nuint` are reserved for a future platform-dependent interop/low-level design.
-`half` may be added later for graphics and FFI. None of these names is accepted today.
+`half` is also unsupported. None of these names is accepted today.

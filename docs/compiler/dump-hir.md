@@ -8,7 +8,7 @@ aster dump-hir path\to\file.aster
 
 The command reads a `.aster` file, lexes it, parses it, performs semantic validation,
 lowers the implemented general-language nodes through the frontend pipeline, and prints its HIR view.
-It never executes source code and does not invoke Cranelift or a linker.
+It never executes source code and does not invoke Cranelift, native code generation, or a system linker.
 
 Invalid input produces the same positioned diagnostics as `aster check` and exits unsuccessfully.
 Warnings, including unreachable-code warnings, are rendered before a successful dump.

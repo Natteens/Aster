@@ -75,6 +75,6 @@ tables are calculated from concrete types before HIR and MIR. Expanding recursiv
 can never reach a finite specialization are rejected.
 
 Current limits: no constraints (`where`), variance, generic methods with additional parameters,
-generic constructors, generic inheritance, static members on generic types, partial application,
+constructors with their own type parameters, generic inheritance, static members on generic types, partial application,
 default type arguments, reflection, boxing, `object`, or generic standard collections. Struct
 methods are not executable yet; generic structs are currently data types with fields and literals.

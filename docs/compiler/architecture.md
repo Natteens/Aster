@@ -56,7 +56,7 @@ types. Only concrete declarations proceed to HIR, MIR, layout calculation, inter
 Cranelift; the backend has no generic ABI or type-erasure path. See
 [`monomorphization.md`](monomorphization.md).
 
-`semantic::general` builds initial type/function/local symbol tables and checks visibility,
+The semantic analyzer builds initial type/function/local symbol tables and checks visibility,
 declarations, types, calls, expressions, variables, constants, logging, lexical scopes,
 loop context, all-path returns, and unreachable-code warnings.
 

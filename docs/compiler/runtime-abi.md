@@ -71,17 +71,16 @@ Rules:
 
 ## `unsafe` boundary
 
-All `unsafe` in `aster-runtime` is confined to ABI pointer views and aligned buffer projection:
-`string::view`, context-owned string creation, and the small array entry points that borrow the
-live host-owned context/header.
+All `unsafe` in `aster-runtime` is confined to ABI pointer views, context-owned allocation, and
+aligned buffer projection across the string, logging, math, array, and object entry points.
 The crate lints with `unsafe_code = "deny"` and each use carries an explicit `SAFETY` comment.
 Runtime entry points are panic-free: malformed input yields controlled diagnostics because a
 panic across the `extern "C"` boundary would abort the process.
 
 `aster.math` itself is ordinary Aster source. Its private domain-error declarations carry trusted
-provider metadata and lower to a typed MIR intrinsic, which the backend binds through this registry. The intrinsic exists because
-the language has no general exception or `Result` mechanism yet; backend code never identifies
-public math methods by their textual names.
+provider metadata and lower to a typed MIR intrinsic, which the backend binds through this registry. The intrinsic provides a
+panic-free host boundary without introducing exception or unwind behavior; backend code never
+identifies public math methods by their textual names.
 
 String concatenation and length are typed MIR intrinsics selected from checked string expressions.
 Cranelift maps those enum variants to registry entries; it never recognizes `String`, `Length`, or

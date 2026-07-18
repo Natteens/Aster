@@ -1,7 +1,5 @@
 # Result propagation (`?`)
 
-Status: **ACCEPTED**
-
 The postfix `?` operator propagates the `Error` case of an
 [`aster.core.Result<T, E>`](option-result.md) and continues with the `Ok`
 payload:
@@ -57,7 +55,7 @@ it does not expand into source-level `switch`.
 - **Only the official `aster.core.Result` supports `?`.** Recognition is
   nominal: a user-defined enum named `Result` in another namespace is not the
   official type and is rejected.
-- **`?` needs an enclosing function.** Used at module scope there is nowhere to
+- **`?` needs an enclosing function.** Used at namespace scope there is nowhere to
   return, so it is rejected.
 - **There are no exceptions.** `?` is ordinary control flow; there is no
   `throw`, `catch`, or unwinding.
@@ -91,7 +89,7 @@ if (Validate()? == true) { return Result<int, string>.Ok(42); }
 
 ## Current limitations
 
-These are the boundaries of this milestone, not permanent language decisions:
+Current boundaries:
 
 - **`Option<T>` is not propagated yet.** Only `Result` participates in `?`.
 - **No automatic error conversion.** Mismatched error types must be converted

@@ -30,7 +30,6 @@ Arrays may contain executable scalar types or finite structs and may be passed t
 Aster functions. Arrays returned to the selected CLI entry are not printable, so a public scalar
 entry function should consume the result.
 
-There is currently no `null`, resizing, slicing, nested/multidimensional array, array `foreach`, or
-independent freeing. Array identity exists, but `==`/`!=` semantics have not been accepted yet and
-compare reference identity with `==` and `!=`; elements are not compared implicitly. All storage belongs to
-the current JIT execution context.
+There is no `null`, resizing, slicing, nested/multidimensional array, array `foreach`, or independent
+freeing. `==` and `!=` compare array reference identity; elements are not compared implicitly. All
+storage belongs to the current JIT execution context.

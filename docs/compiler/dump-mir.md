@@ -8,7 +8,7 @@ aster dump-mir path\to\file.aster
 
 The command reads and validates the `.aster` source, lowers its general-language HIR to MIR, and prints
 the result. It never executes the program and does not invoke Cranelift, machine-code generation, or a
-linker. Invalid input is rejected with the normal positioned diagnostics before MIR
+system linker. Invalid input is rejected with the normal positioned diagnostics before MIR
 is created.
 
 The output is a debug-oriented tree containing typed functions, locals, basic blocks, instructions,

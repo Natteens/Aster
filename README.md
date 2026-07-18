@@ -2,15 +2,12 @@
 
 [![CI](https://github.com/Natteens/Aster/actions/workflows/ci.yml/badge.svg)](https://github.com/Natteens/Aster/actions/workflows/ci.yml)
 
-Aster is an experimental, general-purpose native programming language. Its compiler is written in
-Rust and combines a familiar C#-inspired syntax with a pipeline built specifically for the
-language.
+Aster is an experimental native language that explores how low-level programming can feel direct
+without making every program look low-level. Its code is familiar and readable, while types,
+representations, errors, and runtime costs stay concrete.
 
-The project explores how concrete types, monomorphized generics, and explicit absence and error
-values can fit into a small native language without hiding the compiler architecture.
-
-> Aster is not production-ready. Its syntax, runtime model, and tooling may change. Automatic
-> parallelism is a future research direction, not a feature of the current compiler.
+The compiler is written in Rust and executes programs natively through a Cranelift JIT. Aster is
+not production-ready: syntax, tooling, and the runtime model may still change.
 
 ## A first program
 
@@ -19,81 +16,74 @@ public class Program
 {
     public static int Main()
     {
+        Log("Hello, Aster!");
         return 42;
     }
 }
 ```
 
-With [stable Rust](https://rustup.rs) installed (Rust 1.85 or newer), install the CLI from the
-repository root:
+After cloning the repository, install the CLI from its root with stable Rust 1.85 or newer:
 
 ```console
 cargo install --path crates/aster-cli --locked --force
 ```
 
-The installed executable is named `aster`. Run the matching example with:
+The installed executable is named `aster`:
 
 ```console
 aster run examples/hello.aster
+aster check examples/hello.aster
+aster watch examples/hello.aster
 ```
 
-The compiler JIT-compiles the program with Cranelift and prints `42`.
+The first command logs a greeting and prints `42`.
 
-## What works today
+## Why Aster
 
-- Concrete primitive and user-defined types, including classes, structs, interfaces, enums,
-  properties, arrays, and immutable strings.
-- Functions, methods, constructors, control flow, namespaces, `using` declarations, and multifile
-  projects.
-- Generic functions and types specialized through monomorphization before HIR and MIR.
-- `Option<T>`, `Result<T, E>`, exhaustive enum `switch`, and postfix `?` propagation.
-- A small source-based standard library with `aster.core`, `aster.math`, and `aster.text`.
-- CLI commands for checking, running, watching, and inspecting typed HIR and control-flow MIR.
-- Native in-memory execution through the Cranelift JIT.
+Aster is guided by a few practical choices:
 
-Aster does not currently produce standalone executables or object files. It also has no package
-manager, finalized long-lived memory model, garbage collector, or AOT backend.
+- **Concrete types.** Generic code is specialized before HIR and MIR, so layouts and calls do not
+  depend on hidden type erasure.
+- **Predictable behavior.** Evaluation order, dispatch, allocation, and value-versus-reference
+  semantics should be visible in the language model.
+- **Explicit failure.** Expected absence and errors travel through values such as `Option<T>` and
+  `Result<T, E>` instead of implicit nulls or exceptions.
+- **Usable tools.** Installation, diagnostics, examples, and the CLI are part of the language
+  experience, not an afterthought.
 
-## Design direction
+The complete principles and their practical consequences are in the
+[design goals](docs/specification/00-goals.md).
 
-- Keep the source language familiar while making types and effects explicit.
-- Carry concrete types through the compiler instead of relying on runtime generic erasure.
-- Keep AST, HIR, MIR, runtime boundaries, and backend responsibilities visible and testable.
-- Add language behavior only as complete vertical slices with diagnostics, lowering, execution,
-  tests, and documentation.
+## Where the project stands
 
-Concurrency, automatic parallelism, GPU support, and optional engine-oriented libraries remain
-research topics. They are not implied by the current language or runtime.
+Today Aster can run single-file and multifile programs with concrete primitives, arrays, classes,
+structs, interfaces, enums, properties, overloads, namespaces, and monomorphized generics. Its
+standard library includes focused math and text APIs together with `Option<T>` and `Result<T, E>`.
 
-## Toolchain
+The compiler follows a typed pipeline from AST to HIR, MIR, and Cranelift. It does not yet produce
+standalone executables, manage packages, provide long-lived object ownership, or offer a garbage
+collector. Automatic parallelism, threads, GPU execution, and HVM integration are research topics,
+not current features. Any future work in that area must preserve determinism and make its costs
+understandable; Aster is not committed to reproducing Bend's architecture.
 
-```text
-source -> lexer/parser -> AST -> linking/monomorphization/semantics -> HIR -> MIR -> Cranelift JIT
-```
+## Learn and explore
 
-Aster remains an intentional Cargo workspace. The syntax, compiler, IRs, runtime, shared type rules,
-CLI, and Cranelift backend live in separate crates. The declarative VS Code extension remains in
-[`editors/vscode`](editors/vscode/README.md).
+- [Getting started](docs/getting-started.md) installs the CLI and builds a first program.
+- [Runnable examples](examples/README.md) provide a short learning path.
+- [Language tour](docs/language-tour.md) explains the main ideas through code.
+- [Documentation index](docs/README.md) separates guides, reference, compiler internals, and
+  research notes.
 
-## Documentation
+## Development
 
-The [documentation index](docs/README.md) is the main map for guides, language reference,
-standard-library APIs, compiler internals, development, releases, and roadmaps.
-
-Good starting points:
-
-- [Getting started](docs/getting-started.md)
-- [Examples](examples/README.md)
-- [Language tour](docs/language-tour.md)
-- [CLI reference](docs/reference/cli.md)
-- [Compiler architecture](docs/compiler/architecture.md)
-
-## Contributing
+Aster is a Cargo workspace: the compiler, syntax tree, IRs, runtime, CLI, and Cranelift backend are
+separate crates. The VS Code extension lives in [`editors/vscode`](editors/vscode/README.md).
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before proposing language behavior or architectural changes.
-It documents the required checks and Conventional Commit policy.
+The official project is maintained at [Natteens/Aster](https://github.com/Natteens/Aster); forks
+should follow the [project identity policy](TRADEMARKS.md) when they are distributed.
 
 ## License
 
-Aster is available under either the [MIT License](LICENSE-MIT) or the
+Aster is currently available under either the [MIT License](LICENSE-MIT) or the
 [Apache License 2.0](LICENSE-APACHE), at your option.
