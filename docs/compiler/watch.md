@@ -2,7 +2,6 @@
 
 ```
 aster watch <FILE> [--function <NAME>]
-cargo run -p aster-cli -- watch <FILE> [--function <NAME>]
 ```
 
 `FILE` is the root source. The watcher tracks it, the nearest `Aster.toml`, and every successfully
@@ -27,3 +26,6 @@ Behavior:
 
 This is **recompile and restart**, not hot reload: no program state survives a rebuild. See
 `docs/compiler/hot-reload-foundation.md` for the future hot reload design.
+
+When developing the compiler without installing the binary, see [Development](development.md) for
+the equivalent Cargo workflow.

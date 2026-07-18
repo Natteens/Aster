@@ -6,12 +6,31 @@ executable output or game engine attached.
 
 You need [Rust](https://rustup.rs) installed; everything else is in this repository.
 
+## Install the CLI
+
+From the repository root, install the development build once:
+
+```console
+cargo install --path crates/aster-cli --locked --force
+```
+
+Cargo installs an executable named `aster` in its binary directory, normally
+`%USERPROFILE%\.cargo\bin` on Windows or `$HOME/.cargo/bin` on Unix. Make sure that directory is on
+`PATH`, then verify the installation:
+
+```console
+aster --version
+aster --help
+```
+
+The standard library is embedded in the executable, so normal commands work outside the repository.
+
 ## Run your first app
 
 From the repository root:
 
-```powershell
-cargo run --quiet -p aster-cli -- run examples\conventional_main.aster
+```console
+aster run examples/hello.aster
 ```
 
 This finds `public static int Main()`, compiles it, and prints `42`. The first compiler build can
@@ -33,14 +52,14 @@ public class Program
 
 Check it for errors without running anything:
 
-```powershell
-cargo run -p aster-cli -- check hello.aster
+```console
+aster check hello.aster
 ```
 
 Run it:
 
-```powershell
-cargo run -p aster-cli -- run hello.aster
+```console
+aster run hello.aster
 ```
 
 For an application, `Main` must be public, static, parameterless, and return `void` or `int`.
@@ -62,8 +81,8 @@ examples/hello_app/
 
 Run it with:
 
-```powershell
-cargo run --quiet -p aster-cli -- run examples\hello_app\app\main.aster
+```console
+aster run examples/hello_app/app/main.aster
 ```
 
 It logs a greeting and prints `42`. Both files belong to namespace `app` because they are in the
@@ -88,14 +107,14 @@ public class Program
 
 Run the complete example with:
 
-```powershell
-cargo run --quiet -p aster-cli -- run examples\math_basics.aster
+```console
+aster run examples/math_basics.aster
 ```
 
 The result is `100`. A manifest-based project example is also available:
 
-```powershell
-cargo run --quiet -p aster-cli -- run examples\standard_library\app\main.aster
+```console
+aster run examples/standard_library/app/main.aster
 ```
 
 See the [standard library](reference/standard-library.md) and
@@ -125,40 +144,38 @@ if (!String.IsEmpty(message))
 
 Run the complete example with:
 
-```powershell
-cargo run --quiet -p aster-cli -- run examples\standard_text\app\main.aster
+```console
+aster run examples/standard_text/app/main.aster
 ```
 
 See the [strings reference](reference/strings.md) for allocation and Unicode details.
 
 ## Rerun on every save
 
-```powershell
-cargo run -p aster-cli -- watch examples\conventional_main.aster
+```console
+aster watch examples/hello.aster
 ```
 
 `watch` reruns `Main` whenever the root file, a loaded project namespace file, or `Aster.toml`
 changes. A broken
 save reports diagnostics and keeps watching. Press `Ctrl+C` to stop it normally.
 
-## Run an explicit test function
+## Run an explicit development function
 
 Existing examples and compiler tests can still choose a public parameterless namespace-level function:
 
-```powershell
-cargo run -p aster-cli -- run examples\expressions.aster --function Run
+```console
+aster run examples/expressions.aster --function Run
 ```
 
 `--function` takes precedence over the conventional or manifest entry.
 
-## Run the compiler tests
-
-```powershell
-cargo test --workspace
-```
+This override is intended for targeted compiler development and debugging. Public examples use
+`Program.Main` or a manifest entry instead.
 
 ## Where to go next
 
+- [Examples](../examples/README.md) — the recommended runnable sequence.
 - [Language tour](language-tour.md) — the language by example.
 - [CLI reference](reference/cli.md) — checking, running, watching, and IR inspection.
 - [VS Code extension](../editors/vscode/README.md) — syntax highlighting and snippets.

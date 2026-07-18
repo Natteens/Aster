@@ -7,6 +7,7 @@ that a feature is implemented.
 
 ## Getting Started
 
+- [Runnable examples](../examples/README.md) — the recommended single-file and multifile examples.
 - [Getting started](getting-started.md) — install Rust, run an application, use namespaces, and try
   the standard library.
 - [Language tour](language-tour.md) — a compact walkthrough of the implemented language.

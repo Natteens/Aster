@@ -23,8 +23,11 @@ internal int Read(IScore item)
     return item.Value();
 }
 
-public int Run()
+public class Program
 {
-    Counter counter = new Counter(42);
-    return Read(counter);
+    public static int Main()
+    {
+        Counter counter = new Counter(42);
+        return Read(counter);
+    }
 }

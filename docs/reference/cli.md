@@ -1,7 +1,13 @@
 # Command line
 
-The compiler ships one binary, `aster`. During development, replace `aster` with
-`cargo run -p aster-cli --`.
+Install the `aster` binary from the repository root:
+
+```console
+cargo install --path crates/aster-cli --locked --force
+```
+
+The standard library is embedded in the executable, so the CLI can run source files from any
+working directory.
 
 | Command | What it does |
 | --- | --- |
@@ -13,8 +19,8 @@ The compiler ships one binary, `aster`. During development, replace `aster` with
 
 ## Running an application
 
-```powershell
-aster run examples\conventional_main.aster
+```console
+aster run examples/hello.aster
 ```
 
 Without `--function`, `run` uses the nearest optional `Aster.toml` entry or finds one conventional
@@ -29,13 +35,13 @@ aster run examples\jit_basics.aster --function Calculate
 
 The explicit function must be a public, parameterless namespace-level function in the root namespace. Its
 supported result is printed, and `void` prints `function completed successfully (void)`. This mode
-takes precedence over `Aster.toml` and conventional `Main`; it is useful for examples and compiler
-development.
+takes precedence over `Aster.toml` and conventional `Main`; it is intended for targeted compiler
+development, tests, and debugging.
 
 ## Watching a project
 
-```powershell
-aster watch examples\conventional_main.aster
+```console
+aster watch examples/hello.aster
 ```
 
 `watch` keeps the terminal open and recompiles after changes to the root, a loaded project
@@ -47,3 +53,9 @@ explicit test function instead.
 Unsupported runtime constructs are rejected with a controlled error rather than executed
 incorrectly. See [types](types.md), [namespaces](namespaces.md), and
 [application entry](application-entry.md) for the current boundaries.
+
+## Compiler development
+
+Contributors can run the binary from the checkout without installing it by replacing `aster` with
+`cargo run -p aster-cli --`. See [compiler development](../compiler/development.md) for the full
+workspace validation workflow.

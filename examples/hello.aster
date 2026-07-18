@@ -1,0 +1,8 @@
+public class Program
+{
+    public static int Main()
+    {
+        Log("Hello, Aster!");
+        return 42;
+    }
+}

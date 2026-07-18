@@ -1,0 +1,15 @@
+public class Program
+{
+    public static int Main()
+    {
+        int total = 0;
+        for (int value = 1; value <= 6; value++)
+        {
+            if (value % 2 == 0)
+            {
+                total += value;
+            }
+        }
+        return total;
+    }
+}

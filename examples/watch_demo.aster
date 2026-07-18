@@ -1,8 +1,11 @@
-// Try: aster watch examples/watch_demo.aster --function Run
+// Try: aster watch examples/watch_demo.aster
 // Edit the returned value and save; the watcher recompiles and reruns.
 
-public int Run()
+public class Program
 {
-    Log("watch demo executou");
-    return 3;
+    public static int Main()
+    {
+        Log("watch demo executou");
+        return 3;
+    }
 }

@@ -56,7 +56,7 @@ an engine, or remote downloads.
 
 ## Explicit development entry
 
-`--function NAME` remains useful for examples and compiler tests:
+`--function NAME` remains useful for targeted compiler tests and debugging:
 
 ```powershell
 aster run examples\expressions.aster --function Run

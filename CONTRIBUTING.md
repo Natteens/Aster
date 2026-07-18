@@ -14,6 +14,9 @@ cargo test --workspace --all-targets
 git diff --check
 ```
 
+These Cargo commands validate the compiler checkout. User-facing guides use the installed `aster`
+binary; contributors may run `cargo run -p aster-cli -- <COMMAND>` when testing local CLI changes.
+
 Commits must follow [Conventional Commits](https://www.conventionalcommits.org/):
 `type(scope): description`. Common types are `feat`, `fix`, `docs`, `test`, `refactor`, `perf`,
 `build`, `ci`, and `chore`. Breaking changes use `!` or a `BREAKING CHANGE:` footer.

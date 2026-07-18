@@ -13,11 +13,21 @@ fn run(mut arguments: impl Iterator<Item = String>) -> Result<(), ()> {
     match arguments.next().as_deref() {
         Some(command @ ("check" | "dump-hir" | "dump-mir")) => {
             let Some(file_name) = arguments.next() else {
-                eprintln!("error: missing .aster file\n\nUsage: aster {command} <FILE>");
+                eprintln!("error: missing source file\n\nUsage: aster {command} <FILE>");
                 return Err(());
             };
-            if arguments.next().is_some() {
-                eprintln!("error: unexpected extra argument\n\nUsage: aster {command} <FILE>");
+            if matches!(file_name.as_str(), "--help" | "-h") {
+                if let Some(argument) = arguments.next() {
+                    eprintln!("error: unexpected argument `{argument}`");
+                    return Err(());
+                }
+                print_command_help(command);
+                return Ok(());
+            }
+            if let Some(argument) = arguments.next() {
+                eprintln!(
+                    "error: unexpected argument `{argument}`\n\nUsage: aster {command} <FILE>"
+                );
                 return Err(());
             }
             process_file(command, &file_name)
@@ -25,15 +35,25 @@ fn run(mut arguments: impl Iterator<Item = String>) -> Result<(), ()> {
         Some(command @ ("run" | "watch")) => {
             let Some(file_name) = arguments.next() else {
                 eprintln!(
-                    "error: missing .aster file\n\nUsage: aster {command} <FILE> [--function <NAME>]"
+                    "error: missing source file\n\nUsage: aster {command} <FILE> [--function <NAME>]"
                 );
                 return Err(());
             };
+            if matches!(file_name.as_str(), "--help" | "-h") {
+                if let Some(argument) = arguments.next() {
+                    eprintln!("error: unexpected argument `{argument}`");
+                    return Err(());
+                }
+                print_command_help(command);
+                return Ok(());
+            }
             let function_name = match arguments.next() {
                 None => None,
                 Some(option) if option == "--function" => {
                     let Some(name) = arguments.next() else {
-                        eprintln!("error: missing function name after `--function`");
+                        eprintln!(
+                            "error: missing function name after `--function`\n\nUsage: aster {command} <FILE> [--function <NAME>]"
+                        );
                         return Err(());
                     };
                     Some(name)
@@ -45,9 +65,9 @@ fn run(mut arguments: impl Iterator<Item = String>) -> Result<(), ()> {
                     return Err(());
                 }
             };
-            if arguments.next().is_some() {
+            if let Some(argument) = arguments.next() {
                 eprintln!(
-                    "error: unexpected extra argument\n\nUsage: aster {command} <FILE> [--function <NAME>]"
+                    "error: unexpected argument `{argument}`\n\nUsage: aster {command} <FILE> [--function <NAME>]"
                 );
                 return Err(());
             }
@@ -58,10 +78,22 @@ fn run(mut arguments: impl Iterator<Item = String>) -> Result<(), ()> {
             }
         }
         Some("--version" | "-V") => {
+            if let Some(argument) = arguments.next() {
+                eprintln!("error: unexpected argument `{argument}`");
+                return Err(());
+            }
             println!("aster {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Some("--help" | "-h") | None => {
+        Some("--help" | "-h") => {
+            if let Some(argument) = arguments.next() {
+                eprintln!("error: unexpected argument `{argument}`");
+                return Err(());
+            }
+            print_help();
+            Ok(())
+        }
+        None => {
             print_help();
             Ok(())
         }
@@ -75,16 +107,34 @@ fn run(mut arguments: impl Iterator<Item = String>) -> Result<(), ()> {
 
 pub(crate) fn read_source(file_name: &str) -> Result<String, ()> {
     let path = Path::new(file_name);
-    if path.extension().and_then(|extension| extension.to_str()) != Some("aster") {
-        eprintln!("error: expected a file with the `.aster` extension");
-        return Err(());
-    }
+    validate_source_file(path)?;
     fs::read_to_string(path).map_err(|error| {
         eprintln!("error: could not read `{file_name}`: {error}");
     })
 }
 
+fn validate_source_file(path: &Path) -> Result<(), ()> {
+    let display = path.display();
+    let metadata = fs::metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            eprintln!("error: file not found: {display}");
+        } else {
+            eprintln!("error: could not access `{display}`: {error}");
+        }
+    })?;
+    if metadata.is_dir() {
+        eprintln!("error: expected an Aster source file, found directory: {display}");
+        return Err(());
+    }
+    if path.extension().and_then(|extension| extension.to_str()) != Some("aster") {
+        eprintln!("error: expected an Aster source file with the `.aster` extension: {display}");
+        return Err(());
+    }
+    Ok(())
+}
+
 fn process_file(command: &str, file_name: &str) -> Result<(), ()> {
+    validate_source_file(Path::new(file_name))?;
     match aster_compiler::compile_project(Path::new(file_name)) {
         Ok(project) => {
             let compilation = &project.compilation;
@@ -124,6 +174,7 @@ fn process_file(command: &str, file_name: &str) -> Result<(), ()> {
 }
 
 fn run_file(file_name: &str, function_name: Option<&str>) -> Result<(), ()> {
+    validate_source_file(Path::new(file_name))?;
     let project = match aster_compiler::compile_project(Path::new(file_name)) {
         Ok(compilation) => compilation,
         Err(diagnostics) => {
@@ -203,6 +254,33 @@ fn print_help() {
     println!(
         "Aster compiler\n\nUsage: aster <COMMAND>\n\nCommands:\n  check <FILE>                       Validate an Aster source file\n  dump-hir <FILE>                    Validate and print typed HIR without executing\n  dump-mir <FILE>                    Validate and print control-flow MIR without executing\n  run <FILE> [--function <NAME>]     Run application Main or an explicitly selected function\n  watch <FILE> [--function <NAME>]   Recompile and rerun on each file change\n\nOptions:\n  -h, --help                         Print help\n  -V, --version                      Print version"
     );
+}
+
+fn print_command_help(command: &str) {
+    let (usage, description) = match command {
+        "check" => (
+            "aster check <FILE>",
+            "Validate an Aster source file or project root source.",
+        ),
+        "dump-hir" => (
+            "aster dump-hir <FILE>",
+            "Validate and print typed HIR without executing.",
+        ),
+        "dump-mir" => (
+            "aster dump-mir <FILE>",
+            "Validate and print control-flow MIR without executing.",
+        ),
+        "run" => (
+            "aster run <FILE> [--function <NAME>]",
+            "Run the application entry point or an explicitly selected function.",
+        ),
+        "watch" => (
+            "aster watch <FILE> [--function <NAME>]",
+            "Recompile and rerun when a loaded project file changes.",
+        ),
+        _ => unreachable!("help requested for a known command"),
+    };
+    println!("{description}\n\nUsage: {usage}");
 }
 
 #[cfg(test)]

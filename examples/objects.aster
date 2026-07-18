@@ -1,0 +1,29 @@
+public class Counter
+{
+    private int value;
+
+    public Counter(int initialValue)
+    {
+        value = initialValue;
+    }
+
+    public int Value
+    {
+        get { return value; }
+    }
+
+    public void Add(int amount)
+    {
+        value += amount;
+    }
+}
+
+public class Program
+{
+    public static int Main()
+    {
+        Counter counter = new Counter(40);
+        counter.Add(2);
+        return counter.Value;
+    }
+}

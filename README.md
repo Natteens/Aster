@@ -24,11 +24,17 @@ public class Program
 }
 ```
 
-With [stable Rust](https://rustup.rs) installed (Rust 1.85 or newer), run the matching example from
-the repository root:
+With [stable Rust](https://rustup.rs) installed (Rust 1.85 or newer), install the CLI from the
+repository root:
 
 ```console
-cargo run --quiet -p aster-cli -- run examples/conventional_main.aster
+cargo install --path crates/aster-cli --locked --force
+```
+
+The installed executable is named `aster`. Run the matching example with:
+
+```console
+aster run examples/hello.aster
 ```
 
 The compiler JIT-compiles the program with Cranelift and prints `42`.
@@ -77,6 +83,7 @@ standard-library APIs, compiler internals, development, releases, and roadmaps.
 Good starting points:
 
 - [Getting started](docs/getting-started.md)
+- [Examples](examples/README.md)
 - [Language tour](docs/language-tour.md)
 - [CLI reference](docs/reference/cli.md)
 - [Compiler architecture](docs/compiler/architecture.md)

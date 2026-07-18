@@ -71,9 +71,9 @@ will mean that one type may be divided across files.
 
 ## Run and watch
 
-```powershell
-cargo run --quiet -p aster-cli -- run examples\namespaces\app\main.aster
-cargo run --quiet -p aster-cli -- watch examples\namespaces\app\main.aster
+```console
+aster run examples/namespaces/app/main.aster
+aster watch examples/namespaces/app/main.aster
 ```
 
 The nearest `Aster.toml` establishes the project root. Without a manifest, the directory that

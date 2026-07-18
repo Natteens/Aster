@@ -8,8 +8,11 @@ public T First<T>(T[] values)
     return values[0];
 }
 
-public int Run()
+public class Program
 {
-    int[] values = [10, 20, 42];
-    return Choose<int>(false, First(values), 42);
+    public static int Main()
+    {
+        int[] values = [10, 20, 42];
+        return Choose<int>(false, First(values), 42);
+    }
 }
