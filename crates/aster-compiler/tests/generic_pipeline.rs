@@ -57,6 +57,25 @@ fn generic_diagnostics_are_specific() {
 }
 
 #[test]
+fn expanding_function_specialization_reports_the_recursive_call_span() {
+    let source = "public T Grow<T>(T value) { T[] values = [value]; return Grow(values); } public int Run() { return Grow(1); }";
+    let diagnostics = aster_compiler::compile(source).expect_err("expansion must be rejected");
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("recursively creates a different specialization")
+        })
+        .expect("expansion diagnostic");
+
+    assert_eq!(
+        &source[diagnostic.span.start..diagnostic.span.end],
+        "Grow(values)"
+    );
+}
+
+#[test]
 fn substitution_handles_multiple_parameters_through_nested_expressions() {
     let source = "public U Select<T, U>(bool condition, T first, U second) { T[] firsts = [first]; U[] seconds = [second]; seconds[0] = second; return condition ? seconds[0] : second; } public long Run() { return Select<int, long>(true, 1, 42L); }";
     let compilation = aster_compiler::compile(source).expect("two parameter specialization");

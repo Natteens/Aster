@@ -54,6 +54,25 @@ fn generic_type_diagnostics_are_specific() {
 }
 
 #[test]
+fn expanding_type_specialization_reports_the_recursive_type_span() {
+    let source = "public class Grow<T> { public Grow<Grow<T>> next; public Grow() {} } public int Run() { Grow<int> value = new Grow<int>(); return 0; }";
+    let diagnostics = aster_compiler::compile(source).expect_err("expansion must be rejected");
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("infinitely expanding specialization")
+        })
+        .expect("expansion diagnostic");
+
+    assert_eq!(
+        &source[diagnostic.span.start..diagnostic.span.end],
+        "Grow<Grow<T>> "
+    );
+}
+
+#[test]
 fn nested_generic_arrays_are_concrete_in_all_declaration_positions() {
     let source = "public struct Pair<T, U> { public T First; public U Second; } public class Box<T> { private T value; public Box(T value) { this.value = value; } public T Value { get { return value; } private set { value = value; } } public T Get() { return value; } } public Box<Pair<int, long>[]> Echo(Box<Pair<int, long>[]> value) { return value; } public int Run() { Pair<int, long>[] pairs = [Pair<int, long> { First: 42, Second: 1L }]; Box<Pair<int, long>[]> boxed = new Box<Pair<int, long>[]>(pairs); Box<Pair<int, long>[]> echoed = Echo(boxed); return (int)echoed.Value[0].First; }";
     let compilation = aster_compiler::compile(source).expect("nested generic arrays");
