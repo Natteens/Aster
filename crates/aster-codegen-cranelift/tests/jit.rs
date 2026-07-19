@@ -8,13 +8,13 @@ fn run(source: &str, function: &str) -> Result<ExecutionValue, String> {
 }
 
 fn run_project(source: &str, function: &str) -> Result<ExecutionValue, String> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("aster-stdlib-jit-{nonce}.aster"));
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "aster-stdlib-jit-{}-{id}.aster",
+        std::process::id()
+    ));
     std::fs::write(&path, source).expect("write temporary Aster project");
     let compilation = compile_project(&path).map_err(|diagnostics| format!("{diagnostics:#?}"));
     std::fs::remove_file(&path).expect("remove temporary Aster project");
