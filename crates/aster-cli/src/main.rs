@@ -311,10 +311,12 @@ fn print_command_help(command: &str) {
 mod tests {
     use std::{
         fs,
-        time::{SystemTime, UNIX_EPOCH},
+        sync::atomic::{AtomicU64, Ordering},
     };
 
     use super::{process_file, run, run_file};
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn help_accepts_dump_hir_command() {
@@ -323,11 +325,9 @@ mod tests {
 
     #[test]
     fn dump_hir_validates_and_prints_without_execution() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("aster-dump-hir-{nonce}.aster"));
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("aster-dump-hir-{}-{id}.aster", std::process::id()));
         fs::write(&path, "public int Value() { return 1; }").expect("write test source");
         let result = process_file("dump-hir", path.to_str().expect("UTF-8 test path"));
         fs::remove_file(path).expect("remove test source");
@@ -336,11 +336,9 @@ mod tests {
 
     #[test]
     fn dump_mir_validates_and_prints_without_execution() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("aster-dump-mir-{nonce}.aster"));
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("aster-dump-mir-{}-{id}.aster", std::process::id()));
         fs::write(&path, "public int Value() { return 1; }").expect("write test source");
         let result = process_file("dump-mir", path.to_str().expect("UTF-8 test path"));
         fs::remove_file(path).expect("remove test source");
@@ -361,11 +359,9 @@ mod tests {
         assert!(process_file("check", library.to_str().expect("UTF-8 path")).is_ok());
         fs::remove_file(library).expect("remove library source");
 
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!("aster-check-manifest-{nonce}"));
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("aster-check-manifest-{}-{id}", std::process::id()));
         fs::create_dir_all(&directory).expect("create test directory");
         fs::write(directory.join("Aster.toml"), "[application\nentry = 1")
             .expect("write invalid manifest");
@@ -400,11 +396,9 @@ mod tests {
 
     #[test]
     fn explicit_function_takes_precedence_over_an_invalid_manifest() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after epoch")
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!("aster-override-{nonce}"));
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("aster-override-{}-{id}", std::process::id()));
         fs::create_dir_all(&directory).expect("create test project");
         fs::write(directory.join("Aster.toml"), "not valid toml = [")
             .expect("write invalid manifest");
@@ -421,11 +415,9 @@ mod tests {
 
     #[test]
     fn manifest_entry_executes_with_same_namespace_files() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after epoch")
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!("aster-manifest-run-{nonce}"));
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("aster-manifest-run-{}-{id}", std::process::id()));
         fs::create_dir_all(directory.join("app")).expect("create test project");
         fs::write(
             directory.join("Aster.toml"),
@@ -450,11 +442,9 @@ mod tests {
 
     #[test]
     fn function_from_a_used_namespace_cannot_be_selected_as_the_entry() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after epoch")
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!("aster-entry-{nonce}"));
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("aster-entry-{}-{id}", std::process::id()));
         fs::create_dir_all(directory.join("app")).expect("create test project");
         let root = directory.join("main.aster");
         fs::write(&root, "using app; public int Run() { return Double(2); }")
@@ -474,11 +464,9 @@ mod tests {
     }
 
     fn test_file(label: &str, source: &str) -> std::path::PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("aster-{label}-{nonce}.aster"));
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("aster-{label}-{}-{id}.aster", std::process::id()));
         fs::write(&path, source).expect("write test source");
         path
     }

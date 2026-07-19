@@ -219,13 +219,16 @@ mod tests {
         collections::BTreeMap,
         fs,
         path::PathBuf,
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        sync::atomic::{AtomicU64, Ordering},
+        time::{Duration, SystemTime},
     };
 
     use super::{
         ChangeDetector, DependencyChangeDetector, Snapshot, WatchDecision, build_and_run,
         watched_paths,
     };
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
     #[allow(clippy::unnecessary_wraps)] // matches `ChangeDetector::observe`'s input
     fn snapshot(seconds: u64, length: u64) -> Option<Snapshot> {
@@ -294,11 +297,9 @@ mod tests {
 
     #[test]
     fn conventional_entry_runs_and_manifest_is_watched() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!("aster-watch-main-{nonce}"));
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("aster-watch-main-{}-{id}", std::process::id()));
         fs::create_dir_all(&directory).expect("create test directory");
         let manifest = directory.join("Aster.toml");
         fs::write(&manifest, "[application]\nentry = \"app.Program.Main\"\n")
@@ -332,11 +333,9 @@ mod tests {
 
     #[test]
     fn string_rebuilds_use_fresh_execution_contexts() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!("aster-watch-strings-{nonce}"));
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("aster-watch-strings-{}-{id}", std::process::id()));
         fs::create_dir_all(&directory).expect("create test directory");
         let root = directory.join("main.aster");
         fs::write(
@@ -356,11 +355,9 @@ mod tests {
 
     #[test]
     fn failed_rebuild_keeps_the_last_successful_namespace_graph() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!("aster-watch-recovery-{nonce}"));
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("aster-watch-recovery-{}-{id}", std::process::id()));
         let dependency = directory.join("app/value.aster");
         fs::create_dir_all(dependency.parent().expect("namespace parent")).expect("create project");
         fs::write(

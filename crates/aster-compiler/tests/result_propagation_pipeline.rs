@@ -1,12 +1,15 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use aster_compiler::{ProjectCompilation, compile_project, hir, mir};
 
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
 fn compile(source: &str) -> Result<ProjectCompilation, Vec<String>> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("aster-try-pipeline-{nonce}.aster"));
+    let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "aster-try-pipeline-{}-{id}.aster",
+        std::process::id()
+    ));
     std::fs::write(&path, source).expect("write temporary source");
     let result = compile_project(&path).map_err(|diagnostics| {
         diagnostics
@@ -28,12 +31,8 @@ fn errors(source: &str) -> Vec<String> {
 /// Compile a multi-file project laid out as `(relative_path, contents)` pairs.
 /// The first entry is the root file passed to `compile_project`.
 fn compile_dir(files: &[(&str, &str)]) -> Result<ProjectCompilation, Vec<String>> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!("aster-try-proj-{nonce}"));
+    let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("aster-try-proj-{}-{id}", std::process::id()));
     for (relative, contents) in files {
         let path = root.join(relative);
         std::fs::create_dir_all(path.parent().expect("file has a parent")).expect("create dirs");

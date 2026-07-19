@@ -1,10 +1,12 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use aster_compiler::{ProjectSourceOrigin, compile_project};
+
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 struct Project {
     root: PathBuf,
@@ -12,11 +14,11 @@ struct Project {
 
 impl Project {
     fn new(label: &str) -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("aster-namespace-{label}-{nonce}"));
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "aster-namespace-{label}-{}-{id}",
+            std::process::id()
+        ));
         fs::create_dir_all(&root).expect("create project");
         Self { root }
     }

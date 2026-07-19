@@ -1,6 +1,10 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use aster_codegen_cranelift::{ExecutionValue, execute, execute_symbol};
 use aster_compiler::{compile, compile_project};
 use aster_mir as mir;
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 fn run(source: &str, function: &str) -> Result<ExecutionValue, String> {
     let compilation = compile(source).map_err(|diagnostics| format!("{diagnostics:#?}"))?;
@@ -8,8 +12,6 @@ fn run(source: &str, function: &str) -> Result<ExecutionValue, String> {
 }
 
 fn run_project(source: &str, function: &str) -> Result<ExecutionValue, String> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
         "aster-stdlib-jit-{}-{id}.aster",
@@ -254,13 +256,11 @@ fn field_initializer_constructs_a_nested_object_with_constructor_arguments() {
 
 #[test]
 fn field_initializer_construction_resolves_across_namespace_files() {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!("aster-field-initializer-{nonce}"));
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "aster-field-initializer-{}-{id}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(root.join("app")).expect("create namespace directory");
     let main = root.join("main.aster");
     std::fs::write(

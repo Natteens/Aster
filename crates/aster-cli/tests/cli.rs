@@ -2,8 +2,10 @@ use std::{
     fs,
     path::PathBuf,
     process::{Command, Output},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::atomic::{AtomicU64, Ordering},
 };
+
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[test]
 fn global_help_and_version_describe_the_installed_binary() {
@@ -207,11 +209,8 @@ fn aster<const N: usize>(arguments: [&str; N]) -> Output {
 }
 
 fn temporary_directory(label: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock after Unix epoch")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!("aster-cli-{label}-{nonce}"));
+    let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("aster-cli-{label}-{}-{id}", std::process::id()));
     fs::create_dir_all(&path).expect("create temporary directory");
     path
 }

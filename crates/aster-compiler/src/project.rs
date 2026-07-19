@@ -928,18 +928,20 @@ impl AstVisitorMut for Rewriter {
 mod standard_library_tests {
     use std::{
         fs,
-        time::{SystemTime, UNIX_EPOCH},
+        sync::atomic::{AtomicU64, Ordering},
     };
 
     use super::{StandardLibrary, compile_project_with_standard_library};
 
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
     #[test]
     fn missing_official_namespace_reports_an_incomplete_distribution() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("aster-missing-stdlib-{nonce}.aster"));
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "aster-missing-stdlib-{}-{id}.aster",
+            std::process::id()
+        ));
         fs::write(&path, "using aster.math; public int Run() { return 0; }")
             .expect("write test source");
         let diagnostics = compile_project_with_standard_library(&path, StandardLibrary::empty())
