@@ -10,6 +10,7 @@
 //! [`string`]. No pointer handed across this boundary may outlive the JIT
 //! module or session that produced it.
 
+mod arena;
 pub mod context;
 pub mod log;
 mod math;

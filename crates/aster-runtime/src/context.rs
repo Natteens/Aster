@@ -1,7 +1,9 @@
 //! Per-execution ownership and the array runtime ABI.
 
+use std::mem::{align_of, size_of};
 use std::ptr;
 
+use crate::arena::PagedArena;
 use crate::string::AsterStrHeader;
 
 /// Stable array header visible to generated code only through runtime calls.
@@ -34,33 +36,39 @@ enum AllocationCategory {
 }
 
 /// Owns every dynamic allocation made by one JIT invocation.
-/// Dropping the context releases all individually boxed buffers together.
-///
-/// This is **not** a bump arena or region allocator. Each allocation
-/// produces its own `Box<[u64]>`, and all boxes are freed when the
+/// All memory lives in a paged bump arena and is released in bulk when the
 /// context is dropped. No individual deallocation exists.
-#[derive(Default)]
 pub struct ExecutionContext {
-    buffers: Vec<Box<[u64]>>,
-    // Each header needs a stable address while the Vec grows.
-    #[allow(clippy::vec_box)]
-    arrays: Vec<Box<AsterArray>>,
+    arena: PagedArena,
     error: Option<String>,
     collect_stats: bool,
     stats: MemoryStats,
 }
 
+impl Default for ExecutionContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ExecutionContext {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            arena: PagedArena::new(),
+            error: None,
+            collect_stats: false,
+            stats: MemoryStats::default(),
+        }
     }
 
     #[must_use]
     pub fn with_stats() -> Self {
         Self {
+            arena: PagedArena::new(),
+            error: None,
             collect_stats: true,
-            ..Self::default()
+            stats: MemoryStats::default(),
         }
     }
 
@@ -79,12 +87,7 @@ impl ExecutionContext {
         }
     }
 
-    fn record_allocation(
-        &mut self,
-        category: AllocationCategory,
-        requested: usize,
-        reserved: usize,
-    ) {
+    fn record_allocation(&mut self, category: AllocationCategory, requested: usize) {
         if !self.collect_stats {
             return;
         }
@@ -95,8 +98,9 @@ impl ExecutionContext {
             AllocationCategory::String => self.stats.string_allocations += 1,
         }
         self.stats.requested_bytes += requested as u64;
-        self.stats.used_bytes += reserved as u64;
-        self.stats.reserved_bytes += reserved as u64;
+        let metrics = self.arena.metrics();
+        self.stats.used_bytes = metrics.used_bytes as u64;
+        self.stats.reserved_bytes = metrics.reserved_bytes as u64;
         if self.stats.used_bytes > self.stats.peak_used_bytes {
             self.stats.peak_used_bytes = self.stats.used_bytes;
         }
@@ -120,34 +124,30 @@ impl ExecutionContext {
             self.fail("array allocation size exceeds the addressable range");
             valid_size as usize
         };
-        let words = bytes.div_ceil(size_of::<u64>());
-        let reserved = words * size_of::<u64>();
-        let mut buffer = vec![0_u64; words].into_boxed_slice();
-        let data = buffer.as_mut_ptr().cast::<u8>();
-        self.buffers.push(buffer);
-        let mut header = Box::new(AsterArray {
-            data,
-            length: valid_length,
-            element_size: valid_size,
-        });
-        let pointer = ptr::from_mut(header.as_mut());
-        self.arrays.push(header);
-        self.record_allocation(
-            AllocationCategory::Array,
-            bytes,
-            reserved + size_of::<AsterArray>(),
-        );
-        pointer
+        let data = self.arena.alloc(bytes, 8);
+        #[allow(clippy::cast_ptr_alignment)]
+        let header_ptr = self
+            .arena
+            .alloc(size_of::<AsterArray>(), align_of::<AsterArray>())
+            .cast::<AsterArray>();
+        // SAFETY: `header_ptr` points to zeroed, correctly aligned memory for
+        // `AsterArray`. No Rust reference to arena memory is held across this
+        // write. The data pointer was returned by a prior arena allocation and
+        // remains stable.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*header_ptr).data = data;
+            (*header_ptr).length = valid_length;
+            (*header_ptr).element_size = valid_size;
+        }
+        self.record_allocation(AllocationCategory::Array, bytes);
+        header_ptr
     }
 
     pub(crate) fn allocate_object(&mut self, size: u32) -> *mut u8 {
         let bytes = usize::try_from(size.max(1)).unwrap_or(1);
-        let words = bytes.div_ceil(size_of::<u64>());
-        let reserved = words * size_of::<u64>();
-        let mut buffer = vec![0_u64; words].into_boxed_slice();
-        let pointer = buffer.as_mut_ptr().cast::<u8>();
-        self.buffers.push(buffer);
-        self.record_allocation(AllocationCategory::Object, bytes, reserved);
+        let pointer = self.arena.alloc(bytes, 8);
+        self.record_allocation(AllocationCategory::Object, bytes);
         pointer
     }
 
@@ -163,20 +163,12 @@ impl ExecutionContext {
             self.fail("string allocation exceeds the addressable range");
             return ptr::null();
         };
-        let words = total_bytes.div_ceil(size_of::<u64>()).max(1);
-        let reserved = words * size_of::<u64>();
-        let mut buffer = Vec::new();
-        if buffer.try_reserve_exact(words).is_err() {
-            self.fail("string allocation failed");
-            return ptr::null();
-        }
-        buffer.resize(words, 0_u64);
-        // SAFETY: `buffer` owns `words * size_of::<u64>()` writable bytes and
-        // `total_bytes` is no larger than that rounded-up allocation.
+        let ptr = self.arena.alloc(total_bytes, align_of::<AsterStrHeader>());
+        // SAFETY: `ptr` points to `total_bytes` of zeroed, correctly aligned
+        // memory owned by the arena. No other reference to this region exists.
+        // The slice is consumed before `record_allocation` borrows `self`.
         #[allow(unsafe_code)]
-        let bytes = unsafe {
-            std::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<u8>(), total_bytes)
-        };
+        let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, total_bytes) };
         bytes[..size_of::<usize>()].copy_from_slice(&payload_bytes.to_ne_bytes());
         let mut cursor = size_of::<usize>();
         for part in parts {
@@ -184,11 +176,11 @@ impl ExecutionContext {
             bytes[cursor..end].copy_from_slice(part.as_bytes());
             cursor = end;
         }
-        let buffer = buffer.into_boxed_slice();
-        let pointer = buffer.as_ptr().cast::<AsterStrHeader>();
-        self.buffers.push(buffer);
-        self.record_allocation(AllocationCategory::String, total_bytes, reserved);
-        pointer
+        self.record_allocation(AllocationCategory::String, total_bytes);
+        // The arena allocates with `align_of::<AsterStrHeader>()`, so the
+        // pointer is correctly aligned for this cast.
+        #[allow(clippy::cast_ptr_alignment)]
+        ptr.cast::<AsterStrHeader>()
     }
 }
 
@@ -251,6 +243,11 @@ pub extern "C" fn aster_rt_array_length(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::cast_ptr_alignment,
+    clippy::ptr_as_ptr,
+    clippy::ptr_cast_constness
+)]
 mod tests {
     use super::*;
     use crate::object::aster_rt_object_new;
@@ -261,8 +258,12 @@ mod tests {
         let context_pointer = &raw mut context;
         let array = aster_rt_array_new(context_pointer, 2, 4);
         assert_eq!(aster_rt_array_length(context_pointer, array), 2);
-        assert!(!aster_rt_array_element(context_pointer, array, 0).is_null());
-        assert_eq!(context.buffers[0][0], 0);
+        let element = aster_rt_array_element(context_pointer, array, 0);
+        assert!(!element.is_null());
+        // SAFETY: element points to zeroed arena memory with space for a u32.
+        #[allow(unsafe_code)]
+        let value = unsafe { std::ptr::read(element as *const u32) };
+        assert_eq!(value, 0);
         assert!(!aster_rt_array_element(context_pointer, array, 2).is_null());
         assert!(context.take_error().unwrap().contains("outside"));
     }
@@ -272,8 +273,10 @@ mod tests {
         let mut context = ExecutionContext::new();
         let pointer = aster_rt_object_new(&raw mut context, 16);
         assert!(!pointer.is_null());
-        assert_eq!(context.buffers.len(), 1);
-        assert!(context.buffers[0].iter().all(|word| *word == 0));
+        // SAFETY: pointer points to 16 bytes of zeroed memory owned by the arena.
+        #[allow(unsafe_code)]
+        let bytes = unsafe { std::slice::from_raw_parts(pointer, 16) };
+        assert!(bytes.iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -362,5 +365,161 @@ mod tests {
         let stats = context.memory_stats();
         assert!(stats.requested_bytes <= stats.used_bytes);
         assert!(stats.used_bytes <= stats.reserved_bytes);
+    }
+
+    #[test]
+    fn two_objects_have_separate_storage() {
+        let mut context = ExecutionContext::new();
+        let ctx = &raw mut context;
+        let a = aster_rt_object_new(ctx, 32);
+        let b = aster_rt_object_new(ctx, 32);
+        assert_ne!(a, b);
+        // SAFETY: both pointers are arena-owned, non-overlapping.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::write(a as *mut u64, 0xAAAA);
+            std::ptr::write(b as *mut u64, 0xBBBB);
+            assert_eq!(std::ptr::read(a as *const u64), 0xAAAA);
+            assert_eq!(std::ptr::read(b as *const u64), 0xBBBB);
+        }
+    }
+
+    #[test]
+    fn objects_cross_multiple_pages() {
+        let mut context = ExecutionContext::with_stats();
+        let ctx = &raw mut context;
+        let mut ptrs = Vec::new();
+        for _ in 0..2048 {
+            let p = aster_rt_object_new(ctx, 64);
+            assert!(!p.is_null());
+            ptrs.push(p);
+        }
+        // SAFETY: verify first and last are zeroed and distinct.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!(std::ptr::read(ptrs[0] as *const u8), 0);
+            assert_eq!(std::ptr::read(*ptrs.last().unwrap() as *const u8), 0);
+        }
+        assert_ne!(ptrs[0], *ptrs.last().unwrap());
+        let stats = context.memory_stats();
+        assert_eq!(stats.object_allocations, 2048);
+        assert!(stats.reserved_bytes > 64 * 1024);
+    }
+
+    #[test]
+    fn string_valid_after_other_allocations() {
+        let mut context = ExecutionContext::new();
+        let s = context.allocate_string_parts(&["hello"]);
+        assert!(!s.is_null());
+        aster_rt_object_new(&raw mut context, 128);
+        aster_rt_object_new(&raw mut context, 128);
+        // SAFETY: string pointer is arena-owned and stable.
+        #[allow(unsafe_code)]
+        let text = unsafe { crate::string::view(s) };
+        assert_eq!(text, Some("hello"));
+    }
+
+    #[test]
+    fn two_strings_have_separate_storage() {
+        let mut context = ExecutionContext::new();
+        let a = context.allocate_string_parts(&["alpha"]);
+        let b = context.allocate_string_parts(&["beta"]);
+        assert_ne!(a, b);
+        // SAFETY: both strings are arena-owned.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!(crate::string::view(a), Some("alpha"));
+            assert_eq!(crate::string::view(b), Some("beta"));
+        }
+    }
+
+    #[test]
+    fn strings_cross_multiple_pages() {
+        let mut context = ExecutionContext::with_stats();
+        let long_part = "x".repeat(1024);
+        let mut ptrs = Vec::new();
+        for _ in 0..128 {
+            let p = context.allocate_string_parts(&[&long_part]);
+            assert!(!p.is_null());
+            ptrs.push(p);
+        }
+        // SAFETY: first string is still valid.
+        #[allow(unsafe_code)]
+        let text = unsafe { crate::string::view(ptrs[0]) };
+        assert_eq!(text, Some(long_part.as_str()));
+        assert_eq!(context.memory_stats().string_allocations, 128);
+    }
+
+    #[test]
+    fn array_header_and_data_valid_after_new_pages() {
+        let mut context = ExecutionContext::new();
+        let ctx = &raw mut context;
+        let array = aster_rt_array_new(ctx, 4, 4);
+        for _ in 0..4 {
+            aster_rt_object_new(ctx, 32768);
+        }
+        assert_eq!(aster_rt_array_length(ctx, array), 4);
+        let elem = aster_rt_array_element(ctx, array, 3);
+        assert!(!elem.is_null());
+        // SAFETY: element still points to valid zeroed memory.
+        #[allow(unsafe_code)]
+        let value = unsafe { std::ptr::read(elem as *const u32) };
+        assert_eq!(value, 0);
+    }
+
+    #[test]
+    fn large_array_exceeds_default_page() {
+        let mut context = ExecutionContext::with_stats();
+        let ctx = &raw mut context;
+        let array = aster_rt_array_new(ctx, 100_000, 8);
+        assert!(!array.is_null());
+        assert_eq!(aster_rt_array_length(ctx, array), 100_000);
+        let last = aster_rt_array_element(ctx, array, 99_999);
+        assert!(!last.is_null());
+        assert!(context.take_error().is_none());
+        let stats = context.memory_stats();
+        assert_eq!(stats.array_allocations, 1);
+        assert!(stats.reserved_bytes >= 800_000);
+    }
+
+    #[test]
+    fn arena_metrics_known_sequence() {
+        let mut context = ExecutionContext::with_stats();
+        aster_rt_object_new(&raw mut context, 16);
+        let stats = context.memory_stats();
+        assert_eq!(stats.requested_bytes, 16);
+        assert_eq!(stats.used_bytes, 16);
+        assert_eq!(stats.reserved_bytes, 64 * 1024);
+        assert_eq!(stats.peak_used_bytes, stats.used_bytes);
+        assert_eq!(stats.peak_reserved_bytes, stats.reserved_bytes);
+    }
+
+    #[test]
+    fn independent_contexts_have_independent_arenas() {
+        let mut a = ExecutionContext::with_stats();
+        let mut b = ExecutionContext::with_stats();
+        aster_rt_object_new(&raw mut a, 32);
+        aster_rt_object_new(&raw mut b, 64);
+        assert_eq!(a.memory_stats().requested_bytes, 32);
+        assert_eq!(b.memory_stats().requested_bytes, 64);
+    }
+
+    #[test]
+    fn many_object_allocations_cross_multiple_pages() {
+        let mut context = ExecutionContext::with_stats();
+        let ctx = &raw mut context;
+        for _ in 0..10_000 {
+            let p = aster_rt_object_new(ctx, 32);
+            assert!(!p.is_null());
+        }
+        let stats = context.memory_stats();
+        assert_eq!(stats.total_allocations, 10_000);
+        assert_eq!(stats.object_allocations, 10_000);
+        assert_eq!(stats.requested_bytes, 320_000);
+        assert!(stats.used_bytes >= 320_000);
+        assert!(stats.reserved_bytes >= stats.used_bytes);
+        // With 64 KiB pages and 32-byte objects, we should have far fewer
+        // pages than individual allocations.
+        assert!(stats.reserved_bytes <= stats.used_bytes * 2);
     }
 }
