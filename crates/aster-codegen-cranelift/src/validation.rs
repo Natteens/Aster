@@ -7,13 +7,8 @@ pub(super) fn select_entry<'a>(
     let function = module
         .functions
         .iter()
-        .find(|function| function.name == function_name)
+        .find(|function| function.name == function_name && function.owner.is_none())
         .ok_or_else(|| BackendError::new(format!("function `{function_name}` was not found")))?;
-    if function.owner.is_some() {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` is a method; classes and objects are not supported by the JIT"
-        )));
-    }
     validate_invocable_entry(function, function_name)?;
     Ok(function)
 }

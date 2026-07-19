@@ -1290,3 +1290,58 @@ fn executes_imported_structs_used_by_imported_classes() {
         Ok(ExecutionValue::Int(9))
     );
 }
+
+#[test]
+fn selects_free_function_over_instance_method_with_same_name() {
+    let source = r"
+        public class Service {
+            public int Run() { return 1; }
+        }
+        public int Run() {
+            Service s = new Service();
+            return s.Run() + 41;
+        }
+    ";
+    assert_eq!(run(source, "Run"), Ok(ExecutionValue::Int(42)));
+}
+
+#[test]
+fn selects_free_function_over_static_method_with_same_name() {
+    let source = r"
+        public class Service {
+            public static int Run() { return 41; }
+        }
+        public int Run() {
+            return Service.Run() + 1;
+        }
+    ";
+    assert_eq!(run(source, "Run"), Ok(ExecutionValue::Int(42)));
+}
+
+#[test]
+fn program_main_calls_method_with_same_name() {
+    let source = "public class Service { public int Main() { return 42; } } public class Program { public static int Main() { Service s = new Service(); return s.Main(); } }";
+    let compilation = compile(source).expect("should compile");
+    let symbol = compilation
+        .hir
+        .items
+        .iter()
+        .find_map(|item| {
+            let aster_compiler::hir::Item::Class(class) = item else {
+                return None;
+            };
+            if class.name != "Program" {
+                return None;
+            }
+            class
+                .methods
+                .iter()
+                .find(|m| m.name == "Main")
+                .map(|m| m.symbol)
+        })
+        .expect("Program.Main symbol");
+    assert_eq!(
+        execute_symbol(&compilation.mir, symbol),
+        Ok(ExecutionValue::Int(42))
+    );
+}
