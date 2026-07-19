@@ -113,8 +113,14 @@ impl PagedArena {
     ///   satisfy the underlying page allocation.
     pub(crate) fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
         assert!(size > 0, "zero-size allocation");
-        assert!(align.is_power_of_two(), "alignment must be a non-zero power of two");
-        assert!(align <= MAX_ALIGN, "alignment {align} exceeds MAX_ALIGN ({MAX_ALIGN})");
+        assert!(
+            align.is_power_of_two(),
+            "alignment must be a non-zero power of two"
+        );
+        assert!(
+            align <= MAX_ALIGN,
+            "alignment {align} exceeds MAX_ALIGN ({MAX_ALIGN})"
+        );
 
         if let Some(page) = self.pages.last_mut() {
             if let Some((ptr, consumed)) = page.try_alloc(size, align) {
