@@ -6,7 +6,8 @@ use super::{
 pub(super) fn execute_resolved(
     module: &mir::Module,
     entry: &mir::Function,
-) -> Result<ExecutionValue, BackendError> {
+    collect_stats: bool,
+) -> Result<(ExecutionValue, super::MemoryStats), BackendError> {
     let mut builder = JITBuilder::new(default_libcall_names()).map_err(module_error)?;
     for function in runtime_functions() {
         builder.symbol(function.name, function.address);
@@ -23,9 +24,14 @@ pub(super) fn execute_resolved(
     let pointer = codegen.jit.get_finalized_function(entry_id);
     // The JITModule stays alive until after the invocation copies any result
     // (including string payloads) into host-owned memory.
-    let mut execution_context = aster_runtime::ExecutionContext::new();
+    let mut execution_context = if collect_stats {
+        aster_runtime::ExecutionContext::with_stats()
+    } else {
+        aster_runtime::ExecutionContext::new()
+    };
     let value = invoke_finalized(pointer, &entry.return_type, &mut execution_context);
     let runtime_error = execution_context.take_error();
+    let stats = execution_context.memory_stats().clone();
     // SAFETY: execution finished and `value` owns copies of any data that
     // lived in the module, so no pointer into the JIT memory survives.
     // Releasing here prevents leaking code and data pages across repeated
@@ -37,7 +43,7 @@ pub(super) fn execute_resolved(
     if let Some(error) = runtime_error {
         Err(BackendError::new(format!("Aster runtime error: {error}")))
     } else {
-        value
+        value.map(|v| (v, stats))
     }
 }
 

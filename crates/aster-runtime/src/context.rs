@@ -12,8 +12,33 @@ pub struct AsterArray {
     element_size: u32,
 }
 
+/// Immutable snapshot of allocation metrics for one execution.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryStats {
+    pub total_allocations: u64,
+    pub object_allocations: u64,
+    pub array_allocations: u64,
+    pub string_allocations: u64,
+    pub requested_bytes: u64,
+    pub used_bytes: u64,
+    pub reserved_bytes: u64,
+    pub peak_used_bytes: u64,
+    pub peak_reserved_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+enum AllocationCategory {
+    Object,
+    Array,
+    String,
+}
+
 /// Owns every dynamic allocation made by one JIT invocation.
-/// Dropping the context releases all buffers and headers together.
+/// Dropping the context releases all individually boxed buffers together.
+///
+/// This is **not** a bump arena or region allocator. Each allocation
+/// produces its own `Box<[u64]>`, and all boxes are freed when the
+/// context is dropped. No individual deallocation exists.
 #[derive(Default)]
 pub struct ExecutionContext {
     buffers: Vec<Box<[u64]>>,
@@ -21,6 +46,8 @@ pub struct ExecutionContext {
     #[allow(clippy::vec_box)]
     arrays: Vec<Box<AsterArray>>,
     error: Option<String>,
+    collect_stats: bool,
+    stats: MemoryStats,
 }
 
 impl ExecutionContext {
@@ -29,13 +56,52 @@ impl ExecutionContext {
         Self::default()
     }
 
+    #[must_use]
+    pub fn with_stats() -> Self {
+        Self {
+            collect_stats: true,
+            ..Self::default()
+        }
+    }
+
     pub fn take_error(&mut self) -> Option<String> {
         self.error.take()
+    }
+
+    #[must_use]
+    pub fn memory_stats(&self) -> &MemoryStats {
+        &self.stats
     }
 
     pub(crate) fn fail(&mut self, message: impl Into<String>) {
         if self.error.is_none() {
             self.error = Some(message.into());
+        }
+    }
+
+    fn record_allocation(
+        &mut self,
+        category: AllocationCategory,
+        requested: usize,
+        reserved: usize,
+    ) {
+        if !self.collect_stats {
+            return;
+        }
+        self.stats.total_allocations += 1;
+        match category {
+            AllocationCategory::Object => self.stats.object_allocations += 1,
+            AllocationCategory::Array => self.stats.array_allocations += 1,
+            AllocationCategory::String => self.stats.string_allocations += 1,
+        }
+        self.stats.requested_bytes += requested as u64;
+        self.stats.used_bytes += reserved as u64;
+        self.stats.reserved_bytes += reserved as u64;
+        if self.stats.used_bytes > self.stats.peak_used_bytes {
+            self.stats.peak_used_bytes = self.stats.used_bytes;
+        }
+        if self.stats.reserved_bytes > self.stats.peak_reserved_bytes {
+            self.stats.peak_reserved_bytes = self.stats.reserved_bytes;
         }
     }
 
@@ -54,7 +120,9 @@ impl ExecutionContext {
             self.fail("array allocation size exceeds the addressable range");
             valid_size as usize
         };
-        let mut buffer = vec![0_u64; bytes.div_ceil(size_of::<u64>())].into_boxed_slice();
+        let words = bytes.div_ceil(size_of::<u64>());
+        let reserved = words * size_of::<u64>();
+        let mut buffer = vec![0_u64; words].into_boxed_slice();
         let data = buffer.as_mut_ptr().cast::<u8>();
         self.buffers.push(buffer);
         let mut header = Box::new(AsterArray {
@@ -64,14 +132,22 @@ impl ExecutionContext {
         });
         let pointer = ptr::from_mut(header.as_mut());
         self.arrays.push(header);
+        self.record_allocation(
+            AllocationCategory::Array,
+            bytes,
+            reserved + size_of::<AsterArray>(),
+        );
         pointer
     }
 
     pub(crate) fn allocate_object(&mut self, size: u32) -> *mut u8 {
         let bytes = usize::try_from(size.max(1)).unwrap_or(1);
-        let mut buffer = vec![0_u64; bytes.div_ceil(size_of::<u64>())].into_boxed_slice();
+        let words = bytes.div_ceil(size_of::<u64>());
+        let reserved = words * size_of::<u64>();
+        let mut buffer = vec![0_u64; words].into_boxed_slice();
         let pointer = buffer.as_mut_ptr().cast::<u8>();
         self.buffers.push(buffer);
+        self.record_allocation(AllocationCategory::Object, bytes, reserved);
         pointer
     }
 
@@ -88,6 +164,7 @@ impl ExecutionContext {
             return ptr::null();
         };
         let words = total_bytes.div_ceil(size_of::<u64>()).max(1);
+        let reserved = words * size_of::<u64>();
         let mut buffer = Vec::new();
         if buffer.try_reserve_exact(words).is_err() {
             self.fail("string allocation failed");
@@ -110,6 +187,7 @@ impl ExecutionContext {
         let buffer = buffer.into_boxed_slice();
         let pointer = buffer.as_ptr().cast::<AsterStrHeader>();
         self.buffers.push(buffer);
+        self.record_allocation(AllocationCategory::String, total_bytes, reserved);
         pointer
     }
 }
@@ -196,5 +274,93 @@ mod tests {
         assert!(!pointer.is_null());
         assert_eq!(context.buffers.len(), 1);
         assert!(context.buffers[0].iter().all(|word| *word == 0));
+    }
+
+    #[test]
+    fn stats_disabled_by_default() {
+        let mut context = ExecutionContext::new();
+        aster_rt_object_new(&raw mut context, 16);
+        aster_rt_array_new(&raw mut context, 4, 4);
+        context.allocate_string_parts(&["hello"]);
+        assert_eq!(*context.memory_stats(), MemoryStats::default());
+    }
+
+    #[test]
+    fn object_allocation_increments_stats() {
+        let mut context = ExecutionContext::with_stats();
+        aster_rt_object_new(&raw mut context, 16);
+        let stats = context.memory_stats();
+        assert_eq!(stats.total_allocations, 1);
+        assert_eq!(stats.object_allocations, 1);
+        assert_eq!(stats.array_allocations, 0);
+        assert_eq!(stats.string_allocations, 0);
+        assert_eq!(stats.requested_bytes, 16);
+        assert!(stats.used_bytes >= 16);
+        assert!(stats.reserved_bytes >= stats.used_bytes);
+        assert_eq!(stats.peak_used_bytes, stats.used_bytes);
+    }
+
+    #[test]
+    fn array_is_one_logical_allocation() {
+        let mut context = ExecutionContext::with_stats();
+        aster_rt_array_new(&raw mut context, 4, 4);
+        let stats = context.memory_stats();
+        assert_eq!(stats.total_allocations, 1);
+        assert_eq!(stats.array_allocations, 1);
+        assert_eq!(stats.object_allocations, 0);
+        assert!(stats.requested_bytes >= 16);
+        assert!(stats.used_bytes >= stats.requested_bytes);
+        assert!(stats.reserved_bytes >= stats.used_bytes);
+    }
+
+    #[test]
+    fn string_allocation_increments_stats() {
+        let mut context = ExecutionContext::with_stats();
+        context.allocate_string_parts(&["hello"]);
+        let stats = context.memory_stats();
+        assert_eq!(stats.total_allocations, 1);
+        assert_eq!(stats.string_allocations, 1);
+        assert_eq!(stats.object_allocations, 0);
+        assert!(stats.requested_bytes > 0);
+    }
+
+    #[test]
+    fn multiple_allocations_accumulate() {
+        let mut context = ExecutionContext::with_stats();
+        aster_rt_object_new(&raw mut context, 8);
+        aster_rt_object_new(&raw mut context, 8);
+        aster_rt_array_new(&raw mut context, 2, 4);
+        let stats = context.memory_stats();
+        assert_eq!(stats.total_allocations, 3);
+        assert_eq!(stats.object_allocations, 2);
+        assert_eq!(stats.array_allocations, 1);
+    }
+
+    #[test]
+    fn peaks_are_never_below_final_values() {
+        let mut context = ExecutionContext::with_stats();
+        aster_rt_object_new(&raw mut context, 64);
+        aster_rt_array_new(&raw mut context, 10, 8);
+        context.allocate_string_parts(&["test"]);
+        let stats = context.memory_stats();
+        assert!(stats.peak_used_bytes >= stats.used_bytes);
+        assert!(stats.peak_reserved_bytes >= stats.reserved_bytes);
+    }
+
+    #[test]
+    fn fresh_context_has_zero_stats() {
+        let context = ExecutionContext::new();
+        assert_eq!(*context.memory_stats(), MemoryStats::default());
+        let context_with = ExecutionContext::with_stats();
+        assert_eq!(*context_with.memory_stats(), MemoryStats::default());
+    }
+
+    #[test]
+    fn requested_used_reserved_ordering() {
+        let mut context = ExecutionContext::with_stats();
+        aster_rt_object_new(&raw mut context, 3);
+        let stats = context.memory_stats();
+        assert!(stats.requested_bytes <= stats.used_bytes);
+        assert!(stats.used_bytes <= stats.reserved_bytes);
     }
 }

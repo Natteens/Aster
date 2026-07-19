@@ -33,10 +33,10 @@ fn run(mut arguments: impl Iterator<Item = String>) -> Result<(), ()> {
             process_file(command, &file_name)
         }
         Some(command @ ("run" | "watch")) => {
+            let usage =
+                format!("Usage: aster {command} <FILE> [--function <NAME>] [--memory-stats]");
             let Some(file_name) = arguments.next() else {
-                eprintln!(
-                    "error: missing source file\n\nUsage: aster {command} <FILE> [--function <NAME>]"
-                );
+                eprintln!("error: missing source file\n\n{usage}");
                 return Err(());
             };
             if matches!(file_name.as_str(), "--help" | "-h") {
@@ -47,34 +47,30 @@ fn run(mut arguments: impl Iterator<Item = String>) -> Result<(), ()> {
                 print_command_help(command);
                 return Ok(());
             }
-            let function_name = match arguments.next() {
-                None => None,
-                Some(option) if option == "--function" => {
-                    let Some(name) = arguments.next() else {
-                        eprintln!(
-                            "error: missing function name after `--function`\n\nUsage: aster {command} <FILE> [--function <NAME>]"
-                        );
+            let mut function_name: Option<String> = None;
+            let mut memory_stats = false;
+            while let Some(option) = arguments.next() {
+                match option.as_str() {
+                    "--function" => {
+                        let Some(name) = arguments.next() else {
+                            eprintln!("error: missing function name after `--function`\n\n{usage}");
+                            return Err(());
+                        };
+                        function_name = Some(name);
+                    }
+                    "--memory-stats" => {
+                        memory_stats = true;
+                    }
+                    _ => {
+                        eprintln!("error: unexpected argument `{option}`\n\n{usage}");
                         return Err(());
-                    };
-                    Some(name)
+                    }
                 }
-                Some(argument) => {
-                    eprintln!(
-                        "error: unexpected argument `{argument}`\n\nUsage: aster {command} <FILE> [--function <NAME>]"
-                    );
-                    return Err(());
-                }
-            };
-            if let Some(argument) = arguments.next() {
-                eprintln!(
-                    "error: unexpected argument `{argument}`\n\nUsage: aster {command} <FILE> [--function <NAME>]"
-                );
-                return Err(());
             }
             if command == "watch" {
                 watch::watch_file(&file_name, function_name.as_deref())
             } else {
-                run_file(&file_name, function_name.as_deref())
+                run_file(&file_name, function_name.as_deref(), memory_stats)
             }
         }
         Some("--version" | "-V") => {
@@ -173,7 +169,7 @@ fn process_file(command: &str, file_name: &str) -> Result<(), ()> {
     }
 }
 
-fn run_file(file_name: &str, function_name: Option<&str>) -> Result<(), ()> {
+fn run_file(file_name: &str, function_name: Option<&str>, memory_stats: bool) -> Result<(), ()> {
     validate_source_file(Path::new(file_name))?;
     let project = match aster_compiler::compile_project(Path::new(file_name)) {
         Ok(compilation) => compilation,
@@ -188,10 +184,12 @@ fn run_file(file_name: &str, function_name: Option<&str>) -> Result<(), ()> {
         eprintln!("{}", diagnostic.render());
     }
     match execute_project(&project, Path::new(file_name), function_name) {
-        Ok((value, _)) => {
-            // A void entry point produces no Aster value; only program logs are shown.
+        Ok((value, _, stats)) => {
             if !matches!(value, aster_codegen_cranelift::ExecutionValue::Void) {
                 println!("{value}");
+            }
+            if memory_stats {
+                print_memory_stats(&stats);
             }
             Ok(())
         }
@@ -203,7 +201,14 @@ pub(crate) fn execute_project(
     project: &aster_compiler::ProjectCompilation,
     root_file: &Path,
     function_name: Option<&str>,
-) -> Result<(aster_codegen_cranelift::ExecutionValue, String), ()> {
+) -> Result<
+    (
+        aster_codegen_cranelift::ExecutionValue,
+        String,
+        aster_codegen_cranelift::MemoryStats,
+    ),
+    (),
+> {
     if let Some(function_name) = function_name {
         if !project.is_root_public_function(function_name) {
             eprintln!(
@@ -211,9 +216,12 @@ pub(crate) fn execute_project(
             );
             return Err(());
         }
-        return aster_codegen_cranelift::execute(&project.compilation.mir, function_name)
-            .map(|value| (value, function_name.to_owned()))
-            .map_err(|error| eprintln!("error: {error}"));
+        return aster_codegen_cranelift::execute_with_stats(
+            &project.compilation.mir,
+            function_name,
+        )
+        .map(|(value, stats)| (value, function_name.to_owned(), stats))
+        .map_err(|error| eprintln!("error: {error}"));
     }
 
     let entry =
@@ -222,8 +230,8 @@ pub(crate) fn execute_project(
                 eprintln!("{}", diagnostic.render());
             }
         })?;
-    aster_codegen_cranelift::execute_symbol(&project.compilation.mir, entry.symbol)
-        .map(|value| (value, entry.display_name))
+    aster_codegen_cranelift::execute_symbol_with_stats(&project.compilation.mir, entry.symbol)
+        .map(|(value, stats)| (value, entry.display_name, stats))
         .map_err(|error| eprintln!("error: {error}"))
 }
 
@@ -253,6 +261,19 @@ pub(crate) fn project_diagnostics(
         .collect()
 }
 
+fn print_memory_stats(stats: &aster_codegen_cranelift::MemoryStats) {
+    println!("memory:");
+    println!("  allocations: {}", stats.total_allocations);
+    println!("  objects: {}", stats.object_allocations);
+    println!("  arrays: {}", stats.array_allocations);
+    println!("  strings: {}", stats.string_allocations);
+    println!("  requested: {} bytes", stats.requested_bytes);
+    println!("  used: {} bytes", stats.used_bytes);
+    println!("  reserved: {} bytes", stats.reserved_bytes);
+    println!("  peak used: {} bytes", stats.peak_used_bytes);
+    println!("  peak reserved: {} bytes", stats.peak_reserved_bytes);
+}
+
 fn print_help() {
     println!(
         "Aster compiler\n\nUsage: aster <COMMAND>\n\nCommands:\n  check <FILE>                       Validate an Aster source file\n  dump-hir <FILE>                    Validate and print typed HIR without executing\n  dump-mir <FILE>                    Validate and print control-flow MIR without executing\n  run <FILE> [--function <NAME>]     Run application Main or an explicitly selected function\n  watch <FILE> [--function <NAME>]   Recompile and rerun on each file change\n\nOptions:\n  -h, --help                         Print help\n  -V, --version                      Print version"
@@ -274,7 +295,7 @@ fn print_command_help(command: &str) {
             "Validate and print control-flow MIR without executing.",
         ),
         "run" => (
-            "aster run <FILE> [--function <NAME>]",
+            "aster run <FILE> [--function <NAME>] [--memory-stats]",
             "Run the application entry point or an explicitly selected function.",
         ),
         "watch" => (
@@ -357,7 +378,11 @@ mod tests {
     #[test]
     fn run_command_executes_an_explicit_function() {
         let path = test_file("run", "public int Calculate() { return 42; }");
-        let result = run_file(path.to_str().expect("UTF-8 test path"), Some("Calculate"));
+        let result = run_file(
+            path.to_str().expect("UTF-8 test path"),
+            Some("Calculate"),
+            false,
+        );
         fs::remove_file(path).expect("remove test source");
         assert!(result.is_ok());
     }
@@ -368,7 +393,7 @@ mod tests {
             "main",
             "public class Program { public static int Main() { return 42; } }",
         );
-        let result = run_file(path.to_str().expect("UTF-8 test path"), None);
+        let result = run_file(path.to_str().expect("UTF-8 test path"), None, false);
         fs::remove_file(path).expect("remove test source");
         assert!(result.is_ok());
     }
@@ -385,7 +410,11 @@ mod tests {
             .expect("write invalid manifest");
         let root = directory.join("main.aster");
         fs::write(&root, "public int Calculate() { return 42; }").expect("write test source");
-        let result = run_file(root.to_str().expect("UTF-8 test path"), Some("Calculate"));
+        let result = run_file(
+            root.to_str().expect("UTF-8 test path"),
+            Some("Calculate"),
+            false,
+        );
         fs::remove_dir_all(directory).expect("remove test project");
         assert!(result.is_ok());
     }
@@ -414,7 +443,7 @@ mod tests {
             "namespace app; public class Program { public static int Main() { return Answer(); } }",
         )
         .expect("write root source");
-        let result = run_file(root.to_str().expect("UTF-8 test path"), None);
+        let result = run_file(root.to_str().expect("UTF-8 test path"), None, false);
         fs::remove_dir_all(directory).expect("remove test project");
         assert!(result.is_ok());
     }
@@ -435,7 +464,11 @@ mod tests {
             "namespace app; public int Double(int value) { return value * 2; }",
         )
         .expect("write namespace source");
-        let result = run_file(root.to_str().expect("UTF-8 test path"), Some("app::Double"));
+        let result = run_file(
+            root.to_str().expect("UTF-8 test path"),
+            Some("app::Double"),
+            false,
+        );
         fs::remove_dir_all(directory).expect("remove test project");
         assert!(result.is_err());
     }
@@ -448,5 +481,26 @@ mod tests {
         let path = std::env::temp_dir().join(format!("aster-{label}-{nonce}.aster"));
         fs::write(&path, source).expect("write test source");
         path
+    }
+
+    #[test]
+    fn memory_stats_flag_does_not_change_result() {
+        let path = test_file("stats-flag", "public int Run() { return 7; }");
+        let without = run_file(path.to_str().expect("UTF-8"), Some("Run"), false);
+        let with = run_file(path.to_str().expect("UTF-8"), Some("Run"), true);
+        fs::remove_file(&path).expect("remove test file");
+        assert!(without.is_ok());
+        assert!(with.is_ok());
+    }
+
+    #[test]
+    fn memory_stats_flag_accepted_for_class_program() {
+        let path = test_file(
+            "stats-class",
+            "public class Program { public static int Main() { return 1; } }",
+        );
+        let result = run_file(path.to_str().expect("UTF-8"), None, true);
+        fs::remove_file(&path).expect("remove test file");
+        assert!(result.is_ok());
     }
 }

@@ -1345,3 +1345,121 @@ fn program_main_calls_method_with_same_name() {
         Ok(ExecutionValue::Int(42))
     );
 }
+
+fn run_with_stats(
+    source: &str,
+    function: &str,
+) -> Result<(ExecutionValue, aster_codegen_cranelift::MemoryStats), String> {
+    let compilation = compile(source).map_err(|diagnostics| format!("{diagnostics:#?}"))?;
+    aster_codegen_cranelift::execute_with_stats(&compilation.mir, function)
+        .map_err(|error| error.to_string())
+}
+
+#[test]
+fn execute_without_stats_returns_zero_metrics() {
+    let source = r"
+        public class Point { public int x; public int y; }
+        public int Run() { Point p = new Point(); return 1; }
+    ";
+    let compilation = compile(source).expect("should compile");
+    let (_, stats) = aster_codegen_cranelift::execute_with_stats(&compilation.mir, "Run")
+        .expect("with_stats path");
+    assert!(stats.total_allocations > 0);
+    let value = execute(&compilation.mir, "Run").expect("without stats path");
+    assert_eq!(value, ExecutionValue::Int(1));
+}
+
+#[test]
+fn stats_same_result_with_or_without_stats() {
+    let source = r"
+        public class Counter { public int count; }
+        public int Run() {
+            Counter c = new Counter();
+            c.count = 10;
+            return c.count;
+        }
+    ";
+    let value_only = run(source, "Run").expect("without stats");
+    let (value_with, _) = run_with_stats(source, "Run").expect("with stats");
+    assert_eq!(value_only, value_with);
+}
+
+#[test]
+fn stats_object_allocation_from_class() {
+    let source = r"
+        public class Point { public int x; public int y; }
+        public int Run() { Point p = new Point(); return 1; }
+    ";
+    let (value, stats) = run_with_stats(source, "Run").expect("should run");
+    assert_eq!(value, ExecutionValue::Int(1));
+    assert_eq!(stats.object_allocations, 1);
+    assert_eq!(stats.total_allocations, 1);
+    assert_eq!(stats.array_allocations, 0);
+    assert!(stats.used_bytes > 0);
+}
+
+#[test]
+fn stats_array_is_one_logical_allocation() {
+    let source = r"
+        public int Run() { int[] arr = new int[5]; return arr.Length; }
+    ";
+    let (value, stats) = run_with_stats(source, "Run").expect("should run");
+    assert_eq!(value, ExecutionValue::Int(5));
+    assert_eq!(stats.array_allocations, 1);
+    assert_eq!(stats.total_allocations, 1);
+    assert!(stats.used_bytes > 0);
+}
+
+#[test]
+fn stats_string_literal_is_not_a_dynamic_allocation() {
+    let source = r#"
+        public string Run() { return "hello"; }
+    "#;
+    let (value, stats) = run_with_stats(source, "Run").expect("should run");
+    assert_eq!(value, ExecutionValue::String("hello".into()));
+    assert_eq!(stats.string_allocations, 0);
+    assert_eq!(stats.total_allocations, 0);
+}
+
+#[test]
+fn stats_interpolated_string_is_a_dynamic_allocation() {
+    let source = r#"
+        public string Run() { int x = 42; return $"value={x}"; }
+    "#;
+    let (value, stats) = run_with_stats(source, "Run").expect("should run");
+    assert!(matches!(value, ExecutionValue::String(_)));
+    assert!(stats.string_allocations >= 1);
+    assert!(stats.total_allocations >= 1);
+}
+
+#[test]
+fn stats_multiple_allocation_types() {
+    let source = r#"
+        public class Box { public int value; }
+        public string Run() {
+            Box b = new Box();
+            int[] arr = new int[3];
+            return $"box={b.value}, len={arr.Length}";
+        }
+    "#;
+    let (value, stats) = run_with_stats(source, "Run").expect("should run");
+    assert!(matches!(value, ExecutionValue::String(_)));
+    assert!(stats.object_allocations >= 1);
+    assert!(stats.array_allocations >= 1);
+    assert!(stats.string_allocations >= 1);
+    assert!(stats.total_allocations >= 3);
+    assert!(stats.peak_used_bytes >= stats.used_bytes);
+    assert!(stats.peak_reserved_bytes >= stats.reserved_bytes);
+    assert!(stats.requested_bytes <= stats.used_bytes);
+}
+
+#[test]
+fn stats_separate_executions_have_independent_metrics() {
+    let source = r"
+        public class Node { public int data; }
+        public int Run() { Node n = new Node(); return 1; }
+    ";
+    let (_, stats1) = run_with_stats(source, "Run").expect("first run");
+    let (_, stats2) = run_with_stats(source, "Run").expect("second run");
+    assert_eq!(stats1, stats2);
+}

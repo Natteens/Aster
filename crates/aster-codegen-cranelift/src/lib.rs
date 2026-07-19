@@ -24,6 +24,7 @@ use std::{
 };
 
 use aster_mir as mir;
+pub use aster_runtime::MemoryStats;
 use aster_runtime::{RuntimeType, runtime_functions};
 use aster_types::Primitive;
 use cranelift_codegen::ir::{
@@ -147,7 +148,22 @@ impl Error for BackendError {}
 pub fn execute(module: &mir::Module, function_name: &str) -> Result<ExecutionValue, BackendError> {
     validate_module(module)?;
     let entry = select_entry(module, function_name)?;
-    execute_resolved(module, entry)
+    execute_resolved(module, entry, false).map(|(value, _)| value)
+}
+
+/// Like [`execute`], but also returns runtime allocation metrics.
+///
+/// # Errors
+///
+/// Returns a controlled error for an invalid entry selection, unsupported MIR, or a
+/// Cranelift declaration/compilation/finalization failure.
+pub fn execute_with_stats(
+    module: &mir::Module,
+    function_name: &str,
+) -> Result<(ExecutionValue, MemoryStats), BackendError> {
+    validate_module(module)?;
+    let entry = select_entry(module, function_name)?;
+    execute_resolved(module, entry, true)
 }
 
 /// Compile validated MIR and invoke the concrete function selected by the
@@ -168,5 +184,25 @@ pub fn execute_symbol(
         .find(|function| function.symbol == symbol)
         .ok_or_else(|| BackendError::new(format!("entry symbol {symbol:?} was not found")))?;
     validate_invocable_entry(entry, &entry.name)?;
-    execute_resolved(module, entry)
+    execute_resolved(module, entry, false).map(|(value, _)| value)
+}
+
+/// Like [`execute_symbol`], but also returns runtime allocation metrics.
+///
+/// # Errors
+///
+/// Returns a controlled error if the symbol is missing or cannot use the
+/// zero-parameter host invocation ABI.
+pub fn execute_symbol_with_stats(
+    module: &mir::Module,
+    symbol: mir::SymbolId,
+) -> Result<(ExecutionValue, MemoryStats), BackendError> {
+    validate_module(module)?;
+    let entry = module
+        .functions
+        .iter()
+        .find(|function| function.symbol == symbol)
+        .ok_or_else(|| BackendError::new(format!("entry symbol {symbol:?} was not found")))?;
+    validate_invocable_entry(entry, &entry.name)?;
+    execute_resolved(module, entry, true)
 }
