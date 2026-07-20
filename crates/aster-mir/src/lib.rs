@@ -114,6 +114,17 @@ pub struct BasicBlock {
     pub terminator: Terminator,
 }
 
+/// Storage region selected for one dynamic allocation.
+///
+/// `Temporary` is represented in MIR now, but the Cranelift backend rejects it
+/// until the compiler can prove the lifetime and the runtime ABI can select the
+/// temporary arena safely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllocationRegion {
+    Persistent,
+    Temporary,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Instruction {
     Assign {
@@ -145,10 +156,12 @@ pub enum Instruction {
         element_type: Type,
         length: Operand,
         requires_default: bool,
+        region: AllocationRegion,
     },
     AllocateObject {
         destination: Place,
         class: SymbolId,
+        region: AllocationRegion,
     },
 }
 

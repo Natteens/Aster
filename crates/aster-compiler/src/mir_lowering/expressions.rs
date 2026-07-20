@@ -375,6 +375,7 @@ impl FunctionLowerer {
         self.instruction(mir::Instruction::AllocateObject {
             destination: place.clone(),
             class,
+            region: mir::AllocationRegion::Persistent,
         });
         let receiver = mir::Operand {
             type_: type_.clone(),
@@ -413,6 +414,7 @@ impl FunctionLowerer {
             element_type: (**element_type).clone(),
             length: int_operand(elements.len()),
             requires_default: false,
+            region: mir::AllocationRegion::Persistent,
         });
         for (index, element) in elements.iter().enumerate() {
             let value = self
@@ -448,6 +450,7 @@ impl FunctionLowerer {
             element_type: element_type.clone(),
             length,
             requires_default: true,
+            region: mir::AllocationRegion::Persistent,
         });
         mir::Operand {
             type_: type_.clone(),

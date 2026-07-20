@@ -265,19 +265,38 @@ fn validate_instruction(
             destination,
             element_type,
             length,
+            region,
             ..
         } => {
+            validate_allocation_region(*region, function_name)?;
             validate_place(destination, function_name)?;
             validate_value_type(element_type, function_name)?;
             validate_operand(length, function_name)
         }
-        mir::Instruction::AllocateObject { destination, class } => {
+        mir::Instruction::AllocateObject {
+            destination,
+            class,
+            region,
+        } => {
+            validate_allocation_region(*region, function_name)?;
             validate_place(destination, function_name)?;
             if classes.contains(class) {
                 Ok(())
             } else {
                 Err(unsupported(function_name, "allocation of a non-class type"))
             }
+        }
+    }
+}
+
+fn validate_allocation_region(
+    region: mir::AllocationRegion,
+    function_name: &str,
+) -> Result<(), BackendError> {
+    match region {
+        mir::AllocationRegion::Persistent => Ok(()),
+        mir::AllocationRegion::Temporary => {
+            Err(unsupported(function_name, "temporary allocation regions"))
         }
     }
 }

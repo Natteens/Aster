@@ -245,6 +245,7 @@ impl Codegen {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn translate_array_allocation(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
@@ -252,8 +253,14 @@ impl Codegen {
         element_type: &mir::Type,
         length: &mir::Operand,
         requires_default: bool,
+        region: mir::AllocationRegion,
         state: &FunctionState,
     ) -> Result<(), BackendError> {
+        if region != mir::AllocationRegion::Persistent {
+            return Err(BackendError::new(
+                "temporary array allocations are not yet supported by the Cranelift JIT",
+            ));
+        }
         if requires_default && !self.layouts.zero_initializable(element_type) {
             return Err(BackendError::new(format!(
                 "`new {}[length]` has no safe all-zero default; initialize every element with an array literal",
@@ -279,8 +286,14 @@ impl Codegen {
         builder: &mut FunctionBuilder<'_>,
         destination: &mir::Place,
         class: mir::SymbolId,
+        region: mir::AllocationRegion,
         state: &FunctionState,
     ) -> Result<(), BackendError> {
+        if region != mir::AllocationRegion::Persistent {
+            return Err(BackendError::new(
+                "temporary object allocations are not yet supported by the Cranelift JIT",
+            ));
+        }
         let function_ref = self
             .jit
             .declare_func_in_func(self.runtime_ids["aster_rt_object_new"], builder.func);

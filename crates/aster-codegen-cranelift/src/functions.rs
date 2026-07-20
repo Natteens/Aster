@@ -129,17 +129,21 @@ impl Codegen {
                 element_type,
                 length,
                 requires_default,
+                region,
             } => self.translate_array_allocation(
                 builder,
                 destination,
                 element_type,
                 length,
                 *requires_default,
+                *region,
                 state,
             ),
-            mir::Instruction::AllocateObject { destination, class } => {
-                self.translate_object_allocation(builder, destination, *class, state)
-            }
+            mir::Instruction::AllocateObject {
+                destination,
+                class,
+                region,
+            } => self.translate_object_allocation(builder, destination, *class, *region, state),
         }
     }
 }

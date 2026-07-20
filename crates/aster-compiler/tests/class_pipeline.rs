@@ -29,7 +29,13 @@ fn class_symbols_receivers_and_allocation_reach_hir_and_mir() {
             .iter()
             .flat_map(|function| &function.blocks)
             .flat_map(|block| &block.instructions)
-            .any(|instruction| matches!(instruction, mir::Instruction::AllocateObject { .. }))
+            .any(|instruction| matches!(
+                instruction,
+                mir::Instruction::AllocateObject {
+                    region: mir::AllocationRegion::Persistent,
+                    ..
+                }
+            ))
     );
     assert!(
         compilation

@@ -29,6 +29,7 @@ fn arrays_are_typed_in_hir_and_explicit_in_mir() {
                 instruction,
                 mir::Instruction::AllocateArray {
                     element_type: mir::Type::Int,
+                    region: mir::AllocationRegion::Persistent,
                     ..
                 }
             ))
