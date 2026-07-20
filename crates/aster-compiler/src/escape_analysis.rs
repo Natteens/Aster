@@ -1,13 +1,13 @@
-//! Conservative escape classification for MIR object allocations.
+//! Conservative escape classification and region selection for MIR objects.
 //!
 //! The pass first computes interprocedural summaries for direct Aster calls.
 //! Summaries are solved over the direct-call graph by strongly connected
 //! components and a monotone fixpoint, so direct and mutual recursion do not
 //! depend on declaration order.
 //!
-//! This pass deliberately does not change [`mir::AllocationRegion`]. It only
-//! records which object allocations are local candidates. Runtime and backend
-//! integration remain separate later steps.
+//! Object allocations proven local to their containing function are rewritten
+//! to [`mir::AllocationRegion::Temporary`]. Every uncertain or escaping object
+//! remains persistent. Arrays and dynamic strings are outside this pass.
 
 use std::collections::{HashMap, HashSet};
 
@@ -70,23 +70,51 @@ enum EscapeReason {
     UnsupportedUse,
 }
 
-/// Run the dormant analysis for every MIR function.
+/// Classify every MIR object allocation and apply its storage region.
 ///
-/// Results are intentionally not applied to MIR yet. The pass runs in normal
-/// compilation so later stages can consume the same implementation rather than
-/// introducing a test-only prototype.
-pub(super) fn analyze(module: &mir::Module) {
+/// This is deliberately conservative: only [`EscapeClassification::LocalCandidate`]
+/// becomes temporary. Any escape reason keeps the original persistent lifetime.
+pub(super) fn assign_allocation_regions(module: &mut mir::Module) {
     let summaries = build_function_summaries(module);
+    let classifications = module
+        .functions
+        .iter()
+        .map(|function| classify_function(function, &summaries))
+        .collect::<Vec<_>>();
+
     let mut local_candidates = 0_usize;
     let mut persistent = 0_usize;
 
-    for function in &module.functions {
-        for classification in classify_function(function, &summaries) {
+    for (function, function_classifications) in module.functions.iter_mut().zip(classifications) {
+        let mut function_classifications = function_classifications.into_iter();
+
+        for instruction in function
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+        {
+            let mir::Instruction::AllocateObject { region, .. } = instruction else {
+                continue;
+            };
+            let classification = function_classifications
+                .next()
+                .expect("every MIR object allocation has a classification");
             match classification {
-                EscapeClassification::LocalCandidate => local_candidates += 1,
-                EscapeClassification::Persistent(_) => persistent += 1,
+                EscapeClassification::LocalCandidate => {
+                    *region = mir::AllocationRegion::Temporary;
+                    local_candidates += 1;
+                }
+                EscapeClassification::Persistent(_) => {
+                    *region = mir::AllocationRegion::Persistent;
+                    persistent += 1;
+                }
             }
         }
+
+        debug_assert!(
+            function_classifications.next().is_none(),
+            "escape analysis produced more classifications than object allocations"
+        );
     }
 
     debug_assert_eq!(
@@ -525,6 +553,28 @@ mod tests {
         classify_function(function, &summaries)
     }
 
+    fn object_regions(source: &str, function_name: &str) -> Vec<mir::AllocationRegion> {
+        let compilation = compilation(source);
+        let function = compilation
+            .mir
+            .functions
+            .iter()
+            .find(|function| function.name == function_name && function.owner.is_none())
+            .unwrap_or_else(|| panic!("missing MIR function `{function_name}`"));
+
+        function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| {
+                let mir::Instruction::AllocateObject { region, .. } = instruction else {
+                    return None;
+                };
+                Some(*region)
+            })
+            .collect()
+    }
+
     fn summaries(
         source: &str,
     ) -> (
@@ -711,15 +761,34 @@ mod tests {
     }
 
     #[test]
-    fn actual_mir_regions_remain_persistent() {
+    fn local_candidate_is_emitted_as_temporary() {
         let source = "public class Box { public Box() {} public int Get() { return 1; } } public int Run() { Box box = new Box(); return box.Get(); }";
+        assert_eq!(
+            object_regions(source, "Run"),
+            vec![mir::AllocationRegion::Temporary]
+        );
+    }
+
+    #[test]
+    fn returned_object_is_emitted_as_persistent() {
+        let source =
+            "public class Box { public Box() {} } public Box Create() { return new Box(); }";
+        assert_eq!(
+            object_regions(source, "Create"),
+            vec![mir::AllocationRegion::Persistent]
+        );
+    }
+
+    #[test]
+    fn arrays_remain_persistent_when_object_regions_are_activated() {
+        let source = "public int Run() { int[] values = [1, 2, 3]; return values.Length; }";
         let compilation = compilation(source);
         assert!(compilation.mir.functions.iter().all(|function| {
             function.blocks.iter().all(|block| {
                 block.instructions.iter().all(|instruction| {
                     !matches!(
                         instruction,
-                        mir::Instruction::AllocateObject {
+                        mir::Instruction::AllocateArray {
                             region: mir::AllocationRegion::Temporary,
                             ..
                         }

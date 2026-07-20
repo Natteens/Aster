@@ -32,7 +32,7 @@ fn class_symbols_receivers_and_allocation_reach_hir_and_mir() {
             .any(|instruction| matches!(
                 instruction,
                 mir::Instruction::AllocateObject {
-                    region: mir::AllocationRegion::Persistent,
+                    region: mir::AllocationRegion::Temporary,
                     ..
                 }
             ))

@@ -1395,7 +1395,9 @@ fn stats_object_allocation_from_class() {
     assert_eq!(stats.object_allocations, 1);
     assert_eq!(stats.total_allocations, 1);
     assert_eq!(stats.array_allocations, 0);
-    assert!(stats.used_bytes > 0);
+    assert_eq!(stats.used_bytes, 0);
+    assert!(stats.reserved_bytes > 0);
+    assert!(stats.peak_used_bytes > 0);
 }
 
 #[test]
@@ -1450,7 +1452,7 @@ fn stats_multiple_allocation_types() {
     assert!(stats.total_allocations >= 3);
     assert!(stats.peak_used_bytes >= stats.used_bytes);
     assert!(stats.peak_reserved_bytes >= stats.reserved_bytes);
-    assert!(stats.requested_bytes <= stats.used_bytes);
+    assert!(stats.requested_bytes > 0);
 }
 
 #[test]

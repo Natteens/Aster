@@ -116,9 +116,9 @@ pub struct BasicBlock {
 
 /// Storage region selected for one dynamic allocation.
 ///
-/// `Temporary` is represented in MIR now, but the Cranelift backend rejects it
-/// until the compiler can prove the lifetime and the runtime ABI can select the
-/// temporary arena safely.
+/// The compiler emits `Temporary` only for object allocations proven not to
+/// escape their containing function. Arrays remain `Persistent` until their
+/// own escape rules and runtime path are implemented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AllocationRegion {
     Persistent,
