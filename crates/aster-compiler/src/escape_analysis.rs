@@ -1,18 +1,59 @@
-//! Conservative, intraprocedural escape classification for MIR object allocations.
+//! Conservative escape classification for MIR object allocations.
 //!
-//! This pass deliberately does not change [`mir::AllocationRegion`]. It records
-//! only what can be learned inside one function. Calls other than the mandatory
-//! constructor receiver remain conservative until function summaries exist.
+//! The pass first computes interprocedural summaries for direct Aster calls.
+//! Summaries are solved over the direct-call graph by strongly connected
+//! components and a monotone fixpoint, so direct and mutual recursion do not
+//! depend on declaration order.
+//!
+//! This pass deliberately does not change [`mir::AllocationRegion`]. It only
+//! records which object allocations are local candidates. Runtime and backend
+//! integration remain separate later steps.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use aster_mir as mir;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ParameterSummary {
+    /// The callee can store this parameter or pass it to an unknown/escaping use.
+    escapes: bool,
+    /// The callee can return this parameter, or one of its local aliases.
+    returned: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FunctionSummary {
+    parameters: Vec<ParameterSummary>,
+}
+
+impl FunctionSummary {
+    fn for_function(function: &mir::Function) -> Self {
+        Self {
+            parameters: vec![ParameterSummary::default(); function.parameters.len()],
+        }
+    }
+
+    fn merge(&mut self, newer: &Self) -> bool {
+        debug_assert_eq!(self.parameters.len(), newer.parameters.len());
+        let mut changed = false;
+        for (current, update) in self.parameters.iter_mut().zip(&newer.parameters) {
+            let merged = ParameterSummary {
+                escapes: current.escapes || update.escapes,
+                returned: current.returned || update.returned,
+            };
+            changed |= *current != merged;
+            *current = merged;
+        }
+        changed
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EscapeClassification {
-    /// No use visible in this function forces the object to outlive the call.
+    /// No use visible through local code or known summaries forces the object
+    /// to outlive the containing function.
     LocalCandidate,
-    /// The allocation must remain persistent under the current local analysis.
+    /// The allocation must remain persistent under the current analysis.
     Persistent(EscapeReason),
 }
 
@@ -29,18 +70,18 @@ enum EscapeReason {
     UnsupportedUse,
 }
 
-/// Run the dormant local analysis for every MIR function.
+/// Run the dormant analysis for every MIR function.
 ///
-/// Results are intentionally not applied to MIR yet. The pass still runs in
-/// normal compilation so later stages can consume the same implementation
-/// rather than introducing a test-only prototype.
+/// Results are intentionally not applied to MIR yet. The pass runs in normal
+/// compilation so later stages can consume the same implementation rather than
+/// introducing a test-only prototype.
 pub(super) fn analyze(module: &mir::Module) {
-    let constructors = constructor_symbols(module);
+    let summaries = build_function_summaries(module);
     let mut local_candidates = 0_usize;
     let mut persistent = 0_usize;
 
     for function in &module.functions {
-        for classification in classify_function(function, &constructors) {
+        for classification in classify_function(function, &summaries) {
             match classification {
                 EscapeClassification::LocalCandidate => local_candidates += 1,
                 EscapeClassification::Persistent(_) => persistent += 1,
@@ -51,17 +92,155 @@ pub(super) fn analyze(module: &mir::Module) {
     debug_assert_eq!(
         local_candidates + persistent,
         object_allocation_count(module),
-        "every MIR object allocation must receive one local escape classification"
+        "every MIR object allocation must receive one escape classification"
     );
 }
 
-fn constructor_symbols(module: &mir::Module) -> HashSet<mir::SymbolId> {
-    module
+fn build_function_summaries(module: &mir::Module) -> HashMap<mir::SymbolId, FunctionSummary> {
+    let indices = module
         .functions
         .iter()
-        .filter(|function| function.constructor)
-        .map(|function| function.symbol)
-        .collect()
+        .enumerate()
+        .map(|(index, function)| (function.symbol, index))
+        .collect::<HashMap<_, _>>();
+    let graph = direct_call_graph(module, &indices);
+    let components = strongly_connected_components(&graph);
+    let mut summaries = module
+        .functions
+        .iter()
+        .map(|function| (function.symbol, FunctionSummary::for_function(function)))
+        .collect::<HashMap<_, _>>();
+
+    // Kosaraju returns caller components before their direct callees for our
+    // caller -> callee graph. Reverse that order so external dependencies are
+    // stable before solving each recursive component.
+    for component in components.iter().rev() {
+        loop {
+            let mut changed = false;
+            for &function_index in component {
+                let function = &module.functions[function_index];
+                let update = summarize_function(function, &summaries);
+                changed |= summaries
+                    .get_mut(&function.symbol)
+                    .expect("every MIR function has an initialized summary")
+                    .merge(&update);
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    summaries
+}
+
+fn direct_call_graph(
+    module: &mir::Module,
+    indices: &HashMap<mir::SymbolId, usize>,
+) -> Vec<Vec<usize>> {
+    let mut graph = vec![Vec::new(); module.functions.len()];
+
+    for (caller_index, function) in module.functions.iter().enumerate() {
+        for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+            let mir::Instruction::Call {
+                function: callee, ..
+            } = instruction
+            else {
+                continue;
+            };
+            if let Some(&callee_index) = indices.get(callee) {
+                graph[caller_index].push(callee_index);
+            }
+        }
+        graph[caller_index].sort_unstable();
+        graph[caller_index].dedup();
+    }
+
+    graph
+}
+
+fn strongly_connected_components(graph: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    fn visit(node: usize, graph: &[Vec<usize>], visited: &mut [bool], order: &mut Vec<usize>) {
+        if visited[node] {
+            return;
+        }
+        visited[node] = true;
+        for &next in &graph[node] {
+            visit(next, graph, visited, order);
+        }
+        order.push(node);
+    }
+
+    fn collect(
+        node: usize,
+        reverse: &[Vec<usize>],
+        visited: &mut [bool],
+        component: &mut Vec<usize>,
+    ) {
+        if visited[node] {
+            return;
+        }
+        visited[node] = true;
+        component.push(node);
+        for &next in &reverse[node] {
+            collect(next, reverse, visited, component);
+        }
+    }
+
+    let mut visited = vec![false; graph.len()];
+    let mut order = Vec::with_capacity(graph.len());
+    for node in 0..graph.len() {
+        visit(node, graph, &mut visited, &mut order);
+    }
+
+    let mut reverse = vec![Vec::new(); graph.len()];
+    for (caller, callees) in graph.iter().enumerate() {
+        for &callee in callees {
+            reverse[callee].push(caller);
+        }
+    }
+
+    visited.fill(false);
+    let mut components = Vec::new();
+    for &node in order.iter().rev() {
+        if visited[node] {
+            continue;
+        }
+        let mut component = Vec::new();
+        collect(node, &reverse, &mut visited, &mut component);
+        component.sort_unstable();
+        components.push(component);
+    }
+    components
+}
+
+fn summarize_function(
+    function: &mir::Function,
+    summaries: &HashMap<mir::SymbolId, FunctionSummary>,
+) -> FunctionSummary {
+    let mut summary = FunctionSummary::for_function(function);
+
+    for (index, parameter) in function.parameters.iter().enumerate() {
+        if !matches!(&parameter.type_, mir::Type::Class(_)) {
+            continue;
+        }
+
+        let aliases = collect_aliases(function, parameter.id, summaries);
+        for block in &function.blocks {
+            if block
+                .instructions
+                .iter()
+                .any(|instruction| instruction_escape(instruction, &aliases, summaries).is_some())
+            {
+                summary.parameters[index].escapes = true;
+            }
+            if terminator_returns_alias(&block.terminator, &aliases) {
+                summary.parameters[index].returned = true;
+            }
+        }
+    }
+
+    summary
 }
 
 fn object_allocation_count(module: &mir::Module) -> usize {
@@ -76,7 +255,7 @@ fn object_allocation_count(module: &mir::Module) -> usize {
 
 fn classify_function(
     function: &mir::Function,
-    constructors: &HashSet<mir::SymbolId>,
+    summaries: &HashMap<mir::SymbolId, FunctionSummary>,
 ) -> Vec<EscapeClassification> {
     let mut classifications = Vec::new();
 
@@ -91,7 +270,7 @@ fn classify_function(
                 ));
                 continue;
             };
-            classifications.push(classify_allocation(function, *origin, constructors));
+            classifications.push(classify_allocation(function, *origin, summaries));
         }
     }
 
@@ -101,39 +280,50 @@ fn classify_function(
 fn classify_allocation(
     function: &mir::Function,
     origin: mir::LocalId,
-    constructors: &HashSet<mir::SymbolId>,
+    summaries: &HashMap<mir::SymbolId, FunctionSummary>,
 ) -> EscapeClassification {
-    let aliases = collect_aliases(function, origin);
+    let aliases = collect_aliases(function, origin, summaries);
 
     for block in &function.blocks {
         for instruction in &block.instructions {
-            if let Some(reason) = instruction_escape(instruction, &aliases, constructors) {
+            if let Some(reason) = instruction_escape(instruction, &aliases, summaries) {
                 return EscapeClassification::Persistent(reason);
             }
         }
-        if let Some(reason) = terminator_escape(&block.terminator, &aliases) {
-            return EscapeClassification::Persistent(reason);
+        if terminator_returns_alias(&block.terminator, &aliases) {
+            return EscapeClassification::Persistent(EscapeReason::Returned);
         }
     }
 
     EscapeClassification::LocalCandidate
 }
 
-fn collect_aliases(function: &mir::Function, origin: mir::LocalId) -> HashSet<mir::LocalId> {
+fn collect_aliases(
+    function: &mir::Function,
+    origin: mir::LocalId,
+    summaries: &HashMap<mir::SymbolId, FunctionSummary>,
+) -> HashSet<mir::LocalId> {
     let mut aliases = HashSet::from([origin]);
 
     loop {
         let mut changed = false;
         for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
-            let mir::Instruction::Assign {
-                target: mir::Place::Local(destination),
-                value,
-            } = instruction
-            else {
-                continue;
-            };
-            if alias_source(value, &aliases).is_some() {
-                changed |= aliases.insert(*destination);
+            match instruction {
+                mir::Instruction::Assign {
+                    target: mir::Place::Local(destination),
+                    value,
+                } if alias_source(value, &aliases).is_some() => {
+                    changed |= aliases.insert(*destination);
+                }
+                mir::Instruction::Call {
+                    destination: Some(mir::Place::Local(destination)),
+                    function,
+                    arguments,
+                    ..
+                } if call_returns_alias(*function, arguments, &aliases, summaries) => {
+                    changed |= aliases.insert(*destination);
+                }
+                _ => {}
             }
         }
         if !changed {
@@ -153,25 +343,63 @@ fn alias_source(value: &mir::Rvalue, aliases: &HashSet<mir::LocalId>) -> Option<
     }
 }
 
+fn call_returns_alias(
+    function: mir::SymbolId,
+    arguments: &[mir::Operand],
+    aliases: &HashSet<mir::LocalId>,
+    summaries: &HashMap<mir::SymbolId, FunctionSummary>,
+) -> bool {
+    let Some(summary) = summaries.get(&function) else {
+        return false;
+    };
+
+    arguments.iter().enumerate().any(|(index, argument)| {
+        direct_alias(argument, aliases).is_some()
+            && summary
+                .parameters
+                .get(index)
+                .is_some_and(|parameter| parameter.returned)
+    })
+}
+
 fn instruction_escape(
     instruction: &mir::Instruction,
     aliases: &HashSet<mir::LocalId>,
-    constructors: &HashSet<mir::SymbolId>,
+    summaries: &HashMap<mir::SymbolId, FunctionSummary>,
 ) -> Option<EscapeReason> {
     match instruction {
         mir::Instruction::Assign { target, value } => assignment_escape(target, value, aliases),
         mir::Instruction::Call {
+            destination,
             function,
             arguments,
             ..
         } => {
-            for (index, argument) in arguments.iter().enumerate() {
-                if direct_alias(argument, aliases).is_some()
-                    && !(index == 0 && constructors.contains(function))
-                {
-                    return Some(EscapeReason::PassedToCall);
-                }
+            let Some(summary) = summaries.get(function) else {
+                return arguments
+                    .iter()
+                    .any(|argument| direct_alias(argument, aliases).is_some())
+                    .then_some(EscapeReason::PassedToCall);
+            };
+
+            if arguments.iter().enumerate().any(|(index, argument)| {
+                direct_alias(argument, aliases).is_some()
+                    && summary
+                        .parameters
+                        .get(index)
+                        .is_none_or(|parameter| parameter.escapes)
+            }) {
+                return Some(EscapeReason::PassedToCall);
             }
+
+            if destination
+                .as_ref()
+                .is_some_and(|place| !matches!(place, mir::Place::Local(_)))
+                && call_returns_alias(*function, arguments, aliases, summaries)
+            {
+                return Some(EscapeReason::Stored);
+            }
+
             None
         }
         mir::Instruction::CallInterface {
@@ -256,20 +484,11 @@ fn rvalue_uses_alias(value: &mir::Rvalue, aliases: &HashSet<mir::LocalId>) -> bo
     }
 }
 
-fn terminator_escape(
-    terminator: &mir::Terminator,
-    aliases: &HashSet<mir::LocalId>,
-) -> Option<EscapeReason> {
-    match terminator {
-        mir::Terminator::Return(Some(value)) if direct_alias(value, aliases).is_some() => {
-            Some(EscapeReason::Returned)
-        }
-        mir::Terminator::Goto(_)
-        | mir::Terminator::Branch { .. }
-        | mir::Terminator::Return(_)
-        | mir::Terminator::End
-        | mir::Terminator::Unreachable => None,
-    }
+fn terminator_returns_alias(terminator: &mir::Terminator, aliases: &HashSet<mir::LocalId>) -> bool {
+    matches!(
+        terminator,
+        mir::Terminator::Return(Some(value)) if direct_alias(value, aliases).is_some()
+    )
 }
 
 fn direct_alias(operand: &mir::Operand, aliases: &HashSet<mir::LocalId>) -> Option<mir::LocalId> {
@@ -281,20 +500,40 @@ fn direct_alias(operand: &mir::Operand, aliases: &HashSet<mir::LocalId>) -> Opti
 
 #[cfg(test)]
 mod tests {
-    use super::{EscapeClassification, EscapeReason, classify_function, constructor_symbols};
+    use std::collections::HashMap;
+
+    use super::{
+        EscapeClassification, EscapeReason, build_function_summaries, classify_function,
+        strongly_connected_components,
+    };
     use crate::{compile, mir};
 
+    fn compilation(source: &str) -> crate::Compilation {
+        compile(source)
+            .unwrap_or_else(|diagnostics| panic!("invalid test source: {diagnostics:#?}"))
+    }
+
     fn classifications(source: &str, function_name: &str) -> Vec<EscapeClassification> {
-        let compilation = compile(source)
-            .unwrap_or_else(|diagnostics| panic!("invalid test source: {diagnostics:#?}"));
-        let constructors = constructor_symbols(&compilation.mir);
+        let compilation = compilation(source);
+        let summaries = build_function_summaries(&compilation.mir);
         let function = compilation
             .mir
             .functions
             .iter()
             .find(|function| function.name == function_name && function.owner.is_none())
             .unwrap_or_else(|| panic!("missing MIR function `{function_name}`"));
-        classify_function(function, &constructors)
+        classify_function(function, &summaries)
+    }
+
+    fn summaries(
+        source: &str,
+    ) -> (
+        crate::Compilation,
+        HashMap<mir::SymbolId, super::FunctionSummary>,
+    ) {
+        let compilation = compilation(source);
+        let summaries = build_function_summaries(&compilation.mir);
+        (compilation, summaries)
     }
 
     #[test]
@@ -326,33 +565,155 @@ mod tests {
     }
 
     #[test]
-    fn passing_an_object_to_a_free_function_is_conservative() {
-        let source = "public class Box { public Box() {} } public void Consume(Box value) {} public int Run() { Box box = new Box(); Consume(box); return 0; }";
+    fn safe_free_function_parameter_no_longer_forces_an_escape() {
+        let source = "public class Box { public Box() {} } public void Observe(Box value) {} public int Run() { Box box = new Box(); Observe(box); return 0; }";
         assert_eq!(
             classifications(source, "Run"),
-            vec![EscapeClassification::Persistent(EscapeReason::PassedToCall)]
+            vec![EscapeClassification::LocalCandidate]
         );
     }
 
     #[test]
-    fn ordinary_method_receivers_wait_for_function_summaries() {
+    fn transitive_escape_through_known_calls_is_propagated() {
+        let source = "public class Box { public Box() {} } public class Holder { public Box value; public Holder(Box initial) { value = initial; } } public void Store(Holder holder, Box value) { holder.value = value; } public void Forward(Holder holder, Box value) { Store(holder, value); } public int Run() { Holder holder = new Holder(new Box()); Box box = new Box(); Forward(holder, box); return 0; }";
+        let classifications = classifications(source, "Run");
+        assert!(
+            classifications.contains(&EscapeClassification::Persistent(
+                EscapeReason::PassedToCall
+            )),
+            "{classifications:#?}"
+        );
+    }
+
+    #[test]
+    fn returned_parameter_alias_is_tracked_in_the_caller() {
+        let source = "public class Box { public Box() {} } public Box Identity(Box value) { return value; } public Box Run() { Box box = new Box(); Box alias = Identity(box); return alias; }";
+        assert_eq!(
+            classifications(source, "Run"),
+            vec![EscapeClassification::Persistent(EscapeReason::Returned)]
+        );
+    }
+
+    #[test]
+    fn ignored_returned_alias_can_remain_local() {
+        let source = "public class Box { public Box() {} } public Box Identity(Box value) { return value; } public int Run() { Box box = new Box(); Box alias = Identity(box); return 0; }";
+        assert_eq!(
+            classifications(source, "Run"),
+            vec![EscapeClassification::LocalCandidate]
+        );
+    }
+
+    #[test]
+    fn ordinary_non_escaping_method_receiver_is_local() {
         let source = "public class Box { public Box() {} public int Get() { return 1; } } public int Run() { Box box = new Box(); return box.Get(); }";
         assert_eq!(
             classifications(source, "Run"),
-            vec![EscapeClassification::Persistent(EscapeReason::PassedToCall)]
+            vec![EscapeClassification::LocalCandidate]
         );
     }
 
     #[test]
-    fn arrays_are_outside_the_first_local_escape_analysis() {
+    fn monomorphized_generic_summary_preserves_return_aliases() {
+        let source = "public class Box { public Box() {} } public T Identity<T>(T value) { return value; } public int Run() { Box box = new Box(); Box alias = Identity(box); return 0; }";
+        assert_eq!(
+            classifications(source, "Run"),
+            vec![EscapeClassification::LocalCandidate]
+        );
+    }
+
+    #[test]
+    fn interface_conversion_remains_conservative() {
+        let source = "public interface IBox { int Get(); } public class Box : IBox { public Box() {} public int Get() { return 1; } } public int Run() { Box box = new Box(); IBox view = box; return view.Get(); }";
+        assert_eq!(
+            classifications(source, "Run"),
+            vec![EscapeClassification::Persistent(
+                EscapeReason::InterfaceConversion
+            )]
+        );
+    }
+
+    #[test]
+    fn recursive_non_escaping_call_reaches_a_fixpoint() {
+        let source = "public class Box { public Box() {} } public void Visit(Box value, int depth) { if (depth > 0) { Visit(value, depth - 1); } } public int Run() { Box box = new Box(); Visit(box, 2); return 0; }";
+        assert_eq!(
+            classifications(source, "Run"),
+            vec![EscapeClassification::LocalCandidate]
+        );
+    }
+
+    #[test]
+    fn mutual_recursion_propagates_an_escape_inside_the_component() {
+        let source = "public class Box { public Box() {} } public class Holder { public Box value; public Holder(Box initial) { value = initial; } } public void First(Holder holder, Box value, bool stop) { if (stop) { holder.value = value; } else { Second(holder, value, true); } } public void Second(Holder holder, Box value, bool stop) { if (stop) { First(holder, value, true); } else { holder.value = value; } } public int Run() { Holder holder = new Holder(new Box()); Box box = new Box(); First(holder, box, false); return 0; }";
+        let classifications = classifications(source, "Run");
+        assert!(
+            classifications.contains(&EscapeClassification::Persistent(
+                EscapeReason::PassedToCall
+            )),
+            "{classifications:#?}"
+        );
+    }
+
+    #[test]
+    fn constructor_summary_tracks_stored_arguments() {
+        let source = "public class Box { public Box() {} } public class Holder { private Box value; public Holder(Box initial) { value = initial; } } public int Run() { Box box = new Box(); Holder holder = new Holder(box); return 0; }";
+        let classifications = classifications(source, "Run");
+        assert!(
+            classifications.contains(&EscapeClassification::Persistent(
+                EscapeReason::PassedToCall
+            )),
+            "{classifications:#?}"
+        );
+    }
+
+    #[test]
+    fn summaries_distinguish_returned_from_other_escape() {
+        let source = "public class Box { public Box() {} } public Box Identity(Box value) { return value; } public void Consume(Box value) { Box alias = value; }";
+        let (compilation, summaries) = summaries(source);
+        let identity = compilation
+            .mir
+            .functions
+            .iter()
+            .find(|function| function.name == "Identity")
+            .expect("Identity MIR function");
+        let consume = compilation
+            .mir
+            .functions
+            .iter()
+            .find(|function| function.name == "Consume")
+            .expect("Consume MIR function");
+
+        assert_eq!(
+            summaries[&identity.symbol].parameters[0],
+            super::ParameterSummary {
+                escapes: false,
+                returned: true,
+            }
+        );
+        assert_eq!(
+            summaries[&consume.symbol].parameters[0],
+            super::ParameterSummary::default()
+        );
+    }
+
+    #[test]
+    fn finds_direct_and_mutual_recursive_components() {
+        let graph = vec![vec![0], vec![2], vec![1], vec![2]];
+        let components = strongly_connected_components(&graph);
+        assert!(components.contains(&vec![0]));
+        assert!(components.contains(&vec![1, 2]));
+        assert!(components.contains(&vec![3]));
+    }
+
+    #[test]
+    fn arrays_are_outside_this_escape_analysis() {
         let source = "public int Run() { int[] values = [1, 2, 3]; return values.Length; }";
         assert!(classifications(source, "Run").is_empty());
     }
 
     #[test]
     fn actual_mir_regions_remain_persistent() {
-        let source = "public class Box { public Box() {} } public int Run() { Box box = new Box(); return 1; }";
-        let compilation = compile(source).expect("valid source");
+        let source = "public class Box { public Box() {} public int Get() { return 1; } } public int Run() { Box box = new Box(); return box.Get(); }";
+        let compilation = compilation(source);
         assert!(compilation.mir.functions.iter().all(|function| {
             function.blocks.iter().all(|block| {
                 block.instructions.iter().all(|instruction| {
