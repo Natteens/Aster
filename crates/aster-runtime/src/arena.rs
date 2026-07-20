@@ -1,21 +1,31 @@
 //! Paged bump allocator for per-execution memory.
 //!
 //! Each [`PagedArena`] owns a sequence of pages allocated via
-//! [`std::alloc::alloc_zeroed`]. Allocations bump a cursor within the active
-//! (last) page. When the active page is exhausted, a new one is appended.
-//! Pages are never moved or freed individually — all memory is released when
-//! the arena is dropped.
+//! [`std::alloc::alloc_zeroed`]. Allocations bump a cursor within the last
+//! active page. Rewound pages remain reserved and can be reused without moving
+//! their backing memory. All pages are released when the arena is dropped.
 //!
 //! Requests larger than [`DEFAULT_PAGE_SIZE`] get a dedicated page whose
 //! capacity equals the request size.
 
-use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
+use std::{
+    alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 /// Default page capacity in bytes.
 const DEFAULT_PAGE_SIZE: usize = 64 * 1024;
 
 /// Maximum alignment supported by arena allocations.
 const MAX_ALIGN: usize = 16;
+
+static NEXT_ARENA_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_arena_id() -> u64 {
+    NEXT_ARENA_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("arena id space exhausted")
+}
 
 /// One contiguous page of zeroed memory.
 struct Page {
@@ -65,6 +75,26 @@ impl Page {
         self.cursor = end;
         Some((ptr, consumed))
     }
+
+    fn rewind_to(&mut self, cursor: usize) {
+        assert!(
+            cursor <= self.cursor,
+            "page rewind cursor exceeds current cursor"
+        );
+
+        let reclaimed = self.cursor - cursor;
+        if reclaimed != 0 {
+            // SAFETY: `cursor <= self.cursor <= self.capacity()`, so the range
+            // starting at `base + cursor` with length `reclaimed` lies entirely
+            // inside this live page allocation.
+            #[allow(unsafe_code)]
+            unsafe {
+                std::ptr::write_bytes(self.base.add(cursor), 0, reclaimed);
+            }
+        }
+
+        self.cursor = cursor;
+    }
 }
 
 impl Drop for Page {
@@ -78,7 +108,16 @@ impl Drop for Page {
     }
 }
 
-/// Cumulative allocation statistics from the arena.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ArenaMark {
+    arena_id: u64,
+    mark_id: u64,
+    active_pages: usize,
+    cursor: usize,
+    used_bytes: usize,
+}
+
+/// Current allocation statistics from the arena.
 pub(crate) struct ArenaMetrics {
     /// Total bytes consumed inside pages, including alignment padding.
     pub used_bytes: usize,
@@ -89,21 +128,29 @@ pub(crate) struct ArenaMetrics {
 /// Paged bump allocator. Owns all pages and frees them on drop.
 pub(crate) struct PagedArena {
     pages: Vec<Page>,
+    active_pages: usize,
     used_bytes: usize,
     reserved_bytes: usize,
+    arena_id: u64,
+    next_mark_id: u64,
+    mark_stack: Vec<u64>,
 }
 
 impl PagedArena {
     pub(crate) fn new() -> Self {
         PagedArena {
             pages: Vec::new(),
+            active_pages: 0,
             used_bytes: 0,
             reserved_bytes: 0,
+            arena_id: next_arena_id(),
+            next_mark_id: 1,
+            mark_stack: Vec::new(),
         }
     }
 
     /// Allocate `size` bytes with the given alignment. The returned pointer is
-    /// stable for the arena's lifetime and points to zeroed memory.
+    /// stable while its region remains active and points to zeroed memory.
     ///
     /// # Panics
     ///
@@ -122,24 +169,151 @@ impl PagedArena {
             "alignment {align} exceeds MAX_ALIGN ({MAX_ALIGN})"
         );
 
-        if let Some(page) = self.pages.last_mut() {
+        if self.active_pages != 0 {
+            let page = &mut self.pages[self.active_pages - 1];
             if let Some((ptr, consumed)) = page.try_alloc(size, align) {
                 self.used_bytes += consumed;
                 return ptr;
             }
         }
 
+        assert!(
+            self.pages[self.active_pages..]
+                .iter()
+                .all(|page| page.cursor == 0),
+            "inactive arena page must have zero cursor"
+        );
+
+        let reusable_index = self.pages[self.active_pages..]
+            .iter()
+            .enumerate()
+            .filter(|(_, page)| page.capacity() >= size)
+            .min_by_key(|(_, page)| page.capacity())
+            .map(|(offset, _)| self.active_pages + offset);
+
+        if let Some(index) = reusable_index {
+            self.pages.swap(self.active_pages, index);
+            let page = &mut self.pages[self.active_pages];
+            let (ptr, consumed) = page
+                .try_alloc(size, align)
+                .expect("reused page must satisfy the allocation");
+            self.active_pages += 1;
+            self.used_bytes += consumed;
+            return ptr;
+        }
+
         // Fresh pages are MAX_ALIGN-aligned, so the first allocation needs no padding.
         let capacity = size.max(DEFAULT_PAGE_SIZE);
-
         let mut page = Page::new(capacity);
         let (ptr, consumed) = page
             .try_alloc(size, align)
             .expect("fresh page must satisfy the allocation");
+
         self.used_bytes += consumed;
         self.reserved_bytes += page.capacity();
         self.pages.push(page);
+        let new_page_index = self.pages.len() - 1;
+        self.pages.swap(self.active_pages, new_page_index);
+        self.active_pages += 1;
         ptr
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn mark(&mut self) -> ArenaMark {
+        let mark_id = self.next_mark_id;
+        self.next_mark_id = self
+            .next_mark_id
+            .checked_add(1)
+            .expect("arena mark id space exhausted");
+        self.mark_stack.push(mark_id);
+
+        let cursor = if self.active_pages == 0 {
+            0
+        } else {
+            self.pages[self.active_pages - 1].cursor
+        };
+
+        ArenaMark {
+            arena_id: self.arena_id,
+            mark_id,
+            active_pages: self.active_pages,
+            cursor,
+            used_bytes: self.used_bytes,
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(clippy::needless_pass_by_value)]
+    pub(crate) fn rewind(&mut self, mark: ArenaMark) {
+        let ArenaMark {
+            arena_id,
+            mark_id,
+            active_pages,
+            cursor,
+            used_bytes,
+        } = mark;
+
+        assert_eq!(
+            arena_id, self.arena_id,
+            "arena mark belongs to a different arena"
+        );
+
+        let active_mark = self
+            .mark_stack
+            .last()
+            .copied()
+            .expect("arena has no active mark");
+
+        assert_eq!(
+            mark_id, active_mark,
+            "arena marks must be rewound in LIFO order"
+        );
+        assert!(
+            active_pages <= self.active_pages,
+            "arena mark has invalid active page count"
+        );
+        assert!(
+            used_bytes <= self.used_bytes,
+            "arena mark has invalid used byte count"
+        );
+
+        if active_pages == 0 {
+            assert_eq!(cursor, 0, "empty arena mark must have a zero cursor");
+            assert_eq!(used_bytes, 0, "empty arena mark must have zero used bytes");
+
+            for page in &mut self.pages[..self.active_pages] {
+                page.rewind_to(0);
+            }
+        } else {
+            assert!(
+                active_pages <= self.pages.len(),
+                "arena mark references a missing page"
+            );
+
+            let marked_page = active_pages - 1;
+
+            assert!(
+                cursor <= self.pages[marked_page].cursor,
+                "arena mark cursor exceeds current page cursor"
+            );
+
+            self.pages[marked_page].rewind_to(cursor);
+
+            for page in &mut self.pages[active_pages..self.active_pages] {
+                page.rewind_to(0);
+            }
+        }
+
+        self.active_pages = active_pages;
+        self.used_bytes = used_bytes;
+
+        let removed = self.mark_stack.pop();
+
+        assert_eq!(
+            removed,
+            Some(mark_id),
+            "arena mark stack changed during rewind"
+        );
     }
 
     pub(crate) fn metrics(&self) -> ArenaMetrics {
@@ -153,6 +327,18 @@ impl PagedArena {
     #[cfg(test)]
     fn page_count(&self) -> usize {
         self.pages.len()
+    }
+
+    #[cfg(test)]
+    fn active_page_count(&self) -> usize {
+        self.active_pages
+    }
+
+    #[cfg(test)]
+    fn active_page_capacity(&self) -> Option<usize> {
+        self.active_pages
+            .checked_sub(1)
+            .map(|index| self.pages[index].capacity())
     }
 }
 
@@ -431,5 +617,315 @@ mod tests {
     fn alloc_excess_align_panics() {
         let mut arena = PagedArena::new();
         arena.alloc(8, MAX_ALIGN * 2);
+    }
+
+    #[test]
+    fn empty_mark_rewinds_without_allocating_pages() {
+        let mut arena = PagedArena::new();
+        let mark = arena.mark();
+        arena.rewind(mark);
+
+        let metrics = arena.metrics();
+        assert_eq!(metrics.used_bytes, 0);
+        assert_eq!(metrics.reserved_bytes, 0);
+        assert_eq!(arena.page_count(), 0);
+        assert_eq!(arena.active_page_count(), 0);
+    }
+
+    #[test]
+    fn rewind_restores_usage_within_the_same_page() {
+        let mut arena = PagedArena::new();
+        arena.alloc(8, 8);
+        let mark = arena.mark();
+        let before = arena.metrics();
+
+        arena.alloc(32, 8);
+        assert!(arena.metrics().used_bytes > before.used_bytes);
+        arena.rewind(mark);
+
+        let after = arena.metrics();
+        assert_eq!(after.used_bytes, before.used_bytes);
+        assert_eq!(after.reserved_bytes, before.reserved_bytes);
+        assert_eq!(arena.active_page_count(), 1);
+    }
+
+    #[test]
+    fn rewind_preserves_content_allocated_before_the_mark() {
+        let mut arena = PagedArena::new();
+        let persistent = arena.alloc(8, 8);
+        // SAFETY: `persistent` points to eight live arena-owned bytes.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::write(persistent as *mut u64, 0xCAFE_BABE);
+        }
+
+        let mark = arena.mark();
+        arena.alloc(256, 8);
+        arena.rewind(mark);
+
+        // SAFETY: the allocation was created before the mark and remains active.
+        #[allow(unsafe_code)]
+        let value = unsafe { std::ptr::read(persistent as *const u64) };
+        assert_eq!(value, 0xCAFE_BABE);
+    }
+
+    #[test]
+    fn reused_region_is_zeroed_after_rewind() {
+        let mut arena = PagedArena::new();
+        let mark = arena.mark();
+        let old_address = {
+            let ptr = arena.alloc(64, 8);
+            // SAFETY: `ptr` points to 64 live arena-owned bytes.
+            #[allow(unsafe_code)]
+            unsafe {
+                std::ptr::write_bytes(ptr, 0xAB, 64);
+            }
+            ptr as usize
+        };
+
+        arena.rewind(mark);
+
+        let reused = arena.alloc(64, 8);
+        assert_eq!(reused as usize, old_address);
+        // SAFETY: `reused` is a new live allocation of 64 bytes.
+        #[allow(unsafe_code)]
+        let bytes = unsafe { std::slice::from_raw_parts(reused, 64) };
+        assert!(bytes.iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn rewind_restores_alignment_padding() {
+        let mut arena = PagedArena::new();
+        arena.alloc(3, 1);
+        let mark = arena.mark();
+        let before = arena.metrics().used_bytes;
+
+        arena.alloc(4, 8);
+        assert_eq!(arena.metrics().used_bytes, 12);
+        arena.rewind(mark);
+
+        assert_eq!(arena.metrics().used_bytes, before);
+        assert_eq!(before, 3);
+    }
+
+    #[test]
+    fn rewind_crossing_pages_keeps_them_reserved_and_inactive() {
+        let mut arena = PagedArena::new();
+        arena.alloc(8, 8);
+        let mark = arena.mark();
+        let used_before = arena.metrics().used_bytes;
+
+        arena.alloc(DEFAULT_PAGE_SIZE, 8);
+        arena.alloc(DEFAULT_PAGE_SIZE, 8);
+        let reserved_before = arena.metrics().reserved_bytes;
+        assert_eq!(arena.active_page_count(), 3);
+
+        arena.rewind(mark);
+
+        assert_eq!(arena.metrics().used_bytes, used_before);
+        assert_eq!(arena.metrics().reserved_bytes, reserved_before);
+        assert_eq!(arena.page_count(), 3);
+        assert_eq!(arena.active_page_count(), 1);
+    }
+
+    #[test]
+    fn inactive_pages_are_reused_before_allocating_new_pages() {
+        let mut arena = PagedArena::new();
+        let mark = arena.mark();
+
+        arena.alloc(DEFAULT_PAGE_SIZE, 8);
+        arena.alloc(DEFAULT_PAGE_SIZE, 8);
+        let page_count = arena.page_count();
+        let reserved = arena.metrics().reserved_bytes;
+
+        arena.rewind(mark);
+        arena.alloc(8, 8);
+
+        assert_eq!(arena.page_count(), page_count);
+        assert_eq!(arena.metrics().reserved_bytes, reserved);
+        assert_eq!(arena.active_page_count(), 1);
+    }
+
+    #[test]
+    fn oversized_inactive_page_is_reused() {
+        let mut arena = PagedArena::new();
+        let big_size = DEFAULT_PAGE_SIZE * 2;
+        let mark = arena.mark();
+        let original = arena.alloc(big_size, 8) as usize;
+        let reserved = arena.metrics().reserved_bytes;
+
+        arena.rewind(mark);
+        let reused = arena.alloc(big_size, 8) as usize;
+
+        assert_eq!(reused, original);
+        assert_eq!(arena.page_count(), 1);
+        assert_eq!(arena.metrics().reserved_bytes, reserved);
+    }
+
+    #[test]
+    fn inactive_page_reuse_uses_smallest_sufficient_capacity() {
+        let mut arena = PagedArena::new();
+        let mark = arena.mark();
+
+        arena.alloc(DEFAULT_PAGE_SIZE * 2, 8);
+        arena.alloc(DEFAULT_PAGE_SIZE, 8);
+        arena.rewind(mark);
+
+        arena.alloc(32, 8);
+
+        assert_eq!(arena.active_page_capacity(), Some(DEFAULT_PAGE_SIZE));
+        assert_eq!(arena.page_count(), 2);
+    }
+
+    #[test]
+    fn nested_marks_restore_only_their_own_regions() {
+        let mut arena = PagedArena::new();
+        let a = arena.alloc(8, 8);
+        // SAFETY: `a` points to eight live arena-owned bytes.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::write(a as *mut u64, 1);
+        }
+
+        let outer = arena.mark();
+        let b = arena.alloc(8, 8);
+        // SAFETY: `b` points to eight live arena-owned bytes.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::write(b as *mut u64, 2);
+        }
+
+        let inner = arena.mark();
+        let c_address = arena.alloc(8, 8) as usize;
+        arena.rewind(inner);
+
+        // SAFETY: `a` and `b` were allocated before the inner mark.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!(std::ptr::read(a as *const u64), 1);
+            assert_eq!(std::ptr::read(b as *const u64), 2);
+        }
+
+        let reused_c = arena.alloc(8, 8);
+        assert_eq!(reused_c as usize, c_address);
+        arena.rewind(outer);
+
+        // SAFETY: `a` was allocated before the outer mark.
+        #[allow(unsafe_code)]
+        let a_value = unsafe { std::ptr::read(a as *const u64) };
+        assert_eq!(a_value, 1);
+    }
+
+    #[test]
+    fn inner_rewind_does_not_clear_outer_allocation() {
+        let mut arena = PagedArena::new();
+        let outer = arena.mark();
+        let outer_value = arena.alloc(8, 8);
+        // SAFETY: `outer_value` points to eight live arena-owned bytes.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::write(outer_value as *mut u64, 42);
+        }
+
+        let inner = arena.mark();
+        arena.alloc(128, 8);
+        arena.rewind(inner);
+
+        // SAFETY: `outer_value` was allocated before the inner mark.
+        #[allow(unsafe_code)]
+        let value = unsafe { std::ptr::read(outer_value as *const u64) };
+        assert_eq!(value, 42);
+
+        arena.rewind(outer);
+    }
+
+    #[test]
+    #[should_panic(expected = "arena marks must be rewound in LIFO order")]
+    fn rewinding_marks_out_of_order_panics() {
+        let mut arena = PagedArena::new();
+        let outer = arena.mark();
+        let _inner = arena.mark();
+        arena.rewind(outer);
+    }
+
+    #[test]
+    #[should_panic(expected = "arena mark belongs to a different arena")]
+    fn rewinding_mark_from_another_arena_panics() {
+        let mut first = PagedArena::new();
+        let mut second = PagedArena::new();
+        let mark = first.mark();
+        second.rewind(mark);
+    }
+
+    #[test]
+    fn reserved_bytes_never_decrease_after_rewind() {
+        let mut arena = PagedArena::new();
+        let mark = arena.mark();
+        arena.alloc(DEFAULT_PAGE_SIZE, 8);
+        arena.alloc(DEFAULT_PAGE_SIZE * 2, 8);
+        let reserved = arena.metrics().reserved_bytes;
+
+        arena.rewind(mark);
+
+        assert_eq!(arena.metrics().reserved_bytes, reserved);
+        assert_eq!(arena.metrics().used_bytes, 0);
+    }
+
+    #[test]
+    fn mark_after_multiple_pages_preserves_all_prior_pages() {
+        let mut arena = PagedArena::new();
+        let first = arena.alloc(DEFAULT_PAGE_SIZE, 8);
+        let second = arena.alloc(DEFAULT_PAGE_SIZE, 8);
+        // SAFETY: both pointers refer to live allocations created before the mark.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::write(first as *mut u64, 11);
+            std::ptr::write(second as *mut u64, 22);
+        }
+
+        let mark = arena.mark();
+        arena.alloc(DEFAULT_PAGE_SIZE, 8);
+        arena.rewind(mark);
+
+        // SAFETY: both allocations predate the mark and remain active.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!(std::ptr::read(first as *const u64), 11);
+            assert_eq!(std::ptr::read(second as *const u64), 22);
+        }
+        assert_eq!(arena.active_page_count(), 2);
+    }
+
+    #[test]
+    fn rewind_from_exact_page_limit_reuses_following_page() {
+        let mut arena = PagedArena::new();
+        arena.alloc(DEFAULT_PAGE_SIZE, 8);
+        let mark = arena.mark();
+
+        arena.alloc(8, 8);
+        let pages = arena.page_count();
+        let reserved = arena.metrics().reserved_bytes;
+        arena.rewind(mark);
+
+        arena.alloc(8, 8);
+
+        assert_eq!(arena.page_count(), pages);
+        assert_eq!(arena.metrics().reserved_bytes, reserved);
+        assert_eq!(arena.active_page_count(), 2);
+    }
+
+    #[test]
+    fn drop_after_multiple_rewinds_does_not_double_free() {
+        let mut arena = PagedArena::new();
+
+        let outer = arena.mark();
+        arena.alloc(DEFAULT_PAGE_SIZE, 8);
+        let inner = arena.mark();
+        arena.alloc(DEFAULT_PAGE_SIZE * 2, 8);
+        arena.rewind(inner);
+        arena.alloc(DEFAULT_PAGE_SIZE * 2, 8);
+        arena.rewind(outer);
+
+        drop(arena);
     }
 }
