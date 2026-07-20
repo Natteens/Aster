@@ -88,7 +88,12 @@ fn mir_evaluates_left_to_right_stringifies_and_joins_exactly_once() {
     assert_eq!(
         intrinsics
             .iter()
-            .filter(|intrinsic| **intrinsic == mir::Intrinsic::StringFromLong)
+            .filter(|intrinsic| {
+                matches!(
+                    **intrinsic,
+                    mir::Intrinsic::StringFromLong | mir::Intrinsic::StringFromLongTemporary
+                )
+            })
             .count(),
         3
     );
@@ -101,6 +106,18 @@ fn mir_evaluates_left_to_right_stringifies_and_joins_exactly_once() {
         1
     );
     assert_eq!(intrinsics.last(), Some(&mir::Intrinsic::StringJoin));
+    assert_eq!(
+        intrinsics
+            .iter()
+            .filter_map(|intrinsic| intrinsic.string_allocation_region())
+            .collect::<Vec<_>>(),
+        vec![
+            mir::AllocationRegion::Temporary,
+            mir::AllocationRegion::Temporary,
+            mir::AllocationRegion::Temporary,
+            mir::AllocationRegion::Persistent,
+        ]
+    );
 
     // The join call receives every stringified segment plus the literal text
     // between them, all already typed `string`.
@@ -148,9 +165,12 @@ fn already_string_values_are_not_redundantly_stringified() {
         })
         .collect::<Vec<_>>();
     assert!(
-        intrinsics
-            .iter()
-            .all(|intrinsic| *intrinsic != mir::Intrinsic::StringFromLong),
+        intrinsics.iter().all(|intrinsic| {
+            !matches!(
+                *intrinsic,
+                mir::Intrinsic::StringFromLong | mir::Intrinsic::StringFromLongTemporary
+            )
+        }),
         "a string-typed part must not be converted: {intrinsics:?}"
     );
     assert_eq!(

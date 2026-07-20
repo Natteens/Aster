@@ -52,7 +52,10 @@ impl Codegen {
         state: &FunctionState,
     ) -> Result<(), BackendError> {
         match intrinsic {
-            mir::Intrinsic::StringFromLong | mir::Intrinsic::StringFromULong => {
+            mir::Intrinsic::StringFromLong
+            | mir::Intrinsic::StringFromLongTemporary
+            | mir::Intrinsic::StringFromULong
+            | mir::Intrinsic::StringFromULongTemporary => {
                 return self.translate_string_from_integer(
                     builder,
                     destination,
@@ -61,11 +64,23 @@ impl Codegen {
                     state,
                 );
             }
-            mir::Intrinsic::StringFromDouble => {
-                return self.translate_string_from_double(builder, destination, arguments, state);
+            mir::Intrinsic::StringFromDouble | mir::Intrinsic::StringFromDoubleTemporary => {
+                return self.translate_string_from_double(
+                    builder,
+                    destination,
+                    intrinsic,
+                    arguments,
+                    state,
+                );
             }
-            mir::Intrinsic::StringJoin => {
-                return self.translate_string_join(builder, destination, arguments, state);
+            mir::Intrinsic::StringJoin | mir::Intrinsic::StringJoinTemporary => {
+                return self.translate_string_join(
+                    builder,
+                    destination,
+                    intrinsic,
+                    arguments,
+                    state,
+                );
             }
             _ => {}
         }
@@ -75,9 +90,18 @@ impl Codegen {
             mir::Intrinsic::LogError => ("aster_rt_log", Some(2), false),
             mir::Intrinsic::StringEquals => ("aster_rt_string_eq", None, false),
             mir::Intrinsic::StringConcat => ("aster_rt_string_concat", None, true),
+            mir::Intrinsic::StringConcatTemporary => {
+                ("aster_rt_string_concat_temporary", None, true)
+            }
             mir::Intrinsic::StringLength => ("aster_rt_string_length", None, true),
             mir::Intrinsic::StringFromBool => ("aster_rt_string_from_bool", None, true),
+            mir::Intrinsic::StringFromBoolTemporary => {
+                ("aster_rt_string_from_bool_temporary", None, true)
+            }
             mir::Intrinsic::StringFromChar => ("aster_rt_string_from_char", None, true),
+            mir::Intrinsic::StringFromCharTemporary => {
+                ("aster_rt_string_from_char_temporary", None, true)
+            }
             mir::Intrinsic::ReportRuntimeError(kind) => (
                 "aster_rt_math_domain_error",
                 Some(match kind {
@@ -88,9 +112,13 @@ impl Codegen {
                 true,
             ),
             mir::Intrinsic::StringFromLong
+            | mir::Intrinsic::StringFromLongTemporary
             | mir::Intrinsic::StringFromULong
+            | mir::Intrinsic::StringFromULongTemporary
             | mir::Intrinsic::StringFromDouble
-            | mir::Intrinsic::StringJoin => {
+            | mir::Intrinsic::StringFromDoubleTemporary
+            | mir::Intrinsic::StringJoin
+            | mir::Intrinsic::StringJoinTemporary => {
                 unreachable!("handled by the dedicated translators above")
             }
         };
@@ -131,15 +159,16 @@ impl Codegen {
         arguments: &[mir::Operand],
         state: &FunctionState,
     ) -> Result<(), BackendError> {
-        let symbol = match intrinsic {
-            mir::Intrinsic::StringFromLong => "aster_rt_string_from_long",
-            mir::Intrinsic::StringFromULong => "aster_rt_string_from_ulong",
-            _ => unreachable!("caller matched only these two intrinsics"),
-        };
-        let widened_type = if symbol == "aster_rt_string_from_long" {
-            mir::Type::Long
-        } else {
-            mir::Type::ULong
+        let (symbol, widened_type) = match intrinsic {
+            mir::Intrinsic::StringFromLong => ("aster_rt_string_from_long", mir::Type::Long),
+            mir::Intrinsic::StringFromLongTemporary => {
+                ("aster_rt_string_from_long_temporary", mir::Type::Long)
+            }
+            mir::Intrinsic::StringFromULong => ("aster_rt_string_from_ulong", mir::Type::ULong),
+            mir::Intrinsic::StringFromULongTemporary => {
+                ("aster_rt_string_from_ulong_temporary", mir::Type::ULong)
+            }
+            _ => unreachable!("caller matched only integer-to-string intrinsics"),
         };
         let argument = arguments.first().ok_or_else(|| {
             BackendError::new("string interpolation conversion requires one argument")
@@ -162,6 +191,7 @@ impl Codegen {
         &mut self,
         builder: &mut FunctionBuilder<'_>,
         destination: Option<&mir::Place>,
+        intrinsic: mir::Intrinsic,
         arguments: &[mir::Operand],
         state: &FunctionState,
     ) -> Result<(), BackendError> {
@@ -170,10 +200,14 @@ impl Codegen {
         })?;
         let value = self.translate_operand(builder, argument, state)?;
         let value = cast_value(builder, &argument.type_, &mir::Type::Double, value)?;
-        let function_ref = self.jit.declare_func_in_func(
-            self.runtime_ids["aster_rt_string_from_double"],
-            builder.func,
-        );
+        let symbol = match intrinsic {
+            mir::Intrinsic::StringFromDouble => "aster_rt_string_from_double",
+            mir::Intrinsic::StringFromDoubleTemporary => "aster_rt_string_from_double_temporary",
+            _ => unreachable!("caller matched only double-to-string intrinsics"),
+        };
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids[symbol], builder.func);
         let context = state
             .execution_context
             .ok_or_else(|| BackendError::new("runtime intrinsic requires an execution context"))?;
@@ -190,6 +224,7 @@ impl Codegen {
         &mut self,
         builder: &mut FunctionBuilder<'_>,
         destination: Option<&mir::Place>,
+        intrinsic: mir::Intrinsic,
         arguments: &[mir::Operand],
         state: &FunctionState,
     ) -> Result<(), BackendError> {
@@ -216,9 +251,14 @@ impl Codegen {
             builder.ins().stack_store(value, slot, offset);
         }
         let array_pointer = builder.ins().stack_addr(self.pointer_type, slot, 0);
+        let symbol = match intrinsic {
+            mir::Intrinsic::StringJoin => "aster_rt_string_join",
+            mir::Intrinsic::StringJoinTemporary => "aster_rt_string_join_temporary",
+            _ => unreachable!("caller matched only string-join intrinsics"),
+        };
         let function_ref = self
             .jit
-            .declare_func_in_func(self.runtime_ids["aster_rt_string_join"], builder.func);
+            .declare_func_in_func(self.runtime_ids[symbol], builder.func);
         let context = state
             .execution_context
             .ok_or_else(|| BackendError::new("runtime intrinsic requires an execution context"))?;
@@ -256,20 +296,19 @@ impl Codegen {
         region: mir::AllocationRegion,
         state: &FunctionState,
     ) -> Result<(), BackendError> {
-        if region != mir::AllocationRegion::Persistent {
-            return Err(BackendError::new(
-                "temporary array allocations are not yet supported by the Cranelift JIT",
-            ));
-        }
         if requires_default && !self.layouts.zero_initializable(element_type) {
             return Err(BackendError::new(format!(
                 "`new {}[length]` has no safe all-zero default; initialize every element with an array literal",
                 type_name(element_type)
             )));
         }
+        let symbol = match region {
+            mir::AllocationRegion::Persistent => "aster_rt_array_new",
+            mir::AllocationRegion::Temporary => "aster_rt_array_new_temporary",
+        };
         let function_ref = self
             .jit
-            .declare_func_in_func(self.runtime_ids["aster_rt_array_new"], builder.func);
+            .declare_func_in_func(self.runtime_ids[symbol], builder.func);
         let context = state
             .execution_context
             .ok_or_else(|| BackendError::new("array allocation is missing its ExecutionContext"))?;

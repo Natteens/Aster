@@ -1,13 +1,13 @@
-//! Conservative escape classification and region selection for MIR objects.
+//! Conservative escape classification and region selection for MIR allocations.
 //!
 //! The pass first computes interprocedural summaries for direct Aster calls.
 //! Summaries are solved over the direct-call graph by strongly connected
 //! components and a monotone fixpoint, so direct and mutual recursion do not
 //! depend on declaration order.
 //!
-//! Object allocations proven local to their containing function are rewritten
-//! to [`mir::AllocationRegion::Temporary`]. Every uncertain or escaping object
-//! remains persistent. Arrays and dynamic strings are outside this pass.
+//! Objects, arrays, and dynamic strings proven local to their containing
+//! function are rewritten to [`mir::AllocationRegion::Temporary`]. Every
+//! uncertain or escaping allocation remains persistent.
 
 use std::collections::{HashMap, HashSet};
 
@@ -70,7 +70,7 @@ enum EscapeReason {
     UnsupportedUse,
 }
 
-/// Classify every MIR object allocation and apply its storage region.
+/// Classify every MIR allocation and apply its storage region.
 ///
 /// This is deliberately conservative: only [`EscapeClassification::LocalCandidate`]
 /// becomes temporary. Any escape reason keeps the original persistent lifetime.
@@ -93,34 +93,35 @@ pub(super) fn assign_allocation_regions(module: &mut mir::Module) {
             .iter_mut()
             .flat_map(|block| &mut block.instructions)
         {
-            let mir::Instruction::AllocateObject { region, .. } = instruction else {
+            if !is_dynamic_allocation(instruction) {
                 continue;
-            };
+            }
             let classification = function_classifications
                 .next()
-                .expect("every MIR object allocation has a classification");
-            match classification {
+                .expect("every MIR allocation has an escape classification");
+            let region = match classification {
                 EscapeClassification::LocalCandidate => {
-                    *region = mir::AllocationRegion::Temporary;
                     local_candidates += 1;
+                    mir::AllocationRegion::Temporary
                 }
                 EscapeClassification::Persistent(_) => {
-                    *region = mir::AllocationRegion::Persistent;
                     persistent += 1;
+                    mir::AllocationRegion::Persistent
                 }
-            }
+            };
+            set_allocation_region(instruction, region);
         }
 
         debug_assert!(
             function_classifications.next().is_none(),
-            "escape analysis produced more classifications than object allocations"
+            "escape analysis produced more classifications than allocations"
         );
     }
 
     debug_assert_eq!(
         local_candidates + persistent,
-        object_allocation_count(module),
-        "every MIR object allocation must receive one escape classification"
+        dynamic_allocation_count(module),
+        "every MIR allocation must receive one escape classification"
     );
 }
 
@@ -249,7 +250,7 @@ fn summarize_function(
     let mut summary = FunctionSummary::for_function(function);
 
     for (index, parameter) in function.parameters.iter().enumerate() {
-        if !matches!(&parameter.type_, mir::Type::Class(_)) {
+        if !is_tracked_reference_type(&parameter.type_) {
             continue;
         }
 
@@ -271,13 +272,61 @@ fn summarize_function(
     summary
 }
 
-fn object_allocation_count(module: &mir::Module) -> usize {
+fn is_tracked_reference_type(type_: &mir::Type) -> bool {
+    matches!(
+        type_,
+        mir::Type::Class(_) | mir::Type::Array(_) | mir::Type::String
+    )
+}
+
+fn is_dynamic_allocation(instruction: &mir::Instruction) -> bool {
+    matches!(
+        instruction,
+        mir::Instruction::AllocateObject { .. } | mir::Instruction::AllocateArray { .. }
+    ) || matches!(
+        instruction,
+        mir::Instruction::CallIntrinsic { intrinsic, .. }
+            if intrinsic.string_allocation_region().is_some()
+    )
+}
+
+fn allocation_destination(instruction: &mir::Instruction) -> Option<&mir::Place> {
+    match instruction {
+        mir::Instruction::AllocateObject { destination, .. }
+        | mir::Instruction::AllocateArray { destination, .. } => Some(destination),
+        mir::Instruction::CallIntrinsic {
+            destination,
+            intrinsic,
+            ..
+        } if intrinsic.string_allocation_region().is_some() => destination.as_ref(),
+        _ => None,
+    }
+}
+
+fn set_allocation_region(instruction: &mut mir::Instruction, region: mir::AllocationRegion) {
+    match instruction {
+        mir::Instruction::AllocateObject {
+            region: current, ..
+        }
+        | mir::Instruction::AllocateArray {
+            region: current, ..
+        } => *current = region,
+        mir::Instruction::CallIntrinsic { intrinsic, .. }
+            if intrinsic.string_allocation_region().is_some() =>
+        {
+            *intrinsic = intrinsic.with_string_allocation_region(region);
+        }
+        _ => unreachable!("only dynamic allocations receive storage regions"),
+    }
+}
+
+fn dynamic_allocation_count(module: &mir::Module) -> usize {
     module
         .functions
         .iter()
         .flat_map(|function| &function.blocks)
         .flat_map(|block| &block.instructions)
-        .filter(|instruction| matches!(instruction, mir::Instruction::AllocateObject { .. }))
+        .filter(|instruction| is_dynamic_allocation(instruction))
         .count()
 }
 
@@ -289,10 +338,10 @@ fn classify_function(
 
     for block in &function.blocks {
         for instruction in &block.instructions {
-            let mir::Instruction::AllocateObject { destination, .. } = instruction else {
+            if !is_dynamic_allocation(instruction) {
                 continue;
-            };
-            let mir::Place::Local(origin) = destination else {
+            }
+            let Some(mir::Place::Local(origin)) = allocation_destination(instruction) else {
                 classifications.push(EscapeClassification::Persistent(
                     EscapeReason::NonLocalDestination,
                 ));
@@ -363,7 +412,7 @@ fn collect_aliases(
 fn alias_source(value: &mir::Rvalue, aliases: &HashSet<mir::LocalId>) -> Option<mir::LocalId> {
     match &value.kind {
         mir::RvalueKind::Use(operand) | mir::RvalueKind::Cast(operand)
-            if matches!(&value.type_, mir::Type::Class(_)) =>
+            if is_tracked_reference_type(&value.type_) =>
         {
             direct_alias(operand, aliases)
         }
@@ -445,10 +494,40 @@ fn instruction_escape(
                 None
             }
         }
-        mir::Instruction::CallIntrinsic { arguments, .. } => arguments
-            .iter()
-            .any(|argument| direct_alias(argument, aliases).is_some())
-            .then_some(EscapeReason::PassedToIntrinsic),
+        mir::Instruction::CallIntrinsic {
+            intrinsic,
+            arguments,
+            ..
+        } => {
+            let borrows_only = matches!(
+                *intrinsic,
+                mir::Intrinsic::Log
+                    | mir::Intrinsic::LogWarning
+                    | mir::Intrinsic::LogError
+                    | mir::Intrinsic::StringEquals
+                    | mir::Intrinsic::StringConcat
+                    | mir::Intrinsic::StringConcatTemporary
+                    | mir::Intrinsic::StringLength
+                    | mir::Intrinsic::StringFromLong
+                    | mir::Intrinsic::StringFromLongTemporary
+                    | mir::Intrinsic::StringFromULong
+                    | mir::Intrinsic::StringFromULongTemporary
+                    | mir::Intrinsic::StringFromDouble
+                    | mir::Intrinsic::StringFromDoubleTemporary
+                    | mir::Intrinsic::StringFromBool
+                    | mir::Intrinsic::StringFromBoolTemporary
+                    | mir::Intrinsic::StringFromChar
+                    | mir::Intrinsic::StringFromCharTemporary
+                    | mir::Intrinsic::StringJoin
+                    | mir::Intrinsic::StringJoinTemporary
+                    | mir::Intrinsic::ReportRuntimeError(_)
+            );
+            (!borrows_only
+                && arguments
+                    .iter()
+                    .any(|argument| direct_alias(argument, aliases).is_some()))
+            .then_some(EscapeReason::PassedToIntrinsic)
+        }
         mir::Instruction::AllocateArray { .. } | mir::Instruction::AllocateObject { .. } => None,
     }
 }
@@ -467,8 +546,7 @@ fn assignment_escape(
             }
         }
         mir::RvalueKind::Cast(operand) if direct_alias(operand, aliases).is_some() => {
-            if matches!(target, mir::Place::Local(_)) && matches!(&value.type_, mir::Type::Class(_))
-            {
+            if matches!(target, mir::Place::Local(_)) && is_tracked_reference_type(&value.type_) {
                 None
             } else {
                 Some(EscapeReason::UnsupportedUse)
@@ -486,6 +564,7 @@ fn assignment_escape(
         {
             Some(EscapeReason::Contained)
         }
+        mir::RvalueKind::ArrayLength(operand) if direct_alias(operand, aliases).is_some() => None,
         mir::RvalueKind::Equality { .. } => None,
         _ if rvalue_uses_alias(value, aliases) => Some(EscapeReason::UnsupportedUse),
         _ => None,
@@ -571,6 +650,50 @@ mod tests {
                     return None;
                 };
                 Some(*region)
+            })
+            .collect()
+    }
+
+    fn array_regions(source: &str, function_name: &str) -> Vec<mir::AllocationRegion> {
+        let compilation = compilation(source);
+        let function = compilation
+            .mir
+            .functions
+            .iter()
+            .find(|function| function.name == function_name && function.owner.is_none())
+            .unwrap_or_else(|| panic!("missing MIR function `{function_name}`"));
+
+        function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| {
+                let mir::Instruction::AllocateArray { region, .. } = instruction else {
+                    return None;
+                };
+                Some(*region)
+            })
+            .collect()
+    }
+
+    fn string_regions(source: &str, function_name: &str) -> Vec<mir::AllocationRegion> {
+        let compilation = compilation(source);
+        let function = compilation
+            .mir
+            .functions
+            .iter()
+            .find(|function| function.name == function_name && function.owner.is_none())
+            .unwrap_or_else(|| panic!("missing MIR function `{function_name}`"));
+
+        function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| {
+                let mir::Instruction::CallIntrinsic { intrinsic, .. } = instruction else {
+                    return None;
+                };
+                intrinsic.string_allocation_region()
             })
             .collect()
     }
@@ -755,9 +878,39 @@ mod tests {
     }
 
     #[test]
-    fn arrays_are_outside_this_escape_analysis() {
+    fn local_array_is_a_local_candidate() {
         let source = "public int Run() { int[] values = [1, 2, 3]; return values.Length; }";
-        assert!(classifications(source, "Run").is_empty());
+        assert_eq!(
+            classifications(source, "Run"),
+            vec![EscapeClassification::LocalCandidate]
+        );
+    }
+
+    #[test]
+    fn returned_array_requires_persistent_storage() {
+        let source = "public int[] Make() { return [1, 2, 3]; }";
+        assert_eq!(
+            classifications(source, "Make"),
+            vec![EscapeClassification::Persistent(EscapeReason::Returned)]
+        );
+    }
+
+    #[test]
+    fn local_dynamic_string_is_a_local_candidate() {
+        let source = r#"public int Run() { string left = "As"; string value = left + "ter"; return value.Length; }"#;
+        assert_eq!(
+            classifications(source, "Run"),
+            vec![EscapeClassification::LocalCandidate]
+        );
+    }
+
+    #[test]
+    fn returned_dynamic_string_requires_persistent_storage() {
+        let source = r#"public string Make() { string left = "As"; return left + "ter"; }"#;
+        assert_eq!(
+            classifications(source, "Make"),
+            vec![EscapeClassification::Persistent(EscapeReason::Returned)]
+        );
     }
 
     #[test]
@@ -780,21 +933,38 @@ mod tests {
     }
 
     #[test]
-    fn arrays_remain_persistent_when_object_regions_are_activated() {
+    fn local_array_is_emitted_as_temporary() {
         let source = "public int Run() { int[] values = [1, 2, 3]; return values.Length; }";
-        let compilation = compilation(source);
-        assert!(compilation.mir.functions.iter().all(|function| {
-            function.blocks.iter().all(|block| {
-                block.instructions.iter().all(|instruction| {
-                    !matches!(
-                        instruction,
-                        mir::Instruction::AllocateArray {
-                            region: mir::AllocationRegion::Temporary,
-                            ..
-                        }
-                    )
-                })
-            })
-        }));
+        assert_eq!(
+            array_regions(source, "Run"),
+            vec![mir::AllocationRegion::Temporary]
+        );
+    }
+
+    #[test]
+    fn returned_array_is_emitted_as_persistent() {
+        let source = "public int[] Make() { return [1, 2, 3]; }";
+        assert_eq!(
+            array_regions(source, "Make"),
+            vec![mir::AllocationRegion::Persistent]
+        );
+    }
+
+    #[test]
+    fn local_dynamic_string_is_emitted_as_temporary() {
+        let source = r#"public int Run() { string left = "As"; string value = left + "ter"; return value.Length; }"#;
+        assert_eq!(
+            string_regions(source, "Run"),
+            vec![mir::AllocationRegion::Temporary]
+        );
+    }
+
+    #[test]
+    fn returned_dynamic_string_is_emitted_as_persistent() {
+        let source = r#"public string Make() { string left = "As"; return left + "ter"; }"#;
+        assert_eq!(
+            string_regions(source, "Make"),
+            vec![mir::AllocationRegion::Persistent]
+        );
     }
 }

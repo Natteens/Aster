@@ -40,7 +40,7 @@ impl Codegen {
             slots: HashMap::new(),
             execution_context: None,
             hidden_return: None,
-            temporary_scope: function_uses_temporary_objects(function),
+            temporary_scope: function_uses_temporary_allocations(function),
         };
         for local in function.parameters.iter().chain(&function.locals) {
             let layout = self.layouts.type_layout(&local.type_)?;
@@ -161,18 +161,23 @@ impl Codegen {
     }
 }
 
-fn function_uses_temporary_objects(function: &mir::Function) -> bool {
+fn function_uses_temporary_allocations(function: &mir::Function) -> bool {
     function
         .blocks
         .iter()
         .flat_map(|block| &block.instructions)
-        .any(|instruction| {
-            matches!(
-                instruction,
-                mir::Instruction::AllocateObject {
-                    region: mir::AllocationRegion::Temporary,
-                    ..
-                }
-            )
+        .any(|instruction| match instruction {
+            mir::Instruction::AllocateObject {
+                region: mir::AllocationRegion::Temporary,
+                ..
+            }
+            | mir::Instruction::AllocateArray {
+                region: mir::AllocationRegion::Temporary,
+                ..
+            } => true,
+            mir::Instruction::CallIntrinsic { intrinsic, .. } => {
+                intrinsic.string_allocation_region() == Some(mir::AllocationRegion::Temporary)
+            }
+            _ => false,
         })
 }

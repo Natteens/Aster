@@ -52,9 +52,24 @@ fn strings_reach_typed_hir_and_mir() {
     assert_eq!(
         intrinsics
             .iter()
-            .filter(|intrinsic| **intrinsic == mir::Intrinsic::StringConcat)
+            .filter(|intrinsic| {
+                matches!(
+                    **intrinsic,
+                    mir::Intrinsic::StringConcat | mir::Intrinsic::StringConcatTemporary
+                )
+            })
             .count(),
         2
+    );
+    assert_eq!(
+        intrinsics
+            .iter()
+            .filter_map(|intrinsic| intrinsic.string_allocation_region())
+            .collect::<Vec<_>>(),
+        vec![
+            mir::AllocationRegion::Temporary,
+            mir::AllocationRegion::Temporary,
+        ]
     );
     assert!(intrinsics.contains(&mir::Intrinsic::StringLength));
 }

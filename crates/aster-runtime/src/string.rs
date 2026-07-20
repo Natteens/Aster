@@ -6,8 +6,9 @@
 //! UTF-8 bytes. There is no NUL terminator and none may be assumed.
 //!
 //! Ownership: literals live in the JIT module data section. Dynamic strings
-//! live in the current [`crate::ExecutionContext`]. The runtime only borrows
-//! input bytes during a call. No pointer may outlive its JIT session.
+//! live in the persistent or temporary arena of the current
+//! [`crate::ExecutionContext`]. The runtime only borrows input bytes during a
+//! call. No pointer may outlive its JIT session or temporary function scope.
 
 use std::ptr;
 
@@ -96,13 +97,34 @@ pub extern "C" fn aster_rt_string_eq(
     }
 }
 
-/// Concatenate two immutable strings into storage owned by `context`.
-/// Empty operands reuse the other reference without allocating.
+/// Concatenate two immutable strings into persistent storage owned by
+/// `context`. The result is always a new allocation, including empty operands,
+/// so its lifetime is determined only by the selected destination region.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn aster_rt_string_concat(
     context: *mut ExecutionContext,
     left: *const AsterStrHeader,
     right: *const AsterStrHeader,
+) -> *const AsterStrHeader {
+    string_concat(context, left, right, false)
+}
+
+/// Concatenate two immutable strings into the active temporary scope.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_concat_temporary(
+    context: *mut ExecutionContext,
+    left: *const AsterStrHeader,
+    right: *const AsterStrHeader,
+) -> *const AsterStrHeader {
+    string_concat(context, left, right, true)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+fn string_concat(
+    context: *mut ExecutionContext,
+    left: *const AsterStrHeader,
+    right: *const AsterStrHeader,
+    temporary: bool,
 ) -> *const AsterStrHeader {
     if context.is_null() {
         return ptr::null();
@@ -115,65 +137,104 @@ pub extern "C" fn aster_rt_string_concat(
         context.fail("string concatenation received an invalid UTF-8 string reference");
         return ptr::null();
     };
-    if left.is_empty() {
-        return right
-            .as_ptr()
-            .wrapping_sub(size_of::<AsterStrHeader>())
-            .cast();
+    if temporary {
+        context.allocate_temporary_string_parts(&[left, right])
+    } else {
+        context.allocate_string_parts(&[left, right])
     }
-    if right.is_empty() {
-        return left
-            .as_ptr()
-            .wrapping_sub(size_of::<AsterStrHeader>())
-            .cast();
-    }
-    context.allocate_string_parts(&[left, right])
 }
 
-/// Convert a signed integer, already widened to `long`, to a `string` owned
-/// by `context`. Backs string interpolation for `sbyte`/`short`/`int`/`long`.
+/// Convert a signed integer, already widened to `long`, to a persistent
+/// `string`. Backs string interpolation for `sbyte`/`short`/`int`/`long`.
 pub extern "C" fn aster_rt_string_from_long(
     context: *mut ExecutionContext,
     value: i64,
 ) -> *const AsterStrHeader {
-    string_from_display(context, value)
+    string_from_display(context, value, false)
+}
+
+/// Temporary counterpart of [`aster_rt_string_from_long`].
+pub extern "C" fn aster_rt_string_from_long_temporary(
+    context: *mut ExecutionContext,
+    value: i64,
+) -> *const AsterStrHeader {
+    string_from_display(context, value, true)
 }
 
 /// Convert an unsigned integer, already widened to `ulong` (passed as the
-/// identical `i64` bit pattern), to a `string` owned by `context`. Backs
-/// string interpolation for `byte`/`ushort`/`uint`/`ulong`.
+/// identical `i64` bit pattern), to a persistent `string`.
 pub extern "C" fn aster_rt_string_from_ulong(
     context: *mut ExecutionContext,
     value: i64,
 ) -> *const AsterStrHeader {
-    string_from_display(context, u64::from_ne_bytes(value.to_ne_bytes()))
+    string_from_display(context, u64::from_ne_bytes(value.to_ne_bytes()), false)
+}
+
+/// Temporary counterpart of [`aster_rt_string_from_ulong`].
+pub extern "C" fn aster_rt_string_from_ulong_temporary(
+    context: *mut ExecutionContext,
+    value: i64,
+) -> *const AsterStrHeader {
+    string_from_display(context, u64::from_ne_bytes(value.to_ne_bytes()), true)
 }
 
 /// Convert a `float` (already promoted to `double`) or `double` to a
-/// `string` owned by `context`. Uses Rust's locale-independent `Display` for
-/// `f64`, so the decimal separator is always `.` regardless of the host
-/// system's regional settings.
+/// persistent `string`. Formatting is locale independent.
 pub extern "C" fn aster_rt_string_from_double(
     context: *mut ExecutionContext,
     value: f64,
 ) -> *const AsterStrHeader {
-    string_from_display(context, value)
+    string_from_display(context, value, false)
 }
 
-/// Convert a `bool` (`0`/`1`) to `"false"`/`"true"`, owned by `context`.
+/// Temporary counterpart of [`aster_rt_string_from_double`].
+pub extern "C" fn aster_rt_string_from_double_temporary(
+    context: *mut ExecutionContext,
+    value: f64,
+) -> *const AsterStrHeader {
+    string_from_display(context, value, true)
+}
+
+/// Convert a `bool` (`0`/`1`) to a persistent `"false"`/`"true"` string.
 pub extern "C" fn aster_rt_string_from_bool(
     context: *mut ExecutionContext,
     value: i8,
 ) -> *const AsterStrHeader {
-    string_from_display(context, value != 0)
+    string_from_display(context, value != 0, false)
 }
 
-/// Convert one Unicode scalar value to its one-character `string`, owned by
-/// `context`. An invalid scalar value produces a controlled runtime error.
+/// Temporary counterpart of [`aster_rt_string_from_bool`].
+pub extern "C" fn aster_rt_string_from_bool_temporary(
+    context: *mut ExecutionContext,
+    value: i8,
+) -> *const AsterStrHeader {
+    string_from_display(context, value != 0, true)
+}
+
+/// Convert one Unicode scalar value to a persistent one-character string.
+/// An invalid scalar value produces a controlled runtime error.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn aster_rt_string_from_char(
     context: *mut ExecutionContext,
     value: u32,
+) -> *const AsterStrHeader {
+    string_from_char(context, value, false)
+}
+
+/// Temporary counterpart of [`aster_rt_string_from_char`].
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_from_char_temporary(
+    context: *mut ExecutionContext,
+    value: u32,
+) -> *const AsterStrHeader {
+    string_from_char(context, value, true)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+fn string_from_char(
+    context: *mut ExecutionContext,
+    value: u32,
+    temporary: bool,
 ) -> *const AsterStrHeader {
     if context.is_null() {
         return ptr::null();
@@ -185,12 +246,19 @@ pub extern "C" fn aster_rt_string_from_char(
         context.fail("string interpolation received an invalid `char` value");
         return ptr::null();
     };
-    context.allocate_string_parts(&[character.encode_utf8(&mut [0; 4])])
+    let mut buffer = [0; 4];
+    let text = character.encode_utf8(&mut buffer);
+    if temporary {
+        context.allocate_temporary_string_parts(&[text])
+    } else {
+        context.allocate_string_parts(&[text])
+    }
 }
 
 fn string_from_display(
     context: *mut ExecutionContext,
     value: impl std::fmt::Display,
+    temporary: bool,
 ) -> *const AsterStrHeader {
     if context.is_null() {
         return ptr::null();
@@ -198,13 +266,15 @@ fn string_from_display(
     // SAFETY: generated code passes its live hidden ExecutionContext.
     #[allow(unsafe_code)]
     let context = unsafe { &mut *context };
-    context.allocate_string_parts(&[&value.to_string()])
+    let value = value.to_string();
+    if temporary {
+        context.allocate_temporary_string_parts(&[&value])
+    } else {
+        context.allocate_string_parts(&[&value])
+    }
 }
 
-/// Join every part, each already a valid ABI string, into one new `string`
-/// owned by `context`. Computes the combined length and copies every part's
-/// bytes exactly once, so this is a single allocation regardless of how many
-/// parts are joined. Backs string interpolation's final concatenation.
+/// Join every part into one persistent dynamic string.
 ///
 /// # Safety
 ///
@@ -215,6 +285,30 @@ pub extern "C" fn aster_rt_string_join(
     context: *mut ExecutionContext,
     parts: *const *const AsterStrHeader,
     count: i32,
+) -> *const AsterStrHeader {
+    string_join(context, parts, count, false)
+}
+
+/// Join every part into one string owned by the active temporary scope.
+///
+/// # Safety
+///
+/// Same contract as [`aster_rt_string_join`].
+#[allow(unsafe_code, clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_join_temporary(
+    context: *mut ExecutionContext,
+    parts: *const *const AsterStrHeader,
+    count: i32,
+) -> *const AsterStrHeader {
+    string_join(context, parts, count, true)
+}
+
+#[allow(unsafe_code, clippy::not_unsafe_ptr_arg_deref)]
+fn string_join(
+    context: *mut ExecutionContext,
+    parts: *const *const AsterStrHeader,
+    count: i32,
+    temporary: bool,
 ) -> *const AsterStrHeader {
     if context.is_null() || parts.is_null() || count < 0 {
         return ptr::null();
@@ -233,7 +327,11 @@ pub extern "C" fn aster_rt_string_join(
         };
         views.push(text);
     }
-    context.allocate_string_parts(&views)
+    if temporary {
+        context.allocate_temporary_string_parts(&views)
+    } else {
+        context.allocate_string_parts(&views)
+    }
 }
 
 /// Return the number of Unicode scalar values in one immutable string.
@@ -321,26 +419,28 @@ mod tests {
     }
 
     #[test]
-    fn concatenates_into_context_and_reuses_empty_operands() {
+    fn concatenates_into_context_and_copies_empty_operands() {
         let left = aligned("Olá, ");
-        let right = aligned("Natte!");
+        let right = aligned("Aster!");
         let empty = aligned("");
         let mut context = ExecutionContext::new();
         let result = aster_rt_string_concat(&raw mut context, pointer(&left), pointer(&right));
         // SAFETY: the result is owned by the still-live context.
         #[allow(unsafe_code)]
         let result = unsafe { view(result) };
-        assert_eq!(result, Some("Olá, Natte!"));
-        assert_eq!(
-            aster_rt_string_concat(&raw mut context, pointer(&empty), pointer(&right)),
-            pointer(&right)
-        );
+        assert_eq!(result, Some("Olá, Aster!"));
+        let copied = aster_rt_string_concat(&raw mut context, pointer(&empty), pointer(&right));
+        assert_ne!(copied, pointer(&right));
+        // SAFETY: the copied result is owned by the still-live context.
+        #[allow(unsafe_code)]
+        let copied_text = unsafe { view(copied) };
+        assert_eq!(copied_text, Some("Aster!"));
         assert!(context.take_error().is_none());
     }
 
     #[test]
     fn length_counts_unicode_scalars_not_utf8_bytes() {
-        let text = aligned("Olá, Natte!");
+        let text = aligned("Olá, Mundo!");
         let mut context = ExecutionContext::new();
         assert_eq!(aster_rt_string_length(&raw mut context, pointer(&text)), 11);
         assert!(context.take_error().is_none());

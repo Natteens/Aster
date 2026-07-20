@@ -116,9 +116,9 @@ pub struct BasicBlock {
 
 /// Storage region selected for one dynamic allocation.
 ///
-/// The compiler emits `Temporary` only for object allocations proven not to
-/// escape their containing function. Arrays remain `Persistent` until their
-/// own escape rules and runtime path are implemented.
+/// The compiler emits `Temporary` only for objects, arrays, and dynamic
+/// strings proven not to escape their containing function. Every uncertain
+/// allocation remains `Persistent`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AllocationRegion {
     Persistent,
@@ -174,19 +174,112 @@ pub enum Intrinsic {
     LogError,
     StringEquals,
     StringConcat,
+    StringConcatTemporary,
     StringLength,
     /// Convert a signed integer (widened to `long`) to a `string`.
     StringFromLong,
+    StringFromLongTemporary,
     /// Convert an unsigned integer (widened to `ulong`) to a `string`.
     StringFromULong,
+    StringFromULongTemporary,
     /// Convert a `float` (promoted to `double`) or `double` to a `string`.
     StringFromDouble,
+    StringFromDoubleTemporary,
     StringFromBool,
+    StringFromBoolTemporary,
     StringFromChar,
+    StringFromCharTemporary,
     /// Join every argument, each already a `string`, into one new `string`,
     /// in a single allocation. Backs string interpolation.
     StringJoin,
+    StringJoinTemporary,
     ReportRuntimeError(RuntimeErrorKind),
+}
+
+impl Intrinsic {
+    /// Region carried by intrinsics that create a dynamic string.
+    #[must_use]
+    pub const fn string_allocation_region(self) -> Option<AllocationRegion> {
+        match self {
+            Self::StringConcat
+            | Self::StringFromLong
+            | Self::StringFromULong
+            | Self::StringFromDouble
+            | Self::StringFromBool
+            | Self::StringFromChar
+            | Self::StringJoin => Some(AllocationRegion::Persistent),
+            Self::StringConcatTemporary
+            | Self::StringFromLongTemporary
+            | Self::StringFromULongTemporary
+            | Self::StringFromDoubleTemporary
+            | Self::StringFromBoolTemporary
+            | Self::StringFromCharTemporary
+            | Self::StringJoinTemporary => Some(AllocationRegion::Temporary),
+            Self::Log
+            | Self::LogWarning
+            | Self::LogError
+            | Self::StringEquals
+            | Self::StringLength
+            | Self::ReportRuntimeError(_) => None,
+        }
+    }
+
+    /// Return the equivalent dynamic-string intrinsic for `region`.
+    #[must_use]
+    pub const fn with_string_allocation_region(self, region: AllocationRegion) -> Self {
+        match (self, region) {
+            (Self::StringConcat | Self::StringConcatTemporary, AllocationRegion::Persistent) => {
+                Self::StringConcat
+            }
+            (Self::StringConcat | Self::StringConcatTemporary, AllocationRegion::Temporary) => {
+                Self::StringConcatTemporary
+            }
+            (
+                Self::StringFromLong | Self::StringFromLongTemporary,
+                AllocationRegion::Persistent,
+            ) => Self::StringFromLong,
+            (Self::StringFromLong | Self::StringFromLongTemporary, AllocationRegion::Temporary) => {
+                Self::StringFromLongTemporary
+            }
+            (
+                Self::StringFromULong | Self::StringFromULongTemporary,
+                AllocationRegion::Persistent,
+            ) => Self::StringFromULong,
+            (
+                Self::StringFromULong | Self::StringFromULongTemporary,
+                AllocationRegion::Temporary,
+            ) => Self::StringFromULongTemporary,
+            (
+                Self::StringFromDouble | Self::StringFromDoubleTemporary,
+                AllocationRegion::Persistent,
+            ) => Self::StringFromDouble,
+            (
+                Self::StringFromDouble | Self::StringFromDoubleTemporary,
+                AllocationRegion::Temporary,
+            ) => Self::StringFromDoubleTemporary,
+            (
+                Self::StringFromBool | Self::StringFromBoolTemporary,
+                AllocationRegion::Persistent,
+            ) => Self::StringFromBool,
+            (Self::StringFromBool | Self::StringFromBoolTemporary, AllocationRegion::Temporary) => {
+                Self::StringFromBoolTemporary
+            }
+            (
+                Self::StringFromChar | Self::StringFromCharTemporary,
+                AllocationRegion::Persistent,
+            ) => Self::StringFromChar,
+            (Self::StringFromChar | Self::StringFromCharTemporary, AllocationRegion::Temporary) => {
+                Self::StringFromCharTemporary
+            }
+            (Self::StringJoin | Self::StringJoinTemporary, AllocationRegion::Persistent) => {
+                Self::StringJoin
+            }
+            (Self::StringJoin | Self::StringJoinTemporary, AllocationRegion::Temporary) => {
+                Self::StringJoinTemporary
+            }
+            _ => self,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

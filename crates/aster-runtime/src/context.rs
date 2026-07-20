@@ -44,9 +44,9 @@ enum AllocationCategory {
 pub(crate) struct TemporaryArenaMark(ArenaMark);
 
 /// Owns every dynamic allocation made by one JIT invocation.
-/// Persistent allocations live in `arena`; a second paged arena is reserved
-/// for future temporary allocations. Both arenas are released in bulk when
-/// the context is dropped. No individual deallocation exists.
+/// Persistent allocations live in `arena`; function-local objects, arrays,
+/// and strings can use `temporary_arena`. Both arenas are released in bulk
+/// when the context is dropped, while temporary scopes rewind on return.
 pub struct ExecutionContext {
     arena: PagedArena,
     temporary_arena: PagedArena,
@@ -183,7 +183,17 @@ impl ExecutionContext {
         pointer
     }
 
-    fn allocate_array(&mut self, length: i32, element_size: u32) -> *mut AsterArray {
+    fn allocate_array_in_region(
+        &mut self,
+        length: i32,
+        element_size: u32,
+        temporary: bool,
+    ) -> *mut AsterArray {
+        if temporary && self.temporary_scopes.is_empty() {
+            self.fail("temporary array allocation requires an active temporary scope");
+            return ptr::null_mut();
+        }
+
         let valid_length = length.max(0);
         let valid_size = element_size.max(1);
         if length < 0 {
@@ -198,16 +208,24 @@ impl ExecutionContext {
             self.fail("array allocation size exceeds the addressable range");
             valid_size as usize
         };
-        let data = self.arena.alloc(bytes, 8);
-        #[allow(clippy::cast_ptr_alignment)]
-        let header_ptr = self
-            .arena
-            .alloc(size_of::<AsterArray>(), align_of::<AsterArray>())
-            .cast::<AsterArray>();
+
+        let (data, header_ptr) = {
+            let arena = if temporary {
+                &mut self.temporary_arena
+            } else {
+                &mut self.arena
+            };
+            let data = arena.alloc(bytes, 8);
+            #[allow(clippy::cast_ptr_alignment)]
+            let header_ptr = arena
+                .alloc(size_of::<AsterArray>(), align_of::<AsterArray>())
+                .cast::<AsterArray>();
+            (data, header_ptr)
+        };
+
         // SAFETY: `header_ptr` points to zeroed, correctly aligned memory for
-        // `AsterArray`. No Rust reference to arena memory is held across this
-        // write. The data pointer was returned by a prior arena allocation and
-        // remains stable.
+        // `AsterArray`. Header and data belong to the same selected arena and
+        // therefore have exactly the same lifetime.
         #[allow(unsafe_code)]
         unsafe {
             (*header_ptr).data = data;
@@ -218,6 +236,18 @@ impl ExecutionContext {
         header_ptr
     }
 
+    fn allocate_array(&mut self, length: i32, element_size: u32) -> *mut AsterArray {
+        self.allocate_array_in_region(length, element_size, false)
+    }
+
+    pub(crate) fn allocate_temporary_array(
+        &mut self,
+        length: i32,
+        element_size: u32,
+    ) -> *mut AsterArray {
+        self.allocate_array_in_region(length, element_size, true)
+    }
+
     pub(crate) fn allocate_object(&mut self, size: u32) -> *mut u8 {
         let bytes = usize::try_from(size.max(1)).unwrap_or(1);
         let pointer = self.arena.alloc(bytes, 8);
@@ -225,7 +255,16 @@ impl ExecutionContext {
         pointer
     }
 
-    pub(crate) fn allocate_string_parts(&mut self, parts: &[&str]) -> *const AsterStrHeader {
+    fn allocate_string_parts_in_region(
+        &mut self,
+        parts: &[&str],
+        temporary: bool,
+    ) -> *const AsterStrHeader {
+        if temporary && self.temporary_scopes.is_empty() {
+            self.fail("temporary string allocation requires an active temporary scope");
+            return ptr::null();
+        }
+
         let Some(payload_bytes) = parts
             .iter()
             .try_fold(0_usize, |total, part| total.checked_add(part.len()))
@@ -237,12 +276,21 @@ impl ExecutionContext {
             self.fail("string allocation exceeds the addressable range");
             return ptr::null();
         };
-        let ptr = self.arena.alloc(total_bytes, align_of::<AsterStrHeader>());
-        // SAFETY: `ptr` points to `total_bytes` of zeroed, correctly aligned
-        // memory owned by the arena. No other reference to this region exists.
-        // The slice is consumed before `record_allocation` borrows `self`.
+
+        let pointer = {
+            let arena = if temporary {
+                &mut self.temporary_arena
+            } else {
+                &mut self.arena
+            };
+            arena.alloc(total_bytes, align_of::<AsterStrHeader>())
+        };
+
+        // SAFETY: `pointer` points to `total_bytes` of zeroed, correctly aligned
+        // memory owned by the selected arena. No other reference to this region
+        // exists. The slice is consumed before `record_allocation` borrows self.
         #[allow(unsafe_code)]
-        let bytes = unsafe { std::slice::from_raw_parts_mut(ptr, total_bytes) };
+        let bytes = unsafe { std::slice::from_raw_parts_mut(pointer, total_bytes) };
         bytes[..size_of::<usize>()].copy_from_slice(&payload_bytes.to_ne_bytes());
         let mut cursor = size_of::<usize>();
         for part in parts {
@@ -254,7 +302,18 @@ impl ExecutionContext {
         // The arena allocates with `align_of::<AsterStrHeader>()`, so the
         // pointer is correctly aligned for this cast.
         #[allow(clippy::cast_ptr_alignment)]
-        ptr.cast::<AsterStrHeader>()
+        pointer.cast::<AsterStrHeader>()
+    }
+
+    pub(crate) fn allocate_string_parts(&mut self, parts: &[&str]) -> *const AsterStrHeader {
+        self.allocate_string_parts_in_region(parts, false)
+    }
+
+    pub(crate) fn allocate_temporary_string_parts(
+        &mut self,
+        parts: &[&str],
+    ) -> *const AsterStrHeader {
+        self.allocate_string_parts_in_region(parts, true)
     }
 }
 
@@ -297,6 +356,23 @@ pub extern "C" fn aster_rt_array_new(
     let context = unsafe { &mut *context };
     let size = u32::try_from(element_size).unwrap_or(1);
     context.allocate_array(length, size)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_array_new_temporary(
+    context: *mut ExecutionContext,
+    length: i32,
+    element_size: i32,
+) -> *mut AsterArray {
+    if context.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: generated functions receive the live host-owned context as their
+    // hidden first parameter, and invocation cannot outlive that context.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let size = u32::try_from(element_size).unwrap_or(1);
+    context.allocate_temporary_array(length, size)
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -869,6 +945,77 @@ mod tests {
             context
                 .take_error()
                 .is_some_and(|error| error.contains("active temporary scope"))
+        );
+    }
+
+    #[test]
+    fn temporary_array_scope_rewinds_header_and_data_together() {
+        let mut context = ExecutionContext::with_stats();
+        let pointer = &raw mut context;
+
+        aster_rt_temporary_scope_enter(pointer);
+        let array = aster_rt_array_new_temporary(pointer, 2, 4);
+        assert!(!array.is_null());
+        assert_eq!(aster_rt_array_length(pointer, array), 2);
+        let element = aster_rt_array_element(pointer, array, 1);
+        assert!(!element.is_null());
+        // SAFETY: the element points to four live bytes in the active scope.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::write(element.cast::<u32>(), 42);
+            assert_eq!(std::ptr::read(element.cast::<u32>()), 42);
+        }
+        assert!(context.memory_stats().used_bytes > 0);
+
+        aster_rt_temporary_scope_leave(pointer);
+
+        let stats = context.memory_stats();
+        assert_eq!(stats.total_allocations, 1);
+        assert_eq!(stats.array_allocations, 1);
+        assert_eq!(stats.used_bytes, 0);
+        assert!(stats.peak_used_bytes > 0);
+    }
+
+    #[test]
+    fn temporary_string_scope_rewinds_storage() {
+        let mut context = ExecutionContext::with_stats();
+        let pointer = &raw mut context;
+
+        aster_rt_temporary_scope_enter(pointer);
+        let string = context.allocate_temporary_string_parts(&["Aster"]);
+        assert!(!string.is_null());
+        // SAFETY: the string is live until the matching scope leave below.
+        #[allow(unsafe_code)]
+        let text = unsafe { crate::string::view(string) };
+        assert_eq!(text, Some("Aster"));
+
+        aster_rt_temporary_scope_leave(pointer);
+
+        let stats = context.memory_stats();
+        assert_eq!(stats.total_allocations, 1);
+        assert_eq!(stats.string_allocations, 1);
+        assert_eq!(stats.used_bytes, 0);
+        assert!(stats.peak_used_bytes > 0);
+    }
+
+    #[test]
+    fn temporary_array_and_string_require_an_active_scope() {
+        let mut context = ExecutionContext::new();
+
+        let array = aster_rt_array_new_temporary(&raw mut context, 1, 4);
+        assert!(array.is_null());
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("temporary array allocation"))
+        );
+
+        let string = context.allocate_temporary_string_parts(&["Aster"]);
+        assert!(string.is_null());
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("temporary string allocation"))
         );
     }
 }

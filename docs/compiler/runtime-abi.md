@@ -18,9 +18,15 @@ Current exports:
 | -------------------- | -------------------------------------- | -------------------------------- |
 | `aster_rt_log`       | `(i32 level, ptr message) -> ()`       | `Log` / `Log.Warning` / `Log.Error` |
 | `aster_rt_string_eq` | `(ptr left, ptr right) -> i8`          | `string == string` by content    |
-| `aster_rt_string_concat` | `(ptr context, ptr left, ptr right) -> ptr` | Allocate immutable concatenated text |
+| `aster_rt_string_concat` | `(ptr context, ptr left, ptr right) -> ptr` | Allocate persistent immutable concatenated text |
+| `aster_rt_string_concat_temporary` | `(ptr context, ptr left, ptr right) -> ptr` | Allocate concatenated text in the active temporary scope |
+| `aster_rt_string_from_*` | `(ptr context, scalar value) -> ptr` | Format a scalar into a persistent string |
+| `aster_rt_string_from_*_temporary` | `(ptr context, scalar value) -> ptr` | Format a scalar into the active temporary scope |
+| `aster_rt_string_join` | `(ptr context, ptr parts, i32 count) -> ptr` | Join interpolation parts into persistent text |
+| `aster_rt_string_join_temporary` | `(ptr context, ptr parts, i32 count) -> ptr` | Join interpolation parts into temporary text |
 | `aster_rt_string_length` | `(ptr context, ptr value) -> i32` | Count Unicode scalar values |
-| `aster_rt_array_new` | `(ptr context, i32 length, i32 stride) -> ptr` | Allocate a zeroed fixed array |
+| `aster_rt_array_new` | `(ptr context, i32 length, i32 stride) -> ptr` | Allocate a persistent zeroed fixed array |
+| `aster_rt_array_new_temporary` | `(ptr context, i32 length, i32 stride) -> ptr` | Allocate an array header and buffer in the active temporary scope |
 | `aster_rt_array_element` | `(ptr context, ptr array, i32 index) -> ptr` | Checked element address |
 | `aster_rt_array_length` | `(ptr context, ptr array) -> i32` | Read immutable array length |
 | `aster_rt_object_new` | `(ptr context, i32 size) -> ptr` | Allocate zeroed object storage |
@@ -55,21 +61,24 @@ Rules:
 
 ## Ownership and lifetime
 
-- String literals live in the data section of the JIT module that compiled them. Dynamically
-  concatenated strings are aligned buffers owned by the current ExecutionContext.
-- Inputs are borrowed only for one runtime call. Concatenation returns either a new context-owned
-  reference or, for an empty operand, the unchanged other reference.
+- String literals live in the data section of the JIT module that compiled them. Dynamic
+  strings are aligned buffers owned by either the persistent or temporary arena of the current
+  ExecutionContext.
+- Inputs are borrowed only for one runtime call. Concatenation and interpolation always copy into
+  a new allocation, including empty operands, so the result lifetime depends only on its selected
+  region and never aliases a shorter-lived input.
 - **No pointer may outlive the JIT module or session that produced it.** Dropping a JIT module
   invalidates every string pointer created from its data section; callers (the CLI `run`
   command, the watcher) must copy any result they want to keep into host-owned memory before
   releasing the module.
-- Array headers, array buffers, persistent object storage, and dynamic strings belong to the
+- Persistent array headers, array buffers, object storage, and dynamic strings belong to the
   host-created ExecutionContext and are released together after the invocation. Internal Aster
   calls forward the same hidden context pointer.
-- Generated functions that contain temporary object allocations enter a nested temporary scope
-  on function entry and leave it on every normal `Return` or `End`. Leaving rewinds only the
+- An array header and its data buffer always use the same arena, so neither can outlive the other.
+- Generated functions that contain temporary objects, arrays, or strings enter a nested temporary
+  scope on function entry and leave it on every normal `Return` or `End`. Leaving rewinds only the
   innermost checkpoint; allocations made by callers before a nested call remain valid.
-- Temporary object allocation is valid only while such a scope is active. The runtime reports a
+- Temporary allocation is valid only while such a scope is active. The runtime reports a
   controlled error for unmatched scope exits or temporary allocation without a scope.
 - Object storage follows the same ownership rule. Generated constructors and methods receive the
   object pointer directly; the runtime only allocates and owns the bytes.

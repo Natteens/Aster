@@ -1,4 +1,4 @@
-use aster_codegen_cranelift::{ExecutionValue, execute, execute_with_stats};
+use aster_codegen_cranelift::{ExecutionValue, execute_with_stats};
 use aster_compiler::compile;
 use aster_mir as mir;
 
@@ -16,6 +16,42 @@ fn object_regions(module: &mir::Module, function_name: &str) -> Vec<mir::Allocat
                 return None;
             };
             Some(*region)
+        })
+        .collect()
+}
+
+fn array_regions(module: &mir::Module, function_name: &str) -> Vec<mir::AllocationRegion> {
+    module
+        .functions
+        .iter()
+        .find(|function| function.name == function_name && function.owner.is_none())
+        .unwrap_or_else(|| panic!("missing MIR function `{function_name}`"))
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| {
+            let mir::Instruction::AllocateArray { region, .. } = instruction else {
+                return None;
+            };
+            Some(*region)
+        })
+        .collect()
+}
+
+fn string_regions(module: &mir::Module, function_name: &str) -> Vec<mir::AllocationRegion> {
+    module
+        .functions
+        .iter()
+        .find(|function| function.name == function_name && function.owner.is_none())
+        .unwrap_or_else(|| panic!("missing MIR function `{function_name}`"))
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| {
+            let mir::Instruction::CallIntrinsic { intrinsic, .. } = instruction else {
+                return None;
+            };
+            intrinsic.string_allocation_region()
         })
         .collect()
 }
@@ -181,22 +217,47 @@ fn implicit_end_leaves_a_temporary_scope() {
 }
 
 #[test]
-fn temporary_arrays_remain_rejected_until_the_array_lote() {
-    let source = "public int Run() { int[] values = [42]; return values[0]; }";
-    let mut compilation = compile(source).expect("valid array program");
-    for instruction in compilation
-        .mir
-        .functions
-        .iter_mut()
-        .flat_map(|function| &mut function.blocks)
-        .flat_map(|block| &mut block.instructions)
-    {
-        if let mir::Instruction::AllocateArray { region, .. } = instruction {
-            *region = mir::AllocationRegion::Temporary;
+fn compiler_marks_local_array_temporary_and_rewinds_header_and_data() {
+    let source = "public int Run() { int[] values = [20, 22]; return values[0] + values[1]; }";
+    let compilation = compile(source).expect("valid temporary array program");
+    assert_eq!(
+        array_regions(&compilation.mir, "Run"),
+        vec![mir::AllocationRegion::Temporary]
+    );
+
+    let (value, stats) =
+        execute_with_stats(&compilation.mir, "Run").expect("temporary array should execute");
+
+    assert_eq!(value, ExecutionValue::Int(42));
+    assert_eq!(stats.total_allocations, 1);
+    assert_eq!(stats.array_allocations, 1);
+    assert_eq!(stats.used_bytes, 0);
+    assert!(stats.reserved_bytes > 0);
+    assert!(stats.peak_used_bytes > 0);
+}
+
+#[test]
+fn compiler_marks_local_dynamic_string_temporary_and_rewinds_it() {
+    let source = r#"
+        public int Run() {
+            string left = "As";
+            string value = left + "ter";
+            return value.Length + 37;
         }
-    }
+    "#;
+    let compilation = compile(source).expect("valid temporary string program");
+    assert_eq!(
+        string_regions(&compilation.mir, "Run"),
+        vec![mir::AllocationRegion::Temporary]
+    );
 
-    let error = execute(&compilation.mir, "Run").expect_err("temporary arrays are not active yet");
+    let (value, stats) =
+        execute_with_stats(&compilation.mir, "Run").expect("temporary string should execute");
 
-    assert!(error.message().contains("temporary array allocations"));
+    assert_eq!(value, ExecutionValue::Int(42));
+    assert_eq!(stats.total_allocations, 1);
+    assert_eq!(stats.string_allocations, 1);
+    assert_eq!(stats.used_bytes, 0);
+    assert!(stats.reserved_bytes > 0);
+    assert!(stats.peak_used_bytes > 0);
 }

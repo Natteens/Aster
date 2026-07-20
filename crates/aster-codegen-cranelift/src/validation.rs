@@ -265,10 +265,8 @@ fn validate_instruction(
             destination,
             element_type,
             length,
-            region,
             ..
         } => {
-            validate_array_allocation_region(*region, function_name)?;
             validate_place(destination, function_name)?;
             validate_value_type(element_type, function_name)?;
             validate_operand(length, function_name)
@@ -282,18 +280,6 @@ fn validate_instruction(
             } else {
                 Err(unsupported(function_name, "allocation of a non-class type"))
             }
-        }
-    }
-}
-
-fn validate_array_allocation_region(
-    region: mir::AllocationRegion,
-    function_name: &str,
-) -> Result<(), BackendError> {
-    match region {
-        mir::AllocationRegion::Persistent => Ok(()),
-        mir::AllocationRegion::Temporary => {
-            Err(unsupported(function_name, "temporary array allocations"))
         }
     }
 }
@@ -356,7 +342,7 @@ fn validate_intrinsic_shape(
                 && return_type == &mir::Type::Bool
                 && matches!(arguments, [left, right] if left.type_ == mir::Type::String && right.type_ == mir::Type::String)
         }
-        mir::Intrinsic::StringConcat => {
+        mir::Intrinsic::StringConcat | mir::Intrinsic::StringConcatTemporary => {
             destination.is_some()
                 && return_type == &mir::Type::String
                 && matches!(arguments, [left, right] if left.type_ == mir::Type::String && right.type_ == mir::Type::String)
@@ -366,7 +352,7 @@ fn validate_intrinsic_shape(
                 && return_type == &mir::Type::Int
                 && matches!(arguments, [value] if value.type_ == mir::Type::String)
         }
-        mir::Intrinsic::StringFromLong => {
+        mir::Intrinsic::StringFromLong | mir::Intrinsic::StringFromLongTemporary => {
             destination.is_some()
                 && return_type == &mir::Type::String
                 && matches!(
@@ -377,7 +363,7 @@ fn validate_intrinsic_shape(
                     )
                 )
         }
-        mir::Intrinsic::StringFromULong => {
+        mir::Intrinsic::StringFromULong | mir::Intrinsic::StringFromULongTemporary => {
             destination.is_some()
                 && return_type == &mir::Type::String
                 && matches!(
@@ -388,7 +374,7 @@ fn validate_intrinsic_shape(
                     )
                 )
         }
-        mir::Intrinsic::StringFromDouble => {
+        mir::Intrinsic::StringFromDouble | mir::Intrinsic::StringFromDoubleTemporary => {
             destination.is_some()
                 && return_type == &mir::Type::String
                 && matches!(
@@ -396,17 +382,17 @@ fn validate_intrinsic_shape(
                     [value] if matches!(value.type_, mir::Type::Float | mir::Type::Double)
                 )
         }
-        mir::Intrinsic::StringFromBool => {
+        mir::Intrinsic::StringFromBool | mir::Intrinsic::StringFromBoolTemporary => {
             destination.is_some()
                 && return_type == &mir::Type::String
                 && matches!(arguments, [value] if value.type_ == mir::Type::Bool)
         }
-        mir::Intrinsic::StringFromChar => {
+        mir::Intrinsic::StringFromChar | mir::Intrinsic::StringFromCharTemporary => {
             destination.is_some()
                 && return_type == &mir::Type::String
                 && matches!(arguments, [value] if value.type_ == mir::Type::Char)
         }
-        mir::Intrinsic::StringJoin => {
+        mir::Intrinsic::StringJoin | mir::Intrinsic::StringJoinTemporary => {
             destination.is_some()
                 && return_type == &mir::Type::String
                 && !arguments.is_empty()

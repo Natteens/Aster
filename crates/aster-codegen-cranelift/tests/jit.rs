@@ -1409,6 +1409,21 @@ fn stats_array_is_one_logical_allocation() {
     assert_eq!(value, ExecutionValue::Int(5));
     assert_eq!(stats.array_allocations, 1);
     assert_eq!(stats.total_allocations, 1);
+    assert_eq!(stats.used_bytes, 0);
+    assert!(stats.reserved_bytes > 0);
+    assert!(stats.peak_used_bytes > 0);
+}
+
+#[test]
+fn stats_returned_array_remains_persistent() {
+    let source = r"
+        internal int[] Make() { return [42]; }
+        public int Run() { int[] values = Make(); return values[0]; }
+    ";
+    let (value, stats) = run_with_stats(source, "Run").expect("should run");
+    assert_eq!(value, ExecutionValue::Int(42));
+    assert_eq!(stats.array_allocations, 1);
+    assert_eq!(stats.total_allocations, 1);
     assert!(stats.used_bytes > 0);
 }
 
@@ -1432,6 +1447,26 @@ fn stats_interpolated_string_is_a_dynamic_allocation() {
     assert!(matches!(value, ExecutionValue::String(_)));
     assert!(stats.string_allocations >= 1);
     assert!(stats.total_allocations >= 1);
+    assert!(stats.used_bytes > 0);
+    assert!(stats.peak_used_bytes >= stats.used_bytes);
+}
+
+#[test]
+fn stats_local_dynamic_string_is_rewound() {
+    let source = r#"
+        public int Run() {
+            string left = "As";
+            string value = left + "ter";
+            return value.Length + 37;
+        }
+    "#;
+    let (value, stats) = run_with_stats(source, "Run").expect("should run");
+    assert_eq!(value, ExecutionValue::Int(42));
+    assert_eq!(stats.string_allocations, 1);
+    assert_eq!(stats.total_allocations, 1);
+    assert_eq!(stats.used_bytes, 0);
+    assert!(stats.reserved_bytes > 0);
+    assert!(stats.peak_used_bytes > 0);
 }
 
 #[test]
