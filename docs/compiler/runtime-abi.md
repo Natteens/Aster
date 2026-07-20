@@ -102,3 +102,17 @@ identifies public math methods by their textual names.
 String concatenation and length are typed MIR intrinsics selected from checked string expressions.
 Cranelift maps those enum variants to registry entries; it never recognizes `String`, `Length`, or
 `aster.text` by source spelling.
+
+## Memory statistics
+
+`ExecutionContext::with_stats` enables cumulative allocation counts together with current and peak
+arena usage. The CLI exposes the same snapshot through `aster run <FILE> --memory-stats`.
+
+`used_bytes` can decrease when a temporary scope rewinds. `reserved_bytes` does not decrease during
+the invocation because pages remain owned by the context and are reused. Allocation counts,
+`requested_bytes`, and peak values are cumulative. Array accounting includes its element buffer in
+`requested_bytes`; the separate header and any alignment padding appear only in used/reserved
+metrics.
+
+The region model, conservative escape rules, and benchmark procedure are documented in
+[memory management](memory-management.md).

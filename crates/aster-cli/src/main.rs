@@ -276,7 +276,7 @@ fn print_memory_stats(stats: &aster_codegen_cranelift::MemoryStats) {
 
 fn print_help() {
     println!(
-        "Aster compiler\n\nUsage: aster <COMMAND>\n\nCommands:\n  check <FILE>                       Validate an Aster source file\n  dump-hir <FILE>                    Validate and print typed HIR without executing\n  dump-mir <FILE>                    Validate and print control-flow MIR without executing\n  run <FILE> [--function <NAME>]     Run application Main or an explicitly selected function\n  watch <FILE> [--function <NAME>]   Recompile and rerun on each file change\n\nOptions:\n  -h, --help                         Print help\n  -V, --version                      Print version"
+        "Aster compiler\n\nUsage: aster <COMMAND>\n\nCommands:\n  check <FILE>                       Validate an Aster source file\n  dump-hir <FILE>                    Validate and print typed HIR without executing\n  dump-mir <FILE>                    Validate and print control-flow MIR without executing\n  run <FILE> [--function <NAME>] [--memory-stats]\n                                      Run application Main or an explicitly selected function\n  watch <FILE> [--function <NAME>]   Recompile and rerun on each file change\n\nOptions:\n  -h, --help                         Print help\n  -V, --version                      Print version"
     );
 }
 

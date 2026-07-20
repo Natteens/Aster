@@ -1,0 +1,27 @@
+public class BenchmarkBox
+{
+    public int value;
+}
+
+internal int BuildTemporary()
+{
+    BenchmarkBox box = new BenchmarkBox();
+    box.value = 39;
+
+    int[] values = [1];
+
+    string prefix = "A";
+    string text = prefix + "B";
+
+    return box.value + values[0] + text.Length;
+}
+
+public int Run()
+{
+    int total = 0;
+    for (int index = 0; index < 100000; index++)
+    {
+        total += BuildTemporary();
+    }
+    return total;
+}

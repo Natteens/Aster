@@ -1,0 +1,36 @@
+public class BenchmarkBox
+{
+    public int value;
+}
+
+internal BenchmarkBox MakeBox()
+{
+    BenchmarkBox box = new BenchmarkBox();
+    box.value = 39;
+    return box;
+}
+
+internal int[] MakeArray()
+{
+    return [1];
+}
+
+internal string MakeString()
+{
+    string prefix = "A";
+    return prefix + "B";
+}
+
+public int Run()
+{
+    int total = 0;
+    for (int index = 0; index < 100000; index++)
+    {
+        BenchmarkBox box = MakeBox();
+        int[] values = MakeArray();
+        string text = MakeString();
+
+        total += box.value + values[0] + text.Length;
+    }
+    return total;
+}

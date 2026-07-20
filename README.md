@@ -66,6 +66,11 @@ collector. Automatic parallelism, threads, GPU execution, and HVM integration ar
 not current features. Any future work in that area must preserve determinism and make its costs
 understandable; Aster is not committed to reproducing Bend's architecture.
 
+Dynamic objects, arrays, and strings are owned by per-execution paged arenas. Conservative escape
+analysis reclaims proven function-local allocations on return while keeping uncertain or escaping
+values persistent for the rest of the invocation. See [memory management](docs/compiler/memory-management.md)
+for the region rules, metrics, and reproducible benchmark.
+
 ## Learn and explore
 
 - [Getting started](docs/getting-started.md) installs the CLI and builds a first program.
