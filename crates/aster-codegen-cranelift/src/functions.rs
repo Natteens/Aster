@@ -40,6 +40,7 @@ impl Codegen {
             slots: HashMap::new(),
             execution_context: None,
             hidden_return: None,
+            temporary_scope: function_uses_temporary_objects(function),
         };
         for local in function.parameters.iter().chain(&function.locals) {
             let layout = self.layouts.type_layout(&local.type_)?;
@@ -60,6 +61,18 @@ impl Codegen {
                 let values = builder.block_params(entry).to_vec();
                 let mut values = values.into_iter();
                 state.execution_context = values.next();
+                if state.temporary_scope {
+                    let context = state.execution_context.ok_or_else(|| {
+                        BackendError::new(
+                            "temporary allocation scope is missing its ExecutionContext",
+                        )
+                    })?;
+                    let function_ref = self.jit.declare_func_in_func(
+                        self.runtime_ids["aster_rt_temporary_scope_enter"],
+                        builder.func,
+                    );
+                    builder.ins().call(function_ref, &[context]);
+                }
                 if is_aggregate(&function.return_type) {
                     state.hidden_return = values.next();
                 }
@@ -146,4 +159,20 @@ impl Codegen {
             } => self.translate_object_allocation(builder, destination, *class, *region, state),
         }
     }
+}
+
+fn function_uses_temporary_objects(function: &mir::Function) -> bool {
+    function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .any(|instruction| {
+            matches!(
+                instruction,
+                mir::Instruction::AllocateObject {
+                    region: mir::AllocationRegion::Temporary,
+                    ..
+                }
+            )
+        })
 }

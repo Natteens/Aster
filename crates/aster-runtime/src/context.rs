@@ -50,6 +50,7 @@ pub(crate) struct TemporaryArenaMark(ArenaMark);
 pub struct ExecutionContext {
     arena: PagedArena,
     temporary_arena: PagedArena,
+    temporary_scopes: Vec<TemporaryArenaMark>,
     error: Option<String>,
     collect_stats: bool,
     stats: MemoryStats,
@@ -67,6 +68,7 @@ impl ExecutionContext {
         Self {
             arena: PagedArena::new(),
             temporary_arena: PagedArena::new(),
+            temporary_scopes: Vec::new(),
             error: None,
             collect_stats: false,
             stats: MemoryStats::default(),
@@ -78,6 +80,7 @@ impl ExecutionContext {
         Self {
             arena: PagedArena::new(),
             temporary_arena: PagedArena::new(),
+            temporary_scopes: Vec::new(),
             error: None,
             collect_stats: true,
             stats: MemoryStats::default(),
@@ -156,6 +159,30 @@ impl ExecutionContext {
         self.refresh_memory_usage();
     }
 
+    fn enter_temporary_scope(&mut self) {
+        let mark = self.mark_temporary();
+        self.temporary_scopes.push(mark);
+    }
+
+    fn leave_temporary_scope(&mut self) {
+        let Some(mark) = self.temporary_scopes.pop() else {
+            self.fail("temporary scope leave has no matching enter");
+            return;
+        };
+        self.rewind_temporary(mark);
+    }
+
+    pub(crate) fn allocate_temporary_object(&mut self, size: u32) -> *mut u8 {
+        if self.temporary_scopes.is_empty() {
+            self.fail("temporary object allocation requires an active temporary scope");
+            return ptr::null_mut();
+        }
+        let bytes = usize::try_from(size.max(1)).unwrap_or(1);
+        let pointer = self.temporary_arena.alloc(bytes, 8);
+        self.record_allocation(AllocationCategory::Object, bytes);
+        pointer
+    }
+
     fn allocate_array(&mut self, length: i32, element_size: u32) -> *mut AsterArray {
         let valid_length = length.max(0);
         let valid_size = element_size.max(1);
@@ -232,6 +259,30 @@ impl ExecutionContext {
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_temporary_scope_enter(context: *mut ExecutionContext) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: generated functions receive the live host-owned context as their
+    // hidden first parameter, and invocation cannot outlive that context.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    context.enter_temporary_scope();
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_temporary_scope_leave(context: *mut ExecutionContext) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: generated functions receive the live host-owned context as their
+    // hidden first parameter, and invocation cannot outlive that context.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    context.leave_temporary_scope();
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn aster_rt_array_new(
     context: *mut ExecutionContext,
     length: i32,
@@ -297,7 +348,7 @@ pub extern "C" fn aster_rt_array_length(
 )]
 mod tests {
     use super::*;
-    use crate::object::aster_rt_object_new;
+    use crate::object::{aster_rt_object_new, aster_rt_object_new_temporary};
 
     #[test]
     fn allocation_is_zeroed_and_bounds_errors_are_controlled() {
@@ -741,5 +792,83 @@ mod tests {
         let wrong_mark = TemporaryArenaMark(context.arena.mark());
 
         context.rewind_temporary(wrong_mark);
+    }
+
+    #[test]
+    fn temporary_object_scope_rewinds_usage_and_preserves_logical_stats() {
+        let mut context = ExecutionContext::with_stats();
+        let pointer = &raw mut context;
+
+        aster_rt_temporary_scope_enter(pointer);
+        let object = aster_rt_object_new_temporary(pointer, 32);
+        assert!(!object.is_null());
+        assert_eq!(context.memory_stats().used_bytes, 32);
+
+        aster_rt_temporary_scope_leave(pointer);
+
+        let stats = context.memory_stats();
+        assert_eq!(stats.total_allocations, 1);
+        assert_eq!(stats.object_allocations, 1);
+        assert_eq!(stats.requested_bytes, 32);
+        assert_eq!(stats.used_bytes, 0);
+        assert_eq!(stats.reserved_bytes, 64 * 1024);
+        assert_eq!(stats.peak_used_bytes, 32);
+    }
+
+    #[test]
+    fn nested_runtime_temporary_scopes_preserve_outer_objects() {
+        let mut context = ExecutionContext::with_stats();
+        let pointer = &raw mut context;
+
+        aster_rt_temporary_scope_enter(pointer);
+        let outer = aster_rt_object_new_temporary(pointer, 8);
+        assert!(!outer.is_null());
+        // SAFETY: `outer` points to eight live bytes in the active outer scope.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::write(outer.cast::<u64>(), 42);
+        }
+
+        aster_rt_temporary_scope_enter(pointer);
+        let inner = aster_rt_object_new_temporary(pointer, 16);
+        assert!(!inner.is_null());
+        aster_rt_temporary_scope_leave(pointer);
+
+        // SAFETY: leaving the inner scope cannot rewind the outer allocation.
+        #[allow(unsafe_code)]
+        let value = unsafe { std::ptr::read(outer.cast::<u64>()) };
+        assert_eq!(value, 42);
+        assert_eq!(context.memory_stats().used_bytes, 8);
+
+        aster_rt_temporary_scope_leave(pointer);
+        assert_eq!(context.memory_stats().used_bytes, 0);
+        assert_eq!(context.memory_stats().object_allocations, 2);
+    }
+
+    #[test]
+    fn unmatched_runtime_temporary_scope_leave_is_controlled() {
+        let mut context = ExecutionContext::new();
+
+        aster_rt_temporary_scope_leave(&raw mut context);
+
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("no matching enter"))
+        );
+    }
+
+    #[test]
+    fn temporary_object_without_scope_is_rejected_without_panicking() {
+        let mut context = ExecutionContext::new();
+
+        let object = aster_rt_object_new_temporary(&raw mut context, 16);
+
+        assert!(object.is_null());
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("active temporary scope"))
+        );
     }
 }

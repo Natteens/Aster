@@ -268,17 +268,14 @@ fn validate_instruction(
             region,
             ..
         } => {
-            validate_allocation_region(*region, function_name)?;
+            validate_array_allocation_region(*region, function_name)?;
             validate_place(destination, function_name)?;
             validate_value_type(element_type, function_name)?;
             validate_operand(length, function_name)
         }
         mir::Instruction::AllocateObject {
-            destination,
-            class,
-            region,
+            destination, class, ..
         } => {
-            validate_allocation_region(*region, function_name)?;
             validate_place(destination, function_name)?;
             if classes.contains(class) {
                 Ok(())
@@ -289,14 +286,14 @@ fn validate_instruction(
     }
 }
 
-fn validate_allocation_region(
+fn validate_array_allocation_region(
     region: mir::AllocationRegion,
     function_name: &str,
 ) -> Result<(), BackendError> {
     match region {
         mir::AllocationRegion::Persistent => Ok(()),
         mir::AllocationRegion::Temporary => {
-            Err(unsupported(function_name, "temporary allocation regions"))
+            Err(unsupported(function_name, "temporary array allocations"))
         }
     }
 }

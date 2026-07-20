@@ -289,14 +289,13 @@ impl Codegen {
         region: mir::AllocationRegion,
         state: &FunctionState,
     ) -> Result<(), BackendError> {
-        if region != mir::AllocationRegion::Persistent {
-            return Err(BackendError::new(
-                "temporary object allocations are not yet supported by the Cranelift JIT",
-            ));
-        }
+        let symbol = match region {
+            mir::AllocationRegion::Persistent => "aster_rt_object_new",
+            mir::AllocationRegion::Temporary => "aster_rt_object_new_temporary",
+        };
         let function_ref = self
             .jit
-            .declare_func_in_func(self.runtime_ids["aster_rt_object_new"], builder.func);
+            .declare_func_in_func(self.runtime_ids[symbol], builder.func);
         let context = state.execution_context.ok_or_else(|| {
             BackendError::new("object allocation is missing its ExecutionContext")
         })?;

@@ -1,6 +1,6 @@
 use super::{
-    BackendError, Block, Codegen, FunctionBuilder, FunctionState, HashMap, InstBuilder, TrapCode,
-    is_aggregate, mir,
+    BackendError, Block, Codegen, FunctionBuilder, FunctionState, HashMap, InstBuilder, Module,
+    TrapCode, is_aggregate, mir,
 };
 
 impl Codegen {
@@ -34,6 +34,7 @@ impl Codegen {
                         BackendError::new("struct return is missing its hidden destination")
                     })?;
                     self.copy_value(builder, &value.type_, source, destination)?;
+                    self.leave_temporary_scope(builder, state)?;
                     builder.ins().return_(&[]);
                     return Ok(());
                 }
@@ -43,15 +44,36 @@ impl Codegen {
                     .transpose()?
                     .into_iter()
                     .collect::<Vec<_>>();
+                self.leave_temporary_scope(builder, state)?;
                 builder.ins().return_(&values);
             }
             mir::Terminator::End => {
+                self.leave_temporary_scope(builder, state)?;
                 builder.ins().return_(&[]);
             }
             mir::Terminator::Unreachable => {
                 builder.ins().trap(TrapCode::unwrap_user(1));
             }
         }
+        Ok(())
+    }
+
+    fn leave_temporary_scope(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        if !state.temporary_scope {
+            return Ok(());
+        }
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new("temporary allocation scope is missing its ExecutionContext")
+        })?;
+        let function_ref = self.jit.declare_func_in_func(
+            self.runtime_ids["aster_rt_temporary_scope_leave"],
+            builder.func,
+        );
+        builder.ins().call(function_ref, &[context]);
         Ok(())
     }
 }

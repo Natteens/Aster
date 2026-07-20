@@ -5,10 +5,13 @@
 //! runtime module (files, time, windowing, audio, networking, ECS) means
 //! adding entries here — never special cases inside a backend.
 
-use crate::context::{aster_rt_array_element, aster_rt_array_length, aster_rt_array_new};
+use crate::context::{
+    aster_rt_array_element, aster_rt_array_length, aster_rt_array_new,
+    aster_rt_temporary_scope_enter, aster_rt_temporary_scope_leave,
+};
 use crate::log::aster_rt_log;
 use crate::math::aster_rt_math_domain_error;
-use crate::object::aster_rt_object_new;
+use crate::object::{aster_rt_object_new, aster_rt_object_new_temporary};
 use crate::string::{
     aster_rt_string_concat, aster_rt_string_eq, aster_rt_string_from_bool,
     aster_rt_string_from_char, aster_rt_string_from_double, aster_rt_string_from_long,
@@ -74,6 +77,30 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             signature: RuntimeSignature {
                 parameters: &[RuntimeType::Pointer, RuntimeType::I32],
                 result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_object_new_temporary",
+            address: aster_rt_object_new_temporary as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::I32],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_temporary_scope_enter",
+            address: aster_rt_temporary_scope_enter as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_temporary_scope_leave",
+            address: aster_rt_temporary_scope_leave as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer],
+                result: None,
             },
         },
         RuntimeFunction {
@@ -202,5 +229,32 @@ mod tests {
             &[RuntimeType::I32, RuntimeType::Pointer]
         );
         assert_eq!(log.signature.result, None);
+    }
+
+    #[test]
+    fn temporary_scope_and_object_signatures_match_the_abi() {
+        let functions = runtime_functions();
+
+        let allocation = functions
+            .iter()
+            .find(|function| function.name == "aster_rt_object_new_temporary")
+            .expect("temporary object allocation is registered");
+        assert_eq!(
+            allocation.signature.parameters,
+            &[RuntimeType::Pointer, RuntimeType::I32]
+        );
+        assert_eq!(allocation.signature.result, Some(RuntimeType::Pointer));
+
+        for name in [
+            "aster_rt_temporary_scope_enter",
+            "aster_rt_temporary_scope_leave",
+        ] {
+            let function = functions
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("missing runtime function `{name}`"));
+            assert_eq!(function.signature.parameters, &[RuntimeType::Pointer]);
+            assert_eq!(function.signature.result, None);
+        }
     }
 }

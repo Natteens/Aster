@@ -24,6 +24,9 @@ Current exports:
 | `aster_rt_array_element` | `(ptr context, ptr array, i32 index) -> ptr` | Checked element address |
 | `aster_rt_array_length` | `(ptr context, ptr array) -> i32` | Read immutable array length |
 | `aster_rt_object_new` | `(ptr context, i32 size) -> ptr` | Allocate zeroed object storage |
+| `aster_rt_object_new_temporary` | `(ptr context, i32 size) -> ptr` | Allocate zeroed object storage in the active temporary scope |
+| `aster_rt_temporary_scope_enter` | `(ptr context) -> ()` | Push a temporary-arena checkpoint for one generated function |
+| `aster_rt_temporary_scope_leave` | `(ptr context) -> ()` | Rewind the innermost temporary-arena checkpoint |
 | `aster_rt_math_domain_error` | `(ptr context, i32 code) -> ()` | Record a controlled `aster.math` domain failure |
 
 Log levels: `0` = normal, `1` = warning, `2` = error. Any other value is reported as a
@@ -60,9 +63,14 @@ Rules:
   invalidates every string pointer created from its data section; callers (the CLI `run`
   command, the watcher) must copy any result they want to keep into host-owned memory before
   releasing the module.
-- Array headers, array buffers, object storage, and dynamic strings belong to the host-created
-  ExecutionContext and are released together after the invocation. Internal Aster calls forward
-  the same hidden context pointer.
+- Array headers, array buffers, persistent object storage, and dynamic strings belong to the
+  host-created ExecutionContext and are released together after the invocation. Internal Aster
+  calls forward the same hidden context pointer.
+- Generated functions that contain temporary object allocations enter a nested temporary scope
+  on function entry and leave it on every normal `Return` or `End`. Leaving rewinds only the
+  innermost checkpoint; allocations made by callers before a nested call remain valid.
+- Temporary object allocation is valid only while such a scope is active. The runtime reports a
+  controlled error for unmatched scope exits or temporary allocation without a scope.
 - Object storage follows the same ownership rule. Generated constructors and methods receive the
   object pointer directly; the runtime only allocates and owns the bytes.
 - Interface values do not allocate runtime memory. They copy a pair of pointers: the object owned

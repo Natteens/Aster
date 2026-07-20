@@ -59,6 +59,7 @@ struct FunctionState {
     slots: HashMap<mir::LocalId, StackSlot>,
     execution_context: Option<Value>,
     hidden_return: Option<Value>,
+    temporary_scope: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
