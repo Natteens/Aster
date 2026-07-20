@@ -3,7 +3,7 @@
 use std::mem::{align_of, size_of};
 use std::ptr;
 
-use crate::arena::PagedArena;
+use crate::arena::{ArenaMark, PagedArena};
 use crate::string::AsterStrHeader;
 
 /// Stable array header visible to generated code only through runtime calls.
@@ -35,11 +35,21 @@ enum AllocationCategory {
     String,
 }
 
+/// Opaque checkpoint for the temporary arena owned by one execution context.
+///
+/// The token is intentionally neither `Copy` nor `Clone`: rewinding consumes
+/// it, so the same checkpoint cannot be applied twice through this API.
+#[must_use = "temporary arena marks must be rewound in LIFO order"]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct TemporaryArenaMark(ArenaMark);
+
 /// Owns every dynamic allocation made by one JIT invocation.
-/// All memory lives in a paged bump arena and is released in bulk when the
-/// context is dropped. No individual deallocation exists.
+/// Persistent allocations live in `arena`; a second paged arena is reserved
+/// for future temporary allocations. Both arenas are released in bulk when
+/// the context is dropped. No individual deallocation exists.
 pub struct ExecutionContext {
     arena: PagedArena,
+    temporary_arena: PagedArena,
     error: Option<String>,
     collect_stats: bool,
     stats: MemoryStats,
@@ -56,6 +66,7 @@ impl ExecutionContext {
     pub fn new() -> Self {
         Self {
             arena: PagedArena::new(),
+            temporary_arena: PagedArena::new(),
             error: None,
             collect_stats: false,
             stats: MemoryStats::default(),
@@ -66,6 +77,7 @@ impl ExecutionContext {
     pub fn with_stats() -> Self {
         Self {
             arena: PagedArena::new(),
+            temporary_arena: PagedArena::new(),
             error: None,
             collect_stats: true,
             stats: MemoryStats::default(),
@@ -98,15 +110,50 @@ impl ExecutionContext {
             AllocationCategory::String => self.stats.string_allocations += 1,
         }
         self.stats.requested_bytes += requested as u64;
-        let metrics = self.arena.metrics();
-        self.stats.used_bytes = metrics.used_bytes as u64;
-        self.stats.reserved_bytes = metrics.reserved_bytes as u64;
-        if self.stats.used_bytes > self.stats.peak_used_bytes {
-            self.stats.peak_used_bytes = self.stats.used_bytes;
+        self.refresh_memory_usage();
+    }
+
+    fn refresh_memory_usage(&mut self) {
+        if !self.collect_stats {
+            return;
         }
-        if self.stats.reserved_bytes > self.stats.peak_reserved_bytes {
-            self.stats.peak_reserved_bytes = self.stats.reserved_bytes;
-        }
+
+        let persistent = self.arena.metrics();
+        let temporary = self.temporary_arena.metrics();
+        let used_bytes = persistent
+            .used_bytes
+            .checked_add(temporary.used_bytes)
+            .expect("combined arena used bytes overflow");
+        let reserved_bytes = persistent
+            .reserved_bytes
+            .checked_add(temporary.reserved_bytes)
+            .expect("combined arena reserved bytes overflow");
+
+        self.stats.used_bytes = used_bytes as u64;
+        self.stats.reserved_bytes = reserved_bytes as u64;
+        self.stats.peak_used_bytes = self.stats.peak_used_bytes.max(self.stats.used_bytes);
+        self.stats.peak_reserved_bytes = self
+            .stats
+            .peak_reserved_bytes
+            .max(self.stats.reserved_bytes);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn mark_temporary(&mut self) -> TemporaryArenaMark {
+        TemporaryArenaMark(self.temporary_arena.mark())
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn allocate_temporary(&mut self, size: usize, align: usize) -> *mut u8 {
+        let pointer = self.temporary_arena.alloc(size, align);
+        self.refresh_memory_usage();
+        pointer
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn rewind_temporary(&mut self, mark: TemporaryArenaMark) {
+        self.temporary_arena.rewind(mark.0);
+        self.refresh_memory_usage();
     }
 
     fn allocate_array(&mut self, length: i32, element_size: u32) -> *mut AsterArray {
@@ -521,5 +568,178 @@ mod tests {
         // With 64 KiB pages and 32-byte objects, we should have far fewer
         // pages than individual allocations.
         assert!(stats.reserved_bytes <= stats.used_bytes * 2);
+    }
+
+    #[test]
+    fn fresh_context_owns_two_empty_arenas() {
+        let context = ExecutionContext::new();
+        let persistent = context.arena.metrics();
+        let temporary = context.temporary_arena.metrics();
+
+        assert_eq!(persistent.used_bytes, 0);
+        assert_eq!(persistent.reserved_bytes, 0);
+        assert_eq!(temporary.used_bytes, 0);
+        assert_eq!(temporary.reserved_bytes, 0);
+    }
+
+    #[test]
+    fn normal_allocations_use_only_the_persistent_arena() {
+        let mut context = ExecutionContext::with_stats();
+        aster_rt_object_new(&raw mut context, 32);
+
+        let persistent = context.arena.metrics();
+        let temporary = context.temporary_arena.metrics();
+        let stats = context.memory_stats();
+
+        assert_eq!(persistent.used_bytes, 32);
+        assert_eq!(temporary.used_bytes, 0);
+        assert_eq!(temporary.reserved_bytes, 0);
+        assert_eq!(stats.used_bytes, 32);
+        assert_eq!(stats.reserved_bytes, 64 * 1024);
+        assert_eq!(stats.total_allocations, 1);
+        assert_eq!(stats.object_allocations, 1);
+        assert_eq!(stats.requested_bytes, 32);
+    }
+
+    #[test]
+    fn temporary_allocation_updates_combined_usage_without_logical_counts() {
+        let mut context = ExecutionContext::with_stats();
+        let pointer = context.allocate_temporary(32, 8);
+
+        assert!(!pointer.is_null());
+        assert_eq!(context.arena.metrics().used_bytes, 0);
+        assert_eq!(context.temporary_arena.metrics().used_bytes, 32);
+
+        let stats = context.memory_stats();
+        assert_eq!(stats.used_bytes, 32);
+        assert_eq!(stats.reserved_bytes, 64 * 1024);
+        assert_eq!(stats.peak_used_bytes, 32);
+        assert_eq!(stats.peak_reserved_bytes, 64 * 1024);
+        assert_eq!(stats.total_allocations, 0);
+        assert_eq!(stats.requested_bytes, 0);
+    }
+
+    #[test]
+    fn temporary_rewind_restores_usage_but_keeps_capacity_and_peak() {
+        let mut context = ExecutionContext::with_stats();
+        let mark = context.mark_temporary();
+        context.allocate_temporary(1024, 8);
+
+        let reserved = context.memory_stats().reserved_bytes;
+        let peak_used = context.memory_stats().peak_used_bytes;
+        context.rewind_temporary(mark);
+
+        let stats = context.memory_stats();
+        assert_eq!(context.temporary_arena.metrics().used_bytes, 0);
+        assert_eq!(stats.used_bytes, 0);
+        assert_eq!(stats.reserved_bytes, reserved);
+        assert_eq!(stats.peak_used_bytes, peak_used);
+        assert_eq!(peak_used, 1024);
+    }
+
+    #[test]
+    fn temporary_rewind_preserves_data_allocated_before_the_mark() {
+        let mut context = ExecutionContext::with_stats();
+        let persistent_temporary = context.allocate_temporary(8, 8);
+        // SAFETY: the pointer refers to eight live bytes in the temporary arena.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::write(persistent_temporary as *mut u64, 0xCAFE_BABE);
+        }
+
+        let mark = context.mark_temporary();
+        context.allocate_temporary(256, 8);
+        context.rewind_temporary(mark);
+
+        // SAFETY: this allocation predates the mark and remains active.
+        #[allow(unsafe_code)]
+        let value = unsafe { std::ptr::read(persistent_temporary as *const u64) };
+        assert_eq!(value, 0xCAFE_BABE);
+        assert_eq!(context.memory_stats().used_bytes, 8);
+    }
+
+    #[test]
+    fn rewound_temporary_memory_is_zeroed_when_reused() {
+        let mut context = ExecutionContext::with_stats();
+        let mark = context.mark_temporary();
+        let old = context.allocate_temporary(64, 8);
+        // SAFETY: `old` points to 64 live bytes in the temporary arena.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::write_bytes(old, 0xAB, 64);
+        }
+
+        context.rewind_temporary(mark);
+        let reused = context.allocate_temporary(64, 8);
+
+        assert_eq!(reused, old);
+        // SAFETY: `reused` is a new live allocation of 64 bytes.
+        #[allow(unsafe_code)]
+        let bytes = unsafe { std::slice::from_raw_parts(reused, 64) };
+        assert!(bytes.iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn temporary_capacity_is_reused_after_rewind() {
+        let mut context = ExecutionContext::with_stats();
+        let mark = context.mark_temporary();
+        context.allocate_temporary(64 * 1024, 8);
+        let reserved = context.temporary_arena.metrics().reserved_bytes;
+
+        context.rewind_temporary(mark);
+        context.allocate_temporary(64, 8);
+
+        assert_eq!(context.temporary_arena.metrics().reserved_bytes, reserved);
+        assert_eq!(context.memory_stats().reserved_bytes, reserved as u64);
+    }
+
+    #[test]
+    fn combined_peak_is_the_maximum_simultaneous_usage() {
+        let mut context = ExecutionContext::with_stats();
+        let mark = context.mark_temporary();
+        context.allocate_temporary(64 * 1024, 8);
+        assert_eq!(context.memory_stats().peak_used_bytes, 64 * 1024);
+
+        context.rewind_temporary(mark);
+        aster_rt_object_new(&raw mut context, 32 * 1024);
+
+        let stats = context.memory_stats();
+        assert_eq!(stats.used_bytes, 32 * 1024);
+        assert_eq!(stats.peak_used_bytes, 64 * 1024);
+        assert_ne!(stats.peak_used_bytes, 96 * 1024);
+    }
+
+    #[test]
+    fn nested_temporary_marks_rewind_in_lifo_order() {
+        let mut context = ExecutionContext::with_stats();
+        let outer = context.mark_temporary();
+        context.allocate_temporary(8, 8);
+        let inner = context.mark_temporary();
+        context.allocate_temporary(16, 8);
+
+        context.rewind_temporary(inner);
+        assert_eq!(context.memory_stats().used_bytes, 8);
+
+        context.rewind_temporary(outer);
+        assert_eq!(context.memory_stats().used_bytes, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "arena mark belongs to a different arena")]
+    fn temporary_mark_from_another_context_is_rejected() {
+        let mut first = ExecutionContext::new();
+        let mut second = ExecutionContext::new();
+        let mark = first.mark_temporary();
+
+        second.rewind_temporary(mark);
+    }
+
+    #[test]
+    #[should_panic(expected = "arena mark belongs to a different arena")]
+    fn persistent_arena_mark_is_rejected_by_temporary_rewind() {
+        let mut context = ExecutionContext::new();
+        let wrong_mark = TemporaryArenaMark(context.arena.mark());
+
+        context.rewind_temporary(wrong_mark);
     }
 }
