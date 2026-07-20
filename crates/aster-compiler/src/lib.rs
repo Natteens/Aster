@@ -2,6 +2,7 @@
 
 mod application;
 mod constexpr;
+mod escape_analysis;
 mod generics;
 mod hir_lowering;
 mod mir_lowering;
@@ -63,6 +64,7 @@ fn compile_module(
     } else {
         let hir = hir_lowering::lower(&module, &semantic_model, intrinsic_bindings);
         let mir = mir_lowering::lower(&hir);
+        escape_analysis::analyze(&mir);
         Ok(Compilation {
             tokens,
             module,
