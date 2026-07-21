@@ -15,6 +15,10 @@ mod layouts;
 mod places;
 mod validation;
 mod values;
+// Prepared internal infrastructure for a future sublote: no public entry
+// point submits to it yet, so it is only exercised by its own tests.
+#[allow(dead_code)]
+mod worker_pool;
 
 use std::{
     cmp::Ordering,
