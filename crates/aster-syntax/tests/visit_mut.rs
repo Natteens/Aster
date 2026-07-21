@@ -213,6 +213,7 @@ fn fixture() -> Module {
     let function = FunctionDeclaration {
         constructor: false,
         is_static: false,
+        is_async: false,
         type_parameters: vec![TypeParameter {
             name: "U".to_owned(),
             span: span(57),
@@ -266,6 +267,7 @@ fn fixture() -> Module {
             Member::Method(FunctionDeclaration {
                 constructor: true,
                 is_static: false,
+                is_async: false,
                 type_parameters: Vec::new(),
                 visibility: Visibility::Public,
                 return_type: type_ref("void", 75),

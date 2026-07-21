@@ -118,6 +118,16 @@ struct Binding {
     value: Option<ConstValue>,
 }
 
+/// Where analysis currently is relative to an `async` function's single
+/// `await`. Replaces two coupled booleans (`is_async` + `saw_await`) so the
+/// impossible "saw await outside async" combination cannot be represented.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AsyncAnalysisState {
+    OutsideAsync,
+    BeforeAwait,
+    AfterAwait,
+}
+
 struct Analyzer<'a> {
     context: &'a Context,
     scopes: Vec<HashMap<String, Binding>>,
@@ -131,6 +141,7 @@ struct Analyzer<'a> {
     diagnostics: Vec<Diagnostic>,
     loop_depth: usize,
     model_context: String,
+    async_state: AsyncAnalysisState,
 }
 
 impl<'a> Analyzer<'a> {
@@ -177,6 +188,7 @@ impl<'a> Analyzer<'a> {
             diagnostics: Vec::new(),
             loop_depth: 0,
             model_context,
+            async_state: AsyncAnalysisState::OutsideAsync,
         }
     }
 

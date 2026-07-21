@@ -122,6 +122,7 @@ impl Codegen {
                     mir::RuntimeErrorKind::MathAbsIntOverflow => 0,
                     mir::RuntimeErrorKind::MathAbsLongOverflow => 1,
                     mir::RuntimeErrorKind::MathClampInvalidRange => 2,
+                    mir::RuntimeErrorKind::AsyncRuntimeUnavailable => 3,
                 }),
                 true,
             ),

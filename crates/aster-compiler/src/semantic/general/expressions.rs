@@ -26,6 +26,34 @@ impl Analyzer<'_> {
     /// `aster.core.Result`, that the enclosing function returns a `Result` with
     /// an exactly matching error type, and record the concrete resolution for
     /// HIR lowering. Returns the success type `T`.
+    fn await_expression(&mut self, operand: &Expression, span: Span) -> Type {
+        let operand_type = self.expression(operand);
+        if self.async_state == super::AsyncAnalysisState::OutsideAsync {
+            self.diagnostics.push(
+                Diagnostic::error("`await` is only valid inside an `async` function", span)
+                    .with_help("mark the enclosing function `async Task<T>`"),
+            );
+            return Type::Unknown;
+        }
+        self.async_state = super::AsyncAnalysisState::AfterAwait;
+        if let Type::Task(result_type) = operand_type {
+            return *result_type;
+        }
+        if operand_type != Type::Unknown {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "`await` requires a `Task<T>` operand, found `{}`",
+                        operand_type.display()
+                    ),
+                    span,
+                )
+                .with_help("await the result of `Task.Run(...)`"),
+            );
+        }
+        Type::Unknown
+    }
+
     fn try_propagate(&mut self, operand: &Expression, span: Span) -> Type {
         let operand_type = self.expression(operand);
         let Type::Enum(result_name) = operand_type else {
@@ -243,6 +271,7 @@ impl Analyzer<'_> {
                 operator, operand, ..
             } => self.increment_decrement(*operator, operand, expression.span),
             ExpressionKind::Try { operand } => self.try_propagate(operand, expression.span),
+            ExpressionKind::Await { operand } => self.await_expression(operand, expression.span),
             ExpressionKind::Conditional {
                 condition,
                 when_true,

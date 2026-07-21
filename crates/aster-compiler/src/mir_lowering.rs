@@ -71,11 +71,34 @@ impl FunctionLowerer {
     }
 
     fn lower(mut self, function: &hir::Function, owner: Option<hir::SymbolId>) -> mir::Function {
-        if let Some(body) = &function.body {
-            self.lower_block(body);
-        }
-        if let Some(current) = self.current {
-            self.terminate(current, mir::Terminator::End);
+        // Sublote 1 stops at HIR: async bodies (which contain `await`) are not
+        // lowered to executable MIR yet. Instead of walking the body, emit a
+        // non-executable placeholder that reports a controlled runtime error if
+        // the function is ever executed, then returns. This keeps `await` out of
+        // MIR lowering entirely and, unlike a trap, never aborts the host.
+        if function.is_async {
+            self.instruction(mir::Instruction::CallIntrinsic {
+                destination: None,
+                intrinsic: mir::Intrinsic::ReportRuntimeError(
+                    mir::RuntimeErrorKind::AsyncRuntimeUnavailable,
+                ),
+                arguments: Vec::new(),
+                return_type: mir::Type::Void,
+            });
+            // `Task<T>` is a plain `i64` handle, so a zero long is a valid,
+            // never-observed return value: execution stops at the controlled
+            // error above before this handle can be used.
+            self.terminate_current(mir::Terminator::Return(Some(mir::Operand {
+                type_: mir::Type::Long,
+                kind: mir::OperandKind::Constant(mir::Constant::Integer("0".to_owned())),
+            })));
+        } else {
+            if let Some(body) = &function.body {
+                self.lower_block(body);
+            }
+            if let Some(current) = self.current {
+                self.terminate(current, mir::Terminator::End);
+            }
         }
         let blocks = self
             .blocks

@@ -382,6 +382,7 @@ impl Lowerer<'_> {
         hir::Function {
             constructor: function.constructor,
             is_static: function.is_static,
+            is_async: function.is_async,
             symbol,
             name: function.name.clone(),
             visibility: visibility(function.visibility),
@@ -458,6 +459,7 @@ fn accessor_function(
     ast::FunctionDeclaration {
         constructor: false,
         is_static: false,
+        is_async: false,
         type_parameters: Vec::new(),
         visibility: accessor.visibility,
         return_type: if getter {

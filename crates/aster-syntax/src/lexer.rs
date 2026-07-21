@@ -297,6 +297,8 @@ impl Lexer<'_> {
             "protected" => TokenKind::Protected,
             "private" => TokenKind::Private,
             "static" => TokenKind::Static,
+            "async" => TokenKind::Async,
+            "await" => TokenKind::Await,
             "class" => TokenKind::Class,
             "struct" => TokenKind::Struct,
             "interface" => TokenKind::Interface,
@@ -527,6 +529,17 @@ mod tests {
 
     use super::lex;
     use crate::TokenKind;
+
+    #[test]
+    fn lexes_async_and_await_keywords() {
+        let tokens = lex("async await").expect("keywords should lex");
+        let kinds = tokens
+            .into_iter()
+            .map(|token| token.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(kinds[0], TokenKind::Async);
+        assert_eq!(kinds[1], TokenKind::Await);
+    }
 
     #[test]
     fn lexes_all_general_keywords() {

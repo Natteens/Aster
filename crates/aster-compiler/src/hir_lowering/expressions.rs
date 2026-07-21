@@ -368,6 +368,20 @@ impl Lowerer<'_> {
                     },
                 }
             }
+            ast::ExpressionKind::Await { operand } => {
+                let operand = self.expression(operand);
+                let result_type = match operand.type_.clone() {
+                    hir::Type::Task(inner) => inner,
+                    other => Box::new(other),
+                };
+                hir::Expression {
+                    type_: (*result_type).clone(),
+                    kind: hir::ExpressionKind::Await {
+                        operand: Box::new(operand),
+                        result_type,
+                    },
+                }
+            }
             ast::ExpressionKind::Try { operand } => {
                 let resolved = self.model.propagations[&model_key].clone();
                 let value = self.expression(operand);

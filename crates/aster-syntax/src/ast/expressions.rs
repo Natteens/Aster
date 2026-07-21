@@ -52,6 +52,12 @@ pub enum ExpressionKind {
     Try {
         operand: Box<Expression>,
     },
+    /// Prefix `await`: suspend on an `aster.core.Task<T>` operand and continue
+    /// with its `T` result. Kept as its own node, not a `UnaryOperator`, so the
+    /// `Task<T> -> T` type change is preserved through lowering.
+    Await {
+        operand: Box<Expression>,
+    },
     Conditional {
         condition: Box<Expression>,
         when_true: Box<Expression>,

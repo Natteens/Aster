@@ -116,6 +116,7 @@ pub(crate) fn evaluate(
         | ExpressionKind::Call { .. }
         | ExpressionKind::IncrementDecrement { .. }
         | ExpressionKind::Try { .. }
+        | ExpressionKind::Await { .. }
         | ExpressionKind::Assignment { .. }
         | ExpressionKind::InterpolatedString { .. } => Err(ConstError::NotConstant(span)),
     }

@@ -1,8 +1,9 @@
 use super::{
-    AccessorKind, Analyzer, Binding, Callable, Context, Diagnostic, EnumCaseInfo, Field,
-    FunctionDeclaration, HashMap, HashSet, Item, Member, Model, Module, Property, PropertyInfo,
-    Signature, Span, Type, TypeDeclaration, TypeInfo, TypeKind, TypeName, TypeRef, Visibility,
-    callable_key, resolve_type, resolve_type_readonly,
+    AccessorKind, Analyzer, Binding, Callable, Context, Diagnostic, EnumCaseInfo, Expression,
+    ExpressionKind, Field, FunctionDeclaration, HashMap, HashSet, InterpolatedPart, Item, Member,
+    Model, Module, Property, PropertyInfo, Signature, Span, Statement, Type, TypeDeclaration,
+    TypeInfo, TypeKind, TypeName, TypeRef, Visibility, callable_key, resolve_type,
+    resolve_type_readonly,
 };
 
 pub(super) fn collect_type_names(module: &Module, context: &mut Context) {
@@ -243,6 +244,17 @@ fn collect_type_members(
                         "static interface methods are not implemented",
                         method.span,
                     ));
+                }
+                if method.is_async && method.body.is_none() {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            "an `async` function must have a body",
+                            method.span,
+                        )
+                        .with_help(
+                            "`async` is only valid on free functions or static methods with a block body",
+                        ),
+                    );
                 }
                 if kind == TypeKind::Interface && method.visibility != Visibility::Public {
                     diagnostics.push(
@@ -810,10 +822,23 @@ fn validate_function_with_initialized_fields(
     model: &mut Model,
     initialized_fields: &HashSet<String>,
 ) {
+    if function.is_async && function.body.is_none() {
+        diagnostics.push(
+            Diagnostic::error("an `async` function must have a body", function.span).with_help(
+                "`async` is only valid on free functions or static methods with a block body",
+            ),
+        );
+        return;
+    }
     let Some(body) = &function.body else {
         return;
     };
-    let return_type = resolve_type_readonly(&function.return_type, context);
+    let declared_return = resolve_type_readonly(&function.return_type, context);
+    let return_type = if function.is_async {
+        validate_async_function(function, body, &declared_return, owner, diagnostics)
+    } else {
+        declared_return
+    };
     let (mut fields, methods) = owner
         .and_then(|owner| context.types.get(&owner.name))
         .map_or_else(
@@ -836,6 +861,9 @@ fn validate_function_with_initialized_fields(
         crate::semantic::function_context(function, owner),
         model,
     );
+    if function.is_async {
+        analyzer.async_state = super::AsyncAnalysisState::BeforeAwait;
+    }
     for parameter in &function.parameters {
         analyzer.declare(
             &parameter.name,
@@ -881,6 +909,230 @@ fn validate_function_with_initialized_fields(
     diagnostics.append(&mut analyzer.diagnostics);
 }
 
+/// Enforce the restricted first-version `async`/`await` surface and return the
+/// concrete `T` that `return` statements are checked against (the inner type of
+/// the declared `Task<T>`), rather than the declared `Task<T>` itself.
+fn validate_async_function(
+    function: &FunctionDeclaration,
+    body: &aster_syntax::Block,
+    declared_return: &Type,
+    owner: Option<&TypeDeclaration>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Type {
+    if let Some(parameter) = function.parameters.first() {
+        diagnostics.push(
+            Diagnostic::error(
+                "an `async` function cannot declare parameters in this version",
+                parameter.span,
+            )
+            .with_help("async functions currently take no parameters"),
+        );
+    }
+    if !function.is_static && owner.is_some() {
+        diagnostics.push(
+            Diagnostic::error(
+                "`async` instance methods are not supported in this version",
+                function.span,
+            )
+            .with_help("mark the method `static`"),
+        );
+    }
+    let effective_return = match declared_return {
+        Type::Task(inner) => {
+            if matches!(**inner, Type::Void) {
+                diagnostics.push(
+                    Diagnostic::error(
+                        "`async Task<void>` is not supported in this version",
+                        function.return_type.span,
+                    )
+                    .with_help("return a scalar `Task<T>`, for example `Task<int>`"),
+                );
+            } else if !super::calls::transferable(inner) {
+                diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "`async Task<{}>` requires a scalar result `T` in this version",
+                            inner.display()
+                        ),
+                        function.return_type.span,
+                    )
+                    .with_help("async supports only scalar results: bool, char, integers, floats"),
+                );
+            }
+            (**inner).clone()
+        }
+        other => {
+            diagnostics.push(
+                Diagnostic::error(
+                    "an `async` function must return `Task<T>`",
+                    function.return_type.span,
+                )
+                .with_help("change the return type to `Task<T>` with a scalar `T`"),
+            );
+            other.clone()
+        }
+    };
+    validate_async_body(body, diagnostics);
+    effective_return
+}
+
+/// Structural checks for an async body: linear control flow, exactly one
+/// `await`, and only the direct `await Task.Run(...)` form. The reference-local
+/// rule runs later, inside the analyzer, where concrete local types are known.
+fn validate_async_body(body: &aster_syntax::Block, diagnostics: &mut Vec<Diagnostic>) {
+    for statement in &body.statements {
+        match statement {
+            Statement::If { span, .. }
+            | Statement::While { span, .. }
+            | Statement::For { span, .. }
+            | Statement::Switch { span, .. }
+            | Statement::Break(span)
+            | Statement::Continue(span) => diagnostics.push(
+                Diagnostic::error(
+                    "an `async` function must have linear control flow in this version",
+                    *span,
+                )
+                .with_help("remove `if`, `switch`, and loops from async bodies"),
+            ),
+            Statement::Variable(_) | Statement::Return { .. } | Statement::Expression(_) => {}
+        }
+    }
+    let mut operands = Vec::new();
+    for statement in &body.statements {
+        collect_statement_awaits(statement, &mut operands);
+    }
+    match operands.as_slice() {
+        [operand] => {
+            let direct = matches!(
+                &operand.kind,
+                ExpressionKind::Call { callee, .. } if super::calls::is_task_run_callee(callee)
+            );
+            if !direct {
+                diagnostics.push(
+                    Diagnostic::error(
+                        "`await` must directly await `Task.Run(...)` in this version",
+                        operand.span,
+                    )
+                    .with_help("write `await Task.Run(Function)`"),
+                );
+            }
+        }
+        [] => diagnostics.push(
+            Diagnostic::error(
+                "an `async` function must contain exactly one `await` in this version",
+                body.span,
+            )
+            .with_help("await one `Task.Run(...)`"),
+        ),
+        [_, second, ..] => diagnostics.push(
+            Diagnostic::error(
+                "an `async` function may contain only one `await` in this version",
+                second.span,
+            )
+            .with_help("reduce the body to a single `await`"),
+        ),
+    }
+    // The conservative "no reference local before the await" rule needs the
+    // concrete (possibly inferred) type of each local, so it runs inside the
+    // analyzer (see `Analyzer::statement`), not this pre-analysis AST pass.
+}
+
+pub(super) fn is_reference_type(type_: &Type) -> bool {
+    matches!(
+        type_,
+        Type::String | Type::Array(_) | Type::Class(_) | Type::Interface(_) | Type::Task(_)
+    )
+}
+
+fn collect_statement_awaits<'a>(statement: &'a Statement, out: &mut Vec<&'a Expression>) {
+    match statement {
+        Statement::Variable(variable) => {
+            if let Some(initializer) = &variable.initializer {
+                collect_expression_awaits(initializer, out);
+            }
+        }
+        Statement::Return { value, .. } => {
+            if let Some(value) = value {
+                collect_expression_awaits(value, out);
+            }
+        }
+        Statement::Expression(expression) => collect_expression_awaits(expression, out),
+        Statement::If { .. }
+        | Statement::While { .. }
+        | Statement::For { .. }
+        | Statement::Switch { .. }
+        | Statement::Break(_)
+        | Statement::Continue(_) => {}
+    }
+}
+
+fn collect_expression_awaits<'a>(expression: &'a Expression, out: &mut Vec<&'a Expression>) {
+    match &expression.kind {
+        ExpressionKind::Await { operand } => {
+            out.push(operand);
+            collect_expression_awaits(operand, out);
+        }
+        ExpressionKind::Unary { operand, .. }
+        | ExpressionKind::IncrementDecrement { operand, .. }
+        | ExpressionKind::Try { operand }
+        | ExpressionKind::Cast { operand, .. } => collect_expression_awaits(operand, out),
+        ExpressionKind::Binary { left, right, .. } => {
+            collect_expression_awaits(left, out);
+            collect_expression_awaits(right, out);
+        }
+        ExpressionKind::Assignment { target, value, .. } => {
+            collect_expression_awaits(target, out);
+            collect_expression_awaits(value, out);
+        }
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            collect_expression_awaits(condition, out);
+            collect_expression_awaits(when_true, out);
+            collect_expression_awaits(when_false, out);
+        }
+        ExpressionKind::Call {
+            callee, arguments, ..
+        } => {
+            collect_expression_awaits(callee, out);
+            for argument in arguments {
+                collect_expression_awaits(argument, out);
+            }
+        }
+        ExpressionKind::Member { object, .. } => collect_expression_awaits(object, out),
+        ExpressionKind::Index { array, index } => {
+            collect_expression_awaits(array, out);
+            collect_expression_awaits(index, out);
+        }
+        ExpressionKind::NewArray { length, .. } => collect_expression_awaits(length, out),
+        ExpressionKind::NewObject { arguments, .. } => {
+            for argument in arguments {
+                collect_expression_awaits(argument, out);
+            }
+        }
+        ExpressionKind::ArrayLiteral(elements) => {
+            for element in elements {
+                collect_expression_awaits(element, out);
+            }
+        }
+        ExpressionKind::StructLiteral { fields, .. } => {
+            for field in fields {
+                collect_expression_awaits(&field.value, out);
+            }
+        }
+        ExpressionKind::InterpolatedString { parts } => {
+            for part in parts {
+                if let InterpolatedPart::Expression(expression) = part {
+                    collect_expression_awaits(expression, out);
+                }
+            }
+        }
+        ExpressionKind::Literal(_) | ExpressionKind::Name(_) | ExpressionKind::This => {}
+    }
+}
+
 fn validate_property(
     property: &Property,
     owner: &TypeDeclaration,
@@ -892,6 +1144,7 @@ fn validate_property(
         let function = FunctionDeclaration {
             constructor: false,
             is_static: false,
+            is_async: false,
             type_parameters: Vec::new(),
             visibility: getter.visibility,
             return_type: property.type_ref.clone(),
@@ -906,6 +1159,7 @@ fn validate_property(
         let function = FunctionDeclaration {
             constructor: false,
             is_static: false,
+            is_async: false,
             type_parameters: Vec::new(),
             visibility: setter.visibility,
             return_type: TypeRef::new("void", property.type_ref.span),

@@ -271,6 +271,12 @@ impl FunctionLowerer {
             hir::ExpressionKind::TaskWait { task, result_type } => {
                 Some(self.lower_task_wait(task, result_type))
             }
+            // `await` only appears inside `async` bodies, which `lower` replaces
+            // with a non-executable placeholder and never walks (sublote 1 stops
+            // at HIR). This arm is therefore never reached for valid Aster; it
+            // returns `None` rather than panicking so no `async`/`await` input
+            // can ever cause a Rust panic in the compiler.
+            hir::ExpressionKind::Await { .. } => None,
         }
     }
 
@@ -675,6 +681,9 @@ pub(super) fn lower_intrinsic(intrinsic: hir::Intrinsic) -> mir::Intrinsic {
                 }
                 hir::RuntimeErrorKind::MathClampInvalidRange => {
                     mir::RuntimeErrorKind::MathClampInvalidRange
+                }
+                hir::RuntimeErrorKind::AsyncRuntimeUnavailable => {
+                    mir::RuntimeErrorKind::AsyncRuntimeUnavailable
                 }
             })
         }

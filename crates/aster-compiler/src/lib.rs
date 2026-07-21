@@ -110,6 +110,7 @@ fn synthesize_default_constructors(module: &mut Module) {
         class.members.push(Member::Method(FunctionDeclaration {
             constructor: true,
             is_static: false,
+            is_async: false,
             type_parameters: Vec::new(),
             visibility: Visibility::Public,
             return_type: TypeRef::new("void", class.span),

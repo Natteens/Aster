@@ -232,7 +232,8 @@ impl Monomorphizer {
             ),
             ExpressionKind::Unary { operand, .. }
             | ExpressionKind::IncrementDecrement { operand, .. }
-            | ExpressionKind::Try { operand } => self.expression(operand, environment),
+            | ExpressionKind::Try { operand }
+            | ExpressionKind::Await { operand } => self.expression(operand, environment),
             ExpressionKind::Conditional {
                 condition,
                 when_true,

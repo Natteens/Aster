@@ -35,6 +35,15 @@ struct Parser {
     diagnostics: Vec<Diagnostic>,
 }
 
+/// The declaration modifiers already parsed before a function's name, grouped
+/// so `function_after_name` keeps a small argument list.
+#[derive(Clone, Copy)]
+struct FunctionModifiers {
+    visibility: Visibility,
+    is_static: bool,
+    is_async: bool,
+}
+
 impl Parser {
     fn module(&mut self) -> Module {
         let namespace = if self.at(&TokenKind::Namespace) {
@@ -149,6 +158,16 @@ impl Parser {
         let start = self.current().span.start;
         let visibility = self.visibility(Visibility::Internal);
         let is_static = self.take(&TokenKind::Static).is_some();
+        let async_token = self.take(&TokenKind::Async);
+        let is_async = async_token.is_some();
+        if let Some(token) = &async_token
+            && !self.is_type_start()
+        {
+            self.diagnostics.push(
+                Diagnostic::error("only free functions can be `async`", token.span)
+                    .with_help("`async` applies to a function returning `Task<T>`"),
+            );
+        }
         if is_static
             && !matches!(
                 self.current().kind,
@@ -177,7 +196,7 @@ impl Parser {
             TokenKind::Const | TokenKind::Var => {
                 self.variable(Some(visibility)).map(Item::Variable)
             }
-            _ if self.is_type_start() => self.typed_module_item(visibility, start),
+            _ if self.is_type_start() => self.typed_module_item(visibility, start, is_async),
             _ => None,
         }
     }
@@ -293,6 +312,8 @@ impl Parser {
         };
         let visibility = self.visibility(default);
         let is_static = self.take(&TokenKind::Static).is_some();
+        let async_token = self.take(&TokenKind::Async);
+        let is_async = async_token.is_some();
         if owner == TypeKind::Class
             && matches!(&self.current().kind, TokenKind::Identifier(name) if name == owner_name)
             && self.peek(1).kind == TokenKind::LeftParen
@@ -303,14 +324,23 @@ impl Parser {
                         .with_help("remove `static` from the constructor"),
                 );
             }
+            if let Some(token) = &async_token {
+                self.diagnostics.push(
+                    Diagnostic::error("constructors cannot be `async`", token.span)
+                        .with_help("remove `async` from the constructor"),
+                );
+            }
             let token = self.advance().clone();
             return self
                 .function_after_name(
-                    visibility,
+                    FunctionModifiers {
+                        visibility,
+                        is_static: false,
+                        is_async: false,
+                    },
                     TypeRef::new("void", token.span),
                     owner_name.to_owned(),
                     start,
-                    false,
                     false,
                 )
                 .map(|mut constructor| {
@@ -322,15 +352,24 @@ impl Parser {
         let (name, _) = self.identifier()?;
         if self.at(&TokenKind::LeftParen) || self.at(&TokenKind::Less) {
             self.function_after_name(
-                visibility,
+                FunctionModifiers {
+                    visibility,
+                    is_static,
+                    is_async,
+                },
                 type_ref,
                 name,
                 start,
                 owner == TypeKind::Interface,
-                is_static,
             )
             .map(Member::Method)
         } else if self.at(&TokenKind::LeftBrace) {
+            if let Some(token) = &async_token {
+                self.diagnostics.push(
+                    Diagnostic::error("only methods can be `async`", token.span)
+                        .with_help("remove `async` from the property"),
+                );
+            }
             if is_static {
                 self.diagnostics.push(
                     Diagnostic::error("static properties are not implemented", self.current().span)
@@ -340,6 +379,12 @@ impl Parser {
             self.property_after_name(visibility, type_ref, name, start)
                 .map(Member::Property)
         } else {
+            if let Some(token) = &async_token {
+                self.diagnostics.push(
+                    Diagnostic::error("only methods can be `async`", token.span)
+                        .with_help("remove `async` from the field"),
+                );
+            }
             if is_static {
                 self.diagnostics.push(
                     Diagnostic::error("static fields are not implemented", self.current().span)
@@ -351,13 +396,34 @@ impl Parser {
         }
     }
 
-    fn typed_module_item(&mut self, visibility: Visibility, start: usize) -> Option<Item> {
+    fn typed_module_item(
+        &mut self,
+        visibility: Visibility,
+        start: usize,
+        is_async: bool,
+    ) -> Option<Item> {
         let type_ref = self.type_ref()?;
         let (name, _) = self.identifier()?;
         if self.at(&TokenKind::LeftParen) || self.at(&TokenKind::Less) {
-            self.function_after_name(visibility, type_ref, name, start, false, false)
-                .map(Item::Function)
+            self.function_after_name(
+                FunctionModifiers {
+                    visibility,
+                    is_static: false,
+                    is_async,
+                },
+                type_ref,
+                name,
+                start,
+                false,
+            )
+            .map(Item::Function)
         } else {
+            if is_async {
+                self.diagnostics.push(
+                    Diagnostic::error("only functions can be `async`", type_ref.span)
+                        .with_help("remove `async`; variables cannot be `async`"),
+                );
+            }
             self.variable_after_name(
                 Some(visibility),
                 VariableKind::Explicit(type_ref),
@@ -370,13 +436,17 @@ impl Parser {
 
     fn function_after_name(
         &mut self,
-        visibility: Visibility,
+        modifiers: FunctionModifiers,
         return_type: TypeRef,
         name: String,
         start: usize,
         signature_only: bool,
-        is_static: bool,
     ) -> Option<FunctionDeclaration> {
+        let FunctionModifiers {
+            visibility,
+            is_static,
+            is_async,
+        } = modifiers;
         let type_parameters = self.type_parameters()?;
         self.expect(&TokenKind::LeftParen)?;
         let parameters = self.parameters()?;
@@ -386,6 +456,7 @@ impl Parser {
             Some(FunctionDeclaration {
                 constructor: false,
                 is_static,
+                is_async,
                 type_parameters,
                 visibility,
                 return_type,
@@ -400,6 +471,7 @@ impl Parser {
             Some(FunctionDeclaration {
                 constructor: false,
                 is_static,
+                is_async,
                 type_parameters,
                 visibility,
                 return_type,
@@ -959,6 +1031,17 @@ impl Parser {
     }
 
     fn unary(&mut self) -> Option<Expression> {
+        if self.at(&TokenKind::Await) {
+            let start = self.advance().span.start;
+            let operand = self.unary()?;
+            let span = Span::new(start, operand.span.end);
+            return Some(Expression {
+                kind: ExpressionKind::Await {
+                    operand: Box::new(operand),
+                },
+                span,
+            });
+        }
         if let Some(target) = self.cast_target() {
             let start = self.advance().span.start;
             let type_token = self.advance().clone();
@@ -1795,6 +1878,50 @@ mod tests {
             unreachable!();
         };
         assert!(matches!(class.members[0], Member::Method(_)));
+    }
+
+    #[test]
+    fn parses_async_free_function_and_await_expression() {
+        let module = parse_source(
+            "public async Task<int> Calculate() { int value = await Task.Run(Compute); return value + 1; }",
+        );
+        let Item::Function(function) = &module.items[0] else {
+            panic!("first item should be a function");
+        };
+        assert!(function.is_async);
+        assert_eq!(function.return_type.name, "Task<int>");
+        let statements = first_function_statements(&module);
+        let Statement::Variable(variable) = &statements[0] else {
+            panic!("first statement should declare a variable");
+        };
+        assert!(matches!(
+            variable.initializer.as_ref().unwrap().kind,
+            ExpressionKind::Await { .. }
+        ));
+    }
+
+    #[test]
+    fn parses_static_async_method_with_modifier_order() {
+        let module = parse_source(
+            "public static class Jobs { public static async Task<int> Run() { return await Task.Run(Work); } public int Work() { return 1; } }",
+        );
+        let Item::Class(class) = &module.items[0] else {
+            panic!("first item should be a class");
+        };
+        let Member::Method(method) = &class.members[0] else {
+            panic!("first member should be a method");
+        };
+        assert!(method.is_static);
+        assert!(method.is_async);
+    }
+
+    #[test]
+    fn a_plain_function_is_not_async() {
+        let module = parse_source("public int Run() { return 0; }");
+        let Item::Function(function) = &module.items[0] else {
+            panic!("first item should be a function");
+        };
+        assert!(!function.is_async);
     }
 
     #[test]

@@ -766,7 +766,7 @@ impl Analyzer<'_> {
 /// Structural check for `Task.Run(...)`, mirroring `logging_level`: `Task`
 /// is recognized as this well-known API surface only in exactly this shape,
 /// never by scanning source text elsewhere.
-fn is_task_run_callee(callee: &Expression) -> bool {
+pub(super) fn is_task_run_callee(callee: &Expression) -> bool {
     matches!(
         &callee.kind,
         ExpressionKind::Member { object, name }
@@ -779,7 +779,7 @@ fn is_task_run_callee(callee: &Expression) -> bool {
 /// owned data in this version. Excludes `void` (no `Task<void>` yet) and
 /// every type with arena identity (`string`, arrays, classes, interfaces,
 /// enums, structs, and `Task<T>` itself).
-fn transferable(type_: &Type) -> bool {
+pub(super) fn transferable(type_: &Type) -> bool {
     matches!(
         type_,
         Type::Bool

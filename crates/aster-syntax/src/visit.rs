@@ -330,7 +330,8 @@ pub fn walk_expression_mut<V: AstVisitorMut + ?Sized>(
         }
         ExpressionKind::Unary { operand, .. }
         | ExpressionKind::IncrementDecrement { operand, .. }
-        | ExpressionKind::Try { operand } => visitor.visit_expression_mut(operand),
+        | ExpressionKind::Try { operand }
+        | ExpressionKind::Await { operand } => visitor.visit_expression_mut(operand),
         ExpressionKind::Conditional {
             condition,
             when_true,

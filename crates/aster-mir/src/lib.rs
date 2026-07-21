@@ -295,6 +295,8 @@ pub enum RuntimeErrorKind {
     MathAbsIntOverflow,
     MathAbsLongOverflow,
     MathClampInvalidRange,
+    /// An `async` function was executed before the async runtime exists.
+    AsyncRuntimeUnavailable,
 }
 
 #[derive(Clone, Debug, PartialEq)]

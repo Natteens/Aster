@@ -92,6 +92,7 @@ pub struct Field {
 pub struct FunctionDeclaration {
     pub constructor: bool,
     pub is_static: bool,
+    pub is_async: bool,
     pub type_parameters: Vec<TypeParameter>,
     pub visibility: Visibility,
     pub return_type: TypeRef,

@@ -55,6 +55,9 @@ pub enum RuntimeErrorKind {
     MathAbsIntOverflow,
     MathAbsLongOverflow,
     MathClampInvalidRange,
+    /// An `async` function was executed before the async runtime exists. Its
+    /// placeholder body reports this controlled error instead of trapping.
+    AsyncRuntimeUnavailable,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -111,6 +114,7 @@ pub struct Field {
 pub struct Function {
     pub constructor: bool,
     pub is_static: bool,
+    pub is_async: bool,
     pub symbol: SymbolId,
     pub name: String,
     pub visibility: Visibility,
@@ -310,6 +314,14 @@ pub enum ExpressionKind {
     /// error. This expression's type is always `result_type` (`T`).
     TaskWait {
         task: Box<Expression>,
+        result_type: Box<Type>,
+    },
+    /// `await operand` inside an `async` function: `operand` is a `Task<T>`
+    /// expression (only `Task.Run(...)` in this version) and this node's type
+    /// is the concrete scalar `result_type` (`T`). Carries no suspension
+    /// machinery yet; sublote 1 stops at this typed representation.
+    Await {
+        operand: Box<Expression>,
         result_type: Box<Type>,
     },
 }
