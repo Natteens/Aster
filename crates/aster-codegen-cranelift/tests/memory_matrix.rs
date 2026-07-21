@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 use aster_codegen_cranelift::execute_with_stats;
 use aster_compiler::compile;
-use matrix::{Region, Report, Scale, Status, run_matrix, serialize_report, workloads};
+use matrix::{Region, Report, Scale, Status, json_string, run_matrix, serialize_report, workloads};
 
 fn small_report() -> &'static Report {
     static REPORT: OnceLock<Report> = OnceLock::new();
@@ -125,6 +125,13 @@ fn deterministic_metrics_are_stable_between_executions() {
 
     assert_eq!(first_value, second_value);
     assert_eq!(first_stats, second_stats);
+}
+
+#[test]
+fn json_string_escapes_every_control_character() {
+    let source = "a\"b\\c\nd\re\tf\u{08}g\u{0c}h\u{01}";
+    let escaped = json_string(source);
+    assert_eq!(escaped, "\"a\\\"b\\\\c\\nd\\re\\tf\\bg\\fh\\u0001\"");
 }
 
 #[test]

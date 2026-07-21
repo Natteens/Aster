@@ -7,7 +7,8 @@
     "release": "semantic-release",
     "release:dry-run": "semantic-release --dry-run",
     "release:sync-version": "node scripts/sync-release-version.mjs",
-    "test:release-script": "node --test scripts/*.test.mjs"
+    "test:release-script": "node --test scripts/*.test.mjs",
+    "test:benchmark-compare": "node --test benchmarks/memory/compare.test.mjs"
   },
   "devDependencies": {
     "@semantic-release/changelog": "6.0.3",

@@ -68,16 +68,45 @@ reuse.
 
 ## Reproducible comparison
 
-The repository includes equivalent temporary and persistent workloads under
-`benchmarks/memory`.
+The repository includes eight formal workloads under `benchmarks/memory`: an
+object, array, dynamic string, and mixed program in both a temporary and a
+persistent variant. Each workload runs at `small`, `medium`, and `large` scales
+and returns a deterministic checksum.
+
+The `memory_matrix` executor compiles each workload, runs a warmup, then takes
+timed samples. It verifies the checksum, the per-category allocation counts, the
+expected region, and the temporary and persistent `used_bytes` invariants, and
+emits a structured JSON document.
+
+```console
+cargo run --release -p aster-codegen-cranelift --example memory_matrix -- --scale small,medium
+cargo run --release -p aster-codegen-cranelift --example memory_matrix -- --scale small --json
+```
+
+The JSON separates deterministic metrics, timing, and metadata. Only the
+checksum and the `MemoryStats` fields are frozen in a baseline, and only for a
+matching target and profile. Timing (`frontend_compile`, `jit_and_execute`,
+`end_to_end`) is informative: it includes Cranelift code generation,
+finalization, and execution, is never frozen, and is never compared, because
+wall-clock time is not reproducible across machines.
+
+Validation and comparison are manual. Run `memory_matrix`, validate the JSON
+with `node benchmarks/memory/compare.mjs validate`, optionally generate a local
+baseline for the real target and profile with `compare.mjs to-baseline`, and
+compare later reports with `compare.mjs compare`. The comparator rejects a
+mismatched schema, target, or profile, reports per-field deterministic
+differences, and ignores timing. No baseline is shipped in the repository and
+metrics are never copied between targets. `large` is for manual local runs only.
+See `benchmarks/memory/README.md` for the schema and the baseline procedure.
+
+The older two-workload timing example remains available:
 
 ```console
 cargo run --release -p aster-codegen-cranelift --example memory_regions
 ```
 
-The benchmark excludes Aster source compilation from timing, but includes
-Cranelift code generation, finalization, and execution for each sample. Use it
-as a same-machine regression check, not as a cross-machine performance claim.
+Use these benchmarks as a same-machine regression check, not as a cross-machine
+performance claim.
 
 ## Current boundary
 

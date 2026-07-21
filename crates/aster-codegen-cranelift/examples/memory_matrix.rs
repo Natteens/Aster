@@ -217,6 +217,7 @@ pub struct Environment {
     pub aster_version: &'static str,
     pub os: &'static str,
     pub arch: &'static str,
+    pub target: String,
     pub profile: &'static str,
     pub git_revision: String,
 }
@@ -237,6 +238,7 @@ impl Environment {
             aster_version: env!("CARGO_PKG_VERSION"),
             os: std::env::consts::OS,
             arch: std::env::consts::ARCH,
+            target: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
             profile,
             git_revision,
         }
@@ -576,6 +578,8 @@ fn json_escape(value: &str) -> String {
             '\n' => escaped.push_str("\\n"),
             '\r' => escaped.push_str("\\r"),
             '\t' => escaped.push_str("\\t"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0c}' => escaped.push_str("\\f"),
             control if u32::from(control) < 0x20 => {
                 write!(escaped, "\\u{:04x}", u32::from(control))
                     .expect("writing to a String cannot fail");
@@ -586,7 +590,7 @@ fn json_escape(value: &str) -> String {
     escaped
 }
 
-fn json_string(value: &str) -> String {
+pub fn json_string(value: &str) -> String {
     format!("\"{}\"", json_escape(value))
 }
 
@@ -663,10 +667,11 @@ fn json_result(result: &CaseResult) -> String {
 pub fn serialize_report(report: &Report) -> String {
     let environment = format!(
         "  \"environment\": {{\"aster_version\": {}, \"os\": {}, \"arch\": {}, \
-         \"profile\": {}, \"git_revision\": {}}}",
+         \"target\": {}, \"profile\": {}, \"git_revision\": {}}}",
         json_string(report.environment.aster_version),
         json_string(report.environment.os),
         json_string(report.environment.arch),
+        json_string(&report.environment.target),
         json_string(report.environment.profile),
         json_string(&report.environment.git_revision),
     );
@@ -762,13 +767,23 @@ fn selected_scales() -> Vec<Scale> {
     }
 }
 
+fn json_only() -> bool {
+    std::env::args()
+        .skip(1)
+        .any(|argument| argument == "--json")
+}
+
 fn main() {
     let scales = selected_scales();
     let report = run_matrix(&scales);
 
-    print_human_summary(&report);
-    println!();
-    println!("{}", serialize_report(&report));
+    if json_only() {
+        println!("{}", serialize_report(&report));
+    } else {
+        print_human_summary(&report);
+        println!();
+        println!("{}", serialize_report(&report));
+    }
 
     if !report.all_passed() {
         std::process::exit(1);
