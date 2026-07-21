@@ -29,6 +29,10 @@ pub enum Type {
     Interface(SymbolId),
     Enum(SymbolId),
     Array(Box<Type>),
+    /// `aster.core.Task<T>`: an opaque host-side handle for one spawned task.
+    /// Compiler-intrinsic, like `Array`; never monomorphized like a stdlib
+    /// generic, and never exposes arena identity to generated code.
+    Task(Box<Type>),
     Unknown,
 }
 
@@ -290,6 +294,23 @@ pub enum ExpressionKind {
     /// has a type with a defined textual conversion. Always typed `string`.
     InterpolatedString {
         parts: Vec<InterpolatedPart>,
+    },
+    /// `aster.core.Task.Run(function)`: spawn a statically resolved,
+    /// zero-parameter free function or static method on the host's
+    /// execution pool. `function` is never a variable, a generic template,
+    /// or an interface dispatch; semantic analysis resolves it to a concrete
+    /// symbol before this node exists. This expression's type is always
+    /// `Type::Task(return_type)`.
+    TaskRun {
+        function: SymbolId,
+        return_type: Box<Type>,
+    },
+    /// `task.Wait()` on an `aster.core.Task<T>` value: block until the task
+    /// completes and produce its `T` result, or propagate a controlled
+    /// error. This expression's type is always `result_type` (`T`).
+    TaskWait {
+        task: Box<Expression>,
+        result_type: Box<Type>,
     },
 }
 

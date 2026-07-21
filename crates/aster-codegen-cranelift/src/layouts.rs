@@ -191,6 +191,14 @@ impl Layouts {
                     .map_err(|_| BackendError::new("pointer alignment is too large"))?,
             });
         }
+        // `Task<T>` is a plain `i64` handle id (see `declarations::clif_value_type`),
+        // never a pointer.
+        if matches!(type_, mir::Type::Task(_)) {
+            return Ok(TypeLayout {
+                size: 8,
+                align_shift: 3,
+            });
+        }
         let size = match primitive(type_) {
             Some(Primitive::String) => self.pointer_bytes,
             Some(Primitive::Decimal) => {
@@ -237,6 +245,14 @@ impl Layouts {
                 size: self.pointer_bytes,
                 align_shift: u8::try_from(self.pointer_bytes.trailing_zeros())
                     .map_err(|_| BackendError::new("pointer alignment is too large"))?,
+            });
+        }
+        // `Task<T>` is a plain `i64` handle id (see `declarations::clif_value_type`),
+        // never a pointer.
+        if matches!(type_, mir::Type::Task(_)) {
+            return Ok(TypeLayout {
+                size: 8,
+                align_shift: 3,
             });
         }
         let size = match primitive(type_) {

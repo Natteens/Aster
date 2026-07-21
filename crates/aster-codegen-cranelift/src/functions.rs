@@ -129,12 +129,13 @@ impl Codegen {
                 destination,
                 intrinsic,
                 arguments,
-                ..
+                return_type,
             } => self.translate_intrinsic(
                 builder,
                 destination.as_ref(),
                 *intrinsic,
                 arguments,
+                return_type,
                 state,
             ),
             mir::Instruction::AllocateArray {

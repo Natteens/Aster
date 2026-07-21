@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use super::task_runtime::{TaskRuntime, module_uses_tasks};
 use super::{
     BackendError, Codegen, ExecutionValue, HashMap, JITBuilder, JITModule, default_libcall_names,
     mir, module_error, runtime_functions,
@@ -30,6 +33,7 @@ impl PreparedProgram {
         for function in runtime_functions() {
             builder.symbol(function.name, function.address);
         }
+        super::task_abi::bind_task_functions(&mut builder);
         let jit = JITModule::new(builder);
         let mut codegen = Codegen::new(jit, module)?;
         let function_ids = codegen.declare_functions(module)?;
@@ -58,10 +62,16 @@ impl PreparedProgram {
     /// duration of this call because `self.jit` is not dropped until `Self`
     /// is. Looks up `symbol` in the map built once by [`Self::prepare`], so
     /// no textual function lookup happens on this path.
+    ///
+    /// `task_runtime`, when present, is registered on the fresh
+    /// `ExecutionContext` before invocation so `Task.Run` can reach the
+    /// host's execution pool (see `aster_runtime::ExecutionContext::set_task_runtime`).
+    /// Sequential invocations that never use `Task.Run` pass `None`.
     pub(super) fn invoke(
         &self,
         symbol: mir::SymbolId,
         collect_stats: bool,
+        task_runtime: Option<*mut ()>,
     ) -> Result<(ExecutionValue, super::MemoryStats), BackendError> {
         let (pointer, return_type) = self
             .entries
@@ -72,6 +82,9 @@ impl PreparedProgram {
         } else {
             aster_runtime::ExecutionContext::new()
         };
+        if let Some(pointer) = task_runtime {
+            execution_context.set_task_runtime(pointer);
+        }
         let value = invoke_finalized(*pointer, return_type, &mut execution_context);
         let runtime_error = execution_context.take_error();
         let stats = execution_context.memory_stats().clone();
@@ -100,13 +113,30 @@ impl Drop for PreparedProgram {
     }
 }
 
+/// Shared implementation behind every public `execute*` function. Detects
+/// whether `module` uses `Task.Run`/`Wait` anywhere and, only then, creates
+/// a [`TaskRuntime`] for the duration of this call: a module that never
+/// uses tasks never pays for one, and there is no second, task-aware
+/// entry point to choose instead of this one.
 pub(super) fn execute_resolved(
     module: &mir::Module,
     entry: &mir::Function,
     collect_stats: bool,
 ) -> Result<(ExecutionValue, super::MemoryStats), BackendError> {
     let prepared = PreparedProgram::prepare(module)?;
-    prepared.invoke(entry.symbol, collect_stats)
+    if !module_uses_tasks(module) {
+        return prepared.invoke(entry.symbol, collect_stats, None);
+    }
+    let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let mut runtime = TaskRuntime::new(Arc::new(module.clone()), worker_count)?;
+    // SAFETY-relevant only in spirit: this is a plain pointer value, not a
+    // live borrow held across the call. `runtime` is not read or written by
+    // name again until after `invoke` returns, so nothing aliases it while
+    // `task_abi`'s ABI functions dereference the pointer on this same
+    // thread. `runtime` outlives the call and is dropped only afterward,
+    // which shuts its pool down and releases every task entry.
+    let pointer = std::ptr::from_mut(&mut runtime).cast::<()>();
+    prepared.invoke(entry.symbol, collect_stats, Some(pointer))
 }
 
 /// This is the only unsafe boundary in the backend. Cranelift returns an untyped
@@ -254,13 +284,13 @@ mod tests {
         let (prepared, run) = prepare(&module, "Run");
 
         let (first, _) = prepared
-            .invoke(run, false)
+            .invoke(run, false, None)
             .expect("first invocation succeeds");
         let (second, _) = prepared
-            .invoke(run, false)
+            .invoke(run, false, None)
             .expect("second invocation succeeds");
         let (third, _) = prepared
-            .invoke(run, false)
+            .invoke(run, false, None)
             .expect("third invocation succeeds");
 
         assert_eq!(first, ExecutionValue::Int(42));
@@ -278,8 +308,10 @@ mod tests {
             .expect("entry resolves")
             .symbol;
 
-        let (answer_value, _) = prepared.invoke(answer, false).expect("Answer succeeds");
-        let (run_value, _) = prepared.invoke(run, false).expect("Run succeeds");
+        let (answer_value, _) = prepared
+            .invoke(answer, false, None)
+            .expect("Answer succeeds");
+        let (run_value, _) = prepared.invoke(run, false, None).expect("Run succeeds");
 
         assert_eq!(answer_value, ExecutionValue::Int(42));
         assert_eq!(run_value, ExecutionValue::Int(84));
@@ -292,7 +324,9 @@ mod tests {
         let (prepared, run) = prepare(&module, "Run");
 
         for _ in 0..3 {
-            let (value, stats) = prepared.invoke(run, true).expect("invocation succeeds");
+            let (value, stats) = prepared
+                .invoke(run, true, None)
+                .expect("invocation succeeds");
             assert_eq!(value, ExecutionValue::Int(42));
             assert_eq!(stats.total_allocations, 1);
             assert_eq!(stats.array_allocations, 1);
@@ -313,13 +347,13 @@ mod tests {
         // suppressed, duplicated, or reworded by leftover state from a
         // previous invocation's `ExecutionContext.error` field.
         let first = prepared
-            .invoke(run, false)
+            .invoke(run, false, None)
             .expect_err("first invocation fails");
         let second = prepared
-            .invoke(run, false)
+            .invoke(run, false, None)
             .expect_err("second invocation fails");
         let third = prepared
-            .invoke(run, false)
+            .invoke(run, false, None)
             .expect_err("third invocation fails");
 
         assert_eq!(first, second);
@@ -332,7 +366,7 @@ mod tests {
         let module = compile("public int Run() { return 40 + 2; }");
         let (prepared, run) = prepare(&module, "Run");
 
-        let prepared_result = prepared.invoke(run, false).map(|(value, _)| value);
+        let prepared_result = prepared.invoke(run, false, None).map(|(value, _)| value);
 
         let entry = crate::select_entry(&module, "Run").expect("entry resolves");
         let sequential_result = execute_resolved(&module, entry, false).map(|(value, _)| value);
@@ -344,7 +378,9 @@ mod tests {
     fn dropping_a_prepared_program_after_use_frees_jit_memory_exactly_once() {
         let module = compile("public int Run() { return 1; }");
         let (prepared, run) = prepare(&module, "Run");
-        prepared.invoke(run, false).expect("invocation succeeds");
+        prepared
+            .invoke(run, false, None)
+            .expect("invocation succeeds");
         // `Drop` moves `jit` out of the `Option` before freeing it, so this
         // cannot double-free even if `drop` were somehow reachable twice.
         drop(prepared);

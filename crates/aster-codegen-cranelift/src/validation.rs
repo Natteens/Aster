@@ -249,8 +249,19 @@ fn validate_instruction(
                 validate_place(destination, function_name)?;
             }
             validate_return_type(return_type, function_name)?;
-            for argument in arguments {
-                validate_operand(argument, function_name)?;
+            if *intrinsic == mir::Intrinsic::TaskRun {
+                // `Task.Run`'s lone argument is a resolved function
+                // reference (`OperandKind::Function`), not a normal value
+                // operand; `validate_intrinsic_shape` below checks its
+                // shape directly instead of the generic `validate_operand`,
+                // which otherwise rejects every `Function` operand.
+                if let [argument] = &arguments[..] {
+                    validate_value_type(&argument.type_, function_name)?;
+                }
+            } else {
+                for argument in arguments {
+                    validate_operand(argument, function_name)?;
+                }
             }
             validate_intrinsic_shape(
                 destination.as_ref(),
@@ -402,6 +413,25 @@ fn validate_intrinsic_shape(
         }
         mir::Intrinsic::ReportRuntimeError(_) => {
             destination.is_none() && return_type == &mir::Type::Void && arguments.is_empty()
+        }
+        mir::Intrinsic::TaskRun => {
+            destination.is_some()
+                && matches!(
+                    (return_type, arguments),
+                    (mir::Type::Task(result), [argument])
+                        if matches!(argument.kind, mir::OperandKind::Function(_))
+                            && argument.type_ == **result
+                )
+        }
+        mir::Intrinsic::TaskWait => {
+            destination.is_some()
+                && matches!(
+                    arguments,
+                    [argument] if matches!(
+                        &argument.type_,
+                        mir::Type::Task(inner) if **inner == *return_type
+                    )
+                )
         }
     };
     if valid {
@@ -558,7 +588,11 @@ fn validate_value_type(type_: &mir::Type, function_name: &str) -> Result<(), Bac
     if executable_value_type(type_)
         || matches!(
             type_,
-            mir::Type::User(_) | mir::Type::Class(_) | mir::Type::Interface(_) | mir::Type::Enum(_)
+            mir::Type::User(_)
+                | mir::Type::Class(_)
+                | mir::Type::Interface(_)
+                | mir::Type::Enum(_)
+                | mir::Type::Task(_)
         )
     {
         Ok(())

@@ -194,6 +194,12 @@ pub enum Intrinsic {
     StringJoin,
     StringJoinTemporary,
     ReportRuntimeError(RuntimeErrorKind),
+    /// `aster.core.Task.Run(function)`. The sole argument is always an
+    /// `OperandKind::Function` operand naming the resolved, zero-parameter
+    /// target; `return_type` is that function's return type.
+    TaskRun,
+    /// `task.Wait()`. The sole argument is the `Task<T>` operand to join.
+    TaskWait,
 }
 
 impl Intrinsic {
@@ -220,7 +226,9 @@ impl Intrinsic {
             | Self::LogError
             | Self::StringEquals
             | Self::StringLength
-            | Self::ReportRuntimeError(_) => None,
+            | Self::ReportRuntimeError(_)
+            | Self::TaskRun
+            | Self::TaskWait => None,
         }
     }
 

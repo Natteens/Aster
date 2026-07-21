@@ -56,6 +56,12 @@ impl Codegen {
         if matches!(type_, mir::Type::Array(_) | mir::Type::Class(_)) {
             return Ok(self.pointer_type);
         }
+        // `Task<T>` is a plain opaque integer handle (a `TaskHandleId`, see
+        // `task_runtime`), never a pointer: there is nothing on this side of
+        // the ABI for generated code to dereference, leak, or double-free.
+        if matches!(type_, mir::Type::Task(_)) {
+            return Ok(types::I64);
+        }
         match primitive(type_) {
             Some(Primitive::Bool | Primitive::SByte | Primitive::Byte) => Ok(types::I8),
             Some(Primitive::Short | Primitive::UShort) => Ok(types::I16),

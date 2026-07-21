@@ -119,7 +119,12 @@ fn worker_loop(
         return;
     }
     while let Some(job) = queue.pop() {
-        let outcome = match program.invoke(job.symbol, job.collect_stats) {
+        // Nested `Task.Run` from within a task run by this worker is not
+        // supported in this version: the worker's own `PreparedProgram`
+        // never registers a task runtime, so `Task.Run` inside a task
+        // fails with a controlled error instead of deadlocking or reaching
+        // this same pool recursively.
+        let outcome = match program.invoke(job.symbol, job.collect_stats, None) {
             Ok((value, stats)) => TaskOutcome::Completed(value, stats),
             Err(error) => TaskOutcome::Failed(error),
         };
@@ -137,6 +142,9 @@ pub(super) struct TaskHandle {
 }
 
 impl TaskHandle {
+    // Diagnostics-only accessor, currently exercised only by tests; kept for
+    // the same reason `TaskId` itself exists (see its doc comment).
+    #[allow(dead_code)]
     pub(super) fn id(&self) -> TaskId {
         self.id
     }
@@ -160,6 +168,11 @@ impl TaskHandle {
 /// a fixed set of worker threads. Not a general-purpose closure pool: every
 /// job is exactly "invoke this resolved MIR function symbol."
 pub(super) struct ExecutionPool {
+    // Only read by `resolve`, currently exercised only by tests: today's
+    // sole caller (`task_runtime::TaskRuntime`, via `execution::execute_resolved`)
+    // already has its own `mir::Module` reference and resolves the entry
+    // itself before the pool exists.
+    #[allow(dead_code)]
     module: Arc<mir::Module>,
     queue: Arc<JobQueue>,
     // A mutex so `shutdown` can join every worker from `&self`: `submit` and
@@ -259,7 +272,11 @@ impl ExecutionPool {
     /// Resolve a public, zero-parameter, scalar-returning function by name
     /// to the `mir::SymbolId` [`Self::submit`] expects. Does the one textual
     /// lookup this pool ever performs; workers never look functions up by
-    /// name.
+    /// name. Currently exercised only by tests: `task_runtime::TaskRuntime`
+    /// resolves `Task.Run`'s target from an already-compiled `SymbolId`
+    /// baked in by codegen, never by name, but this stays available for a
+    /// future direct pool caller that only has a name.
+    #[allow(dead_code)]
     pub(super) fn resolve(&self, function_name: &str) -> Result<mir::SymbolId, BackendError> {
         select_entry(&self.module, function_name).map(|function| function.symbol)
     }

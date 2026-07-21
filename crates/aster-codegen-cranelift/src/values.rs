@@ -282,6 +282,7 @@ pub(super) fn type_name(type_: &mir::Type) -> &'static str {
             mir::Type::Interface(_) => "interface",
             mir::Type::Enum(_) => "enum",
             mir::Type::Array(_) => "array",
+            mir::Type::Task(_) => "task",
             mir::Type::Unknown => "unknown",
             _ => unreachable!("every primitive MIR type has an aster-types adapter"),
         },
@@ -314,6 +315,7 @@ pub(super) fn primitive(type_: &mir::Type) -> Option<Primitive> {
         | mir::Type::Interface(_)
         | mir::Type::Enum(_)
         | mir::Type::Array(_)
+        | mir::Type::Task(_)
         | mir::Type::Unknown => {
             return None;
         }

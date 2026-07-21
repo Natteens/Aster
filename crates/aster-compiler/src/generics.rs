@@ -44,6 +44,7 @@ struct Monomorphizer {
 impl Monomorphizer {
     fn run(mut self, module: &mut Module) -> Vec<Diagnostic> {
         self.validate_templates();
+        self.reject_reserved_task_template(module);
         // Discovery is intentionally synchronous and depth-first: cache entries are installed
         // before recursive materialization, and generated dependencies are accumulated first.
         // Open templates are removed before any concrete item is rewritten; only generated closed
@@ -70,5 +71,44 @@ impl Monomorphizer {
             .items
             .extend(self.generated.drain(..).map(Item::Function));
         self.diagnostics
+    }
+
+    /// A generic type template named `Task` is stripped from `module.items`
+    /// below (open templates never reach semantic analysis), so
+    /// `semantic::validate_no_reserved_type_names` cannot see it. `Task` is
+    /// reserved for the intrinsic task system regardless of arity, so this
+    /// catches the generic-template case at the one point it is still
+    /// visible; the non-generic case is caught later, in `semantic`.
+    fn reject_reserved_task_template(&mut self, module: &Module) {
+        for item in &module.items {
+            let (kind, name, span) = match item {
+                Item::Class(value) if !value.type_parameters.is_empty() => {
+                    ("class", &value.name, value.span)
+                }
+                Item::Struct(value) if !value.type_parameters.is_empty() => {
+                    ("struct", &value.name, value.span)
+                }
+                Item::Interface(value) if !value.type_parameters.is_empty() => {
+                    ("interface", &value.name, value.span)
+                }
+                Item::Enum(value) if !value.type_parameters.is_empty() => {
+                    ("enum", &value.name, value.span)
+                }
+                _ => continue,
+            };
+            if name == "Task" {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "`{name}` is reserved for the intrinsic task system and cannot be declared as a generic {kind} template"
+                        ),
+                        span,
+                    )
+                    .with_help(
+                        "rename this type; `Task<T>` is a built-in type, not something a program can declare",
+                    ),
+                );
+            }
+        }
     }
 }

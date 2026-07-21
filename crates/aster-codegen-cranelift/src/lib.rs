@@ -13,11 +13,10 @@ mod functions;
 mod interfaces;
 mod layouts;
 mod places;
+mod task_abi;
+mod task_runtime;
 mod validation;
 mod values;
-// Prepared internal infrastructure for a future sublote: no public entry
-// point submits to it yet, so it is only exercised by its own tests.
-#[allow(dead_code)]
 mod worker_pool;
 
 use std::{
@@ -145,6 +144,15 @@ impl fmt::Display for BackendError {
 impl Error for BackendError {}
 
 /// Compile a validated MIR module in memory and invoke one explicitly selected function.
+///
+/// If, and only if, `module` contains `aster.core.Task.Run`/`Task<T>.Wait`
+/// anywhere (see `task_runtime::module_uses_tasks`), this call also creates
+/// an internal task runtime (one `worker_pool::ExecutionPool` plus task
+/// entries) for the duration of this call only, then fully shuts it down
+/// before returning — never a global, never a singleton, and never created
+/// at all for a module that never uses tasks. Every entry point in this
+/// file shares this same behavior through `execution::execute_resolved`;
+/// there is exactly one way to run an Aster program.
 ///
 /// # Errors
 ///

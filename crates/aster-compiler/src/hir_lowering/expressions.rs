@@ -247,6 +247,35 @@ impl Lowerer<'_> {
                         },
                     };
                 }
+                // `Task` is reserved (see `semantic::validate_no_reserved_type_names`),
+                // so a validated module's semantic model always recorded a
+                // `task_runs` entry for every node this shape check matches.
+                if is_task_run_callee(callee) {
+                    let resolved = &self.model.task_runs[&model_key];
+                    let function = self.callable_symbols[&resolved.function];
+                    let return_type = self.callable_results[&function].clone();
+                    return hir::Expression {
+                        type_: hir::Type::Task(Box::new(return_type.clone())),
+                        kind: hir::ExpressionKind::TaskRun {
+                            function,
+                            return_type: Box::new(return_type),
+                        },
+                    };
+                }
+                if let ast::ExpressionKind::Member { object, name } = &callee.kind
+                    && name == "Wait"
+                {
+                    let object = self.expression(object);
+                    if let hir::Type::Task(result_type) = object.type_.clone() {
+                        return hir::Expression {
+                            type_: (*result_type).clone(),
+                            kind: hir::ExpressionKind::TaskWait {
+                                task: Box::new(object),
+                                result_type,
+                            },
+                        };
+                    }
+                }
                 let resolved = &self.model.calls[&model_key];
                 let symbol = self.callable_symbols[&resolved.callable];
                 let type_ = self.callable_results[&symbol].clone();
@@ -532,6 +561,17 @@ fn log_level(callee: &ast::Expression) -> Option<hir::LogLevel> {
         },
         _ => None,
     }
+}
+
+/// Mirrors `semantic::general::calls::is_task_run_callee` structurally at
+/// this layer, exactly like `log_level` mirrors `logging_level`.
+fn is_task_run_callee(callee: &ast::Expression) -> bool {
+    matches!(
+        &callee.kind,
+        ast::ExpressionKind::Member { object, name }
+            if name == "Run"
+                && matches!(&object.kind, ast::ExpressionKind::Name(object) if object == "Task")
+    )
 }
 
 fn tag(index: usize) -> u32 {

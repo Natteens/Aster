@@ -54,6 +54,13 @@ pub struct ExecutionContext {
     error: Option<String>,
     collect_stats: bool,
     stats: MemoryStats,
+    /// Opaque host extension slot: an untyped handle to whatever the current
+    /// top-level execution registered (e.g. a task-execution pool), set by
+    /// the host before invoking the entry function. This crate never reads
+    /// or writes through the pointer itself; only the host that set it knows
+    /// its real type. Absent (`None`) for every sequential invocation that
+    /// does not opt in.
+    task_runtime: Option<*mut ()>,
 }
 
 impl Default for ExecutionContext {
@@ -72,6 +79,7 @@ impl ExecutionContext {
             error: None,
             collect_stats: false,
             stats: MemoryStats::default(),
+            task_runtime: None,
         }
     }
 
@@ -84,6 +92,7 @@ impl ExecutionContext {
             error: None,
             collect_stats: true,
             stats: MemoryStats::default(),
+            task_runtime: None,
         }
     }
 
@@ -96,10 +105,28 @@ impl ExecutionContext {
         &self.stats
     }
 
-    pub(crate) fn fail(&mut self, message: impl Into<String>) {
+    /// Record a controlled runtime error. First-error-wins: later calls are
+    /// ignored once an error is already recorded. Public so host-provided
+    /// ABI functions defined outside this crate (e.g. a JIT backend's task
+    /// support) can report failures through the same channel as every
+    /// built-in runtime function.
+    pub fn fail(&mut self, message: impl Into<String>) {
         if self.error.is_none() {
             self.error = Some(message.into());
         }
+    }
+
+    /// Register the current top-level execution's opaque host extension
+    /// (e.g. a task-execution pool). Overwrites any previous value.
+    pub fn set_task_runtime(&mut self, pointer: *mut ()) {
+        self.task_runtime = Some(pointer);
+    }
+
+    /// The opaque host extension registered by [`Self::set_task_runtime`],
+    /// or `None` if this execution never opted in.
+    #[must_use]
+    pub fn task_runtime(&self) -> Option<*mut ()> {
+        self.task_runtime
     }
 
     fn record_allocation(&mut self, category: AllocationCategory, requested: usize) {

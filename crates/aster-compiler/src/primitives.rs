@@ -29,6 +29,7 @@ pub(crate) fn of_hir(type_: &aster_hir::Type) -> Option<Primitive> {
         | Type::Interface(_)
         | Type::Enum(_)
         | Type::Array(_)
+        | Type::Task(_)
         | Type::Unknown => {
             return None;
         }

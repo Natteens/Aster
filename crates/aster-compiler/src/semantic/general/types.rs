@@ -25,6 +25,9 @@ pub(super) enum Type {
     Interface(String),
     Enum(String),
     Array(Box<Type>),
+    /// `aster.core.Task<T>`, recognized structurally like `Array`, never
+    /// looked up as a user-declared generic type.
+    Task(Box<Type>),
     Unknown,
 }
 
@@ -36,6 +39,7 @@ impl Type {
                 name.clone()
             }
             Self::Array(element) => format!("{}[]", element.display()),
+            Self::Task(result) => format!("Task<{}>", result.display()),
             Self::Unknown => "<unknown>".to_owned(),
             _ => self
                 .primitive()
@@ -69,6 +73,7 @@ impl Type {
             | Self::Interface(_)
             | Self::Enum(_)
             | Self::Array(_)
+            | Self::Task(_)
             | Self::Unknown => {
                 return None;
             }
@@ -136,6 +141,22 @@ pub(super) fn resolve_type(
 }
 
 pub(super) fn resolve_type_readonly(type_ref: &TypeRef, context: &Context) -> Type {
+    if let Some(inner) = type_ref
+        .name
+        .strip_prefix("Task<")
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
+        // `Task<T>` is a reserved intrinsic type (no user declaration named
+        // `Task` can exist; see `semantic::validate_no_reserved_type_names`),
+        // resolved structurally before any user-declared-type lookup runs,
+        // exactly like `T[]`.
+        let result = resolve_type_readonly(&TypeRef::new(inner, type_ref.span), context);
+        return if result == Type::Unknown {
+            Type::Unknown
+        } else {
+            Type::Task(Box::new(result))
+        };
+    }
     if let Some(element) = type_ref.name.strip_suffix("[]") {
         let element = resolve_type_readonly(&TypeRef::new(element, type_ref.span), context);
         return if matches!(element, Type::Void | Type::Unknown) {

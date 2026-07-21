@@ -264,6 +264,57 @@ impl FunctionLowerer {
             hir::ExpressionKind::InterpolatedString { parts } => {
                 Some(self.lower_interpolated_string(parts))
             }
+            hir::ExpressionKind::TaskRun {
+                function,
+                return_type,
+            } => Some(self.lower_task_run(*function, return_type, expression.type_.clone())),
+            hir::ExpressionKind::TaskWait { task, result_type } => {
+                Some(self.lower_task_wait(task, result_type))
+            }
+        }
+    }
+
+    /// `aster.core.Task.Run(function)`: `function` is already a resolved,
+    /// concrete symbol, carried as an `OperandKind::Function` argument
+    /// rather than looked up again by name.
+    fn lower_task_run(
+        &mut self,
+        function: hir::SymbolId,
+        return_type: &hir::Type,
+        task_type: hir::Type,
+    ) -> mir::Operand {
+        let destination = mir::Place::Local(self.new_temporary(task_type.clone()));
+        self.instruction(mir::Instruction::CallIntrinsic {
+            destination: Some(destination.clone()),
+            intrinsic: mir::Intrinsic::TaskRun,
+            arguments: vec![mir::Operand {
+                type_: return_type.clone(),
+                kind: mir::OperandKind::Function(function),
+            }],
+            return_type: task_type.clone(),
+        });
+        mir::Operand {
+            type_: task_type,
+            kind: mir::OperandKind::Copy(destination),
+        }
+    }
+
+    /// `task.Wait()`: block on the already-lowered `Task<T>` operand and
+    /// produce its `T` result.
+    fn lower_task_wait(&mut self, task: &hir::Expression, result_type: &hir::Type) -> mir::Operand {
+        let task_operand = self
+            .lower_expression(task)
+            .expect("a Task<T> value produces an operand");
+        let destination = mir::Place::Local(self.new_temporary(result_type.clone()));
+        self.instruction(mir::Instruction::CallIntrinsic {
+            destination: Some(destination.clone()),
+            intrinsic: mir::Intrinsic::TaskWait,
+            arguments: vec![task_operand],
+            return_type: result_type.clone(),
+        });
+        mir::Operand {
+            type_: result_type.clone(),
+            kind: mir::OperandKind::Copy(destination),
         }
     }
 

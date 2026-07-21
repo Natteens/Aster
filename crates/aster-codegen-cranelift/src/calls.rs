@@ -43,15 +43,29 @@ impl Codegen {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) fn translate_intrinsic(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
         destination: Option<&mir::Place>,
         intrinsic: mir::Intrinsic,
         arguments: &[mir::Operand],
+        return_type: &mir::Type,
         state: &FunctionState,
     ) -> Result<(), BackendError> {
         match intrinsic {
+            mir::Intrinsic::TaskRun => {
+                return self.translate_task_run(builder, destination, arguments, state);
+            }
+            mir::Intrinsic::TaskWait => {
+                return self.translate_task_wait(
+                    builder,
+                    destination,
+                    arguments,
+                    return_type,
+                    state,
+                );
+            }
             mir::Intrinsic::StringFromLong
             | mir::Intrinsic::StringFromLongTemporary
             | mir::Intrinsic::StringFromULong
@@ -118,7 +132,9 @@ impl Codegen {
             | mir::Intrinsic::StringFromDouble
             | mir::Intrinsic::StringFromDoubleTemporary
             | mir::Intrinsic::StringJoin
-            | mir::Intrinsic::StringJoinTemporary => {
+            | mir::Intrinsic::StringJoinTemporary
+            | mir::Intrinsic::TaskRun
+            | mir::Intrinsic::TaskWait => {
                 unreachable!("handled by the dedicated translators above")
             }
         };
@@ -141,6 +157,86 @@ impl Codegen {
         if let Some(destination) = destination {
             let result = builder.inst_results(call).first().copied().ok_or_else(|| {
                 BackendError::new("runtime intrinsic did not produce its declared result")
+            })?;
+            self.store_scalar(builder, destination, result, state)?;
+        }
+        Ok(())
+    }
+
+    /// `aster.core.Task.Run(function)`. `arguments` holds exactly one
+    /// `OperandKind::Function` operand (validated shape), so the target
+    /// symbol is emitted as a compile-time constant, never loaded through
+    /// `translate_operand`.
+    fn translate_task_run(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: Option<&mir::Place>,
+        arguments: &[mir::Operand],
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let [
+            mir::Operand {
+                kind: mir::OperandKind::Function(symbol),
+                ..
+            },
+        ] = arguments
+        else {
+            return Err(BackendError::new(
+                "Task.Run requires exactly one resolved function argument",
+            ));
+        };
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("Task.Run requires an execution context"))?;
+        let symbol_constant = builder.ins().iconst(types::I32, i64::from(symbol.0));
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids["aster_task_run"], builder.func);
+        let call = builder
+            .ins()
+            .call(function_ref, &[context, symbol_constant]);
+        if let Some(destination) = destination {
+            let result =
+                builder.inst_results(call).first().copied().ok_or_else(|| {
+                    BackendError::new("Task.Run did not produce its declared result")
+                })?;
+            self.store_scalar(builder, destination, result, state)?;
+        }
+        Ok(())
+    }
+
+    /// `task.Wait()`. Dispatches to the `aster_task_wait_*` symbol matching
+    /// `return_type`'s Cranelift-level representation.
+    fn translate_task_wait(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: Option<&mir::Place>,
+        arguments: &[mir::Operand],
+        return_type: &mir::Type,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let [task] = arguments else {
+            return Err(BackendError::new(
+                "Task<T>.Wait requires exactly one task argument",
+            ));
+        };
+        let symbol = super::task_abi::wait_symbol_for(return_type).ok_or_else(|| {
+            BackendError::new(format!(
+                "`Task<{}>.Wait` cannot execute yet",
+                type_name(return_type)
+            ))
+        })?;
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("Task<T>.Wait requires an execution context"))?;
+        let handle = self.translate_operand(builder, task, state)?;
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids[symbol], builder.func);
+        let call = builder.ins().call(function_ref, &[context, handle]);
+        if let Some(destination) = destination {
+            let result = builder.inst_results(call).first().copied().ok_or_else(|| {
+                BackendError::new("Task<T>.Wait did not produce its declared result")
             })?;
             self.store_scalar(builder, destination, result, state)?;
         }

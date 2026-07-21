@@ -52,6 +52,14 @@ pub(crate) struct ResolvedPropertyAssignment {
     pub setter: CallableKey,
 }
 
+/// A resolved `aster.core.Task.Run(function)`: the concrete zero-parameter
+/// free function or static method `function` names, resolved once here so
+/// HIR lowering never re-resolves the argument by name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedTaskRun {
+    pub function: CallableKey,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedEnumCase {
     pub enum_name: String,
@@ -77,6 +85,7 @@ pub(crate) struct Model {
     pub property_reads: HashMap<ModelNodeKey, CallableKey>,
     pub property_assignments: HashMap<ModelNodeKey, ResolvedPropertyAssignment>,
     pub enum_values: HashMap<ModelNodeKey, ResolvedEnumCase>,
+    pub task_runs: HashMap<ModelNodeKey, ResolvedTaskRun>,
     pub switch_cases: HashMap<ModelNodeKey, ResolvedEnumCase>,
     pub propagations: HashMap<ModelNodeKey, ResolvedPropagation>,
 }
@@ -106,9 +115,36 @@ pub(crate) fn field_context(owner: &str, field: &str, start: usize) -> String {
 pub(super) fn validate(module: &Module) -> (Vec<Diagnostic>, Model) {
     let mut diagnostics = Vec::new();
     validate_declaration_names(module, &mut diagnostics);
+    validate_no_reserved_type_names(module, &mut diagnostics);
     let mut model = Model::default();
     general::validate(module, &mut diagnostics, &mut model);
     (diagnostics, model)
+}
+
+/// `Task` is a reserved, intrinsic type name (`aster.core.Task<T>`; see
+/// `hir::Type::Task`): no class, struct, interface, or enum declaration
+/// (generic or not) may use it. This is the single place that reservation
+/// is enforced, so every later stage can recognize `Task`/`Task.Run`/`Wait`
+/// structurally without checking whether a user redefined the name.
+fn validate_no_reserved_type_names(module: &Module, diagnostics: &mut Vec<Diagnostic>) {
+    for item in &module.items {
+        let (kind, name, span) = match item {
+            Item::Class(item) => ("class", &item.name, item.span),
+            Item::Struct(item) => ("struct", &item.name, item.span),
+            Item::Interface(item) => ("interface", &item.name, item.span),
+            Item::Enum(item) => ("enum", &item.name, item.span),
+            Item::Function(_) | Item::Variable(_) => continue,
+        };
+        if name == "Task" {
+            diagnostics.push(
+                Diagnostic::error(
+                    format!("`{name}` is reserved for the intrinsic task system and cannot be declared as a {kind}"),
+                    span,
+                )
+                .with_help("rename this type; `Task<T>` is a built-in type, not something a program can declare"),
+            );
+        }
+    }
 }
 
 fn validate_declaration_names(module: &Module, diagnostics: &mut Vec<Diagnostic>) {

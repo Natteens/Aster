@@ -21,6 +21,14 @@ impl Monomorphizer {
             *argument = TypeName::parse(&self.concretize_type_name(&argument.to_string(), span))
                 .unwrap_or_else(|| argument.clone());
         }
+        if type_name.base == "Task" {
+            // `Task` is reserved (see `semantic::validate_no_reserved_type_names`),
+            // so `Task<T>` is always the compiler intrinsic (`hir::Type::Task`),
+            // never a user or stdlib generic template: it never goes through
+            // template-arity checking or monomorphization here. Semantic
+            // analysis resolves it directly from this reconstructed name.
+            return type_name.to_string();
+        }
         let template_arity = self
             .type_templates
             .get(&type_name.base)

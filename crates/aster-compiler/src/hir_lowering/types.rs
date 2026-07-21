@@ -12,6 +12,18 @@ impl Lowerer<'_> {
     }
 
     pub(super) fn resolve_type(&self, type_ref: &ast::TypeRef) -> hir::Type {
+        if let Some(inner) = type_ref
+            .name
+            .strip_prefix("Task<")
+            .and_then(|rest| rest.strip_suffix('>'))
+        {
+            // `Task` is reserved (see `semantic::validate_no_reserved_type_names`);
+            // this is the central point that resolves it to the intrinsic
+            // `hir::Type::Task`, exactly like `T[]` resolves to `Type::Array`.
+            return hir::Type::Task(Box::new(
+                self.resolve_type(&ast::TypeRef::new(inner, type_ref.span)),
+            ));
+        }
         if let Some(element) = type_ref.name.strip_suffix("[]") {
             return hir::Type::Array(Box::new(
                 self.resolve_type(&ast::TypeRef::new(element, type_ref.span)),

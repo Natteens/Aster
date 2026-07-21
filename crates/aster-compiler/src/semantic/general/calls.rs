@@ -1,6 +1,6 @@
 use super::{
     Analyzer, Callable, Diagnostic, Dispatch, Expression, ExpressionKind, ResolvedCall,
-    ResolvedEnumCase, Signature, Span, Type, TypeKind, Visibility,
+    ResolvedEnumCase, ResolvedTaskRun, Signature, Span, Type, TypeKind, Visibility,
 };
 
 impl Analyzer<'_> {
@@ -314,6 +314,26 @@ impl Analyzer<'_> {
         if let Some(level) = logging_level(callee) {
             return self.logging_call(level, arguments, span);
         }
+        // `Task` is a reserved intrinsic name (no user declaration named
+        // `Task` can exist; see `semantic::validate_no_reserved_type_names`),
+        // so this structural shape check alone identifies `Task.Run`.
+        if is_task_run_callee(callee) {
+            return self.task_run(arguments, span);
+        }
+        if let ExpressionKind::Member { object, name } = &callee.kind
+            && name == "Wait"
+        {
+            let object_type = self.expression(object);
+            if let Type::Task(result_type) = object_type {
+                if !arguments.is_empty() {
+                    self.diagnostics.push(Diagnostic::error(
+                        "`Task<T>.Wait` accepts no arguments",
+                        span,
+                    ));
+                }
+                return *result_type;
+            }
+        }
         let calls_current_instance = matches!(&callee.kind, ExpressionKind::Name(name) if self.methods.contains_key(name))
             || matches!(&callee.kind, ExpressionKind::Member { object, .. } if matches!(object.kind, ExpressionKind::This));
         if self.constructor
@@ -583,6 +603,144 @@ impl Analyzer<'_> {
         Type::Void
     }
 
+    /// `aster.core.Task.Run(function)`. `function` must directly name a
+    /// resolvable, zero-parameter free function or static method whose
+    /// result can safely cross a worker boundary; anything else is a
+    /// controlled diagnostic here rather than a later panic.
+    fn task_run(&mut self, arguments: &[Expression], span: Span) -> Type {
+        let [argument] = arguments else {
+            self.diagnostics.push(Diagnostic::error(
+                format!(
+                    "`Task.Run` expects exactly one function argument, found {}",
+                    arguments.len()
+                ),
+                span,
+            ));
+            for argument in arguments {
+                self.expression(argument);
+            }
+            return Type::Unknown;
+        };
+        let Some(candidate) = self.resolve_task_run_target(argument) else {
+            return Type::Unknown;
+        };
+        if !transferable(&candidate.signature.result) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "`Task<{}>` cannot cross a worker boundary in this version",
+                        candidate.signature.result.display()
+                    ),
+                    argument.span,
+                )
+                .with_help(
+                    "Task.Run currently supports only scalar results (bool, char, integers, floats)",
+                ),
+            );
+            return Type::Unknown;
+        }
+        let result_type = candidate.signature.result.clone();
+        self.model.task_runs.insert(
+            self.model_key(span),
+            ResolvedTaskRun {
+                function: candidate.key,
+            },
+        );
+        Type::Task(Box::new(result_type))
+    }
+
+    /// Resolve `Task.Run`'s sole argument to the concrete, zero-parameter,
+    /// non-generic free function or static method it directly names.
+    /// Never treats a variable, an instance method, or any other expression
+    /// shape as a function reference.
+    fn resolve_task_run_target(&mut self, argument: &Expression) -> Option<Callable> {
+        match &argument.kind {
+            ExpressionKind::Name(name) => {
+                let mut candidates = self
+                    .context
+                    .functions
+                    .get(name)
+                    .into_iter()
+                    .flatten()
+                    .filter(|candidate| candidate.is_static)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                candidates.extend(
+                    self.methods
+                        .get(name)
+                        .into_iter()
+                        .flatten()
+                        .filter(|candidate| candidate.is_static)
+                        .cloned(),
+                );
+                self.pick_task_run_candidate(name, argument.span, candidates)
+            }
+            ExpressionKind::Member { object, name } => {
+                let ExpressionKind::Name(type_name) = &object.kind else {
+                    self.diagnostics.push(Diagnostic::error(
+                        "`Task.Run` argument must directly name a static method or free function",
+                        argument.span,
+                    ));
+                    return None;
+                };
+                let Some(info) = self.context.types.get(type_name) else {
+                    self.diagnostics.push(Diagnostic::error(
+                        format!("unknown type `{type_name}`"),
+                        argument.span,
+                    ));
+                    return None;
+                };
+                let candidates = info
+                    .methods
+                    .get(name)
+                    .into_iter()
+                    .flatten()
+                    .filter(|candidate| candidate.is_static)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                self.pick_task_run_candidate(name, argument.span, candidates)
+            }
+            _ => {
+                self.diagnostics.push(Diagnostic::error(
+                    "`Task.Run` argument must directly name a static method or free function",
+                    argument.span,
+                ));
+                None
+            }
+        }
+    }
+
+    fn pick_task_run_candidate(
+        &mut self,
+        name: &str,
+        span: Span,
+        candidates: Vec<Callable>,
+    ) -> Option<Callable> {
+        let mut zero_argument = candidates
+            .into_iter()
+            .filter(|candidate| candidate.signature.parameters.is_empty())
+            .collect::<Vec<_>>();
+        match zero_argument.len() {
+            0 => {
+                self.diagnostics.push(Diagnostic::error(
+                    format!(
+                        "no zero-parameter static method or free function named `{name}` is available for `Task.Run`"
+                    ),
+                    span,
+                ));
+                None
+            }
+            1 => zero_argument.pop(),
+            _ => {
+                self.diagnostics.push(Diagnostic::error(
+                    format!("`Task.Run({name})` is ambiguous among multiple candidates"),
+                    span,
+                ));
+                None
+            }
+        }
+    }
+
     fn check_arguments(&mut self, signature: &Signature, arguments: &[Expression], span: Span) {
         if arguments.len() != signature.parameters.len() {
             self.diagnostics.push(
@@ -603,6 +761,41 @@ impl Analyzer<'_> {
             self.require_assignable_value(&expected, &actual, argument);
         }
     }
+}
+
+/// Structural check for `Task.Run(...)`, mirroring `logging_level`: `Task`
+/// is recognized as this well-known API surface only in exactly this shape,
+/// never by scanning source text elsewhere.
+fn is_task_run_callee(callee: &Expression) -> bool {
+    matches!(
+        &callee.kind,
+        ExpressionKind::Member { object, name }
+            if name == "Run"
+                && matches!(&object.kind, ExpressionKind::Name(object) if object == "Task")
+    )
+}
+
+/// Whether a `Task<T>` result of type `type_` can cross a worker boundary as
+/// owned data in this version. Excludes `void` (no `Task<void>` yet) and
+/// every type with arena identity (`string`, arrays, classes, interfaces,
+/// enums, structs, and `Task<T>` itself).
+fn transferable(type_: &Type) -> bool {
+    matches!(
+        type_,
+        Type::Bool
+            | Type::SByte
+            | Type::Byte
+            | Type::Short
+            | Type::UShort
+            | Type::Int
+            | Type::UInt
+            | Type::Long
+            | Type::ULong
+            | Type::Float
+            | Type::Double
+            | Type::Decimal
+            | Type::Char
+    )
 }
 
 fn logging_level(callee: &Expression) -> Option<LogLevel<'_>> {

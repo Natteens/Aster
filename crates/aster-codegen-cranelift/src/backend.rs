@@ -25,7 +25,7 @@ impl Codegen {
                 .map_err(module_error)?;
             runtime_ids.insert(function.name, id);
         }
-        Ok(Self {
+        let mut codegen = Self {
             jit,
             pointer_type,
             string_data: HashMap::new(),
@@ -44,7 +44,9 @@ impl Codegen {
                 })
                 .collect(),
             layouts: Layouts::new(module, pointer_bytes)?,
-        })
+        };
+        codegen.declare_task_functions()?;
+        Ok(codegen)
     }
 }
 
