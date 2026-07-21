@@ -1,0 +1,30 @@
+internal int BuildArray()
+{
+    int[] values = [7];
+    return values[0];
+}
+
+internal int RunArray(int iterations)
+{
+    int total = 0;
+    for (int index = 0; index < iterations; index++)
+    {
+        total += BuildArray();
+    }
+    return total;
+}
+
+public int RunSmall()
+{
+    return RunArray(10000);
+}
+
+public int RunMedium()
+{
+    return RunArray(100000);
+}
+
+public int RunLarge()
+{
+    return RunArray(500000);
+}

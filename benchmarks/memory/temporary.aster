@@ -25,3 +25,28 @@ public int Run()
     }
     return total;
 }
+
+internal int RunMixed(int iterations)
+{
+    int total = 0;
+    for (int index = 0; index < iterations; index++)
+    {
+        total += BuildTemporary();
+    }
+    return total;
+}
+
+public int RunSmall()
+{
+    return RunMixed(10000);
+}
+
+public int RunMedium()
+{
+    return RunMixed(100000);
+}
+
+public int RunLarge()
+{
+    return RunMixed(500000);
+}

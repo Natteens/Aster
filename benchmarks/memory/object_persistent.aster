@@ -1,0 +1,37 @@
+public class BenchmarkBox
+{
+    public int value;
+}
+
+internal BenchmarkBox MakeObject()
+{
+    BenchmarkBox box = new BenchmarkBox();
+    box.value = 39;
+    return box;
+}
+
+internal int RunObject(int iterations)
+{
+    int total = 0;
+    for (int index = 0; index < iterations; index++)
+    {
+        BenchmarkBox box = MakeObject();
+        total += box.value;
+    }
+    return total;
+}
+
+public int RunSmall()
+{
+    return RunObject(10000);
+}
+
+public int RunMedium()
+{
+    return RunObject(100000);
+}
+
+public int RunLarge()
+{
+    return RunObject(150000);
+}

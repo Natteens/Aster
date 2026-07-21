@@ -1,0 +1,31 @@
+internal int BuildString()
+{
+    string prefix = "A";
+    string text = prefix + "B";
+    return text.Length;
+}
+
+internal int RunString(int iterations)
+{
+    int total = 0;
+    for (int index = 0; index < iterations; index++)
+    {
+        total += BuildString();
+    }
+    return total;
+}
+
+public int RunSmall()
+{
+    return RunString(10000);
+}
+
+public int RunMedium()
+{
+    return RunString(100000);
+}
+
+public int RunLarge()
+{
+    return RunString(500000);
+}
