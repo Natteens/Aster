@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Hand-written lexer, AST, and parser for Aster"
 
 [dependencies]
-aster-diagnostics = { path = "../aster-diagnostics", version = "0.26.0" }
+aster-diagnostics = { path = "../aster-diagnostics", version = "0.27.0" }
 
 [lints]
 workspace = true
