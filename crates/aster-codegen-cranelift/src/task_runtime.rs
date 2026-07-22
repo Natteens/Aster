@@ -1197,7 +1197,14 @@ mod tests {
         assert!(error.message().contains("later logical failure"));
     }
 
-    // --- Parallel.Reduce ---------------------------------------------------
+    // --- Parallel.For / Parallel.ForEach: explicit worker-count coverage ---
+    //
+    // `execute`/`execute_with_stats` (the public surface exercised by the
+    // integration test suites) always pick `available_parallelism()`, so a
+    // CI runner's own core count silently decides whether "1 worker" or "N
+    // workers" is what actually gets tested. Driving `TaskRuntime` directly
+    // here pins the worker count explicitly, closing that gap for `For` and
+    // `ForEach` the same way Lote 6C already did for `Reduce` below.
 
     fn symbol(module: &mir::Module, name: &str) -> mir::SymbolId {
         module
@@ -1207,6 +1214,84 @@ mod tests {
             .unwrap_or_else(|| panic!("{name} is declared"))
             .symbol
     }
+
+    #[test]
+    fn parallel_for_same_error_contract_with_one_two_or_many_workers() {
+        // Every index but 7 is safe against a length-8 array; index 7 alone
+        // overflows the length-7 slot it is deliberately given, so the
+        // deterministic "smallest failing index" is unambiguous regardless
+        // of how many workers actually run the range.
+        let source = "public void Body(int index) { \
+             int size = index == 7 ? 7 : 8; \
+             int[] a = new int[size]; \
+             int x = a[index]; \
+         }";
+        for worker_count in [1, 2, 6] {
+            let module = compile(source);
+            let body = symbol(&module, "Body");
+            let runtime = TaskRuntime::new(&Arc::new(module), worker_count)
+                .expect("runtime starts with the requested worker count");
+            let error = runtime
+                .parallel_for(0, 16, body)
+                .expect_err("index 7 must fail regardless of worker count");
+            assert!(
+                error.message().contains("array index 7"),
+                "worker_count {worker_count}: unexpected error {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_for_succeeds_identically_with_one_two_or_many_workers() {
+        let source = "public void Body(int index) { }";
+        for worker_count in [1, 2, 6] {
+            let module = compile(source);
+            let body = symbol(&module, "Body");
+            let runtime = TaskRuntime::new(&Arc::new(module), worker_count)
+                .expect("runtime starts with the requested worker count");
+            runtime
+                .parallel_for(0, 500, body)
+                .unwrap_or_else(|error| panic!("worker_count {worker_count}: {error}"));
+        }
+    }
+
+    #[test]
+    fn parallel_for_each_same_error_contract_with_one_two_or_many_workers() {
+        let source = "public void Body(int value) { \
+             int size = value == 7 ? 7 : 8; \
+             int[] a = new int[size]; \
+             int x = a[value]; \
+         }";
+        let values: Vec<ExecutionValue> = (0..16).map(ExecutionValue::Int).collect();
+        for worker_count in [1, 2, 6] {
+            let module = compile(source);
+            let body = symbol(&module, "Body");
+            let runtime = TaskRuntime::new(&Arc::new(module), worker_count)
+                .expect("runtime starts with the requested worker count");
+            let error = runtime
+                .parallel_for_each(values.clone(), body)
+                .expect_err("array position 7 must fail regardless of worker count");
+            assert!(
+                error.message().contains("array index 7"),
+                "worker_count {worker_count}: unexpected error {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_for_and_for_each_are_stable_across_repeated_runs_at_a_fixed_worker_count() {
+        let for_source = "public void Body(int index) { }";
+        let module = Arc::new(compile(for_source));
+        let body = symbol(&module, "Body");
+        let runtime = TaskRuntime::new(&module, 4).expect("runtime starts");
+        for repetition in 0..10 {
+            runtime
+                .parallel_for(0, 300, body)
+                .unwrap_or_else(|error| panic!("repetition {repetition}: {error}"));
+        }
+    }
+
+    // --- Parallel.Reduce ---------------------------------------------------
 
     const REDUCE_SOURCE: &str = "public int AddValue(int accumulator, int value) { return accumulator + value; } \
          public int AddPartial(int left, int right) { return left + right; }";
