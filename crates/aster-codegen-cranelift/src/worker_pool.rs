@@ -483,6 +483,24 @@ mod tests {
             .unwrap_or_else(|error| panic!("task {id:?} channel failed: {error}"))
     }
 
+    /// `JobKind` (what a worker actually receives) must stay `Send + 'static`
+    /// with no raw pointer, `ExecutionContext`, or `PreparedProgram` inside
+    /// it. This is a compile-time guarantee, not a runtime assertion: a
+    /// future variant carrying `*mut aster_runtime::ExecutionContext` or a
+    /// borrowed array pointer would make `JobKind` stop being `Send` (raw
+    /// pointers are not `Send`) and this test would fail to *compile*, not
+    /// just fail to pass. `ExecutionValue` (the only thing `ForEachChunk`
+    /// carries per element) is scalar-only, never a class/array/interface
+    /// handle (see `values::primitive`).
+    #[test]
+    fn job_kind_carries_only_owned_send_data_no_arena_pointer_or_context() {
+        fn assert_send<T: Send>() {}
+        assert_send::<JobKind>();
+        assert_send::<ChunkOutcome>();
+        assert_send::<TaskOutcome>();
+        assert_send::<Vec<ExecutionValue>>();
+    }
+
     #[test]
     fn single_worker_pool_runs_a_task() {
         let module = Arc::new(compile("public int Run() { return 40 + 2; }"));

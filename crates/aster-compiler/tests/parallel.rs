@@ -469,6 +469,61 @@ fn parallel_for_each_class_array_is_rejected() {
 }
 
 #[test]
+fn parallel_for_each_decimal_array_is_rejected() {
+    // `decimal` is numeric but has no backend ABI yet, so `decimal[]` must be
+    // rejected the same way a reference-typed array is, not silently accepted
+    // because it is a recognized numeric type.
+    assert_error(
+        "public void Body(decimal value) { } \
+         public int Main() { decimal[] values = [1.5m]; Parallel.ForEach(values, Body); return 0; }",
+        "requires a scalar element type",
+    );
+}
+
+#[test]
+fn parallel_for_each_interface_array_is_rejected() {
+    assert_error(
+        "public interface IThing { int Get(); } \
+         public class Thing : IThing { public Thing() {} public int Get() { return 1; } } \
+         public void Body(IThing value) { } \
+         public int Main() { IThing[] values = new IThing[1]; Parallel.ForEach(values, Body); return 0; }",
+        "requires a scalar element type",
+    );
+}
+
+#[test]
+fn parallel_for_each_enum_array_is_rejected() {
+    assert_error(
+        "public enum Color { Red, Green, Blue } \
+         public void Body(Color value) { } \
+         public int Main() { Color[] values = new Color[1]; Parallel.ForEach(values, Body); return 0; }",
+        "requires a scalar element type",
+    );
+}
+
+#[test]
+fn parallel_for_each_rejects_a_body_whose_parameter_type_does_not_match_the_element_type() {
+    // Both `int` and `long` are worker-transferable on their own; the body's
+    // parameter must still match the array's concrete element type exactly.
+    assert_error(
+        &format!(
+            "{BODY_LONG} public int Main() {{ int[] values = [1, 2, 3]; Parallel.ForEach(values, BodyLong); return 0; }}"
+        ),
+        "no static method or free function with signature",
+    );
+}
+
+#[test]
+fn parallel_for_each_struct_array_is_rejected() {
+    assert_error(
+        "public struct Point { public int x; public int y; } \
+         public void Body(Point value) { } \
+         public int Main() { Point[] values = new Point[1]; Parallel.ForEach(values, Body); return 0; }",
+        "requires a scalar element type",
+    );
+}
+
+#[test]
 fn sequential_module_does_not_reference_parallel() {
     assert_valid("public int Main() { return 1 + 1; }");
 }

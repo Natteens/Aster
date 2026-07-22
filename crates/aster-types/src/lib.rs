@@ -98,6 +98,36 @@ impl Primitive {
         self.is_integer() || self.is_float() || matches!(self, Self::Decimal)
     }
 
+    /// Whether the compiler's backend can execute code that produces or
+    /// consumes a value of this primitive today.
+    ///
+    /// `decimal` is recognized by the type system (it participates in
+    /// [`Self::is_numeric`], conversions, and promotion) but has no runtime
+    /// representation yet, so it alone is excluded here. This is the single
+    /// fact callers should check before assuming a primitive can appear in
+    /// generated code, rather than re-deriving it from `is_numeric` or a
+    /// separately maintained list.
+    #[must_use]
+    pub const fn is_backend_executable(self) -> bool {
+        !matches!(self, Self::Decimal)
+    }
+
+    /// Whether one value of this primitive can cross an Aster worker boundary
+    /// (a `Task.Run`/`Parallel.For`/`Parallel.ForEach` target, an async frame
+    /// slot, or a `Task<T>` result): copied entirely by value, with no arena
+    /// identity and a fixed-width ABI representation already implemented.
+    ///
+    /// This is strictly narrower than [`Self::is_backend_executable`]:
+    /// `string` executes fine sequentially but is excluded here because it
+    /// carries arena identity (no fixed byte width — see [`Self::bit_width`]);
+    /// `decimal` is excluded for both reasons at once. Deriving this from
+    /// `bit_width` instead of a second hand-written list keeps the two facts
+    /// from drifting apart as primitives are added.
+    #[must_use]
+    pub const fn is_worker_transferable(self) -> bool {
+        self.is_backend_executable() && self.bit_width().is_some()
+    }
+
     /// Inclusive mathematical range of an integer primitive.
     #[must_use]
     pub const fn integer_range(self) -> Option<(i128, i128)> {
@@ -256,6 +286,48 @@ mod tests {
             Primitive::Long.integer_range(),
             Some((i128::from(i64::MIN), i128::from(i64::MAX)))
         );
+    }
+
+    #[test]
+    fn decimal_is_recognized_but_not_backend_executable() {
+        assert!(Primitive::Decimal.is_numeric());
+        assert!(!Primitive::Decimal.is_backend_executable());
+        assert!(!Primitive::Decimal.is_worker_transferable());
+    }
+
+    #[test]
+    fn string_executes_but_is_not_worker_transferable() {
+        assert!(Primitive::String.is_backend_executable());
+        assert!(!Primitive::String.is_worker_transferable());
+    }
+
+    #[test]
+    fn every_fixed_width_primitive_is_worker_transferable() {
+        for primitive in [
+            Primitive::Bool,
+            Primitive::Char,
+            Primitive::SByte,
+            Primitive::Byte,
+            Primitive::Short,
+            Primitive::UShort,
+            Primitive::Int,
+            Primitive::UInt,
+            Primitive::Long,
+            Primitive::ULong,
+            Primitive::Float,
+            Primitive::Double,
+        ] {
+            assert!(
+                primitive.is_backend_executable(),
+                "{primitive:?} must be backend executable"
+            );
+            assert!(
+                primitive.is_worker_transferable(),
+                "{primitive:?} must be worker transferable"
+            );
+        }
+        assert!(!Primitive::Decimal.is_worker_transferable());
+        assert!(!Primitive::String.is_worker_transferable());
     }
 
     #[test]

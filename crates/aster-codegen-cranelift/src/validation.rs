@@ -1,4 +1,4 @@
-use super::{BackendError, HashMap, HashSet, integer_constant_bits, mir, type_name};
+use super::{BackendError, HashMap, HashSet, integer_constant_bits, mir, primitive, type_name};
 
 pub(super) fn select_entry<'a>(
     module: &'a mir::Module,
@@ -427,11 +427,13 @@ fn validate_intrinsic_shape(
                     (mir::Type::Task(result), [argument])
                         if matches!(argument.kind, mir::OperandKind::Function(_))
                             && argument.type_ == **result
+                            && is_worker_transferable(result)
                             && function_operand_matches(argument, &[], result, signatures)
                 )
         }
         mir::Intrinsic::TaskWait => {
             destination.is_some()
+                && is_worker_transferable(return_type)
                 && matches!(
                     arguments,
                     [argument] if matches!(
@@ -478,12 +480,12 @@ fn validate_intrinsic_shape(
                     [handle, index, value]
                         if handle.type_ == mir::Type::Long
                             && index.type_ == mir::Type::Int
-                            && is_transferable_scalar(&value.type_)
+                            && is_worker_transferable(&value.type_)
                 )
         }
         mir::Intrinsic::AsyncLoadSlot => {
             destination.is_some()
-                && is_transferable_scalar(return_type)
+                && is_worker_transferable(return_type)
                 && matches!(
                     arguments,
                     [handle, index]
@@ -503,7 +505,7 @@ fn validate_intrinsic_shape(
         }
         mir::Intrinsic::AsyncAwaitResult => {
             destination.is_some()
-                && is_transferable_scalar(return_type)
+                && is_worker_transferable(return_type)
                 && matches!(arguments, [handle] if handle.type_ == mir::Type::Long)
         }
         mir::Intrinsic::AsyncSetResult => {
@@ -512,7 +514,7 @@ fn validate_intrinsic_shape(
                 && matches!(
                     arguments,
                     [handle, value]
-                        if handle.type_ == mir::Type::Long && is_transferable_scalar(&value.type_)
+                        if handle.type_ == mir::Type::Long && is_worker_transferable(&value.type_)
                 )
         }
         mir::Intrinsic::ParallelFor => {
@@ -543,7 +545,7 @@ fn validate_intrinsic_shape(
                             mir::Type::Array(element) if **element == body.type_
                         )
                             && matches!(body.kind, mir::OperandKind::Function(_))
-                            && is_transferable_scalar(&body.type_)
+                            && is_worker_transferable(&body.type_)
                             && function_operand_matches(
                                 body,
                                 std::slice::from_ref(&body.type_),
@@ -698,41 +700,25 @@ fn validate_place(place: &mir::Place, function_name: &str) -> Result<(), Backend
     }
 }
 
-fn is_transferable_scalar(type_: &mir::Type) -> bool {
-    matches!(
-        type_,
-        mir::Type::Bool
-            | mir::Type::SByte
-            | mir::Type::Byte
-            | mir::Type::Short
-            | mir::Type::UShort
-            | mir::Type::Int
-            | mir::Type::UInt
-            | mir::Type::Long
-            | mir::Type::ULong
-            | mir::Type::Float
-            | mir::Type::Double
-            | mir::Type::Char
-    )
+/// Whether a value of `type_` can cross a worker boundary (`Task.Run`,
+/// `Parallel.For`/`ForEach`, or an async frame slot): copied entirely by
+/// value, with a fixed-width ABI and no arena identity. Derives from
+/// `aster-types`'s single `Primitive::is_worker_transferable` fact by way of
+/// `values::primitive`, the crate's one MIR-type-to-primitive adapter,
+/// instead of a second hand-written list that could drift from it (see
+/// `aster_compiler::semantic::general::calls::transferable`, the equivalent
+/// predicate at the frontend, which derives from the same
+/// `aster-types` fact independently).
+fn is_worker_transferable(type_: &mir::Type) -> bool {
+    primitive(type_).is_some_and(aster_types::Primitive::is_worker_transferable)
 }
 
+/// Whether the JIT backend can execute code that produces or consumes
+/// `type_` today. Wider than [`is_worker_transferable`]: `string` executes
+/// sequentially but cannot cross a worker boundary (arena identity, no fixed
+/// width). Derives from `Primitive::is_backend_executable`.
 fn executable_value_type(type_: &mir::Type) -> bool {
-    matches!(
-        type_,
-        mir::Type::SByte
-            | mir::Type::Byte
-            | mir::Type::Short
-            | mir::Type::UShort
-            | mir::Type::Int
-            | mir::Type::UInt
-            | mir::Type::Long
-            | mir::Type::ULong
-            | mir::Type::Float
-            | mir::Type::Double
-            | mir::Type::Bool
-            | mir::Type::Char
-            | mir::Type::String
-    )
+    primitive(type_).is_some_and(aster_types::Primitive::is_backend_executable)
 }
 
 fn validate_value_type(type_: &mir::Type, function_name: &str) -> Result<(), BackendError> {
@@ -842,5 +828,188 @@ mod tests {
 
         let error = validate_module(&module).expect_err("wrong task ABI must be rejected");
         assert!(error.message().contains("malformed TaskRun"));
+    }
+
+    /// Adulterated MIR (never producible by the compiler itself, since the
+    /// semantic `transferable` gate already rejects `Task<Box>` at the
+    /// source level) must still be caught here, not reach
+    /// `execution::invoke_finalized`'s `unreachable!()` fallback on a worker
+    /// thread. This is the MIR-level half of the worker-boundary guarantee:
+    /// the frontend check alone is not the only line of defense.
+    #[test]
+    fn task_run_rejects_a_non_transferable_result_type() {
+        let mut module = aster_compiler::compile(
+            "public class Box { public Box() {} } \
+             public Box Make() { return new Box(); } \
+             public int Compute() { return 1; } \
+             public int Main() { return Task.Run(Compute).Wait(); }",
+        )
+        .expect("source compiles")
+        .mir;
+        let make = module
+            .functions
+            .iter()
+            .find(|function| function.name == "Make")
+            .expect("Make is declared")
+            .symbol;
+        let box_class = module
+            .classes
+            .iter()
+            .find(|class| class.name == "Box")
+            .expect("Box is declared")
+            .symbol;
+        for function in &mut module.functions {
+            for block in &mut function.blocks {
+                for instruction in &mut block.instructions {
+                    if let mir::Instruction::CallIntrinsic {
+                        intrinsic: mir::Intrinsic::TaskRun,
+                        arguments,
+                        return_type,
+                        ..
+                    } = instruction
+                    {
+                        arguments[0].kind = mir::OperandKind::Function(make);
+                        arguments[0].type_ = mir::Type::Class(box_class);
+                        *return_type = mir::Type::Task(Box::new(mir::Type::Class(box_class)));
+                    }
+                }
+            }
+        }
+
+        let error = validate_module(&module)
+            .expect_err("a Task.Run result with arena identity must be rejected");
+        assert!(error.message().contains("malformed TaskRun"));
+    }
+
+    #[test]
+    fn task_wait_rejects_a_non_transferable_result_type() {
+        let mut module = aster_compiler::compile(
+            "public class Box { public Box() {} } \
+             public int Compute() { return 1; } \
+             public int Main() { return Task.Run(Compute).Wait(); }",
+        )
+        .expect("source compiles")
+        .mir;
+        let box_class = module
+            .classes
+            .iter()
+            .find(|class| class.name == "Box")
+            .expect("Box is declared")
+            .symbol;
+        for function in &mut module.functions {
+            for block in &mut function.blocks {
+                for instruction in &mut block.instructions {
+                    if let mir::Instruction::CallIntrinsic {
+                        intrinsic: mir::Intrinsic::TaskWait,
+                        arguments,
+                        return_type,
+                        ..
+                    } = instruction
+                    {
+                        arguments[0].type_ = mir::Type::Task(Box::new(mir::Type::Class(box_class)));
+                        *return_type = mir::Type::Class(box_class);
+                    }
+                }
+            }
+        }
+
+        let error = validate_module(&module)
+            .expect_err("a Task<T>.Wait result with arena identity must be rejected");
+        assert!(error.message().contains("malformed TaskWait"));
+    }
+
+    #[test]
+    fn async_store_slot_rejects_a_decimal_value() {
+        // `decimal` is rejected here even earlier than the `AsyncStoreSlot`
+        // shape check: `validate_operand`'s generic value-type pass already
+        // refuses any `decimal` operand anywhere in MIR (see
+        // `validate_value_type`), before intrinsic-specific shape validation
+        // even runs. The frame slot is still provably never populated with a
+        // `decimal`, just via the more fundamental of the two gates.
+        let mut module = aster_compiler::compile(
+            "public int Compute() { return 1; } \
+             public async Task<int> Calculate() { int value = 5; int result = await Task.Run(Compute); return value + result; }",
+        )
+        .expect("source compiles")
+        .mir;
+        for function in &mut module.functions {
+            for block in &mut function.blocks {
+                for instruction in &mut block.instructions {
+                    if let mir::Instruction::CallIntrinsic {
+                        intrinsic: mir::Intrinsic::AsyncStoreSlot,
+                        arguments,
+                        ..
+                    } = instruction
+                    {
+                        arguments[2].type_ = mir::Type::Decimal;
+                    }
+                }
+            }
+        }
+
+        let error = validate_module(&module)
+            .expect_err("a decimal async frame slot must be rejected, not silently stored");
+        assert!(error.message().contains("cannot execute yet"));
+    }
+
+    #[test]
+    fn async_load_slot_rejects_a_decimal_result() {
+        let mut module = aster_compiler::compile(
+            "public int Compute() { return 1; } \
+             public async Task<int> Calculate() { int value = 5; int result = await Task.Run(Compute); return value + result; }",
+        )
+        .expect("source compiles")
+        .mir;
+        for function in &mut module.functions {
+            for block in &mut function.blocks {
+                for instruction in &mut block.instructions {
+                    if let mir::Instruction::CallIntrinsic {
+                        intrinsic: mir::Intrinsic::AsyncLoadSlot,
+                        return_type,
+                        ..
+                    } = instruction
+                    {
+                        *return_type = mir::Type::Decimal;
+                    }
+                }
+            }
+        }
+
+        let error = validate_module(&module)
+            .expect_err("loading a decimal async frame slot must be rejected");
+        assert!(error.message().contains("cannot execute yet"));
+    }
+
+    /// Isolates the `is_worker_transferable` shape check itself (as opposed
+    /// to the earlier, more general `decimal`-anywhere-in-MIR rejection
+    /// exercised above): `string` is backend-executable (a valid MIR value
+    /// type, passes `validate_operand` cleanly) but is not worker-
+    /// transferable, so only the `AsyncStoreSlot` shape check can catch it.
+    #[test]
+    fn async_store_slot_rejects_a_string_value() {
+        let mut module = aster_compiler::compile(
+            "public int Compute() { return 1; } \
+             public async Task<int> Calculate() { int value = 5; int result = await Task.Run(Compute); return value + result; }",
+        )
+        .expect("source compiles")
+        .mir;
+        for function in &mut module.functions {
+            for block in &mut function.blocks {
+                for instruction in &mut block.instructions {
+                    if let mir::Instruction::CallIntrinsic {
+                        intrinsic: mir::Intrinsic::AsyncStoreSlot,
+                        arguments,
+                        ..
+                    } = instruction
+                    {
+                        arguments[2].type_ = mir::Type::String;
+                    }
+                }
+            }
+        }
+
+        let error = validate_module(&module)
+            .expect_err("a string async frame slot must be rejected (arena identity)");
+        assert!(error.message().contains("malformed AsyncStoreSlot"));
     }
 }

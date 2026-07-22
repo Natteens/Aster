@@ -262,3 +262,35 @@ fn inferred_scalar_local_before_await_is_allowed() {
          public async Task<int> Calculate() { var number = 10; int result = await Task.Run(Compute); return number + result; }",
     );
 }
+
+#[test]
+fn decimal_local_before_await_is_rejected() {
+    // `decimal` is not a reference type (so the reference-local rule alone
+    // would miss it), but it still has no worker-transferable ABI, so it
+    // must not be allowed to persist across the suspension either.
+    assert_error(
+        "public int Compute() { return 1; } \
+         public async Task<int> Calculate() { decimal price = 1.5m; int result = await Task.Run(Compute); return result; }",
+        "a `decimal` local cannot be declared before `await`",
+    );
+}
+
+#[test]
+fn enum_local_before_await_is_rejected() {
+    assert_error(
+        "public enum Color { Red, Green, Blue } \
+         public int Compute() { return 1; } \
+         public async Task<int> Calculate() { Color color = Color.Red; int result = await Task.Run(Compute); return result; }",
+        "local cannot be declared before `await`",
+    );
+}
+
+#[test]
+fn struct_local_before_await_is_rejected() {
+    assert_error(
+        "public struct Point { public int x; public int y; } \
+         public int Compute() { return 1; } \
+         public async Task<int> Calculate() { Point p = Point { x: 1, y: 2 }; int result = await Task.Run(Compute); return result; }",
+        "local cannot be declared before `await`",
+    );
+}

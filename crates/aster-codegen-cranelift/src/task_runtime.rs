@@ -802,6 +802,37 @@ mod tests {
     }
 
     #[test]
+    fn a_move_next_step_returning_an_invalid_status_is_a_controlled_error() {
+        // `MoveNext` only ever legitimately returns `0` (pending) or `1`
+        // (completed); anything else can only come from adulterated MIR or a
+        // corrupted handle, and must resolve the task with a controlled
+        // error rather than being silently accepted as one of the two valid
+        // states.
+        let module = compile("public int Compute() { return 1; }");
+        let move_next = module.functions[0].symbol;
+        let mut runtime = TaskRuntime::new(&Arc::new(module), 1).expect("runtime starts");
+        let handle = runtime
+            .async_spawn(move_next, 0)
+            .expect("async task registers");
+
+        runtime.apply_move_next(
+            handle,
+            Ok((ExecutionValue::Int(42), MemoryStats::default())),
+        );
+
+        let task = runtime
+            .async_tasks
+            .get(&handle)
+            .expect("the task is still registered");
+        let resolved = task
+            .resolved
+            .clone()
+            .expect("an invalid status must resolve the task, not leave it pending");
+        let error = resolved.expect_err("an invalid status must be a controlled error");
+        assert!(error.message().contains("invalid status"));
+    }
+
+    #[test]
     fn waiting_twice_on_the_same_plain_id_returns_the_same_outcome() {
         let module = compile("public int Compute() { return 42; }");
         let symbol = module

@@ -1,5 +1,5 @@
 use super::{
-    Analyzer, Callable, Diagnostic, Dispatch, Expression, ExpressionKind, ResolvedCall,
+    Analyzer, Callable, Diagnostic, Dispatch, Expression, ExpressionKind, Primitive, ResolvedCall,
     ResolvedEnumCase, ResolvedParallelFor, ResolvedParallelForEach, ResolvedTaskRun, Signature,
     Span, Type, TypeKind, Visibility,
 };
@@ -1000,27 +1000,23 @@ pub(super) fn is_parallel_for_each_callee(callee: &Expression) -> bool {
     )
 }
 
-/// Whether a `Task<T>` result of type `type_` can cross a worker boundary as
-/// owned data in this version. Excludes `void` (no `Task<void>` yet) and
-/// every type with arena identity (`string`, arrays, classes, interfaces,
-/// enums, structs, and `Task<T>` itself).
+/// Whether a value of type `type_` can cross an Aster worker boundary
+/// (`Task.Run`, `Parallel.For`/`ForEach`, or an async frame slot) as owned
+/// data in this version.
+///
+/// Derives from `aster_types::Primitive::is_worker_transferable` rather than
+/// maintaining a second hand-written list: only types with a primitive
+/// behind them (`Type::primitive`) are even candidates, so `void`, arrays,
+/// classes, interfaces, enums, structs, and `Task<T>` itself are excluded
+/// automatically (`primitive()` returns `None` for all of them) rather than
+/// by name here. Among primitives, `decimal` and `string` are excluded
+/// because neither has a fixed-width, arena-free ABI yet (see
+/// `Primitive::is_worker_transferable`), even though both are otherwise
+/// recognized, ordinary value types.
 pub(super) fn transferable(type_: &Type) -> bool {
-    matches!(
-        type_,
-        Type::Bool
-            | Type::SByte
-            | Type::Byte
-            | Type::Short
-            | Type::UShort
-            | Type::Int
-            | Type::UInt
-            | Type::Long
-            | Type::ULong
-            | Type::Float
-            | Type::Double
-            | Type::Decimal
-            | Type::Char
-    )
+    type_
+        .primitive()
+        .is_some_and(Primitive::is_worker_transferable)
 }
 
 fn logging_level(callee: &Expression) -> Option<LogLevel<'_>> {

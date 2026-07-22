@@ -48,16 +48,32 @@ impl Analyzer<'_> {
                     // Conservative v1 rule: a reference-typed local (of any
                     // inferred or explicit type) declared before the single
                     // `await` cannot cross the suspension.
-                    if self.async_state == super::AsyncAnalysisState::BeforeAwait
-                        && super::declarations::is_reference_type(&binding.type_)
-                    {
-                        self.diagnostics.push(
-                            Diagnostic::error(
-                                "a reference-typed local cannot be declared before `await` in this version",
-                                variable.span,
-                            )
-                            .with_help("only scalar locals may cross an `await`"),
-                        );
+                    if self.async_state == super::AsyncAnalysisState::BeforeAwait {
+                        if super::declarations::is_reference_type(&binding.type_) {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    "a reference-typed local cannot be declared before `await` in this version",
+                                    variable.span,
+                                )
+                                .with_help("only scalar locals may cross an `await`"),
+                            );
+                        } else if binding.type_ != Type::Unknown
+                            && !super::calls::transferable(&binding.type_)
+                        {
+                            // Not a reference type (caught above), but still not
+                            // worker-transferable: `decimal` (no backend ABI yet)
+                            // or an enum/struct value type.
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    format!(
+                                        "a `{}` local cannot be declared before `await` in this version",
+                                        binding.type_.display()
+                                    ),
+                                    variable.span,
+                                )
+                                .with_help("only scalar locals may cross an `await`"),
+                            );
+                        }
                     }
                     self.declare(&variable.name, binding);
                 }

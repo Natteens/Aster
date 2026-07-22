@@ -169,6 +169,153 @@ fn a_non_transferable_return_type_is_rejected() {
 }
 
 #[test]
+fn a_decimal_return_type_is_rejected() {
+    // `decimal` is semantically a numeric/scalar type (`Primitive::is_numeric`),
+    // but has no backend ABI yet, so it must not cross a worker boundary
+    // merely because it "looks scalar".
+    let errors = compile_errors(
+        r"
+        public decimal Compute() { return 1.5m; }
+        public int Main() {
+            Task<decimal> task = Task.Run(Compute);
+            return 0;
+        }
+        ",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("cross a worker boundary")),
+        "expected the non-transferable-result diagnostic for `decimal`, got {errors:?}"
+    );
+}
+
+#[test]
+fn a_class_return_type_is_rejected() {
+    let errors = compile_errors(
+        r"
+        public class Box { public Box() {} }
+        public Box Make() { return new Box(); }
+        public int Main() {
+            Task<Box> task = Task.Run(Make);
+            return 0;
+        }
+        ",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("cross a worker boundary")),
+        "expected the non-transferable-result diagnostic for a class, got {errors:?}"
+    );
+}
+
+#[test]
+fn an_interface_return_type_is_rejected() {
+    let errors = compile_errors(
+        r"
+        public interface IBox { int Get(); }
+        public class Box : IBox { public Box() {} public int Get() { return 1; } }
+        public IBox Make() { return new Box(); }
+        public int Main() {
+            Task<IBox> task = Task.Run(Make);
+            return 0;
+        }
+        ",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("cross a worker boundary")),
+        "expected the non-transferable-result diagnostic for an interface, got {errors:?}"
+    );
+}
+
+#[test]
+fn an_enum_return_type_is_rejected() {
+    let errors = compile_errors(
+        r"
+        public enum Color { Red, Green, Blue }
+        public Color Make() { return Color.Red; }
+        public int Main() {
+            Task<Color> task = Task.Run(Make);
+            return 0;
+        }
+        ",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("cross a worker boundary")),
+        "expected the non-transferable-result diagnostic for an enum, got {errors:?}"
+    );
+}
+
+#[test]
+fn a_struct_return_type_is_rejected() {
+    let errors = compile_errors(
+        r"
+        public struct Point { public int x; public int y; }
+        public Point Make() { return Point { x: 1, y: 2 }; }
+        public int Main() {
+            Task<Point> task = Task.Run(Make);
+            return 0;
+        }
+        ",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("cross a worker boundary")),
+        "expected the non-transferable-result diagnostic for a struct, got {errors:?}"
+    );
+}
+
+#[test]
+fn an_array_return_type_is_rejected() {
+    let errors = compile_errors(
+        r"
+        public int[] Make() { return [1, 2, 3]; }
+        public int Main() {
+            Task<int[]> task = Task.Run(Make);
+            return 0;
+        }
+        ",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("cross a worker boundary")),
+        "expected the non-transferable-result diagnostic for an array, got {errors:?}"
+    );
+}
+
+#[test]
+fn a_nested_task_return_type_is_rejected() {
+    // A zero-parameter static function whose declared return type is itself
+    // `Task<T>` must be rejected by the transferability gate specifically
+    // (`Task<Task<int>>` is not worker-transferable), independent of the
+    // separate nested-concurrency diagnostic this shape also triggers
+    // because `Wrapper`'s own body uses `Task.Run`.
+    let errors = compile_errors(
+        r"
+        public int Compute() { return 1; }
+        public Task<int> Wrapper() { return Task.Run(Compute); }
+        public int Main() {
+            Task<int> task = Task.Run(Wrapper);
+            return 0;
+        }
+        ",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("cross a worker boundary")),
+        "expected the non-transferable-result diagnostic for Task<Task<int>>, got {errors:?}"
+    );
+}
+
+#[test]
 fn task_int_is_incompatible_with_task_string() {
     let errors = compile_errors(
         r"
