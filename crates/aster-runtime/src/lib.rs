@@ -13,6 +13,7 @@
 mod arena;
 pub mod context;
 pub mod io;
+pub mod io_error;
 pub mod log;
 mod math;
 mod object;
@@ -29,6 +30,7 @@ pub use io::{
     aster_rt_io_read_line, aster_rt_io_read_line_temporary, aster_rt_io_write,
     aster_rt_io_write_line,
 };
+pub use io_error::{PortableIoError, PortableIoErrorKind, classify_io_error};
 pub use log::LogLevel;
 pub use registry::{RuntimeFunction, RuntimeSignature, RuntimeType, runtime_functions};
 pub use string::{AsterStrHeader, decode_str, encode_str};

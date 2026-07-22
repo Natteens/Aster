@@ -210,7 +210,30 @@ impl FunctionLowerer {
                 ),
                 element_type: expression.type_.clone(),
             },
-            _ => panic!("validated assignment has a place expression"),
+            // Any other expression (e.g. a call or `List<T>.Get` result) has
+            // no stable memory location of its own. Reads reach this through
+            // `place_operand` for a `Member`/`Index` expression whose base
+            // is such a value (e.g. `list.Get(0).Field` used in a `switch`
+            // discriminant): perfectly valid to read, just not already
+            // addressable. Materialize it into a fresh temporary local and
+            // use that as the place. (Writes reaching this arm assign into
+            // that same temporary, which is then discarded -- matching the
+            // read's semantics for a rvalue base; this fix does not add
+            // lvalue validation for assignment targets, a separate concern.)
+            _ => {
+                let value = self
+                    .lower_expression(expression)
+                    .expect("validated expression produces a value");
+                let local = self.new_temporary(expression.type_.clone());
+                self.assign(
+                    mir::Place::Local(local),
+                    mir::Rvalue {
+                        type_: expression.type_.clone(),
+                        kind: mir::RvalueKind::Use(value),
+                    },
+                );
+                mir::Place::Local(local)
+            }
         }
     }
 

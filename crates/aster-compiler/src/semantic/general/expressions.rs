@@ -1017,6 +1017,31 @@ impl Analyzer<'_> {
         Type::Unknown
     }
 
+    /// Whether `expression` names a real, observably-mutable memory location
+    /// rather than a temporary value. A local/parameter/`this` field, any
+    /// array/list index (arrays and lists are always heap references, so
+    /// indexing one is valid regardless of how the reference itself was
+    /// obtained -- unchanged, existing behavior), and a field reached
+    /// through a class/interface reference (a class is a shared reference:
+    /// mutating a field through *any* reference to it, even one just
+    /// returned by a call, is observable) all qualify. A field of a
+    /// struct-typed (`Type::User`) base only qualifies when that base is
+    /// itself assignable this same way; a bare call, literal, or other pure
+    /// rvalue is not, because mutating a copy about to be discarded has no
+    /// observable effect (see `mir_lowering::places`'s `place()`, which
+    /// materializes such reads into a temporary rather than writing back to
+    /// anything).
+    fn is_assignable_place(&mut self, expression: &Expression) -> bool {
+        match &expression.kind {
+            ExpressionKind::Name(_) | ExpressionKind::This | ExpressionKind::Index { .. } => true,
+            ExpressionKind::Member { object, .. } => {
+                matches!(self.expression(object), Type::Class(_) | Type::Interface(_))
+                    || self.is_assignable_place(object)
+            }
+            _ => false,
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn assignment(
         &mut self,
@@ -1145,6 +1170,13 @@ impl Analyzer<'_> {
             return result;
         }
         let ExpressionKind::Name(name) = &target.kind else {
+            if !self.is_assignable_place(target) {
+                self.diagnostics.push(
+                    Diagnostic::error("cannot assign to a field of a temporary value", target.span)
+                        .with_help("store the value in a variable first, then assign to its field"),
+                );
+                return Type::Unknown;
+            }
             let target_type = self.expression(target);
             return self.assignment_types(operator, target_type, &value_type, value, span);
         };

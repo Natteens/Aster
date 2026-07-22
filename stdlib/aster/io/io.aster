@@ -2,6 +2,30 @@ namespace aster.io;
 
 using aster.core;
 
+/// Portable, stable category of a filesystem error. Deliberately coarse:
+/// operations added in later milestones (M2C/M2D) classify into these
+/// cases; this milestone only declares the shape.
+public enum IOErrorKind
+{
+    NotFound,
+    PermissionDenied,
+    AlreadyExists,
+    InvalidPath,
+    InvalidUtf8,
+    NotFile,
+    NotDirectory,
+    LimitExceeded,
+    Other,
+}
+
+/// Portable filesystem error: a stable category plus the native OS code
+/// when one exists (`0` otherwise). Carries no message, path, or handle.
+public struct IOError
+{
+    public IOErrorKind Kind;
+    public int OsCode;
+}
+
 public void Write(string value)
 {
 }

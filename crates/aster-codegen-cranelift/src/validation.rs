@@ -116,9 +116,15 @@ pub(super) fn validate_module(module: &mir::Module) -> Result<(), BackendError> 
         .iter()
         .map(|definition| (definition.symbol, definition))
         .collect::<HashMap<_, _>>();
+    let struct_definitions = module
+        .structs
+        .iter()
+        .map(|definition| (definition.symbol, definition))
+        .collect::<HashMap<_, _>>();
     for function in &module.functions {
         validate_string_try_parse_targets(function, &enum_definitions)?;
         validate_enum_construct_shapes(function, &enum_definitions)?;
+        validate_struct_literal_shapes(function, &struct_definitions)?;
     }
     validate_no_console_io_in_workers(module)?;
     Ok(())
@@ -271,6 +277,60 @@ fn validate_enum_construct_shapes(
                     return Err(BackendError::new(format!(
                         "function `{}` has an `EnumConstruct` for case `{}` with a field that does not match its declaration",
                         function.name, matched.name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every `Aggregate` (a struct literal, e.g. `IOError { Kind: ..., OsCode:
+/// ... }`) must name a `Type::User` struct that actually exists, with
+/// exactly the fields that struct declares, by symbol, order, and type.
+/// Mirrors [`validate_enum_construct_shapes`]: previously `Aggregate`'s only
+/// check was that each field operand was itself well-formed
+/// (`validate_rvalue`), never that the *set* of fields matched the struct's
+/// real declaration, so adulterated MIR reached Cranelift's own verifier
+/// instead of a controlled `BackendError`.
+fn validate_struct_literal_shapes(
+    function: &mir::Function,
+    struct_definitions: &HashMap<mir::SymbolId, &mir::StructDefinition>,
+) -> Result<(), BackendError> {
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            let mir::Instruction::Assign { value, .. } = instruction else {
+                continue;
+            };
+            let mir::RvalueKind::Aggregate(fields) = &value.kind else {
+                continue;
+            };
+            let mir::Type::User(symbol) = &value.type_ else {
+                return Err(BackendError::new(format!(
+                    "function `{}` has an `Aggregate` whose declared type is not a struct",
+                    function.name
+                )));
+            };
+            let definition = struct_definitions.get(symbol).ok_or_else(|| {
+                BackendError::new(format!(
+                    "function `{}` has an `Aggregate` for an unknown struct type",
+                    function.name
+                ))
+            })?;
+            if fields.len() != definition.fields.len() {
+                return Err(BackendError::new(format!(
+                    "function `{}` has an `Aggregate` for `{}` with {} field(s), expected {}",
+                    function.name,
+                    definition.name,
+                    fields.len(),
+                    definition.fields.len()
+                )));
+            }
+            for (provided, expected) in fields.iter().zip(&definition.fields) {
+                if provided.field != expected.symbol || provided.value.type_ != expected.type_ {
+                    return Err(BackendError::new(format!(
+                        "function `{}` has an `Aggregate` for `{}` with a field that does not match its declaration",
+                        function.name, definition.name
                     )));
                 }
             }
