@@ -98,6 +98,29 @@ pub(super) struct TaskRuntime {
     next_token: CompletionToken,
 }
 
+/// Owns the async driver while a pump is active and restores it even if a host
+/// panic unwinds through the pump. The raw pointer follows `pump`'s exclusive,
+/// stack-bounded runtime contract.
+struct DriverRestore {
+    runtime: *mut TaskRuntime,
+    driver: Option<PreparedProgram>,
+}
+
+impl Drop for DriverRestore {
+    fn drop(&mut self) {
+        let Some(driver) = self.driver.take() else {
+            return;
+        };
+        // SAFETY: `DriverRestore` is created only inside `TaskRuntime::pump`,
+        // whose contract keeps `runtime` live and exclusively owned until this
+        // guard is dropped, including during unwinding.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*self.runtime).driver = Some(driver);
+        }
+    }
+}
+
 impl TaskRuntime {
     pub(super) fn new(
         module: &Arc<mir::Module>,
@@ -119,18 +142,30 @@ impl TaskRuntime {
         })
     }
 
-    fn fresh_id(&mut self) -> TaskHandleId {
+    fn fresh_id(&mut self) -> Result<TaskHandleId, BackendError> {
         let id = TaskHandleId(self.next_id);
-        self.next_id = self.next_id.wrapping_add(1);
-        id
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| BackendError::new("task handle id space is exhausted"))?;
+        Ok(id)
+    }
+
+    fn fresh_token(&mut self) -> Result<CompletionToken, BackendError> {
+        let token = self.next_token;
+        self.next_token = self
+            .next_token
+            .checked_add(1)
+            .ok_or_else(|| BackendError::new("async completion token space is exhausted"))?;
+        Ok(token)
     }
 
     // --- plain `Task.Run` / `Wait` (unchanged behavior) -------------------
 
     /// `Task.Run(function)`: submit one plain task and return its handle.
     pub(super) fn run(&mut self, symbol: mir::SymbolId) -> Result<TaskHandleId, BackendError> {
+        let id = self.fresh_id()?;
         let handle = self.pool.submit(symbol, false, None)?;
-        let id = self.fresh_id();
         self.entries.insert(id, TaskEntry::Pending(handle));
         Ok(id)
     }
@@ -161,8 +196,8 @@ impl TaskRuntime {
         &mut self,
         move_next: mir::SymbolId,
         slot_count: usize,
-    ) -> TaskHandleId {
-        let id = self.fresh_id();
+    ) -> Result<TaskHandleId, BackendError> {
+        let id = self.fresh_id()?;
         self.async_tasks.insert(
             id,
             AsyncTask {
@@ -176,17 +211,39 @@ impl TaskRuntime {
                 resolved: None,
             },
         );
-        id
+        Ok(id)
     }
 
-    pub(super) fn async_state(&self, id: TaskHandleId) -> i32 {
-        self.async_tasks.get(&id).map_or(0, |task| task.state)
-    }
-
-    pub(super) fn async_set_state(&mut self, id: TaskHandleId, state: i32) {
-        if let Some(task) = self.async_tasks.get_mut(&id) {
-            task.state = state;
+    pub(super) fn async_state(&self, id: TaskHandleId) -> Result<i32, BackendError> {
+        let task = self
+            .async_tasks
+            .get(&id)
+            .ok_or_else(|| BackendError::new("async state received an unknown task handle"))?;
+        if !matches!(task.state, 0 | 1) {
+            return Err(BackendError::new(format!(
+                "async task has invalid state {}",
+                task.state
+            )));
         }
+        Ok(task.state)
+    }
+
+    pub(super) fn async_set_state(
+        &mut self,
+        id: TaskHandleId,
+        state: i32,
+    ) -> Result<(), BackendError> {
+        let task = self.async_tasks.get_mut(&id).ok_or_else(|| {
+            BackendError::new("async state update received an unknown task handle")
+        })?;
+        if task.resolved.is_some() || task.state != 0 || state != 1 {
+            return Err(BackendError::new(format!(
+                "invalid async state transition {} -> {state}",
+                task.state
+            )));
+        }
+        task.state = state;
+        Ok(())
     }
 
     pub(super) fn async_store_slot(
@@ -194,60 +251,123 @@ impl TaskRuntime {
         id: TaskHandleId,
         index: usize,
         value: ExecutionValue,
-    ) {
-        if let Some(task) = self.async_tasks.get_mut(&id)
-            && let Some(slot) = task.frame.get_mut(index)
-        {
-            *slot = Some(value);
+    ) -> Result<(), BackendError> {
+        let task = self
+            .async_tasks
+            .get_mut(&id)
+            .ok_or_else(|| BackendError::new("async slot store received an unknown task handle"))?;
+        if task.resolved.is_some() || task.state != 0 {
+            return Err(BackendError::new(
+                "async slot store is only valid in state 0",
+            ));
         }
+        let slot = task.frame.get_mut(index).ok_or_else(|| {
+            BackendError::new(format!("async frame slot {index} is out of range"))
+        })?;
+        if slot.is_some() {
+            return Err(BackendError::new(format!(
+                "async frame slot {index} was stored more than once"
+            )));
+        }
+        *slot = Some(value);
+        Ok(())
     }
 
-    pub(super) fn async_load_slot(&self, id: TaskHandleId, index: usize) -> i64 {
-        self.async_tasks
+    pub(super) fn async_load_slot(
+        &self,
+        id: TaskHandleId,
+        index: usize,
+    ) -> Result<i64, BackendError> {
+        let task = self
+            .async_tasks
             .get(&id)
-            .and_then(|task| task.frame.get(index))
-            .and_then(|slot| slot.as_ref())
-            .map_or(0, scalar::to_bits)
+            .ok_or_else(|| BackendError::new("async slot load received an unknown task handle"))?;
+        if task.resolved.is_some() || task.state != 1 {
+            return Err(BackendError::new(
+                "async slot load is only valid in state 1",
+            ));
+        }
+        let value = task
+            .frame
+            .get(index)
+            .ok_or_else(|| BackendError::new(format!("async frame slot {index} is out of range")))?
+            .as_ref()
+            .ok_or_else(|| {
+                BackendError::new(format!("async frame slot {index} is uninitialized"))
+            })?;
+        Ok(scalar::to_bits(value))
     }
 
     /// `AsyncSpawnInner`: submit the awaited `Task.Run` target with a fresh
     /// completion token bound to this async task. Only awaited inners carry a
     /// token; plain tasks and Parallel chunks never do.
-    pub(super) fn async_spawn_inner(&mut self, id: TaskHandleId, inner: mir::SymbolId) {
-        let token = self.next_token;
-        self.next_token = self.next_token.wrapping_add(1);
-        let submission =
-            self.pool
-                .submit(inner, false, Some((Arc::clone(&self.completion), token)));
-        match submission {
-            Ok(handle) => {
-                if let Some(task) = self.async_tasks.get_mut(&id) {
-                    task.inner = Some(handle);
-                    task.inner_token = Some(token);
-                }
-                self.token_to_async.insert(token, id);
-            }
-            Err(error) => {
-                // The pool is shut down: resolve the async task as a controlled
-                // failure now rather than leaving it forever suspended.
-                if let Some(task) = self.async_tasks.get_mut(&id) {
-                    task.resolved = Some(Err(error));
-                }
-            }
+    pub(super) fn async_spawn_inner(
+        &mut self,
+        id: TaskHandleId,
+        inner: mir::SymbolId,
+    ) -> Result<(), BackendError> {
+        let task = self.async_tasks.get(&id).ok_or_else(|| {
+            BackendError::new("async inner spawn received an unknown task handle")
+        })?;
+        if task.resolved.is_some()
+            || task.state != 0
+            || task.inner.is_some()
+            || task.inner_token.is_some()
+        {
+            return Err(BackendError::new(
+                "async task attempted to spawn more than one awaited inner task",
+            ));
         }
+        let token = self.fresh_token()?;
+        let handle = self
+            .pool
+            .submit(inner, false, Some((Arc::clone(&self.completion), token)))?;
+        let task = self
+            .async_tasks
+            .get_mut(&id)
+            .ok_or_else(|| BackendError::new("async task disappeared during inner spawn"))?;
+        task.inner = Some(handle);
+        task.inner_token = Some(token);
+        self.token_to_async.insert(token, id);
+        Ok(())
     }
 
-    pub(super) fn async_await_result(&self, id: TaskHandleId) -> i64 {
-        self.async_tasks
-            .get(&id)
-            .and_then(|task| task.inner_result.as_ref())
-            .map_or(0, scalar::to_bits)
+    pub(super) fn async_await_result(&self, id: TaskHandleId) -> Result<i64, BackendError> {
+        let task = self.async_tasks.get(&id).ok_or_else(|| {
+            BackendError::new("async await result received an unknown task handle")
+        })?;
+        if task.resolved.is_some() || task.state != 1 {
+            return Err(BackendError::new(
+                "async await result is only available while resuming state 1",
+            ));
+        }
+        task.inner_result
+            .as_ref()
+            .map(scalar::to_bits)
+            .ok_or_else(|| BackendError::new("async awaited result is not ready"))
     }
 
-    pub(super) fn async_set_result(&mut self, id: TaskHandleId, value: ExecutionValue) {
-        if let Some(task) = self.async_tasks.get_mut(&id) {
-            task.candidate = Some(value);
+    pub(super) fn async_set_result(
+        &mut self,
+        id: TaskHandleId,
+        value: ExecutionValue,
+    ) -> Result<(), BackendError> {
+        let task = self
+            .async_tasks
+            .get_mut(&id)
+            .ok_or_else(|| BackendError::new("async result received an unknown task handle"))?;
+        if task.resolved.is_some() || task.state != 1 {
+            return Err(BackendError::new(
+                "async result can only be published from state 1",
+            ));
         }
+        if task.candidate.is_some() {
+            return Err(BackendError::new(
+                "async result was published more than once",
+            ));
+        }
+        task.candidate = Some(value);
+        Ok(())
     }
 
     // --- the pump ---------------------------------------------------------
@@ -275,13 +395,17 @@ impl TaskRuntime {
                 "the async pump cannot be re-entered (nested pumping is not supported)",
             ));
         };
-        // SAFETY: same contract; each reborrow inside is short-lived and never
-        // spans a driver step.
-        let outcome = unsafe { Self::pump_loop(runtime, &driver, target) };
-        // SAFETY: restore ownership on every path so the runtime stays usable.
-        unsafe {
-            (*runtime).driver = Some(driver);
-        }
+        let guard = DriverRestore {
+            runtime,
+            driver: Some(driver),
+        };
+        let outcome = match guard.driver.as_ref() {
+            // SAFETY: same contract; each reborrow inside is short-lived and
+            // never spans a driver step.
+            Some(driver) => unsafe { Self::pump_loop(runtime, driver, target) },
+            None => Err(BackendError::new("the async pump lost its driver")),
+        };
+        drop(guard);
         outcome
     }
 
@@ -298,7 +422,7 @@ impl TaskRuntime {
         // SAFETY: short reborrow, immediately dropped.
         let completion = Arc::clone(unsafe { &(*runtime).completion });
         // SAFETY: short reborrow, immediately dropped.
-        unsafe { (*runtime).seed_ready(target) };
+        unsafe { (*runtime).seed_ready(target) }?;
         loop {
             // SAFETY: short reborrow, immediately dropped.
             if let Some(outcome) = unsafe { (*runtime).resolved_outcome(target) } {
@@ -321,7 +445,14 @@ impl TaskRuntime {
             match completion.pop() {
                 Some(token) => {
                     // SAFETY: short reborrow, immediately dropped.
-                    unsafe { (*runtime).on_completion(token) };
+                    let completion = unsafe { (*runtime).on_completion(token) };
+                    if let Err(error) = completion {
+                        // SAFETY: short reborrow, immediately dropped. Cache
+                        // the failure so a repeated Wait cannot block after the
+                        // bad token has already been consumed.
+                        unsafe { (*runtime).resolve_error(target, error.clone()) };
+                        return Err(error);
+                    }
                 }
                 None => {
                     return Err(BackendError::new(
@@ -333,14 +464,15 @@ impl TaskRuntime {
     }
 
     /// Queue `target`'s first `MoveNext` step if it has not started yet.
-    fn seed_ready(&mut self, target: TaskHandleId) {
-        if let Some(task) = self.async_tasks.get(&target)
-            && task.resolved.is_none()
-            && task.state == 0
-            && !self.ready.contains(&target)
-        {
+    fn seed_ready(&mut self, target: TaskHandleId) -> Result<(), BackendError> {
+        let task = self
+            .async_tasks
+            .get(&target)
+            .ok_or_else(|| BackendError::new("async pump received an unknown task handle"))?;
+        if task.resolved.is_none() && task.state == 0 && !self.ready.contains(&target) {
             self.ready.push_back(target);
         }
+        Ok(())
     }
 
     fn pop_ready(&mut self) -> Option<(mir::SymbolId, TaskHandleId)> {
@@ -359,6 +491,12 @@ impl TaskRuntime {
         self.async_tasks.get(&target)?.resolved.clone()
     }
 
+    fn resolve_error(&mut self, target: TaskHandleId, error: BackendError) {
+        if let Some(task) = self.async_tasks.get_mut(&target) {
+            task.resolved = Some(Err(error));
+        }
+    }
+
     /// Apply one completed `MoveNext` step. A controlled error (including any
     /// `context.fail`, which makes `invoke` return `Err`) always wins over a
     /// candidate result, so a failure and a stored result never double-resolve.
@@ -372,12 +510,25 @@ impl TaskRuntime {
         };
         match step {
             Err(error) => task.resolved = Some(Err(error)),
-            Ok((ExecutionValue::Int(PENDING), _)) => {}
+            Ok((ExecutionValue::Int(PENDING), _)) => {
+                if task.state != 1 || task.inner.is_none() || task.inner_token.is_none() {
+                    task.resolved = Some(Err(BackendError::new(
+                        "an async task suspended without a registered awaited operation",
+                    )));
+                }
+            }
             Ok((ExecutionValue::Int(COMPLETED), _)) => {
-                let outcome = match task.candidate.clone() {
-                    Some(value) => Ok(TaskOutcome::Completed(value, MemoryStats::default())),
-                    None => Err(BackendError::new(
-                        "an async task completed without producing a result",
+                let outcome = match (
+                    task.state,
+                    task.inner.is_none(),
+                    task.inner_token.is_none(),
+                    task.candidate.clone(),
+                ) {
+                    (1, true, true, Some(value)) => {
+                        Ok(TaskOutcome::Completed(value, MemoryStats::default()))
+                    }
+                    _ => Err(BackendError::new(
+                        "an async task completed from an invalid state or without producing a result",
                     )),
                 };
                 task.resolved = Some(outcome);
@@ -392,14 +543,24 @@ impl TaskRuntime {
 
     /// Handle one signalled completion token: receive the inner task's cached
     /// outcome and either fail the async task (inner error) or make it ready
-    /// to resume (inner success). An unknown token is ignored, never a crash.
-    fn on_completion(&mut self, token: CompletionToken) {
+    /// to resume (inner success). Unknown or stale tokens are controlled
+    /// runtime errors so the pump cannot silently lose its only wakeup.
+    fn on_completion(&mut self, token: CompletionToken) -> Result<(), BackendError> {
         let Some(handle) = self.token_to_async.remove(&token) else {
-            return;
+            return Err(BackendError::new(format!(
+                "async completion queue produced unknown token {token}"
+            )));
         };
         let Some(task) = self.async_tasks.get_mut(&handle) else {
-            return;
+            return Err(BackendError::new(
+                "async completion token referenced a missing task",
+            ));
         };
+        if task.inner_token != Some(token) {
+            return Err(BackendError::new(
+                "async completion token did not match the suspended task",
+            ));
+        }
         task.inner_token = None;
         let outcome = match task.inner.take() {
             Some(inner) => inner.join(),
@@ -416,6 +577,7 @@ impl TaskRuntime {
                 task.resolved = Some(Err(error));
             }
         }
+        Ok(())
     }
 
     // --- Parallel ---------------------------------------------------------
@@ -435,9 +597,9 @@ impl TaskRuntime {
             )));
         }
         let total = i64::from(end) - i64::from(start);
-        let Ok(total) = usize::try_from(total) else {
-            return Ok(());
-        };
+        let total = usize::try_from(total).map_err(|_| {
+            BackendError::new("Parallel.For range exceeds the addressable iteration count")
+        })?;
         if total == 0 {
             return Ok(());
         }
@@ -445,14 +607,28 @@ impl TaskRuntime {
         let mut receivers = Vec::with_capacity(boundaries.len());
         let mut cursor = i64::from(start);
         for length in boundaries {
-            let chunk_start = i32::try_from(cursor).expect("chunk start fits i32");
-            cursor += i64::try_from(length).expect("chunk length fits i64");
-            let chunk_end = i32::try_from(cursor).expect("chunk end fits i32");
-            receivers.push(self.pool.submit_parallel(JobKind::ForChunk {
+            let chunk_start = i32::try_from(cursor)
+                .map_err(|_| BackendError::new("Parallel.For chunk start exceeds `int`"))?;
+            cursor =
+                cursor
+                    .checked_add(i64::try_from(length).map_err(|_| {
+                        BackendError::new("Parallel.For chunk length exceeds `long`")
+                    })?)
+                    .ok_or_else(|| BackendError::new("Parallel.For chunk boundary overflow"))?;
+            let chunk_end = i32::try_from(cursor)
+                .map_err(|_| BackendError::new("Parallel.For chunk end exceeds `int`"))?;
+            let submission = self.pool.submit_parallel(JobKind::ForChunk {
                 symbol: body,
                 start: chunk_start,
                 end: chunk_end,
-            })?);
+            });
+            match submission {
+                Ok(receiver) => receivers.push(receiver),
+                Err(error) => {
+                    let _ = collect_chunks(receivers);
+                    return Err(error);
+                }
+            }
         }
         collect_chunks(receivers)
     }
@@ -474,11 +650,18 @@ impl TaskRuntime {
         for length in boundaries {
             let rest = values.split_off(length);
             let chunk_values = std::mem::replace(&mut values, rest);
-            receivers.push(self.pool.submit_parallel(JobKind::ForEachChunk {
+            let submission = self.pool.submit_parallel(JobKind::ForEachChunk {
                 symbol: body,
                 base,
                 values: chunk_values,
-            })?);
+            });
+            match submission {
+                Ok(receiver) => receivers.push(receiver),
+                Err(error) => {
+                    let _ = collect_chunks(receivers);
+                    return Err(error);
+                }
+            }
             base += length;
         }
         collect_chunks(receivers)
@@ -515,10 +698,12 @@ fn collect_chunks(
     receivers: Vec<std::sync::mpsc::Receiver<ChunkOutcome>>,
 ) -> Result<(), BackendError> {
     let mut first_error: Option<(i64, BackendError)> = None;
+    let mut disconnected = false;
     for receiver in receivers {
-        let outcome = receiver
-            .recv()
-            .map_err(|_| BackendError::new("a Parallel worker disconnected before finishing"))?;
+        let Ok(outcome) = receiver.recv() else {
+            disconnected = true;
+            continue;
+        };
         if let Some((index, error)) = outcome.first_error {
             if first_error
                 .as_ref()
@@ -530,6 +715,9 @@ fn collect_chunks(
     }
     match first_error {
         Some((_, error)) => Err(error),
+        None if disconnected => Err(BackendError::new(
+            "a Parallel worker disconnected before finishing",
+        )),
         None => Ok(()),
     }
 }
@@ -780,5 +968,88 @@ mod tests {
             "no plain task ever mints a completion token"
         );
         assert!(runtime.token_to_async.is_empty());
+    }
+
+    #[test]
+    fn task_handle_exhaustion_is_controlled_instead_of_wrapping() {
+        let module = compile("public int Compute() { return 1; }");
+        let symbol = module.functions[0].symbol;
+        let mut runtime = TaskRuntime::new(&Arc::new(module), 1).expect("runtime starts");
+        runtime.next_id = u64::MAX;
+
+        let error = runtime.run(symbol).expect_err("id exhaustion must fail");
+        assert!(error.message().contains("id space is exhausted"));
+        assert!(runtime.entries.is_empty());
+    }
+
+    #[test]
+    fn completion_token_exhaustion_is_controlled_instead_of_wrapping() {
+        let module = compile("public int Compute() { return 1; }");
+        let symbol = module.functions[0].symbol;
+        let mut runtime = TaskRuntime::new(&Arc::new(module), 1).expect("runtime starts");
+        let outer = runtime
+            .async_spawn(symbol, 0)
+            .expect("outer async handle is allocated");
+        runtime.next_token = u64::MAX;
+
+        let error = runtime
+            .async_spawn_inner(outer, symbol)
+            .expect_err("token exhaustion must fail");
+        assert!(error.message().contains("token space is exhausted"));
+        assert!(runtime.token_to_async.is_empty());
+    }
+
+    #[test]
+    fn invalid_async_slots_and_state_transitions_are_controlled() {
+        let module = compile("public int Compute() { return 1; }");
+        let symbol = module.functions[0].symbol;
+        let mut runtime = TaskRuntime::new(&Arc::new(module), 1).expect("runtime starts");
+        let outer = runtime
+            .async_spawn(symbol, 0)
+            .expect("outer async handle is allocated");
+
+        assert!(
+            runtime
+                .async_store_slot(outer, 0, ExecutionValue::Int(1))
+                .is_err()
+        );
+        assert!(runtime.async_load_slot(outer, 0).is_err());
+        assert!(runtime.async_set_state(outer, 7).is_err());
+        assert!(runtime.on_completion(99).is_err());
+    }
+
+    #[test]
+    fn driver_guard_restores_the_driver_during_unwind() {
+        let module = compile("public int Compute() { return 1; }");
+        let mut runtime = TaskRuntime::new(&Arc::new(module), 1).expect("runtime starts");
+        let runtime_pointer = std::ptr::from_mut(&mut runtime);
+        let driver = runtime.driver.take().expect("driver is present");
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = DriverRestore {
+                runtime: runtime_pointer,
+                driver: Some(driver),
+            };
+            panic!("simulated host panic while pumping");
+        }));
+
+        assert!(result.is_err());
+        assert!(runtime.driver.is_some());
+    }
+
+    #[test]
+    fn disconnected_chunk_does_not_prevent_draining_later_outcomes() {
+        let (disconnected_tx, disconnected_rx) = mpsc::channel();
+        drop(disconnected_tx);
+        let (logical_tx, logical_rx) = mpsc::channel();
+        logical_tx
+            .send(ChunkOutcome {
+                first_error: Some((7, BackendError::new("later logical failure"))),
+            })
+            .expect("logical outcome is queued");
+
+        let error = collect_chunks(vec![disconnected_rx, logical_rx])
+            .expect_err("all receivers are drained before selection");
+        assert!(error.message().contains("later logical failure"));
     }
 }

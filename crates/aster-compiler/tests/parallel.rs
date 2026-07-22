@@ -139,6 +139,46 @@ fn parallel_for_transitive_nested_concurrency_is_rejected() {
 }
 
 #[test]
+fn an_unrelated_wait_method_does_not_trigger_nested_concurrency() {
+    assert_valid(
+        "public class Probe { public void Wait() { } } \
+         public void Body(int index) { Probe probe = new Probe(); probe.Wait(); } \
+         public int Main() { Parallel.For(0, 1, Body); return 0; }",
+    );
+}
+
+#[test]
+fn sequential_recursion_in_a_parallel_body_remains_valid() {
+    assert_valid(
+        "public void Body(int index) { if (index > 0) { Body(index - 1); } } \
+         public int Main() { Parallel.For(0, 1, Body); return 0; }",
+    );
+}
+
+#[test]
+fn mutual_recursion_reaching_concurrency_is_rejected_without_looping() {
+    assert_error(
+        "public int Inner() { return 1; } \
+         public void First() { Second(); } \
+         public void Second() { First(); Task.Run(Inner).Wait(); } \
+         public void Body(int index) { First(); } \
+         public int Main() { Parallel.For(0, 1, Body); return 0; }",
+        "transitively calls",
+    );
+}
+
+#[test]
+fn overload_identity_does_not_taint_a_sequential_overload() {
+    assert_valid(
+        "public int Inner() { return 1; } \
+         public void Helper() { Task.Run(Inner).Wait(); } \
+         public void Helper(int value) { } \
+         public void Body(int index) { Helper(index); } \
+         public int Main() { Parallel.For(0, 1, Body); return 0; }",
+    );
+}
+
+#[test]
 fn parallel_for_error_points_at_the_target_and_the_reason() {
     let source = "public int Inner() { return 1; } \
          public void Body(int index) { Task.Run(Inner).Wait(); } \

@@ -5,7 +5,7 @@
 //! like `task_abi`'s, but they live here because they touch
 //! [`TaskRuntime`], which `aster-runtime` must never depend on. Every one is
 //! controlled: a null context, a missing runtime, or an unknown handle is
-//! reported through `ExecutionContext::fail` (or ignored) and never panics.
+//! reported through `ExecutionContext::fail` and never panics.
 //!
 //! `Task<T>` and every scalar cross this boundary as plain integers (a handle,
 //! or a `(kind, i64 bits)` pair — see `scalar`), never as a pointer into any
@@ -170,28 +170,47 @@ extern "C" fn aster_async_spawn(
     slot_count: i32,
 ) -> i64 {
     #[allow(unsafe_code)]
-    let Some((_context, runtime)) = (unsafe { context_and_runtime(context) }) else {
+    let Some((context, runtime)) = (unsafe { context_and_runtime(context) }) else {
+        return 0;
+    };
+    let Ok(slots) = usize::try_from(slot_count) else {
+        context.fail(format!(
+            "async frame slot count cannot be negative: {slot_count}"
+        ));
         return 0;
     };
     let symbol = mir::SymbolId(u32::from_ne_bytes(move_next.to_ne_bytes()));
-    let slots = usize::try_from(slot_count).unwrap_or(0);
-    runtime.async_spawn(symbol, slots).to_bits()
+    match runtime.async_spawn(symbol, slots) {
+        Ok(handle) => handle.to_bits(),
+        Err(error) => {
+            report(context, &error);
+            0
+        }
+    }
 }
 
 extern "C" fn aster_async_state(context: *mut ExecutionContext, handle: i64) -> i32 {
     #[allow(unsafe_code)]
-    let Some((_context, runtime)) = (unsafe { context_and_runtime(context) }) else {
+    let Some((context, runtime)) = (unsafe { context_and_runtime(context) }) else {
         return 0;
     };
-    runtime.async_state(TaskHandleId::from_bits(handle))
+    match runtime.async_state(TaskHandleId::from_bits(handle)) {
+        Ok(state) => state,
+        Err(error) => {
+            report(context, &error);
+            0
+        }
+    }
 }
 
 extern "C" fn aster_async_set_state(context: *mut ExecutionContext, handle: i64, state: i32) {
     #[allow(unsafe_code)]
-    let Some((_context, runtime)) = (unsafe { context_and_runtime(context) }) else {
+    let Some((context, runtime)) = (unsafe { context_and_runtime(context) }) else {
         return;
     };
-    runtime.async_set_state(TaskHandleId::from_bits(handle), state);
+    if let Err(error) = runtime.async_set_state(TaskHandleId::from_bits(handle), state) {
+        report(context, &error);
+    }
 }
 
 extern "C" fn aster_async_store_slot(
@@ -202,17 +221,23 @@ extern "C" fn aster_async_store_slot(
     bits: i64,
 ) {
     #[allow(unsafe_code)]
-    let Some((_context, runtime)) = (unsafe { context_and_runtime(context) }) else {
+    let Some((context, runtime)) = (unsafe { context_and_runtime(context) }) else {
         return;
     };
     let Ok(index) = usize::try_from(index) else {
+        context.fail(format!("async frame slot cannot be negative: {index}"));
         return;
     };
-    runtime.async_store_slot(
-        TaskHandleId::from_bits(handle),
-        index,
-        scalar::from_bits(kind, bits),
-    );
+    let value = match scalar::from_bits(kind, bits) {
+        Ok(value) => value,
+        Err(error) => {
+            report(context, &error);
+            return;
+        }
+    };
+    if let Err(error) = runtime.async_store_slot(TaskHandleId::from_bits(handle), index, value) {
+        report(context, &error);
+    }
 }
 
 extern "C" fn aster_async_load_slot(
@@ -221,30 +246,45 @@ extern "C" fn aster_async_load_slot(
     index: i32,
 ) -> i64 {
     #[allow(unsafe_code)]
-    let Some((_context, runtime)) = (unsafe { context_and_runtime(context) }) else {
+    let Some((context, runtime)) = (unsafe { context_and_runtime(context) }) else {
         return 0;
     };
     let Ok(index) = usize::try_from(index) else {
+        context.fail(format!("async frame slot cannot be negative: {index}"));
         return 0;
     };
-    runtime.async_load_slot(TaskHandleId::from_bits(handle), index)
+    match runtime.async_load_slot(TaskHandleId::from_bits(handle), index) {
+        Ok(bits) => bits,
+        Err(error) => {
+            report(context, &error);
+            0
+        }
+    }
 }
 
 extern "C" fn aster_async_spawn_inner(context: *mut ExecutionContext, handle: i64, inner: i32) {
     #[allow(unsafe_code)]
-    let Some((_context, runtime)) = (unsafe { context_and_runtime(context) }) else {
+    let Some((context, runtime)) = (unsafe { context_and_runtime(context) }) else {
         return;
     };
     let inner = mir::SymbolId(u32::from_ne_bytes(inner.to_ne_bytes()));
-    runtime.async_spawn_inner(TaskHandleId::from_bits(handle), inner);
+    if let Err(error) = runtime.async_spawn_inner(TaskHandleId::from_bits(handle), inner) {
+        report(context, &error);
+    }
 }
 
 extern "C" fn aster_async_await_result(context: *mut ExecutionContext, handle: i64) -> i64 {
     #[allow(unsafe_code)]
-    let Some((_context, runtime)) = (unsafe { context_and_runtime(context) }) else {
+    let Some((context, runtime)) = (unsafe { context_and_runtime(context) }) else {
         return 0;
     };
-    runtime.async_await_result(TaskHandleId::from_bits(handle))
+    match runtime.async_await_result(TaskHandleId::from_bits(handle)) {
+        Ok(bits) => bits,
+        Err(error) => {
+            report(context, &error);
+            0
+        }
+    }
 }
 
 extern "C" fn aster_async_set_result(
@@ -254,13 +294,19 @@ extern "C" fn aster_async_set_result(
     bits: i64,
 ) {
     #[allow(unsafe_code)]
-    let Some((_context, runtime)) = (unsafe { context_and_runtime(context) }) else {
+    let Some((context, runtime)) = (unsafe { context_and_runtime(context) }) else {
         return;
     };
-    runtime.async_set_result(
-        TaskHandleId::from_bits(handle),
-        scalar::from_bits(kind, bits),
-    );
+    let value = match scalar::from_bits(kind, bits) {
+        Ok(value) => value,
+        Err(error) => {
+            report(context, &error);
+            return;
+        }
+    };
+    if let Err(error) = runtime.async_set_result(TaskHandleId::from_bits(handle), value) {
+        report(context, &error);
+    }
 }
 
 extern "C" fn aster_parallel_for(context: *mut ExecutionContext, start: i32, end: i32, body: i32) {
@@ -287,7 +333,13 @@ extern "C" fn aster_parallel_for_each(
     let body = mir::SymbolId(u32::from_ne_bytes(body.to_ne_bytes()));
     // Evaluate the array once and copy its scalar elements into host-owned
     // storage before any worker runs. Only owned scalars reach the pool.
-    let values = copy_scalar_array(context, array, kind);
+    let values = match copy_scalar_array(context, array, kind) {
+        Ok(values) => values,
+        Err(error) => {
+            report(context, &error);
+            return;
+        }
+    };
     if let Err(error) = runtime.parallel_for_each(values, body) {
         report(context, &error);
     }
@@ -313,32 +365,56 @@ fn copy_scalar_array(
     context: &mut ExecutionContext,
     array: *mut u8,
     kind: i32,
-) -> Vec<ExecutionValue> {
+) -> Result<Vec<ExecutionValue>, BackendError> {
     if array.is_null() {
-        return Vec::new();
+        return Err(BackendError::new("Parallel.ForEach received a null array"));
+    }
+    if (array as usize) % std::mem::align_of::<aster_runtime::AsterArray>() != 0 {
+        return Err(BackendError::new(
+            "Parallel.ForEach received a misaligned array header",
+        ));
     }
     // The arena that produced `array` always allocates `AsterArray` headers
     // at `align_of::<AsterArray>()` (see `aster_runtime::context`), so this
     // pointer is correctly aligned despite the `*mut u8` parameter type.
     let header = array.cast::<aster_runtime::AsterArray>();
+    let expected_size = scalar::byte_width(kind)?;
+    // SAFETY: the pointer is non-null and alignment-checked above. Valid Aster
+    // MIR obtains it from this live context's array allocator; no pointer is
+    // retained after this host-side copy.
+    let actual_size = usize::try_from(unsafe { (&*header).element_size() })
+        .map_err(|_| BackendError::new("Parallel.ForEach element size exceeds the platform"))?;
+    if actual_size != expected_size {
+        return Err(BackendError::new(format!(
+            "Parallel.ForEach element size mismatch: header has {actual_size} bytes, scalar kind requires {expected_size}"
+        )));
+    }
     let length = aster_rt_array_length(context, header);
-    let length = usize::try_from(length).unwrap_or(0);
+    let length = usize::try_from(length)
+        .map_err(|_| BackendError::new("Parallel.ForEach array has a negative length"))?;
+    length.checked_mul(expected_size).ok_or_else(|| {
+        BackendError::new("Parallel.ForEach array byte length exceeds the addressable range")
+    })?;
     let mut values = Vec::with_capacity(length);
     for index in 0..length {
         let element = aster_rt_array_element(
             context,
             header,
-            i32::try_from(index).expect("array index fits i32"),
+            i32::try_from(index)
+                .map_err(|_| BackendError::new("Parallel.ForEach array index exceeds `int`"))?,
         );
         if element.is_null() {
-            return values;
+            return Err(BackendError::new(
+                "Parallel.ForEach could not read an array element",
+            ));
         }
-        // SAFETY: `element` points to one live, `element_size`-byte scalar of
-        // the concrete `kind` inside the host context's arena, valid for the
-        // duration of this host-thread call.
-        values.push(unsafe { read_scalar(element, kind) });
+        // SAFETY: `validation::validate_intrinsic_shape` requires the array
+        // element type, body parameter, and scalar `kind` metadata to agree.
+        // `element` therefore points to one live, correctly sized scalar in
+        // the host context's arena for the duration of this call.
+        values.push(unsafe { read_scalar(element, kind) }?);
     }
-    values
+    Ok(values)
 }
 
 /// Read one scalar of `kind` from `pointer` using an unaligned load.
@@ -346,9 +422,9 @@ fn copy_scalar_array(
 /// # Safety
 /// `pointer` must point to a live, correctly sized scalar of `kind`.
 #[allow(unsafe_code)]
-unsafe fn read_scalar(pointer: *const u8, kind: i32) -> ExecutionValue {
+unsafe fn read_scalar(pointer: *const u8, kind: i32) -> Result<ExecutionValue, BackendError> {
     unsafe {
-        match kind {
+        Ok(match kind {
             scalar::BOOL => ExecutionValue::Bool(pointer.read() != 0),
             scalar::SBYTE => ExecutionValue::SByte(pointer.cast::<i8>().read()),
             scalar::BYTE => ExecutionValue::Byte(pointer.read()),
@@ -359,11 +435,16 @@ unsafe fn read_scalar(pointer: *const u8, kind: i32) -> ExecutionValue {
             scalar::ULONG => ExecutionValue::ULong(pointer.cast::<u64>().read_unaligned()),
             scalar::FLOAT => ExecutionValue::Float(pointer.cast::<f32>().read_unaligned()),
             scalar::DOUBLE => ExecutionValue::Double(pointer.cast::<f64>().read_unaligned()),
-            scalar::CHAR => ExecutionValue::Char(
-                char::from_u32(pointer.cast::<u32>().read_unaligned()).unwrap_or('\u{0}'),
-            ),
-            // `LONG` and any unrecognized kind share this fallback.
-            _ => ExecutionValue::Long(pointer.cast::<i64>().read_unaligned()),
-        }
+            scalar::CHAR => {
+                let bits = pointer.cast::<u32>().read_unaligned();
+                ExecutionValue::Char(char::from_u32(bits).ok_or_else(|| {
+                    BackendError::new(format!(
+                        "invalid Unicode scalar value U+{bits:08X} in Parallel.ForEach array"
+                    ))
+                })?)
+            }
+            scalar::LONG => ExecutionValue::Long(pointer.cast::<i64>().read_unaligned()),
+            _ => return Err(BackendError::new(format!("unknown scalar kind tag {kind}"))),
+        })
     }
 }

@@ -14,6 +14,15 @@ pub struct AsterArray {
     element_size: u32,
 }
 
+impl AsterArray {
+    /// Element stride recorded when this runtime-owned header was allocated.
+    /// Host ABI adapters use it to validate scalar transport before reading.
+    #[must_use]
+    pub fn element_size(&self) -> u32 {
+        self.element_size
+    }
+}
+
 /// Immutable snapshot of allocation metrics for one execution.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemoryStats {

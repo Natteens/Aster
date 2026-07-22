@@ -34,6 +34,15 @@ fn accepts_static_async_method_matching_the_example() {
 }
 
 #[test]
+fn an_unrelated_wait_method_is_allowed_after_the_await() {
+    assert_valid(
+        "public class Probe { public int Wait() { return 2; } } \
+         public int Compute() { return 40; } \
+         public async Task<int> Calculate() { int value = await Task.Run(Compute); Probe probe = new Probe(); return value + probe.Wait(); }",
+    );
+}
+
+#[test]
 fn hir_marks_the_function_async_and_types_await_as_the_scalar_result() {
     let compilation = compile(FREE_ASYNC).expect("valid async compiles");
     let function = compilation

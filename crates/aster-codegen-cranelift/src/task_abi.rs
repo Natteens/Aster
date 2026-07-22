@@ -203,12 +203,53 @@ fn wait(context: *mut ExecutionContext, handle: i64) -> Option<ExecutionValue> {
     }
 }
 
+fn report_wait_type_mismatch(
+    context: *mut ExecutionContext,
+    expected: &str,
+    value: &ExecutionValue,
+) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: this helper is called only from the wait ABI entry points with
+    // the same live context pointer generated code passed to `wait`.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    context.fail(format!(
+        "Task<T>.Wait expected {expected}, but the task produced {}",
+        execution_value_kind(value)
+    ));
+}
+
+fn execution_value_kind(value: &ExecutionValue) -> &'static str {
+    match value {
+        ExecutionValue::Bool(_) => "bool",
+        ExecutionValue::SByte(_) => "sbyte",
+        ExecutionValue::Byte(_) => "byte",
+        ExecutionValue::Short(_) => "short",
+        ExecutionValue::UShort(_) => "ushort",
+        ExecutionValue::Int(_) => "int",
+        ExecutionValue::UInt(_) => "uint",
+        ExecutionValue::Long(_) => "long",
+        ExecutionValue::ULong(_) => "ulong",
+        ExecutionValue::Float(_) => "float",
+        ExecutionValue::Double(_) => "double",
+        ExecutionValue::Char(_) => "char",
+        ExecutionValue::String(_) => "string",
+        ExecutionValue::Void => "void",
+    }
+}
+
 extern "C" fn aster_task_wait_i32(context: *mut ExecutionContext, handle: i64) -> i32 {
     match wait(context, handle) {
         Some(ExecutionValue::Int(value)) => value,
         Some(ExecutionValue::UInt(value)) => i32::from_ne_bytes(value.to_ne_bytes()),
         Some(ExecutionValue::Char(value)) => i32::from_ne_bytes((value as u32).to_ne_bytes()),
-        _ => 0,
+        Some(value) => {
+            report_wait_type_mismatch(context, "an i32-compatible result", &value);
+            0
+        }
+        None => 0,
     }
 }
 
@@ -216,21 +257,33 @@ extern "C" fn aster_task_wait_i64(context: *mut ExecutionContext, handle: i64) -
     match wait(context, handle) {
         Some(ExecutionValue::Long(value)) => value,
         Some(ExecutionValue::ULong(value)) => i64::from_ne_bytes(value.to_ne_bytes()),
-        _ => 0,
+        Some(value) => {
+            report_wait_type_mismatch(context, "an i64-compatible result", &value);
+            0
+        }
+        None => 0,
     }
 }
 
 extern "C" fn aster_task_wait_f32(context: *mut ExecutionContext, handle: i64) -> f32 {
     match wait(context, handle) {
         Some(ExecutionValue::Float(value)) => value,
-        _ => 0.0,
+        Some(value) => {
+            report_wait_type_mismatch(context, "float", &value);
+            0.0
+        }
+        None => 0.0,
     }
 }
 
 extern "C" fn aster_task_wait_f64(context: *mut ExecutionContext, handle: i64) -> f64 {
     match wait(context, handle) {
         Some(ExecutionValue::Double(value)) => value,
-        _ => 0.0,
+        Some(value) => {
+            report_wait_type_mismatch(context, "double", &value);
+            0.0
+        }
+        None => 0.0,
     }
 }
 
@@ -239,7 +292,11 @@ extern "C" fn aster_task_wait_i8(context: *mut ExecutionContext, handle: i64) ->
         Some(ExecutionValue::SByte(value)) => value,
         Some(ExecutionValue::Byte(value)) => i8::from_ne_bytes(value.to_ne_bytes()),
         Some(ExecutionValue::Bool(value)) => i8::from(value),
-        _ => 0,
+        Some(value) => {
+            report_wait_type_mismatch(context, "an i8-compatible result", &value);
+            0
+        }
+        None => 0,
     }
 }
 
@@ -247,7 +304,11 @@ extern "C" fn aster_task_wait_i16(context: *mut ExecutionContext, handle: i64) -
     match wait(context, handle) {
         Some(ExecutionValue::Short(value)) => value,
         Some(ExecutionValue::UShort(value)) => i16::from_ne_bytes(value.to_ne_bytes()),
-        _ => 0,
+        Some(value) => {
+            report_wait_type_mismatch(context, "an i16-compatible result", &value);
+            0
+        }
+        None => 0,
     }
 }
 
@@ -282,5 +343,27 @@ mod tests {
     fn a_null_context_never_dereferences_anything() {
         assert_eq!(aster_task_run(std::ptr::null_mut(), 0), 0);
         assert_eq!(aster_task_wait_i32(std::ptr::null_mut(), 0), 0);
+    }
+
+    #[test]
+    fn waiting_through_an_incompatible_abi_type_reports_a_controlled_error() {
+        let module = aster_compiler::compile("public long Compute() { return 1L; }")
+            .expect("source compiles")
+            .mir;
+        let symbol = module.functions[0].symbol;
+        let mut runtime =
+            TaskRuntime::new(&Arc::new(module), 1).expect("runtime starts with no tasks yet");
+        let handle = runtime.run(symbol).expect("task is accepted");
+        let mut context = ExecutionContext::new();
+        context.set_task_runtime(std::ptr::from_mut(&mut runtime).cast::<()>());
+
+        let result = aster_task_wait_i32(&raw mut context, handle.to_bits());
+
+        assert_eq!(result, 0);
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("expected an i32-compatible"))
+        );
     }
 }

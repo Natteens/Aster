@@ -272,6 +272,7 @@ fn validate_instruction(
                 arguments,
                 return_type,
                 function_name,
+                signatures,
             )?;
             Ok(())
         }
@@ -345,6 +346,7 @@ fn validate_intrinsic_shape(
     arguments: &[mir::Operand],
     return_type: &mir::Type,
     function_name: &str,
+    signatures: &HashMap<mir::SymbolId, &mir::Function>,
 ) -> Result<(), BackendError> {
     let valid = match intrinsic {
         mir::Intrinsic::Log | mir::Intrinsic::LogWarning | mir::Intrinsic::LogError => {
@@ -425,6 +427,7 @@ fn validate_intrinsic_shape(
                     (mir::Type::Task(result), [argument])
                         if matches!(argument.kind, mir::OperandKind::Function(_))
                             && argument.type_ == **result
+                            && function_operand_matches(argument, &[], result, signatures)
                 )
         }
         mir::Intrinsic::TaskWait => {
@@ -445,6 +448,12 @@ fn validate_intrinsic_shape(
                     [move_next, count]
                         if matches!(move_next.kind, mir::OperandKind::Function(_))
                             && count.type_ == mir::Type::Int
+                            && function_operand_matches(
+                                move_next,
+                                &[mir::Type::Long],
+                                &mir::Type::Int,
+                                signatures,
+                            )
                 )
         }
         mir::Intrinsic::AsyncState => {
@@ -489,6 +498,7 @@ fn validate_intrinsic_shape(
                     [handle, inner]
                         if handle.type_ == mir::Type::Long
                             && matches!(inner.kind, mir::OperandKind::Function(_))
+                            && function_operand_matches(inner, &[], &inner.type_, signatures)
                 )
         }
         mir::Intrinsic::AsyncAwaitResult => {
@@ -514,6 +524,12 @@ fn validate_intrinsic_shape(
                         if start.type_ == mir::Type::Int
                             && end.type_ == mir::Type::Int
                             && matches!(body.kind, mir::OperandKind::Function(_))
+                            && function_operand_matches(
+                                body,
+                                &[mir::Type::Int],
+                                &mir::Type::Void,
+                                signatures,
+                            )
                 )
         }
         mir::Intrinsic::ParallelForEach => {
@@ -522,9 +538,18 @@ fn validate_intrinsic_shape(
                 && matches!(
                     arguments,
                     [values, body]
-                        if matches!(values.type_, mir::Type::Array(_))
+                        if matches!(
+                            &values.type_,
+                            mir::Type::Array(element) if **element == body.type_
+                        )
                             && matches!(body.kind, mir::OperandKind::Function(_))
                             && is_transferable_scalar(&body.type_)
+                            && function_operand_matches(
+                                body,
+                                std::slice::from_ref(&body.type_),
+                                &mir::Type::Void,
+                                signatures,
+                            )
                 )
         }
     };
@@ -535,6 +560,26 @@ fn validate_intrinsic_shape(
             "function `{function_name}` contains a malformed {intrinsic:?} runtime intrinsic"
         )))
     }
+}
+
+fn function_operand_matches(
+    operand: &mir::Operand,
+    parameters: &[mir::Type],
+    return_type: &mir::Type,
+    signatures: &HashMap<mir::SymbolId, &mir::Function>,
+) -> bool {
+    let mir::OperandKind::Function(symbol) = operand.kind else {
+        return false;
+    };
+    signatures.get(&symbol).is_some_and(|function| {
+        function.return_type == *return_type
+            && function.parameters.len() == parameters.len()
+            && function
+                .parameters
+                .iter()
+                .zip(parameters)
+                .all(|(actual, expected)| actual.type_ == *expected)
+    })
 }
 
 fn validate_rvalue(
@@ -732,4 +777,70 @@ fn unsupported(function_name: &str, feature: &str) -> BackendError {
     BackendError::new(format!(
         "Cranelift JIT does not yet support {feature} in function `{function_name}`"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parallel_for_each_rejects_element_metadata_that_disagrees_with_the_body_signature() {
+        let mut module = aster_compiler::compile(
+            "public void Body(int value) { } \
+             public int Main() { int[] values = [1]; Parallel.ForEach(values, Body); return 0; }",
+        )
+        .expect("source compiles")
+        .mir;
+        for function in &mut module.functions {
+            for block in &mut function.blocks {
+                for instruction in &mut block.instructions {
+                    if let mir::Instruction::CallIntrinsic {
+                        intrinsic: mir::Intrinsic::ParallelForEach,
+                        arguments,
+                        ..
+                    } = instruction
+                    {
+                        arguments[1].type_ = mir::Type::Double;
+                    }
+                }
+            }
+        }
+
+        let error = validate_module(&module).expect_err("mismatched scalar width must be rejected");
+        assert!(error.message().contains("malformed ParallelForEach"));
+    }
+
+    #[test]
+    fn task_run_rejects_a_symbol_with_an_incompatible_signature() {
+        let mut module = aster_compiler::compile(
+            "public int Compute() { return 1; } \
+             public void Wrong(int value) { } \
+             public int Main() { return Task.Run(Compute).Wait(); }",
+        )
+        .expect("source compiles")
+        .mir;
+        let wrong = module
+            .functions
+            .iter()
+            .find(|function| function.name == "Wrong")
+            .expect("Wrong is declared")
+            .symbol;
+        for function in &mut module.functions {
+            for block in &mut function.blocks {
+                for instruction in &mut block.instructions {
+                    if let mir::Instruction::CallIntrinsic {
+                        intrinsic: mir::Intrinsic::TaskRun,
+                        arguments,
+                        ..
+                    } = instruction
+                    {
+                        arguments[0].kind = mir::OperandKind::Function(wrong);
+                    }
+                }
+            }
+        }
+
+        let error = validate_module(&module).expect_err("wrong task ABI must be rejected");
+        assert!(error.message().contains("malformed TaskRun"));
+    }
 }

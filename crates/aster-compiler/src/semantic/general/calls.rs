@@ -332,6 +332,15 @@ impl Analyzer<'_> {
         {
             let object_type = self.expression(object);
             if let Type::Task(result_type) = object_type {
+                if self.async_state != super::AsyncAnalysisState::OutsideAsync {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "`Wait()` is not supported inside an `async` function in this version",
+                            span,
+                        )
+                        .with_help("only the function's own single `await` may suspend"),
+                    );
+                }
                 if !arguments.is_empty() {
                     self.diagnostics.push(Diagnostic::error(
                         "`Task<T>.Wait` accepts no arguments",

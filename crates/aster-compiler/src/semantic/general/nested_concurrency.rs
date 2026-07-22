@@ -21,6 +21,7 @@ use super::{CallableKey, Model};
 /// [`CallableKey`] the resolved call graph in [`Model`] already uses.
 struct FunctionFacts<'a> {
     name: String,
+    context: String,
     is_async: bool,
     body: Option<&'a Block>,
 }
@@ -50,6 +51,7 @@ pub(super) fn validate(module: &Module, model: &Model, diagnostics: &mut Vec<Dia
             node_key.span,
             &facts,
             &callees,
+            model,
             diagnostics,
         );
     }
@@ -60,6 +62,7 @@ pub(super) fn validate(module: &Module, model: &Model, diagnostics: &mut Vec<Dia
             node_key.span,
             &facts,
             &callees,
+            model,
             diagnostics,
         );
     }
@@ -70,6 +73,7 @@ pub(super) fn validate(module: &Module, model: &Model, diagnostics: &mut Vec<Dia
             node_key.span,
             &facts,
             &callees,
+            model,
             diagnostics,
         );
     }
@@ -79,9 +83,13 @@ pub(super) fn validate(module: &Module, model: &Model, diagnostics: &mut Vec<Dia
             continue;
         }
         let Some(body) = fact.body else { continue };
-        if let Some((offender, reason)) =
-            find_reachable(key, &callees, &facts, ConcurrencyFilter::ParallelOnly)
-        {
+        if let Some((offender, reason)) = find_reachable(
+            key,
+            &callees,
+            &facts,
+            model,
+            ConcurrencyFilter::ParallelOnly,
+        ) {
             diagnostics.push(
                 Diagnostic::error(
                     format!(
@@ -115,12 +123,13 @@ fn check_target(
     submission_span: Span,
     facts: &HashMap<CallableKey, FunctionFacts<'_>>,
     callees: &HashMap<CallableKey, Vec<CallableKey>>,
+    model: &Model,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let target_name = facts
         .get(target)
         .map_or_else(|| "<unknown>".to_owned(), |fact| fact.name.clone());
-    if let Some(reason) = direct_reason(target, facts) {
+    if let Some(reason) = direct_reason(target, facts, model) {
         diagnostics.push(
             Diagnostic::error(
                 format!("`{operation}` target `{target_name}` itself uses {reason}"),
@@ -130,7 +139,8 @@ fn check_target(
         );
         return;
     }
-    if let Some((offender, reason)) = find_reachable(target, callees, facts, ConcurrencyFilter::Any)
+    if let Some((offender, reason)) =
+        find_reachable(target, callees, facts, model, ConcurrencyFilter::Any)
     {
         diagnostics.push(
             Diagnostic::error(
@@ -148,19 +158,20 @@ fn check_target(
 fn direct_reason(
     key: &CallableKey,
     facts: &HashMap<CallableKey, FunctionFacts<'_>>,
+    model: &Model,
 ) -> Option<&'static str> {
     let fact = facts.get(key)?;
     if fact.is_async {
         return Some("being an `async` function");
     }
     let body = fact.body?;
-    direct_use_in_body(body)
+    direct_use_in_body(body, &fact.context, model)
 }
 
 /// Scan `body`'s statements structurally for a direct `Task.Run`,
 /// `Task<T>.Wait`, `Parallel.For`, or `Parallel.ForEach` call, matching the
 /// same structural shape checks the resolver itself uses.
-fn direct_use_in_body(body: &Block) -> Option<&'static str> {
+fn direct_use_in_body(body: &Block, context: &str, model: &Model) -> Option<&'static str> {
     let mut calls = Vec::new();
     for statement in &body.statements {
         super::declarations::collect_statement_calls(statement, &mut calls);
@@ -172,7 +183,12 @@ fn direct_use_in_body(body: &Block) -> Option<&'static str> {
         if super::calls::is_task_run_callee(callee) {
             return Some("`Task.Run`");
         }
+        let key = crate::semantic::ModelNodeKey {
+            context: context.to_owned(),
+            span: call.span,
+        };
         if matches!(&callee.kind, aster_syntax::ExpressionKind::Member { name, .. } if name == "Wait")
+            && !model.calls.contains_key(&key)
         {
             return Some("`Task<T>.Wait`");
         }
@@ -195,6 +211,7 @@ fn find_reachable(
     start: &CallableKey,
     callees: &HashMap<CallableKey, Vec<CallableKey>>,
     facts: &HashMap<CallableKey, FunctionFacts<'_>>,
+    model: &Model,
     filter: ConcurrencyFilter,
 ) -> Option<(String, &'static str)> {
     let mut visited: HashSet<CallableKey> = HashSet::new();
@@ -213,7 +230,8 @@ fn find_reachable(
                 if fact.is_async {
                     Some("being an `async` function")
                 } else {
-                    fact.body.and_then(direct_use_in_body)
+                    fact.body
+                        .and_then(|body| direct_use_in_body(body, &fact.context, model))
                 }
             }
             ConcurrencyFilter::ParallelOnly => fact.body.and_then(|body| {
@@ -276,11 +294,12 @@ fn insert_fact<'a>(
     let owner_name = owner.map(|owner| owner.name.as_str());
     let key = super::callable_key(&function.name, function.span.start, None, owner_name);
     let context = crate::semantic::function_context(function, owner);
-    context_to_key.insert(context, key.clone());
+    context_to_key.insert(context.clone(), key.clone());
     facts.insert(
         key,
         FunctionFacts {
             name: function.name.clone(),
+            context,
             is_async: function.is_async,
             body: function.body.as_ref(),
         },

@@ -1036,11 +1036,10 @@ fn validate_async_body(body: &aster_syntax::Block, diagnostics: &mut Vec<Diagnos
     // concrete (possibly inferred) type of each local, so it runs inside the
     // analyzer (see `Analyzer::statement`), not this pre-analysis AST pass.
 
-    // `Wait()`/`Parallel` anywhere in an async body (not only around the
-    // await) would let the host pump reenter itself or block on a worker
-    // from the host thread; reject both structurally here, independent of
-    // the transitive nested-concurrency pass in `nested_concurrency`, which
-    // only catches concurrency reached through an ordinary function call.
+    // `Parallel` anywhere in an async body (not only around the await) is
+    // rejected structurally here. `Task<T>.Wait()` needs the resolved receiver
+    // type, so `Analyzer::call` rejects that intrinsic precisely instead of
+    // treating every unrelated method named `Wait` as concurrency.
     let mut calls = Vec::new();
     for statement in &body.statements {
         collect_statement_calls(statement, &mut calls);
@@ -1049,15 +1048,7 @@ fn validate_async_body(body: &aster_syntax::Block, diagnostics: &mut Vec<Diagnos
         let ExpressionKind::Call { callee, .. } = &call.kind else {
             continue;
         };
-        if matches!(&callee.kind, ExpressionKind::Member { name, .. } if name == "Wait") {
-            diagnostics.push(
-                Diagnostic::error(
-                    "`Wait()` is not supported inside an `async` function in this version",
-                    call.span,
-                )
-                .with_help("only the function's own single `await` may suspend"),
-            );
-        } else if super::calls::is_parallel_for_callee(callee)
+        if super::calls::is_parallel_for_callee(callee)
             || super::calls::is_parallel_for_each_callee(callee)
         {
             diagnostics.push(

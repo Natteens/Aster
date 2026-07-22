@@ -57,6 +57,9 @@ pub(super) enum JobKind {
         base: usize,
         values: Vec<ExecutionValue>,
     },
+    /// Test-only host panic injection used to verify pool-wide failure cleanup.
+    #[cfg(test)]
+    Panic(Arc<std::sync::Barrier>),
 }
 
 /// The kind-matched reply channel for one job.
@@ -136,6 +139,17 @@ impl JobQueue {
         drop(state);
         self.not_empty.notify_all();
     }
+
+    /// Fail the queue after a worker panic. Dropping queued jobs disconnects
+    /// their reply channels, so every already-issued handle unblocks with a
+    /// controlled error instead of waiting forever for a worker that died.
+    fn abort(&self) {
+        let mut state = self.state.lock().expect("job queue mutex is not poisoned");
+        state.closed = true;
+        state.jobs.clear();
+        drop(state);
+        self.not_empty.notify_all();
+    }
 }
 
 /// Build this worker's `PreparedProgram` and report the outcome to the pool
@@ -196,6 +210,11 @@ fn worker_loop(
                 Respond::Chunk(reply),
             ) => {
                 let _ = reply.send(program.run_for_each_chunk(symbol, base, &values));
+            }
+            #[cfg(test)]
+            (JobKind::Panic(barrier), Respond::Task(_reply)) => {
+                barrier.wait();
+                panic!("simulated worker panic");
             }
             // A kind/reply mismatch is impossible: both are built together in
             // `submit`/`submit_parallel`. Nothing to report if it ever occurs.
@@ -297,16 +316,22 @@ impl ExecutionPool {
         for index in 0..worker_count {
             let worker_module = Arc::clone(&module);
             let worker_queue = Arc::clone(&queue);
+            let panic_queue = Arc::clone(&queue);
             let (ready_tx, ready_rx) = mpsc::channel();
             let simulate_this_worker_failing = failing_index == Some(index);
             workers.push(thread::spawn(move || {
-                if simulate_this_worker_failing {
-                    let _ = ready_tx.send(Err(BackendError::new(
-                        "simulated worker preparation failure",
-                    )));
-                    return;
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if simulate_this_worker_failing {
+                        let _ = ready_tx.send(Err(BackendError::new(
+                            "simulated worker preparation failure",
+                        )));
+                        return;
+                    }
+                    worker_loop(&worker_module, &worker_queue, &ready_tx);
+                }));
+                if outcome.is_err() {
+                    panic_queue.abort();
                 }
-                worker_loop(&worker_module, &worker_queue, &ready_tx);
             }));
             ready_receivers.push(ready_rx);
         }
@@ -392,6 +417,21 @@ impl ExecutionPool {
             completion: None,
         })?;
         Ok(receiver)
+    }
+
+    #[cfg(test)]
+    fn submit_panicking(
+        &self,
+        barrier: Arc<std::sync::Barrier>,
+    ) -> Result<TaskHandle, BackendError> {
+        let id = TaskId(self.next_task_id.fetch_add(1, Ordering::Relaxed));
+        let (reply, receiver) = mpsc::channel();
+        self.queue.push(Job {
+            kind: JobKind::Panic(barrier),
+            respond: Respond::Task(reply),
+            completion: None,
+        })?;
+        Ok(TaskHandle { id, receiver })
     }
 
     /// Stop accepting new tasks, let every already-accepted task finish, and
@@ -812,6 +852,28 @@ mod tests {
 
         let result = handle.join();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn worker_panic_disconnects_queued_jobs_and_closes_the_pool() {
+        let module = Arc::new(compile("public int Run() { return 1; }"));
+        let pool = ExecutionPool::new(module, 1).expect("pool starts");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let panicking = pool
+            .submit_panicking(Arc::clone(&barrier))
+            .expect("panic job is accepted");
+        let queued = pool
+            .submit(pool.resolve("Run").expect("Run resolves"), false, None)
+            .expect("second job is queued before the panic");
+
+        barrier.wait();
+
+        assert!(panicking.join().is_err());
+        assert!(queued.join().is_err());
+        assert!(
+            pool.submit(pool.resolve("Run").expect("Run resolves"), false, None)
+                .is_err()
+        );
     }
 
     #[test]
