@@ -297,5 +297,17 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
             note(max, *body);
             collect_expression(values, max);
         }
+        hir::ExpressionKind::ParallelReduce {
+            values,
+            identity,
+            accumulate,
+            combine,
+            ..
+        } => {
+            note(max, *accumulate);
+            note(max, *combine);
+            collect_expression(values, max);
+            collect_expression(identity, max);
+        }
     }
 }

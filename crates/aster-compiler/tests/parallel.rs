@@ -568,12 +568,436 @@ fn enum_named_parallel_is_rejected() {
     );
 }
 
+// --- Parallel.Reduce ---------------------------------------------------
+
+const ADD_VALUE: &str =
+    "public int AddValue(int accumulator, int value) { return accumulator + value; }";
+const ADD_PARTIAL: &str = "public int AddPartial(int left, int right) { return left + right; }";
+
 #[test]
-fn parallel_reduce_is_not_available() {
-    let source = "public int Body(int a, int b) { return a + b; } \
-         public int Main() { return Parallel.Reduce(0, 10, Body); }";
+fn parallel_reduce_valid_signature_compiles() {
+    assert_valid(&format!(
+        "{ADD_VALUE} {ADD_PARTIAL} \
+         public int Main() {{ int[] values = [1, 2, 3, 4, 5]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }}"
+    ));
+}
+
+#[test]
+fn parallel_reduce_free_functions_compile() {
+    assert_valid(
+        "public int AddValue(int accumulator, int value) { return accumulator + value; } \
+         public int AddPartial(int left, int right) { return left + right; } \
+         public int Main() { int[] values = [1, 2, 3]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }",
+    );
+}
+
+#[test]
+fn parallel_reduce_result_can_be_used_in_a_further_expression() {
+    assert_valid(&format!(
+        "{ADD_VALUE} {ADD_PARTIAL} \
+         public int Main() {{ int[] values = [1, 2, 3]; return Parallel.Reduce(values, 0, AddValue, AddPartial) + 1; }}"
+    ));
+}
+
+#[test]
+fn parallel_reduce_wrong_argument_count_is_rejected() {
+    assert_error(
+        &format!(
+            "{ADD_VALUE} {ADD_PARTIAL} \
+             public int Main() {{ int[] values = [1]; return Parallel.Reduce(values, 0, AddValue); }}"
+        ),
+        "expects exactly 4 arguments",
+    );
+}
+
+#[test]
+fn parallel_reduce_non_array_first_argument_is_rejected() {
+    assert_error(
+        &format!(
+            "{ADD_VALUE} {ADD_PARTIAL} public int Main() {{ return Parallel.Reduce(5, 0, AddValue, AddPartial); }}"
+        ),
+        "requires an array argument",
+    );
+}
+
+#[test]
+fn parallel_reduce_non_transferable_element_is_rejected_string() {
+    assert_error(
+        "public int AddValue(int accumulator, string value) { return accumulator + value.Length; } \
+         public int AddPartial(int left, int right) { return left + right; } \
+         public int Main() { string[] values = [\"a\"]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }",
+        "requires a scalar element type",
+    );
+}
+
+#[test]
+fn parallel_reduce_non_transferable_element_is_rejected_class() {
+    assert_error(
+        "public class Thing { } \
+         public int AddValue(int accumulator, Thing value) { return accumulator; } \
+         public int AddPartial(int left, int right) { return left + right; } \
+         public int Main() { Thing[] values = new Thing[1]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }",
+        "requires a scalar element type",
+    );
+}
+
+#[test]
+fn parallel_reduce_non_transferable_element_is_rejected_interface() {
+    assert_error(
+        "public interface IThing { int Get(); } \
+         public class Thing : IThing { public Thing() {} public int Get() { return 1; } } \
+         public int AddValue(int accumulator, IThing value) { return accumulator; } \
+         public int AddPartial(int left, int right) { return left + right; } \
+         public int Main() { IThing[] values = new IThing[1]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }",
+        "requires a scalar element type",
+    );
+}
+
+#[test]
+fn parallel_reduce_non_transferable_element_is_rejected_struct() {
+    assert_error(
+        "public struct Point { public int x; public int y; } \
+         public int AddValue(int accumulator, Point value) { return accumulator; } \
+         public int AddPartial(int left, int right) { return left + right; } \
+         public int Main() { Point[] values = new Point[1]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }",
+        "requires a scalar element type",
+    );
+}
+
+#[test]
+fn parallel_reduce_non_transferable_element_is_rejected_enum() {
+    assert_error(
+        "public enum Color { Red, Green, Blue } \
+         public int AddValue(int accumulator, Color value) { return accumulator; } \
+         public int AddPartial(int left, int right) { return left + right; } \
+         public int Main() { Color[] values = new Color[1]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }",
+        "requires a scalar element type",
+    );
+}
+
+#[test]
+fn parallel_reduce_decimal_element_is_rejected() {
+    // `decimal` is numeric but not worker-transferable (Lote 6B): it must not
+    // be silently accepted just because it "looks scalar."
+    assert_error(
+        "public decimal AddValue(decimal accumulator, decimal value) { return accumulator + value; } \
+         public decimal AddPartial(decimal left, decimal right) { return left + right; } \
+         public decimal Main() { decimal[] values = [1.0m]; return Parallel.Reduce(values, 0.0m, AddValue, AddPartial); }",
+        "requires a scalar element type",
+    );
+}
+
+#[test]
+fn parallel_reduce_task_element_is_rejected() {
+    assert_error(
+        "public int Compute() { return 1; } \
+         public int AddValue(int accumulator, Task<int> value) { return accumulator; } \
+         public int AddPartial(int left, int right) { return left + right; } \
+         public int Main() { Task<int>[] values = new Task<int>[1]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }",
+        "requires a scalar element type",
+    );
+}
+
+#[test]
+fn parallel_reduce_non_transferable_identity_is_rejected_class() {
+    assert_error(
+        "public class Box { public Box() {} } \
+         public Box AddValue(Box accumulator, int value) { return accumulator; } \
+         public Box AddPartial(Box left, Box right) { return left; } \
+         public int Main() { int[] values = [1]; Box identity = new Box(); Parallel.Reduce(values, identity, AddValue, AddPartial); return 0; }",
+        "cannot cross a worker boundary",
+    );
+}
+
+#[test]
+fn parallel_reduce_decimal_identity_is_rejected() {
+    assert_error(
+        "public decimal AddValue(decimal accumulator, int value) { return accumulator; } \
+         public decimal AddPartial(decimal left, decimal right) { return left; } \
+         public decimal Main() { int[] values = [1]; return Parallel.Reduce(values, 0.0m, AddValue, AddPartial); }",
+        "cannot cross a worker boundary",
+    );
+}
+
+#[test]
+fn parallel_reduce_accumulate_wrong_arity_is_rejected() {
+    assert_error(
+        &format!(
+            "public int AddValue(int accumulator) {{ return accumulator; }} {ADD_PARTIAL} \
+             public int Main() {{ int[] values = [1]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }}"
+        ),
+        "no static method or free function with signature",
+    );
+}
+
+#[test]
+fn parallel_reduce_accumulate_wrong_parameter_type_is_rejected() {
+    assert_error(
+        &format!(
+            "public int AddValue(int accumulator, long value) {{ return accumulator; }} {ADD_PARTIAL} \
+             public int Main() {{ int[] values = [1]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }}"
+        ),
+        "no static method or free function with signature",
+    );
+}
+
+#[test]
+fn parallel_reduce_accumulate_wrong_return_type_is_rejected() {
+    assert_error(
+        &format!(
+            "public long AddValue(int accumulator, int value) {{ return accumulator; }} {ADD_PARTIAL} \
+             public int Main() {{ int[] values = [1]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }}"
+        ),
+        "no static method or free function with signature",
+    );
+}
+
+#[test]
+fn parallel_reduce_combine_wrong_signature_is_rejected() {
+    assert_error(
+        &format!(
+            "{ADD_VALUE} public int AddPartial(int left, long right) {{ return left; }} \
+             public int Main() {{ int[] values = [1]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }}"
+        ),
+        "no static method or free function with signature",
+    );
+}
+
+#[test]
+fn parallel_reduce_instance_method_accumulate_is_rejected() {
+    let source = format!(
+        "public class Ops {{ public int AddValue(int accumulator, int value) {{ return accumulator + value; }} }} {ADD_PARTIAL} \
+         public int Main() {{ Ops ops = new Ops(); int[] values = [1]; return Parallel.Reduce(values, 0, ops.AddValue, AddPartial); }}"
+    );
     assert!(
-        compile(source).is_err(),
-        "Parallel.Reduce must not compile in this version"
+        compile(&source).is_err(),
+        "an instance method must not be accepted as Accumulate"
+    );
+}
+
+#[test]
+fn parallel_reduce_instance_method_combine_is_rejected() {
+    let source = format!(
+        "{ADD_VALUE} public class Ops {{ public int AddPartial(int left, int right) {{ return left + right; }} }} \
+         public int Main() {{ Ops ops = new Ops(); int[] values = [1]; return Parallel.Reduce(values, 0, AddValue, ops.AddPartial); }}"
+    );
+    assert!(
+        compile(&source).is_err(),
+        "an instance method must not be accepted as Combine"
+    );
+}
+
+#[test]
+fn parallel_reduce_async_accumulate_is_rejected() {
+    assert_error(
+        &format!(
+            "public int Compute() {{ return 1; }} \
+             public async Task<int> AddValue(int accumulator, int value) {{ int v = await Task.Run(Compute); return accumulator + v; }} \
+             {ADD_PARTIAL} \
+             public int Main() {{ int[] values = [1]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }}"
+        ),
+        "no static method or free function with signature",
+    );
+}
+
+#[test]
+fn parallel_reduce_direct_nested_task_run_in_accumulate_is_rejected() {
+    assert_error(
+        &format!(
+            "public int Compute() {{ return 1; }} \
+             public int AddValue(int accumulator, int value) {{ Task.Run(Compute); return accumulator + value; }} \
+             {ADD_PARTIAL} \
+             public int Main() {{ int[] values = [1]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }}"
+        ),
+        "itself uses",
+    );
+}
+
+#[test]
+fn parallel_reduce_direct_nested_parallel_reduce_in_combine_is_rejected() {
+    assert_error(
+        &format!(
+            "{ADD_VALUE} \
+             public int AddPartial(int left, int right) {{ int[] inner = [1]; return Parallel.Reduce(inner, left, AddValue, AddPartial); }} \
+             public int Main() {{ int[] values = [1, 2]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }}"
+        ),
+        "itself uses",
+    );
+}
+
+#[test]
+fn parallel_reduce_transitive_nested_concurrency_in_accumulate_is_rejected() {
+    assert_error(
+        &format!(
+            "public int Inner() {{ return 1; }} \
+             public void Helper() {{ Task.Run(Inner).Wait(); }} \
+             public int AddValue(int accumulator, int value) {{ Helper(); return accumulator + value; }} \
+             {ADD_PARTIAL} \
+             public int Main() {{ int[] values = [1]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }}"
+        ),
+        "transitively calls",
+    );
+}
+
+#[test]
+fn parallel_reduce_transitive_nested_parallel_for_in_combine_is_rejected() {
+    assert_error(
+        &format!(
+            "public void Body(int index) {{ }} \
+             public void Helper() {{ Parallel.For(0, 1, Body); }} \
+             {ADD_VALUE} \
+             public int AddPartial(int left, int right) {{ Helper(); return left + right; }} \
+             public int Main() {{ int[] values = [1, 2]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }}"
+        ),
+        "transitively calls",
+    );
+}
+
+#[test]
+fn parallel_reduce_interface_dispatch_reaching_task_run_is_rejected() {
+    let source = format!(
+        "public interface IWorker {{ int Combine(int left, int right); }} \
+         public int Compute() {{ return 1; }} \
+         public class Worker : IWorker {{ public Worker() {{}} public int Combine(int left, int right) {{ Task.Run(Compute); return left + right; }} }} \
+         public int AddPartial(int left, int right) {{ IWorker worker = new Worker(); return worker.Combine(left, right); }} \
+         {ADD_VALUE} \
+         public int Main() {{ int[] values = [1, 2]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }}"
+    );
+    let diagnostics = compile(&source).expect_err("interface dispatch must expose Task.Run");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("through interface call")),
+        "missing interface path diagnostic: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn parallel_reduce_inside_async_function_is_rejected() {
+    assert_error(
+        &format!(
+            "public int Compute() {{ return 1; }} {ADD_VALUE} {ADD_PARTIAL} \
+             public int RunReduce() {{ int[] values = [1]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }} \
+             public async Task<int> Calculate() {{ int value = await Task.Run(Compute); return value + RunReduce(); }}"
+        ),
+        "which uses `Parallel.Reduce`",
+    );
+}
+
+#[test]
+fn parallel_reduce_overload_is_chosen_by_complete_signature() {
+    // Two `AddValue` overloads exist; only the `(int, int) -> int` one
+    // matches the array's `int` element and the identity's `int` type.
+    assert_valid(&format!(
+        "public int AddValue(int accumulator, int value) {{ return accumulator + value; }} \
+         public long AddValue(long accumulator, long value) {{ return accumulator + value; }} \
+         {ADD_PARTIAL} \
+         public int Main() {{ int[] values = [1, 2, 3]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }}"
+    ));
+}
+
+#[test]
+fn parallel_reduce_ambiguous_overload_is_rejected() {
+    // `Main` is itself a method of `Ops`, which also declares a static
+    // `AddValue` with the identical signature as the free function: the bare
+    // name resolves to both, so `Accumulate` is ambiguous.
+    assert_error(
+        "public int AddValue(int accumulator, int value) { return accumulator + value; } \
+         public class Ops { \
+             public static int AddValue(int accumulator, int value) { return accumulator + value; } \
+             public static int AddPartial(int left, int right) { return left + right; } \
+             public static int Main() { int[] values = [1]; return Parallel.Reduce(values, 0, AddValue, AddPartial); } \
+         }",
+        "ambiguous",
+    );
+}
+
+#[test]
+fn a_type_named_parallel_by_a_user_namespace_does_not_activate_reduce() {
+    // `Parallel` is reserved (see `validate_no_reserved_type_names`), so this
+    // is only a negative-shape sanity check: an unrelated `Reduce` method on
+    // another type must never be mistaken for the intrinsic.
+    assert_valid(
+        "public static class Utils { public static int Reduce(int a, int b) { return a + b; } } \
+         public int Main() { return Utils.Reduce(1, 2); }",
+    );
+}
+
+#[test]
+fn different_element_and_accumulator_types_are_accepted() {
+    // `TElement` (`long`) and `TAccumulator` (`int`) may differ, as long as
+    // both are worker-transferable and the signatures are exact.
+    assert_valid(
+        "public int CountValue(int accumulator, long value) { return accumulator + 1; } \
+         public int CountPartial(int left, int right) { return left + right; } \
+         public int Main() { long[] values = [10L, 20L, 30L]; return Parallel.Reduce(values, 0, CountValue, CountPartial); }",
+    );
+}
+
+#[test]
+fn parallel_reduce_array_and_identity_are_evaluated_once_left_to_right() {
+    let compilation = compile(&format!(
+        "public int[] GetValues() {{ return [1, 2, 3]; }} \
+         public int GetIdentity() {{ return 0; }} \
+         {ADD_VALUE} {ADD_PARTIAL} \
+         public int Main() {{ return Parallel.Reduce(GetValues(), GetIdentity(), AddValue, AddPartial); }}"
+    ))
+    .expect("valid program");
+    let main = compilation
+        .mir
+        .functions
+        .iter()
+        .find(|function| function.name == "Main" && function.owner.is_none())
+        .expect("Main is lowered to MIR");
+    let calls: Vec<&aster_compiler::mir::SymbolId> = main
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction {
+            aster_compiler::mir::Instruction::Call { function, .. } => Some(function),
+            _ => None,
+        })
+        .collect();
+    let get_values = compilation
+        .mir
+        .functions
+        .iter()
+        .find(|function| function.name == "GetValues")
+        .expect("GetValues is declared")
+        .symbol;
+    let get_identity = compilation
+        .mir
+        .functions
+        .iter()
+        .find(|function| function.name == "GetIdentity")
+        .expect("GetIdentity is declared")
+        .symbol;
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|symbol| ***symbol == get_values)
+            .count(),
+        1,
+        "the array expression must be evaluated exactly once"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|symbol| ***symbol == get_identity)
+            .count(),
+        1,
+        "the identity expression must be evaluated exactly once"
+    );
+    let values_index = calls
+        .iter()
+        .position(|symbol| **symbol == get_values)
+        .unwrap();
+    let identity_index = calls
+        .iter()
+        .position(|symbol| **symbol == get_identity)
+        .unwrap();
+    assert!(
+        values_index < identity_index,
+        "the array must be evaluated before the identity (left to right)"
     );
 }

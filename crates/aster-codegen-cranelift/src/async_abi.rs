@@ -9,9 +9,12 @@
 //!
 //! `Task<T>` and every scalar cross this boundary as plain integers (a handle,
 //! or a `(kind, i64 bits)` pair — see `scalar`), never as a pointer into any
-//! arena. The only pointer that crosses is a `Parallel.ForEach` source array,
-//! and it is read and copied entirely on the host before any worker runs (see
-//! [`aster_parallel_for_each`]); no array pointer ever reaches a worker.
+//! arena. The only pointer that crosses is a `Parallel.ForEach`/`Reduce`
+//! source array, and it is read and copied entirely on the host before any
+//! worker runs (see [`aster_parallel_for_each`]/[`aster_parallel_reduce`]); no
+//! array pointer ever reaches a worker. `Parallel.Reduce`'s identity and
+//! combined result cross the same way a `Task<T>.Wait` result or async frame
+//! slot does: as a `(kind, bits)` pair, never a pointer.
 
 use aster_runtime::{ExecutionContext, aster_rt_array_element, aster_rt_array_length};
 
@@ -23,7 +26,7 @@ use super::{
 
 /// Name and address of every async/parallel ABI function exported to generated
 /// code, alongside `task_abi::task_functions()`.
-fn async_functions() -> [(&'static str, *const u8); 10] {
+fn async_functions() -> [(&'static str, *const u8); 11] {
     [
         ("aster_async_spawn", aster_async_spawn as *const u8),
         ("aster_async_state", aster_async_state as *const u8),
@@ -50,6 +53,7 @@ fn async_functions() -> [(&'static str, *const u8); 10] {
             "aster_parallel_for_each",
             aster_parallel_for_each as *const u8,
         ),
+        ("aster_parallel_reduce", aster_parallel_reduce as *const u8),
     ]
 }
 
@@ -108,6 +112,15 @@ impl Codegen {
                     signature.params.push(AbiParam::new(pointer)); // array header
                     signature.params.push(AbiParam::new(types::I32)); // body symbol
                     signature.params.push(AbiParam::new(types::I32)); // element kind
+                }
+                "aster_parallel_reduce" => {
+                    signature.params.push(AbiParam::new(pointer)); // array header
+                    signature.params.push(AbiParam::new(types::I64)); // identity bits
+                    signature.params.push(AbiParam::new(types::I32)); // identity (accumulator) kind
+                    signature.params.push(AbiParam::new(types::I32)); // element kind
+                    signature.params.push(AbiParam::new(types::I32)); // accumulate symbol
+                    signature.params.push(AbiParam::new(types::I32)); // combine symbol
+                    signature.returns.push(AbiParam::new(types::I64)); // accumulator result bits
                 }
                 _ => unreachable!("async_functions lists every symbol handled above"),
             }
@@ -342,6 +355,51 @@ extern "C" fn aster_parallel_for_each(
     };
     if let Err(error) = runtime.parallel_for_each(values, body) {
         report(context, &error);
+    }
+}
+
+/// `Parallel.Reduce(values, identity, Accumulate, Combine)`: `values` are
+/// copied host-side exactly like [`aster_parallel_for_each`]'s array (no
+/// array pointer ever reaches a worker); `identity` crosses as a `(kind,
+/// bits)` pair, exactly like an async frame slot, never a pointer. The
+/// combined `TAccumulator` result is returned the same way `Task<T>.Wait`
+/// returns its scalar: as raw bits the caller narrows back to the concrete
+/// type (see `calls::translate_async_intrinsic`).
+extern "C" fn aster_parallel_reduce(
+    context: *mut ExecutionContext,
+    array: *mut u8,
+    identity_bits: i64,
+    identity_kind: i32,
+    element_kind: i32,
+    accumulate: i32,
+    combine: i32,
+) -> i64 {
+    #[allow(unsafe_code)]
+    let Some((context, runtime)) = (unsafe { context_and_runtime(context) }) else {
+        return 0;
+    };
+    let identity = match scalar::from_bits(identity_kind, identity_bits) {
+        Ok(value) => value,
+        Err(error) => {
+            report(context, &error);
+            return 0;
+        }
+    };
+    let values = match copy_scalar_array(context, array, element_kind) {
+        Ok(values) => values,
+        Err(error) => {
+            report(context, &error);
+            return 0;
+        }
+    };
+    let accumulate = mir::SymbolId(u32::from_ne_bytes(accumulate.to_ne_bytes()));
+    let combine = mir::SymbolId(u32::from_ne_bytes(combine.to_ne_bytes()));
+    match runtime.parallel_reduce(values, identity, accumulate, combine) {
+        Ok(result) => scalar::to_bits(&result),
+        Err(error) => {
+            report(context, &error);
+            0
+        }
     }
 }
 

@@ -311,6 +311,31 @@ impl Lowerer<'_> {
                         },
                     };
                 }
+                if is_parallel_reduce_callee(callee) {
+                    let resolved = &self.model.parallel_reduce[&model_key];
+                    let accumulate = self.callable_symbols[&resolved.accumulate];
+                    let combine = self.callable_symbols[&resolved.combine];
+                    let [values, identity, _accumulate, _combine] = arguments.as_slice() else {
+                        unreachable!("validated Parallel.Reduce has exactly 4 arguments");
+                    };
+                    let values = self.expression(values);
+                    let element_type = match values.type_.clone() {
+                        hir::Type::Array(element) => element,
+                        other => Box::new(other),
+                    };
+                    let identity = self.expression(identity);
+                    let accumulator_type = identity.type_.clone();
+                    return hir::Expression {
+                        type_: accumulator_type,
+                        kind: hir::ExpressionKind::ParallelReduce {
+                            values: Box::new(values),
+                            element_type,
+                            identity: Box::new(identity),
+                            accumulate,
+                            combine,
+                        },
+                    };
+                }
                 let resolved = &self.model.calls[&model_key];
                 let symbol = self.callable_symbols[&resolved.callable];
                 let type_ = self.callable_results[&symbol].clone();
@@ -639,6 +664,16 @@ fn is_parallel_for_each_callee(callee: &ast::Expression) -> bool {
         &callee.kind,
         ast::ExpressionKind::Member { object, name }
             if name == "ForEach"
+                && matches!(&object.kind, ast::ExpressionKind::Name(object) if object == "Parallel")
+    )
+}
+
+/// Mirrors `semantic::general::calls::is_parallel_reduce_callee`.
+fn is_parallel_reduce_callee(callee: &ast::Expression) -> bool {
+    matches!(
+        &callee.kind,
+        ast::ExpressionKind::Member { object, name }
+            if name == "Reduce"
                 && matches!(&object.kind, ast::ExpressionKind::Name(object) if object == "Parallel")
     )
 }

@@ -234,6 +234,13 @@ pub enum Intrinsic {
     /// `Parallel.ForEach(values, Body)`. Arguments:
     /// `[array, Function(body_symbol)]`; synchronous, returns void.
     ParallelForEach,
+    /// `Parallel.Reduce(values, identity, Accumulate, Combine)`. Arguments:
+    /// `[array, identity, Function(accumulate_symbol),
+    /// Function(combine_symbol)]`; synchronous, returns the concrete
+    /// `TAccumulator` result (`identity`'s type). `accumulate_symbol` resolves
+    /// `Accumulate(TAccumulator, TElement) -> TAccumulator`; `combine_symbol`
+    /// resolves `Combine(TAccumulator, TAccumulator) -> TAccumulator`.
+    ParallelReduce,
 }
 
 impl Intrinsic {
@@ -272,7 +279,8 @@ impl Intrinsic {
             | Self::AsyncAwaitResult
             | Self::AsyncSetResult
             | Self::ParallelFor
-            | Self::ParallelForEach => None,
+            | Self::ParallelForEach
+            | Self::ParallelReduce => None,
         }
     }
 

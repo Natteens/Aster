@@ -31,7 +31,10 @@ use std::sync::Arc;
 
 use super::completion_queue::{CompletionQueue, CompletionToken};
 use super::execution::PreparedProgram;
-use super::worker_pool::{ChunkOutcome, ExecutionPool, JobKind, TaskHandle, TaskOutcome};
+use super::worker_pool::{
+    ChunkOutcome, CombineOutcome, ExecutionPool, JobKind, ReduceChunkOutcome, TaskHandle,
+    TaskOutcome,
+};
 use super::{BackendError, ExecutionValue, MemoryStats, mir, scalar};
 
 /// Opaque, stable identity for one task within its owning [`TaskRuntime`].
@@ -666,6 +669,79 @@ impl TaskRuntime {
         }
         collect_chunks(receivers)
     }
+
+    /// `Parallel.Reduce(values, identity, Accumulate, Combine)`: `values` are
+    /// already the host-owned scalar copies (see `async_abi`); no array
+    /// pointer ever reaches a worker. An empty array returns `identity`
+    /// without running `Accumulate` or `Combine` at all. Chunk partials are
+    /// collected in chunk-index order (never completion order) and folded
+    /// left to right with `Combine`.
+    pub(super) fn parallel_reduce(
+        &self,
+        values: Vec<ExecutionValue>,
+        identity: ExecutionValue,
+        accumulate: mir::SymbolId,
+        combine: mir::SymbolId,
+    ) -> Result<ExecutionValue, BackendError> {
+        if values.is_empty() {
+            return Ok(identity);
+        }
+        let boundaries = chunk_boundaries(values.len(), self.worker_count);
+        let mut receivers = Vec::with_capacity(boundaries.len());
+        let mut values = values;
+        let mut base = 0;
+        for length in boundaries {
+            let rest = values.split_off(length);
+            let chunk_values = std::mem::replace(&mut values, rest);
+            let submission = self.pool.submit_reduce_chunk(JobKind::ReduceChunk {
+                symbol: accumulate,
+                base,
+                identity: identity.clone(),
+                values: chunk_values,
+            });
+            match submission {
+                Ok(receiver) => receivers.push(receiver),
+                Err(error) => {
+                    let _ = collect_reduce_chunks(receivers);
+                    return Err(error);
+                }
+            }
+            base += length;
+        }
+        let partials = collect_reduce_chunks(receivers)?;
+        self.combine_partials(combine, partials)
+    }
+
+    /// Fold `partials` (one owned scalar per chunk, already ordered by chunk
+    /// index) left to right with `Combine`, submitting at most
+    /// `partials.len() - 1` combine jobs to this same pool, one at a time,
+    /// waiting for each result before submitting the next. This never
+    /// reenters the `PreparedProgram` that is running the call that started
+    /// the reduction: every `Combine` call runs on a pool worker, exactly
+    /// like an accumulation chunk.
+    fn combine_partials(
+        &self,
+        combine: mir::SymbolId,
+        mut partials: Vec<ExecutionValue>,
+    ) -> Result<ExecutionValue, BackendError> {
+        // `parallel_reduce` only calls this with at least one partial: an
+        // empty `values` array returns early, and every chunk boundary is
+        // non-empty, so `collect_reduce_chunks` never returns an empty `Vec`
+        // once `values` was non-empty.
+        let mut accumulator = partials.remove(0);
+        for right in partials {
+            let receiver = self.pool.submit_combine_step(JobKind::CombineStep {
+                symbol: combine,
+                left: accumulator.clone(),
+                right,
+            })?;
+            let CombineOutcome { result } = receiver.recv().map_err(|_| {
+                BackendError::new("a Parallel.Reduce combine worker disconnected before finishing")
+            })?;
+            accumulator = result?;
+        }
+        Ok(accumulator)
+    }
 }
 
 impl Drop for TaskRuntime {
@@ -722,6 +798,42 @@ fn collect_chunks(
     }
 }
 
+/// Wait for every accepted `Parallel.Reduce` chunk (draining every receiver
+/// regardless of an earlier failure) and either propagate the failure with
+/// the smallest logical array position, independent of completion order, or
+/// return every chunk's owned partial result in chunk-index order.
+fn collect_reduce_chunks(
+    receivers: Vec<std::sync::mpsc::Receiver<ReduceChunkOutcome>>,
+) -> Result<Vec<ExecutionValue>, BackendError> {
+    let mut first_error: Option<(i64, BackendError)> = None;
+    let mut partials = Vec::with_capacity(receivers.len());
+    let mut disconnected = false;
+    for receiver in receivers {
+        let Ok(outcome) = receiver.recv() else {
+            disconnected = true;
+            continue;
+        };
+        match outcome.result {
+            Ok(value) => partials.push(value),
+            Err((index, error)) => {
+                if first_error
+                    .as_ref()
+                    .is_none_or(|(current, _)| index < *current)
+                {
+                    first_error = Some((index, error));
+                }
+            }
+        }
+    }
+    match first_error {
+        Some((_, error)) => Err(error),
+        None if disconnected => Err(BackendError::new(
+            "a Parallel.Reduce worker disconnected before finishing",
+        )),
+        None => Ok(partials),
+    }
+}
+
 /// Whether `module` uses any concurrency intrinsic and therefore needs a
 /// [`TaskRuntime`] for the duration of a top-level execution. The only place
 /// this crate inspects MIR to decide that; a fully sequential module never
@@ -738,7 +850,8 @@ pub(super) fn module_uses_tasks(module: &mir::Module) -> bool {
                             | mir::Intrinsic::AsyncSpawn
                             | mir::Intrinsic::AsyncSpawnInner
                             | mir::Intrinsic::ParallelFor
-                            | mir::Intrinsic::ParallelForEach,
+                            | mir::Intrinsic::ParallelForEach
+                            | mir::Intrinsic::ParallelReduce,
                         ..
                     }
                 )
@@ -1082,5 +1195,235 @@ mod tests {
         let error = collect_chunks(vec![disconnected_rx, logical_rx])
             .expect_err("all receivers are drained before selection");
         assert!(error.message().contains("later logical failure"));
+    }
+
+    // --- Parallel.Reduce ---------------------------------------------------
+
+    fn symbol(module: &mir::Module, name: &str) -> mir::SymbolId {
+        module
+            .functions
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap_or_else(|| panic!("{name} is declared"))
+            .symbol
+    }
+
+    const REDUCE_SOURCE: &str = "public int AddValue(int accumulator, int value) { return accumulator + value; } \
+         public int AddPartial(int left, int right) { return left + right; }";
+
+    /// Deterministic proof that chunk partials are ordered by chunk index,
+    /// never by arrival order: messages are sent in reverse of receiver
+    /// order (simulating chunk 2 completing before chunks 0 and 1), and
+    /// `collect_reduce_chunks` must still return them index-ordered. No
+    /// sleep, no real thread race: the ordering guarantee is structural
+    /// (`Receiver::recv` on receiver *i* only ever observes sender *i*'s
+    /// message), and this test exercises that structure directly.
+    #[test]
+    fn reduce_chunk_partials_are_ordered_by_chunk_index_not_send_order() {
+        let (tx0, rx0) = mpsc::channel();
+        let (tx1, rx1) = mpsc::channel();
+        let (tx2, rx2) = mpsc::channel();
+        tx2.send(ReduceChunkOutcome {
+            result: Ok(ExecutionValue::Int(3)),
+        })
+        .expect("chunk 2 sends first");
+        tx0.send(ReduceChunkOutcome {
+            result: Ok(ExecutionValue::Int(1)),
+        })
+        .expect("chunk 0 sends second");
+        tx1.send(ReduceChunkOutcome {
+            result: Ok(ExecutionValue::Int(2)),
+        })
+        .expect("chunk 1 sends last");
+
+        let partials = collect_reduce_chunks(vec![rx0, rx1, rx2]).expect("every chunk succeeded");
+        assert_eq!(
+            partials,
+            vec![
+                ExecutionValue::Int(1),
+                ExecutionValue::Int(2),
+                ExecutionValue::Int(3)
+            ]
+        );
+    }
+
+    /// Deterministic proof that the smallest *logical* index wins regardless
+    /// of which failing chunk's message arrives first.
+    #[test]
+    fn reduce_chunk_error_selection_picks_the_smallest_logical_index_regardless_of_send_order() {
+        let (tx0, rx0) = mpsc::channel();
+        let (tx1, rx1) = mpsc::channel();
+        // The chunk covering the *later* logical position reports first.
+        tx1.send(ReduceChunkOutcome {
+            result: Err((5, BackendError::new("late position failure"))),
+        })
+        .expect("chunk 1 sends first");
+        tx0.send(ReduceChunkOutcome {
+            result: Err((2, BackendError::new("early position failure"))),
+        })
+        .expect("chunk 0 sends second");
+
+        let error = collect_reduce_chunks(vec![rx0, rx1])
+            .expect_err("an accumulation error must propagate");
+        assert!(error.message().contains("early position failure"));
+    }
+
+    /// Every accepted chunk is drained even when one receiver disconnects,
+    /// mirroring `disconnected_chunk_does_not_prevent_draining_later_outcomes`.
+    #[test]
+    fn disconnected_reduce_chunk_does_not_prevent_draining_a_later_failure() {
+        let (disconnected_tx, disconnected_rx) = mpsc::channel();
+        drop(disconnected_tx);
+        let (logical_tx, logical_rx) = mpsc::channel();
+        logical_tx
+            .send(ReduceChunkOutcome {
+                result: Err((7, BackendError::new("later logical failure"))),
+            })
+            .expect("logical outcome is queued");
+
+        let error = collect_reduce_chunks(vec![disconnected_rx, logical_rx])
+            .expect_err("all receivers are drained before selection");
+        assert!(error.message().contains("later logical failure"));
+    }
+
+    #[test]
+    fn parallel_reduce_gives_the_same_result_with_one_two_or_many_workers() {
+        let values: Vec<ExecutionValue> = (1..=50).map(ExecutionValue::Int).collect();
+        let expected = ExecutionValue::Int((1..=50).sum());
+        for worker_count in [1, 2, 8] {
+            let module = compile(REDUCE_SOURCE);
+            let accumulate = symbol(&module, "AddValue");
+            let combine = symbol(&module, "AddPartial");
+            let runtime = TaskRuntime::new(&Arc::new(module), worker_count)
+                .expect("runtime starts with the requested worker count");
+            let result = runtime
+                .parallel_reduce(values.clone(), ExecutionValue::Int(0), accumulate, combine)
+                .expect("reduction succeeds");
+            assert_eq!(
+                result, expected,
+                "worker_count {worker_count} produced a different result"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_reduce_empty_array_returns_identity_directly() {
+        let module = compile(REDUCE_SOURCE);
+        let accumulate = symbol(&module, "AddValue");
+        let combine = symbol(&module, "AddPartial");
+        let runtime = TaskRuntime::new(&Arc::new(module), 4).expect("runtime starts");
+        let result = runtime
+            .parallel_reduce(Vec::new(), ExecutionValue::Int(99), accumulate, combine)
+            .expect("an empty array never fails");
+        assert_eq!(result, ExecutionValue::Int(99));
+    }
+
+    #[test]
+    fn parallel_reduce_combines_partials_left_to_right_in_chunk_order() {
+        // `Combine(left, right) = left * 100 + right` is sensitive to
+        // combination order: getting chunk order wrong changes the result.
+        // With 4 workers over 4 single-element chunks (`[1, 2, 3, 4]`),
+        // `Accumulate` returns each element itself (identity `0`), so the
+        // only way to reach `1020304` is folding strictly left to right in
+        // chunk (array-position) order.
+        let module = compile(
+            "public int AddValue(int accumulator, int value) { return accumulator + value; } \
+             public int Weighted(int left, int right) { return left * 100 + right; }",
+        );
+        let accumulate = symbol(&module, "AddValue");
+        let combine = symbol(&module, "Weighted");
+        let runtime = TaskRuntime::new(&Arc::new(module), 4).expect("runtime starts");
+        let values = vec![
+            ExecutionValue::Int(1),
+            ExecutionValue::Int(2),
+            ExecutionValue::Int(3),
+            ExecutionValue::Int(4),
+        ];
+        let result = runtime
+            .parallel_reduce(values, ExecutionValue::Int(0), accumulate, combine)
+            .expect("reduction succeeds");
+        assert_eq!(result, ExecutionValue::Int(1_020_304));
+    }
+
+    #[test]
+    fn parallel_reduce_repeated_executions_with_the_same_worker_count_return_the_same_result() {
+        let module = Arc::new(compile(REDUCE_SOURCE));
+        let accumulate = symbol(&module, "AddValue");
+        let combine = symbol(&module, "AddPartial");
+        let runtime = TaskRuntime::new(&module, 4).expect("runtime starts");
+        let values: Vec<ExecutionValue> = (1..=30).map(ExecutionValue::Int).collect();
+        for _ in 0..10 {
+            let result = runtime
+                .parallel_reduce(values.clone(), ExecutionValue::Int(0), accumulate, combine)
+                .expect("reduction succeeds");
+            assert_eq!(result, ExecutionValue::Int((1..=30).sum()));
+        }
+    }
+
+    #[test]
+    fn a_parallel_reduce_accumulate_error_does_not_contaminate_a_later_reduction() {
+        let module = Arc::new(compile(
+            "public int Boom(int accumulator, int value) { int[] a = new int[1]; return a[value]; } \
+             public int AddPartial(int left, int right) { return left + right; }",
+        ));
+        let boom = symbol(&module, "Boom");
+        let combine = symbol(&module, "AddPartial");
+        let runtime = TaskRuntime::new(&module, 2).expect("runtime starts");
+
+        let failing = runtime.parallel_reduce(
+            vec![ExecutionValue::Int(5)],
+            ExecutionValue::Int(0),
+            boom,
+            combine,
+        );
+        assert!(failing.is_err(), "the out-of-bounds access must fail");
+
+        let succeeding = runtime.parallel_reduce(
+            vec![ExecutionValue::Int(0)],
+            ExecutionValue::Int(0),
+            boom,
+            combine,
+        );
+        assert_eq!(
+            succeeding,
+            Ok(ExecutionValue::Int(0)),
+            "a later, valid reduction must not be affected by the earlier failure"
+        );
+    }
+
+    #[test]
+    fn a_parallel_reduce_combine_error_does_not_contaminate_a_later_reduction() {
+        let module = Arc::new(compile(
+            "public int AddValue(int accumulator, int value) { return accumulator + value; } \
+             public int BoomCombine(int left, int right) { int[] a = new int[1]; return a[left + right]; }",
+        ));
+        let accumulate = symbol(&module, "AddValue");
+        let boom_combine = symbol(&module, "BoomCombine");
+        let runtime = TaskRuntime::new(&module, 4).expect("runtime starts");
+
+        // Two single-element chunks (4 workers, 2 elements) force exactly one
+        // combine step; `left + right` (1) is out of bounds against `a`.
+        let failing = runtime.parallel_reduce(
+            vec![ExecutionValue::Int(0), ExecutionValue::Int(1)],
+            ExecutionValue::Int(0),
+            accumulate,
+            boom_combine,
+        );
+        assert!(
+            failing.is_err(),
+            "the combine step's failure must propagate"
+        );
+
+        let succeeding = runtime.parallel_reduce(
+            vec![ExecutionValue::Int(1)],
+            ExecutionValue::Int(0),
+            accumulate,
+            boom_combine,
+        );
+        assert_eq!(
+            succeeding,
+            Ok(ExecutionValue::Int(1)),
+            "a later reduction needing no combine step must not be affected"
+        );
     }
 }

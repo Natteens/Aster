@@ -1,7 +1,7 @@
 use super::{
     Analyzer, Callable, Diagnostic, Dispatch, Expression, ExpressionKind, Primitive, ResolvedCall,
-    ResolvedEnumCase, ResolvedParallelFor, ResolvedParallelForEach, ResolvedTaskRun, Signature,
-    Span, Type, TypeKind, Visibility,
+    ResolvedEnumCase, ResolvedParallelFor, ResolvedParallelForEach, ResolvedParallelReduce,
+    ResolvedTaskRun, Signature, Span, Type, TypeKind, Visibility,
 };
 
 impl Analyzer<'_> {
@@ -326,6 +326,9 @@ impl Analyzer<'_> {
         }
         if is_parallel_for_each_callee(callee) {
             return self.parallel_for_each(arguments, span);
+        }
+        if is_parallel_reduce_callee(callee) {
+            return self.parallel_reduce(arguments, span);
         }
         if let ExpressionKind::Member { object, name } = &callee.kind
             && name == "Wait"
@@ -845,6 +848,210 @@ impl Analyzer<'_> {
         Type::Void
     }
 
+    /// `Parallel.Reduce(values, identity, Accumulate, Combine)`: `values` must
+    /// be an array of a worker-transferable element type (`TElement`);
+    /// `identity` must itself be worker-transferable, and its type fixes the
+    /// accumulator type (`TAccumulator`) for this call. `Accumulate` must
+    /// directly name a resolvable zero-capture free function or static
+    /// method `TAccumulator(TAccumulator, TElement)`; `Combine` must directly
+    /// name one `TAccumulator(TAccumulator, TAccumulator)`. Arguments are
+    /// evaluated left to right, exactly once: `values`, then `identity`;
+    /// `Accumulate`/`Combine` are never evaluated as runtime expressions,
+    /// only resolved structurally, exactly like `Parallel.For`/`ForEach`'s body.
+    fn parallel_reduce(&mut self, arguments: &[Expression], span: Span) -> Type {
+        let [values, identity, accumulate_argument, combine_argument] = arguments else {
+            self.diagnostics.push(Diagnostic::error(
+                format!(
+                    "`Parallel.Reduce` expects exactly 4 arguments, found {}",
+                    arguments.len()
+                ),
+                span,
+            ));
+            for argument in arguments {
+                self.expression(argument);
+            }
+            return Type::Unknown;
+        };
+        let values_type = self.expression(values);
+        let Type::Array(element_type) = values_type else {
+            self.diagnostics.push(Diagnostic::error(
+                "`Parallel.Reduce` requires an array argument",
+                values.span,
+            ));
+            self.expression(identity);
+            self.expression(accumulate_argument);
+            self.expression(combine_argument);
+            return Type::Unknown;
+        };
+        if !transferable(&element_type) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "`Parallel.Reduce` over `{}[]` requires a scalar element type in this version",
+                        element_type.display()
+                    ),
+                    values.span,
+                )
+                .with_help("Parallel.Reduce currently supports only scalar elements: bool, char, integers, floats"),
+            );
+            self.expression(identity);
+            self.expression(accumulate_argument);
+            self.expression(combine_argument);
+            return Type::Unknown;
+        }
+        let identity_type = self.expression(identity);
+        if !transferable(&identity_type) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "`Parallel.Reduce` identity of type `{}` cannot cross a worker boundary in this version",
+                        identity_type.display()
+                    ),
+                    identity.span,
+                )
+                .with_help("the identity must be a scalar value: bool, char, integers, floats"),
+            );
+            self.expression(accumulate_argument);
+            self.expression(combine_argument);
+            return Type::Unknown;
+        }
+        let Some(accumulate) = self.resolve_reduce_operator_target(
+            accumulate_argument,
+            "Accumulate",
+            &[identity_type.clone(), (*element_type).clone()],
+            &identity_type,
+        ) else {
+            self.expression(combine_argument);
+            return Type::Unknown;
+        };
+        let Some(combine) = self.resolve_reduce_operator_target(
+            combine_argument,
+            "Combine",
+            &[identity_type.clone(), identity_type.clone()],
+            &identity_type,
+        ) else {
+            return Type::Unknown;
+        };
+        self.model.parallel_reduce.insert(
+            self.model_key(span),
+            ResolvedParallelReduce {
+                accumulate: accumulate.key,
+                combine: combine.key,
+            },
+        );
+        identity_type
+    }
+
+    /// Resolve a `Parallel.Reduce` `Accumulate`/`Combine` argument to the
+    /// concrete, zero-capture free function or static method it directly
+    /// names, with exactly `expected_parameters` and exactly
+    /// `expected_return`. Generalizes [`Self::resolve_parallel_body_target`]
+    /// to a non-`void` return and two parameters: never a variable, an
+    /// instance method, an async function, or any other expression shape.
+    fn resolve_reduce_operator_target(
+        &mut self,
+        argument: &Expression,
+        operator_name: &str,
+        expected_parameters: &[Type],
+        expected_return: &Type,
+    ) -> Option<Callable> {
+        let candidates = match &argument.kind {
+            ExpressionKind::Name(name) => {
+                let mut candidates = self
+                    .context
+                    .functions
+                    .get(name)
+                    .into_iter()
+                    .flatten()
+                    .filter(|candidate| candidate.is_static)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                candidates.extend(
+                    self.methods
+                        .get(name)
+                        .into_iter()
+                        .flatten()
+                        .filter(|candidate| candidate.is_static)
+                        .cloned(),
+                );
+                candidates
+            }
+            ExpressionKind::Member { object, name } => {
+                let ExpressionKind::Name(type_name) = &object.kind else {
+                    self.diagnostics.push(Diagnostic::error(
+                        format!(
+                            "a `Parallel.Reduce` {operator_name} must directly name a static method or free function"
+                        ),
+                        argument.span,
+                    ));
+                    return None;
+                };
+                let Some(info) = self.context.types.get(type_name) else {
+                    self.diagnostics.push(Diagnostic::error(
+                        format!("unknown type `{type_name}`"),
+                        argument.span,
+                    ));
+                    return None;
+                };
+                info.methods
+                    .get(name)
+                    .into_iter()
+                    .flatten()
+                    .filter(|candidate| candidate.is_static)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            }
+            _ => {
+                self.diagnostics.push(Diagnostic::error(
+                    format!(
+                        "a `Parallel.Reduce` {operator_name} must directly name a static method or free function"
+                    ),
+                    argument.span,
+                ));
+                return None;
+            }
+        };
+        let matching = candidates
+            .into_iter()
+            .filter(|candidate| {
+                candidate.signature.result == *expected_return
+                    && candidate.signature.parameters == expected_parameters
+            })
+            .collect::<Vec<_>>();
+        match matching.len() {
+            0 => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "no static method or free function with signature `{}({})` is available for this `Parallel.Reduce` {operator_name}",
+                            expected_return.display(),
+                            expected_parameters
+                                .iter()
+                                .map(Type::display)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        argument.span,
+                    )
+                    .with_help(format!(
+                        "{operator_name} must be a static method or free function taking exactly the expected parameters and returning the accumulator type"
+                    )),
+                );
+                None
+            }
+            1 => matching.into_iter().next(),
+            _ => {
+                self.diagnostics.push(Diagnostic::error(
+                    format!(
+                        "this `Parallel.Reduce` {operator_name} is ambiguous among multiple candidates"
+                    ),
+                    argument.span,
+                ));
+                None
+            }
+        }
+    }
+
     /// Resolve a `Parallel.For`/`Parallel.ForEach` body argument to the
     /// concrete, zero-capture free function or static method it directly
     /// names, with exactly `expected_parameters` and a `void` result. Mirrors
@@ -996,6 +1203,16 @@ pub(super) fn is_parallel_for_each_callee(callee: &Expression) -> bool {
         &callee.kind,
         ExpressionKind::Member { object, name }
             if name == "ForEach"
+                && matches!(&object.kind, ExpressionKind::Name(object) if object == "Parallel")
+    )
+}
+
+/// Structural check for `Parallel.Reduce(...)`, mirroring [`is_task_run_callee`].
+pub(super) fn is_parallel_reduce_callee(callee: &Expression) -> bool {
+    matches!(
+        &callee.kind,
+        ExpressionKind::Member { object, name }
+            if name == "Reduce"
                 && matches!(&object.kind, ExpressionKind::Name(object) if object == "Parallel")
     )
 }

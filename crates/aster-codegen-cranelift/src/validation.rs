@@ -554,6 +554,35 @@ fn validate_intrinsic_shape(
                             )
                 )
         }
+        mir::Intrinsic::ParallelReduce => {
+            destination.is_some()
+                && is_worker_transferable(return_type)
+                && matches!(
+                    arguments,
+                    [values, identity, accumulate, combine]
+                        if matches!(
+                            &values.type_,
+                            mir::Type::Array(element) if **element == accumulate.type_
+                        )
+                            && is_worker_transferable(&accumulate.type_)
+                            && identity.type_ == *return_type
+                            && matches!(accumulate.kind, mir::OperandKind::Function(_))
+                            && function_operand_matches(
+                                accumulate,
+                                &[return_type.clone(), accumulate.type_.clone()],
+                                return_type,
+                                signatures,
+                            )
+                            && combine.type_ == *return_type
+                            && matches!(combine.kind, mir::OperandKind::Function(_))
+                            && function_operand_matches(
+                                combine,
+                                &[return_type.clone(), return_type.clone()],
+                                return_type,
+                                signatures,
+                            )
+                )
+        }
     };
     if valid {
         Ok(())
@@ -1011,5 +1040,190 @@ mod tests {
         let error = validate_module(&module)
             .expect_err("a string async frame slot must be rejected (arena identity)");
         assert!(error.message().contains("malformed AsyncStoreSlot"));
+    }
+
+    const REDUCE_SOURCE: &str = "public int AddValue(int accumulator, int value) { return accumulator + value; } \
+         public int AddPartial(int left, int right) { return left + right; } \
+         public class Box { public Box() {} } \
+         public Box MakeBox() { return new Box(); } \
+         public int Main() { int[] values = [1, 2, 3]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }";
+
+    fn mutate_reduce<F>(source: &str, mut mutate: F) -> mir::Module
+    where
+        F: FnMut(&mut Option<mir::Place>, &mut [mir::Operand], &mut mir::Type),
+    {
+        let mut module = aster_compiler::compile(source)
+            .expect("source compiles")
+            .mir;
+        for function in &mut module.functions {
+            for block in &mut function.blocks {
+                for instruction in &mut block.instructions {
+                    if let mir::Instruction::CallIntrinsic {
+                        intrinsic: mir::Intrinsic::ParallelReduce,
+                        destination,
+                        arguments,
+                        return_type,
+                    } = instruction
+                    {
+                        mutate(destination, arguments, return_type);
+                    }
+                }
+            }
+        }
+        module
+    }
+
+    #[test]
+    fn parallel_reduce_rejects_a_nonexistent_accumulate_symbol() {
+        let module = mutate_reduce(REDUCE_SOURCE, |_, arguments, _| {
+            arguments[2].kind = mir::OperandKind::Function(mir::SymbolId(999_999));
+        });
+        let error =
+            validate_module(&module).expect_err("a symbol absent from the module must be rejected");
+        assert!(error.message().contains("malformed ParallelReduce"));
+    }
+
+    #[test]
+    fn parallel_reduce_rejects_an_accumulate_retargeted_to_a_mismatched_symbol() {
+        // Retarget `Accumulate` to `MakeBox`, a real symbol in the module
+        // whose actual arity (zero parameters) and return type (`Box`)
+        // match neither `Accumulate`'s required shape nor its carried
+        // element type: `function_operand_matches` must reject it.
+        let compiled = aster_compiler::compile(REDUCE_SOURCE)
+            .expect("source compiles")
+            .mir;
+        let make_box = compiled
+            .functions
+            .iter()
+            .find(|function| function.name == "MakeBox")
+            .expect("MakeBox is declared")
+            .symbol;
+        let mut module = compiled;
+        for function in &mut module.functions {
+            for block in &mut function.blocks {
+                for instruction in &mut block.instructions {
+                    if let mir::Instruction::CallIntrinsic {
+                        intrinsic: mir::Intrinsic::ParallelReduce,
+                        arguments,
+                        ..
+                    } = instruction
+                    {
+                        arguments[2].kind = mir::OperandKind::Function(make_box);
+                    }
+                }
+            }
+        }
+
+        let error =
+            validate_module(&module).expect_err("an arity/signature mismatch must be rejected");
+        assert!(error.message().contains("malformed ParallelReduce"));
+    }
+
+    #[test]
+    fn parallel_reduce_rejects_a_mutated_return_type_with_arena_identity() {
+        // `box` is a genuine `Class(Box)`-typed local (a `Copy` operand, not
+        // a reinterpreted integer constant), so retargeting `identity` to it
+        // isolates the `is_worker_transferable` gate itself rather than
+        // tripping the unrelated integer-constant-width check.
+        let compiled = aster_compiler::compile(
+            "public int AddValue(int accumulator, int value) { return accumulator + value; } \
+             public int AddPartial(int left, int right) { return left + right; } \
+             public class Box { public Box() {} } \
+             public Box MakeBox() { return new Box(); } \
+             public int Main() { \
+                 Box box = MakeBox(); \
+                 int[] values = [1, 2, 3]; \
+                 return Parallel.Reduce(values, 0, AddValue, AddPartial); \
+             }",
+        )
+        .expect("source compiles")
+        .mir;
+        let box_class = compiled
+            .classes
+            .iter()
+            .find(|class| class.name == "Box")
+            .expect("Box is declared")
+            .symbol;
+        let make_box = compiled
+            .functions
+            .iter()
+            .find(|function| function.name == "MakeBox")
+            .expect("MakeBox is declared")
+            .symbol;
+        let mut module = compiled;
+        for function in &mut module.functions {
+            if function.name != "Main" {
+                continue;
+            }
+            let box_local = function
+                .locals
+                .iter()
+                .find(|local| local.type_ == mir::Type::Class(box_class))
+                .expect("`box` local is present")
+                .id;
+            for block in &mut function.blocks {
+                for instruction in &mut block.instructions {
+                    if let mir::Instruction::CallIntrinsic {
+                        intrinsic: mir::Intrinsic::ParallelReduce,
+                        arguments,
+                        return_type,
+                        ..
+                    } = instruction
+                    {
+                        // Retarget both operators and the declared return
+                        // type consistently to `Box`, so only the
+                        // `is_worker_transferable` gate (not a mere
+                        // signature mismatch) is exercised.
+                        *return_type = mir::Type::Class(box_class);
+                        arguments[1] = mir::Operand {
+                            type_: mir::Type::Class(box_class),
+                            kind: mir::OperandKind::Copy(mir::Place::Local(box_local)),
+                        };
+                        arguments[2].kind = mir::OperandKind::Function(make_box);
+                        arguments[2].type_ = mir::Type::Int;
+                        arguments[3].kind = mir::OperandKind::Function(make_box);
+                        arguments[3].type_ = mir::Type::Class(box_class);
+                    }
+                }
+            }
+        }
+
+        let error = validate_module(&module)
+            .expect_err("a Parallel.Reduce result with arena identity must be rejected");
+        assert!(error.message().contains("malformed ParallelReduce"));
+    }
+
+    #[test]
+    fn parallel_reduce_rejects_a_mutated_element_type_mismatch() {
+        let module = mutate_reduce(REDUCE_SOURCE, |_, arguments, _| {
+            // The array's element type (`int`) no longer matches
+            // `Accumulate`'s carried element type.
+            arguments[2].type_ = mir::Type::Long;
+        });
+        let error = validate_module(&module)
+            .expect_err("an element/parameter type mismatch must be rejected");
+        assert!(error.message().contains("malformed ParallelReduce"));
+    }
+
+    #[test]
+    fn parallel_reduce_rejects_a_mutated_combine_type() {
+        let module = mutate_reduce(REDUCE_SOURCE, |_, arguments, _| {
+            arguments[3].type_ = mir::Type::Long;
+        });
+        let error = validate_module(&module).expect_err(
+            "a Combine operand type inconsistent with the declared result must be rejected",
+        );
+        assert!(error.message().contains("malformed ParallelReduce"));
+    }
+
+    #[test]
+    fn parallel_reduce_rejects_a_missing_destination() {
+        let module = mutate_reduce(REDUCE_SOURCE, |destination, _, _| {
+            *destination = None;
+        });
+        let error = validate_module(&module).expect_err(
+            "Parallel.Reduce always produces a value; a missing destination is malformed",
+        );
+        assert!(error.message().contains("malformed ParallelReduce"));
     }
 }

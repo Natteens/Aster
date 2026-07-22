@@ -36,6 +36,21 @@ pub(super) struct ChunkOutcome {
     pub(super) first_error: Option<(i64, BackendError)>,
 }
 
+/// The result of one `Parallel.Reduce` accumulation chunk: the chunk's owned
+/// partial result, or the first failing element's logical array position.
+#[derive(Debug)]
+pub(super) struct ReduceChunkOutcome {
+    pub(super) result: Result<ExecutionValue, (i64, BackendError)>,
+}
+
+/// The result of one `Parallel.Reduce` combine step: the combined scalar, or
+/// a controlled error from that specific `Combine` call. No logical index: a
+/// combine step folds two chunk partials, not one array position.
+#[derive(Debug)]
+pub(super) struct CombineOutcome {
+    pub(super) result: Result<ExecutionValue, BackendError>,
+}
+
 /// What one job asks a worker to do. Every variant resolves a MIR function by
 /// its concrete symbol; no textual lookup and no per-iteration JIT happen.
 pub(super) enum JobKind {
@@ -57,6 +72,26 @@ pub(super) enum JobKind {
         base: usize,
         values: Vec<ExecutionValue>,
     },
+    /// `Accumulate(identity, values[i])` folded sequentially over one
+    /// `Parallel.Reduce` chunk of host-owned scalar copies, whose first
+    /// element is the original array position `base`. `identity` is an owned
+    /// copy, never a shared accumulator.
+    ReduceChunk {
+        symbol: mir::SymbolId,
+        base: usize,
+        identity: ExecutionValue,
+        values: Vec<ExecutionValue>,
+    },
+    /// One `Combine(left, right)` call submitted to the pool during a
+    /// `Parallel.Reduce`'s sequential combination phase, so the host thread
+    /// running `Main` never reenters its own `PreparedProgram`. Submitted one
+    /// at a time, never concurrently with another combine step of the same
+    /// reduction.
+    CombineStep {
+        symbol: mir::SymbolId,
+        left: ExecutionValue,
+        right: ExecutionValue,
+    },
     /// Test-only host panic injection used to verify pool-wide failure cleanup.
     #[cfg(test)]
     Panic(Arc<std::sync::Barrier>),
@@ -66,6 +101,8 @@ pub(super) enum JobKind {
 enum Respond {
     Task(mpsc::Sender<TaskOutcome>),
     Chunk(mpsc::Sender<ChunkOutcome>),
+    Reduce(mpsc::Sender<ReduceChunkOutcome>),
+    Combine(mpsc::Sender<CombineOutcome>),
 }
 
 struct Job {
@@ -210,6 +247,27 @@ fn worker_loop(
                 Respond::Chunk(reply),
             ) => {
                 let _ = reply.send(program.run_for_each_chunk(symbol, base, &values));
+            }
+            (
+                JobKind::ReduceChunk {
+                    symbol,
+                    base,
+                    identity,
+                    values,
+                },
+                Respond::Reduce(reply),
+            ) => {
+                let _ = reply.send(program.run_reduce_chunk(symbol, base, &identity, &values));
+            }
+            (
+                JobKind::CombineStep {
+                    symbol,
+                    left,
+                    right,
+                },
+                Respond::Combine(reply),
+            ) => {
+                let _ = reply.send(program.run_combine_step(symbol, &left, &right));
             }
             #[cfg(test)]
             (JobKind::Panic(barrier), Respond::Task(_reply)) => {
@@ -419,6 +477,39 @@ impl ExecutionPool {
         Ok(receiver)
     }
 
+    /// Queue one `Parallel.Reduce` accumulation chunk and return the channel
+    /// its [`ReduceChunkOutcome`] arrives on.
+    pub(super) fn submit_reduce_chunk(
+        &self,
+        kind: JobKind,
+    ) -> Result<mpsc::Receiver<ReduceChunkOutcome>, BackendError> {
+        let (reply, receiver) = mpsc::channel();
+        self.queue.push(Job {
+            kind,
+            respond: Respond::Reduce(reply),
+            completion: None,
+        })?;
+        Ok(receiver)
+    }
+
+    /// Queue one `Parallel.Reduce` combine step and return the channel its
+    /// [`CombineOutcome`] arrives on. Callers submit these one at a time,
+    /// waiting for each result before submitting the next, so the sequential
+    /// combination phase never runs two `Combine` calls of the same
+    /// reduction concurrently.
+    pub(super) fn submit_combine_step(
+        &self,
+        kind: JobKind,
+    ) -> Result<mpsc::Receiver<CombineOutcome>, BackendError> {
+        let (reply, receiver) = mpsc::channel();
+        self.queue.push(Job {
+            kind,
+            respond: Respond::Combine(reply),
+            completion: None,
+        })?;
+        Ok(receiver)
+    }
+
     #[cfg(test)]
     fn submit_panicking(
         &self,
@@ -499,6 +590,10 @@ mod tests {
         assert_send::<ChunkOutcome>();
         assert_send::<TaskOutcome>();
         assert_send::<Vec<ExecutionValue>>();
+        // `Parallel.Reduce`'s job/outcome types must hold to the same
+        // guarantee: only owned scalars, never a pointer or `ExecutionContext`.
+        assert_send::<ReduceChunkOutcome>();
+        assert_send::<CombineOutcome>();
     }
 
     #[test]

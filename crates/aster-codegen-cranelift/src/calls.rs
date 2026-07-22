@@ -106,7 +106,8 @@ impl Codegen {
             | mir::Intrinsic::AsyncAwaitResult
             | mir::Intrinsic::AsyncSetResult
             | mir::Intrinsic::ParallelFor
-            | mir::Intrinsic::ParallelForEach => {
+            | mir::Intrinsic::ParallelForEach
+            | mir::Intrinsic::ParallelReduce => {
                 return self.translate_async_intrinsic(
                     builder,
                     destination,
@@ -164,7 +165,8 @@ impl Codegen {
             | mir::Intrinsic::AsyncAwaitResult
             | mir::Intrinsic::AsyncSetResult
             | mir::Intrinsic::ParallelFor
-            | mir::Intrinsic::ParallelForEach => {
+            | mir::Intrinsic::ParallelForEach
+            | mir::Intrinsic::ParallelReduce => {
                 unreachable!("handled by the dedicated translators above")
             }
         };
@@ -393,6 +395,43 @@ impl Codegen {
                     "aster_parallel_for_each",
                     &[context, values, body, kind],
                 );
+            }
+            mir::Intrinsic::ParallelReduce => {
+                let values = self.translate_operand(builder, &arguments[0], state)?;
+                let identity_operand = &arguments[1];
+                let identity_kind = builder
+                    .ins()
+                    .iconst(types::I32, scalar_kind(&identity_operand.type_)?);
+                let identity_value = self.translate_operand(builder, identity_operand, state)?;
+                let identity_bits =
+                    scalar_to_bits(builder, &identity_operand.type_, identity_value)?;
+                let accumulate_operand = &arguments[2];
+                let accumulate = builder
+                    .ins()
+                    .iconst(types::I32, function_symbol(accumulate_operand)?);
+                // The element scalar type rides on the resolved `Accumulate`
+                // operand, exactly like `ParallelForEach`'s body operand.
+                let element_kind = builder
+                    .ins()
+                    .iconst(types::I32, scalar_kind(&accumulate_operand.type_)?);
+                let combine_operand = &arguments[3];
+                let combine = builder
+                    .ins()
+                    .iconst(types::I32, function_symbol(combine_operand)?);
+                let call = self.call_runtime(
+                    builder,
+                    "aster_parallel_reduce",
+                    &[
+                        context,
+                        values,
+                        identity_bits,
+                        identity_kind,
+                        element_kind,
+                        accumulate,
+                        combine,
+                    ],
+                );
+                self.store_scalar_from_bits(builder, destination, call, return_type, state)?;
             }
             _ => unreachable!("caller matched only async and Parallel intrinsics"),
         }

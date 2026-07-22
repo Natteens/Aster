@@ -1,14 +1,15 @@
 //! Conservative, transitive rejection of nested concurrency (Lote 5, kept
 //! deliberately simple ahead of Lote 6's real race/scheduling analysis).
 //!
-//! A function submitted to a worker (`Task.Run`'s target, or a `Parallel.For`
-//! /`Parallel.ForEach` body) must never itself, or through any function it
-//! calls, use `Task.Run`, `Task<T>.Wait`, `Parallel.For`/`Parallel.ForEach`,
-//! or be an `async` function. Symmetrically, an `async` function's own
-//! ordinary (non-awaited) calls must never reach `Parallel.For`/`ForEach`.
-//! Both rules are checked over the same resolved call graph. Interface calls
-//! conservatively expand to every exact registered implementation. A visited
-//! set bounds ordinary (non-concurrency) recursion.
+//! A function submitted to a worker (`Task.Run`'s target, a `Parallel.For`
+//! /`Parallel.ForEach` body, or a `Parallel.Reduce` `Accumulate`/`Combine`)
+//! must never itself, or through any function it calls, use `Task.Run`,
+//! `Task<T>.Wait`, `Parallel.For`/`ForEach`/`Reduce`, or be an `async`
+//! function. Symmetrically, an `async` function's own ordinary (non-awaited)
+//! calls must never reach `Parallel.For`/`ForEach`/`Reduce`. Both rules are
+//! checked over the same resolved call graph. Interface calls conservatively
+//! expand to every exact registered implementation. A visited set bounds
+//! ordinary (non-concurrency) recursion.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -88,6 +89,28 @@ pub(super) fn validate(
         check_target(
             &resolved.body,
             "Parallel.ForEach",
+            node_key.span,
+            &facts,
+            &callees,
+            model,
+            diagnostics,
+        );
+    }
+    let mut parallel_reduce = model.parallel_reduce.iter().collect::<Vec<_>>();
+    parallel_reduce.sort_by_key(|(key, _)| (key.context.as_str(), key.span.start, key.span.end));
+    for (node_key, resolved) in parallel_reduce {
+        check_target(
+            &resolved.accumulate,
+            "Parallel.Reduce (Accumulate)",
+            node_key.span,
+            &facts,
+            &callees,
+            model,
+            diagnostics,
+        );
+        check_target(
+            &resolved.combine,
+            "Parallel.Reduce (Combine)",
             node_key.span,
             &facts,
             &callees,
@@ -267,6 +290,9 @@ fn direct_use_in_body(body: &Block, context: &str, model: &Model) -> Option<&'st
         if super::calls::is_parallel_for_each_callee(callee) {
             return Some("`Parallel.ForEach`");
         }
+        if super::calls::is_parallel_reduce_callee(callee) {
+            return Some("`Parallel.Reduce`");
+        }
     }
     None
 }
@@ -320,6 +346,8 @@ fn find_reachable(
                         Some("`Parallel.For`")
                     } else if super::calls::is_parallel_for_each_callee(callee) {
                         Some("`Parallel.ForEach`")
+                    } else if super::calls::is_parallel_reduce_callee(callee) {
+                        Some("`Parallel.Reduce`")
                     } else {
                         None
                     }

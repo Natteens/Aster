@@ -338,6 +338,19 @@ pub enum ExpressionKind {
         element_type: Box<Type>,
         body: SymbolId,
     },
+    /// `Parallel.Reduce(values, identity, Accumulate, Combine)`: fold
+    /// `Accumulate` over every element of the scalar array `values`, starting
+    /// from `identity`, then combine chunk partials with `Combine`.
+    /// `element_type` is the concrete scalar element type (`TElement`);
+    /// `identity`'s type is the concrete accumulator type (`TAccumulator`).
+    /// This expression's type is always `TAccumulator`.
+    ParallelReduce {
+        values: Box<Expression>,
+        element_type: Box<Type>,
+        identity: Box<Expression>,
+        accumulate: SymbolId,
+        combine: SymbolId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

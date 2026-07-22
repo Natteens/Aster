@@ -174,6 +174,84 @@ impl PreparedProgram {
         }
         super::worker_pool::ChunkOutcome { first_error: None }
     }
+
+    /// Run one `Parallel.Reduce` accumulation chunk: fold `Accumulate` over
+    /// `values` in order, starting from an owned copy of `identity`, with one
+    /// `ExecutionContext` for the whole chunk. Stops at the first error,
+    /// reporting the failing element's logical array position (`base` plus
+    /// its offset within this chunk).
+    pub(super) fn run_reduce_chunk(
+        &self,
+        symbol: mir::SymbolId,
+        base: usize,
+        identity: &ExecutionValue,
+        values: &[ExecutionValue],
+    ) -> super::worker_pool::ReduceChunkOutcome {
+        use super::worker_pool::ReduceChunkOutcome;
+        let logical = |offset: usize| i64::try_from(base + offset).unwrap_or(i64::MAX);
+        let Some((pointer, _)) = self.entries.get(&symbol) else {
+            return ReduceChunkOutcome {
+                result: Err((
+                    logical(0),
+                    BackendError::new("Parallel.Reduce Accumulate was not prepared"),
+                )),
+            };
+        };
+        let mut context = aster_runtime::ExecutionContext::new();
+        let mut accumulator = identity.clone();
+        for (offset, value) in values.iter().enumerate() {
+            let next = match invoke_binary_scalar(*pointer, &mut context, &accumulator, value) {
+                Ok(next) => next,
+                Err(error) => {
+                    return ReduceChunkOutcome {
+                        result: Err((logical(offset), error)),
+                    };
+                }
+            };
+            if let Some(error) = context.take_error() {
+                return ReduceChunkOutcome {
+                    result: Err((
+                        logical(offset),
+                        BackendError::new(format!("Aster runtime error: {error}")),
+                    )),
+                };
+            }
+            accumulator = next;
+        }
+        ReduceChunkOutcome {
+            result: Ok(accumulator),
+        }
+    }
+
+    /// Run one `Parallel.Reduce` combine step: `Combine(left, right)` with its
+    /// own fresh `ExecutionContext`, never the `ExecutionContext` of any chunk
+    /// or of the invocation that started the reduction.
+    pub(super) fn run_combine_step(
+        &self,
+        symbol: mir::SymbolId,
+        left: &ExecutionValue,
+        right: &ExecutionValue,
+    ) -> super::worker_pool::CombineOutcome {
+        use super::worker_pool::CombineOutcome;
+        let Some((pointer, _)) = self.entries.get(&symbol) else {
+            return CombineOutcome {
+                result: Err(BackendError::new(
+                    "Parallel.Reduce Combine was not prepared",
+                )),
+            };
+        };
+        let mut context = aster_runtime::ExecutionContext::new();
+        let result = match invoke_binary_scalar(*pointer, &mut context, left, right) {
+            Ok(value) => value,
+            Err(error) => return CombineOutcome { result: Err(error) },
+        };
+        if let Some(error) = context.take_error() {
+            return CombineOutcome {
+                result: Err(BackendError::new(format!("Aster runtime error: {error}"))),
+            };
+        }
+        CombineOutcome { result: Ok(result) }
+    }
 }
 
 fn chunk_error(index: i64, message: impl Into<String>) -> super::worker_pool::ChunkOutcome {
@@ -258,6 +336,166 @@ fn invoke_body_scalar(
             ExecutionValue::String(_) | ExecutionValue::Void => {}
         }
     }
+}
+
+/// Invoke a `Parallel.Reduce` `Accumulate(TAccumulator, TElement) ->
+/// TAccumulator` or `Combine(TAccumulator, TAccumulator) -> TAccumulator`
+/// body with two scalar arguments, dispatching to the concrete ABI shape by
+/// each value's variant so width, signedness, and float bit patterns are
+/// preserved. `accumulator` and `element` may be different concrete scalar
+/// kinds (e.g. `Accumulate(int, long)`); `Combine` simply calls this with
+/// both arguments of the same kind. Never a panic: an invalid `char` result
+/// or a validated-impossible non-scalar variant is a controlled error,
+/// exactly like `execution::invoke_finalized`'s own `char` handling.
+#[allow(unsafe_code, clippy::too_many_lines)]
+fn invoke_binary_scalar(
+    pointer: *const u8,
+    context: &mut aster_runtime::ExecutionContext,
+    accumulator: &ExecutionValue,
+    element: &ExecutionValue,
+) -> Result<ExecutionValue, BackendError> {
+    // SAFETY: the body is finalized as `(ExecutionContext*, TAccumulator,
+    // TElement) -> TAccumulator` where the Cranelift types match the widths
+    // dispatched on here (validated shape: `validation::is_worker_transferable`
+    // on both the accumulator and element types).
+    macro_rules! call_with_element {
+        ($accumulator_native:ty, $accumulator_value:expr) => {
+            match element {
+                ExecutionValue::Bool(value) => {
+                    let function: extern "C" fn(
+                        *mut aster_runtime::ExecutionContext,
+                        $accumulator_native,
+                        i8,
+                    ) -> $accumulator_native = unsafe { std::mem::transmute(pointer) };
+                    function(context, $accumulator_value, i8::from(*value))
+                }
+                ExecutionValue::SByte(value) => {
+                    let function: extern "C" fn(
+                        *mut aster_runtime::ExecutionContext,
+                        $accumulator_native,
+                        i8,
+                    ) -> $accumulator_native = unsafe { std::mem::transmute(pointer) };
+                    function(context, $accumulator_value, *value)
+                }
+                ExecutionValue::Byte(value) => {
+                    let function: extern "C" fn(
+                        *mut aster_runtime::ExecutionContext,
+                        $accumulator_native,
+                        u8,
+                    ) -> $accumulator_native = unsafe { std::mem::transmute(pointer) };
+                    function(context, $accumulator_value, *value)
+                }
+                ExecutionValue::Short(value) => {
+                    let function: extern "C" fn(
+                        *mut aster_runtime::ExecutionContext,
+                        $accumulator_native,
+                        i16,
+                    ) -> $accumulator_native = unsafe { std::mem::transmute(pointer) };
+                    function(context, $accumulator_value, *value)
+                }
+                ExecutionValue::UShort(value) => {
+                    let function: extern "C" fn(
+                        *mut aster_runtime::ExecutionContext,
+                        $accumulator_native,
+                        u16,
+                    ) -> $accumulator_native = unsafe { std::mem::transmute(pointer) };
+                    function(context, $accumulator_value, *value)
+                }
+                ExecutionValue::Int(value) => {
+                    let function: extern "C" fn(
+                        *mut aster_runtime::ExecutionContext,
+                        $accumulator_native,
+                        i32,
+                    ) -> $accumulator_native = unsafe { std::mem::transmute(pointer) };
+                    function(context, $accumulator_value, *value)
+                }
+                ExecutionValue::UInt(value) => {
+                    let function: extern "C" fn(
+                        *mut aster_runtime::ExecutionContext,
+                        $accumulator_native,
+                        u32,
+                    ) -> $accumulator_native = unsafe { std::mem::transmute(pointer) };
+                    function(context, $accumulator_value, *value)
+                }
+                ExecutionValue::Long(value) => {
+                    let function: extern "C" fn(
+                        *mut aster_runtime::ExecutionContext,
+                        $accumulator_native,
+                        i64,
+                    ) -> $accumulator_native = unsafe { std::mem::transmute(pointer) };
+                    function(context, $accumulator_value, *value)
+                }
+                ExecutionValue::ULong(value) => {
+                    let function: extern "C" fn(
+                        *mut aster_runtime::ExecutionContext,
+                        $accumulator_native,
+                        u64,
+                    ) -> $accumulator_native = unsafe { std::mem::transmute(pointer) };
+                    function(context, $accumulator_value, *value)
+                }
+                ExecutionValue::Float(value) => {
+                    let function: extern "C" fn(
+                        *mut aster_runtime::ExecutionContext,
+                        $accumulator_native,
+                        f32,
+                    ) -> $accumulator_native = unsafe { std::mem::transmute(pointer) };
+                    function(context, $accumulator_value, *value)
+                }
+                ExecutionValue::Double(value) => {
+                    let function: extern "C" fn(
+                        *mut aster_runtime::ExecutionContext,
+                        $accumulator_native,
+                        f64,
+                    ) -> $accumulator_native = unsafe { std::mem::transmute(pointer) };
+                    function(context, $accumulator_value, *value)
+                }
+                ExecutionValue::Char(value) => {
+                    let function: extern "C" fn(
+                        *mut aster_runtime::ExecutionContext,
+                        $accumulator_native,
+                        u32,
+                    ) -> $accumulator_native = unsafe { std::mem::transmute(pointer) };
+                    function(context, $accumulator_value, *value as u32)
+                }
+                ExecutionValue::String(_) | ExecutionValue::Void => {
+                    return Err(BackendError::new(
+                        "Parallel.Reduce received a non-scalar element",
+                    ));
+                }
+            }
+        };
+    }
+
+    let result = match accumulator {
+        ExecutionValue::Bool(value) => {
+            let raw: i8 = call_with_element!(i8, i8::from(*value));
+            ExecutionValue::Bool(raw != 0)
+        }
+        ExecutionValue::SByte(value) => ExecutionValue::SByte(call_with_element!(i8, *value)),
+        ExecutionValue::Byte(value) => ExecutionValue::Byte(call_with_element!(u8, *value)),
+        ExecutionValue::Short(value) => ExecutionValue::Short(call_with_element!(i16, *value)),
+        ExecutionValue::UShort(value) => ExecutionValue::UShort(call_with_element!(u16, *value)),
+        ExecutionValue::Int(value) => ExecutionValue::Int(call_with_element!(i32, *value)),
+        ExecutionValue::UInt(value) => ExecutionValue::UInt(call_with_element!(u32, *value)),
+        ExecutionValue::Long(value) => ExecutionValue::Long(call_with_element!(i64, *value)),
+        ExecutionValue::ULong(value) => ExecutionValue::ULong(call_with_element!(u64, *value)),
+        ExecutionValue::Float(value) => ExecutionValue::float(call_with_element!(f32, *value)),
+        ExecutionValue::Double(value) => ExecutionValue::double(call_with_element!(f64, *value)),
+        ExecutionValue::Char(value) => {
+            let raw: u32 = call_with_element!(u32, *value as u32);
+            return char::from_u32(raw).map(ExecutionValue::Char).ok_or_else(|| {
+                BackendError::new(format!(
+                    "Parallel.Reduce Accumulate/Combine returned invalid Unicode scalar value U+{raw:08X} as `char`"
+                ))
+            });
+        }
+        ExecutionValue::String(_) | ExecutionValue::Void => {
+            return Err(BackendError::new(
+                "Parallel.Reduce received a non-scalar accumulator",
+            ));
+        }
+    };
+    Ok(result)
 }
 
 impl Drop for PreparedProgram {

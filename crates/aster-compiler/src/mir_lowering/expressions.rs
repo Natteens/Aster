@@ -288,6 +288,20 @@ impl FunctionLowerer {
                 self.lower_parallel_for_each(values, element_type, *body);
                 None
             }
+            hir::ExpressionKind::ParallelReduce {
+                values,
+                element_type,
+                identity,
+                accumulate,
+                combine,
+            } => Some(self.lower_parallel_reduce(
+                values,
+                element_type,
+                identity,
+                *accumulate,
+                *combine,
+                expression.type_.clone(),
+            )),
         }
     }
 
@@ -389,6 +403,51 @@ impl FunctionLowerer {
             ],
             return_type: mir::Type::Void,
         });
+    }
+
+    /// `Parallel.Reduce(values, identity, Accumulate, Combine)`: evaluate the
+    /// scalar array and the identity exactly once, left to right, then a
+    /// single synchronous intrinsic copies the array's elements host-side,
+    /// folds `Accumulate` per chunk starting from `identity`, and combines
+    /// chunk partials with `Combine`. `accumulate`/`combine` are carried by
+    /// identity, never re-resolved by name.
+    fn lower_parallel_reduce(
+        &mut self,
+        values: &hir::Expression,
+        element_type: &hir::Type,
+        identity: &hir::Expression,
+        accumulate: hir::SymbolId,
+        combine: hir::SymbolId,
+        accumulator_type: hir::Type,
+    ) -> mir::Operand {
+        let values = self
+            .lower_expression(values)
+            .expect("validated array expression produces a value");
+        let identity = self
+            .lower_expression(identity)
+            .expect("validated identity expression produces a value");
+        let destination = mir::Place::Local(self.new_temporary(accumulator_type.clone()));
+        self.instruction(mir::Instruction::CallIntrinsic {
+            destination: Some(destination.clone()),
+            intrinsic: mir::Intrinsic::ParallelReduce,
+            arguments: vec![
+                values,
+                identity,
+                mir::Operand {
+                    type_: element_type.clone(),
+                    kind: mir::OperandKind::Function(accumulate),
+                },
+                mir::Operand {
+                    type_: accumulator_type.clone(),
+                    kind: mir::OperandKind::Function(combine),
+                },
+            ],
+            return_type: accumulator_type.clone(),
+        });
+        mir::Operand {
+            type_: accumulator_type,
+            kind: mir::OperandKind::Copy(destination),
+        }
     }
 
     /// Lowers `$"..."` to: evaluate and (when needed) stringify every

@@ -229,3 +229,168 @@ fn errors_and_successes_interleave_across_many_separate_executions() {
         }
     }
 }
+
+// --- Parallel.Reduce -----------------------------------------------------
+
+const ADD_VALUE: &str =
+    "public int AddValue(int accumulator, int value) { return accumulator + value; }";
+const ADD_PARTIAL: &str = "public int AddPartial(int left, int right) { return left + right; }";
+
+#[test]
+fn parallel_reduce_sums_int_values() {
+    // The exact example from the Lote 6C specification.
+    let source = format!(
+        "{ADD_VALUE} {ADD_PARTIAL} \
+         public int Main() {{ int[] values = [1, 2, 3, 4, 5]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }}"
+    );
+    assert_eq!(run(&source), Ok(ExecutionValue::Int(15)));
+}
+
+#[test]
+fn parallel_reduce_sums_long_values() {
+    let source = "public long AddValue(long accumulator, long value) { return accumulator + value; } \
+         public long AddPartial(long left, long right) { return left + right; } \
+         public long Main() { long[] values = [10L, 20L, 30L, 40L]; return Parallel.Reduce(values, 0L, AddValue, AddPartial); }";
+    assert_eq!(run(source), Ok(ExecutionValue::Long(100)));
+}
+
+#[test]
+fn parallel_reduce_sums_uint_and_ulong_values() {
+    let uint_source = "public uint AddValue(uint accumulator, uint value) { return accumulator + value; } \
+         public uint AddPartial(uint left, uint right) { return left + right; } \
+         public uint Main() { uint[] values = [1u, 2u, 3u]; return Parallel.Reduce(values, 0u, AddValue, AddPartial); }";
+    assert_eq!(run(uint_source), Ok(ExecutionValue::UInt(6)));
+
+    let ulong_source = "public ulong AddValue(ulong accumulator, ulong value) { return accumulator + value; } \
+         public ulong AddPartial(ulong left, ulong right) { return left + right; } \
+         public ulong Main() { ulong[] values = [1ul, 2ul, 3ul]; return Parallel.Reduce(values, 0ul, AddValue, AddPartial); }";
+    assert_eq!(run(ulong_source), Ok(ExecutionValue::ULong(6)));
+}
+
+#[test]
+fn parallel_reduce_bool_or_reduction() {
+    let source = "public bool OrValue(bool accumulator, bool value) { return accumulator || value; } \
+         public bool OrPartial(bool left, bool right) { return left || right; } \
+         public bool Main() { bool[] values = [false, false, true, false]; return Parallel.Reduce(values, false, OrValue, OrPartial); }";
+    assert_eq!(run(source), Ok(ExecutionValue::Bool(true)));
+}
+
+#[test]
+fn parallel_reduce_sums_float_and_double_values() {
+    let float_source = "public float AddValue(float accumulator, float value) { return accumulator + value; } \
+         public float AddPartial(float left, float right) { return left + right; } \
+         public float Main() { float[] values = [1.5f, 2.5f]; return Parallel.Reduce(values, 0.0f, AddValue, AddPartial); }";
+    assert_eq!(run(float_source), Ok(ExecutionValue::float(4.0)));
+
+    let double_source = "public double AddValue(double accumulator, double value) { return accumulator + value; } \
+         public double AddPartial(double left, double right) { return left + right; } \
+         public double Main() { double[] values = [1.25d, 2.75d]; return Parallel.Reduce(values, 0.0d, AddValue, AddPartial); }";
+    assert_eq!(run(double_source), Ok(ExecutionValue::double(4.0)));
+}
+
+#[test]
+fn parallel_reduce_with_different_element_and_accumulator_types() {
+    // `TElement` (`long`) differs from `TAccumulator` (`int`): counts how
+    // many `long` elements are present.
+    let source = "public int CountValue(int accumulator, long value) { return accumulator + 1; } \
+         public int CountPartial(int left, int right) { return left + right; } \
+         public int Main() { long[] values = [10L, 20L, 30L, 40L, 50L]; return Parallel.Reduce(values, 0, CountValue, CountPartial); }";
+    assert_eq!(run(source), Ok(ExecutionValue::Int(5)));
+}
+
+#[test]
+fn parallel_reduce_empty_array_returns_identity_without_running_accumulate_or_combine() {
+    // `Accumulate`/`Combine` would divide by zero if ever invoked; an empty
+    // array must return the identity untouched.
+    let source = "public int Boom(int accumulator, int value) { return accumulator / 0; } \
+         public int BoomPartial(int left, int right) { return left / 0; } \
+         public int Main() { int[] values = new int[0]; return Parallel.Reduce(values, 7, Boom, BoomPartial); }";
+    assert_eq!(run(source), Ok(ExecutionValue::Int(7)));
+}
+
+#[test]
+fn parallel_reduce_single_element() {
+    let source = format!(
+        "{ADD_VALUE} {ADD_PARTIAL} \
+         public int Main() {{ int[] values = [41]; return Parallel.Reduce(values, 1, AddValue, AddPartial); }}"
+    );
+    assert_eq!(run(&source), Ok(ExecutionValue::Int(42)));
+}
+
+#[test]
+fn parallel_reduce_many_positions() {
+    let source = format!(
+        "{ADD_VALUE} {ADD_PARTIAL} \
+         public int[] Build() {{ \
+             int[] values = new int[1000]; \
+             for (int i = 0; i < 1000; i++) {{ values[i] = 1; }} \
+             return values; \
+         }} \
+         public int Main() {{ return Parallel.Reduce(Build(), 0, AddValue, AddPartial); }}"
+    );
+    assert_eq!(run(&source), Ok(ExecutionValue::Int(1000)));
+}
+
+#[test]
+fn parallel_reduce_free_function_runs() {
+    let source = format!(
+        "{ADD_VALUE} {ADD_PARTIAL} \
+         public int Main() {{ int[] values = [1, 2, 3]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }}"
+    );
+    assert_eq!(run(&source), Ok(ExecutionValue::Int(6)));
+}
+
+#[test]
+fn parallel_reduce_static_method_runs() {
+    let source = "public static class Jobs { \
+             public static int AddValue(int accumulator, int value) { return accumulator + value; } \
+             public static int AddPartial(int left, int right) { return left + right; } \
+         } \
+         public int Main() { int[] values = [1, 2, 3]; return Parallel.Reduce(values, 0, Jobs.AddValue, Jobs.AddPartial); }";
+    assert_eq!(run(source), Ok(ExecutionValue::Int(6)));
+}
+
+#[test]
+fn parallel_reduce_result_feeds_a_further_expression() {
+    let source = format!(
+        "{ADD_VALUE} {ADD_PARTIAL} \
+         public int Main() {{ int[] values = [1, 2, 3]; return Parallel.Reduce(values, 0, AddValue, AddPartial) * 10; }}"
+    );
+    assert_eq!(run(&source), Ok(ExecutionValue::Int(60)));
+}
+
+#[test]
+fn parallel_reduce_a_controlled_accumulate_error_propagates_with_its_logical_position() {
+    // Every position but 3 is safe against a length-8 array; position 3
+    // overflows the length-3 slot it is deliberately given.
+    let source = "public int Boom(int accumulator, int value) { \
+             int size = value == 3 ? 3 : 8; \
+             int[] a = new int[size]; \
+             return accumulator + a[value]; \
+         } \
+         public int BoomPartial(int left, int right) { return left + right; } \
+         public int Main() { int[] values = [0, 1, 2, 3, 4, 5, 6, 7]; return Parallel.Reduce(values, 0, Boom, BoomPartial); }";
+    let error = run(source).expect_err("the deliberately out-of-bounds position must fail");
+    assert!(error.contains("array index 3"), "unexpected error: {error}");
+}
+
+#[test]
+fn parallel_reduce_repeated_calls_reuse_the_pool_and_do_not_accumulate_memory() {
+    let source = format!(
+        "{ADD_VALUE} {ADD_PARTIAL} \
+         public int Main() {{ int[] values = [1, 2, 3, 4, 5]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }}"
+    );
+    let compilation = compile(&source).expect("valid program");
+    // The array literal itself is a legitimate persistent allocation in
+    // `Main`'s own arena (conservatively escaping through the intrinsic
+    // call), so `used_bytes` is not zero; what must hold across repeated,
+    // independent invocations is that it never grows.
+    let mut expected_used_bytes = None;
+    for _ in 0..20 {
+        let (value, stats) = execute_with_stats(&compilation.mir, "Main")
+            .expect("every repeated call must succeed identically");
+        assert_eq!(value, ExecutionValue::Int(15));
+        let expected = *expected_used_bytes.get_or_insert(stats.used_bytes);
+        assert_eq!(stats.used_bytes, expected);
+    }
+}

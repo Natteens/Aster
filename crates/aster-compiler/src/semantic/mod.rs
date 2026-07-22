@@ -74,6 +74,15 @@ pub(crate) struct ResolvedParallelForEach {
     pub body: CallableKey,
 }
 
+/// A resolved `Parallel.Reduce(values, identity, Accumulate, Combine)`:
+/// `Accumulate`'s and `Combine`'s concrete, zero-capture targets, resolved
+/// once here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedParallelReduce {
+    pub accumulate: CallableKey,
+    pub combine: CallableKey,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedEnumCase {
     pub enum_name: String,
@@ -102,6 +111,7 @@ pub(crate) struct Model {
     pub task_runs: HashMap<ModelNodeKey, ResolvedTaskRun>,
     pub parallel_for: HashMap<ModelNodeKey, ResolvedParallelFor>,
     pub parallel_for_each: HashMap<ModelNodeKey, ResolvedParallelForEach>,
+    pub parallel_reduce: HashMap<ModelNodeKey, ResolvedParallelReduce>,
     pub switch_cases: HashMap<ModelNodeKey, ResolvedEnumCase>,
     pub propagations: HashMap<ModelNodeKey, ResolvedPropagation>,
 }
