@@ -17,7 +17,7 @@ use std::{
 const DEFAULT_PAGE_SIZE: usize = 64 * 1024;
 
 /// Maximum alignment supported by arena allocations.
-const MAX_ALIGN: usize = 16;
+pub(crate) const MAX_ALIGN: usize = 16;
 
 static NEXT_ARENA_ID: AtomicU64 = AtomicU64::new(1);
 

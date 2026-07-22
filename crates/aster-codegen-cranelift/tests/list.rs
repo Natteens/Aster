@@ -267,6 +267,54 @@ fn a_constructed_list_still_cannot_cross_a_worker_boundary_via_task_run() {
 }
 
 #[test]
+fn parallel_for_each_rejects_a_list_element_type() {
+    // Same `is_worker_transferable` gate as `Task.Run` above, reached through
+    // `Parallel.ForEach`'s body-parameter check instead â€” no List-specific
+    // rule needed.
+    let errors = compile_errors(
+        "public void Body(List<int> item) { int x = item.Length; } \
+         public int Main() { List<int>[] values = new List<int>[1]; Parallel.ForEach(values, Body); return 0; }",
+    );
+    assert!(
+        !errors.is_empty(),
+        "expected `Parallel.ForEach` over `List<int>` elements to be rejected"
+    );
+}
+
+#[test]
+fn parallel_reduce_rejects_a_list_element_type() {
+    // Same gate, reached through `Parallel.Reduce`'s element/accumulator
+    // check.
+    let errors = compile_errors(
+        "public int CountValue(int acc, List<int> item) { return acc + item.Length; } \
+         public int CountPartial(int a, int b) { return a + b; } \
+         public int Main() { List<int>[] values = new List<int>[1]; return Parallel.Reduce(values, 0, CountValue, CountPartial); }",
+    );
+    assert!(
+        !errors.is_empty(),
+        "expected `Parallel.Reduce` over `List<int>` elements to be rejected"
+    );
+}
+
+#[test]
+fn an_async_function_cannot_keep_a_list_alive_across_an_await() {
+    // The same gate also guards the async state machine's slot storage
+    // (`AsyncStoreSlot`/`AsyncLoadSlot`): a `List<T>` local live across an
+    // `await` would need to be saved into a slot, which `is_worker_transferable`
+    // refuses.
+    let errors = compile_errors(
+        "public int Compute() { return 1; } \
+         public async Task<int> Calculate() { List<int> kept = new List<int>(); kept.Add(1); \
+         int v = await Task.Run(Compute); return kept.Length + v; } \
+         public int Main() { return 0; }",
+    );
+    assert!(
+        !errors.is_empty(),
+        "expected a `List<int>` kept alive across `await` to be rejected"
+    );
+}
+
+#[test]
 fn arrays_and_objects_are_unaffected_by_list_construction() {
     let source = "
         public class Box { public int value; public Box(int value) { this.value = value; } }

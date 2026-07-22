@@ -3,7 +3,7 @@
 use std::mem::{align_of, size_of};
 use std::ptr;
 
-use crate::arena::{ArenaMark, PagedArena};
+use crate::arena::{ArenaMark, MAX_ALIGN, PagedArena};
 use crate::string::AsterStrHeader;
 
 /// Stable array header visible to generated code only through runtime calls.
@@ -373,6 +373,12 @@ impl ExecutionContext {
             ));
             return ptr::null_mut();
         }
+        if element_align as usize > MAX_ALIGN {
+            self.fail(format!(
+                "list element alignment {element_align} exceeds the arena's maximum supported alignment of {MAX_ALIGN}"
+            ));
+            return ptr::null_mut();
+        }
         if region == ListRegion::Temporary && self.temporary_scopes.is_empty() {
             self.fail("temporary list allocation requires an active temporary scope");
             return ptr::null_mut();
@@ -448,6 +454,12 @@ impl ExecutionContext {
             self.fail("list header has a non-power-of-two element alignment");
             return false;
         }
+        if element_align as usize > MAX_ALIGN {
+            self.fail(format!(
+                "list header element alignment {element_align} exceeds the arena's maximum supported alignment of {MAX_ALIGN}"
+            ));
+            return false;
+        }
         if capacity == 0 {
             if !data_is_null {
                 self.fail("list header has a data pointer despite zero capacity");
@@ -499,6 +511,12 @@ impl ExecutionContext {
         }
         if region == ListRegion::Temporary && self.temporary_scopes.is_empty() {
             self.fail("temporary list growth requires an active temporary scope");
+            return None;
+        }
+        if element_align as usize > MAX_ALIGN {
+            self.fail(format!(
+                "list element alignment {element_align} exceeds the arena's maximum supported alignment of {MAX_ALIGN}"
+            ));
             return None;
         }
         let new_data = {
@@ -1240,6 +1258,22 @@ mod tests {
     }
 
     #[test]
+    fn list_rejects_alignment_beyond_the_arena_maximum() {
+        let mut context = ExecutionContext::new();
+        // 32 is a valid power of two but exceeds `arena::MAX_ALIGN` (16);
+        // without this check the value survives construction and only
+        // panics later, inside `PagedArena::alloc`, the first time the
+        // list's buffer is grown.
+        let header = context.allocate_list_in_region(4, 32, 1, ListRegion::Persistent);
+        assert!(header.is_null());
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("exceeds the arena's maximum"))
+        );
+    }
+
+    #[test]
     fn temporary_list_requires_an_active_scope() {
         let mut context = ExecutionContext::new();
         let header = context.allocate_list_in_region(4, 4, 1, ListRegion::Temporary);
@@ -1539,6 +1573,30 @@ mod tests {
                 .take_error()
                 .is_some_and(|error| error.contains("null data pointer"))
         );
+    }
+
+    #[test]
+    fn list_add_rejects_a_header_with_alignment_beyond_the_arena_maximum() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        // SAFETY: simulates a corrupted header reaching `list.Add` with an
+        // element alignment the arena cannot satisfy (`PagedArena::alloc`
+        // asserts `align <= MAX_ALIGN`); the growth path (length == capacity
+        // == 0 here) is exactly where this would otherwise trigger a real,
+        // uncontrolled panic instead of a reported runtime error.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*list).element_align = 32;
+        }
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 32, 1, source_address(&value));
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("exceeds the arena's maximum"))
+        );
+        assert_eq!(aster_rt_list_length(context_pointer, list), 0);
     }
 
     #[test]
@@ -2163,6 +2221,173 @@ mod tests {
         let mut out = 0_i32;
         aster_rt_list_get(context_pointer, list, 4, 4, 1, 0, destination(&mut out));
         assert_eq!(out, 20);
+    }
+
+    /// A tiny fixed, non-cryptographic linear congruential generator so the
+    /// operation sequence below is exactly reproducible on failure (no `rand`
+    /// dependency, no time-based input, no external state).
+    fn next_deterministic(seed: &mut u32) -> u32 {
+        *seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        *seed >> 16
+    }
+
+    #[test]
+    fn list_matches_a_reference_vec_model_over_a_deterministic_operation_sequence() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let mut model: Vec<i32> = Vec::new();
+        let mut seed = 0xC0FF_EE42_u32;
+
+        let assert_matches_model =
+            |context_pointer: *mut ExecutionContext, list: *mut AsterList, model: &[i32]| {
+                assert_eq!(
+                    aster_rt_list_length(context_pointer, list),
+                    i32::try_from(model.len()).unwrap()
+                );
+                for (index, &expected) in model.iter().enumerate() {
+                    let mut out = 0_i32;
+                    aster_rt_list_get(
+                        context_pointer,
+                        list,
+                        4,
+                        4,
+                        1,
+                        i32::try_from(index).unwrap(),
+                        destination(&mut out),
+                    );
+                    assert_eq!(out, expected, "mismatch at index {index}: {model:?}");
+                }
+            };
+
+        for step in 0_i32..300 {
+            match next_deterministic(&mut seed) % 5 {
+                0 | 1 => {
+                    // Add: value is a pure function of `step`, so the
+                    // expected content is reconstructible from the step
+                    // count alone.
+                    let value = step * 7 + 3;
+                    aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+                    assert!(context.take_error().is_none());
+                    model.push(value);
+                }
+                2 if !model.is_empty() => {
+                    let index = (next_deterministic(&mut seed) as usize) % model.len();
+                    let mut out = 0_i32;
+                    aster_rt_list_get(
+                        context_pointer,
+                        list,
+                        4,
+                        4,
+                        1,
+                        i32::try_from(index).unwrap(),
+                        destination(&mut out),
+                    );
+                    assert!(context.take_error().is_none());
+                    assert_eq!(out, model[index]);
+                }
+                3 if !model.is_empty() => {
+                    let index = (next_deterministic(&mut seed) as usize) % model.len();
+                    aster_rt_list_remove_at(
+                        context_pointer,
+                        list,
+                        4,
+                        4,
+                        1,
+                        i32::try_from(index).unwrap(),
+                    );
+                    assert!(context.take_error().is_none());
+                    model.remove(index);
+                }
+                _ => {
+                    // Either the `2`/`3` guard failed on an empty list, or we
+                    // rolled `4`: exercise an out-of-bounds `Get`/`RemoveAt`
+                    // and confirm the error is controlled and the model-
+                    // observable state is untouched.
+                    let length_before = aster_rt_list_length(context_pointer, list);
+                    let bad_index = length_before + 1;
+                    let mut out = -1_i32;
+                    aster_rt_list_get(
+                        context_pointer,
+                        list,
+                        4,
+                        4,
+                        1,
+                        bad_index,
+                        destination(&mut out),
+                    );
+                    assert!(context.take_error().is_some());
+                    aster_rt_list_remove_at(context_pointer, list, 4, 4, 1, bad_index);
+                    assert!(context.take_error().is_some());
+                    assert_eq!(aster_rt_list_length(context_pointer, list), length_before);
+                }
+            }
+            assert_matches_model(context_pointer, list, &model);
+        }
+
+        assert!(
+            model.len() > 30,
+            "the deterministic sequence should have exercised substantial growth, got {}",
+            model.len()
+        );
+    }
+
+    #[test]
+    fn a_list_error_in_one_context_does_not_contaminate_an_independent_context() {
+        let mut first = ExecutionContext::new();
+        let first_pointer = &raw mut first;
+        let first_list = aster_rt_list_new(first_pointer, 4, 4, 1);
+        aster_rt_list_remove_at(first_pointer, first_list, 4, 4, 1, 0);
+        assert!(first.take_error().is_some());
+
+        let mut second = ExecutionContext::new();
+        let second_pointer = &raw mut second;
+        let second_list = aster_rt_list_new(second_pointer, 4, 4, 1);
+        let value = 99_i32;
+        aster_rt_list_add(second_pointer, second_list, 4, 4, 1, source_address(&value));
+        assert!(second.take_error().is_none());
+        assert_eq!(aster_rt_list_length(second_pointer, second_list), 1);
+    }
+
+    #[test]
+    fn a_temporary_list_scope_reclaims_every_generation_of_its_buffer_on_reset() {
+        // Many create/add/read/remove/empty cycles inside repeated temporary
+        // scopes: each cycle grows a temporary list through several buffer
+        // generations, so leaving the scope must reclaim the header, every
+        // superseded growth buffer, and the final buffer alike (Section 6).
+        let mut context = ExecutionContext::with_stats();
+        let context_pointer = &raw mut context;
+        let baseline_used = context.memory_stats().used_bytes;
+
+        for _cycle in 0..5 {
+            context.enter_temporary_scope();
+            let list = aster_rt_list_new_temporary(context_pointer, 4, 4, 1);
+            assert!(!list.is_null());
+            for value in 0_i32..40 {
+                aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+            }
+            assert!(context.take_error().is_none());
+            for index in 0_i32..40 {
+                let mut out = 0_i32;
+                aster_rt_list_get(context_pointer, list, 4, 4, 1, index, destination(&mut out));
+            }
+            for _ in 0_i32..40 {
+                aster_rt_list_remove_at(context_pointer, list, 4, 4, 1, 0);
+            }
+            assert_eq!(aster_rt_list_length(context_pointer, list), 0);
+            assert!(
+                context.memory_stats().used_bytes > baseline_used,
+                "the scope should be using more memory than baseline while active"
+            );
+            context.leave_temporary_scope();
+            assert!(context.take_error().is_none());
+            assert_eq!(
+                context.memory_stats().used_bytes,
+                baseline_used,
+                "leaving the scope must reclaim the header and every growth generation, \
+                 not just the final buffer"
+            );
+        }
     }
 
     #[test]
