@@ -1,0 +1,16 @@
+namespace aster.io;
+
+using aster.core;
+
+public void Write(string value)
+{
+}
+
+public void WriteLine(string value)
+{
+}
+
+public Option<string> ReadLine()
+{
+    return Option<string>.None;
+}

@@ -53,6 +53,12 @@ pub enum Visibility {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Intrinsic {
     ReportRuntimeError(RuntimeErrorKind),
+    /// `aster.io.Write(string)`: emits its argument's UTF-8 bytes verbatim.
+    ConsoleWrite,
+    /// `aster.io.WriteLine(string)`: like `ConsoleWrite`, plus a trailing LF.
+    ConsoleWriteLine,
+    /// `aster.io.ReadLine()`: reads one line into `Option<string>`; `None` on EOF.
+    ConsoleReadLine,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

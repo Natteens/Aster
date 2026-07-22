@@ -122,6 +122,19 @@ impl Codegen {
                     state,
                 );
             }
+            mir::Intrinsic::ConsoleWrite
+            | mir::Intrinsic::ConsoleWriteLine
+            | mir::Intrinsic::ConsoleReadLine
+            | mir::Intrinsic::ConsoleReadLineTemporary => {
+                return self.translate_console_io(
+                    builder,
+                    destination,
+                    intrinsic,
+                    arguments,
+                    return_type,
+                    state,
+                );
+            }
             mir::Intrinsic::AsyncSpawn
             | mir::Intrinsic::AsyncState
             | mir::Intrinsic::AsyncSetState
@@ -212,7 +225,11 @@ impl Codegen {
             | mir::Intrinsic::StringTryParseLong
             | mir::Intrinsic::StringTryParseULong
             | mir::Intrinsic::StringTryParseFloat
-            | mir::Intrinsic::StringTryParseDouble => {
+            | mir::Intrinsic::StringTryParseDouble
+            | mir::Intrinsic::ConsoleWrite
+            | mir::Intrinsic::ConsoleWriteLine
+            | mir::Intrinsic::ConsoleReadLine
+            | mir::Intrinsic::ConsoleReadLineTemporary => {
                 unreachable!("handled by the dedicated translators above")
             }
         };
@@ -761,6 +778,116 @@ impl Codegen {
             ],
         );
         Ok(())
+    }
+
+    /// `aster.io.Write`/`WriteLine`/`ReadLine`, bound to their official
+    /// declarations by `SymbolId` (never by name) at HIR lowering. `Write`/
+    /// `WriteLine` pass their `string` argument straight through, unchanged,
+    /// to the runtime; `ReadLine` writes a full `Option<string>` into its
+    /// destination using the same layout-driven ABI as `string.TryParse*`.
+    fn translate_console_io(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: Option<&mir::Place>,
+        intrinsic: mir::Intrinsic,
+        arguments: &[mir::Operand],
+        return_type: &mir::Type,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new("aster.io intrinsic is missing its ExecutionContext")
+        })?;
+        match intrinsic {
+            mir::Intrinsic::ConsoleWrite | mir::Intrinsic::ConsoleWriteLine => {
+                let [value] = arguments else {
+                    return Err(BackendError::new(
+                        "aster.io.Write/WriteLine requires exactly one argument",
+                    ));
+                };
+                let value = self.translate_operand(builder, value, state)?;
+                let symbol = match intrinsic {
+                    mir::Intrinsic::ConsoleWrite => "aster_rt_io_write",
+                    mir::Intrinsic::ConsoleWriteLine => "aster_rt_io_write_line",
+                    _ => unreachable!("caller matched only console write intrinsics"),
+                };
+                let function_ref = self
+                    .jit
+                    .declare_func_in_func(self.runtime_ids[symbol], builder.func);
+                builder.ins().call(function_ref, &[context, value]);
+                Ok(())
+            }
+            mir::Intrinsic::ConsoleReadLine | mir::Intrinsic::ConsoleReadLineTemporary => {
+                let destination = destination
+                    .ok_or_else(|| BackendError::new("aster.io.ReadLine requires a destination"))?;
+                let mir::Type::Enum(symbol) = return_type else {
+                    return Err(BackendError::new(
+                        "aster.io.ReadLine must return a concrete Option<string>",
+                    ));
+                };
+                let (some_tag, none_tag, payload_offset) = {
+                    let definition = self.layouts.enums.get(symbol).ok_or_else(|| {
+                        BackendError::new("aster.io.ReadLine returns an unknown enum type")
+                    })?;
+                    let none_case = definition
+                        .cases
+                        .iter()
+                        .find(|case| case.fields.is_empty())
+                        .ok_or_else(|| {
+                            BackendError::new(
+                                "aster.io.ReadLine target is not shaped like Option<T>",
+                            )
+                        })?;
+                    let some_case = definition
+                        .cases
+                        .iter()
+                        .find(|case| case.fields.len() == 1)
+                        .ok_or_else(|| {
+                            BackendError::new(
+                                "aster.io.ReadLine target is not shaped like Option<T>",
+                            )
+                        })?;
+                    let value_field = &some_case.fields[0];
+                    let field_layout =
+                        self.layouts
+                            .fields
+                            .get(&value_field.symbol)
+                            .ok_or_else(|| {
+                                BackendError::new(
+                                    "aster.io.ReadLine payload field has no computed layout",
+                                )
+                            })?;
+                    (some_case.tag, none_case.tag, field_layout.offset)
+                };
+                let layout = self.layouts.type_layout(return_type)?;
+                let destination_address = self.place_address(builder, destination, state)?;
+                let symbol_name = match intrinsic {
+                    mir::Intrinsic::ConsoleReadLine => "aster_rt_io_read_line",
+                    mir::Intrinsic::ConsoleReadLineTemporary => "aster_rt_io_read_line_temporary",
+                    _ => unreachable!("caller matched only console read-line intrinsics"),
+                };
+                let function_ref = self
+                    .jit
+                    .declare_func_in_func(self.runtime_ids[symbol_name], builder.func);
+                let total_size = builder.ins().iconst(types::I32, i64::from(layout.size));
+                let some_tag_value = builder.ins().iconst(types::I32, i64::from(some_tag));
+                let none_tag_value = builder.ins().iconst(types::I32, i64::from(none_tag));
+                let payload_offset_value =
+                    builder.ins().iconst(types::I32, i64::from(payload_offset));
+                builder.ins().call(
+                    function_ref,
+                    &[
+                        context,
+                        destination_address,
+                        total_size,
+                        some_tag_value,
+                        none_tag_value,
+                        payload_offset_value,
+                    ],
+                );
+                Ok(())
+            }
+            _ => unreachable!("caller matched only console intrinsics"),
+        }
     }
 
     fn store_intrinsic_result(

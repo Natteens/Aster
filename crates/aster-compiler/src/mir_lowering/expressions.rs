@@ -957,6 +957,9 @@ pub(super) fn lower_intrinsic(intrinsic: hir::Intrinsic) -> mir::Intrinsic {
                 }
             })
         }
+        hir::Intrinsic::ConsoleWrite => mir::Intrinsic::ConsoleWrite,
+        hir::Intrinsic::ConsoleWriteLine => mir::Intrinsic::ConsoleWriteLine,
+        hir::Intrinsic::ConsoleReadLine => mir::Intrinsic::ConsoleReadLine,
     }
 }
 

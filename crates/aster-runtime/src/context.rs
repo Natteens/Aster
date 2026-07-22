@@ -136,6 +136,12 @@ pub struct ExecutionContext {
     /// its real type. Absent (`None`) for every sequential invocation that
     /// does not opt in.
     task_runtime: Option<*mut ()>,
+    /// Console I/O backend for `aster.io.Write`/`WriteLine`/`ReadLine`.
+    /// Owned per-context (never a global or singleton), so independent
+    /// contexts never share output or input. Lazily defaults to real
+    /// stdin/stdout on first use; a host (tests, or a future CLI override)
+    /// can inject an in-memory backend first via [`Self::set_console_backend`].
+    console: Option<Box<dyn crate::io::ConsoleBackend>>,
 }
 
 impl Default for ExecutionContext {
@@ -155,6 +161,7 @@ impl ExecutionContext {
             collect_stats: false,
             stats: MemoryStats::default(),
             task_runtime: None,
+            console: None,
         }
     }
 
@@ -168,6 +175,7 @@ impl ExecutionContext {
             collect_stats: true,
             stats: MemoryStats::default(),
             task_runtime: None,
+            console: None,
         }
     }
 
@@ -202,6 +210,24 @@ impl ExecutionContext {
     #[must_use]
     pub fn task_runtime(&self) -> Option<*mut ()> {
         self.task_runtime
+    }
+
+    /// Inject the console I/O backend this context uses for `aster.io.Write`/
+    /// `WriteLine`/`ReadLine`. Overwrites any previous backend (including the
+    /// lazily created default). Independent contexts never share a backend;
+    /// this is per-context state, not a global or singleton.
+    pub fn set_console_backend(&mut self, backend: Box<dyn crate::io::ConsoleBackend>) {
+        self.console = Some(backend);
+    }
+
+    /// The active console backend, lazily defaulting to real stdin/stdout on
+    /// first use so a host that never calls `set_console_backend` still gets
+    /// working I/O.
+    pub(crate) fn console_backend(&mut self) -> &mut dyn crate::io::ConsoleBackend {
+        if self.console.is_none() {
+            self.console = Some(Box::new(crate::io::StdConsoleBackend::default()));
+        }
+        self.console.as_deref_mut().expect("just initialized above")
     }
 
     fn record_allocation(&mut self, category: AllocationCategory, requested: usize) {

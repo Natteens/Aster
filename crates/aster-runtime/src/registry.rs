@@ -11,6 +11,10 @@ use crate::context::{
     aster_rt_list_new, aster_rt_list_new_temporary, aster_rt_list_remove_at,
     aster_rt_temporary_scope_enter, aster_rt_temporary_scope_leave,
 };
+use crate::io::{
+    aster_rt_io_read_line, aster_rt_io_read_line_temporary, aster_rt_io_write,
+    aster_rt_io_write_line,
+};
 use crate::log::aster_rt_log;
 use crate::math::{aster_rt_integer_arithmetic_error, aster_rt_math_domain_error};
 use crate::object::{aster_rt_object_new, aster_rt_object_new_temporary};
@@ -566,6 +570,52 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             signature: RuntimeSignature {
                 parameters: &[
                     RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_io_write",
+            address: aster_rt_io_write as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_io_write_line",
+            address: aster_rt_io_write_line as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_io_read_line",
+            address: aster_rt_io_read_line as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_io_read_line_temporary",
+            address: aster_rt_io_read_line_temporary as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
                     RuntimeType::Pointer,
                     RuntimeType::Pointer,
                     RuntimeType::I32,

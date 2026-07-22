@@ -11,6 +11,7 @@ use aster_hir::{Intrinsic, RuntimeErrorKind};
 const MATH_SOURCE: &str = include_str!("../../../stdlib/aster/math.aster");
 const TEXT_SOURCE: &str = include_str!("../../../stdlib/aster/text/text.aster");
 const CORE_SOURCE: &str = include_str!("../../../stdlib/aster/core/core.aster");
+const IO_SOURCE: &str = include_str!("../../../stdlib/aster/io/io.aster");
 
 /// Namespace of the official core standard library, and the single source of
 /// truth for where the official `Result`/`Option` declarations live. Passes that
@@ -40,6 +41,7 @@ impl StandardLibrary {
                 ("aster.math", MATH_SOURCE),
                 ("aster.text", TEXT_SOURCE),
                 ("aster.core", CORE_SOURCE),
+                ("aster.io", IO_SOURCE),
             ]),
         }
     }
@@ -56,23 +58,34 @@ impl StandardLibrary {
     }
 
     pub(crate) fn intrinsic_bindings(&self) -> HashMap<String, Intrinsic> {
-        if !self.modules.contains_key("aster.math") {
-            return HashMap::new();
+        let mut bindings = HashMap::new();
+        if self.modules.contains_key("aster.math") {
+            bindings.extend([
+                (
+                    "aster.math::__AbsIntOverflow".to_owned(),
+                    Intrinsic::ReportRuntimeError(RuntimeErrorKind::MathAbsIntOverflow),
+                ),
+                (
+                    "aster.math::__AbsLongOverflow".to_owned(),
+                    Intrinsic::ReportRuntimeError(RuntimeErrorKind::MathAbsLongOverflow),
+                ),
+                (
+                    "aster.math::__ClampInvalidRange".to_owned(),
+                    Intrinsic::ReportRuntimeError(RuntimeErrorKind::MathClampInvalidRange),
+                ),
+            ]);
         }
-        HashMap::from([
-            (
-                "aster.math::__AbsIntOverflow".to_owned(),
-                Intrinsic::ReportRuntimeError(RuntimeErrorKind::MathAbsIntOverflow),
-            ),
-            (
-                "aster.math::__AbsLongOverflow".to_owned(),
-                Intrinsic::ReportRuntimeError(RuntimeErrorKind::MathAbsLongOverflow),
-            ),
-            (
-                "aster.math::__ClampInvalidRange".to_owned(),
-                Intrinsic::ReportRuntimeError(RuntimeErrorKind::MathClampInvalidRange),
-            ),
-        ])
+        if self.modules.contains_key("aster.io") {
+            bindings.extend([
+                ("aster.io::Write".to_owned(), Intrinsic::ConsoleWrite),
+                (
+                    "aster.io::WriteLine".to_owned(),
+                    Intrinsic::ConsoleWriteLine,
+                ),
+                ("aster.io::ReadLine".to_owned(), Intrinsic::ConsoleReadLine),
+            ]);
+        }
+        bindings
     }
 
     pub(crate) fn display_path(module: &str) -> PathBuf {
@@ -80,7 +93,7 @@ impl StandardLibrary {
         for segment in module.split('.') {
             path.push(segment);
         }
-        if matches!(module, "aster.text" | "aster.core") {
+        if matches!(module, "aster.text" | "aster.core" | "aster.io") {
             path.push(
                 module
                     .rsplit('.')

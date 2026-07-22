@@ -167,7 +167,7 @@ impl Error for BackendError {}
 pub fn execute(module: &mir::Module, function_name: &str) -> Result<ExecutionValue, BackendError> {
     validate_module(module)?;
     let entry = select_entry(module, function_name)?;
-    execute_resolved(module, entry, false).map(|(value, _)| value)
+    execute_resolved(module, entry, false, None).map(|(value, _)| value)
 }
 
 /// Like [`execute`], but also returns runtime allocation metrics.
@@ -182,7 +182,43 @@ pub fn execute_with_stats(
 ) -> Result<(ExecutionValue, MemoryStats), BackendError> {
     validate_module(module)?;
     let entry = select_entry(module, function_name)?;
-    execute_resolved(module, entry, true)
+    execute_resolved(module, entry, true, None)
+}
+
+/// Like [`execute`], but injects `console_backend` for `aster.io.Write`/
+/// `WriteLine`/`ReadLine` instead of the default real stdin/stdout. Intended
+/// for tests: pass an in-memory backend to observe output and supply input
+/// without touching the developer's or CI's real terminal.
+///
+/// # Errors
+///
+/// Returns a controlled error for an invalid entry selection, unsupported MIR, or a
+/// Cranelift declaration/compilation/finalization failure.
+pub fn execute_with_console(
+    module: &mir::Module,
+    function_name: &str,
+    console_backend: Box<dyn aster_runtime::ConsoleBackend>,
+) -> Result<ExecutionValue, BackendError> {
+    validate_module(module)?;
+    let entry = select_entry(module, function_name)?;
+    execute_resolved(module, entry, false, Some(console_backend)).map(|(value, _)| value)
+}
+
+/// Like [`execute_with_console`], but also returns runtime allocation
+/// metrics.
+///
+/// # Errors
+///
+/// Returns a controlled error for an invalid entry selection, unsupported MIR, or a
+/// Cranelift declaration/compilation/finalization failure.
+pub fn execute_with_console_and_stats(
+    module: &mir::Module,
+    function_name: &str,
+    console_backend: Box<dyn aster_runtime::ConsoleBackend>,
+) -> Result<(ExecutionValue, MemoryStats), BackendError> {
+    validate_module(module)?;
+    let entry = select_entry(module, function_name)?;
+    execute_resolved(module, entry, true, Some(console_backend))
 }
 
 /// Compile validated MIR and invoke the concrete function selected by the
@@ -203,7 +239,7 @@ pub fn execute_symbol(
         .find(|function| function.symbol == symbol)
         .ok_or_else(|| BackendError::new(format!("entry symbol {symbol:?} was not found")))?;
     validate_invocable_entry(entry, &entry.name)?;
-    execute_resolved(module, entry, false).map(|(value, _)| value)
+    execute_resolved(module, entry, false, None).map(|(value, _)| value)
 }
 
 /// Like [`execute_symbol`], but also returns runtime allocation metrics.
@@ -223,5 +259,5 @@ pub fn execute_symbol_with_stats(
         .find(|function| function.symbol == symbol)
         .ok_or_else(|| BackendError::new(format!("entry symbol {symbol:?} was not found")))?;
     validate_invocable_entry(entry, &entry.name)?;
-    execute_resolved(module, entry, true)
+    execute_resolved(module, entry, true, None)
 }

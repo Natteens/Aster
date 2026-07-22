@@ -275,7 +275,19 @@ fn summarize_function(
 fn is_tracked_reference_type(type_: &mir::Type) -> bool {
     matches!(
         type_,
-        mir::Type::Class(_) | mir::Type::Array(_) | mir::Type::String | mir::Type::List(_)
+        mir::Type::Class(_)
+            | mir::Type::Array(_)
+            | mir::Type::String
+            | mir::Type::List(_)
+            // An enum (e.g. `Option<string>`) is a value type, but plain
+            // copies of it (`switch`'s scrutinee binding, an intermediate
+            // temporary) must still propagate an alias of a tracked origin
+            // through to wherever its payload is later read out via
+            // `EnumField` (see `direct_alias`), or a reference-typed payload
+            // (only possible since `aster.io.ReadLine`'s `Option<string>`;
+            // every prior `Option`/`Result` payload was a scalar) looks
+            // non-escaping even when the enum obviously escapes.
+            | mir::Type::Enum(_)
     )
 }
 
@@ -544,6 +556,8 @@ fn instruction_escape(
                     | mir::Intrinsic::StringTryParseULong
                     | mir::Intrinsic::StringTryParseFloat
                     | mir::Intrinsic::StringTryParseDouble
+                    | mir::Intrinsic::ConsoleWrite
+                    | mir::Intrinsic::ConsoleWriteLine
                     | mir::Intrinsic::ReportRuntimeError(_)
             );
             (!borrows_only
@@ -615,6 +629,11 @@ fn assignment_escape(
         }
         mir::RvalueKind::ArrayLength(operand) if direct_alias(operand, aliases).is_some() => None,
         mir::RvalueKind::ListLength(operand) if direct_alias(operand, aliases).is_some() => None,
+        // Reading an aliased enum's tag (how `switch`/`?` choose a case)
+        // only inspects the discriminant, never the payload -- safe on its
+        // own regardless of whether the enum escapes. Never observed before
+        // an enum type was tracked at all (see `is_tracked_reference_type`).
+        mir::RvalueKind::Discriminant(operand) if direct_alias(operand, aliases).is_some() => None,
         mir::RvalueKind::Equality { .. } => None,
         _ if rvalue_uses_alias(value, aliases) => Some(EscapeReason::UnsupportedUse),
         _ => None,
@@ -650,10 +669,27 @@ fn terminator_returns_alias(terminator: &mir::Terminator, aliases: &HashSet<mir:
 }
 
 fn direct_alias(operand: &mir::Operand, aliases: &HashSet<mir::LocalId>) -> Option<mir::LocalId> {
-    let mir::OperandKind::Copy(mir::Place::Local(local)) = &operand.kind else {
-        return None;
-    };
-    aliases.contains(local).then_some(*local)
+    match &operand.kind {
+        mir::OperandKind::Copy(mir::Place::Local(local)) => {
+            aliases.contains(local).then_some(*local)
+        }
+        // Reading a field out of an enum payload (how `switch`/postfix `?`
+        // extract `Some(value)`) propagates the base's alias: if the enum
+        // itself was tracked (e.g. `aster.io.ReadLine()`'s `Option<string>`),
+        // a reference-typed payload copied out of it escapes exactly when
+        // whatever receives it escapes, same as copying the base directly.
+        // Every prior `Option<T>`/`Result<T,E>` payload was a scalar, where
+        // `alias_source`'s `is_tracked_reference_type` gate already excluded
+        // this path, so the gap was never observed before a reference-typed
+        // payload existed.
+        mir::OperandKind::Copy(mir::Place::EnumField { base, .. }) => {
+            let mir::Place::Local(local) = base.as_ref() else {
+                return None;
+            };
+            aliases.contains(local).then_some(*local)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

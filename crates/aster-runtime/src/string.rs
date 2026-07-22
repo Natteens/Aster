@@ -641,7 +641,7 @@ fn substring_boundary_error(
 /// for the concrete `Option<T>` layout, owned exclusively by the caller for
 /// the duration of this call.
 #[allow(unsafe_code)]
-unsafe fn write_option_result<T>(
+pub(crate) unsafe fn write_option_result<T>(
     destination: *mut u8,
     total_size: usize,
     payload_offset: usize,

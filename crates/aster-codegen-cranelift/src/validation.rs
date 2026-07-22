@@ -120,6 +120,93 @@ pub(super) fn validate_module(module: &mir::Module) -> Result<(), BackendError> 
         validate_string_try_parse_targets(function, &enum_definitions)?;
         validate_enum_construct_shapes(function, &enum_definitions)?;
     }
+    validate_no_console_io_in_workers(module)?;
+    Ok(())
+}
+
+/// Console I/O is rejected anywhere reachable from a `Task.Run`/
+/// `Parallel.For`/`ForEach`/`Reduce` worker body: output order and input
+/// consumption would be non-deterministic across workers, and the console
+/// backend is neither shared nor synchronized. Builds the whole module's
+/// direct call graph once (`Instruction::Call` edges), marks every function
+/// whose body directly calls a `Console*` intrinsic, then, for every worker
+/// entry point found anywhere in the module, walks the graph from its
+/// `Function` operand(s) to see whether a console-using function is
+/// reachable.
+fn validate_no_console_io_in_workers(module: &mir::Module) -> Result<(), BackendError> {
+    let mut callees: HashMap<mir::SymbolId, Vec<mir::SymbolId>> = HashMap::new();
+    let mut console_users: HashSet<mir::SymbolId> = HashSet::new();
+    for function in &module.functions {
+        let mut direct = Vec::new();
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                match instruction {
+                    mir::Instruction::Call {
+                        function: callee, ..
+                    } => direct.push(*callee),
+                    mir::Instruction::CallIntrinsic {
+                        intrinsic:
+                            mir::Intrinsic::ConsoleWrite
+                            | mir::Intrinsic::ConsoleWriteLine
+                            | mir::Intrinsic::ConsoleReadLine
+                            | mir::Intrinsic::ConsoleReadLineTemporary,
+                        ..
+                    } => {
+                        console_users.insert(function.symbol);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        callees.insert(function.symbol, direct);
+    }
+    let reaches_console = |root: mir::SymbolId| -> bool {
+        let mut visited: HashSet<mir::SymbolId> = HashSet::new();
+        let mut stack = vec![root];
+        while let Some(symbol) = stack.pop() {
+            if !visited.insert(symbol) {
+                continue;
+            }
+            if console_users.contains(&symbol) {
+                return true;
+            }
+            if let Some(direct) = callees.get(&symbol) {
+                stack.extend(direct.iter().copied());
+            }
+        }
+        false
+    };
+    for function in &module.functions {
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                let mir::Instruction::CallIntrinsic {
+                    intrinsic,
+                    arguments,
+                    ..
+                } = instruction
+                else {
+                    continue;
+                };
+                let worker_name = match intrinsic {
+                    mir::Intrinsic::TaskRun => "Task.Run",
+                    mir::Intrinsic::ParallelFor => "Parallel.For",
+                    mir::Intrinsic::ParallelForEach => "Parallel.ForEach",
+                    mir::Intrinsic::ParallelReduce => "Parallel.Reduce",
+                    _ => continue,
+                };
+                for argument in arguments {
+                    if let mir::OperandKind::Function(target) = argument.kind
+                        && reaches_console(target)
+                    {
+                        return Err(BackendError::new(format!(
+                            "function `{}` uses `{worker_name}` with a worker body that (directly or transitively) calls `aster.io.Write`/`WriteLine`/`ReadLine`, which is rejected in this version",
+                            function.name
+                        )));
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -192,12 +279,13 @@ fn validate_enum_construct_shapes(
     Ok(())
 }
 
-/// The exact `Option<T>` shape `string.TryParse*()` must return: precisely
-/// two cases, one carrying zero fields (`None`) and the other carrying
-/// exactly one field of the primitive `intrinsic` targets (`Some`). Runs
-/// once per function over the whole module's enum definitions -- data
-/// `validate_intrinsic_shape` does not have -- rather than threading it
-/// through every layer of the generic per-instruction validators above.
+/// The exact `Option<T>` shape `string.TryParse*()`/`aster.io.ReadLine()`
+/// must return: precisely two cases, one carrying zero fields (`None`) and
+/// the other carrying exactly one field of the type `intrinsic` targets
+/// (`Some`). Runs once per function over the whole module's enum
+/// definitions -- data `validate_intrinsic_shape` does not have -- rather
+/// than threading it through every layer of the generic per-instruction
+/// validators above.
 fn validate_string_try_parse_targets(
     function: &mir::Function,
     enum_definitions: &HashMap<mir::SymbolId, &mir::EnumDefinition>,
@@ -220,6 +308,9 @@ fn validate_string_try_parse_targets(
                 mir::Intrinsic::StringTryParseULong => mir::Type::ULong,
                 mir::Intrinsic::StringTryParseFloat => mir::Type::Float,
                 mir::Intrinsic::StringTryParseDouble => mir::Type::Double,
+                mir::Intrinsic::ConsoleReadLine | mir::Intrinsic::ConsoleReadLineTemporary => {
+                    mir::Type::String
+                }
                 _ => continue,
             };
             let mir::Type::Enum(symbol) = return_type else {
@@ -651,6 +742,10 @@ fn is_string_method_intrinsic(intrinsic: mir::Intrinsic) -> bool {
             | mir::Intrinsic::StringTryParseULong
             | mir::Intrinsic::StringTryParseFloat
             | mir::Intrinsic::StringTryParseDouble
+            | mir::Intrinsic::ConsoleWrite
+            | mir::Intrinsic::ConsoleWriteLine
+            | mir::Intrinsic::ConsoleReadLine
+            | mir::Intrinsic::ConsoleReadLineTemporary
     )
 }
 
@@ -1092,6 +1187,20 @@ fn validate_intrinsic_shape(
             destination.is_some()
                 && matches!(return_type, mir::Type::Enum(_))
                 && matches!(arguments, [receiver] if receiver.type_ == mir::Type::String)
+        }
+        mir::Intrinsic::ConsoleWrite | mir::Intrinsic::ConsoleWriteLine => {
+            destination.is_none()
+                && *return_type == mir::Type::Void
+                && matches!(arguments, [value] if value.type_ == mir::Type::String)
+        }
+        // `aster.io.ReadLine()`: aridade zero, a destination whose type is
+        // *some* concrete enum. `validate_string_try_parse_targets` (reused
+        // for this same shape, run once over the whole module) confirms the
+        // enum is actually `Option<string>`.
+        mir::Intrinsic::ConsoleReadLine | mir::Intrinsic::ConsoleReadLineTemporary => {
+            destination.is_some()
+                && matches!(return_type, mir::Type::Enum(_))
+                && arguments.is_empty()
         }
         mir::Intrinsic::TaskRun => {
             destination.is_some()

@@ -306,6 +306,19 @@ pub enum Intrinsic {
     StringTryParseULong,
     StringTryParseFloat,
     StringTryParseDouble,
+    /// `aster.io.Write(string)`: writes its argument's UTF-8 bytes verbatim
+    /// to the console backend and flushes. Argument: `[value]` (a `string`,
+    /// only ever borrowed); `return_type` always `void`.
+    ConsoleWrite,
+    /// `aster.io.WriteLine(string)`: like `ConsoleWrite`, plus a trailing LF.
+    ConsoleWriteLine,
+    /// `aster.io.ReadLine()`: reads one line from the console backend into a
+    /// freshly allocated persistent `Option<string>`. No arguments;
+    /// `return_type` is always the `Option<string>` specialization. `None`
+    /// on EOF.
+    ConsoleReadLine,
+    /// Temporary-arena counterpart of [`Self::ConsoleReadLine`].
+    ConsoleReadLineTemporary,
 }
 
 impl Intrinsic {
@@ -322,7 +335,8 @@ impl Intrinsic {
             | Self::StringFromChar
             | Self::StringJoin
             | Self::StringSubstringFrom
-            | Self::StringSubstringRange => Some(AllocationRegion::Persistent),
+            | Self::StringSubstringRange
+            | Self::ConsoleReadLine => Some(AllocationRegion::Persistent),
             Self::StringConcatTemporary
             | Self::StringFromLongTemporary
             | Self::StringFromULongTemporary
@@ -332,7 +346,8 @@ impl Intrinsic {
             | Self::StringFromCharTemporary
             | Self::StringJoinTemporary
             | Self::StringSubstringFromTemporary
-            | Self::StringSubstringRangeTemporary => Some(AllocationRegion::Temporary),
+            | Self::StringSubstringRangeTemporary
+            | Self::ConsoleReadLineTemporary => Some(AllocationRegion::Temporary),
             Self::Log
             | Self::LogWarning
             | Self::LogError
@@ -362,7 +377,9 @@ impl Intrinsic {
             | Self::StringTryParseLong
             | Self::StringTryParseULong
             | Self::StringTryParseFloat
-            | Self::StringTryParseDouble => None,
+            | Self::StringTryParseDouble
+            | Self::ConsoleWrite
+            | Self::ConsoleWriteLine => None,
         }
     }
 
@@ -443,6 +460,14 @@ impl Intrinsic {
                 Self::StringSubstringRange | Self::StringSubstringRangeTemporary,
                 AllocationRegion::Temporary,
             ) => Self::StringSubstringRangeTemporary,
+            (
+                Self::ConsoleReadLine | Self::ConsoleReadLineTemporary,
+                AllocationRegion::Persistent,
+            ) => Self::ConsoleReadLine,
+            (
+                Self::ConsoleReadLine | Self::ConsoleReadLineTemporary,
+                AllocationRegion::Temporary,
+            ) => Self::ConsoleReadLineTemporary,
             _ => self,
         }
     }

@@ -12,6 +12,7 @@
 
 mod arena;
 pub mod context;
+pub mod io;
 pub mod log;
 mod math;
 mod object;
@@ -22,6 +23,11 @@ pub use context::{
     AsterArray, AsterList, ExecutionContext, ListRegion, MemoryStats, aster_rt_array_element,
     aster_rt_array_length, aster_rt_list_add, aster_rt_list_get, aster_rt_list_length,
     aster_rt_list_new, aster_rt_list_new_temporary, aster_rt_list_remove_at,
+};
+pub use io::{
+    ConsoleBackend, FailingConsoleBackend, MemoryConsoleBackend, StdConsoleBackend,
+    aster_rt_io_read_line, aster_rt_io_read_line_temporary, aster_rt_io_write,
+    aster_rt_io_write_line,
 };
 pub use log::LogLevel;
 pub use registry::{RuntimeFunction, RuntimeSignature, RuntimeType, runtime_functions};

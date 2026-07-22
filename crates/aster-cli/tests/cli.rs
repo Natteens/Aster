@@ -1,7 +1,8 @@
 use std::{
     fs,
+    io::Write as _,
     path::PathBuf,
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -199,6 +200,97 @@ fn absolute_source_path_and_embedded_stdlib_work_outside_the_repository() {
     fs::remove_dir_all(&directory).expect("remove temporary directory");
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output).trim(), "42");
+}
+
+#[test]
+fn aster_io_uses_real_stdin_and_stdout_under_run() {
+    let directory = temporary_directory("console-io");
+    let main = directory.join("main.aster");
+    fs::write(
+        &main,
+        "using aster.core;\nusing aster.io;\n\
+         public void Main() {\n\
+             Write(\"Name: \");\n\
+             Option<string> name = ReadLine();\n\
+             switch (name) { case Some(value): WriteLine(\"Hi, \" + value + \"!\"); case None: WriteLine(\"no input\"); }\n\
+         }",
+    )
+    .expect("write console io program");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args([
+            "run",
+            main.to_str().expect("UTF-8 temporary path"),
+            "--function",
+            "Main",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn Aster binary");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(b"Ada\n")
+        .expect("write to child stdin");
+    let output = child.wait_with_output().expect("wait for Aster binary");
+    fs::remove_dir_all(&directory).expect("remove temporary directory");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "Name: Hi, Ada!\n");
+}
+
+#[test]
+fn aster_io_reports_none_on_immediate_eof() {
+    let directory = temporary_directory("console-io-eof");
+    let main = directory.join("main.aster");
+    fs::write(
+        &main,
+        "using aster.core;\nusing aster.io;\n\
+         public void Main() {\n\
+             Option<string> name = ReadLine();\n\
+             switch (name) { case Some(value): WriteLine(value); case None: WriteLine(\"eof\"); }\n\
+         }",
+    )
+    .expect("write console io program");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args([
+            "run",
+            main.to_str().expect("UTF-8 temporary path"),
+            "--function",
+            "Main",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn Aster binary");
+    // Dropping the piped stdin handle immediately (never written to) closes
+    // it, so the child sees EOF right away instead of blocking.
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("wait for Aster binary");
+    fs::remove_dir_all(&directory).expect("remove temporary directory");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "eof\n");
+}
+
+#[test]
+fn check_never_touches_stdin_or_program_output() {
+    let directory = temporary_directory("console-io-check");
+    let main = directory.join("main.aster");
+    fs::write(
+        &main,
+        "using aster.io;\npublic void Main() { WriteLine(\"should not run\"); }",
+    )
+    .expect("write console io program");
+    let output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["check", main.to_str().expect("UTF-8 temporary path")])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run Aster binary");
+    fs::remove_dir_all(&directory).expect("remove temporary directory");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!stdout(&output).contains("should not run"));
 }
 
 fn aster<const N: usize>(arguments: [&str; N]) -> Output {
