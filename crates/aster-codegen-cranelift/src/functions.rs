@@ -158,16 +158,11 @@ impl Codegen {
                 class,
                 region,
             } => self.translate_object_allocation(builder, destination, *class, *region, state),
-            // `List<T>` has a native header, layout, and structural
-            // validation (Lote List A) but no runtime ABI symbol or codegen
-            // path yet (Lote List B). `validation.rs` already proves this
-            // instruction is never reachable from a validated module built
-            // by this compiler (no source syntax produces it); this stays a
-            // controlled error rather than a panic for any other caller of
-            // codegen, such as a hand-built MIR module in a test.
-            mir::Instruction::AllocateList { .. } => {
-                Err(BackendError::new("List<T> allocation has no codegen yet"))
-            }
+            mir::Instruction::AllocateList {
+                destination,
+                element_type,
+                region,
+            } => self.translate_list_allocation(builder, destination, element_type, *region, state),
         }
     }
 }
@@ -183,6 +178,10 @@ fn function_uses_temporary_allocations(function: &mir::Function) -> bool {
                 ..
             }
             | mir::Instruction::AllocateArray {
+                region: mir::AllocationRegion::Temporary,
+                ..
+            }
+            | mir::Instruction::AllocateList {
                 region: mir::AllocationRegion::Temporary,
                 ..
             } => true,

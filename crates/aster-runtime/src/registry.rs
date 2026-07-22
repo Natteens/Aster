@@ -7,7 +7,8 @@
 
 use crate::context::{
     aster_rt_array_element, aster_rt_array_length, aster_rt_array_new,
-    aster_rt_array_new_temporary, aster_rt_temporary_scope_enter, aster_rt_temporary_scope_leave,
+    aster_rt_array_new_temporary, aster_rt_list_length, aster_rt_list_new,
+    aster_rt_list_new_temporary, aster_rt_temporary_scope_enter, aster_rt_temporary_scope_leave,
 };
 use crate::log::aster_rt_log;
 use crate::math::{aster_rt_integer_arithmetic_error, aster_rt_math_domain_error};
@@ -126,6 +127,40 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
         RuntimeFunction {
             name: "aster_rt_array_length",
             address: aster_rt_array_length as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::I32),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_list_new",
+            address: aster_rt_list_new as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I64,
+                ],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_list_new_temporary",
+            address: aster_rt_list_new_temporary as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I64,
+                ],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_list_length",
+            address: aster_rt_list_length as *const u8,
             signature: RuntimeSignature {
                 parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
                 result: Some(RuntimeType::I32),

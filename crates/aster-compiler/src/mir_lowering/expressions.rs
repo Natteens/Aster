@@ -55,6 +55,9 @@ impl FunctionLowerer {
                 element_type,
                 length,
             } => Some(self.lower_new_array(&expression.type_, element_type, length)),
+            hir::ExpressionKind::NewList { element_type } => {
+                Some(self.lower_new_list(&expression.type_, element_type))
+            }
             hir::ExpressionKind::Index { .. } | hir::ExpressionKind::Member { .. } => {
                 Some(self.place_operand(expression))
             }
@@ -66,6 +69,12 @@ impl FunctionLowerer {
                     expression.type_.clone(),
                     mir::RvalueKind::ArrayLength(array),
                 ))
+            }
+            hir::ExpressionKind::ListLength(list) => {
+                let list = self
+                    .lower_expression(list)
+                    .expect("validated list produces a value");
+                Some(self.temporary(expression.type_.clone(), mir::RvalueKind::ListLength(list)))
             }
             hir::ExpressionKind::StringLength(value) => {
                 let value = self
@@ -633,6 +642,22 @@ impl FunctionLowerer {
             element_type: element_type.clone(),
             length,
             requires_default: true,
+            region: mir::AllocationRegion::Persistent,
+        });
+        mir::Operand {
+            type_: type_.clone(),
+            kind: mir::OperandKind::Copy(mir::Place::Local(local)),
+        }
+    }
+
+    fn lower_new_list(&mut self, type_: &hir::Type, element_type: &hir::Type) -> mir::Operand {
+        let local = self.new_temporary(type_.clone());
+        // Always lowered `Persistent`; escape analysis (a later, whole-module
+        // pass) rewrites this to `Temporary` when provably safe, exactly like
+        // `AllocateObject`/`AllocateArray` above.
+        self.instruction(mir::Instruction::AllocateList {
+            destination: mir::Place::Local(local),
+            element_type: element_type.clone(),
             region: mir::AllocationRegion::Persistent,
         });
         mir::Operand {

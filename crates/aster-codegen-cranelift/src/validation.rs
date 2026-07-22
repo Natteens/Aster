@@ -814,6 +814,20 @@ fn validate_rvalue(
             Ok(())
         }
         mir::RvalueKind::ArrayLength(array) => validate_operand(array, function_name),
+        mir::RvalueKind::ListLength(list) => {
+            validate_operand(list, function_name)?;
+            if !matches!(list.type_, mir::Type::List(_)) {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` has a `ListLength` reading a non-`List<T>` receiver"
+                )));
+            }
+            if value.type_ != mir::Type::Int {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` has a `ListLength` whose result type is not `int`"
+                )));
+            }
+            Ok(())
+        }
         mir::RvalueKind::MakeInterface {
             object,
             class,
@@ -1608,5 +1622,92 @@ mod tests {
         let error = validate_invocable_entry(&function, "Main")
             .expect_err("an entry function returning List<T> must be rejected");
         assert!(error.message().contains("returns a List<T>"));
+    }
+
+    /// `ListLength` has no source syntax producing it directly through the
+    /// helper below (it takes the receiver/result types as raw MIR), so
+    /// every scenario is hand-built, mirroring `allocate_list_module` above.
+    fn list_length_module(list_type: mir::Type, declared_result_type: mir::Type) -> mir::Module {
+        let list_local = mir::LocalId(0);
+        let result_local = mir::LocalId(1);
+        mir::Module {
+            structs: Vec::new(),
+            classes: Vec::new(),
+            interfaces: Vec::new(),
+            enums: Vec::new(),
+            interface_implementations: Vec::new(),
+            functions: vec![mir::Function {
+                constructor: false,
+                symbol: mir::SymbolId(1),
+                owner: None,
+                name: "Length".to_owned(),
+                visibility: mir::Visibility::Public,
+                parameters: vec![mir::Local {
+                    id: list_local,
+                    symbol: None,
+                    name: "list".to_owned(),
+                    type_: list_type.clone(),
+                    mutable: false,
+                    temporary: false,
+                }],
+                locals: vec![mir::Local {
+                    id: result_local,
+                    symbol: None,
+                    name: "result".to_owned(),
+                    type_: declared_result_type.clone(),
+                    mutable: true,
+                    temporary: false,
+                }],
+                return_type: mir::Type::Void,
+                entry: mir::BasicBlockId(0),
+                blocks: vec![mir::BasicBlock {
+                    id: mir::BasicBlockId(0),
+                    instructions: vec![mir::Instruction::Assign {
+                        target: mir::Place::Local(result_local),
+                        value: mir::Rvalue {
+                            type_: declared_result_type,
+                            kind: mir::RvalueKind::ListLength(mir::Operand {
+                                type_: list_type,
+                                kind: mir::OperandKind::Copy(mir::Place::Local(list_local)),
+                            }),
+                        },
+                    }],
+                    terminator: mir::Terminator::Return(None),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn list_length_accepts_a_well_formed_read() {
+        let module = list_length_module(mir::Type::List(Box::new(mir::Type::Int)), mir::Type::Int);
+        validate_module(&module).expect("List<int>.Length is well-formed");
+    }
+
+    #[test]
+    fn list_length_rejects_a_non_list_receiver() {
+        let module = list_length_module(mir::Type::Int, mir::Type::Int);
+        let error = validate_module(&module)
+            .expect_err("ListLength on a non-List<T> receiver must be rejected");
+        assert!(error.message().contains("non-`List<T>` receiver"));
+    }
+
+    #[test]
+    fn list_length_rejects_a_non_int_result() {
+        let module = list_length_module(mir::Type::List(Box::new(mir::Type::Int)), mir::Type::Long);
+        let error = validate_module(&module)
+            .expect_err("ListLength must always produce `int`, never `long`");
+        assert!(error.message().contains("result type is not `int`"));
+    }
+
+    #[test]
+    fn list_length_rejects_a_malformed_list_receiver_type() {
+        let module = list_length_module(
+            mir::Type::List(Box::new(mir::Type::Decimal)),
+            mir::Type::Int,
+        );
+        let error = validate_module(&module)
+            .expect_err("List<decimal> has no runtime representation and must be rejected");
+        assert!(error.message().contains("decimal"));
     }
 }

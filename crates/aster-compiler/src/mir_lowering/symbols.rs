@@ -154,7 +154,7 @@ fn collect_variable(variable: &hir::Variable, max: &mut u32) {
 #[allow(clippy::too_many_lines)]
 fn collect_expression(expression: &hir::Expression, max: &mut u32) {
     match &expression.kind {
-        hir::ExpressionKind::Literal(_) => {}
+        hir::ExpressionKind::Literal(_) | hir::ExpressionKind::NewList { .. } => {}
         hir::ExpressionKind::Symbol(symbol) => note(max, *symbol),
         hir::ExpressionKind::StructLiteral {
             struct_symbol,
@@ -202,6 +202,7 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
         }
         hir::ExpressionKind::ArrayLength(operand)
         | hir::ExpressionKind::StringLength(operand)
+        | hir::ExpressionKind::ListLength(operand)
         | hir::ExpressionKind::Convert { operand }
         | hir::ExpressionKind::Unary { operand, .. } => {
             collect_expression(operand, max);

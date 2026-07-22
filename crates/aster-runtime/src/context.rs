@@ -356,7 +356,6 @@ impl ExecutionContext {
     /// panic, never a trap, never a partially written header (nothing is
     /// written to the header until every validation has passed). Capacity
     /// is not reserved ahead of time: growth is a future operation.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn allocate_list_in_region(
         &mut self,
         element_size: u32,
@@ -576,6 +575,66 @@ pub extern "C" fn aster_rt_array_length(
     }
 }
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_list_new(
+    context: *mut ExecutionContext,
+    element_size: i32,
+    element_align: i32,
+    element_type_key: i64,
+) -> *mut AsterList {
+    if context.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: generated functions receive the live host-owned context as their
+    // hidden first parameter, and invocation cannot outlive that context.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let size = u32::try_from(element_size).unwrap_or(0);
+    let align = u32::try_from(element_align).unwrap_or(0);
+    // `as u64` is a bit-preserving reinterpretation of the same 64 bits the
+    // compiler produced from `aster_mir::type_key`; the wire type is `i64`
+    // only because that is the runtime ABI's signed 64-bit carrier.
+    #[allow(clippy::cast_sign_loss)]
+    let type_key = element_type_key as u64;
+    context.allocate_list_in_region(size, align, type_key, ListRegion::Persistent)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_list_new_temporary(
+    context: *mut ExecutionContext,
+    element_size: i32,
+    element_align: i32,
+    element_type_key: i64,
+) -> *mut AsterList {
+    if context.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: generated functions receive the live host-owned context as their
+    // hidden first parameter, and invocation cannot outlive that context.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let size = u32::try_from(element_size).unwrap_or(0);
+    let align = u32::try_from(element_align).unwrap_or(0);
+    #[allow(clippy::cast_sign_loss)]
+    let type_key = element_type_key as u64;
+    context.allocate_list_in_region(size, align, type_key, ListRegion::Temporary)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_list_length(
+    context: *mut ExecutionContext,
+    list: *const AsterList,
+) -> i32 {
+    if context.is_null() || list.is_null() {
+        return 0;
+    }
+    // SAFETY: list headers are owned by the live context passed alongside it.
+    #[allow(unsafe_code)]
+    unsafe {
+        (*list).length
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::cast_ptr_alignment,
@@ -668,6 +727,71 @@ mod tests {
         unsafe {
             assert_eq!((*first).element_type_key(), 1);
             assert_eq!((*second).element_type_key(), 2);
+        }
+    }
+
+    #[test]
+    fn aliasing_a_list_reference_preserves_pointer_identity() {
+        // At the MIR level `List<int> b = a;` lowers to a plain scalar copy
+        // (`List<T>` is never aggregate, see `values::is_aggregate`), exactly
+        // like `Class`/`Array`: an "alias" is, structurally, the same
+        // pointer. Combined with `independent_list_headers_do_not_share_storage`
+        // above (two distinct `new List<T>()` calls never share a header),
+        // this is the full identity guarantee required by List B1.
+        let mut context = ExecutionContext::new();
+        let a = context.allocate_list_in_region(4, 4, 1, ListRegion::Persistent);
+        let b = a;
+        assert!(!a.is_null());
+        assert_eq!(a, b);
+        // SAFETY: `a` was just allocated above and is not aliased outside
+        // this test; mutating through it and reading through `b` proves both
+        // names observe the exact same storage.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*a).length = 7;
+            assert_eq!((*b).length, 7);
+        }
+    }
+
+    #[test]
+    fn list_new_and_length_have_controlled_errors_for_null_pointers() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        assert!(aster_rt_list_new(std::ptr::null_mut(), 4, 4, 1).is_null());
+        assert!(aster_rt_list_new_temporary(std::ptr::null_mut(), 4, 4, 1).is_null());
+        assert_eq!(aster_rt_list_length(context_pointer, std::ptr::null()), 0);
+        assert_eq!(
+            aster_rt_list_length(std::ptr::null_mut(), std::ptr::null()),
+            0
+        );
+    }
+
+    #[test]
+    fn list_new_produces_a_header_readable_through_list_length() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 42);
+        assert!(!list.is_null());
+        assert_eq!(aster_rt_list_length(context_pointer, list), 0);
+        // SAFETY: `list` was just allocated above and is not aliased.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!((*list).region(), ListRegion::Persistent);
+        }
+    }
+
+    #[test]
+    fn list_new_temporary_requires_an_active_scope() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        assert!(aster_rt_list_new_temporary(context_pointer, 4, 4, 1).is_null());
+        context.enter_temporary_scope();
+        let list = aster_rt_list_new_temporary(context_pointer, 4, 4, 1);
+        assert!(!list.is_null());
+        // SAFETY: `list` was just allocated above and is not aliased.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!((*list).region(), ListRegion::Temporary);
         }
     }
 

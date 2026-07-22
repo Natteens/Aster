@@ -159,6 +159,22 @@ impl Lowerer<'_> {
                     },
                 }
             }
+            ast::ExpressionKind::NewObject { type_name, .. } if type_name.starts_with("List<") => {
+                // `List` is reserved and never registered in `self.types`
+                // (see `validate_no_reserved_type_names`), so it is resolved
+                // structurally here instead of through the class lookup
+                // below. Semantic analysis already validated the constructor
+                // takes no arguments, so `arguments` is guaranteed empty.
+                let inner = type_name
+                    .strip_prefix("List<")
+                    .and_then(|rest| rest.strip_suffix('>'))
+                    .expect("guarded above");
+                let element_type = self.resolve_type(&ast::TypeRef::new(inner, expression.span));
+                hir::Expression {
+                    type_: hir::Type::List(Box::new(element_type.clone())),
+                    kind: hir::ExpressionKind::NewList { element_type },
+                }
+            }
             ast::ExpressionKind::NewObject {
                 type_name,
                 arguments,
@@ -208,6 +224,12 @@ impl Lowerer<'_> {
                     return hir::Expression {
                         type_: hir::Type::Int,
                         kind: hir::ExpressionKind::StringLength(Box::new(object)),
+                    };
+                }
+                if matches!(object.type_, hir::Type::List(_)) {
+                    return hir::Expression {
+                        type_: hir::Type::Int,
+                        kind: hir::ExpressionKind::ListLength(Box::new(object)),
                     };
                 }
                 if let Some(key) = self.model.property_reads.get(&model_key) {

@@ -177,15 +177,158 @@ fn list_of_int_is_not_assignable_to_list_of_long() {
 }
 
 #[test]
-fn list_has_no_public_constructor_yet() {
-    let source = "public int Run() { List<int> values = new List<int>(); return 0; }";
-    aster_compiler::compile(source).expect_err("`new List<T>()` must still be rejected");
+fn list_has_no_member_operations_beyond_length() {
+    let source = "public int Run(List<int> values) { values.Add(1); return values.Length; }";
+    let diagnostics =
+        aster_compiler::compile(source).expect_err("`Add` is not implemented in List B1");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("no member `Add`")),
+        "missing `Add` rejection in {diagnostics:#?}"
+    );
+}
+
+// --- List B1: `new List<T>()` and `.Length` -----------------------------
+
+#[test]
+fn new_list_constructs_an_empty_list_with_zero_length() {
+    let source = "public int Run() { List<int> values = new List<int>(); return values.Length; }";
+    let compilation =
+        aster_compiler::compile(source).expect("`new List<T>()` and `.Length` compile");
+    assert!(!format!("{:#?}", compilation.module).contains("Unknown"));
 }
 
 #[test]
-fn list_has_no_member_operations_yet() {
-    let source = "public int Run(List<int> values) { values.Add(1); return values.Length; }";
-    aster_compiler::compile(source).expect_err("List<T> exposes no members in this foundation");
+fn new_list_constructor_diagnostics_are_specific() {
+    for (source, expected) in [
+        (
+            "public int Run() { List<int> values = new List<int>(10); return 0; }",
+            "takes no arguments",
+        ),
+        (
+            "public int Run() { List<int> values = new List<int>(1, 2); return 0; }",
+            "takes no arguments",
+        ),
+        (
+            "public int Run() { List values = new List(); return 0; }",
+            "`List` expects 1 type argument, found 0",
+        ),
+        (
+            "public int Run() { List<int, string> values = new List<int, string>(); return 0; }",
+            "`List` expects 1 type argument, found 2",
+        ),
+        (
+            "public int Run() { List<void> values = new List<void>(); return 0; }",
+            "`List<void>` is not supported",
+        ),
+        (
+            "public int Run() { List<decimal> values = new List<decimal>(); return 0; }",
+            "`List<decimal>` cannot be used until `decimal` is executable",
+        ),
+    ] {
+        let diagnostics = aster_compiler::compile(source).expect_err("invalid `new List<T>()`");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(expected)),
+            "missing `{expected}` in {diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn new_list_constructs_every_required_element_type() {
+    for source in [
+        "public int Run() { List<int> values = new List<int>(); return values.Length; }",
+        "public int Run() { List<string> values = new List<string>(); return values.Length; }",
+        "public class Widget { public Widget() {} } public int Run() { List<Widget> values = new List<Widget>(); return values.Length; }",
+        "public interface IJob { int Run(); } public int Consume() { List<IJob> values = new List<IJob>(); return values.Length; }",
+        "public int Run() { List<int[]> values = new List<int[]>(); return values.Length; }",
+        "public struct Point { public int x; public int y; } public int Run() { List<Point> values = new List<Point>(); return values.Length; }",
+        "public enum Color { Red, Green } public int Run() { List<Color> values = new List<Color>(); return values.Length; }",
+        "public class Box<T> { private T value; public Box(T value) { this.value = value; } public T Get() { return value; } } public int Run() { List<Box<int>> values = new List<Box<int>>(); return values.Length; }",
+        "public int Run() { List<List<int>> values = new List<List<int>>(); return values.Length; }",
+    ] {
+        let compilation = aster_compiler::compile(source).unwrap_or_else(|diagnostics| {
+            panic!("expected `{source}` to compile: {diagnostics:#?}")
+        });
+        assert!(
+            !format!("{:#?}", compilation.module).contains("Unknown"),
+            "`{source}` left an Unknown type behind"
+        );
+    }
+}
+
+#[test]
+fn a_type_reserved_for_list_can_never_be_declared_to_shadow_the_builtin() {
+    // `List` is globally reserved (see `validate_no_reserved_type_names`), so
+    // there is no way for a user declaration to ever exist under that name in
+    // the first place; this is the strongest possible form of "a fake `List`
+    // does not activate the built-in constructor".
+    let diagnostics = aster_compiler::compile("public class List { public List() {} }")
+        .expect_err("`List` is reserved");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("reserved for the built-in `List<T>`")
+    }));
+}
+
+#[test]
+fn list_length_cannot_be_assigned_and_capacity_does_not_exist() {
+    for (source, expected) in [
+        (
+            "public int Run(List<int> values) { values.Length = 10; return 0; }",
+            "list Length is read-only",
+        ),
+        (
+            "public int Run(List<int> values) { return values.Capacity; }",
+            "list has no member `Capacity`",
+        ),
+        (
+            "public int Run(List<int> values) { return values.Count; }",
+            "list has no member `Count`",
+        ),
+    ] {
+        let diagnostics = aster_compiler::compile(source).expect_err("must be rejected");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(expected)),
+            "missing `{expected}` in {diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn list_length_evaluates_its_receiver_exactly_once() {
+    let source = "public List<int> Make() { return new List<int>(); } \
+                  public int Run() { return Make().Length; }";
+    let compilation = aster_compiler::compile(source).expect("`Make().Length` compiles");
+    let run = compilation
+        .mir
+        .functions
+        .iter()
+        .find(|function| function.name == "Run" && function.owner.is_none())
+        .expect("Run is declared");
+    let call_count = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| matches!(instruction, aster_mir::Instruction::Call { .. }))
+        .count();
+    assert_eq!(call_count, 1, "`Make()` must be evaluated exactly once");
+}
+
+#[test]
+fn a_class_field_named_length_still_uses_ordinary_member_resolution() {
+    // The `List<T>.Length` intrinsic is gated on the receiver's type being
+    // `Type::List(_)`; any other type's own `Length` member (field, property,
+    // or method) must keep resolving through the normal path, unaffected.
+    let source = "public class Widget { public int Length; public Widget() { Length = 5; } } \
+                  public int Run() { Widget widget = new Widget(); return widget.Length; }";
+    aster_compiler::compile(source).expect("a class field named `Length` is unaffected by List");
 }
 
 #[test]

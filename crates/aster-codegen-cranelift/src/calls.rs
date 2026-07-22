@@ -672,6 +672,42 @@ impl Codegen {
         let object = builder.inst_results(call)[0];
         self.store_scalar(builder, destination, object, state)
     }
+
+    pub(super) fn translate_list_allocation(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: &mir::Place,
+        element_type: &mir::Type,
+        region: mir::AllocationRegion,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let symbol = match region {
+            mir::AllocationRegion::Persistent => "aster_rt_list_new",
+            mir::AllocationRegion::Temporary => "aster_rt_list_new_temporary",
+        };
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids[symbol], builder.func);
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("list allocation is missing its ExecutionContext"))?;
+        let layout = self.layouts.type_layout(element_type)?;
+        let size = builder.ins().iconst(types::I32, i64::from(layout.size));
+        let align = builder
+            .ins()
+            .iconst(types::I32, i64::from(1_u32 << layout.align_shift));
+        // `type_key` is a plain 64-bit structural identity (see
+        // `aster_mir::type_key`); `as i64` only reinterprets its bits for the
+        // runtime ABI's signed 64-bit carrier, never changes the value.
+        #[allow(clippy::cast_possible_wrap)]
+        let type_key_bits = mir::type_key(element_type) as i64;
+        let type_key = builder.ins().iconst(types::I64, type_key_bits);
+        let call = builder
+            .ins()
+            .call(function_ref, &[context, size, align, type_key]);
+        let list = builder.inst_results(call)[0];
+        self.store_scalar(builder, destination, list, state)
+    }
 }
 
 /// The concrete `SymbolId` (as an `i64` immediate) carried by a resolved

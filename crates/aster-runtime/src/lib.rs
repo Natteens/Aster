@@ -20,7 +20,7 @@ pub mod string;
 
 pub use context::{
     AsterArray, AsterList, ExecutionContext, ListRegion, MemoryStats, aster_rt_array_element,
-    aster_rt_array_length,
+    aster_rt_array_length, aster_rt_list_length, aster_rt_list_new, aster_rt_list_new_temporary,
 };
 pub use log::LogLevel;
 pub use registry::{RuntimeFunction, RuntimeSignature, RuntimeType, runtime_functions};

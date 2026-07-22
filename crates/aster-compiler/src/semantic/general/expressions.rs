@@ -1023,6 +1023,14 @@ impl Analyzer<'_> {
                     );
                     return Type::Unknown;
                 }
+                Type::List(_) => {
+                    self.diagnostics.push(
+                        Diagnostic::error("list Length is read-only", target.span).with_help(
+                            "Length reflects the list's element count and cannot be set directly",
+                        ),
+                    );
+                    return Type::Unknown;
+                }
                 _ => {}
             }
         }

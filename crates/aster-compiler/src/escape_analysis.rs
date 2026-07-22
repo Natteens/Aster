@@ -573,6 +573,7 @@ fn assignment_escape(
             Some(EscapeReason::Contained)
         }
         mir::RvalueKind::ArrayLength(operand) if direct_alias(operand, aliases).is_some() => None,
+        mir::RvalueKind::ListLength(operand) if direct_alias(operand, aliases).is_some() => None,
         mir::RvalueKind::Equality { .. } => None,
         _ if rvalue_uses_alias(value, aliases) => Some(EscapeReason::UnsupportedUse),
         _ => None,
@@ -584,6 +585,7 @@ fn rvalue_uses_alias(value: &mir::Rvalue, aliases: &HashSet<mir::LocalId>) -> bo
         mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Discriminant(operand)
         | mir::RvalueKind::ArrayLength(operand)
+        | mir::RvalueKind::ListLength(operand)
         | mir::RvalueKind::Cast(operand)
         | mir::RvalueKind::Unary { operand, .. } => direct_alias(operand, aliases).is_some(),
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
@@ -702,6 +704,28 @@ mod tests {
                     return None;
                 };
                 intrinsic.string_allocation_region()
+            })
+            .collect()
+    }
+
+    fn list_regions(source: &str, function_name: &str) -> Vec<mir::AllocationRegion> {
+        let compilation = compilation(source);
+        let function = compilation
+            .mir
+            .functions
+            .iter()
+            .find(|function| function.name == function_name && function.owner.is_none())
+            .unwrap_or_else(|| panic!("missing MIR function `{function_name}`"));
+
+        function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| {
+                let mir::Instruction::AllocateList { region, .. } = instruction else {
+                    return None;
+                };
+                Some(*region)
             })
             .collect()
     }
@@ -1118,5 +1142,47 @@ mod tests {
         assert!(super::is_tracked_reference_type(&mir::Type::List(
             Box::new(mir::Type::Int)
         )));
+    }
+
+    // Real, compiled `new List<T>()` source (List B1) exercising the same
+    // escape-analysis pass through the ordinary pipeline, not hand-built MIR.
+
+    #[test]
+    fn a_local_non_escaping_list_from_real_source_is_temporary() {
+        let source =
+            "public int Run() { List<int> values = new List<int>(); return values.Length; }";
+        assert_eq!(
+            list_regions(source, "Run"),
+            vec![mir::AllocationRegion::Temporary]
+        );
+    }
+
+    #[test]
+    fn a_returned_list_from_real_source_is_persistent() {
+        let source = "public List<int> Make() { return new List<int>(); }";
+        assert_eq!(
+            list_regions(source, "Make"),
+            vec![mir::AllocationRegion::Persistent]
+        );
+    }
+
+    #[test]
+    fn a_list_stored_in_a_field_from_real_source_is_persistent() {
+        let source = "public class Holder { public List<int> value; public Holder(List<int> initial) { value = initial; } } \
+                       public int Run() { Holder holder = new Holder(new List<int>()); List<int> values = new List<int>(); holder.value = values; return values.Length; }";
+        let classifications = classifications(source, "Run");
+        assert!(
+            classifications.contains(&EscapeClassification::Persistent(EscapeReason::Stored)),
+            "{classifications:#?}"
+        );
+    }
+
+    #[test]
+    fn a_returned_list_alias_from_real_source_is_persistent() {
+        let source = "public List<int> Make() { List<int> first = new List<int>(); List<int> second = first; return second; }";
+        assert_eq!(
+            list_regions(source, "Make"),
+            vec![mir::AllocationRegion::Persistent]
+        );
     }
 }

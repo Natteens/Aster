@@ -426,6 +426,9 @@ pub enum RvalueKind {
     },
     Discriminant(Operand),
     ArrayLength(Operand),
+    /// Reads the `length` field of a `List<T>` header (see
+    /// `aster_runtime::AsterList`).
+    ListLength(Operand),
     /// Convert the operand to this rvalue's type.
     Cast(Operand),
     MakeInterface {

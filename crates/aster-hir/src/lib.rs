@@ -215,6 +215,11 @@ pub enum ExpressionKind {
         element_type: Type,
         length: Box<Expression>,
     },
+    /// `new List<T>()`: allocates an empty `List<T>` header (see
+    /// `aster_runtime::AsterList`). `element_type` is already concrete.
+    NewList {
+        element_type: Type,
+    },
     Index {
         array: Box<Expression>,
         index: Box<Expression>,
@@ -222,6 +227,8 @@ pub enum ExpressionKind {
     ArrayLength(Box<Expression>),
     /// Number of Unicode scalar values in an immutable UTF-8 string.
     StringLength(Box<Expression>),
+    /// `list.Length`: reads the `length` field of a `List<T>` header.
+    ListLength(Box<Expression>),
     Member {
         object: Box<Expression>,
         symbol: SymbolId,

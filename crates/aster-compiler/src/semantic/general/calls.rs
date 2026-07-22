@@ -1,7 +1,7 @@
 use super::{
     Analyzer, Callable, Diagnostic, Dispatch, Expression, ExpressionKind, Primitive, ResolvedCall,
     ResolvedEnumCase, ResolvedParallelFor, ResolvedParallelForEach, ResolvedParallelReduce,
-    ResolvedTaskRun, Signature, Span, Type, TypeKind, Visibility,
+    ResolvedTaskRun, Signature, Span, Type, TypeKind, TypeRef, Visibility, resolve_type_readonly,
 };
 
 impl Analyzer<'_> {
@@ -11,6 +11,29 @@ impl Analyzer<'_> {
         arguments: &[Expression],
         span: Span,
     ) -> Type {
+        if type_name == "List" || type_name.starts_with("List<") {
+            if !arguments.is_empty() {
+                self.diagnostics.push(
+                    Diagnostic::error("`new List<T>()` takes no arguments", span).with_help(
+                        "remove the arguments; `List<T>` has no constructor parameters yet",
+                    ),
+                );
+                for argument in arguments {
+                    self.expression(argument);
+                }
+                return Type::Unknown;
+            }
+            // `List` is reserved (see `validate_no_reserved_type_names`) and
+            // never registered in `context.types`, so it is recognized
+            // structurally here instead of through the class lookup below.
+            // Arity/`void`/`decimal` for the type argument itself were
+            // already validated during monomorphization
+            // (`Monomorphizer::concretize_type_name`); `resolve_type_readonly`
+            // reproduces the same void/decimal/unknown collapse, so a
+            // malformed element silently resolves to `Unknown` here without a
+            // second, redundant diagnostic.
+            return resolve_type_readonly(&TypeRef::new(type_name, span), self.context);
+        }
         let Some(info) = self.context.types.get(type_name) else {
             self.diagnostics.push(Diagnostic::error(
                 format!("unknown type `{type_name}`"),
@@ -185,6 +208,16 @@ impl Analyzer<'_> {
             }
             self.diagnostics.push(Diagnostic::error(
                 format!("string has no member `{name}`"),
+                span,
+            ));
+            return Type::Unknown;
+        }
+        if matches!(object_type, Type::List(_)) {
+            if name == "Length" {
+                return Type::Int;
+            }
+            self.diagnostics.push(Diagnostic::error(
+                format!("list has no member `{name}`"),
                 span,
             ));
             return Type::Unknown;
@@ -429,6 +462,13 @@ impl Analyzer<'_> {
                     }
                 } else {
                     let receiver = self.expression(object);
+                    if matches!(receiver, Type::List(_)) {
+                        self.diagnostics.push(Diagnostic::error(
+                            format!("list has no member `{name}`"),
+                            callee.span,
+                        ));
+                        return Type::Unknown;
+                    }
                     let interface_dispatch = matches!(receiver, Type::Interface(_));
                     let (Type::User(type_name)
                     | Type::Class(type_name)
