@@ -3,6 +3,7 @@ mod general;
 use std::collections::HashMap;
 
 use aster_diagnostics::{Diagnostic, Span};
+use aster_hir::StringOperation;
 use aster_syntax::{Item, Module};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -114,6 +115,7 @@ pub(crate) struct Model {
     pub parallel_reduce: HashMap<ModelNodeKey, ResolvedParallelReduce>,
     pub switch_cases: HashMap<ModelNodeKey, ResolvedEnumCase>,
     pub propagations: HashMap<ModelNodeKey, ResolvedPropagation>,
+    pub string_operations: HashMap<ModelNodeKey, StringOperation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

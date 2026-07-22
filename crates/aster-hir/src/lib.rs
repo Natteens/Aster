@@ -191,6 +191,16 @@ pub struct Expression {
     pub kind: ExpressionKind,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StringOperation {
+    Contains,
+    StartsWith,
+    EndsWith,
+    IndexOf,
+    SubstringFrom,
+    SubstringRange,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExpressionKind {
     Literal(Literal),
@@ -227,6 +237,13 @@ pub enum ExpressionKind {
     ArrayLength(Box<Expression>),
     /// Number of Unicode scalar values in an immutable UTF-8 string.
     StringLength(Box<Expression>),
+    /// One resolved built-in `string` operation. The receiver and arguments
+    /// remain separate so lowering preserves receiver-first evaluation.
+    StringOperation {
+        operation: StringOperation,
+        receiver: Box<Expression>,
+        arguments: Vec<Expression>,
+    },
     /// `list.Length`: reads the `length` field of a `List<T>` header.
     ListLength(Box<Expression>),
     /// `list.Add(value)`: appends `value`, growing the buffer if needed.

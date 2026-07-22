@@ -126,6 +126,41 @@ impl FunctionLowerer {
                     kind: mir::OperandKind::Copy(place),
                 })
             }
+            hir::ExpressionKind::StringOperation {
+                operation,
+                receiver,
+                arguments,
+            } => {
+                let receiver = self
+                    .lower_expression(receiver)
+                    .expect("validated string receiver produces a value");
+                let mut lowered = Vec::with_capacity(arguments.len() + 1);
+                lowered.push(receiver);
+                lowered.extend(arguments.iter().map(|argument| {
+                    self.lower_expression(argument)
+                        .expect("validated string argument produces a value")
+                }));
+                let intrinsic = match operation {
+                    hir::StringOperation::Contains => mir::Intrinsic::StringContains,
+                    hir::StringOperation::StartsWith => mir::Intrinsic::StringStartsWith,
+                    hir::StringOperation::EndsWith => mir::Intrinsic::StringEndsWith,
+                    hir::StringOperation::IndexOf => mir::Intrinsic::StringIndexOf,
+                    hir::StringOperation::SubstringFrom => mir::Intrinsic::StringSubstringFrom,
+                    hir::StringOperation::SubstringRange => mir::Intrinsic::StringSubstringRange,
+                };
+                let destination = self.new_temporary(expression.type_.clone());
+                let place = mir::Place::Local(destination);
+                self.instruction(mir::Instruction::CallIntrinsic {
+                    destination: Some(place.clone()),
+                    intrinsic,
+                    arguments: lowered,
+                    return_type: expression.type_.clone(),
+                });
+                Some(mir::Operand {
+                    type_: expression.type_.clone(),
+                    kind: mir::OperandKind::Copy(place),
+                })
+            }
             hir::ExpressionKind::Call { callee, arguments } => {
                 self.lower_call(callee, arguments, &expression.type_)
             }

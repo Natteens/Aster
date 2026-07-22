@@ -3,6 +3,7 @@ use super::{
     ResolvedEnumCase, ResolvedParallelFor, ResolvedParallelForEach, ResolvedParallelReduce,
     ResolvedTaskRun, Signature, Span, Type, TypeKind, TypeRef, Visibility, resolve_type_readonly,
 };
+use aster_hir::StringOperation;
 
 impl Analyzer<'_> {
     pub(super) fn new_object(
@@ -462,6 +463,9 @@ impl Analyzer<'_> {
                     }
                 } else {
                     let receiver = self.expression(object);
+                    if receiver == Type::String {
+                        return self.string_operation(name, &argument_types, arguments, span);
+                    }
                     if let Type::List(element_type) = &receiver {
                         if name == "Add" {
                             if arguments.len() != 1 {
@@ -625,6 +629,75 @@ impl Analyzer<'_> {
             },
         );
         callable.signature.result
+    }
+
+    fn string_operation(
+        &mut self,
+        name: &str,
+        argument_types: &[Type],
+        arguments: &[Expression],
+        span: Span,
+    ) -> Type {
+        let (operation, parameters, result) = match (name, argument_types.len()) {
+            ("Contains", 1) => (StringOperation::Contains, vec![Type::String], Type::Bool),
+            ("StartsWith", 1) => (StringOperation::StartsWith, vec![Type::String], Type::Bool),
+            ("EndsWith", 1) => (StringOperation::EndsWith, vec![Type::String], Type::Bool),
+            ("IndexOf", 1) => (StringOperation::IndexOf, vec![Type::String], Type::Int),
+            ("Substring", 1) => (
+                StringOperation::SubstringFrom,
+                vec![Type::Int],
+                Type::String,
+            ),
+            ("Substring", 2) => (
+                StringOperation::SubstringRange,
+                vec![Type::Int, Type::Int],
+                Type::String,
+            ),
+            ("Contains" | "StartsWith" | "EndsWith" | "IndexOf", found) => {
+                self.diagnostics.push(Diagnostic::error(
+                    format!("`string.{name}` expects 1 argument, found {found}"),
+                    span,
+                ));
+                return Type::Unknown;
+            }
+            ("Substring", found) => {
+                self.diagnostics.push(Diagnostic::error(
+                    format!("`string.Substring` expects 1 or 2 arguments, found {found}"),
+                    span,
+                ));
+                return Type::Unknown;
+            }
+            _ => {
+                self.diagnostics.push(Diagnostic::error(
+                    format!("string has no method `{name}`"),
+                    span,
+                ));
+                return Type::Unknown;
+            }
+        };
+
+        let mut incompatible = false;
+        for ((actual, expected), argument) in argument_types.iter().zip(&parameters).zip(arguments)
+        {
+            if actual != expected && *actual != Type::Unknown {
+                incompatible = true;
+                self.diagnostics.push(Diagnostic::error(
+                    format!(
+                        "expected `{}`, found `{}`",
+                        expected.display(),
+                        actual.display()
+                    ),
+                    argument.span,
+                ));
+            }
+        }
+        if incompatible {
+            return Type::Unknown;
+        }
+        self.model
+            .string_operations
+            .insert(self.model_key(span), operation);
+        result
     }
 
     fn resolve_overload(

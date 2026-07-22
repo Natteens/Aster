@@ -359,13 +359,267 @@ pub extern "C" fn aster_rt_string_length(
     }
 }
 
+fn string_predicate(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    pattern: *const AsterStrHeader,
+    operation: &str,
+    predicate: impl FnOnce(&str, &str) -> bool,
+) -> i8 {
+    if context.is_null() {
+        return 0;
+    }
+    // SAFETY: generated code passes its live context and string references
+    // owned by that context or the live JIT module.
+    #[allow(unsafe_code)]
+    let (context, value, pattern) = unsafe { (&mut *context, view(value), view(pattern)) };
+    let (Some(value), Some(pattern)) = (value, pattern) else {
+        context.fail(format!(
+            "String.{operation} received an invalid UTF-8 string reference"
+        ));
+        return 0;
+    };
+    i8::from(predicate(value, pattern))
+}
+
+/// Ordinal, case-sensitive substring search without allocation.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[must_use]
+pub extern "C" fn aster_rt_string_contains(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    pattern: *const AsterStrHeader,
+) -> i8 {
+    string_predicate(context, value, pattern, "Contains", |value, pattern| {
+        value.contains(pattern)
+    })
+}
+
+/// Ordinal, case-sensitive prefix test without allocation.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[must_use]
+pub extern "C" fn aster_rt_string_starts_with(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    pattern: *const AsterStrHeader,
+) -> i8 {
+    string_predicate(context, value, pattern, "StartsWith", |value, pattern| {
+        value.starts_with(pattern)
+    })
+}
+
+/// Ordinal, case-sensitive suffix test without allocation.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[must_use]
+pub extern "C" fn aster_rt_string_ends_with(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    pattern: *const AsterStrHeader,
+) -> i8 {
+    string_predicate(context, value, pattern, "EndsWith", |value, pattern| {
+        value.ends_with(pattern)
+    })
+}
+
+/// Return the first occurrence as a Unicode scalar-value index, or `-1`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[must_use]
+pub extern "C" fn aster_rt_string_index_of(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    pattern: *const AsterStrHeader,
+) -> i32 {
+    if context.is_null() {
+        return -1;
+    }
+    // SAFETY: generated code passes its live context and string references
+    // owned by that context or the live JIT module.
+    #[allow(unsafe_code)]
+    let (context, value, pattern) = unsafe { (&mut *context, view(value), view(pattern)) };
+    let (Some(value), Some(pattern)) = (value, pattern) else {
+        context.fail("String.IndexOf received an invalid UTF-8 string reference");
+        return -1;
+    };
+    let Some(byte_index) = value.find(pattern) else {
+        return -1;
+    };
+    if let Ok(index) = i32::try_from(value[..byte_index].chars().count()) {
+        index
+    } else {
+        context.fail("String.IndexOf result exceeds the supported `int` range");
+        -1
+    }
+}
+
+/// Copy from `start` (in Unicode scalar values) through the end into the
+/// persistent arena.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_substring_from(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    start: i32,
+) -> *const AsterStrHeader {
+    string_substring(context, value, start, None, false)
+}
+
+/// Temporary counterpart of [`aster_rt_string_substring_from`].
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_substring_from_temporary(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    start: i32,
+) -> *const AsterStrHeader {
+    string_substring(context, value, start, None, true)
+}
+
+/// Copy a scalar-indexed range into the persistent arena.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_substring_range(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    start: i32,
+    length: i32,
+) -> *const AsterStrHeader {
+    string_substring(context, value, start, Some(length), false)
+}
+
+/// Temporary counterpart of [`aster_rt_string_substring_range`].
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_substring_range_temporary(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    start: i32,
+    length: i32,
+) -> *const AsterStrHeader {
+    string_substring(context, value, start, Some(length), true)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+fn string_substring(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    start: i32,
+    length: Option<i32>,
+    temporary: bool,
+) -> *const AsterStrHeader {
+    if context.is_null() {
+        return ptr::null();
+    }
+    // SAFETY: generated code passes its live context and an ABI string owned
+    // by that context or the live JIT module.
+    #[allow(unsafe_code)]
+    let (context, value) = unsafe { (&mut *context, view(value)) };
+    let Some(value) = value else {
+        context.fail("String.Substring received an invalid UTF-8 string reference");
+        return ptr::null();
+    };
+    let scalar_length = value.chars().count();
+    let Ok(start_usize) = usize::try_from(start) else {
+        substring_bounds_error(context, start, length, scalar_length, false);
+        return ptr::null();
+    };
+    let end = if let Some(length) = length {
+        let Ok(length_usize) = usize::try_from(length) else {
+            substring_bounds_error(context, start, Some(length), scalar_length, false);
+            return ptr::null();
+        };
+        let Some(end) = start.checked_add(length) else {
+            substring_bounds_error(context, start, Some(length), scalar_length, true);
+            return ptr::null();
+        };
+        let end = usize::try_from(end).unwrap_or(usize::MAX);
+        if start_usize > scalar_length
+            || length_usize > scalar_length - start_usize
+            || end > scalar_length
+        {
+            substring_bounds_error(context, start, Some(length), scalar_length, false);
+            return ptr::null();
+        }
+        end
+    } else {
+        if start_usize > scalar_length {
+            substring_bounds_error(context, start, None, scalar_length, false);
+            return ptr::null();
+        }
+        scalar_length
+    };
+
+    let Some(start_byte) = scalar_boundary(value, start_usize) else {
+        substring_boundary_error(context, start, length, scalar_length);
+        return ptr::null();
+    };
+    let Some(end_byte) = scalar_boundary(value, end) else {
+        substring_boundary_error(context, start, length, scalar_length);
+        return ptr::null();
+    };
+    let Some(result) = value.get(start_byte..end_byte) else {
+        substring_boundary_error(context, start, length, scalar_length);
+        return ptr::null();
+    };
+    if temporary {
+        context.allocate_temporary_string_parts(&[result])
+    } else {
+        context.allocate_string_parts(&[result])
+    }
+}
+
+fn scalar_boundary(value: &str, index: usize) -> Option<usize> {
+    if index == value.chars().count() {
+        Some(value.len())
+    } else {
+        value.char_indices().nth(index).map(|(byte, _)| byte)
+    }
+}
+
+fn substring_bounds_error(
+    context: &mut ExecutionContext,
+    start: i32,
+    length: Option<i32>,
+    current: usize,
+    overflow: bool,
+) {
+    match length {
+        Some(length) if overflow => context.fail(format!(
+            "String.Substring start {start}, length {length} overflows for current length {current}"
+        )),
+        Some(length) => context.fail(format!(
+            "String.Substring start {start}, length {length} is outside current length {current}"
+        )),
+        None => context.fail(format!(
+            "String.Substring start {start} is outside current length {current}"
+        )),
+    }
+}
+
+fn substring_boundary_error(
+    context: &mut ExecutionContext,
+    start: i32,
+    length: Option<i32>,
+    current: usize,
+) {
+    match length {
+        Some(length) => context.fail(format!(
+            "String.Substring start {start}, length {length} does not identify valid UTF-8 boundaries for current length {current}"
+        )),
+        None => context.fail(format!(
+            "String.Substring start {start} does not identify a valid UTF-8 boundary for current length {current}"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AsterStrHeader, aster_rt_string_concat, aster_rt_string_eq, aster_rt_string_length,
-        encode_str, view,
+        AsterStrHeader, aster_rt_string_concat, aster_rt_string_contains,
+        aster_rt_string_ends_with, aster_rt_string_eq, aster_rt_string_index_of,
+        aster_rt_string_length, aster_rt_string_starts_with, aster_rt_string_substring_from,
+        aster_rt_string_substring_range, aster_rt_string_substring_range_temporary, encode_str,
+        view,
     };
-    use crate::ExecutionContext;
+    use crate::{
+        ExecutionContext,
+        context::{aster_rt_temporary_scope_enter, aster_rt_temporary_scope_leave},
+    };
 
     /// 8-byte-aligned backing store for test strings.
     fn aligned(value: &str) -> Vec<u64> {
@@ -444,5 +698,134 @@ mod tests {
         let mut context = ExecutionContext::new();
         assert_eq!(aster_rt_string_length(&raw mut context, pointer(&text)), 11);
         assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    fn ordinal_search_handles_unicode_empty_and_absent_patterns_without_allocating() {
+        let value = aligned("aéβ🙂z");
+        let accent = aligned("é");
+        let emoji = aligned("🙂");
+        let empty = aligned("");
+        let absent = aligned("ASTER");
+        let mut context = ExecutionContext::with_stats();
+
+        assert_eq!(
+            aster_rt_string_contains(&raw mut context, pointer(&value), pointer(&accent)),
+            1
+        );
+        assert_eq!(
+            aster_rt_string_starts_with(&raw mut context, pointer(&value), pointer(&empty)),
+            1
+        );
+        assert_eq!(
+            aster_rt_string_ends_with(&raw mut context, pointer(&value), pointer(&emoji)),
+            0
+        );
+        assert_eq!(
+            aster_rt_string_contains(&raw mut context, pointer(&value), pointer(&absent)),
+            0
+        );
+        assert_eq!(
+            aster_rt_string_index_of(&raw mut context, pointer(&value), pointer(&accent)),
+            1
+        );
+        assert_eq!(
+            aster_rt_string_index_of(&raw mut context, pointer(&value), pointer(&emoji)),
+            3
+        );
+        assert_eq!(
+            aster_rt_string_index_of(&raw mut context, pointer(&value), pointer(&empty)),
+            0
+        );
+        for _ in 0..10_000 {
+            assert_eq!(
+                aster_rt_string_contains(&raw mut context, pointer(&value), pointer(&accent)),
+                1
+            );
+        }
+        assert_eq!(context.memory_stats().total_allocations, 0);
+        assert_eq!(context.memory_stats().used_bytes, 0);
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    fn substring_uses_scalar_indices_and_allocates_in_the_selected_region() {
+        let value = aligned("aéβ🙂z");
+        let mut context = ExecutionContext::with_stats();
+        let persistent = aster_rt_string_substring_range(&raw mut context, pointer(&value), 1, 3);
+        // SAFETY: the result is owned by the live persistent arena.
+        #[allow(unsafe_code)]
+        let persistent = unsafe { view(persistent) };
+        assert_eq!(persistent, Some("éβ🙂"));
+        assert_eq!(context.memory_stats().string_allocations, 1);
+        let persistent_used = context.memory_stats().used_bytes;
+
+        aster_rt_temporary_scope_enter(&raw mut context);
+        let temporary =
+            aster_rt_string_substring_range_temporary(&raw mut context, pointer(&value), 5, 0);
+        // SAFETY: the result remains live until the temporary scope leaves.
+        #[allow(unsafe_code)]
+        let temporary = unsafe { view(temporary) };
+        assert_eq!(temporary, Some(""));
+        assert!(context.memory_stats().used_bytes > persistent_used);
+        aster_rt_temporary_scope_leave(&raw mut context);
+        assert_eq!(context.memory_stats().string_allocations, 2);
+        assert_eq!(context.memory_stats().used_bytes, persistent_used);
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    fn substring_reports_every_invalid_range_without_publishing_a_string() {
+        let value = aligned("abc");
+        for (start, length, expected) in [
+            (-1, Some(1), "start -1, length 1"),
+            (0, Some(-1), "start 0, length -1"),
+            (4, None, "start 4"),
+            (2, Some(2), "start 2, length 2"),
+            (i32::MAX, Some(1), "start 2147483647, length 1"),
+        ] {
+            let mut context = ExecutionContext::new();
+            let result = match length {
+                Some(length) => aster_rt_string_substring_range(
+                    &raw mut context,
+                    pointer(&value),
+                    start,
+                    length,
+                ),
+                None => aster_rt_string_substring_from(&raw mut context, pointer(&value), start),
+            };
+            assert!(result.is_null());
+            let error = context.take_error().expect("range error is recorded");
+            assert!(error.contains("String.Substring"));
+            assert!(error.contains(expected));
+            assert!(error.contains("current length 3"));
+        }
+    }
+
+    #[test]
+    fn string_methods_reject_invalid_utf8_in_a_valid_sized_buffer() {
+        let mut invalid = aligned("x");
+        // SAFETY: `invalid` owns a header plus one payload byte. Only that
+        // payload byte is changed, preserving the allocation and header size
+        // while deliberately making the UTF-8 metadata invalid.
+        #[allow(unsafe_code)]
+        unsafe {
+            invalid
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(size_of::<AsterStrHeader>())
+                .write(0xff);
+        }
+        let pattern = aligned("x");
+        let mut context = ExecutionContext::new();
+        assert_eq!(
+            aster_rt_string_contains(&raw mut context, pointer(&invalid), pointer(&pattern),),
+            0
+        );
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("String.Contains") && error.contains("UTF-8"))
+        );
     }
 }

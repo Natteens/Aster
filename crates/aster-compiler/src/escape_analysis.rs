@@ -511,6 +511,10 @@ fn instruction_escape(
                     | mir::Intrinsic::LogWarning
                     | mir::Intrinsic::LogError
                     | mir::Intrinsic::StringEquals
+                    | mir::Intrinsic::StringContains
+                    | mir::Intrinsic::StringStartsWith
+                    | mir::Intrinsic::StringEndsWith
+                    | mir::Intrinsic::StringIndexOf
                     | mir::Intrinsic::StringConcat
                     | mir::Intrinsic::StringConcatTemporary
                     | mir::Intrinsic::StringLength
@@ -526,6 +530,10 @@ fn instruction_escape(
                     | mir::Intrinsic::StringFromCharTemporary
                     | mir::Intrinsic::StringJoin
                     | mir::Intrinsic::StringJoinTemporary
+                    | mir::Intrinsic::StringSubstringFrom
+                    | mir::Intrinsic::StringSubstringFromTemporary
+                    | mir::Intrinsic::StringSubstringRange
+                    | mir::Intrinsic::StringSubstringRangeTemporary
                     | mir::Intrinsic::ReportRuntimeError(_)
             );
             (!borrows_only

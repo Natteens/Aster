@@ -129,6 +129,18 @@ impl Codegen {
                 ("aster_rt_string_concat_temporary", None, true)
             }
             mir::Intrinsic::StringLength => ("aster_rt_string_length", None, true),
+            mir::Intrinsic::StringContains => ("aster_rt_string_contains", None, true),
+            mir::Intrinsic::StringStartsWith => ("aster_rt_string_starts_with", None, true),
+            mir::Intrinsic::StringEndsWith => ("aster_rt_string_ends_with", None, true),
+            mir::Intrinsic::StringIndexOf => ("aster_rt_string_index_of", None, true),
+            mir::Intrinsic::StringSubstringFrom => ("aster_rt_string_substring_from", None, true),
+            mir::Intrinsic::StringSubstringFromTemporary => {
+                ("aster_rt_string_substring_from_temporary", None, true)
+            }
+            mir::Intrinsic::StringSubstringRange => ("aster_rt_string_substring_range", None, true),
+            mir::Intrinsic::StringSubstringRangeTemporary => {
+                ("aster_rt_string_substring_range_temporary", None, true)
+            }
             mir::Intrinsic::StringFromBool => ("aster_rt_string_from_bool", None, true),
             mir::Intrinsic::StringFromBoolTemporary => {
                 ("aster_rt_string_from_bool_temporary", None, true)

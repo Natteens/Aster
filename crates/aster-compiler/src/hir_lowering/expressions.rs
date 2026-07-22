@@ -298,6 +298,32 @@ impl Lowerer<'_> {
                         };
                     }
                 }
+                if let Some(operation) = self.model.string_operations.get(&model_key).copied() {
+                    let ast::ExpressionKind::Member { object, .. } = &callee.kind else {
+                        unreachable!("validated string operation has a member receiver");
+                    };
+                    let receiver = self.expression(object);
+                    let arguments = arguments
+                        .iter()
+                        .map(|argument| self.expression(argument))
+                        .collect();
+                    let type_ = match operation {
+                        hir::StringOperation::Contains
+                        | hir::StringOperation::StartsWith
+                        | hir::StringOperation::EndsWith => hir::Type::Bool,
+                        hir::StringOperation::IndexOf => hir::Type::Int,
+                        hir::StringOperation::SubstringFrom
+                        | hir::StringOperation::SubstringRange => hir::Type::String,
+                    };
+                    return hir::Expression {
+                        type_,
+                        kind: hir::ExpressionKind::StringOperation {
+                            operation,
+                            receiver: Box::new(receiver),
+                            arguments,
+                        },
+                    };
+                }
                 if let ast::ExpressionKind::Member { object, name } = &callee.kind
                     && name == "Add"
                 {

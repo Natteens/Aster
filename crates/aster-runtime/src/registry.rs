@@ -15,13 +15,16 @@ use crate::log::aster_rt_log;
 use crate::math::{aster_rt_integer_arithmetic_error, aster_rt_math_domain_error};
 use crate::object::{aster_rt_object_new, aster_rt_object_new_temporary};
 use crate::string::{
-    aster_rt_string_concat, aster_rt_string_concat_temporary, aster_rt_string_eq,
-    aster_rt_string_from_bool, aster_rt_string_from_bool_temporary, aster_rt_string_from_char,
+    aster_rt_string_concat, aster_rt_string_concat_temporary, aster_rt_string_contains,
+    aster_rt_string_ends_with, aster_rt_string_eq, aster_rt_string_from_bool,
+    aster_rt_string_from_bool_temporary, aster_rt_string_from_char,
     aster_rt_string_from_char_temporary, aster_rt_string_from_double,
     aster_rt_string_from_double_temporary, aster_rt_string_from_long,
     aster_rt_string_from_long_temporary, aster_rt_string_from_ulong,
-    aster_rt_string_from_ulong_temporary, aster_rt_string_join, aster_rt_string_join_temporary,
-    aster_rt_string_length,
+    aster_rt_string_from_ulong_temporary, aster_rt_string_index_of, aster_rt_string_join,
+    aster_rt_string_join_temporary, aster_rt_string_length, aster_rt_string_starts_with,
+    aster_rt_string_substring_from, aster_rt_string_substring_from_temporary,
+    aster_rt_string_substring_range, aster_rt_string_substring_range_temporary,
 };
 
 /// Backend-neutral value type used in runtime signatures.
@@ -254,6 +257,96 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             },
         },
         RuntimeFunction {
+            name: "aster_rt_string_contains",
+            address: aster_rt_string_contains as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                ],
+                result: Some(RuntimeType::I8),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_starts_with",
+            address: aster_rt_string_starts_with as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                ],
+                result: Some(RuntimeType::I8),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_ends_with",
+            address: aster_rt_string_ends_with as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                ],
+                result: Some(RuntimeType::I8),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_index_of",
+            address: aster_rt_string_index_of as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                ],
+                result: Some(RuntimeType::I32),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_substring_from",
+            address: aster_rt_string_substring_from as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer, RuntimeType::I32],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_substring_from_temporary",
+            address: aster_rt_string_substring_from_temporary as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer, RuntimeType::I32],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_substring_range",
+            address: aster_rt_string_substring_range as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                ],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_substring_range_temporary",
+            address: aster_rt_string_substring_range_temporary as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                ],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
             name: "aster_rt_string_from_long",
             address: aster_rt_string_from_long as *const u8,
             signature: RuntimeSignature {
@@ -391,6 +484,77 @@ mod tests {
             &[RuntimeType::I32, RuntimeType::Pointer]
         );
         assert_eq!(log.signature.result, None);
+    }
+
+    #[test]
+    fn string_search_and_substring_signatures_match_the_abi() {
+        let functions = runtime_functions();
+        for name in [
+            "aster_rt_string_contains",
+            "aster_rt_string_starts_with",
+            "aster_rt_string_ends_with",
+        ] {
+            let function = functions
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("missing runtime function `{name}`"));
+            assert_eq!(
+                function.signature.parameters,
+                &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                ]
+            );
+            assert_eq!(function.signature.result, Some(RuntimeType::I8));
+        }
+        let index = functions
+            .iter()
+            .find(|function| function.name == "aster_rt_string_index_of")
+            .expect("IndexOf binding");
+        assert_eq!(
+            index.signature.parameters,
+            &[
+                RuntimeType::Pointer,
+                RuntimeType::Pointer,
+                RuntimeType::Pointer,
+            ]
+        );
+        assert_eq!(index.signature.result, Some(RuntimeType::I32));
+
+        for name in [
+            "aster_rt_string_substring_from",
+            "aster_rt_string_substring_from_temporary",
+        ] {
+            let function = functions
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("missing runtime function `{name}`"));
+            assert_eq!(
+                function.signature.parameters,
+                &[RuntimeType::Pointer, RuntimeType::Pointer, RuntimeType::I32]
+            );
+            assert_eq!(function.signature.result, Some(RuntimeType::Pointer));
+        }
+        for name in [
+            "aster_rt_string_substring_range",
+            "aster_rt_string_substring_range_temporary",
+        ] {
+            let function = functions
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("missing runtime function `{name}`"));
+            assert_eq!(
+                function.signature.parameters,
+                &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                ]
+            );
+            assert_eq!(function.signature.result, Some(RuntimeType::Pointer));
+        }
     }
 
     #[test]

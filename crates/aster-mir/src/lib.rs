@@ -215,6 +215,14 @@ pub enum Intrinsic {
     StringConcat,
     StringConcatTemporary,
     StringLength,
+    StringContains,
+    StringStartsWith,
+    StringEndsWith,
+    StringIndexOf,
+    StringSubstringFrom,
+    StringSubstringFromTemporary,
+    StringSubstringRange,
+    StringSubstringRangeTemporary,
     /// Convert a signed integer (widened to `long`) to a `string`.
     StringFromLong,
     StringFromLongTemporary,
@@ -293,19 +301,27 @@ impl Intrinsic {
             | Self::StringFromDouble
             | Self::StringFromBool
             | Self::StringFromChar
-            | Self::StringJoin => Some(AllocationRegion::Persistent),
+            | Self::StringJoin
+            | Self::StringSubstringFrom
+            | Self::StringSubstringRange => Some(AllocationRegion::Persistent),
             Self::StringConcatTemporary
             | Self::StringFromLongTemporary
             | Self::StringFromULongTemporary
             | Self::StringFromDoubleTemporary
             | Self::StringFromBoolTemporary
             | Self::StringFromCharTemporary
-            | Self::StringJoinTemporary => Some(AllocationRegion::Temporary),
+            | Self::StringJoinTemporary
+            | Self::StringSubstringFromTemporary
+            | Self::StringSubstringRangeTemporary => Some(AllocationRegion::Temporary),
             Self::Log
             | Self::LogWarning
             | Self::LogError
             | Self::StringEquals
             | Self::StringLength
+            | Self::StringContains
+            | Self::StringStartsWith
+            | Self::StringEndsWith
+            | Self::StringIndexOf
             | Self::ReportRuntimeError(_)
             | Self::TaskRun
             | Self::TaskWait
@@ -376,6 +392,22 @@ impl Intrinsic {
             (Self::StringJoin | Self::StringJoinTemporary, AllocationRegion::Temporary) => {
                 Self::StringJoinTemporary
             }
+            (
+                Self::StringSubstringFrom | Self::StringSubstringFromTemporary,
+                AllocationRegion::Persistent,
+            ) => Self::StringSubstringFrom,
+            (
+                Self::StringSubstringFrom | Self::StringSubstringFromTemporary,
+                AllocationRegion::Temporary,
+            ) => Self::StringSubstringFromTemporary,
+            (
+                Self::StringSubstringRange | Self::StringSubstringRangeTemporary,
+                AllocationRegion::Persistent,
+            ) => Self::StringSubstringRange,
+            (
+                Self::StringSubstringRange | Self::StringSubstringRangeTemporary,
+                AllocationRegion::Temporary,
+            ) => Self::StringSubstringRangeTemporary,
             _ => self,
         }
     }

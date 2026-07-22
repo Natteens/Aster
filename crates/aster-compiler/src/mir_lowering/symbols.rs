@@ -216,6 +216,16 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
         | hir::ExpressionKind::Unary { operand, .. } => {
             collect_expression(operand, max);
         }
+        hir::ExpressionKind::StringOperation {
+            receiver,
+            arguments,
+            ..
+        } => {
+            collect_expression(receiver, max);
+            for argument in arguments {
+                collect_expression(argument, max);
+            }
+        }
         hir::ExpressionKind::Member { object, symbol } => {
             note(max, *symbol);
             collect_expression(object, max);

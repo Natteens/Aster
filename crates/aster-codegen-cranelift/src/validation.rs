@@ -227,8 +227,9 @@ fn validate_function(
         )));
     }
     let locals = function
-        .locals
+        .parameters
         .iter()
+        .chain(&function.locals)
         .map(|local| (local.id, local.type_.clone()))
         .collect::<HashMap<_, _>>();
     for block in &function.blocks {
@@ -310,6 +311,7 @@ fn validate_instruction(
             return_type,
             function_name,
             signatures,
+            locals,
         ),
         mir::Instruction::AllocateArray {
             destination,
@@ -443,9 +445,27 @@ fn validate_call_intrinsic(
     return_type: &mir::Type,
     function_name: &str,
     signatures: &HashMap<mir::SymbolId, &mir::Function>,
+    locals: &HashMap<mir::LocalId, mir::Type>,
 ) -> Result<(), BackendError> {
     if let Some(destination) = destination {
         validate_place(destination, function_name)?;
+        if is_string_method_intrinsic(intrinsic) {
+            let mir::Place::Local(local) = destination else {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` stores {intrinsic:?} into a non-local destination"
+                )));
+            };
+            let declared = locals.get(local).ok_or_else(|| {
+                BackendError::new(format!(
+                    "function `{function_name}` stores {intrinsic:?} into undeclared local {local:?}"
+                ))
+            })?;
+            if declared != return_type {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` stores {intrinsic:?} result expected `{return_type:?}`, found destination `{declared:?}`"
+                )));
+            }
+        }
     }
     validate_return_type(return_type, function_name)?;
     for argument in arguments {
@@ -458,6 +478,9 @@ fn validate_call_intrinsic(
             validate_value_type(&argument.type_, function_name)?;
         } else {
             validate_operand(argument, function_name)?;
+            if is_string_method_intrinsic(intrinsic) {
+                validate_string_operand_locals(argument, intrinsic, function_name, locals)?;
+            }
         }
     }
     validate_intrinsic_shape(
@@ -468,6 +491,72 @@ fn validate_call_intrinsic(
         function_name,
         signatures,
     )
+}
+
+fn is_string_method_intrinsic(intrinsic: mir::Intrinsic) -> bool {
+    matches!(
+        intrinsic,
+        mir::Intrinsic::StringContains
+            | mir::Intrinsic::StringStartsWith
+            | mir::Intrinsic::StringEndsWith
+            | mir::Intrinsic::StringIndexOf
+            | mir::Intrinsic::StringSubstringFrom
+            | mir::Intrinsic::StringSubstringFromTemporary
+            | mir::Intrinsic::StringSubstringRange
+            | mir::Intrinsic::StringSubstringRangeTemporary
+    )
+}
+
+fn validate_string_operand_locals(
+    operand: &mir::Operand,
+    intrinsic: mir::Intrinsic,
+    function_name: &str,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    let mir::OperandKind::Copy(place) = &operand.kind else {
+        return Ok(());
+    };
+    validate_string_place_locals(place, intrinsic, function_name, locals)?;
+    if let mir::Place::Local(local) = place {
+        let declared = &locals[local];
+        if declared != &operand.type_ {
+            return Err(BackendError::new(format!(
+                "function `{function_name}` passes {intrinsic:?} operand expected `{:?}`, found local `{declared:?}`",
+                operand.type_
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_string_place_locals(
+    place: &mir::Place,
+    intrinsic: mir::Intrinsic,
+    function_name: &str,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    match place {
+        mir::Place::Local(local) => {
+            if locals.contains_key(local) {
+                Ok(())
+            } else {
+                Err(BackendError::new(format!(
+                    "function `{function_name}` passes undeclared local {local:?} to {intrinsic:?}"
+                )))
+            }
+        }
+        mir::Place::Field { base, .. } | mir::Place::EnumField { base, .. } => {
+            validate_string_place_locals(base, intrinsic, function_name, locals)
+        }
+        mir::Place::Index { array, index, .. } => {
+            validate_string_operand_locals(array, intrinsic, function_name, locals)?;
+            validate_string_operand_locals(index, intrinsic, function_name, locals)
+        }
+        mir::Place::ObjectField { object, .. } => {
+            validate_string_operand_locals(object, intrinsic, function_name, locals)
+        }
+        mir::Place::Symbol(_) => Ok(()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -765,6 +854,28 @@ fn validate_intrinsic_shape(
                 && return_type == &mir::Type::Int
                 && matches!(arguments, [value] if value.type_ == mir::Type::String)
         }
+        mir::Intrinsic::StringContains
+        | mir::Intrinsic::StringStartsWith
+        | mir::Intrinsic::StringEndsWith => {
+            destination.is_some()
+                && return_type == &mir::Type::Bool
+                && matches!(arguments, [receiver, value] if receiver.type_ == mir::Type::String && value.type_ == mir::Type::String)
+        }
+        mir::Intrinsic::StringIndexOf => {
+            destination.is_some()
+                && return_type == &mir::Type::Int
+                && matches!(arguments, [receiver, value] if receiver.type_ == mir::Type::String && value.type_ == mir::Type::String)
+        }
+        mir::Intrinsic::StringSubstringFrom | mir::Intrinsic::StringSubstringFromTemporary => {
+            destination.is_some()
+                && return_type == &mir::Type::String
+                && matches!(arguments, [receiver, start] if receiver.type_ == mir::Type::String && start.type_ == mir::Type::Int)
+        }
+        mir::Intrinsic::StringSubstringRange | mir::Intrinsic::StringSubstringRangeTemporary => {
+            destination.is_some()
+                && return_type == &mir::Type::String
+                && matches!(arguments, [receiver, start, length] if receiver.type_ == mir::Type::String && start.type_ == mir::Type::Int && length.type_ == mir::Type::Int)
+        }
         mir::Intrinsic::StringFromLong | mir::Intrinsic::StringFromLongTemporary => {
             destination.is_some()
                 && return_type == &mir::Type::String
@@ -983,8 +1094,13 @@ fn validate_intrinsic_shape(
     if valid {
         Ok(())
     } else {
+        let arguments = arguments
+            .iter()
+            .map(|argument| format!("{:?}", argument.type_))
+            .collect::<Vec<_>>()
+            .join(", ");
         Err(BackendError::new(format!(
-            "function `{function_name}` contains a malformed {intrinsic:?} runtime intrinsic"
+            "function `{function_name}` contains a malformed {intrinsic:?} runtime intrinsic: found ({arguments}) -> {return_type:?}"
         )))
     }
 }
@@ -1317,6 +1433,100 @@ mod tests {
 
         let error = validate_module(&module).expect_err("unknown target must be rejected");
         assert!(error.message().contains("unknown basic block"));
+    }
+
+    #[test]
+    fn malformed_string_operation_signature_is_rejected_before_codegen() {
+        let mut module =
+            aster_compiler::compile("public bool Run() { return \"aster\".Contains(\"a\"); }")
+                .expect("source compiles")
+                .mir;
+        let call = module.functions[0]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+            .find(|instruction| {
+                matches!(
+                    instruction,
+                    mir::Instruction::CallIntrinsic {
+                        intrinsic: mir::Intrinsic::StringContains,
+                        ..
+                    }
+                )
+            })
+            .expect("contains intrinsic exists");
+        let mir::Instruction::CallIntrinsic { arguments, .. } = call else {
+            unreachable!();
+        };
+        arguments[1] = mir::Operand {
+            type_: mir::Type::Int,
+            kind: mir::OperandKind::Constant(mir::Constant::Integer("1".to_owned())),
+        };
+
+        let error = validate_module(&module).expect_err("wrong argument type must be rejected");
+        assert!(error.message().contains("StringContains"));
+        assert!(error.message().contains("String, Int"));
+    }
+
+    #[test]
+    fn string_operation_rejects_undeclared_operands_before_codegen() {
+        let mut module =
+            aster_compiler::compile("public int Run(string text) { return text.IndexOf(\"a\"); }")
+                .expect("source compiles")
+                .mir;
+        let call = module.functions[0]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+            .find(|instruction| {
+                matches!(
+                    instruction,
+                    mir::Instruction::CallIntrinsic {
+                        intrinsic: mir::Intrinsic::StringIndexOf,
+                        ..
+                    }
+                )
+            })
+            .expect("index intrinsic exists");
+        let mir::Instruction::CallIntrinsic { arguments, .. } = call else {
+            unreachable!();
+        };
+        arguments[0].kind = mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(u32::MAX)));
+
+        let error = validate_module(&module).expect_err("unknown operand must be rejected");
+        assert!(error.message().contains("undeclared local"));
+        assert!(error.message().contains("StringIndexOf"));
+    }
+
+    #[test]
+    fn string_operation_rejects_an_incompatible_destination_before_codegen() {
+        let mut module =
+            aster_compiler::compile("public string Run(string text) { return text.Substring(1); }")
+                .expect("source compiles")
+                .mir;
+        let call = module.functions[0]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+            .find(|instruction| {
+                matches!(
+                    instruction,
+                    mir::Instruction::CallIntrinsic {
+                        intrinsic: mir::Intrinsic::StringSubstringFrom
+                            | mir::Intrinsic::StringSubstringFromTemporary,
+                        ..
+                    }
+                )
+            })
+            .expect("substring intrinsic exists");
+        let mir::Instruction::CallIntrinsic { return_type, .. } = call else {
+            unreachable!();
+        };
+        *return_type = mir::Type::Int;
+
+        let error = validate_module(&module).expect_err("wrong destination type must be rejected");
+        assert!(error.message().contains("StringSubstringFrom"));
+        assert!(error.message().contains("destination `String`"));
     }
 
     #[test]
