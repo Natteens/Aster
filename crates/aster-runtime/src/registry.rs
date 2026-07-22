@@ -10,7 +10,7 @@ use crate::context::{
     aster_rt_array_new_temporary, aster_rt_temporary_scope_enter, aster_rt_temporary_scope_leave,
 };
 use crate::log::aster_rt_log;
-use crate::math::aster_rt_math_domain_error;
+use crate::math::{aster_rt_integer_arithmetic_error, aster_rt_math_domain_error};
 use crate::object::{aster_rt_object_new, aster_rt_object_new_temporary};
 use crate::string::{
     aster_rt_string_concat, aster_rt_string_concat_temporary, aster_rt_string_eq,
@@ -275,6 +275,14 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
                 result: None,
             },
         },
+        RuntimeFunction {
+            name: "aster_rt_integer_arithmetic_error",
+            address: aster_rt_integer_arithmetic_error as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::I32],
+                result: None,
+            },
+        },
     ]
 }
 
@@ -301,6 +309,20 @@ mod tests {
             &[RuntimeType::I32, RuntimeType::Pointer]
         );
         assert_eq!(log.signature.result, None);
+    }
+
+    #[test]
+    fn integer_arithmetic_error_signature_matches_abi() {
+        let functions = runtime_functions();
+        let reporter = functions
+            .iter()
+            .find(|function| function.name == "aster_rt_integer_arithmetic_error")
+            .unwrap();
+        assert_eq!(
+            reporter.signature.parameters,
+            &[RuntimeType::Pointer, RuntimeType::I32]
+        );
+        assert_eq!(reporter.signature.result, None);
     }
 
     #[test]

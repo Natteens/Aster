@@ -1078,6 +1078,206 @@ fn float_division_by_zero_follows_ieee() {
 }
 
 #[test]
+fn executes_runtime_integer_division_and_remainder() {
+    let source = r"
+        public int Ten() { return 10; }
+        public int Two() { return 2; }
+        public int Three() { return 3; }
+        public int Divide() { return Ten() / Two(); }
+        public int Remainder() { return Ten() % Three(); }
+    ";
+    assert_eq!(run(source, "Divide"), Ok(ExecutionValue::Int(5)));
+    assert_eq!(run(source, "Remainder"), Ok(ExecutionValue::Int(1)));
+}
+
+#[test]
+fn reports_runtime_integer_division_by_zero() {
+    let source = r"
+        public int Ten() { return 10; }
+        public int Zero() { return 0; }
+        public int Divide() { return Ten() / Zero(); }
+    ";
+    assert_eq!(
+        run(source, "Divide"),
+        Err("Aster runtime error: integer division by zero".to_owned())
+    );
+}
+
+#[test]
+fn reports_runtime_integer_remainder_by_zero() {
+    let source = r"
+        public int Ten() { return 10; }
+        public int Zero() { return 0; }
+        public int Remainder() { return Ten() % Zero(); }
+    ";
+    assert_eq!(
+        run(source, "Remainder"),
+        Err("Aster runtime error: integer remainder by zero".to_owned())
+    );
+}
+
+#[test]
+fn reports_runtime_int_division_and_remainder_overflow() {
+    let source = r"
+        public int Minimum() { return -2147483647 - 1; }
+        public int NegativeOne() { return -1; }
+        public int Divide() { return Minimum() / NegativeOne(); }
+        public int Remainder() { return Minimum() % NegativeOne(); }
+    ";
+    assert_eq!(
+        run(source, "Divide"),
+        Err("Aster runtime error: signed integer division overflow".to_owned())
+    );
+    assert_eq!(
+        run(source, "Remainder"),
+        Err("Aster runtime error: signed integer remainder overflow".to_owned())
+    );
+}
+
+#[test]
+fn reports_runtime_long_division_and_remainder_overflow() {
+    let source = r"
+        public long Minimum() { return -9223372036854775807L - 1L; }
+        public long NegativeOne() { return -1L; }
+        public long Divide() { return Minimum() / NegativeOne(); }
+        public long Remainder() { return Minimum() % NegativeOne(); }
+    ";
+    assert_eq!(
+        run(source, "Divide"),
+        Err("Aster runtime error: signed integer division overflow".to_owned())
+    );
+    assert_eq!(
+        run(source, "Remainder"),
+        Err("Aster runtime error: signed integer remainder overflow".to_owned())
+    );
+}
+
+#[test]
+fn reports_runtime_unsigned_division_and_remainder_by_zero() {
+    let source = r"
+        public uint Ten() { return 10u; }
+        public uint Zero() { return 0u; }
+        public uint Divide() { return Ten() / Zero(); }
+        public uint Remainder() { return Ten() % Zero(); }
+        public ulong LongTen() { return 10ul; }
+        public ulong LongZero() { return 0ul; }
+        public ulong LongDivide() { return LongTen() / LongZero(); }
+        public ulong LongRemainder() { return LongTen() % LongZero(); }
+    ";
+    assert_eq!(
+        run(source, "Divide"),
+        Err("Aster runtime error: integer division by zero".to_owned())
+    );
+    assert_eq!(
+        run(source, "Remainder"),
+        Err("Aster runtime error: integer remainder by zero".to_owned())
+    );
+    assert_eq!(
+        run(source, "LongDivide"),
+        Err("Aster runtime error: integer division by zero".to_owned())
+    );
+    assert_eq!(
+        run(source, "LongRemainder"),
+        Err("Aster runtime error: integer remainder by zero".to_owned())
+    );
+}
+
+#[test]
+fn small_integer_operations_are_promoted_and_guarded() {
+    let source = r"
+        public int SByteValid() { sbyte left = 10; sbyte right = 2; return left / right; }
+        public int ByteValid() { byte left = 10; byte right = 3; return left % right; }
+        public int ShortValid() { short left = 10; short right = 2; return left / right; }
+        public int UShortValid() { ushort left = 10; ushort right = 3; return left % right; }
+        public int SByteInvalid() { sbyte left = 10; sbyte right = 0; return left / right; }
+        public int ByteInvalid() { byte left = 10; byte right = 0; return left % right; }
+        public int ShortInvalid() { short left = 10; short right = 0; return left / right; }
+        public int UShortInvalid() { ushort left = 10; ushort right = 0; return left % right; }
+    ";
+    assert_eq!(run(source, "SByteValid"), Ok(ExecutionValue::Int(5)));
+    assert_eq!(run(source, "ByteValid"), Ok(ExecutionValue::Int(1)));
+    assert_eq!(run(source, "ShortValid"), Ok(ExecutionValue::Int(5)));
+    assert_eq!(run(source, "UShortValid"), Ok(ExecutionValue::Int(1)));
+    for (function, expected) in [
+        (
+            "SByteInvalid",
+            "Aster runtime error: integer division by zero",
+        ),
+        (
+            "ByteInvalid",
+            "Aster runtime error: integer remainder by zero",
+        ),
+        (
+            "ShortInvalid",
+            "Aster runtime error: integer division by zero",
+        ),
+        (
+            "UShortInvalid",
+            "Aster runtime error: integer remainder by zero",
+        ),
+    ] {
+        assert_eq!(run(source, function), Err(expected.to_owned()));
+    }
+}
+
+#[test]
+fn integer_arithmetic_error_does_not_contaminate_a_later_execution() {
+    let source = r"
+        public int Zero() { return 0; }
+        public int Invalid() { return 10 / Zero(); }
+        public int Valid() { return 10 / 2; }
+    ";
+    let compilation = compile(source).expect("integer arithmetic program should compile");
+    assert_eq!(
+        execute(&compilation.mir, "Invalid").map_err(|error| error.to_string()),
+        Err("Aster runtime error: integer division by zero".to_owned())
+    );
+    assert_eq!(
+        execute(&compilation.mir, "Valid"),
+        Ok(ExecutionValue::Int(5))
+    );
+}
+
+#[test]
+fn public_execution_apis_return_controlled_integer_errors() {
+    let source = "public int Zero() { return 0; } public int Invalid() { return 10 / Zero(); }";
+    let compilation = compile(source).expect("integer arithmetic program should compile");
+    let symbol = compilation
+        .mir
+        .functions
+        .iter()
+        .find(|function| function.name == "Invalid")
+        .expect("Invalid function should exist")
+        .symbol;
+    let expected = "Aster runtime error: integer division by zero";
+
+    assert_eq!(
+        execute(&compilation.mir, "Invalid")
+            .unwrap_err()
+            .to_string(),
+        expected
+    );
+    assert_eq!(
+        aster_codegen_cranelift::execute_with_stats(&compilation.mir, "Invalid")
+            .unwrap_err()
+            .to_string(),
+        expected
+    );
+    assert_eq!(
+        execute_symbol(&compilation.mir, symbol)
+            .unwrap_err()
+            .to_string(),
+        expected
+    );
+    assert_eq!(
+        aster_codegen_cranelift::execute_symbol_with_stats(&compilation.mir, symbol)
+            .unwrap_err()
+            .to_string(),
+        expected
+    );
+}
+
+#[test]
 fn rejects_float_remainder_with_clear_diagnostic() {
     let error = run(
         "public float Bad() { float a = 5f; float b = 2f; return a % b; }",

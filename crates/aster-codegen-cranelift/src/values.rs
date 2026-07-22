@@ -59,7 +59,22 @@ impl Codegen {
                 let operand_type = left.type_.clone();
                 let left = self.translate_operand(builder, left, state)?;
                 let right = self.translate_operand(builder, right, state)?;
-                translate_binary(builder, *operator, &operand_type, left, right)
+                if matches!(
+                    operator,
+                    mir::BinaryOperator::Divide | mir::BinaryOperator::Remainder
+                ) && !matches!(operand_type, mir::Type::Float | mir::Type::Double)
+                {
+                    self.translate_integer_division_or_remainder(
+                        builder,
+                        *operator,
+                        &operand_type,
+                        left,
+                        right,
+                        state,
+                    )
+                } else {
+                    translate_binary(builder, *operator, &operand_type, left, right)
+                }
             }
             mir::RvalueKind::Equality {
                 left,
@@ -77,6 +92,99 @@ impl Codegen {
                 })
             }
         }
+    }
+
+    fn translate_integer_division_or_remainder(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        operator: mir::BinaryOperator,
+        operand_type: &mir::Type,
+        left: Value,
+        right: Value,
+        state: &FunctionState,
+    ) -> Result<Value, BackendError> {
+        const DIVISION_BY_ZERO: i64 = 0;
+        const REMAINDER_BY_ZERO: i64 = 1;
+        const DIVISION_OVERFLOW: i64 = 2;
+        const REMAINDER_OVERFLOW: i64 = 3;
+
+        let primitive = primitive(operand_type)
+            .ok_or_else(|| BackendError::new("integer operation has a non-primitive type"))?;
+        if !primitive.is_integer() && primitive != Primitive::Char {
+            return Err(BackendError::new(
+                "integer operation has a non-integer operand type",
+            ));
+        }
+        let (zero_code, overflow_code) = match operator {
+            mir::BinaryOperator::Divide => (DIVISION_BY_ZERO, DIVISION_OVERFLOW),
+            mir::BinaryOperator::Remainder => (REMAINDER_BY_ZERO, REMAINDER_OVERFLOW),
+            _ => {
+                return Err(BackendError::new(
+                    "integer division guard received an invalid operator",
+                ));
+            }
+        };
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new("integer operation is missing its ExecutionContext")
+        })?;
+        let reporter = self.jit.declare_func_in_func(
+            self.runtime_ids["aster_rt_integer_arithmetic_error"],
+            builder.func,
+        );
+        let value_type = builder.func.dfg.value_type(left);
+        let zero_error = builder.create_block();
+        let nonzero = builder.create_block();
+        let valid = builder.create_block();
+        let join = builder.create_block();
+        builder.append_block_param(join, value_type);
+
+        let right_is_zero = builder.ins().icmp_imm(IntCC::Equal, right, 0);
+        builder
+            .ins()
+            .brif(right_is_zero, zero_error, &[], nonzero, &[]);
+
+        builder.switch_to_block(zero_error);
+        let zero_code = builder.ins().iconst(types::I32, zero_code);
+        builder.ins().call(reporter, &[context, zero_code]);
+        let dummy = builder.ins().iconst(value_type, 0);
+        builder.ins().jump(join, &[dummy.into()]);
+
+        builder.switch_to_block(nonzero);
+        let unsigned = is_unsigned_integer(operand_type);
+        if unsigned {
+            builder.ins().jump(valid, &[]);
+        } else {
+            let overflow_error = builder.create_block();
+            let minimum = signed_integer_minimum(operand_type)?;
+            let left_is_minimum = builder.ins().icmp_imm(IntCC::Equal, left, minimum);
+            let right_is_negative_one = builder.ins().icmp_imm(IntCC::Equal, right, -1);
+            let overflows = builder.ins().band(left_is_minimum, right_is_negative_one);
+            builder
+                .ins()
+                .brif(overflows, overflow_error, &[], valid, &[]);
+
+            builder.switch_to_block(overflow_error);
+            let overflow_code = builder.ins().iconst(types::I32, overflow_code);
+            builder.ins().call(reporter, &[context, overflow_code]);
+            let dummy = builder.ins().iconst(value_type, 0);
+            builder.ins().jump(join, &[dummy.into()]);
+        }
+
+        builder.switch_to_block(valid);
+        let result = match (operator, unsigned) {
+            (mir::BinaryOperator::Divide, true) => builder.ins().udiv(left, right),
+            (mir::BinaryOperator::Divide, false) => builder.ins().sdiv(left, right),
+            (mir::BinaryOperator::Remainder, true) => builder.ins().urem(left, right),
+            (mir::BinaryOperator::Remainder, false) => builder.ins().srem(left, right),
+            _ => {
+                return Err(BackendError::new(
+                    "integer division guard received an invalid operator",
+                ));
+            }
+        };
+        builder.ins().jump(join, &[result.into()]);
+        builder.switch_to_block(join);
+        Ok(builder.block_params(join)[0])
     }
 
     #[allow(clippy::too_many_lines)]
@@ -430,10 +538,11 @@ fn translate_binary(
     let unsigned = is_unsigned_integer(operand_type);
     Ok(match operator {
         mir::BinaryOperator::Multiply => builder.ins().imul(left, right),
-        mir::BinaryOperator::Divide if unsigned => builder.ins().udiv(left, right),
-        mir::BinaryOperator::Divide => builder.ins().sdiv(left, right),
-        mir::BinaryOperator::Remainder if unsigned => builder.ins().urem(left, right),
-        mir::BinaryOperator::Remainder => builder.ins().srem(left, right),
+        mir::BinaryOperator::Divide | mir::BinaryOperator::Remainder => {
+            return Err(BackendError::new(
+                "integer division or remainder reached codegen without a guard",
+            ));
+        }
         mir::BinaryOperator::Add => builder.ins().iadd(left, right),
         mir::BinaryOperator::Subtract => builder.ins().isub(left, right),
         mir::BinaryOperator::Less if unsigned => {
@@ -485,6 +594,18 @@ fn integer_width(type_: &mir::Type) -> Option<u16> {
     (primitive.is_integer() || matches!(primitive, Primitive::Bool | Primitive::Char))
         .then(|| primitive.bit_width())
         .flatten()
+}
+
+fn signed_integer_minimum(type_: &mir::Type) -> Result<i64, BackendError> {
+    match integer_width(type_) {
+        Some(8) => Ok(i64::from(i8::MIN)),
+        Some(16) => Ok(i64::from(i16::MIN)),
+        Some(32) => Ok(i64::from(i32::MIN)),
+        Some(64) => Ok(i64::MIN),
+        _ => Err(BackendError::new(
+            "signed integer operation has an unsupported width",
+        )),
+    }
 }
 
 /// Parse an integer constant into its i64 bit representation, checking range.
