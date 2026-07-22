@@ -66,11 +66,15 @@ pub(super) fn validate_invocable_entry(
 }
 
 pub(super) fn validate_module(module: &mir::Module) -> Result<(), BackendError> {
-    let signatures = module
-        .functions
-        .iter()
-        .map(|function| (function.symbol, function))
-        .collect::<HashMap<_, _>>();
+    let mut signatures = HashMap::new();
+    for function in &module.functions {
+        if signatures.insert(function.symbol, function).is_some() {
+            return Err(BackendError::new(format!(
+                "duplicate function symbol {:?} in MIR",
+                function.symbol
+            )));
+        }
+    }
     let classes = module
         .classes
         .iter()
@@ -205,6 +209,23 @@ fn validate_function(
     for local in &function.locals {
         validate_value_type(&local.type_, &function.name)?;
     }
+    let blocks = function
+        .blocks
+        .iter()
+        .map(|block| block.id)
+        .collect::<HashSet<_>>();
+    if blocks.len() != function.blocks.len() {
+        return Err(BackendError::new(format!(
+            "function `{}` has duplicate basic block identifiers",
+            function.name
+        )));
+    }
+    if !blocks.contains(&function.entry) {
+        return Err(BackendError::new(format!(
+            "function `{}` references unknown entry block {:?}",
+            function.name, function.entry
+        )));
+    }
     let locals = function
         .locals
         .iter()
@@ -225,7 +246,7 @@ fn validate_function(
                 implementations,
             )?;
         }
-        validate_terminator(&block.terminator, &function.name)?;
+        validate_terminator(&block.terminator, &function.name, &blocks)?;
     }
     Ok(())
 }
@@ -1064,14 +1085,37 @@ fn validate_rvalue(
 fn validate_terminator(
     terminator: &mir::Terminator,
     function_name: &str,
+    blocks: &HashSet<mir::BasicBlockId>,
 ) -> Result<(), BackendError> {
     match terminator {
-        mir::Terminator::Branch { condition, .. } => validate_operand(condition, function_name),
+        mir::Terminator::Goto(target) => validate_block_target(*target, function_name, blocks),
+        mir::Terminator::Branch {
+            condition,
+            then_block,
+            else_block,
+        } => {
+            validate_operand(condition, function_name)?;
+            validate_block_target(*then_block, function_name, blocks)?;
+            validate_block_target(*else_block, function_name, blocks)
+        }
         mir::Terminator::Return(Some(value)) => validate_operand(value, function_name),
-        mir::Terminator::Goto(_)
-        | mir::Terminator::Return(None)
-        | mir::Terminator::End
-        | mir::Terminator::Unreachable => Ok(()),
+        mir::Terminator::Return(None) | mir::Terminator::End | mir::Terminator::Unreachable => {
+            Ok(())
+        }
+    }
+}
+
+fn validate_block_target(
+    target: mir::BasicBlockId,
+    function_name: &str,
+    blocks: &HashSet<mir::BasicBlockId>,
+) -> Result<(), BackendError> {
+    if blocks.contains(&target) {
+        Ok(())
+    } else {
+        Err(BackendError::new(format!(
+            "function `{function_name}` references unknown basic block {target:?}"
+        )))
     }
 }
 
@@ -1194,6 +1238,86 @@ fn unsupported(function_name: &str, feature: &str) -> BackendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_function_symbols_are_rejected_before_codegen() {
+        let mut module = aster_compiler::compile(
+            "public int First() { return 1; } \
+             public int Second() { return 2; } \
+             public int Main() { return First(); }",
+        )
+        .expect("source compiles")
+        .mir;
+        let duplicate = module
+            .functions
+            .iter()
+            .find(|function| function.name == "First")
+            .expect("First exists")
+            .symbol;
+        module
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Second")
+            .expect("Second exists")
+            .symbol = duplicate;
+
+        let error = validate_module(&module).expect_err("duplicate symbols must be rejected");
+        assert!(error.message().contains("duplicate function symbol"));
+    }
+
+    #[test]
+    fn missing_entry_block_is_rejected_before_codegen() {
+        let mut module = aster_compiler::compile("public int Main() { return 1; }")
+            .expect("source compiles")
+            .mir;
+        module
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Main")
+            .expect("Main exists")
+            .entry = mir::BasicBlockId(u32::MAX);
+
+        let error = validate_module(&module).expect_err("missing entry block must be rejected");
+        assert!(error.message().contains("unknown entry block"));
+    }
+
+    #[test]
+    fn duplicate_basic_block_ids_are_rejected_before_codegen() {
+        let mut module = aster_compiler::compile(
+            "public int Main() { int value = 0; if (value == 0) { value = 1; } return value; }",
+        )
+        .expect("source compiles")
+        .mir;
+        let function = module
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Main")
+            .expect("Main exists");
+        assert!(
+            function.blocks.len() > 1,
+            "if lowering creates multiple blocks"
+        );
+        function.blocks[1].id = function.blocks[0].id;
+
+        let error = validate_module(&module).expect_err("duplicate blocks must be rejected");
+        assert!(error.message().contains("duplicate basic block"));
+    }
+
+    #[test]
+    fn unknown_terminator_target_is_rejected_before_codegen() {
+        let mut module = aster_compiler::compile("public int Main() { return 1; }")
+            .expect("source compiles")
+            .mir;
+        let function = module
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Main")
+            .expect("Main exists");
+        function.blocks[0].terminator = mir::Terminator::Goto(mir::BasicBlockId(u32::MAX));
+
+        let error = validate_module(&module).expect_err("unknown target must be rejected");
+        assert!(error.message().contains("unknown basic block"));
+    }
 
     #[test]
     fn parallel_for_each_rejects_element_metadata_that_disagrees_with_the_body_signature() {
