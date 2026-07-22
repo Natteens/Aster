@@ -19,7 +19,8 @@ use crate::string::{
     aster_rt_string_ends_with, aster_rt_string_eq, aster_rt_string_from_bool,
     aster_rt_string_from_bool_temporary, aster_rt_string_from_char,
     aster_rt_string_from_char_temporary, aster_rt_string_from_double,
-    aster_rt_string_from_double_temporary, aster_rt_string_from_long,
+    aster_rt_string_from_double_temporary, aster_rt_string_from_float,
+    aster_rt_string_from_float_temporary, aster_rt_string_from_long,
     aster_rt_string_from_long_temporary, aster_rt_string_from_ulong,
     aster_rt_string_from_ulong_temporary, aster_rt_string_index_of, aster_rt_string_join,
     aster_rt_string_join_temporary, aster_rt_string_length, aster_rt_string_starts_with,
@@ -39,6 +40,8 @@ pub enum RuntimeType {
     I32,
     /// 64-bit signed integer; `ulong` crosses the ABI as this same bit pattern.
     I64,
+    /// 32-bit floating point.
+    F32,
     /// 64-bit floating point.
     F64,
     /// Target-width pointer, e.g. `*const AsterStrHeader` for `string`.
@@ -394,6 +397,22 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             address: aster_rt_string_from_double_temporary as *const u8,
             signature: RuntimeSignature {
                 parameters: &[RuntimeType::Pointer, RuntimeType::F64],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_from_float",
+            address: aster_rt_string_from_float as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::F32],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_from_float_temporary",
+            address: aster_rt_string_from_float_temporary as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::F32],
                 result: Some(RuntimeType::Pointer),
             },
         },

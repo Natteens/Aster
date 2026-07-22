@@ -88,6 +88,15 @@ impl Codegen {
                     state,
                 );
             }
+            mir::Intrinsic::StringFromFloat | mir::Intrinsic::StringFromFloatTemporary => {
+                return self.translate_string_from_float(
+                    builder,
+                    destination,
+                    intrinsic,
+                    arguments,
+                    state,
+                );
+            }
             mir::Intrinsic::StringJoin | mir::Intrinsic::StringJoinTemporary => {
                 return self.translate_string_join(
                     builder,
@@ -180,6 +189,8 @@ impl Codegen {
             | mir::Intrinsic::StringFromULongTemporary
             | mir::Intrinsic::StringFromDouble
             | mir::Intrinsic::StringFromDoubleTemporary
+            | mir::Intrinsic::StringFromFloat
+            | mir::Intrinsic::StringFromFloatTemporary
             | mir::Intrinsic::StringJoin
             | mir::Intrinsic::StringJoinTemporary
             | mir::Intrinsic::TaskRun
@@ -563,6 +574,36 @@ impl Codegen {
             mir::Intrinsic::StringFromDouble => "aster_rt_string_from_double",
             mir::Intrinsic::StringFromDoubleTemporary => "aster_rt_string_from_double_temporary",
             _ => unreachable!("caller matched only double-to-string intrinsics"),
+        };
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids[symbol], builder.func);
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("runtime intrinsic requires an execution context"))?;
+        let call = builder.ins().call(function_ref, &[context, value]);
+        self.store_intrinsic_result(builder, destination, call, state)
+    }
+
+    /// `StringFromFloat`: pass a `float` source straight through, at its
+    /// native 32-bit width, so it never rounds twice (once when widened to
+    /// `double`, once when the runtime formats it).
+    fn translate_string_from_float(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: Option<&mir::Place>,
+        intrinsic: mir::Intrinsic,
+        arguments: &[mir::Operand],
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let argument = arguments.first().ok_or_else(|| {
+            BackendError::new("string interpolation conversion requires one argument")
+        })?;
+        let value = self.translate_operand(builder, argument, state)?;
+        let symbol = match intrinsic {
+            mir::Intrinsic::StringFromFloat => "aster_rt_string_from_float",
+            mir::Intrinsic::StringFromFloatTemporary => "aster_rt_string_from_float_temporary",
+            _ => unreachable!("caller matched only float-to-string intrinsics"),
         };
         let function_ref = self
             .jit

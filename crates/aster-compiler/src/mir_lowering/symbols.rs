@@ -226,6 +226,9 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
                 collect_expression(argument, max);
             }
         }
+        hir::ExpressionKind::FormatPrimitive { receiver, .. } => {
+            collect_expression(receiver, max);
+        }
         hir::ExpressionKind::Member { object, symbol } => {
             note(max, *symbol);
             collect_expression(object, max);

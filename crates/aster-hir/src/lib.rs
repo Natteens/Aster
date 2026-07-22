@@ -278,6 +278,15 @@ pub enum ExpressionKind {
         receiver: Box<Expression>,
         arguments: Vec<Expression>,
     },
+    /// `value.ToString()`: canonical, deterministic, culture-invariant textual
+    /// conversion of one of the eight fundamental primitives (`bool`, `char`,
+    /// `int`, `uint`, `long`, `ulong`, `float`, `double`). `primitive` is
+    /// always `receiver`'s own concrete type, never a textual type name, so
+    /// the backend never guesses which runtime conversion to call.
+    FormatPrimitive {
+        primitive: Type,
+        receiver: Box<Expression>,
+    },
     /// `list.Length`: reads the `length` field of a `List<T>` header.
     ListLength(Box<Expression>),
     /// `list.Add(value)`: appends `value`, growing the buffer if needed.

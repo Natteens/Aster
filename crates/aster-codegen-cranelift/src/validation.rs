@@ -1048,10 +1048,12 @@ fn validate_intrinsic_shape(
         mir::Intrinsic::StringFromDouble | mir::Intrinsic::StringFromDoubleTemporary => {
             destination.is_some()
                 && return_type == &mir::Type::String
-                && matches!(
-                    arguments,
-                    [value] if matches!(value.type_, mir::Type::Float | mir::Type::Double)
-                )
+                && matches!(arguments, [value] if value.type_ == mir::Type::Double)
+        }
+        mir::Intrinsic::StringFromFloat | mir::Intrinsic::StringFromFloatTemporary => {
+            destination.is_some()
+                && return_type == &mir::Type::String
+                && matches!(arguments, [value] if value.type_ == mir::Type::Float)
         }
         mir::Intrinsic::StringFromBool | mir::Intrinsic::StringFromBoolTemporary => {
             destination.is_some()

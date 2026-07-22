@@ -142,6 +142,49 @@ fn mir_evaluates_left_to_right_stringifies_and_joins_exactly_once() {
 }
 
 #[test]
+fn float_interpolation_uses_its_own_conversion_never_widening_through_double() {
+    // Regression: `float` interpolation used to widen to `double` before
+    // stringifying, which double-rounds and can print spurious digits (e.g.
+    // `0.1f` widened to `f64` prints `0.10000000149011612`, not `0.1`). It
+    // must go through `StringFromFloat`, matching `ToString()` (M1C).
+    let compilation = compile(
+        r#"
+        public string Run(float value) {
+            return $"{value}";
+        }
+        "#,
+    )
+    .expect("valid interpolation should compile");
+
+    let function = &compilation.mir.functions[0];
+    let intrinsics = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| {
+            let mir::Instruction::CallIntrinsic { intrinsic, .. } = instruction else {
+                return None;
+            };
+            Some(*intrinsic)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        intrinsics.iter().any(|intrinsic| matches!(
+            *intrinsic,
+            mir::Intrinsic::StringFromFloat | mir::Intrinsic::StringFromFloatTemporary
+        )),
+        "expected a StringFromFloat* intrinsic, found {intrinsics:?}"
+    );
+    assert!(
+        !intrinsics.iter().any(|intrinsic| matches!(
+            *intrinsic,
+            mir::Intrinsic::StringFromDouble | mir::Intrinsic::StringFromDoubleTemporary
+        )),
+        "a `float` must never be widened to `double` before stringifying: {intrinsics:?}"
+    );
+}
+
+#[test]
 fn already_string_values_are_not_redundantly_stringified() {
     let compilation = compile(
         r#"

@@ -168,6 +168,12 @@ impl FunctionLowerer {
                     kind: mir::OperandKind::Copy(place),
                 })
             }
+            hir::ExpressionKind::FormatPrimitive { receiver, .. } => {
+                let receiver = self
+                    .lower_expression(receiver)
+                    .expect("validated ToString receiver produces a value");
+                Some(self.stringify(receiver))
+            }
             hir::ExpressionKind::Call { callee, arguments } => {
                 self.lower_call(callee, arguments, &expression.type_)
             }
@@ -616,7 +622,8 @@ impl FunctionLowerer {
             mir::Type::Byte | mir::Type::UShort | mir::Type::UInt | mir::Type::ULong => {
                 mir::Intrinsic::StringFromULong
             }
-            mir::Type::Float | mir::Type::Double => mir::Intrinsic::StringFromDouble,
+            mir::Type::Float => mir::Intrinsic::StringFromFloat,
+            mir::Type::Double => mir::Intrinsic::StringFromDouble,
             _ => unreachable!("semantic analysis rejects types without a textual conversion"),
         };
         let destination = self.new_temporary(hir::Type::String);

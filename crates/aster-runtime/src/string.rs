@@ -178,8 +178,8 @@ pub extern "C" fn aster_rt_string_from_ulong_temporary(
     string_from_display(context, u64::from_ne_bytes(value.to_ne_bytes()), true)
 }
 
-/// Convert a `float` (already promoted to `double`) or `double` to a
-/// persistent `string`. Formatting is locale independent.
+/// Convert a `double` to a persistent `string`. Formatting is locale
+/// independent.
 pub extern "C" fn aster_rt_string_from_double(
     context: *mut ExecutionContext,
     value: f64,
@@ -191,6 +191,24 @@ pub extern "C" fn aster_rt_string_from_double(
 pub extern "C" fn aster_rt_string_from_double_temporary(
     context: *mut ExecutionContext,
     value: f64,
+) -> *const AsterStrHeader {
+    string_from_display(context, value, true)
+}
+
+/// Convert a `float` directly to a persistent `string`, without promoting it
+/// to `double` first (which would round twice). Formatting is locale
+/// independent.
+pub extern "C" fn aster_rt_string_from_float(
+    context: *mut ExecutionContext,
+    value: f32,
+) -> *const AsterStrHeader {
+    string_from_display(context, value, false)
+}
+
+/// Temporary counterpart of [`aster_rt_string_from_float`].
+pub extern "C" fn aster_rt_string_from_float_temporary(
+    context: *mut ExecutionContext,
+    value: f32,
 ) -> *const AsterStrHeader {
     string_from_display(context, value, true)
 }
@@ -968,8 +986,9 @@ pub extern "C" fn aster_rt_string_try_parse_double(
 mod tests {
     use super::{
         AsterStrHeader, aster_rt_string_concat, aster_rt_string_contains,
-        aster_rt_string_ends_with, aster_rt_string_eq, aster_rt_string_index_of,
-        aster_rt_string_length, aster_rt_string_starts_with, aster_rt_string_substring_from,
+        aster_rt_string_ends_with, aster_rt_string_eq, aster_rt_string_from_double,
+        aster_rt_string_from_float, aster_rt_string_index_of, aster_rt_string_length,
+        aster_rt_string_starts_with, aster_rt_string_substring_from,
         aster_rt_string_substring_range, aster_rt_string_substring_range_temporary,
         aster_rt_string_try_parse_bool, aster_rt_string_try_parse_double,
         aster_rt_string_try_parse_float, aster_rt_string_try_parse_int, encode_str,
@@ -1507,6 +1526,102 @@ mod tests {
                     "{text:?} should be None"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn from_float_and_from_double_preserve_negative_zero_sign_in_text() {
+        let mut context = ExecutionContext::new();
+        // SAFETY: `aster_rt_string_from_float`/`_double` return a freshly
+        // allocated, fully initialized persistent string.
+        #[allow(unsafe_code)]
+        unsafe {
+            let text = view(aster_rt_string_from_float(&raw mut context, -0.0_f32))
+                .expect("valid utf8 string");
+            assert_eq!(text, "-0");
+            let text = view(aster_rt_string_from_float(&raw mut context, 0.0_f32))
+                .expect("valid utf8 string");
+            assert_eq!(text, "0");
+            let text = view(aster_rt_string_from_double(&raw mut context, -0.0_f64))
+                .expect("valid utf8 string");
+            assert_eq!(text, "-0");
+            let text = view(aster_rt_string_from_double(&raw mut context, 0.0_f64))
+                .expect("valid utf8 string");
+            assert_eq!(text, "0");
+        }
+    }
+
+    #[test]
+    fn from_float_never_formats_through_a_widened_double() {
+        // `0.1_f32` widened to `f64` prints `0.10000000149011612` (the exact
+        // bits of the nearest `f64` to that `f32`, per IEEE-754 widening);
+        // formatting `f32` directly must not go through that intermediate
+        // step or every non-exactly-representable `float` would gain spurious
+        // digits.
+        let mut context = ExecutionContext::new();
+        // SAFETY: as above.
+        #[allow(unsafe_code)]
+        let text =
+            unsafe { view(aster_rt_string_from_float(&raw mut context, 0.1_f32)) }.expect("utf8");
+        assert_eq!(text, "0.1");
+    }
+
+    #[test]
+    fn from_float_and_from_double_produce_a_stable_special_value_text() {
+        let mut context = ExecutionContext::new();
+        // SAFETY: as above.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!(
+                view(aster_rt_string_from_float(&raw mut context, f32::NAN)).expect("utf8"),
+                "NaN"
+            );
+            assert_eq!(
+                view(aster_rt_string_from_float(&raw mut context, f32::INFINITY)).expect("utf8"),
+                "inf"
+            );
+            assert_eq!(
+                view(aster_rt_string_from_float(
+                    &raw mut context,
+                    f32::NEG_INFINITY
+                ))
+                .expect("utf8"),
+                "-inf"
+            );
+            assert_eq!(
+                view(aster_rt_string_from_double(&raw mut context, f64::NAN)).expect("utf8"),
+                "NaN"
+            );
+            assert_eq!(
+                view(aster_rt_string_from_double(&raw mut context, f64::INFINITY)).expect("utf8"),
+                "inf"
+            );
+            assert_eq!(
+                view(aster_rt_string_from_double(
+                    &raw mut context,
+                    f64::NEG_INFINITY
+                ))
+                .expect("utf8"),
+                "-inf"
+            );
+        }
+        // The parsing side deliberately keeps rejecting these textual forms.
+        let mut destination = option_destination();
+        let destination_ptr = destination.as_mut_ptr().cast::<u8>();
+        let input = aligned("NaN");
+        aster_rt_string_try_parse_double(
+            &raw mut context,
+            pointer(&input),
+            destination_ptr,
+            16,
+            1,
+            0,
+            8,
+        );
+        // SAFETY: just written above.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!(std::ptr::read_unaligned(destination_ptr.cast::<i32>()), 0);
         }
     }
 

@@ -466,6 +466,24 @@ impl Analyzer<'_> {
                     if receiver == Type::String {
                         return self.string_operation(name, &argument_types, arguments, span);
                     }
+                    if matches!(
+                        receiver,
+                        Type::Bool
+                            | Type::Char
+                            | Type::Int
+                            | Type::UInt
+                            | Type::Long
+                            | Type::ULong
+                            | Type::Float
+                            | Type::Double
+                    ) {
+                        return self.format_primitive_operation(
+                            &receiver,
+                            name,
+                            &argument_types,
+                            span,
+                        );
+                    }
                     if let Type::List(element_type) = &receiver {
                         if name == "Add" {
                             if arguments.len() != 1 {
@@ -629,6 +647,40 @@ impl Analyzer<'_> {
             },
         );
         callable.signature.result
+    }
+
+    /// Resolves `value.ToString()` on one of the eight fundamental
+    /// primitives (`bool`/`char`/`int`/`uint`/`long`/`ulong`/`float`/
+    /// `double`). No other member is exposed on these receivers here, so a
+    /// user type can never collide with this intrinsic: only the resolver's
+    /// primitive-type branch reaches this function at all.
+    fn format_primitive_operation(
+        &mut self,
+        receiver: &Type,
+        name: &str,
+        argument_types: &[Type],
+        span: Span,
+    ) -> Type {
+        if name != "ToString" {
+            self.diagnostics.push(Diagnostic::error(
+                format!("`{}` has no method `{name}`", receiver.display()),
+                span,
+            ));
+            return Type::Unknown;
+        }
+        if !argument_types.is_empty() {
+            self.diagnostics.push(Diagnostic::error(
+                format!(
+                    "`{}.ToString` expects 0 arguments, found {}",
+                    receiver.display(),
+                    argument_types.len()
+                ),
+                span,
+            ));
+            return Type::Unknown;
+        }
+        self.model.format_primitives.insert(self.model_key(span));
+        Type::String
     }
 
     fn string_operation(

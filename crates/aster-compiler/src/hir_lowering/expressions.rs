@@ -338,6 +338,19 @@ impl Lowerer<'_> {
                         },
                     };
                 }
+                if self.model.format_primitives.contains(&model_key) {
+                    let ast::ExpressionKind::Member { object, .. } = &callee.kind else {
+                        unreachable!("validated ToString call has a member receiver");
+                    };
+                    let receiver = self.expression(object);
+                    return hir::Expression {
+                        type_: hir::Type::String,
+                        kind: hir::ExpressionKind::FormatPrimitive {
+                            primitive: receiver.type_.clone(),
+                            receiver: Box::new(receiver),
+                        },
+                    };
+                }
                 if let ast::ExpressionKind::Member { object, name } = &callee.kind
                     && name == "Add"
                 {

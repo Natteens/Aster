@@ -445,6 +445,7 @@ fn call_returns_alias(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn instruction_escape(
     instruction: &mir::Instruction,
     aliases: &HashSet<mir::LocalId>,
@@ -524,6 +525,8 @@ fn instruction_escape(
                     | mir::Intrinsic::StringFromULongTemporary
                     | mir::Intrinsic::StringFromDouble
                     | mir::Intrinsic::StringFromDoubleTemporary
+                    | mir::Intrinsic::StringFromFloat
+                    | mir::Intrinsic::StringFromFloatTemporary
                     | mir::Intrinsic::StringFromBool
                     | mir::Intrinsic::StringFromBoolTemporary
                     | mir::Intrinsic::StringFromChar
@@ -534,6 +537,13 @@ fn instruction_escape(
                     | mir::Intrinsic::StringSubstringFromTemporary
                     | mir::Intrinsic::StringSubstringRange
                     | mir::Intrinsic::StringSubstringRangeTemporary
+                    | mir::Intrinsic::StringTryParseBool
+                    | mir::Intrinsic::StringTryParseInt
+                    | mir::Intrinsic::StringTryParseUInt
+                    | mir::Intrinsic::StringTryParseLong
+                    | mir::Intrinsic::StringTryParseULong
+                    | mir::Intrinsic::StringTryParseFloat
+                    | mir::Intrinsic::StringTryParseDouble
                     | mir::Intrinsic::ReportRuntimeError(_)
             );
             (!borrows_only

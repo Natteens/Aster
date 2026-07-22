@@ -1,6 +1,6 @@
 mod general;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use aster_diagnostics::{Diagnostic, Span};
 use aster_hir::StringOperation;
@@ -128,6 +128,10 @@ pub(crate) struct Model {
     pub switch_cases: HashMap<ModelNodeKey, ResolvedEnumCase>,
     pub propagations: HashMap<ModelNodeKey, ResolvedPropagation>,
     pub string_operations: HashMap<ModelNodeKey, StringOperation>,
+    /// Validated `value.ToString()` call sites on one of the eight
+    /// fundamental primitives. Membership alone is enough for HIR lowering:
+    /// the receiver's own lowered type supplies the exact primitive.
+    pub format_primitives: HashSet<ModelNodeKey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

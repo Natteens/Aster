@@ -87,6 +87,7 @@ pub(super) fn runtime_type(type_: RuntimeType, pointer: ClifType) -> ClifType {
         RuntimeType::I8 => types::I8,
         RuntimeType::I32 => types::I32,
         RuntimeType::I64 => types::I64,
+        RuntimeType::F32 => types::F32,
         RuntimeType::F64 => types::F64,
         RuntimeType::Pointer => pointer,
     }

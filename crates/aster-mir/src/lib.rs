@@ -229,9 +229,14 @@ pub enum Intrinsic {
     /// Convert an unsigned integer (widened to `ulong`) to a `string`.
     StringFromULong,
     StringFromULongTemporary,
-    /// Convert a `float` (promoted to `double`) or `double` to a `string`.
+    /// Convert a `double` to a `string`.
     StringFromDouble,
     StringFromDoubleTemporary,
+    /// Convert a `float` directly to a `string` (never promoted to `double`
+    /// first, which would round twice and could format an already-in-range
+    /// `float` incorrectly).
+    StringFromFloat,
+    StringFromFloatTemporary,
     StringFromBool,
     StringFromBoolTemporary,
     StringFromChar,
@@ -312,6 +317,7 @@ impl Intrinsic {
             | Self::StringFromLong
             | Self::StringFromULong
             | Self::StringFromDouble
+            | Self::StringFromFloat
             | Self::StringFromBool
             | Self::StringFromChar
             | Self::StringJoin
@@ -321,6 +327,7 @@ impl Intrinsic {
             | Self::StringFromLongTemporary
             | Self::StringFromULongTemporary
             | Self::StringFromDoubleTemporary
+            | Self::StringFromFloatTemporary
             | Self::StringFromBoolTemporary
             | Self::StringFromCharTemporary
             | Self::StringJoinTemporary
@@ -392,6 +399,14 @@ impl Intrinsic {
                 Self::StringFromDouble | Self::StringFromDoubleTemporary,
                 AllocationRegion::Temporary,
             ) => Self::StringFromDoubleTemporary,
+            (
+                Self::StringFromFloat | Self::StringFromFloatTemporary,
+                AllocationRegion::Persistent,
+            ) => Self::StringFromFloat,
+            (
+                Self::StringFromFloat | Self::StringFromFloatTemporary,
+                AllocationRegion::Temporary,
+            ) => Self::StringFromFloatTemporary,
             (
                 Self::StringFromBool | Self::StringFromBoolTemporary,
                 AllocationRegion::Persistent,
