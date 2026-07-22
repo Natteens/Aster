@@ -26,6 +26,80 @@ public struct IOError
     public int OsCode;
 }
 
+/// Whether `text` is absolute by the same lexical rules `CombinePath`
+/// rejects a child with: a leading `/` or `\`, or a drive letter (`C:`).
+internal bool IsAsciiLetterText(string oneChar)
+{
+    return oneChar == "A" || oneChar == "B" || oneChar == "C" || oneChar == "D"
+        || oneChar == "E" || oneChar == "F" || oneChar == "G" || oneChar == "H"
+        || oneChar == "I" || oneChar == "J" || oneChar == "K" || oneChar == "L"
+        || oneChar == "M" || oneChar == "N" || oneChar == "O" || oneChar == "P"
+        || oneChar == "Q" || oneChar == "R" || oneChar == "S" || oneChar == "T"
+        || oneChar == "U" || oneChar == "V" || oneChar == "W" || oneChar == "X"
+        || oneChar == "Y" || oneChar == "Z"
+        || oneChar == "a" || oneChar == "b" || oneChar == "c" || oneChar == "d"
+        || oneChar == "e" || oneChar == "f" || oneChar == "g" || oneChar == "h"
+        || oneChar == "i" || oneChar == "j" || oneChar == "k" || oneChar == "l"
+        || oneChar == "m" || oneChar == "n" || oneChar == "o" || oneChar == "p"
+        || oneChar == "q" || oneChar == "r" || oneChar == "s" || oneChar == "t"
+        || oneChar == "u" || oneChar == "v" || oneChar == "w" || oneChar == "x"
+        || oneChar == "y" || oneChar == "z";
+}
+
+internal bool IsAbsolutePathText(string text)
+{
+    if (text.StartsWith("/")) { return true; }
+    if (text.StartsWith("\\")) { return true; }
+    if (text.Length < 2) { return false; }
+    if (text.Substring(1, 1) != ":") { return false; }
+    string first = text.Substring(0, 1);
+    return IsAsciiLetterText(first);
+}
+
+/// A `\0` scalar as a one-character `string`, built without ASTER's `\0`
+/// escape (unsupported by the lexer) so `CombinePath` can still detect an
+/// embedded NUL using only official string operations.
+internal string NulText()
+{
+    char nul = (char)0;
+    return nul.ToString();
+}
+
+/// Lexically join `basePath` and `childPath` with `/`, never touching the
+/// filesystem: no existence check, no canonicalization, no symlink
+/// resolution, no absolutization, no `.`/`..` resolution, no separator
+/// conversion. `basePath`/`childPath` are plain `string`s, not a nominal
+/// `Path` type -- structs cannot yet declare methods the Cranelift backend
+/// can execute, and struct-literal construction requires every field to be
+/// `public` even from a function in this same file (confirmed empirically;
+/// no privileged same-namespace exception), so a nominal, truly immutable
+/// `Path` cannot preserve its own invariants with the language as it stands
+/// today (a `public string Value` field would let any caller read *and
+/// write* it directly). `Path` is deferred until ASTER has a way to build
+/// opaque, validated values without exposing a public field; each future
+/// filesystem operation (M2D) validates its own `string` argument instead.
+public Result<string, IOError> CombinePath(string basePath, string childPath)
+{
+    if (basePath.Length == 0 || childPath.Length == 0)
+    {
+        return Result<string, IOError>.Error(IOError { Kind: IOErrorKind.InvalidPath, OsCode: 0 });
+    }
+    string nul = NulText();
+    if (basePath.Contains(nul) || childPath.Contains(nul))
+    {
+        return Result<string, IOError>.Error(IOError { Kind: IOErrorKind.InvalidPath, OsCode: 0 });
+    }
+    if (IsAbsolutePathText(childPath))
+    {
+        return Result<string, IOError>.Error(IOError { Kind: IOErrorKind.InvalidPath, OsCode: 0 });
+    }
+    if (basePath.EndsWith("/") || basePath.EndsWith("\\"))
+    {
+        return Result<string, IOError>.Ok(basePath + childPath);
+    }
+    return Result<string, IOError>.Ok(basePath + "/" + childPath);
+}
+
 public void Write(string value)
 {
 }
