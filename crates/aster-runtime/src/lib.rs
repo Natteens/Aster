@@ -18,7 +18,9 @@ mod object;
 pub mod registry;
 pub mod string;
 
-pub use context::{AsterArray, ExecutionContext, MemoryStats};
+pub use context::{
+    AsterArray, ExecutionContext, MemoryStats, aster_rt_array_element, aster_rt_array_length,
+};
 pub use log::LogLevel;
 pub use registry::{RuntimeFunction, RuntimeSignature, RuntimeType, runtime_functions};
 pub use string::{AsterStrHeader, decode_str, encode_str};

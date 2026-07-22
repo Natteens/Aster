@@ -11,14 +11,22 @@ impl FunctionLowerer {
         }
     }
 
-    fn lower_statement(&mut self, statement: &hir::Statement) {
+    pub(super) fn lower_statement(&mut self, statement: &hir::Statement) {
         match statement {
             hir::Statement::Variable(variable) => self.lower_variable(variable),
             hir::Statement::Return(value) => {
                 let value = value
                     .as_ref()
                     .and_then(|value| self.lower_expression(value));
-                self.terminate_current(mir::Terminator::Return(value));
+                // Inside a generated async `MoveNext`, a source-level `return`
+                // publishes the value as the async task's candidate result and
+                // then returns the machine's `Completed` status, never the
+                // value itself. See `async_machine`.
+                if self.async_handle.is_some() {
+                    self.emit_async_return(value);
+                } else {
+                    self.terminate_current(mir::Terminator::Return(value));
+                }
             }
             hir::Statement::Expression(expression) => {
                 self.lower_expression(expression);

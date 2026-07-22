@@ -1,7 +1,9 @@
-use super::{FunctionLowerer, HashMap, hir, mir};
+use super::symbols::SymbolAllocator;
+use super::{FunctionLowerer, HashMap, async_machine, hir, mir};
 
 #[allow(clippy::too_many_lines)]
 pub(super) fn lower(module: &hir::Module) -> mir::Module {
+    let mut symbols = SymbolAllocator::new(module);
     let intrinsics = module
         .items
         .iter()
@@ -102,7 +104,14 @@ pub(super) fn lower(module: &hir::Module) -> mir::Module {
     for item in &module.items {
         match item {
             hir::Item::Function(function) => {
-                push_function(&mut functions, function, None, &intrinsics, &enum_map);
+                push_function(
+                    &mut functions,
+                    function,
+                    None,
+                    &intrinsics,
+                    &enum_map,
+                    &mut symbols,
+                );
             }
             hir::Item::Class(declaration) | hir::Item::Struct(declaration) => {
                 for method in &declaration.methods {
@@ -112,6 +121,7 @@ pub(super) fn lower(module: &hir::Module) -> mir::Module {
                         Some(declaration.symbol),
                         &intrinsics,
                         &enum_map,
+                        &mut symbols,
                     );
                 }
             }
@@ -207,8 +217,21 @@ fn push_function(
     owner: Option<hir::SymbolId>,
     intrinsics: &HashMap<hir::SymbolId, hir::Intrinsic>,
     enums: &HashMap<hir::SymbolId, mir::EnumDefinition>,
+    symbols: &mut SymbolAllocator,
 ) {
-    if function.body.is_some() && function.intrinsic.is_none() {
+    if function.body.is_none() || function.intrinsic.is_some() {
+        return;
+    }
+    if function.is_async {
+        // An async function becomes a wrapper (keeping its symbol) plus a
+        // generated `MoveNext` with a fresh, unique symbol referenced only by
+        // identity — never by name.
+        let move_next_symbol = symbols.fresh();
+        let (wrapper, move_next) =
+            async_machine::lower(function, owner, intrinsics, enums, move_next_symbol);
+        functions.push(wrapper);
+        functions.push(move_next);
+    } else {
         functions.push(
             FunctionLowerer::new(function, intrinsics.clone(), enums.clone())
                 .lower(function, owner),

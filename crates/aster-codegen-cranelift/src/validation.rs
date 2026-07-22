@@ -52,6 +52,11 @@ pub(super) fn validate_invocable_entry(
             "entry function `{function_name}` returns an enum; handle it in a scalar entry function instead"
         )));
     }
+    if matches!(function.return_type, mir::Type::Task(_)) {
+        return Err(BackendError::new(format!(
+            "entry function `{function_name}` returns a Task<T>; call it from a scalar entry function and `Wait()` there instead"
+        )));
+    }
     Ok(())
 }
 
@@ -249,17 +254,15 @@ fn validate_instruction(
                 validate_place(destination, function_name)?;
             }
             validate_return_type(return_type, function_name)?;
-            if *intrinsic == mir::Intrinsic::TaskRun {
-                // `Task.Run`'s lone argument is a resolved function
-                // reference (`OperandKind::Function`), not a normal value
-                // operand; `validate_intrinsic_shape` below checks its
-                // shape directly instead of the generic `validate_operand`,
-                // which otherwise rejects every `Function` operand.
-                if let [argument] = &arguments[..] {
+            for argument in arguments {
+                // Spawn-style intrinsics (`Task.Run`, `AsyncSpawn`,
+                // `AsyncSpawnInner`, `Parallel*`) carry a resolved function
+                // reference as an `OperandKind::Function`, which the generic
+                // `validate_operand` rejects. Validate only its value type;
+                // `validate_intrinsic_shape` below checks the full shape.
+                if matches!(argument.kind, mir::OperandKind::Function(_)) {
                     validate_value_type(&argument.type_, function_name)?;
-                }
-            } else {
-                for argument in arguments {
+                } else {
                     validate_operand(argument, function_name)?;
                 }
             }
@@ -335,6 +338,7 @@ fn validate_interface_call(
     validate_return_type(return_type, function_name)
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_intrinsic_shape(
     destination: Option<&mir::Place>,
     intrinsic: mir::Intrinsic,
@@ -431,6 +435,96 @@ fn validate_intrinsic_shape(
                         &argument.type_,
                         mir::Type::Task(inner) if **inner == *return_type
                     )
+                )
+        }
+        mir::Intrinsic::AsyncSpawn => {
+            destination.is_some()
+                && matches!(return_type, mir::Type::Task(_))
+                && matches!(
+                    arguments,
+                    [move_next, count]
+                        if matches!(move_next.kind, mir::OperandKind::Function(_))
+                            && count.type_ == mir::Type::Int
+                )
+        }
+        mir::Intrinsic::AsyncState => {
+            destination.is_some()
+                && *return_type == mir::Type::Int
+                && matches!(arguments, [handle] if handle.type_ == mir::Type::Long)
+        }
+        mir::Intrinsic::AsyncSetState => {
+            destination.is_none()
+                && *return_type == mir::Type::Void
+                && matches!(
+                    arguments,
+                    [handle, new_state]
+                        if handle.type_ == mir::Type::Long && new_state.type_ == mir::Type::Int
+                )
+        }
+        mir::Intrinsic::AsyncStoreSlot => {
+            destination.is_none()
+                && *return_type == mir::Type::Void
+                && matches!(
+                    arguments,
+                    [handle, index, value]
+                        if handle.type_ == mir::Type::Long
+                            && index.type_ == mir::Type::Int
+                            && is_transferable_scalar(&value.type_)
+                )
+        }
+        mir::Intrinsic::AsyncLoadSlot => {
+            destination.is_some()
+                && is_transferable_scalar(return_type)
+                && matches!(
+                    arguments,
+                    [handle, index]
+                        if handle.type_ == mir::Type::Long && index.type_ == mir::Type::Int
+                )
+        }
+        mir::Intrinsic::AsyncSpawnInner => {
+            destination.is_none()
+                && *return_type == mir::Type::Void
+                && matches!(
+                    arguments,
+                    [handle, inner]
+                        if handle.type_ == mir::Type::Long
+                            && matches!(inner.kind, mir::OperandKind::Function(_))
+                )
+        }
+        mir::Intrinsic::AsyncAwaitResult => {
+            destination.is_some()
+                && is_transferable_scalar(return_type)
+                && matches!(arguments, [handle] if handle.type_ == mir::Type::Long)
+        }
+        mir::Intrinsic::AsyncSetResult => {
+            destination.is_none()
+                && *return_type == mir::Type::Void
+                && matches!(
+                    arguments,
+                    [handle, value]
+                        if handle.type_ == mir::Type::Long && is_transferable_scalar(&value.type_)
+                )
+        }
+        mir::Intrinsic::ParallelFor => {
+            destination.is_none()
+                && *return_type == mir::Type::Void
+                && matches!(
+                    arguments,
+                    [start, end, body]
+                        if start.type_ == mir::Type::Int
+                            && end.type_ == mir::Type::Int
+                            && matches!(body.kind, mir::OperandKind::Function(_))
+                )
+        }
+        mir::Intrinsic::ParallelForEach => {
+            destination.is_none()
+                && *return_type == mir::Type::Void
+                && matches!(
+                    arguments,
+                    [values, body]
+                        if matches!(values.type_, mir::Type::Array(_))
+                            && matches!(body.kind, mir::OperandKind::Function(_))
+                            && is_transferable_scalar(&body.type_)
                 )
         }
     };
@@ -557,6 +651,24 @@ fn validate_place(place: &mir::Place, function_name: &str) -> Result<(), Backend
             "module globals, classes, and objects",
         )),
     }
+}
+
+fn is_transferable_scalar(type_: &mir::Type) -> bool {
+    matches!(
+        type_,
+        mir::Type::Bool
+            | mir::Type::SByte
+            | mir::Type::Byte
+            | mir::Type::Short
+            | mir::Type::UShort
+            | mir::Type::Int
+            | mir::Type::UInt
+            | mir::Type::Long
+            | mir::Type::ULong
+            | mir::Type::Float
+            | mir::Type::Double
+            | mir::Type::Char
+    )
 }
 
 fn executable_value_type(type_: &mir::Type) -> bool {

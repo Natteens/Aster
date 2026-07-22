@@ -60,6 +60,20 @@ pub(crate) struct ResolvedTaskRun {
     pub function: CallableKey,
 }
 
+/// A resolved `Parallel.For(start, end, Body)`: `Body`'s concrete zero-capture
+/// `void(int)` target, resolved once here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedParallelFor {
+    pub body: CallableKey,
+}
+
+/// A resolved `Parallel.ForEach(values, Body)`: `Body`'s concrete
+/// zero-capture `void(T)` target, resolved once here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedParallelForEach {
+    pub body: CallableKey,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedEnumCase {
     pub enum_name: String,
@@ -86,6 +100,8 @@ pub(crate) struct Model {
     pub property_assignments: HashMap<ModelNodeKey, ResolvedPropertyAssignment>,
     pub enum_values: HashMap<ModelNodeKey, ResolvedEnumCase>,
     pub task_runs: HashMap<ModelNodeKey, ResolvedTaskRun>,
+    pub parallel_for: HashMap<ModelNodeKey, ResolvedParallelFor>,
+    pub parallel_for_each: HashMap<ModelNodeKey, ResolvedParallelForEach>,
     pub switch_cases: HashMap<ModelNodeKey, ResolvedEnumCase>,
     pub propagations: HashMap<ModelNodeKey, ResolvedPropagation>,
 }
@@ -121,11 +137,12 @@ pub(super) fn validate(module: &Module) -> (Vec<Diagnostic>, Model) {
     (diagnostics, model)
 }
 
-/// `Task` is a reserved, intrinsic type name (`aster.core.Task<T>`; see
-/// `hir::Type::Task`): no class, struct, interface, or enum declaration
-/// (generic or not) may use it. This is the single place that reservation
-/// is enforced, so every later stage can recognize `Task`/`Task.Run`/`Wait`
-/// structurally without checking whether a user redefined the name.
+/// `Task` and `Parallel` are reserved, intrinsic names (`aster.core.Task<T>`,
+/// see `hir::Type::Task`, and the `Parallel.For`/`Parallel.ForEach` surface):
+/// no class, struct, interface, or enum declaration (generic or not) may use
+/// either. This is the single place that reservation is enforced, so every
+/// later stage can recognize these names structurally without checking
+/// whether a user redefined them.
 fn validate_no_reserved_type_names(module: &Module, diagnostics: &mut Vec<Diagnostic>) {
     for item in &module.items {
         let (kind, name, span) = match item {
@@ -135,13 +152,13 @@ fn validate_no_reserved_type_names(module: &Module, diagnostics: &mut Vec<Diagno
             Item::Enum(item) => ("enum", &item.name, item.span),
             Item::Function(_) | Item::Variable(_) => continue,
         };
-        if name == "Task" {
+        if name == "Task" || name == "Parallel" {
             diagnostics.push(
                 Diagnostic::error(
-                    format!("`{name}` is reserved for the intrinsic task system and cannot be declared as a {kind}"),
+                    format!("`{name}` is reserved for the intrinsic concurrency system and cannot be declared as a {kind}"),
                     span,
                 )
-                .with_help("rename this type; `Task<T>` is a built-in type, not something a program can declare"),
+                .with_help("rename this type; it is a built-in name, not something a program can declare"),
             );
         }
     }

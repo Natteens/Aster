@@ -1,8 +1,10 @@
+mod async_machine;
 mod calls;
 mod control_flow;
 mod expressions;
 mod module;
 mod places;
+mod symbols;
 
 use std::collections::HashMap;
 
@@ -36,11 +38,19 @@ struct FunctionLowerer {
     next_temporary: u32,
     intrinsics: HashMap<hir::SymbolId, hir::Intrinsic>,
     enums: HashMap<hir::SymbolId, mir::EnumDefinition>,
+    /// Set while lowering an async `MoveNext` state machine. When present,
+    /// `await` lowers to a use of this pre-materialized result operand and
+    /// `return` stores the value as the async task's candidate result before
+    /// returning the `MoveNext` status. See `async_machine`.
+    async_await_result: Option<mir::Operand>,
+    async_handle: Option<mir::Operand>,
 }
 
 impl FunctionLowerer {
-    fn new(
-        function: &hir::Function,
+    /// Shared skeleton with an empty entry block and no parameters. Used
+    /// directly by `async_machine` for generated functions and by
+    /// [`Self::new`] for ordinary ones.
+    fn new_bare(
         intrinsics: HashMap<hir::SymbolId, hir::Intrinsic>,
         enums: HashMap<hir::SymbolId, mir::EnumDefinition>,
     ) -> Self {
@@ -55,9 +65,20 @@ impl FunctionLowerer {
             next_temporary: 0,
             intrinsics,
             enums,
+            async_await_result: None,
+            async_handle: None,
         };
         let entry = lowerer.new_block();
         lowerer.current = Some(entry);
+        lowerer
+    }
+
+    fn new(
+        function: &hir::Function,
+        intrinsics: HashMap<hir::SymbolId, hir::Intrinsic>,
+        enums: HashMap<hir::SymbolId, mir::EnumDefinition>,
+    ) -> Self {
+        let mut lowerer = Self::new_bare(intrinsics, enums);
         for parameter in &function.parameters {
             let local = lowerer.source_local(
                 parameter.symbol,
@@ -71,34 +92,11 @@ impl FunctionLowerer {
     }
 
     fn lower(mut self, function: &hir::Function, owner: Option<hir::SymbolId>) -> mir::Function {
-        // Sublote 1 stops at HIR: async bodies (which contain `await`) are not
-        // lowered to executable MIR yet. Instead of walking the body, emit a
-        // non-executable placeholder that reports a controlled runtime error if
-        // the function is ever executed, then returns. This keeps `await` out of
-        // MIR lowering entirely and, unlike a trap, never aborts the host.
-        if function.is_async {
-            self.instruction(mir::Instruction::CallIntrinsic {
-                destination: None,
-                intrinsic: mir::Intrinsic::ReportRuntimeError(
-                    mir::RuntimeErrorKind::AsyncRuntimeUnavailable,
-                ),
-                arguments: Vec::new(),
-                return_type: mir::Type::Void,
-            });
-            // `Task<T>` is a plain `i64` handle, so a zero long is a valid,
-            // never-observed return value: execution stops at the controlled
-            // error above before this handle can be used.
-            self.terminate_current(mir::Terminator::Return(Some(mir::Operand {
-                type_: mir::Type::Long,
-                kind: mir::OperandKind::Constant(mir::Constant::Integer("0".to_owned())),
-            })));
-        } else {
-            if let Some(body) = &function.body {
-                self.lower_block(body);
-            }
-            if let Some(current) = self.current {
-                self.terminate(current, mir::Terminator::End);
-            }
+        if let Some(body) = &function.body {
+            self.lower_block(body);
+        }
+        if let Some(current) = self.current {
+            self.terminate(current, mir::Terminator::End);
         }
         let blocks = self
             .blocks
@@ -120,6 +118,71 @@ impl FunctionLowerer {
             return_type: function.return_type.clone(),
             entry: mir::BasicBlockId(0),
             blocks,
+        }
+    }
+
+    /// Finish an ad-hoc (non-`FunctionLowerer::new`) function body, filling in
+    /// missing terminators. Used by `async_machine` for generated functions.
+    fn finish(
+        mut self,
+        symbol: hir::SymbolId,
+        owner: Option<hir::SymbolId>,
+        name: String,
+        visibility: hir::Visibility,
+        return_type: hir::Type,
+    ) -> mir::Function {
+        if let Some(current) = self.current.take() {
+            self.terminate(current, mir::Terminator::End);
+        }
+        let blocks = self
+            .blocks
+            .into_iter()
+            .map(|block| mir::BasicBlock {
+                id: block.id,
+                instructions: block.instructions,
+                terminator: block.terminator.unwrap_or(mir::Terminator::End),
+            })
+            .collect();
+        mir::Function {
+            constructor: false,
+            symbol,
+            owner,
+            name,
+            visibility,
+            parameters: self.parameters,
+            locals: self.locals,
+            return_type,
+            entry: mir::BasicBlockId(0),
+            blocks,
+        }
+    }
+
+    fn push_parameter(&mut self, local: mir::Local) {
+        self.parameters.push(local);
+    }
+
+    fn symbol_local(&self, symbol: hir::SymbolId) -> mir::LocalId {
+        self.symbol_locals[&symbol]
+    }
+
+    /// Emit an intrinsic call whose scalar result is captured in a fresh
+    /// temporary, returning an operand that reads it.
+    fn temporary_intrinsic(
+        &mut self,
+        intrinsic: mir::Intrinsic,
+        arguments: Vec<mir::Operand>,
+        return_type: hir::Type,
+    ) -> mir::Operand {
+        let local = self.new_temporary(return_type.clone());
+        self.instruction(mir::Instruction::CallIntrinsic {
+            destination: Some(mir::Place::Local(local)),
+            intrinsic,
+            arguments,
+            return_type: return_type.clone(),
+        });
+        mir::Operand {
+            type_: return_type,
+            kind: mir::OperandKind::Copy(mir::Place::Local(local)),
         }
     }
 

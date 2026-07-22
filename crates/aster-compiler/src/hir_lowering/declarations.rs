@@ -366,7 +366,15 @@ impl Lowerer<'_> {
             parameters.insert(0, receiver);
         }
         let return_type = self.resolve_type(&function.return_type);
-        let previous_return = std::mem::replace(&mut self.current_return, return_type.clone());
+        // Inside an `async Task<T>` body, `return` yields `T`, not `Task<T>`
+        // (the wrapper produces the `Task<T>` handle). Checking and converting
+        // returns against `T` keeps the awaited/returned values scalar so the
+        // generated `MoveNext` publishes a scalar candidate result.
+        let body_return = match &return_type {
+            hir::Type::Task(inner) if function.is_async => (**inner).clone(),
+            _ => return_type.clone(),
+        };
+        let previous_return = std::mem::replace(&mut self.current_return, body_return);
         self.scopes.push(scope);
         let mut body = function.body.as_ref().map(|body| self.block(body));
         if function.constructor

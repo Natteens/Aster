@@ -161,15 +161,31 @@ fn wait(context: *mut ExecutionContext, handle: i64) -> Option<ExecutionValue> {
     // hidden first argument; it cannot outlive the invocation.
     #[allow(unsafe_code)]
     let context = unsafe { &mut *context };
-    // SAFETY: `task_runtime`'s own contract, upheld by the host.
-    #[allow(unsafe_code)]
-    let Some(runtime) = (unsafe { task_runtime(context) }) else {
+    let Some(pointer) = context.task_runtime() else {
         context.fail(
             "Task<T>.Wait is not available from this entry point (no task runtime registered)",
         );
         return None;
     };
-    match runtime.wait(TaskHandleId::from_bits(handle)) {
+    let runtime = pointer.cast::<TaskRuntime>();
+    let id = TaskHandleId::from_bits(handle);
+    // Classify with a borrow that ends before any pump step runs, then either
+    // join a plain task or drive the async pump. For an async task no `&mut
+    // TaskRuntime` is held across `pump`: it reborrows the runtime through the
+    // per-step context pointer instead (see `task_runtime`). `context` above
+    // is a different object than the runtime, so this holds no aliasing borrow.
+    // SAFETY: the host guarantees `runtime` is live and unaliased for the call.
+    #[allow(unsafe_code)]
+    let is_async = unsafe { (*runtime).is_async_handle(id) };
+    #[allow(unsafe_code)]
+    let outcome = if is_async {
+        // SAFETY: `pump`'s own contract; no runtime borrow is live across it.
+        unsafe { TaskRuntime::pump(runtime, id) }
+    } else {
+        // SAFETY: short-lived exclusive borrow for a single plain join.
+        unsafe { (*runtime).wait(id) }
+    };
+    match outcome {
         Ok(TaskOutcome::Completed(value, _stats)) => Some(value),
         Ok(TaskOutcome::Failed(error)) | Err(error) => {
             // A `TaskOutcome::Failed` message already carries the "Aster
@@ -247,7 +263,7 @@ mod tests {
             .expect("source compiles")
             .mir;
         let mut runtime =
-            TaskRuntime::new(Arc::new(module), 1).expect("runtime starts with no tasks yet");
+            TaskRuntime::new(&Arc::new(module), 1).expect("runtime starts with no tasks yet");
         let mut context = ExecutionContext::new();
         context.set_task_runtime(std::ptr::from_mut(&mut runtime).cast::<()>());
 

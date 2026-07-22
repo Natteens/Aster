@@ -273,6 +273,94 @@ impl Codegen {
     }
 }
 
+/// The `scalar` kind tag for `type_`, matching the runtime's [`crate::scalar`]
+/// constants, so a stored value can be rebuilt as the exact same variant.
+pub(super) fn scalar_kind(type_: &mir::Type) -> Result<i64, BackendError> {
+    use crate::scalar;
+    Ok(i64::from(match type_ {
+        mir::Type::Bool => scalar::BOOL,
+        mir::Type::SByte => scalar::SBYTE,
+        mir::Type::Byte => scalar::BYTE,
+        mir::Type::Short => scalar::SHORT,
+        mir::Type::UShort => scalar::USHORT,
+        mir::Type::Int => scalar::INT,
+        mir::Type::UInt => scalar::UINT,
+        mir::Type::Long => scalar::LONG,
+        mir::Type::ULong => scalar::ULONG,
+        mir::Type::Float => scalar::FLOAT,
+        mir::Type::Double => scalar::DOUBLE,
+        mir::Type::Char => scalar::CHAR,
+        _ => {
+            return Err(BackendError::new(format!(
+                "type `{}` is not a transferable scalar",
+                type_name(type_)
+            )));
+        }
+    }))
+}
+
+/// Widen `value` (of scalar `type_`) into the 64-bit carrier used by the
+/// async/parallel ABI: zero-extend for narrow integers, reinterpret the IEEE
+/// bit pattern for floats.
+pub(super) fn scalar_to_bits(
+    builder: &mut FunctionBuilder<'_>,
+    type_: &mir::Type,
+    value: Value,
+) -> Result<Value, BackendError> {
+    Ok(match type_ {
+        mir::Type::Bool
+        | mir::Type::SByte
+        | mir::Type::Byte
+        | mir::Type::Short
+        | mir::Type::UShort
+        | mir::Type::Int
+        | mir::Type::UInt
+        | mir::Type::Char => builder.ins().uextend(types::I64, value),
+        mir::Type::Long | mir::Type::ULong => value,
+        mir::Type::Float => {
+            let bits = builder.ins().bitcast(types::I32, MemFlags::new(), value);
+            builder.ins().uextend(types::I64, bits)
+        }
+        mir::Type::Double => builder.ins().bitcast(types::I64, MemFlags::new(), value),
+        _ => {
+            return Err(BackendError::new(format!(
+                "type `{}` is not a transferable scalar",
+                type_name(type_)
+            )));
+        }
+    })
+}
+
+/// Narrow the 64-bit carrier `bits` back to a value of scalar `type_`, the
+/// inverse of [`scalar_to_bits`].
+pub(super) fn scalar_from_bits(
+    builder: &mut FunctionBuilder<'_>,
+    type_: &mir::Type,
+    bits: Value,
+) -> Result<Value, BackendError> {
+    Ok(match type_ {
+        mir::Type::Bool | mir::Type::SByte | mir::Type::Byte => {
+            builder.ins().ireduce(types::I8, bits)
+        }
+        mir::Type::Short | mir::Type::UShort => builder.ins().ireduce(types::I16, bits),
+        mir::Type::Int | mir::Type::UInt | mir::Type::Char => {
+            builder.ins().ireduce(types::I32, bits)
+        }
+        mir::Type::Long | mir::Type::ULong => bits,
+        mir::Type::Float => {
+            let narrow = builder.ins().ireduce(types::I32, bits);
+            builder.ins().bitcast(types::F32, MemFlags::new(), narrow)
+        }
+        mir::Type::Double => builder.ins().bitcast(types::F64, MemFlags::new(), bits),
+        _ => {
+            return Err(BackendError::new(format!(
+                "type `{}` is not a transferable scalar",
+                type_name(type_)
+            )));
+        }
+    })
+}
+
 pub(super) fn type_name(type_: &mir::Type) -> &'static str {
     primitive(type_).map_or_else(
         || match type_ {

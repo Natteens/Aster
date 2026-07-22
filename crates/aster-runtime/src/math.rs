@@ -15,7 +15,6 @@ pub extern "C" fn aster_rt_math_domain_error(context: *mut ExecutionContext, cod
         0 => "Math.Abs cannot represent the magnitude of the minimum int value",
         1 => "Math.Abs cannot represent the magnitude of the minimum long value",
         2 => "Math.Clamp requires min to be less than or equal to max",
-        3 => "the async runtime is not implemented yet",
         _ => "unknown runtime error",
     };
     context.fail(message);

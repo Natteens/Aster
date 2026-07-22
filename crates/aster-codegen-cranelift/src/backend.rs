@@ -46,6 +46,7 @@ impl Codegen {
             layouts: Layouts::new(module, pointer_bytes)?,
         };
         codegen.declare_task_functions()?;
+        codegen.declare_async_functions()?;
         Ok(codegen)
     }
 }

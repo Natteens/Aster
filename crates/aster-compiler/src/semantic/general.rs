@@ -16,13 +16,15 @@ use aster_syntax::{
 
 use super::{
     AccessorKind, CallableKey, Dispatch, Model, ResolvedCall, ResolvedEnumCase,
-    ResolvedPropagation, ResolvedPropertyAssignment, ResolvedTaskRun, callable_key,
+    ResolvedParallelFor, ResolvedParallelForEach, ResolvedPropagation, ResolvedPropertyAssignment,
+    ResolvedTaskRun, callable_key,
 };
 use crate::type_names::TypeName;
 
 mod calls;
 mod declarations;
 mod expressions;
+mod nested_concurrency;
 mod statements;
 mod types;
 
@@ -44,6 +46,9 @@ pub(super) fn validate(module: &Module, diagnostics: &mut Vec<Diagnostic>, model
     declarations::validate_struct_cycles(module, &context, diagnostics);
     declarations::validate_module_variables(module, &mut context, diagnostics, model);
     declarations::validate_bodies(module, &context, diagnostics, model);
+    // Runs after every call/Task.Run/Parallel resolution has been recorded in
+    // `model`, so the call graph it walks is complete.
+    nested_concurrency::validate(module, model, diagnostics);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

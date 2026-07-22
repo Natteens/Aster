@@ -4,8 +4,10 @@
 //! on `aster-runtime` for the execution ABI. It does not inspect syntax, AST,
 //! or HIR, and it exposes no Cranelift types to other crates.
 
+mod async_abi;
 mod backend;
 mod calls;
+mod completion_queue;
 mod control_flow;
 mod declarations;
 mod execution;
@@ -13,6 +15,7 @@ mod functions;
 mod interfaces;
 mod layouts;
 mod places;
+mod scalar;
 mod task_abi;
 mod task_runtime;
 mod validation;
@@ -45,7 +48,10 @@ use declarations::runtime_type;
 use execution::execute_resolved;
 use layouts::Layouts;
 use validation::{select_entry, validate_invocable_entry, validate_module};
-use values::{cast_value, integer_constant_bits, is_aggregate, primitive, type_name};
+use values::{
+    cast_value, integer_constant_bits, is_aggregate, primitive, scalar_from_bits, scalar_kind,
+    scalar_to_bits, type_name,
+};
 
 struct Codegen {
     jit: JITModule,

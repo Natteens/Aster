@@ -1035,6 +1035,192 @@ fn validate_async_body(body: &aster_syntax::Block, diagnostics: &mut Vec<Diagnos
     // The conservative "no reference local before the await" rule needs the
     // concrete (possibly inferred) type of each local, so it runs inside the
     // analyzer (see `Analyzer::statement`), not this pre-analysis AST pass.
+
+    // `Wait()`/`Parallel` anywhere in an async body (not only around the
+    // await) would let the host pump reenter itself or block on a worker
+    // from the host thread; reject both structurally here, independent of
+    // the transitive nested-concurrency pass in `nested_concurrency`, which
+    // only catches concurrency reached through an ordinary function call.
+    let mut calls = Vec::new();
+    for statement in &body.statements {
+        collect_statement_calls(statement, &mut calls);
+    }
+    for call in calls {
+        let ExpressionKind::Call { callee, .. } = &call.kind else {
+            continue;
+        };
+        if matches!(&callee.kind, ExpressionKind::Member { name, .. } if name == "Wait") {
+            diagnostics.push(
+                Diagnostic::error(
+                    "`Wait()` is not supported inside an `async` function in this version",
+                    call.span,
+                )
+                .with_help("only the function's own single `await` may suspend"),
+            );
+        } else if super::calls::is_parallel_for_callee(callee)
+            || super::calls::is_parallel_for_each_callee(callee)
+        {
+            diagnostics.push(
+                Diagnostic::error(
+                    "`Parallel` is not supported inside an `async` function in this version",
+                    call.span,
+                )
+                .with_help("call `Parallel.For`/`Parallel.ForEach` outside async functions"),
+            );
+        }
+    }
+}
+
+/// Every `Call` expression node reachable from `statement`, for the
+/// structural `Wait`/`Parallel` rejection above. Mirrors
+/// `collect_statement_awaits`/`collect_expression_awaits` but collects every
+/// call instead of only `await` operands, and also descends into
+/// non-linear control flow (already flagged separately) so a `Wait`/`Parallel`
+/// hidden inside one is still reported.
+pub(super) fn collect_statement_calls<'a>(statement: &'a Statement, out: &mut Vec<&'a Expression>) {
+    match statement {
+        Statement::Variable(variable) => {
+            if let Some(initializer) = &variable.initializer {
+                collect_expression_calls(initializer, out);
+            }
+        }
+        Statement::Return { value, .. } => {
+            if let Some(value) = value {
+                collect_expression_calls(value, out);
+            }
+        }
+        Statement::Expression(expression) => collect_expression_calls(expression, out),
+        Statement::If {
+            condition,
+            then_block,
+            else_block,
+            ..
+        } => {
+            collect_expression_calls(condition, out);
+            for statement in &then_block.statements {
+                collect_statement_calls(statement, out);
+            }
+            if let Some(else_block) = else_block {
+                for statement in &else_block.statements {
+                    collect_statement_calls(statement, out);
+                }
+            }
+        }
+        Statement::While {
+            condition, body, ..
+        } => {
+            collect_expression_calls(condition, out);
+            for statement in &body.statements {
+                collect_statement_calls(statement, out);
+            }
+        }
+        Statement::For {
+            initializer,
+            condition,
+            update,
+            body,
+            ..
+        } => {
+            if let Some(initializer) = initializer {
+                collect_statement_calls(initializer, out);
+            }
+            if let Some(condition) = condition {
+                collect_expression_calls(condition, out);
+            }
+            if let Some(update) = update {
+                collect_expression_calls(update, out);
+            }
+            for statement in &body.statements {
+                collect_statement_calls(statement, out);
+            }
+        }
+        Statement::Switch {
+            value,
+            cases,
+            default,
+            ..
+        } => {
+            collect_expression_calls(value, out);
+            for case in cases {
+                for statement in &case.body.statements {
+                    collect_statement_calls(statement, out);
+                }
+            }
+            if let Some(default) = default {
+                for statement in &default.statements {
+                    collect_statement_calls(statement, out);
+                }
+            }
+        }
+        Statement::Break(_) | Statement::Continue(_) => {}
+    }
+}
+
+fn collect_expression_calls<'a>(expression: &'a Expression, out: &mut Vec<&'a Expression>) {
+    if matches!(expression.kind, ExpressionKind::Call { .. }) {
+        out.push(expression);
+    }
+    match &expression.kind {
+        ExpressionKind::Literal(_) | ExpressionKind::Name(_) | ExpressionKind::This => {}
+        ExpressionKind::StructLiteral { fields, .. } => {
+            for field in fields {
+                collect_expression_calls(&field.value, out);
+            }
+        }
+        ExpressionKind::ArrayLiteral(elements) => {
+            for element in elements {
+                collect_expression_calls(element, out);
+            }
+        }
+        ExpressionKind::NewArray { length, .. } => collect_expression_calls(length, out),
+        ExpressionKind::NewObject { arguments, .. } => {
+            for argument in arguments {
+                collect_expression_calls(argument, out);
+            }
+        }
+        ExpressionKind::Index { array, index } => {
+            collect_expression_calls(array, out);
+            collect_expression_calls(index, out);
+        }
+        ExpressionKind::Member { object, .. } => collect_expression_calls(object, out),
+        ExpressionKind::Call {
+            callee, arguments, ..
+        } => {
+            collect_expression_calls(callee, out);
+            for argument in arguments {
+                collect_expression_calls(argument, out);
+            }
+        }
+        ExpressionKind::Unary { operand, .. }
+        | ExpressionKind::IncrementDecrement { operand, .. }
+        | ExpressionKind::Try { operand }
+        | ExpressionKind::Await { operand }
+        | ExpressionKind::Cast { operand, .. } => collect_expression_calls(operand, out),
+        ExpressionKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            collect_expression_calls(condition, out);
+            collect_expression_calls(when_true, out);
+            collect_expression_calls(when_false, out);
+        }
+        ExpressionKind::Binary { left, right, .. } => {
+            collect_expression_calls(left, out);
+            collect_expression_calls(right, out);
+        }
+        ExpressionKind::Assignment { target, value, .. } => {
+            collect_expression_calls(target, out);
+            collect_expression_calls(value, out);
+        }
+        ExpressionKind::InterpolatedString { parts } => {
+            for part in parts {
+                if let InterpolatedPart::Expression(expression) = part {
+                    collect_expression_calls(expression, out);
+                }
+            }
+        }
+    }
 }
 
 pub(super) fn is_reference_type(type_: &Type) -> bool {

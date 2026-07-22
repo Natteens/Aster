@@ -200,6 +200,40 @@ pub enum Intrinsic {
     TaskRun,
     /// `task.Wait()`. The sole argument is the `Task<T>` operand to join.
     TaskWait,
+    /// Register one async state machine and return its `Task<T>` handle
+    /// (a plain `i64`) without running its body. Arguments:
+    /// `[Function(move_next_symbol), Constant(frame_slot_count)]`. Emitted
+    /// only inside a generated async wrapper.
+    AsyncSpawn,
+    /// Read the current state (`0` or `1`) of the async task named by the
+    /// hidden handle argument. Argument: `[handle]`; result `int`.
+    AsyncState,
+    /// Set the state of the async task named by the handle. Arguments:
+    /// `[handle, Constant(state)]`.
+    AsyncSetState,
+    /// Store a scalar into a frame slot of the async task. Arguments:
+    /// `[handle, Constant(slot_index), value]`; the ABI symbol is chosen by
+    /// the value's concrete scalar type.
+    AsyncStoreSlot,
+    /// Load a scalar from a frame slot. Arguments: `[handle,
+    /// Constant(slot_index)]`; the ABI symbol is chosen by `return_type`.
+    AsyncLoadSlot,
+    /// Submit the awaited `Task.Run` target to the pool with a completion
+    /// token bound to this async task. Arguments:
+    /// `[handle, Function(inner_symbol)]`.
+    AsyncSpawnInner,
+    /// Materialize the completed inner task's scalar result. Argument:
+    /// `[handle]`; the ABI symbol is chosen by `return_type`.
+    AsyncAwaitResult,
+    /// Store the async task's candidate scalar result. Arguments:
+    /// `[handle, value]`; the ABI symbol is chosen by the value's type.
+    AsyncSetResult,
+    /// `Parallel.For(startInclusive, endExclusive, Body)`. Arguments:
+    /// `[start, end, Function(body_symbol)]`; synchronous, returns void.
+    ParallelFor,
+    /// `Parallel.ForEach(values, Body)`. Arguments:
+    /// `[array, Function(body_symbol)]`; synchronous, returns void.
+    ParallelForEach,
 }
 
 impl Intrinsic {
@@ -228,7 +262,17 @@ impl Intrinsic {
             | Self::StringLength
             | Self::ReportRuntimeError(_)
             | Self::TaskRun
-            | Self::TaskWait => None,
+            | Self::TaskWait
+            | Self::AsyncSpawn
+            | Self::AsyncState
+            | Self::AsyncSetState
+            | Self::AsyncStoreSlot
+            | Self::AsyncLoadSlot
+            | Self::AsyncSpawnInner
+            | Self::AsyncAwaitResult
+            | Self::AsyncSetResult
+            | Self::ParallelFor
+            | Self::ParallelForEach => None,
         }
     }
 
@@ -295,8 +339,6 @@ pub enum RuntimeErrorKind {
     MathAbsIntOverflow,
     MathAbsLongOverflow,
     MathClampInvalidRange,
-    /// An `async` function was executed before the async runtime exists.
-    AsyncRuntimeUnavailable,
 }
 
 #[derive(Clone, Debug, PartialEq)]

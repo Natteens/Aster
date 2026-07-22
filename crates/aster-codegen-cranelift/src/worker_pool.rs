@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
+use super::completion_queue::{CompletionQueue, CompletionToken};
 use super::execution::PreparedProgram;
 use super::{BackendError, ExecutionValue, mir, select_entry, validate_module};
 
@@ -20,17 +21,56 @@ use super::{BackendError, ExecutionValue, mir, select_entry, validate_module};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct TaskId(u64);
 
-/// The owned result of one task, delivered over that task's own channel.
+/// The owned result of one plain or awaited task, delivered over its own channel.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum TaskOutcome {
     Completed(ExecutionValue, super::MemoryStats),
     Failed(BackendError),
 }
 
+/// The result of one `Parallel` chunk: either it ran every index cleanly, or
+/// it stopped at the first failing one, reporting that iteration's logical
+/// index (the actual `int` for `For`, the array position for `ForEach`).
+#[derive(Debug)]
+pub(super) struct ChunkOutcome {
+    pub(super) first_error: Option<(i64, BackendError)>,
+}
+
+/// What one job asks a worker to do. Every variant resolves a MIR function by
+/// its concrete symbol; no textual lookup and no per-iteration JIT happen.
+pub(super) enum JobKind {
+    /// One zero-parameter `Task.Run` target.
+    Task {
+        symbol: mir::SymbolId,
+        collect_stats: bool,
+    },
+    /// `Body(int)` over a contiguous half-open range `[start, end)`.
+    ForChunk {
+        symbol: mir::SymbolId,
+        start: i32,
+        end: i32,
+    },
+    /// `Body(T)` over host-owned scalar copies, whose first element is the
+    /// original array position `base`.
+    ForEachChunk {
+        symbol: mir::SymbolId,
+        base: usize,
+        values: Vec<ExecutionValue>,
+    },
+}
+
+/// The kind-matched reply channel for one job.
+enum Respond {
+    Task(mpsc::Sender<TaskOutcome>),
+    Chunk(mpsc::Sender<ChunkOutcome>),
+}
+
 struct Job {
-    symbol: mir::SymbolId,
-    collect_stats: bool,
-    respond_to: mpsc::Sender<TaskOutcome>,
+    kind: JobKind,
+    respond: Respond,
+    /// Present only for an awaited async inner task; signalled after the reply
+    /// is sent so the host pump wakes even if the reply channel was dropped.
+    completion: Option<(Arc<CompletionQueue>, CompletionToken)>,
 }
 
 struct QueueState {
@@ -119,18 +159,53 @@ fn worker_loop(
         return;
     }
     while let Some(job) = queue.pop() {
-        // Nested `Task.Run` from within a task run by this worker is not
-        // supported in this version: the worker's own `PreparedProgram`
-        // never registers a task runtime, so `Task.Run` inside a task
+        // Nested concurrency from within a job run by this worker is not
+        // supported in this version: the worker's own `PreparedProgram` never
+        // registers a task runtime, so `Task.Run`/`Parallel` inside a job
         // fails with a controlled error instead of deadlocking or reaching
-        // this same pool recursively.
-        let outcome = match program.invoke(job.symbol, job.collect_stats, None) {
-            Ok((value, stats)) => TaskOutcome::Completed(value, stats),
-            Err(error) => TaskOutcome::Failed(error),
-        };
-        // The receiving `TaskHandle` may already have been dropped; that is
-        // not this worker's concern, so a failed send is ignored.
-        let _ = job.respond_to.send(outcome);
+        // this same pool recursively. The frontend also rejects it statically.
+        let Job {
+            kind,
+            respond,
+            completion,
+        } = job;
+        match (kind, respond) {
+            (
+                JobKind::Task {
+                    symbol,
+                    collect_stats,
+                },
+                Respond::Task(reply),
+            ) => {
+                let outcome = match program.invoke(symbol, collect_stats, None) {
+                    Ok((value, stats)) => TaskOutcome::Completed(value, stats),
+                    Err(error) => TaskOutcome::Failed(error),
+                };
+                // The receiver may already have been dropped; ignore that.
+                let _ = reply.send(outcome);
+            }
+            (JobKind::ForChunk { symbol, start, end }, Respond::Chunk(reply)) => {
+                let _ = reply.send(program.run_for_chunk(symbol, start, end));
+            }
+            (
+                JobKind::ForEachChunk {
+                    symbol,
+                    base,
+                    values,
+                },
+                Respond::Chunk(reply),
+            ) => {
+                let _ = reply.send(program.run_for_each_chunk(symbol, base, &values));
+            }
+            // A kind/reply mismatch is impossible: both are built together in
+            // `submit`/`submit_parallel`. Nothing to report if it ever occurs.
+            _ => {}
+        }
+        // Signal the awaited async task's completion token last, so the host
+        // pump wakes even if the reply above could not be delivered.
+        if let Some((queue, token)) = completion {
+            queue.push(token);
+        }
     }
 }
 
@@ -281,22 +356,42 @@ impl ExecutionPool {
         select_entry(&self.module, function_name).map(|function| function.symbol)
     }
 
-    /// Queue one task that invokes `symbol` on whichever worker picks it up
-    /// next, with its own fresh `ExecutionContext`. Fails if the pool has
-    /// been shut down.
+    /// Queue one plain or awaited `Task.Run` job that invokes `symbol` on the
+    /// next free worker with its own fresh `ExecutionContext`. `completion`,
+    /// present only for an awaited async inner, is signalled after the reply.
+    /// Fails if the pool has been shut down.
     pub(super) fn submit(
         &self,
         symbol: mir::SymbolId,
         collect_stats: bool,
+        completion: Option<(Arc<CompletionQueue>, CompletionToken)>,
     ) -> Result<TaskHandle, BackendError> {
         let id = TaskId(self.next_task_id.fetch_add(1, Ordering::Relaxed));
-        let (respond_to, receiver) = mpsc::channel();
+        let (reply, receiver) = mpsc::channel();
         self.queue.push(Job {
-            symbol,
-            collect_stats,
-            respond_to,
+            kind: JobKind::Task {
+                symbol,
+                collect_stats,
+            },
+            respond: Respond::Task(reply),
+            completion,
         })?;
         Ok(TaskHandle { id, receiver })
+    }
+
+    /// Queue one `Parallel` chunk and return the channel its [`ChunkOutcome`]
+    /// arrives on. Parallel chunks never carry a completion token.
+    pub(super) fn submit_parallel(
+        &self,
+        kind: JobKind,
+    ) -> Result<mpsc::Receiver<ChunkOutcome>, BackendError> {
+        let (reply, receiver) = mpsc::channel();
+        self.queue.push(Job {
+            kind,
+            respond: Respond::Chunk(reply),
+            completion: None,
+        })?;
+        Ok(receiver)
     }
 
     /// Stop accepting new tasks, let every already-accepted task finish, and
@@ -354,7 +449,7 @@ mod tests {
         let pool = ExecutionPool::new(module, 1).expect("pool starts");
         let run = pool.resolve("Run").expect("Run resolves");
 
-        let handle = pool.submit(run, false).expect("task is accepted");
+        let handle = pool.submit(run, false, None).expect("task is accepted");
         match join_with_timeout(handle) {
             TaskOutcome::Completed(value, _) => assert_eq!(value, ExecutionValue::Int(42)),
             TaskOutcome::Failed(error) => panic!("unexpected failure: {error}"),
@@ -370,7 +465,7 @@ mod tests {
         let run = pool.resolve("Run").expect("Run resolves");
 
         let handles: Vec<_> = (0..20)
-            .map(|_| pool.submit(run, false).expect("task is accepted"))
+            .map(|_| pool.submit(run, false, None).expect("task is accepted"))
             .collect();
 
         for handle in handles {
@@ -394,8 +489,8 @@ mod tests {
 
         // Submitted out of the order results are asserted in, so a pass
         // proves results are matched to their own task, not to arrival order.
-        let run_handle = pool.submit(run, false).expect("task is accepted");
-        let answer_handle = pool.submit(answer, false).expect("task is accepted");
+        let run_handle = pool.submit(run, false, None).expect("task is accepted");
+        let answer_handle = pool.submit(answer, false, None).expect("task is accepted");
 
         match join_with_timeout(answer_handle) {
             TaskOutcome::Completed(value, _) => assert_eq!(value, ExecutionValue::Int(42)),
@@ -418,7 +513,7 @@ mod tests {
         let run = pool.resolve("Run").expect("Run resolves");
 
         let handles: Vec<_> = (0..6)
-            .map(|_| pool.submit(run, true).expect("task is accepted"))
+            .map(|_| pool.submit(run, true, None).expect("task is accepted"))
             .collect();
 
         for handle in handles {
@@ -447,8 +542,8 @@ mod tests {
         let failing = pool.resolve("Failing").expect("Failing resolves");
         let ok = pool.resolve("Ok").expect("Ok resolves");
 
-        let failing_handle = pool.submit(failing, false).expect("task is accepted");
-        let ok_handle = pool.submit(ok, false).expect("task is accepted");
+        let failing_handle = pool.submit(failing, false, None).expect("task is accepted");
+        let ok_handle = pool.submit(ok, false, None).expect("task is accepted");
 
         match join_with_timeout(failing_handle) {
             TaskOutcome::Failed(error) => assert!(error.message().contains("array index 5")),
@@ -469,7 +564,7 @@ mod tests {
         let run = pool.resolve("Run").expect("Run resolves");
 
         let handles: Vec<_> = (0..10)
-            .map(|_| pool.submit(run, false).expect("task is accepted"))
+            .map(|_| pool.submit(run, false, None).expect("task is accepted"))
             .collect();
 
         // Nothing has been joined yet: every job is still only queued or
@@ -492,7 +587,7 @@ mod tests {
 
         pool.shutdown();
 
-        let result = pool.submit(run, false);
+        let result = pool.submit(run, false, None);
         assert!(result.is_err());
     }
 
@@ -505,7 +600,7 @@ mod tests {
         let run = pool.resolve("Run").expect("Run resolves");
 
         let handles: Vec<_> = (0..24)
-            .map(|_| pool.submit(run, true).expect("task is accepted"))
+            .map(|_| pool.submit(run, true, None).expect("task is accepted"))
             .collect();
 
         for handle in handles {
@@ -534,7 +629,7 @@ mod tests {
 
         let mut expected_used_bytes = None;
         for _ in 0..15 {
-            let handle = pool.submit(run, true).expect("task is accepted");
+            let handle = pool.submit(run, true, None).expect("task is accepted");
             match join_with_timeout(handle) {
                 TaskOutcome::Completed(value, stats) => {
                     assert_eq!(value, ExecutionValue::Int(1));
@@ -564,7 +659,7 @@ mod tests {
             } else {
                 temporary
             };
-            let handle = pool.submit(symbol, true).expect("task is accepted");
+            let handle = pool.submit(symbol, true, None).expect("task is accepted");
             match join_with_timeout(handle) {
                 TaskOutcome::Completed(value, stats) => {
                     if round % 2 == 0 {
@@ -591,9 +686,9 @@ mod tests {
         let ok = pool.resolve("Ok").expect("Ok resolves");
         let failing = pool.resolve("Failing").expect("Failing resolves");
 
-        let first = pool.submit(ok, false).expect("task is accepted");
-        let middle = pool.submit(failing, false).expect("task is accepted");
-        let last = pool.submit(ok, false).expect("task is accepted");
+        let first = pool.submit(ok, false, None).expect("task is accepted");
+        let middle = pool.submit(failing, false, None).expect("task is accepted");
+        let last = pool.submit(ok, false, None).expect("task is accepted");
 
         match join_with_timeout(first) {
             TaskOutcome::Completed(value, _) => assert_eq!(value, ExecutionValue::Int(7)),
@@ -620,8 +715,12 @@ mod tests {
         let first_symbol = pool.resolve("First").expect("First resolves");
         let second_symbol = pool.resolve("Second").expect("Second resolves");
 
-        let first_handle = pool.submit(first_symbol, false).expect("task is accepted");
-        let second_handle = pool.submit(second_symbol, false).expect("task is accepted");
+        let first_handle = pool
+            .submit(first_symbol, false, None)
+            .expect("task is accepted");
+        let second_handle = pool
+            .submit(second_symbol, false, None)
+            .expect("task is accepted");
 
         let first_outcome = join_with_timeout(first_handle);
         drop(first_outcome);
@@ -644,8 +743,8 @@ mod tests {
         let run_a = pool_a.resolve("Run").expect("Run resolves in a");
         let run_b = pool_b.resolve("Run").expect("Run resolves in b");
 
-        let handle_a = pool_a.submit(run_a, false).expect("task is accepted");
-        let handle_b = pool_b.submit(run_b, false).expect("task is accepted");
+        let handle_a = pool_a.submit(run_a, false, None).expect("task is accepted");
+        let handle_b = pool_b.submit(run_b, false, None).expect("task is accepted");
 
         match join_with_timeout(handle_a) {
             TaskOutcome::Completed(value, _) => assert_eq!(value, ExecutionValue::Int(1)),
@@ -671,7 +770,7 @@ mod tests {
         pool.shutdown();
 
         assert!(
-            pool.submit(pool.resolve("Run").expect("Run resolves"), false)
+            pool.submit(pool.resolve("Run").expect("Run resolves"), false, None)
                 .is_err()
         );
     }
@@ -687,7 +786,7 @@ mod tests {
         pool.shutdown();
 
         let run = pool.resolve("Run").expect("Run resolves");
-        assert!(pool.submit(run, false).is_err());
+        assert!(pool.submit(run, false, None).is_err());
     }
 
     #[test]
@@ -725,5 +824,31 @@ mod tests {
         assert_send::<BackendError>();
         assert_send::<crate::MemoryStats>();
         assert_send::<Result<TaskOutcome, BackendError>>();
+        // `JobKind::ForEachChunk` carries only owned `ExecutionValue` scalars,
+        // never a pointer into any host arena or `ExecutionContext`: this is
+        // the structural guarantee behind "no array pointer ever reaches a
+        // worker" (see `async_abi::copy_scalar_array`), checked at the type
+        // level rather than by inspecting job contents at runtime.
+        assert_send::<JobKind>();
+        assert_send::<ChunkOutcome>();
+    }
+
+    #[test]
+    fn for_each_chunk_owns_its_scalar_values_not_a_pointer() {
+        let chunk = JobKind::ForEachChunk {
+            symbol: mir::SymbolId(0),
+            base: 0,
+            values: vec![crate::ExecutionValue::Int(1), crate::ExecutionValue::Int(2)],
+        };
+        let JobKind::ForEachChunk { values, .. } = chunk else {
+            unreachable!()
+        };
+        // `values` is a plain, independently owned `Vec`: moving the whole
+        // `JobKind` (as every job is, into the worker's queue) moves this
+        // storage with it, never a reference into the submitting thread's data.
+        assert_eq!(
+            values,
+            vec![crate::ExecutionValue::Int(1), crate::ExecutionValue::Int(2)]
+        );
     }
 }

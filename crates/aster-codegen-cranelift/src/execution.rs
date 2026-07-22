@@ -34,6 +34,7 @@ impl PreparedProgram {
             builder.symbol(function.name, function.address);
         }
         super::task_abi::bind_task_functions(&mut builder);
+        super::async_abi::bind_async_functions(&mut builder);
         let jit = JITModule::new(builder);
         let mut codegen = Codegen::new(jit, module)?;
         let function_ids = codegen.declare_functions(module)?;
@@ -94,6 +95,169 @@ impl PreparedProgram {
             value.map(|v| (v, stats))
         }
     }
+
+    /// Run one async `MoveNext` step on the host, passing the outer task's
+    /// handle as its hidden scalar parameter and registering `task_runtime` on
+    /// the fresh `ExecutionContext` so the step's async intrinsics reach the
+    /// runtime. Returns the machine status as an `ExecutionValue::Int`, or the
+    /// controlled error the step raised (`context.fail` wins over any status).
+    pub(super) fn invoke_move_next(
+        &self,
+        symbol: mir::SymbolId,
+        handle: i64,
+        task_runtime: *mut (),
+    ) -> Result<(ExecutionValue, super::MemoryStats), BackendError> {
+        let (pointer, _return_type) = self.entries.get(&symbol).ok_or_else(|| {
+            BackendError::new(format!("MoveNext symbol {symbol:?} was not prepared"))
+        })?;
+        let mut context = aster_runtime::ExecutionContext::new();
+        context.set_task_runtime(task_runtime);
+        // SAFETY: this symbol was declared and finalized as
+        // `(ExecutionContext*, i64) -> i32` (see `mir_lowering::async_machine`
+        // and `declarations::signature`); the module stays alive for the call.
+        #[allow(unsafe_code)]
+        let function: extern "C" fn(*mut aster_runtime::ExecutionContext, i64) -> i32 =
+            unsafe { std::mem::transmute(*pointer) };
+        let move_next_status = function(&raw mut context, handle);
+        let stats = context.memory_stats().clone();
+        match context.take_error() {
+            Some(error) => Err(BackendError::new(format!("Aster runtime error: {error}"))),
+            None => Ok((ExecutionValue::Int(move_next_status), stats)),
+        }
+    }
+
+    /// Run `Parallel.For`'s `Body(int)` over `[start, end)` on this worker with
+    /// one `ExecutionContext` for the whole chunk, resolving the body pointer
+    /// once and stopping at the first controlled error (reporting that index).
+    pub(super) fn run_for_chunk(
+        &self,
+        symbol: mir::SymbolId,
+        start: i32,
+        end: i32,
+    ) -> super::worker_pool::ChunkOutcome {
+        let Some((pointer, _)) = self.entries.get(&symbol) else {
+            return chunk_error(i64::from(start), "Parallel body was not prepared");
+        };
+        // SAFETY: a `Parallel.For` body is finalized as
+        // `(ExecutionContext*, i32) -> ()` (validated shape).
+        #[allow(unsafe_code)]
+        let body: extern "C" fn(*mut aster_runtime::ExecutionContext, i32) =
+            unsafe { std::mem::transmute(*pointer) };
+        let mut context = aster_runtime::ExecutionContext::new();
+        for index in start..end {
+            body(&raw mut context, index);
+            if let Some(error) = context.take_error() {
+                return chunk_error(i64::from(index), format!("Aster runtime error: {error}"));
+            }
+        }
+        super::worker_pool::ChunkOutcome { first_error: None }
+    }
+
+    /// Run `Parallel.ForEach`'s `Body(T)` over the host-owned scalar copies of
+    /// this chunk, whose first element is original array position `base`.
+    pub(super) fn run_for_each_chunk(
+        &self,
+        symbol: mir::SymbolId,
+        base: usize,
+        values: &[ExecutionValue],
+    ) -> super::worker_pool::ChunkOutcome {
+        let logical = |offset: usize| i64::try_from(base + offset).unwrap_or(i64::MAX);
+        let Some((pointer, _)) = self.entries.get(&symbol) else {
+            return chunk_error(logical(0), "Parallel body was not prepared");
+        };
+        let mut context = aster_runtime::ExecutionContext::new();
+        for (offset, value) in values.iter().enumerate() {
+            invoke_body_scalar(*pointer, &mut context, value);
+            if let Some(error) = context.take_error() {
+                return chunk_error(logical(offset), format!("Aster runtime error: {error}"));
+            }
+        }
+        super::worker_pool::ChunkOutcome { first_error: None }
+    }
+}
+
+fn chunk_error(index: i64, message: impl Into<String>) -> super::worker_pool::ChunkOutcome {
+    super::worker_pool::ChunkOutcome {
+        first_error: Some((index, BackendError::new(message))),
+    }
+}
+
+/// Invoke a `Parallel.ForEach` body with one scalar argument, dispatching to
+/// the concrete ABI shape by the value's variant so width, signedness, and
+/// float bit patterns are all preserved across the call.
+#[allow(unsafe_code)]
+fn invoke_body_scalar(
+    pointer: *const u8,
+    context: &mut aster_runtime::ExecutionContext,
+    value: &ExecutionValue,
+) {
+    // SAFETY: the body is finalized as `(ExecutionContext*, T) -> ()` where the
+    // Cranelift type of `T` matches the width dispatched on here.
+    unsafe {
+        match value {
+            ExecutionValue::Bool(value) => {
+                let body: extern "C" fn(*mut aster_runtime::ExecutionContext, i8) =
+                    std::mem::transmute(pointer);
+                body(context, i8::from(*value));
+            }
+            ExecutionValue::SByte(value) => {
+                let body: extern "C" fn(*mut aster_runtime::ExecutionContext, i8) =
+                    std::mem::transmute(pointer);
+                body(context, *value);
+            }
+            ExecutionValue::Byte(value) => {
+                let body: extern "C" fn(*mut aster_runtime::ExecutionContext, u8) =
+                    std::mem::transmute(pointer);
+                body(context, *value);
+            }
+            ExecutionValue::Short(value) => {
+                let body: extern "C" fn(*mut aster_runtime::ExecutionContext, i16) =
+                    std::mem::transmute(pointer);
+                body(context, *value);
+            }
+            ExecutionValue::UShort(value) => {
+                let body: extern "C" fn(*mut aster_runtime::ExecutionContext, u16) =
+                    std::mem::transmute(pointer);
+                body(context, *value);
+            }
+            ExecutionValue::Int(value) => {
+                let body: extern "C" fn(*mut aster_runtime::ExecutionContext, i32) =
+                    std::mem::transmute(pointer);
+                body(context, *value);
+            }
+            ExecutionValue::UInt(value) => {
+                let body: extern "C" fn(*mut aster_runtime::ExecutionContext, u32) =
+                    std::mem::transmute(pointer);
+                body(context, *value);
+            }
+            ExecutionValue::Long(value) => {
+                let body: extern "C" fn(*mut aster_runtime::ExecutionContext, i64) =
+                    std::mem::transmute(pointer);
+                body(context, *value);
+            }
+            ExecutionValue::ULong(value) => {
+                let body: extern "C" fn(*mut aster_runtime::ExecutionContext, u64) =
+                    std::mem::transmute(pointer);
+                body(context, *value);
+            }
+            ExecutionValue::Float(value) => {
+                let body: extern "C" fn(*mut aster_runtime::ExecutionContext, f32) =
+                    std::mem::transmute(pointer);
+                body(context, *value);
+            }
+            ExecutionValue::Double(value) => {
+                let body: extern "C" fn(*mut aster_runtime::ExecutionContext, f64) =
+                    std::mem::transmute(pointer);
+                body(context, *value);
+            }
+            ExecutionValue::Char(value) => {
+                let body: extern "C" fn(*mut aster_runtime::ExecutionContext, u32) =
+                    std::mem::transmute(pointer);
+                body(context, *value as u32);
+            }
+            ExecutionValue::String(_) | ExecutionValue::Void => {}
+        }
+    }
 }
 
 impl Drop for PreparedProgram {
@@ -128,7 +292,7 @@ pub(super) fn execute_resolved(
         return prepared.invoke(entry.symbol, collect_stats, None);
     }
     let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let mut runtime = TaskRuntime::new(Arc::new(module.clone()), worker_count)?;
+    let mut runtime = TaskRuntime::new(&Arc::new(module.clone()), worker_count)?;
     // SAFETY-relevant only in spirit: this is a plain pointer value, not a
     // live borrow held across the call. `runtime` is not read or written by
     // name again until after `invoke` returns, so nothing aliases it while
@@ -255,6 +419,18 @@ fn invoke_finalized(
                 unsafe { std::mem::transmute(pointer) };
             function(context);
             ExecutionValue::Void
+        }
+        mir::Type::Task(_) => {
+            // SAFETY: The function was declared and finalized as `() -> i64`
+            // above (`Task<T>` is always a plain handle, never a pointer).
+            // `execute`/`execute_symbol` themselves never reach this arm
+            // (`validate_invocable_entry` rejects a `Task<T>` entry with a
+            // controlled error first); this stays defensive for any other
+            // caller of `PreparedProgram::invoke`, such as internal tests
+            // that call an async wrapper directly.
+            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> i64 =
+                unsafe { std::mem::transmute(pointer) };
+            ExecutionValue::Long(function(context))
         }
         _ => unreachable!("entry return type was validated before code generation"),
     };

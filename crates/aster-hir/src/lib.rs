@@ -55,9 +55,6 @@ pub enum RuntimeErrorKind {
     MathAbsIntOverflow,
     MathAbsLongOverflow,
     MathClampInvalidRange,
-    /// An `async` function was executed before the async runtime exists. Its
-    /// placeholder body reports this controlled error instead of trapping.
-    AsyncRuntimeUnavailable,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -318,11 +315,28 @@ pub enum ExpressionKind {
     },
     /// `await operand` inside an `async` function: `operand` is a `Task<T>`
     /// expression (only `Task.Run(...)` in this version) and this node's type
-    /// is the concrete scalar `result_type` (`T`). Carries no suspension
-    /// machinery yet; sublote 1 stops at this typed representation.
+    /// is the concrete scalar `result_type` (`T`).
     Await {
         operand: Box<Expression>,
         result_type: Box<Type>,
+    },
+    /// `Parallel.For(start, end, Body)`: run `body` over `[start, end)` on the
+    /// host worker pool and block until every chunk finishes. `body` is a
+    /// resolved, zero-capture free function or static method taking one `int`
+    /// and returning `void`. This expression's type is always `void`.
+    ParallelFor {
+        start: Box<Expression>,
+        end: Box<Expression>,
+        body: SymbolId,
+    },
+    /// `Parallel.ForEach(values, Body)`: run `body` over every element of the
+    /// scalar array `values`. `element_type` is the concrete scalar element
+    /// type; `body` takes one `element_type` and returns `void`. This
+    /// expression's type is always `void`.
+    ParallelForEach {
+        values: Box<Expression>,
+        element_type: Box<Type>,
+        body: SymbolId,
     },
 }
 

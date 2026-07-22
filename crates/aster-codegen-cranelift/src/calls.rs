@@ -1,6 +1,7 @@
 use super::{
     BackendError, Codegen, FuncId, FunctionBuilder, FunctionState, HashMap, InstBuilder, Module,
-    StackSlotData, StackSlotKind, cast_value, is_aggregate, mir, type_name, types,
+    StackSlotData, StackSlotKind, cast_value, is_aggregate, mir, scalar_from_bits, scalar_kind,
+    scalar_to_bits, type_name, types,
 };
 
 impl Codegen {
@@ -96,6 +97,25 @@ impl Codegen {
                     state,
                 );
             }
+            mir::Intrinsic::AsyncSpawn
+            | mir::Intrinsic::AsyncState
+            | mir::Intrinsic::AsyncSetState
+            | mir::Intrinsic::AsyncStoreSlot
+            | mir::Intrinsic::AsyncLoadSlot
+            | mir::Intrinsic::AsyncSpawnInner
+            | mir::Intrinsic::AsyncAwaitResult
+            | mir::Intrinsic::AsyncSetResult
+            | mir::Intrinsic::ParallelFor
+            | mir::Intrinsic::ParallelForEach => {
+                return self.translate_async_intrinsic(
+                    builder,
+                    destination,
+                    intrinsic,
+                    arguments,
+                    return_type,
+                    state,
+                );
+            }
             _ => {}
         }
         let (symbol, immediate, needs_context) = match intrinsic {
@@ -122,7 +142,6 @@ impl Codegen {
                     mir::RuntimeErrorKind::MathAbsIntOverflow => 0,
                     mir::RuntimeErrorKind::MathAbsLongOverflow => 1,
                     mir::RuntimeErrorKind::MathClampInvalidRange => 2,
-                    mir::RuntimeErrorKind::AsyncRuntimeUnavailable => 3,
                 }),
                 true,
             ),
@@ -135,7 +154,17 @@ impl Codegen {
             | mir::Intrinsic::StringJoin
             | mir::Intrinsic::StringJoinTemporary
             | mir::Intrinsic::TaskRun
-            | mir::Intrinsic::TaskWait => {
+            | mir::Intrinsic::TaskWait
+            | mir::Intrinsic::AsyncSpawn
+            | mir::Intrinsic::AsyncState
+            | mir::Intrinsic::AsyncSetState
+            | mir::Intrinsic::AsyncStoreSlot
+            | mir::Intrinsic::AsyncLoadSlot
+            | mir::Intrinsic::AsyncSpawnInner
+            | mir::Intrinsic::AsyncAwaitResult
+            | mir::Intrinsic::AsyncSetResult
+            | mir::Intrinsic::ParallelFor
+            | mir::Intrinsic::ParallelForEach => {
                 unreachable!("handled by the dedicated translators above")
             }
         };
@@ -240,6 +269,165 @@ impl Codegen {
                 BackendError::new("Task<T>.Wait did not produce its declared result")
             })?;
             self.store_scalar(builder, destination, result, state)?;
+        }
+        Ok(())
+    }
+
+    /// Translate every async state-machine and `Parallel` intrinsic. Each is a
+    /// single ABI call into `task_runtime` via `async_abi`; scalars cross as a
+    /// `(kind, i64 bits)` pair and generated `Function` operands cross as their
+    /// concrete `SymbolId`, never by name.
+    #[allow(clippy::too_many_lines)]
+    fn translate_async_intrinsic(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: Option<&mir::Place>,
+        intrinsic: mir::Intrinsic,
+        arguments: &[mir::Operand],
+        return_type: &mir::Type,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("async intrinsic requires an execution context"))?;
+        match intrinsic {
+            mir::Intrinsic::AsyncSpawn => {
+                let move_next = builder
+                    .ins()
+                    .iconst(types::I32, function_symbol(&arguments[0])?);
+                let slot_count = self.translate_operand(builder, &arguments[1], state)?;
+                let call = self.call_runtime(
+                    builder,
+                    "aster_async_spawn",
+                    &[context, move_next, slot_count],
+                );
+                self.store_intrinsic_result(builder, destination, call, state)?;
+            }
+            mir::Intrinsic::AsyncState => {
+                let handle = self.translate_operand(builder, &arguments[0], state)?;
+                let call = self.call_runtime(builder, "aster_async_state", &[context, handle]);
+                self.store_intrinsic_result(builder, destination, call, state)?;
+            }
+            mir::Intrinsic::AsyncSetState => {
+                let handle = self.translate_operand(builder, &arguments[0], state)?;
+                let new_state = self.translate_operand(builder, &arguments[1], state)?;
+                self.call_runtime(
+                    builder,
+                    "aster_async_set_state",
+                    &[context, handle, new_state],
+                );
+            }
+            mir::Intrinsic::AsyncStoreSlot => {
+                let handle = self.translate_operand(builder, &arguments[0], state)?;
+                let index = self.translate_operand(builder, &arguments[1], state)?;
+                let value_operand = &arguments[2];
+                let kind = builder
+                    .ins()
+                    .iconst(types::I32, scalar_kind(&value_operand.type_)?);
+                let value = self.translate_operand(builder, value_operand, state)?;
+                let bits = scalar_to_bits(builder, &value_operand.type_, value)?;
+                self.call_runtime(
+                    builder,
+                    "aster_async_store_slot",
+                    &[context, handle, index, kind, bits],
+                );
+            }
+            mir::Intrinsic::AsyncLoadSlot => {
+                let handle = self.translate_operand(builder, &arguments[0], state)?;
+                let index = self.translate_operand(builder, &arguments[1], state)?;
+                let call =
+                    self.call_runtime(builder, "aster_async_load_slot", &[context, handle, index]);
+                self.store_scalar_from_bits(builder, destination, call, return_type, state)?;
+            }
+            mir::Intrinsic::AsyncSpawnInner => {
+                let handle = self.translate_operand(builder, &arguments[0], state)?;
+                let inner = builder
+                    .ins()
+                    .iconst(types::I32, function_symbol(&arguments[1])?);
+                self.call_runtime(
+                    builder,
+                    "aster_async_spawn_inner",
+                    &[context, handle, inner],
+                );
+            }
+            mir::Intrinsic::AsyncAwaitResult => {
+                let handle = self.translate_operand(builder, &arguments[0], state)?;
+                let call =
+                    self.call_runtime(builder, "aster_async_await_result", &[context, handle]);
+                self.store_scalar_from_bits(builder, destination, call, return_type, state)?;
+            }
+            mir::Intrinsic::AsyncSetResult => {
+                let handle = self.translate_operand(builder, &arguments[0], state)?;
+                let value_operand = &arguments[1];
+                let kind = builder
+                    .ins()
+                    .iconst(types::I32, scalar_kind(&value_operand.type_)?);
+                let value = self.translate_operand(builder, value_operand, state)?;
+                let bits = scalar_to_bits(builder, &value_operand.type_, value)?;
+                self.call_runtime(
+                    builder,
+                    "aster_async_set_result",
+                    &[context, handle, kind, bits],
+                );
+            }
+            mir::Intrinsic::ParallelFor => {
+                let start = self.translate_operand(builder, &arguments[0], state)?;
+                let end = self.translate_operand(builder, &arguments[1], state)?;
+                let body = builder
+                    .ins()
+                    .iconst(types::I32, function_symbol(&arguments[2])?);
+                self.call_runtime(builder, "aster_parallel_for", &[context, start, end, body]);
+            }
+            mir::Intrinsic::ParallelForEach => {
+                let values = self.translate_operand(builder, &arguments[0], state)?;
+                let body_operand = &arguments[1];
+                let body = builder
+                    .ins()
+                    .iconst(types::I32, function_symbol(body_operand)?);
+                // The element scalar type rides on the resolved body operand.
+                let kind = builder
+                    .ins()
+                    .iconst(types::I32, scalar_kind(&body_operand.type_)?);
+                self.call_runtime(
+                    builder,
+                    "aster_parallel_for_each",
+                    &[context, values, body, kind],
+                );
+            }
+            _ => unreachable!("caller matched only async and Parallel intrinsics"),
+        }
+        Ok(())
+    }
+
+    /// Declare `name` in this function and emit a call to it, returning the
+    /// call instruction so the caller can read its result if any.
+    fn call_runtime(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        name: &str,
+        arguments: &[super::Value],
+    ) -> cranelift_codegen::ir::Inst {
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids[name], builder.func);
+        builder.ins().call(function_ref, arguments)
+    }
+
+    /// Narrow a runtime call's `i64` result back to `type_` and store it.
+    fn store_scalar_from_bits(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: Option<&mir::Place>,
+        call: cranelift_codegen::ir::Inst,
+        type_: &mir::Type,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        if let Some(destination) = destination {
+            let bits = builder.inst_results(call).first().copied().ok_or_else(|| {
+                BackendError::new("async intrinsic did not produce its declared result")
+            })?;
+            let value = scalar_from_bits(builder, type_, bits)?;
+            self.store_scalar(builder, destination, value, state)?;
         }
         Ok(())
     }
@@ -444,5 +632,17 @@ impl Codegen {
         let call = builder.ins().call(function_ref, &[context, size]);
         let object = builder.inst_results(call)[0];
         self.store_scalar(builder, destination, object, state)
+    }
+}
+
+/// The concrete `SymbolId` (as an `i64` immediate) carried by a resolved
+/// `OperandKind::Function` operand, so generated code references a target by
+/// identity, never by name.
+fn function_symbol(operand: &mir::Operand) -> Result<i64, BackendError> {
+    match &operand.kind {
+        mir::OperandKind::Function(symbol) => Ok(i64::from(symbol.0)),
+        _ => Err(BackendError::new(
+            "expected a resolved function operand for a concurrency intrinsic",
+        )),
     }
 }

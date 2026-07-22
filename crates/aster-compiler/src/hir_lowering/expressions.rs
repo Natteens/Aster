@@ -276,6 +276,41 @@ impl Lowerer<'_> {
                         };
                     }
                 }
+                if is_parallel_for_callee(callee) {
+                    let resolved = &self.model.parallel_for[&model_key];
+                    let body = self.callable_symbols[&resolved.body];
+                    let [start, end, _body] = arguments.as_slice() else {
+                        unreachable!("validated Parallel.For has exactly 3 arguments");
+                    };
+                    return hir::Expression {
+                        type_: hir::Type::Void,
+                        kind: hir::ExpressionKind::ParallelFor {
+                            start: Box::new(self.expression(start)),
+                            end: Box::new(self.expression(end)),
+                            body,
+                        },
+                    };
+                }
+                if is_parallel_for_each_callee(callee) {
+                    let resolved = &self.model.parallel_for_each[&model_key];
+                    let body = self.callable_symbols[&resolved.body];
+                    let [values, _body] = arguments.as_slice() else {
+                        unreachable!("validated Parallel.ForEach has exactly 2 arguments");
+                    };
+                    let values = self.expression(values);
+                    let element_type = match values.type_.clone() {
+                        hir::Type::Array(element) => element,
+                        other => Box::new(other),
+                    };
+                    return hir::Expression {
+                        type_: hir::Type::Void,
+                        kind: hir::ExpressionKind::ParallelForEach {
+                            values: Box::new(values),
+                            element_type,
+                            body,
+                        },
+                    };
+                }
                 let resolved = &self.model.calls[&model_key];
                 let symbol = self.callable_symbols[&resolved.callable];
                 let type_ = self.callable_results[&symbol].clone();
@@ -585,6 +620,26 @@ fn is_task_run_callee(callee: &ast::Expression) -> bool {
         ast::ExpressionKind::Member { object, name }
             if name == "Run"
                 && matches!(&object.kind, ast::ExpressionKind::Name(object) if object == "Task")
+    )
+}
+
+/// Mirrors `semantic::general::calls::is_parallel_for_callee`.
+fn is_parallel_for_callee(callee: &ast::Expression) -> bool {
+    matches!(
+        &callee.kind,
+        ast::ExpressionKind::Member { object, name }
+            if name == "For"
+                && matches!(&object.kind, ast::ExpressionKind::Name(object) if object == "Parallel")
+    )
+}
+
+/// Mirrors `semantic::general::calls::is_parallel_for_each_callee`.
+fn is_parallel_for_each_callee(callee: &ast::Expression) -> bool {
+    matches!(
+        &callee.kind,
+        ast::ExpressionKind::Member { object, name }
+            if name == "ForEach"
+                && matches!(&object.kind, ast::ExpressionKind::Name(object) if object == "Parallel")
     )
 }
 

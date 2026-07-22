@@ -1,6 +1,7 @@
 use super::{
     Analyzer, Callable, Diagnostic, Dispatch, Expression, ExpressionKind, ResolvedCall,
-    ResolvedEnumCase, ResolvedTaskRun, Signature, Span, Type, TypeKind, Visibility,
+    ResolvedEnumCase, ResolvedParallelFor, ResolvedParallelForEach, ResolvedTaskRun, Signature,
+    Span, Type, TypeKind, Visibility,
 };
 
 impl Analyzer<'_> {
@@ -319,6 +320,12 @@ impl Analyzer<'_> {
         // so this structural shape check alone identifies `Task.Run`.
         if is_task_run_callee(callee) {
             return self.task_run(arguments, span);
+        }
+        if is_parallel_for_callee(callee) {
+            return self.parallel_for(arguments, span);
+        }
+        if is_parallel_for_each_callee(callee) {
+            return self.parallel_for_each(arguments, span);
         }
         if let ExpressionKind::Member { object, name } = &callee.kind
             && name == "Wait"
@@ -741,6 +748,192 @@ impl Analyzer<'_> {
         }
     }
 
+    /// `Parallel.For(start, end, Body)`: `start`/`end` must be `int`,
+    /// evaluated left to right exactly once by the caller (`Analyzer::call`'s
+    /// normal argument evaluation happens inside `resolve_parallel_body_target`
+    /// and here for `start`/`end`); `Body` must directly name a resolvable
+    /// zero-capture free function or static method `void(int)`.
+    fn parallel_for(&mut self, arguments: &[Expression], span: Span) -> Type {
+        let [start, end, body] = arguments else {
+            self.diagnostics.push(Diagnostic::error(
+                format!(
+                    "`Parallel.For` expects exactly 3 arguments, found {}",
+                    arguments.len()
+                ),
+                span,
+            ));
+            for argument in arguments {
+                self.expression(argument);
+            }
+            return Type::Void;
+        };
+        let start_type = self.expression(start);
+        let end_type = self.expression(end);
+        self.require_assignable_value(&Type::Int, &start_type, start);
+        self.require_assignable_value(&Type::Int, &end_type, end);
+        let Some(candidate) = self.resolve_parallel_body_target(body, &[Type::Int]) else {
+            return Type::Void;
+        };
+        self.model.parallel_for.insert(
+            self.model_key(span),
+            ResolvedParallelFor {
+                body: candidate.key,
+            },
+        );
+        Type::Void
+    }
+
+    /// `Parallel.ForEach(values, Body)`: `values` must be an array of a
+    /// scalar transferable element type; `Body` must directly name a
+    /// resolvable zero-capture free function or static method `void(T)`.
+    fn parallel_for_each(&mut self, arguments: &[Expression], span: Span) -> Type {
+        let [values, body] = arguments else {
+            self.diagnostics.push(Diagnostic::error(
+                format!(
+                    "`Parallel.ForEach` expects exactly 2 arguments, found {}",
+                    arguments.len()
+                ),
+                span,
+            ));
+            for argument in arguments {
+                self.expression(argument);
+            }
+            return Type::Void;
+        };
+        let values_type = self.expression(values);
+        let Type::Array(element_type) = values_type else {
+            self.diagnostics.push(Diagnostic::error(
+                "`Parallel.ForEach` requires an array argument",
+                values.span,
+            ));
+            self.expression(body);
+            return Type::Void;
+        };
+        if !transferable(&element_type) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "`Parallel.ForEach` over `{}[]` requires a scalar element type in this version",
+                        element_type.display()
+                    ),
+                    values.span,
+                )
+                .with_help("Parallel.ForEach currently supports only scalar elements: bool, char, integers, floats"),
+            );
+            self.expression(body);
+            return Type::Void;
+        }
+        let Some(candidate) = self.resolve_parallel_body_target(body, &[(*element_type).clone()])
+        else {
+            return Type::Void;
+        };
+        self.model.parallel_for_each.insert(
+            self.model_key(span),
+            ResolvedParallelForEach {
+                body: candidate.key,
+            },
+        );
+        Type::Void
+    }
+
+    /// Resolve a `Parallel.For`/`Parallel.ForEach` body argument to the
+    /// concrete, zero-capture free function or static method it directly
+    /// names, with exactly `expected_parameters` and a `void` result. Mirrors
+    /// [`Self::resolve_task_run_target`]: never a variable, an instance
+    /// method, an async function, or any other expression shape.
+    fn resolve_parallel_body_target(
+        &mut self,
+        argument: &Expression,
+        expected_parameters: &[Type],
+    ) -> Option<Callable> {
+        let candidates = match &argument.kind {
+            ExpressionKind::Name(name) => {
+                let mut candidates = self
+                    .context
+                    .functions
+                    .get(name)
+                    .into_iter()
+                    .flatten()
+                    .filter(|candidate| candidate.is_static)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                candidates.extend(
+                    self.methods
+                        .get(name)
+                        .into_iter()
+                        .flatten()
+                        .filter(|candidate| candidate.is_static)
+                        .cloned(),
+                );
+                candidates
+            }
+            ExpressionKind::Member { object, name } => {
+                let ExpressionKind::Name(type_name) = &object.kind else {
+                    self.diagnostics.push(Diagnostic::error(
+                        "a `Parallel` body must directly name a static method or free function",
+                        argument.span,
+                    ));
+                    return None;
+                };
+                let Some(info) = self.context.types.get(type_name) else {
+                    self.diagnostics.push(Diagnostic::error(
+                        format!("unknown type `{type_name}`"),
+                        argument.span,
+                    ));
+                    return None;
+                };
+                info.methods
+                    .get(name)
+                    .into_iter()
+                    .flatten()
+                    .filter(|candidate| candidate.is_static)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            }
+            _ => {
+                self.diagnostics.push(Diagnostic::error(
+                    "a `Parallel` body must directly name a static method or free function",
+                    argument.span,
+                ));
+                return None;
+            }
+        };
+        let matching = candidates
+            .into_iter()
+            .filter(|candidate| {
+                candidate.signature.result == Type::Void
+                    && candidate.signature.parameters == expected_parameters
+            })
+            .collect::<Vec<_>>();
+        match matching.len() {
+            0 => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "no static method or free function with signature `void({})` is available for this `Parallel` body",
+                            expected_parameters
+                                .iter()
+                                .map(Type::display)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        argument.span,
+                    )
+                    .with_help("the body must be a static method or free function taking exactly one matching parameter and returning void"),
+                );
+                None
+            }
+            1 => matching.into_iter().next(),
+            _ => {
+                self.diagnostics.push(Diagnostic::error(
+                    "this `Parallel` body is ambiguous among multiple candidates",
+                    argument.span,
+                ));
+                None
+            }
+        }
+    }
+
     fn check_arguments(&mut self, signature: &Signature, arguments: &[Expression], span: Span) {
         if arguments.len() != signature.parameters.len() {
             self.diagnostics.push(
@@ -772,6 +965,29 @@ pub(super) fn is_task_run_callee(callee: &Expression) -> bool {
         ExpressionKind::Member { object, name }
             if name == "Run"
                 && matches!(&object.kind, ExpressionKind::Name(object) if object == "Task")
+    )
+}
+
+/// Structural check for `Parallel.For(...)`, mirroring [`is_task_run_callee`]:
+/// `Parallel` is reserved (see `semantic::validate_no_reserved_type_names`),
+/// so this shape alone identifies the intrinsic, never a user declaration or
+/// an unrelated `For`/`ForEach` function elsewhere.
+pub(super) fn is_parallel_for_callee(callee: &Expression) -> bool {
+    matches!(
+        &callee.kind,
+        ExpressionKind::Member { object, name }
+            if name == "For"
+                && matches!(&object.kind, ExpressionKind::Name(object) if object == "Parallel")
+    )
+}
+
+/// Structural check for `Parallel.ForEach(...)`, mirroring [`is_task_run_callee`].
+pub(super) fn is_parallel_for_each_callee(callee: &Expression) -> bool {
+    matches!(
+        &callee.kind,
+        ExpressionKind::Member { object, name }
+            if name == "ForEach"
+                && matches!(&object.kind, ExpressionKind::Name(object) if object == "Parallel")
     )
 }
 

@@ -271,12 +271,23 @@ impl FunctionLowerer {
             hir::ExpressionKind::TaskWait { task, result_type } => {
                 Some(self.lower_task_wait(task, result_type))
             }
-            // `await` only appears inside `async` bodies, which `lower` replaces
-            // with a non-executable placeholder and never walks (sublote 1 stops
-            // at HIR). This arm is therefore never reached for valid Aster; it
-            // returns `None` rather than panicking so no `async`/`await` input
-            // can ever cause a Rust panic in the compiler.
-            hir::ExpressionKind::Await { .. } => None,
+            // Inside a generated async `MoveNext`, the single `await` is
+            // lowered to a use of the result the state-1 prologue already
+            // materialized from the completed inner task (see `async_machine`).
+            // `await` never appears anywhere else in valid Aster.
+            hir::ExpressionKind::Await { .. } => self.async_await_result.clone(),
+            hir::ExpressionKind::ParallelFor { start, end, body } => {
+                self.lower_parallel_for(start, end, *body);
+                None
+            }
+            hir::ExpressionKind::ParallelForEach {
+                values,
+                element_type,
+                body,
+            } => {
+                self.lower_parallel_for_each(values, element_type, *body);
+                None
+            }
         }
     }
 
@@ -322,6 +333,62 @@ impl FunctionLowerer {
             type_: result_type.clone(),
             kind: mir::OperandKind::Copy(destination),
         }
+    }
+
+    /// `Parallel.For(start, end, Body)`: a single synchronous intrinsic. The
+    /// range bounds are evaluated left to right, exactly once; `body` is a
+    /// resolved symbol carried by identity, never re-resolved by name.
+    fn lower_parallel_for(
+        &mut self,
+        start: &hir::Expression,
+        end: &hir::Expression,
+        body: hir::SymbolId,
+    ) {
+        let start = self
+            .lower_expression(start)
+            .expect("validated range start produces a value");
+        let end = self
+            .lower_expression(end)
+            .expect("validated range end produces a value");
+        self.instruction(mir::Instruction::CallIntrinsic {
+            destination: None,
+            intrinsic: mir::Intrinsic::ParallelFor,
+            arguments: vec![
+                start,
+                end,
+                mir::Operand {
+                    type_: mir::Type::Int,
+                    kind: mir::OperandKind::Function(body),
+                },
+            ],
+            return_type: mir::Type::Void,
+        });
+    }
+
+    /// `Parallel.ForEach(values, Body)`: evaluate the scalar array once, then a
+    /// single synchronous intrinsic copies its elements host-side and runs
+    /// `body` over the copies. `body` is carried by identity.
+    fn lower_parallel_for_each(
+        &mut self,
+        values: &hir::Expression,
+        element_type: &hir::Type,
+        body: hir::SymbolId,
+    ) {
+        let values = self
+            .lower_expression(values)
+            .expect("validated array expression produces a value");
+        self.instruction(mir::Instruction::CallIntrinsic {
+            destination: None,
+            intrinsic: mir::Intrinsic::ParallelForEach,
+            arguments: vec![
+                values,
+                mir::Operand {
+                    type_: element_type.clone(),
+                    kind: mir::OperandKind::Function(body),
+                },
+            ],
+            return_type: mir::Type::Void,
+        });
     }
 
     /// Lowers `$"..."` to: evaluate and (when needed) stringify every
@@ -681,9 +748,6 @@ pub(super) fn lower_intrinsic(intrinsic: hir::Intrinsic) -> mir::Intrinsic {
                 }
                 hir::RuntimeErrorKind::MathClampInvalidRange => {
                     mir::RuntimeErrorKind::MathClampInvalidRange
-                }
-                hir::RuntimeErrorKind::AsyncRuntimeUnavailable => {
-                    mir::RuntimeErrorKind::AsyncRuntimeUnavailable
                 }
             })
         }
