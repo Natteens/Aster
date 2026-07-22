@@ -57,6 +57,11 @@ pub(super) fn validate_invocable_entry(
             "entry function `{function_name}` returns a Task<T>; call it from a scalar entry function and `Wait()` there instead"
         )));
     }
+    if matches!(function.return_type, mir::Type::List(_)) {
+        return Err(BackendError::new(format!(
+            "entry function `{function_name}` returns a List<T>; call it from a scalar entry function instead"
+        )));
+    }
     Ok(())
 }
 
@@ -71,6 +76,23 @@ pub(super) fn validate_module(module: &mir::Module) -> Result<(), BackendError> 
         .iter()
         .map(|class| class.symbol)
         .collect::<HashSet<_>>();
+    // `List<T>`'s element can nominally be any of these; existence is
+    // checked the same way `AllocateObject` already checks `classes`.
+    let structs = module
+        .structs
+        .iter()
+        .map(|definition| definition.symbol)
+        .collect::<HashSet<_>>();
+    let interfaces = module
+        .interfaces
+        .iter()
+        .map(|interface| interface.symbol)
+        .collect::<HashSet<_>>();
+    let enums = module
+        .enums
+        .iter()
+        .map(|definition| definition.symbol)
+        .collect::<HashSet<_>>();
     let (interface_methods, implementations) =
         validate_interface_metadata(module, &signatures, &classes)?;
     for function in &module.functions {
@@ -78,6 +100,9 @@ pub(super) fn validate_module(module: &mir::Module) -> Result<(), BackendError> 
             function,
             &signatures,
             &classes,
+            &structs,
+            &interfaces,
+            &enums,
             &interface_methods,
             &implementations,
         )?;
@@ -156,10 +181,14 @@ fn validate_interface_metadata<'a>(
     Ok((methods, implementations))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_function(
     function: &mir::Function,
     signatures: &HashMap<mir::SymbolId, &mir::Function>,
     classes: &HashSet<mir::SymbolId>,
+    structs: &HashSet<mir::SymbolId>,
+    interfaces: &HashSet<mir::SymbolId>,
+    enums: &HashSet<mir::SymbolId>,
     interface_methods: &InterfaceMethods<'_>,
     implementations: &HashSet<(mir::SymbolId, mir::SymbolId)>,
 ) -> Result<(), BackendError> {
@@ -176,6 +205,11 @@ fn validate_function(
     for local in &function.locals {
         validate_value_type(&local.type_, &function.name)?;
     }
+    let locals = function
+        .locals
+        .iter()
+        .map(|local| (local.id, local.type_.clone()))
+        .collect::<HashMap<_, _>>();
     for block in &function.blocks {
         for instruction in &block.instructions {
             validate_instruction(
@@ -183,6 +217,10 @@ fn validate_function(
                 &function.name,
                 signatures,
                 classes,
+                structs,
+                interfaces,
+                enums,
+                &locals,
                 interface_methods,
                 implementations,
             )?;
@@ -192,11 +230,16 @@ fn validate_function(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_instruction(
     instruction: &mir::Instruction,
     function_name: &str,
     signatures: &HashMap<mir::SymbolId, &mir::Function>,
     classes: &HashSet<mir::SymbolId>,
+    structs: &HashSet<mir::SymbolId>,
+    interfaces: &HashSet<mir::SymbolId>,
+    enums: &HashSet<mir::SymbolId>,
+    locals: &HashMap<mir::LocalId, mir::Type>,
     interface_methods: &InterfaceMethods<'_>,
     implementations: &HashSet<(mir::SymbolId, mir::SymbolId)>,
 ) -> Result<(), BackendError> {
@@ -249,33 +292,14 @@ fn validate_instruction(
             intrinsic,
             arguments,
             return_type,
-        } => {
-            if let Some(destination) = destination {
-                validate_place(destination, function_name)?;
-            }
-            validate_return_type(return_type, function_name)?;
-            for argument in arguments {
-                // Spawn-style intrinsics (`Task.Run`, `AsyncSpawn`,
-                // `AsyncSpawnInner`, `Parallel*`) carry a resolved function
-                // reference as an `OperandKind::Function`, which the generic
-                // `validate_operand` rejects. Validate only its value type;
-                // `validate_intrinsic_shape` below checks the full shape.
-                if matches!(argument.kind, mir::OperandKind::Function(_)) {
-                    validate_value_type(&argument.type_, function_name)?;
-                } else {
-                    validate_operand(argument, function_name)?;
-                }
-            }
-            validate_intrinsic_shape(
-                destination.as_ref(),
-                *intrinsic,
-                arguments,
-                return_type,
-                function_name,
-                signatures,
-            )?;
-            Ok(())
-        }
+        } => validate_call_intrinsic(
+            destination.as_ref(),
+            *intrinsic,
+            arguments,
+            return_type,
+            function_name,
+            signatures,
+        ),
         mir::Instruction::AllocateArray {
             destination,
             element_type,
@@ -296,6 +320,156 @@ fn validate_instruction(
                 Err(unsupported(function_name, "allocation of a non-class type"))
             }
         }
+        mir::Instruction::AllocateList {
+            destination,
+            element_type,
+            ..
+        } => validate_allocate_list(
+            destination,
+            element_type,
+            function_name,
+            classes,
+            structs,
+            interfaces,
+            enums,
+            locals,
+        ),
+    }
+}
+
+fn validate_call_intrinsic(
+    destination: Option<&mir::Place>,
+    intrinsic: mir::Intrinsic,
+    arguments: &[mir::Operand],
+    return_type: &mir::Type,
+    function_name: &str,
+    signatures: &HashMap<mir::SymbolId, &mir::Function>,
+) -> Result<(), BackendError> {
+    if let Some(destination) = destination {
+        validate_place(destination, function_name)?;
+    }
+    validate_return_type(return_type, function_name)?;
+    for argument in arguments {
+        // Spawn-style intrinsics (`Task.Run`, `AsyncSpawn`, `AsyncSpawnInner`,
+        // `Parallel*`) carry a resolved function reference as an
+        // `OperandKind::Function`, which the generic `validate_operand`
+        // rejects. Validate only its value type; `validate_intrinsic_shape`
+        // below checks the full shape.
+        if matches!(argument.kind, mir::OperandKind::Function(_)) {
+            validate_value_type(&argument.type_, function_name)?;
+        } else {
+            validate_operand(argument, function_name)?;
+        }
+    }
+    validate_intrinsic_shape(
+        destination,
+        intrinsic,
+        arguments,
+        return_type,
+        function_name,
+        signatures,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_allocate_list(
+    destination: &mir::Place,
+    element_type: &mir::Type,
+    function_name: &str,
+    classes: &HashSet<mir::SymbolId>,
+    structs: &HashSet<mir::SymbolId>,
+    interfaces: &HashSet<mir::SymbolId>,
+    enums: &HashSet<mir::SymbolId>,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    validate_place(destination, function_name)?;
+    validate_list_element_type(
+        element_type,
+        function_name,
+        classes,
+        structs,
+        interfaces,
+        enums,
+    )?;
+    if let mir::Place::Local(local) = destination {
+        let declared = locals.get(local).ok_or_else(|| {
+            BackendError::new(format!(
+                "function `{function_name}` allocates a `List<T>` into an undeclared local"
+            ))
+        })?;
+        let expected = mir::Type::List(Box::new(element_type.clone()));
+        if *declared != expected {
+            return Err(BackendError::new(format!(
+                "function `{function_name}` has an `AllocateList` whose destination is declared `{}`, but the instruction constructs `{}`",
+                type_name_owned(declared),
+                type_name_owned(&expected),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `element_type` is a concrete type `List<T>` may hold: known to
+/// the module (any nominal symbol actually declared), not `void`, not
+/// `decimal` (checked by the compiler but not executable yet — see
+/// `validate_value_type`), and, when it is itself `List<U>`, recursively
+/// valid. Reuses `validate_value_type`'s existing rules instead of a second,
+/// divergent list of executable types.
+fn validate_list_element_type(
+    element_type: &mir::Type,
+    function_name: &str,
+    classes: &HashSet<mir::SymbolId>,
+    structs: &HashSet<mir::SymbolId>,
+    interfaces: &HashSet<mir::SymbolId>,
+    enums: &HashSet<mir::SymbolId>,
+) -> Result<(), BackendError> {
+    if *element_type == mir::Type::Void {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a `List<void>`, which is not a value type"
+        )));
+    }
+    match element_type {
+        mir::Type::User(symbol) if !structs.contains(symbol) => {
+            return Err(BackendError::new(format!(
+                "function `{function_name}` has a `List<T>` whose element struct is unknown"
+            )));
+        }
+        mir::Type::Class(symbol) if !classes.contains(symbol) => {
+            return Err(BackendError::new(format!(
+                "function `{function_name}` has a `List<T>` whose element class is unknown"
+            )));
+        }
+        mir::Type::Interface(symbol) if !interfaces.contains(symbol) => {
+            return Err(BackendError::new(format!(
+                "function `{function_name}` has a `List<T>` whose element interface is unknown"
+            )));
+        }
+        mir::Type::Enum(symbol) if !enums.contains(symbol) => {
+            return Err(BackendError::new(format!(
+                "function `{function_name}` has a `List<T>` whose element enum is unknown"
+            )));
+        }
+        mir::Type::List(inner) => {
+            return validate_list_element_type(
+                inner,
+                function_name,
+                classes,
+                structs,
+                interfaces,
+                enums,
+            );
+        }
+        _ => {}
+    }
+    validate_value_type(element_type, function_name)
+}
+
+fn type_name_owned(type_: &mir::Type) -> String {
+    match type_ {
+        mir::Type::List(element) => format!("List<{}>", type_name_owned(element)),
+        mir::Type::Array(element) => format!("{}[]", type_name_owned(element)),
+        mir::Type::Task(result) => format!("Task<{}>", type_name_owned(result)),
+        other => type_name(other).to_owned(),
     }
 }
 
@@ -755,6 +929,14 @@ fn validate_value_type(type_: &mir::Type, function_name: &str) -> Result<(), Bac
         if matches!(**element, mir::Type::Array(_)) {
             return Err(unsupported(function_name, "nested arrays"));
         }
+        return validate_value_type(element, function_name);
+    }
+    if let mir::Type::List(element) = type_ {
+        // `List<T>` itself is always a plain reference (pointer-width, see
+        // `layouts::layout_of`); only `T` needs the same value-type rule
+        // (rejects `void`/`decimal`) that every other container element
+        // already gets. Nominal existence for `T` is checked specifically
+        // where a list is actually allocated (`validate_list_element_type`).
         return validate_value_type(element, function_name);
     }
     if executable_value_type(type_)
@@ -1225,5 +1407,206 @@ mod tests {
             "Parallel.Reduce always produces a value; a missing destination is malformed",
         );
         assert!(error.message().contains("malformed ParallelReduce"));
+    }
+
+    /// `AllocateList` has no source syntax yet (List A exposes no
+    /// constructor), so every scenario here is hand-built MIR rather than a
+    /// mutation of compiled output — the same "adulterated MIR must still be
+    /// caught" guarantee the `task_run_rejects_a_non_transferable_result_type`
+    /// family exercises above, just with no valid program to start from.
+    fn allocate_list_module(declared_type: mir::Type, element_type: mir::Type) -> mir::Module {
+        let destination = mir::LocalId(0);
+        mir::Module {
+            structs: Vec::new(),
+            classes: Vec::new(),
+            interfaces: Vec::new(),
+            enums: Vec::new(),
+            interface_implementations: Vec::new(),
+            functions: vec![mir::Function {
+                constructor: false,
+                symbol: mir::SymbolId(1),
+                owner: None,
+                name: "Make".to_owned(),
+                visibility: mir::Visibility::Public,
+                parameters: Vec::new(),
+                locals: vec![mir::Local {
+                    id: destination,
+                    symbol: None,
+                    name: "list".to_owned(),
+                    type_: declared_type,
+                    mutable: true,
+                    temporary: false,
+                }],
+                return_type: mir::Type::Void,
+                entry: mir::BasicBlockId(0),
+                blocks: vec![mir::BasicBlock {
+                    id: mir::BasicBlockId(0),
+                    instructions: vec![mir::Instruction::AllocateList {
+                        destination: mir::Place::Local(destination),
+                        element_type,
+                        region: mir::AllocationRegion::Persistent,
+                    }],
+                    terminator: mir::Terminator::Return(None),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn allocate_list_of_int_into_a_matching_local_is_valid() {
+        let module =
+            allocate_list_module(mir::Type::List(Box::new(mir::Type::Int)), mir::Type::Int);
+        validate_module(&module).expect("List<int> is a well-formed allocation");
+    }
+
+    #[test]
+    fn allocate_list_rejects_a_destination_declared_as_a_bare_element_type() {
+        let module = allocate_list_module(mir::Type::Int, mir::Type::Int);
+        let error = validate_module(&module)
+            .expect_err("a non-List destination for AllocateList must be rejected");
+        assert!(error.message().contains("declared `int`"));
+        assert!(error.message().contains("constructs `List<int>`"));
+    }
+
+    #[test]
+    fn allocate_list_rejects_a_destination_declared_with_a_different_element_type() {
+        let module =
+            allocate_list_module(mir::Type::List(Box::new(mir::Type::Long)), mir::Type::Int);
+        let error = validate_module(&module)
+            .expect_err("List<long> destination with a List<int> allocation must be rejected");
+        assert!(error.message().contains("declared `List<long>`"));
+        assert!(error.message().contains("constructs `List<int>`"));
+    }
+
+    #[test]
+    fn allocate_list_rejects_a_void_element_type() {
+        // The declared-local check (every local's type is validated up front
+        // via `validate_value_type`, which now recurses into `List<T>`'s
+        // element) rejects this before `AllocateList`'s own
+        // `validate_list_element_type` void check ever runs — both exist and
+        // either is a correct place to catch it, so this only pins the
+        // outcome, not which one fires.
+        let module =
+            allocate_list_module(mir::Type::List(Box::new(mir::Type::Void)), mir::Type::Void);
+        let error = validate_module(&module)
+            .expect_err("List<void> is not a value type and must be rejected");
+        assert!(error.message().contains("void"));
+    }
+
+    #[test]
+    fn allocate_list_rejects_a_decimal_element_type() {
+        let module = allocate_list_module(
+            mir::Type::List(Box::new(mir::Type::Decimal)),
+            mir::Type::Decimal,
+        );
+        let error = validate_module(&module)
+            .expect_err("List<decimal> has no runtime representation yet and must be rejected");
+        assert!(error.message().contains("decimal"));
+    }
+
+    #[test]
+    fn allocate_list_rejects_an_unknown_class_element() {
+        let unknown_class = mir::Type::Class(mir::SymbolId(999));
+        let module = allocate_list_module(
+            mir::Type::List(Box::new(unknown_class.clone())),
+            unknown_class,
+        );
+        let error = validate_module(&module)
+            .expect_err("a List<T> element class absent from the module must be rejected");
+        assert!(error.message().contains("element class is unknown"));
+    }
+
+    #[test]
+    fn allocate_list_rejects_an_unknown_struct_element() {
+        let unknown_struct = mir::Type::User(mir::SymbolId(999));
+        let module = allocate_list_module(
+            mir::Type::List(Box::new(unknown_struct.clone())),
+            unknown_struct,
+        );
+        let error = validate_module(&module)
+            .expect_err("a List<T> element struct absent from the module must be rejected");
+        assert!(error.message().contains("element struct is unknown"));
+    }
+
+    #[test]
+    fn allocate_list_rejects_an_unknown_interface_element() {
+        let unknown_interface = mir::Type::Interface(mir::SymbolId(999));
+        let module = allocate_list_module(
+            mir::Type::List(Box::new(unknown_interface.clone())),
+            unknown_interface,
+        );
+        let error = validate_module(&module)
+            .expect_err("a List<T> element interface absent from the module must be rejected");
+        assert!(error.message().contains("element interface is unknown"));
+    }
+
+    #[test]
+    fn allocate_list_rejects_an_unknown_enum_element() {
+        let unknown_enum = mir::Type::Enum(mir::SymbolId(999));
+        let module = allocate_list_module(
+            mir::Type::List(Box::new(unknown_enum.clone())),
+            unknown_enum,
+        );
+        let error = validate_module(&module)
+            .expect_err("a List<T> element enum absent from the module must be rejected");
+        assert!(error.message().contains("element enum is unknown"));
+    }
+
+    #[test]
+    fn allocate_list_rejects_a_nested_list_with_a_bad_inner_element() {
+        let inner = mir::Type::Decimal;
+        let element_type = mir::Type::List(Box::new(inner));
+        let declared = mir::Type::List(Box::new(element_type.clone()));
+        let module = allocate_list_module(declared, element_type);
+        let error = validate_module(&module)
+            .expect_err("List<List<decimal>> must be rejected via the inner element check");
+        assert!(error.message().contains("decimal"));
+    }
+
+    #[test]
+    fn allocate_list_accepts_a_nested_list_of_a_well_formed_element() {
+        let inner = mir::Type::Int;
+        let element_type = mir::Type::List(Box::new(inner));
+        let declared = mir::Type::List(Box::new(element_type.clone()));
+        let module = allocate_list_module(declared, element_type);
+        validate_module(&module).expect("List<List<int>> is a well-formed nested allocation");
+    }
+
+    #[test]
+    fn allocate_list_accepts_a_known_class_element() {
+        let class_symbol = mir::SymbolId(42);
+        let mut module = allocate_list_module(
+            mir::Type::List(Box::new(mir::Type::Class(class_symbol))),
+            mir::Type::Class(class_symbol),
+        );
+        module.classes.push(mir::ClassDefinition {
+            symbol: class_symbol,
+            name: "Widget".to_owned(),
+            fields: Vec::new(),
+        });
+        validate_module(&module).expect("List<Widget> with Widget declared is well-formed");
+    }
+
+    #[test]
+    fn a_function_returning_list_is_rejected_by_the_entry_point_gate() {
+        let function = mir::Function {
+            constructor: false,
+            symbol: mir::SymbolId(1),
+            owner: None,
+            name: "Main".to_owned(),
+            visibility: mir::Visibility::Public,
+            parameters: Vec::new(),
+            locals: Vec::new(),
+            return_type: mir::Type::List(Box::new(mir::Type::Int)),
+            entry: mir::BasicBlockId(0),
+            blocks: vec![mir::BasicBlock {
+                id: mir::BasicBlockId(0),
+                instructions: Vec::new(),
+                terminator: mir::Terminator::Return(None),
+            }],
+        };
+        let error = validate_invocable_entry(&function, "Main")
+            .expect_err("an entry function returning List<T> must be rejected");
+        assert!(error.message().contains("returns a List<T>"));
     }
 }

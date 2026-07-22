@@ -73,12 +73,12 @@ impl Monomorphizer {
         self.diagnostics
     }
 
-    /// A generic type template named `Task` is stripped from `module.items`
-    /// below (open templates never reach semantic analysis), so
-    /// `semantic::validate_no_reserved_type_names` cannot see it. `Task` is
-    /// reserved for the intrinsic task system regardless of arity, so this
-    /// catches the generic-template case at the one point it is still
-    /// visible; the non-generic case is caught later, in `semantic`.
+    /// A generic type template named `Task` or `List` is stripped from
+    /// `module.items` below (open templates never reach semantic analysis),
+    /// so `semantic::validate_no_reserved_type_names` cannot see it. Both are
+    /// reserved regardless of arity, so this catches the generic-template
+    /// case at the one point it is still visible; the non-generic case is
+    /// caught later, in `semantic`.
     fn reject_reserved_task_template(&mut self, module: &Module) {
         for item in &module.items {
             let (kind, name, span) = match item {
@@ -106,6 +106,19 @@ impl Monomorphizer {
                     )
                     .with_help(
                         "rename this type; `Task<T>` is a built-in type, not something a program can declare",
+                    ),
+                );
+            }
+            if name == "List" {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "`{name}` is reserved for the built-in `List<T>` type and cannot be declared as a generic {kind} template"
+                        ),
+                        span,
+                    )
+                    .with_help(
+                        "rename this type; `List<T>` is a built-in type, not something a program can declare",
                     ),
                 );
             }

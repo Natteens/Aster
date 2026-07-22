@@ -53,7 +53,10 @@ impl Codegen {
     }
 
     pub(super) fn clif_value_type(&self, type_: &mir::Type) -> Result<ClifType, BackendError> {
-        if matches!(type_, mir::Type::Array(_) | mir::Type::Class(_)) {
+        if matches!(
+            type_,
+            mir::Type::Array(_) | mir::Type::Class(_) | mir::Type::List(_)
+        ) {
             return Ok(self.pointer_type);
         }
         // `Task<T>` is a plain opaque integer handle (a `TaskHandleId`, see

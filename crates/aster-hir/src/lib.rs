@@ -33,6 +33,11 @@ pub enum Type {
     /// Compiler-intrinsic, like `Array`; never monomorphized like a stdlib
     /// generic, and never exposes arena identity to generated code.
     Task(Box<Type>),
+    /// `List<T>`: a native reference type with its own runtime header and
+    /// growable buffer (see `aster_runtime::AsterList`). Compiler-intrinsic,
+    /// like `Array`/`Task`; the element type `T` must already be concrete
+    /// and executable when this variant exists.
+    List(Box<Type>),
     Unknown,
 }
 

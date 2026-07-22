@@ -147,12 +147,13 @@ pub(super) fn validate(module: &Module) -> (Vec<Diagnostic>, Model) {
     (diagnostics, model)
 }
 
-/// `Task` and `Parallel` are reserved, intrinsic names (`aster.core.Task<T>`,
-/// see `hir::Type::Task`, and the `Parallel.For`/`Parallel.ForEach` surface):
-/// no class, struct, interface, or enum declaration (generic or not) may use
-/// either. This is the single place that reservation is enforced, so every
-/// later stage can recognize these names structurally without checking
-/// whether a user redefined them.
+/// `Task`, `Parallel`, and `List` are reserved, intrinsic names
+/// (`aster.core.Task<T>`, see `hir::Type::Task`, the
+/// `Parallel.For`/`Parallel.ForEach` surface, and `aster.core.List<T>`, see
+/// `hir::Type::List`): no class, struct, interface, or enum declaration
+/// (generic or not) may use any of them. This is the single place that
+/// reservation is enforced, so every later stage can recognize these names
+/// structurally without checking whether a user redefined them.
 fn validate_no_reserved_type_names(module: &Module, diagnostics: &mut Vec<Diagnostic>) {
     for item in &module.items {
         let (kind, name, span) = match item {
@@ -169,6 +170,17 @@ fn validate_no_reserved_type_names(module: &Module, diagnostics: &mut Vec<Diagno
                     span,
                 )
                 .with_help("rename this type; it is a built-in name, not something a program can declare"),
+            );
+        }
+        if name == "List" {
+            diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "`List` is reserved for the built-in `List<T>` type and cannot be declared as a {kind}"
+                    ),
+                    span,
+                )
+                .with_help("rename this type; `List<T>` is a built-in name, not something a program can declare"),
             );
         }
     }

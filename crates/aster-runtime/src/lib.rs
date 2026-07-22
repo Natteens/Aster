@@ -19,7 +19,8 @@ pub mod registry;
 pub mod string;
 
 pub use context::{
-    AsterArray, ExecutionContext, MemoryStats, aster_rt_array_element, aster_rt_array_length,
+    AsterArray, AsterList, ExecutionContext, ListRegion, MemoryStats, aster_rt_array_element,
+    aster_rt_array_length,
 };
 pub use log::LogLevel;
 pub use registry::{RuntimeFunction, RuntimeSignature, RuntimeType, runtime_functions};

@@ -564,3 +564,28 @@ fn the_controlled_error_prefix_is_not_duplicated() {
         "prefix must appear exactly once, got: {error}"
     );
 }
+
+#[test]
+fn a_list_return_type_is_rejected() {
+    // `List<T>` (Lote List A) is a native reference type like `Class`/`Array`,
+    // never mapped by `values::primitive`, so it fails the same
+    // `is_worker_transferable` gate with no List-specific exception needed.
+    // `Make` recurses into itself instead of constructing a `List<int>`,
+    // since List A exposes no constructor yet; this only needs to compile,
+    // never to run.
+    let errors = compile_errors(
+        r"
+        public List<int> Make() { return Make(); }
+        public int Main() {
+            Task<List<int>> task = Task.Run(Make);
+            return 0;
+        }
+        ",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("cross a worker boundary")),
+        "expected the non-transferable-result diagnostic for List<int>, got {errors:?}"
+    );
+}

@@ -24,6 +24,19 @@ impl Lowerer<'_> {
                 self.resolve_type(&ast::TypeRef::new(inner, type_ref.span)),
             ));
         }
+        if let Some(inner) = type_ref
+            .name
+            .strip_prefix("List<")
+            .and_then(|rest| rest.strip_suffix('>'))
+        {
+            // `List` is reserved (see `semantic::validate_no_reserved_type_names`);
+            // semantic analysis already validated arity and rejected `void`/
+            // `decimal` elements, so this only needs to reconstruct the
+            // already-valid intrinsic `hir::Type::List`.
+            return hir::Type::List(Box::new(
+                self.resolve_type(&ast::TypeRef::new(inner, type_ref.span)),
+            ));
+        }
         if let Some(element) = type_ref.name.strip_suffix("[]") {
             return hir::Type::Array(Box::new(
                 self.resolve_type(&ast::TypeRef::new(element, type_ref.span)),

@@ -184,7 +184,10 @@ impl Layouts {
                     .map_err(|_| BackendError::new("pointer alignment is too large"))?,
             });
         }
-        if matches!(type_, mir::Type::Array(_) | mir::Type::Class(_)) {
+        if matches!(
+            type_,
+            mir::Type::Array(_) | mir::Type::Class(_) | mir::Type::List(_)
+        ) {
             return Ok(TypeLayout {
                 size: self.pointer_bytes,
                 align_shift: u8::try_from(self.pointer_bytes.trailing_zeros())
@@ -240,7 +243,10 @@ impl Layouts {
                     .map_err(|_| BackendError::new("pointer alignment is too large"))?,
             });
         }
-        if matches!(type_, mir::Type::Array(_) | mir::Type::Class(_)) {
+        if matches!(
+            type_,
+            mir::Type::Array(_) | mir::Type::Class(_) | mir::Type::List(_)
+        ) {
             return Ok(TypeLayout {
                 size: self.pointer_bytes,
                 align_shift: u8::try_from(self.pointer_bytes.trailing_zeros())
@@ -280,6 +286,7 @@ impl Layouts {
             | mir::Type::Class(_)
             | mir::Type::Interface(_)
             | mir::Type::Enum(_)
+            | mir::Type::List(_)
             | mir::Type::Void
             | mir::Type::Unknown => false,
             mir::Type::User(symbol) => self.structs.get(symbol).is_some_and(|definition| {
@@ -379,5 +386,61 @@ mod layout_tests {
         assert_eq!(layouts.fields[&value].offset, 0);
         assert_eq!(layouts.fields[&next].offset, 8);
         assert_eq!(layouts.types[&class].size, 16);
+    }
+
+    fn empty_module() -> mir::Module {
+        mir::Module {
+            structs: Vec::new(),
+            classes: Vec::new(),
+            interfaces: Vec::new(),
+            enums: Vec::new(),
+            interface_implementations: Vec::new(),
+            functions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn list_of_int_is_pointer_sized_on_a_64_bit_target() {
+        let layouts = Layouts::new(&empty_module(), 8).expect("empty module always lays out");
+        let layout = layouts
+            .type_layout(&mir::Type::List(Box::new(mir::Type::Int)))
+            .expect("List<T> has a pointer layout regardless of T");
+        assert_eq!(layout.size, 8);
+        assert_eq!(layout.align_shift, 3);
+    }
+
+    #[test]
+    fn list_of_int_is_pointer_sized_on_a_32_bit_target() {
+        let layouts = Layouts::new(&empty_module(), 4).expect("empty module always lays out");
+        let layout = layouts
+            .type_layout(&mir::Type::List(Box::new(mir::Type::Int)))
+            .expect("List<T> has a pointer layout regardless of T");
+        assert_eq!(layout.size, 4);
+        assert_eq!(layout.align_shift, 2);
+    }
+
+    #[test]
+    fn list_layout_does_not_depend_on_its_element_type() {
+        let layouts = Layouts::new(&empty_module(), 8).expect("empty module always lays out");
+        let of_int = layouts
+            .type_layout(&mir::Type::List(Box::new(mir::Type::Int)))
+            .expect("List<int>");
+        let of_string = layouts
+            .type_layout(&mir::Type::List(Box::new(mir::Type::String)))
+            .expect("List<string>");
+        let nested = layouts
+            .type_layout(&mir::Type::List(Box::new(mir::Type::List(Box::new(
+                mir::Type::Long,
+            )))))
+            .expect("List<List<long>>");
+        assert_eq!(of_int.size, of_string.size);
+        assert_eq!(of_int.size, nested.size);
+        assert_eq!(of_int.align_shift, nested.align_shift);
+    }
+
+    #[test]
+    fn list_is_never_zero_initializable() {
+        let layouts = Layouts::new(&empty_module(), 8).expect("empty module always lays out");
+        assert!(!layouts.zero_initializable(&mir::Type::List(Box::new(mir::Type::Int))));
     }
 }

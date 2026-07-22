@@ -29,6 +29,48 @@ impl Monomorphizer {
             // analysis resolves it directly from this reconstructed name.
             return type_name.to_string();
         }
+        if type_name.base == "List" {
+            // `List` is reserved (see `semantic::validate_no_reserved_type_names`),
+            // so `List<T>` is always the compiler intrinsic (`hir::Type::List`),
+            // never a user or stdlib generic template. Unlike `Task<T>`, the
+            // element `T` is validated here (arity, `void`, `decimal`)
+            // because semantic resolution collapses any invalid element to
+            // `Unknown` without a dedicated diagnostic of its own.
+            if type_name.arguments.len() != 1 {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "`List` expects 1 type argument, found {}",
+                            type_name.arguments.len()
+                        ),
+                        span,
+                    )
+                    .with_help("write `List<T>` with exactly one concrete element type"),
+                );
+                return type_name.to_string();
+            }
+            let element = &type_name.arguments[0];
+            if element.arguments.is_empty() && !element.array {
+                if element.base == "void" {
+                    self.diagnostics.push(
+                        Diagnostic::error("`List<void>` is not supported", span)
+                            .with_help("use a concrete, non-`void` element type"),
+                    );
+                    return type_name.to_string();
+                }
+                if element.base == "decimal" {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "`List<decimal>` cannot be used until `decimal` is executable",
+                            span,
+                        )
+                        .with_help("use an executable element type"),
+                    );
+                    return type_name.to_string();
+                }
+            }
+            return type_name.to_string();
+        }
         let template_arity = self
             .type_templates
             .get(&type_name.base)

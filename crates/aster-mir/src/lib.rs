@@ -163,6 +163,16 @@ pub enum Instruction {
         class: SymbolId,
         region: AllocationRegion,
     },
+    /// Allocate an empty `List<T>` header (`length = capacity = 0`, no
+    /// buffer yet) in `region`'s arena. `element_type` must be a concrete,
+    /// executable type; the backend derives size/alignment/type key from it
+    /// via the same layout system every other type uses — never a second,
+    /// divergent list of types.
+    AllocateList {
+        destination: Place,
+        element_type: Type,
+        region: AllocationRegion,
+    },
 }
 
 /// Runtime services reachable from generated code. Backends map each variant
@@ -483,5 +493,117 @@ pub enum BinaryOperator {
 impl fmt::Display for Module {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{self:#?}")
+    }
+}
+
+/// Deterministic structural identity for a concrete `Type`, used as
+/// `List<T>`'s `element_type_key`.
+///
+/// Distinguishes any two concrete types that could otherwise share a byte
+/// layout (e.g. two unrelated single-`int`-field classes): every nominal
+/// variant folds in its own monomorphized `SymbolId`, which the compiler
+/// never reuses across distinct concrete declarations. Depends only on the
+/// type's own structure — never a Rust pointer, a memory address, or a
+/// textual name comparison — so it stays valid across arenas and is safe to
+/// embed as a plain runtime constant.
+#[must_use]
+pub fn type_key(type_: &Type) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn mix(hash: u64, value: u64) -> u64 {
+        (hash ^ value).wrapping_mul(FNV_PRIME)
+    }
+
+    fn walk(type_: &Type, hash: u64) -> u64 {
+        match type_ {
+            Type::Void => mix(hash, 0),
+            Type::Bool => mix(hash, 1),
+            Type::SByte => mix(hash, 2),
+            Type::Byte => mix(hash, 3),
+            Type::Short => mix(hash, 4),
+            Type::UShort => mix(hash, 5),
+            Type::Int => mix(hash, 6),
+            Type::UInt => mix(hash, 7),
+            Type::Long => mix(hash, 8),
+            Type::ULong => mix(hash, 9),
+            Type::Float => mix(hash, 10),
+            Type::Double => mix(hash, 11),
+            Type::Decimal => mix(hash, 12),
+            Type::Char => mix(hash, 13),
+            Type::String => mix(hash, 14),
+            Type::User(symbol) => mix(mix(hash, 15), u64::from(symbol.0)),
+            Type::Class(symbol) => mix(mix(hash, 16), u64::from(symbol.0)),
+            Type::Interface(symbol) => mix(mix(hash, 17), u64::from(symbol.0)),
+            Type::Enum(symbol) => mix(mix(hash, 18), u64::from(symbol.0)),
+            Type::Array(element) => walk(element, mix(hash, 19)),
+            Type::Task(result) => walk(result, mix(hash, 20)),
+            Type::List(element) => walk(element, mix(hash, 21)),
+            Type::Unknown => mix(hash, 22),
+        }
+    }
+
+    walk(type_, FNV_OFFSET)
+}
+
+#[cfg(test)]
+mod type_key_tests {
+    use super::{SymbolId, Type, type_key};
+
+    #[test]
+    fn identical_scalar_types_share_a_key() {
+        assert_eq!(type_key(&Type::Int), type_key(&Type::Int));
+    }
+
+    #[test]
+    fn distinct_scalar_types_never_collide() {
+        assert_ne!(type_key(&Type::Int), type_key(&Type::Long));
+        assert_ne!(type_key(&Type::Int), type_key(&Type::UInt));
+    }
+
+    #[test]
+    fn list_of_int_differs_from_a_bare_int_and_from_an_array_of_int() {
+        let list_int = Type::List(Box::new(Type::Int));
+        assert_ne!(type_key(&list_int), type_key(&Type::Int));
+        assert_ne!(
+            type_key(&list_int),
+            type_key(&Type::Array(Box::new(Type::Int)))
+        );
+    }
+
+    #[test]
+    fn nested_lists_are_distinguished_by_depth() {
+        let list_int = Type::List(Box::new(Type::Int));
+        let list_list_int = Type::List(Box::new(list_int.clone()));
+        assert_ne!(type_key(&list_int), type_key(&list_list_int));
+    }
+
+    #[test]
+    fn same_class_symbol_produces_the_same_key_for_list_of_that_class() {
+        let a = Type::List(Box::new(Type::Class(SymbolId(7))));
+        let b = Type::List(Box::new(Type::Class(SymbolId(7))));
+        assert_eq!(type_key(&a), type_key(&b));
+    }
+
+    #[test]
+    fn two_classes_with_identical_layout_but_different_symbols_never_collide() {
+        let a = Type::List(Box::new(Type::Class(SymbolId(1))));
+        let b = Type::List(Box::new(Type::Class(SymbolId(2))));
+        assert_ne!(type_key(&a), type_key(&b));
+    }
+
+    #[test]
+    fn list_of_class_differs_from_list_of_interface_with_the_same_symbol_id() {
+        let class = Type::List(Box::new(Type::Class(SymbolId(3))));
+        let interface = Type::List(Box::new(Type::Interface(SymbolId(3))));
+        assert_ne!(type_key(&class), type_key(&interface));
+    }
+
+    #[test]
+    fn key_is_stable_across_repeated_calls() {
+        let type_ = Type::List(Box::new(Type::String));
+        let first = type_key(&type_);
+        let second = type_key(&type_);
+        assert_eq!(first, second);
     }
 }

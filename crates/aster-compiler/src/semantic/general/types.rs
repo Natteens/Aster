@@ -28,6 +28,9 @@ pub(super) enum Type {
     /// `aster.core.Task<T>`, recognized structurally like `Array`, never
     /// looked up as a user-declared generic type.
     Task(Box<Type>),
+    /// `List<T>`, recognized structurally like `Task<T>`: a reserved,
+    /// compiler-intrinsic reference type, never a user-declared generic.
+    List(Box<Type>),
     Unknown,
 }
 
@@ -40,6 +43,7 @@ impl Type {
             }
             Self::Array(element) => format!("{}[]", element.display()),
             Self::Task(result) => format!("Task<{}>", result.display()),
+            Self::List(element) => format!("List<{}>", element.display()),
             Self::Unknown => "<unknown>".to_owned(),
             _ => self
                 .primitive()
@@ -74,6 +78,7 @@ impl Type {
             | Self::Enum(_)
             | Self::Array(_)
             | Self::Task(_)
+            | Self::List(_)
             | Self::Unknown => {
                 return None;
             }
@@ -157,6 +162,24 @@ pub(super) fn resolve_type_readonly(type_ref: &TypeRef, context: &Context) -> Ty
             Type::Task(Box::new(result))
         };
     }
+    if let Some(inner) = type_ref
+        .name
+        .strip_prefix("List<")
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
+        // `List<T>` is a reserved intrinsic type (no user declaration named
+        // `List` can exist; see `semantic::validate_no_reserved_type_names`),
+        // resolved structurally before any user-declared-type lookup runs,
+        // exactly like `Task<T>`. `void` and `decimal` (not executable yet)
+        // collapse to `Unknown` here rather than a second, divergent
+        // "executable type" list.
+        let result = resolve_type_readonly(&TypeRef::new(inner, type_ref.span), context);
+        return if matches!(result, Type::Void | Type::Decimal | Type::Unknown) {
+            Type::Unknown
+        } else {
+            Type::List(Box::new(result))
+        };
+    }
     if let Some(element) = type_ref.name.strip_suffix("[]") {
         let element = resolve_type_readonly(&TypeRef::new(element, type_ref.span), context);
         return if matches!(element, Type::Void | Type::Unknown) {
@@ -217,6 +240,7 @@ pub(super) fn zero_initializable(
         | Type::Class(_)
         | Type::Interface(_)
         | Type::Enum(_)
+        | Type::List(_)
         | Type::Void
         | Type::Unknown => false,
         Type::User(name) => {

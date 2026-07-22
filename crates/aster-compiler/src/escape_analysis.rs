@@ -275,14 +275,16 @@ fn summarize_function(
 fn is_tracked_reference_type(type_: &mir::Type) -> bool {
     matches!(
         type_,
-        mir::Type::Class(_) | mir::Type::Array(_) | mir::Type::String
+        mir::Type::Class(_) | mir::Type::Array(_) | mir::Type::String | mir::Type::List(_)
     )
 }
 
 fn is_dynamic_allocation(instruction: &mir::Instruction) -> bool {
     matches!(
         instruction,
-        mir::Instruction::AllocateObject { .. } | mir::Instruction::AllocateArray { .. }
+        mir::Instruction::AllocateObject { .. }
+            | mir::Instruction::AllocateArray { .. }
+            | mir::Instruction::AllocateList { .. }
     ) || matches!(
         instruction,
         mir::Instruction::CallIntrinsic { intrinsic, .. }
@@ -293,7 +295,8 @@ fn is_dynamic_allocation(instruction: &mir::Instruction) -> bool {
 fn allocation_destination(instruction: &mir::Instruction) -> Option<&mir::Place> {
     match instruction {
         mir::Instruction::AllocateObject { destination, .. }
-        | mir::Instruction::AllocateArray { destination, .. } => Some(destination),
+        | mir::Instruction::AllocateArray { destination, .. }
+        | mir::Instruction::AllocateList { destination, .. } => Some(destination),
         mir::Instruction::CallIntrinsic {
             destination,
             intrinsic,
@@ -309,6 +312,9 @@ fn set_allocation_region(instruction: &mut mir::Instruction, region: mir::Alloca
             region: current, ..
         }
         | mir::Instruction::AllocateArray {
+            region: current, ..
+        }
+        | mir::Instruction::AllocateList {
             region: current, ..
         } => *current = region,
         mir::Instruction::CallIntrinsic { intrinsic, .. }
@@ -528,7 +534,9 @@ fn instruction_escape(
                     .any(|argument| direct_alias(argument, aliases).is_some()))
             .then_some(EscapeReason::PassedToIntrinsic)
         }
-        mir::Instruction::AllocateArray { .. } | mir::Instruction::AllocateObject { .. } => None,
+        mir::Instruction::AllocateArray { .. }
+        | mir::Instruction::AllocateObject { .. }
+        | mir::Instruction::AllocateList { .. } => None,
     }
 }
 
@@ -610,8 +618,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        EscapeClassification, EscapeReason, build_function_summaries, classify_function,
-        strongly_connected_components,
+        EscapeClassification, EscapeReason, assign_allocation_regions, build_function_summaries,
+        classify_function, strongly_connected_components,
     };
     use crate::{compile, mir};
 
@@ -966,5 +974,149 @@ mod tests {
             string_regions(source, "Make"),
             vec![mir::AllocationRegion::Persistent]
         );
+    }
+
+    // `List<T>` has no source syntax yet (no constructor, see `List A`), so
+    // these build MIR by hand instead of compiling a program, exactly like
+    // `layouts::layout_tests` already does for struct/class layout.
+
+    fn list_local(id: u32, type_: mir::Type) -> mir::Local {
+        mir::Local {
+            id: mir::LocalId(id),
+            symbol: None,
+            name: format!("local{id}"),
+            type_,
+            mutable: true,
+            temporary: false,
+        }
+    }
+
+    fn single_function_module(
+        return_type: mir::Type,
+        locals: Vec<mir::Local>,
+        instructions: Vec<mir::Instruction>,
+        terminator: mir::Terminator,
+    ) -> mir::Module {
+        mir::Module {
+            structs: Vec::new(),
+            classes: Vec::new(),
+            interfaces: Vec::new(),
+            enums: Vec::new(),
+            interface_implementations: Vec::new(),
+            functions: vec![mir::Function {
+                constructor: false,
+                symbol: mir::SymbolId(1),
+                owner: None,
+                name: "Run".to_owned(),
+                visibility: mir::Visibility::Public,
+                parameters: Vec::new(),
+                locals,
+                return_type,
+                entry: mir::BasicBlockId(0),
+                blocks: vec![mir::BasicBlock {
+                    id: mir::BasicBlockId(0),
+                    instructions,
+                    terminator,
+                }],
+            }],
+        }
+    }
+
+    fn allocated_list_region(module: &mir::Module) -> mir::AllocationRegion {
+        module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .find_map(|instruction| match instruction {
+                mir::Instruction::AllocateList { region, .. } => Some(*region),
+                _ => None,
+            })
+            .expect("module contains exactly one AllocateList")
+    }
+
+    #[test]
+    fn a_local_non_escaping_list_is_assigned_to_temporary_storage() {
+        let list_type = mir::Type::List(Box::new(mir::Type::Int));
+        let mut module = single_function_module(
+            mir::Type::Int,
+            vec![list_local(0, list_type.clone())],
+            vec![mir::Instruction::AllocateList {
+                destination: mir::Place::Local(mir::LocalId(0)),
+                element_type: mir::Type::Int,
+                region: mir::AllocationRegion::Persistent,
+            }],
+            mir::Terminator::Return(Some(mir::Operand {
+                type_: mir::Type::Int,
+                kind: mir::OperandKind::Constant(mir::Constant::Integer("0".to_owned())),
+            })),
+        );
+        assign_allocation_regions(&mut module);
+        assert_eq!(
+            allocated_list_region(&module),
+            mir::AllocationRegion::Temporary
+        );
+    }
+
+    #[test]
+    fn a_list_returned_by_alias_is_assigned_to_persistent_storage() {
+        let list_type = mir::Type::List(Box::new(mir::Type::Int));
+        let mut module = single_function_module(
+            list_type.clone(),
+            vec![list_local(0, list_type.clone())],
+            vec![mir::Instruction::AllocateList {
+                destination: mir::Place::Local(mir::LocalId(0)),
+                element_type: mir::Type::Int,
+                region: mir::AllocationRegion::Temporary,
+            }],
+            mir::Terminator::Return(Some(mir::Operand {
+                type_: list_type,
+                kind: mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(0))),
+            })),
+        );
+        assign_allocation_regions(&mut module);
+        assert_eq!(
+            allocated_list_region(&module),
+            mir::AllocationRegion::Persistent
+        );
+    }
+
+    #[test]
+    fn a_list_passed_to_an_unknown_call_is_conservatively_persistent() {
+        let list_type = mir::Type::List(Box::new(mir::Type::Int));
+        let unknown_function = mir::SymbolId(999);
+        let mut module = single_function_module(
+            mir::Type::Int,
+            vec![list_local(0, list_type.clone())],
+            vec![
+                mir::Instruction::AllocateList {
+                    destination: mir::Place::Local(mir::LocalId(0)),
+                    element_type: mir::Type::Int,
+                    region: mir::AllocationRegion::Temporary,
+                },
+                mir::Instruction::Call {
+                    destination: None,
+                    function: unknown_function,
+                    arguments: vec![mir::Operand {
+                        type_: list_type,
+                        kind: mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(0))),
+                    }],
+                    return_type: mir::Type::Void,
+                },
+            ],
+            mir::Terminator::Return(None),
+        );
+        assign_allocation_regions(&mut module);
+        assert_eq!(
+            allocated_list_region(&module),
+            mir::AllocationRegion::Persistent
+        );
+    }
+
+    #[test]
+    fn list_is_a_tracked_reference_type() {
+        assert!(super::is_tracked_reference_type(&mir::Type::List(
+            Box::new(mir::Type::Int)
+        )));
     }
 }

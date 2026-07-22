@@ -1001,3 +1001,27 @@ fn parallel_reduce_array_and_identity_are_evaluated_once_left_to_right() {
         "the array must be evaluated before the identity (left to right)"
     );
 }
+
+#[test]
+fn parallel_for_each_list_array_is_rejected() {
+    // `List<int>[]` has no literal syntax to build a genuine array of lists
+    // from scratch (List A has no constructor), so the element comes from a
+    // parameter instead — the point is only that `List<T>` fails the same
+    // scalar-element gate as every other reference type, with no special
+    // case needed for it.
+    assert_error(
+        "public void Body(List<int> value) { } \
+         public void Consume(List<int> item) { List<int>[] values = [item]; Parallel.ForEach(values, Body); }",
+        "requires a scalar element type",
+    );
+}
+
+#[test]
+fn parallel_reduce_non_transferable_element_is_rejected_list() {
+    assert_error(
+        "public int AddValue(int accumulator, List<int> value) { return accumulator; } \
+         public int AddPartial(int left, int right) { return left + right; } \
+         public int Consume(List<int> item) { List<int>[] values = [item]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }",
+        "requires a scalar element type",
+    );
+}

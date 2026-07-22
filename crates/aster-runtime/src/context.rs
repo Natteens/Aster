@@ -1,4 +1,4 @@
-//! Per-execution ownership and the array runtime ABI.
+//! Per-execution ownership and the array/list runtime ABI.
 
 use std::mem::{align_of, size_of};
 use std::ptr;
@@ -20,6 +20,72 @@ impl AsterArray {
     #[must_use]
     pub fn element_size(&self) -> u32 {
         self.element_size
+    }
+}
+
+/// Which arena owns a `List<T>`'s header and (once grown) its buffer.
+/// Recorded explicitly at allocation time because a future grow operation
+/// must reuse the exact same arena — never deduced later by comparing
+/// pointer addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ListRegion {
+    Persistent,
+    Temporary,
+}
+
+/// Runtime-owned header for one `List<T>` instance. `T`'s content never lives
+/// inline in the value that names the list (that value is always a pointer
+/// to this header, exactly like `Array`/`Class`); this struct owns the
+/// growable buffer instead.
+///
+/// Invariant: `data` is only ever dereferenced when `capacity > 0`. A freshly
+/// allocated list has `capacity == 0`, and `data` is `null` in that case —
+/// an internal detail of this header, never a value observable from Aster
+/// (`List<T>` itself is never `null`; only this empty-buffer sentinel is).
+#[repr(C)]
+pub struct AsterList {
+    data: *mut u8,
+    length: i32,
+    capacity: i32,
+    element_size: u32,
+    element_align: u32,
+    /// Deterministic structural identity of the concrete element type `T`
+    /// (see `aster_mir::type_key`), computed once by the compiler and never
+    /// recomputed or reinterpreted by this crate.
+    element_type_key: u64,
+    region: ListRegion,
+}
+
+impl AsterList {
+    #[must_use]
+    pub fn length(&self) -> i32 {
+        self.length
+    }
+
+    #[must_use]
+    pub fn capacity(&self) -> i32 {
+        self.capacity
+    }
+
+    #[must_use]
+    pub fn element_size(&self) -> u32 {
+        self.element_size
+    }
+
+    #[must_use]
+    pub fn element_align(&self) -> u32 {
+        self.element_align
+    }
+
+    #[must_use]
+    pub fn element_type_key(&self) -> u64 {
+        self.element_type_key
+    }
+
+    #[must_use]
+    pub fn region(&self) -> ListRegion {
+        self.region
     }
 }
 
@@ -284,6 +350,64 @@ impl ExecutionContext {
         self.allocate_array_in_region(length, element_size, true)
     }
 
+    /// Allocate an empty `List<T>` header (`length == capacity == 0`, no
+    /// buffer yet) in the arena selected by `region`. Every failure is
+    /// reported through `self.fail` and returns a null pointer — never a
+    /// panic, never a trap, never a partially written header (nothing is
+    /// written to the header until every validation has passed). Capacity
+    /// is not reserved ahead of time: growth is a future operation.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn allocate_list_in_region(
+        &mut self,
+        element_size: u32,
+        element_align: u32,
+        element_type_key: u64,
+        region: ListRegion,
+    ) -> *mut AsterList {
+        if element_size == 0 {
+            self.fail("list element size must be greater than zero");
+            return ptr::null_mut();
+        }
+        if !element_align.is_power_of_two() {
+            self.fail(format!(
+                "list element alignment must be a nonzero power of two, got {element_align}"
+            ));
+            return ptr::null_mut();
+        }
+        if region == ListRegion::Temporary && self.temporary_scopes.is_empty() {
+            self.fail("temporary list allocation requires an active temporary scope");
+            return ptr::null_mut();
+        }
+
+        let header_ptr = {
+            let arena = if region == ListRegion::Temporary {
+                &mut self.temporary_arena
+            } else {
+                &mut self.arena
+            };
+            #[allow(clippy::cast_ptr_alignment)]
+            arena
+                .alloc(size_of::<AsterList>(), align_of::<AsterList>())
+                .cast::<AsterList>()
+        };
+
+        // SAFETY: `header_ptr` points to zeroed, correctly aligned memory for
+        // `AsterList`, just allocated above and not yet observed anywhere
+        // else; every field is written before this pointer is returned.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*header_ptr).data = ptr::null_mut();
+            (*header_ptr).length = 0;
+            (*header_ptr).capacity = 0;
+            (*header_ptr).element_size = element_size;
+            (*header_ptr).element_align = element_align;
+            (*header_ptr).element_type_key = element_type_key;
+            (*header_ptr).region = region;
+        }
+        self.record_allocation(AllocationCategory::Object, size_of::<AsterList>());
+        header_ptr
+    }
+
     pub(crate) fn allocate_object(&mut self, size: u32) -> *mut u8 {
         let bytes = usize::try_from(size.max(1)).unwrap_or(1);
         let pointer = self.arena.alloc(bytes, 8);
@@ -461,6 +585,91 @@ pub extern "C" fn aster_rt_array_length(
 mod tests {
     use super::*;
     use crate::object::{aster_rt_object_new, aster_rt_object_new_temporary};
+
+    #[test]
+    fn empty_list_header_satisfies_every_invariant() {
+        let mut context = ExecutionContext::new();
+        let header = context.allocate_list_in_region(4, 4, 0xdead_beef, ListRegion::Persistent);
+        assert!(!header.is_null());
+        // SAFETY: `header` was just allocated above and is not aliased.
+        #[allow(unsafe_code)]
+        let list = unsafe { &*header };
+        assert_eq!(list.length(), 0);
+        assert_eq!(list.capacity(), 0);
+        assert_eq!(list.element_size(), 4);
+        assert_eq!(list.element_align(), 4);
+        assert_eq!(list.element_type_key(), 0xdead_beef);
+        assert_eq!(list.region(), ListRegion::Persistent);
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    fn list_rejects_zero_element_size() {
+        let mut context = ExecutionContext::new();
+        let header = context.allocate_list_in_region(0, 4, 1, ListRegion::Persistent);
+        assert!(header.is_null());
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("size"))
+        );
+    }
+
+    #[test]
+    fn list_rejects_non_power_of_two_alignment() {
+        let mut context = ExecutionContext::new();
+        let header = context.allocate_list_in_region(4, 3, 1, ListRegion::Persistent);
+        assert!(header.is_null());
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("alignment"))
+        );
+
+        let mut context = ExecutionContext::new();
+        let header = context.allocate_list_in_region(4, 0, 1, ListRegion::Persistent);
+        assert!(header.is_null());
+        assert!(context.take_error().is_some());
+    }
+
+    #[test]
+    fn temporary_list_requires_an_active_scope() {
+        let mut context = ExecutionContext::new();
+        let header = context.allocate_list_in_region(4, 4, 1, ListRegion::Temporary);
+        assert!(header.is_null());
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("temporary scope"))
+        );
+    }
+
+    #[test]
+    fn temporary_list_succeeds_inside_an_active_scope_and_records_its_region() {
+        let mut context = ExecutionContext::new();
+        context.enter_temporary_scope();
+        let header = context.allocate_list_in_region(8, 8, 42, ListRegion::Temporary);
+        assert!(!header.is_null());
+        // SAFETY: `header` was just allocated above and is not aliased.
+        #[allow(unsafe_code)]
+        let list = unsafe { &*header };
+        assert_eq!(list.region(), ListRegion::Temporary);
+        context.leave_temporary_scope();
+    }
+
+    #[test]
+    fn independent_list_headers_do_not_share_storage() {
+        let mut context = ExecutionContext::new();
+        let first = context.allocate_list_in_region(4, 4, 1, ListRegion::Persistent);
+        let second = context.allocate_list_in_region(8, 8, 2, ListRegion::Persistent);
+        assert_ne!(first as *const (), second as *const ());
+        // SAFETY: both headers were just allocated above and are not aliased.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!((*first).element_type_key(), 1);
+            assert_eq!((*second).element_type_key(), 2);
+        }
+    }
 
     #[test]
     fn allocation_is_zeroed_and_bounds_errors_are_controlled() {
