@@ -173,6 +173,16 @@ pub enum Instruction {
         element_type: Type,
         region: AllocationRegion,
     },
+    /// `list.Add(value)`: appends `value` to `list`'s buffer, growing it if
+    /// needed. `list`'s type is always `List(element)` for some concrete
+    /// `element`, and `value.type_` is always exactly that `element` type;
+    /// nothing else is stored here; the backend derives size/align/type key
+    /// from `value.type_` (or, symmetrically, from `list.type_`'s inner
+    /// element), exactly like `AllocateList`.
+    ListAdd {
+        list: Operand,
+        value: Operand,
+    },
 }
 
 /// Runtime services reachable from generated code. Backends map each variant

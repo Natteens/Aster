@@ -229,6 +229,13 @@ pub enum ExpressionKind {
     StringLength(Box<Expression>),
     /// `list.Length`: reads the `length` field of a `List<T>` header.
     ListLength(Box<Expression>),
+    /// `list.Add(value)`: appends `value`, growing the buffer if needed.
+    /// Always typed `void`. `value`'s type is exactly the list's element
+    /// type (already converted, if needed, by the time this is built).
+    ListAdd {
+        list: Box<Expression>,
+        value: Box<Expression>,
+    },
     Member {
         object: Box<Expression>,
         symbol: SymbolId,

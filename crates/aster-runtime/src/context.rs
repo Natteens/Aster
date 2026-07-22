@@ -25,7 +25,7 @@ impl AsterArray {
 
 /// Which arena owns a `List<T>`'s header and (once grown) its buffer.
 /// Recorded explicitly at allocation time because a future grow operation
-/// must reuse the exact same arena — never deduced later by comparing
+/// must reuse the exact same arena â€” never deduced later by comparing
 /// pointer addresses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -40,7 +40,7 @@ pub enum ListRegion {
 /// growable buffer instead.
 ///
 /// Invariant: `data` is only ever dereferenced when `capacity > 0`. A freshly
-/// allocated list has `capacity == 0`, and `data` is `null` in that case —
+/// allocated list has `capacity == 0`, and `data` is `null` in that case â€”
 /// an internal detail of this header, never a value observable from Aster
 /// (`List<T>` itself is never `null`; only this empty-buffer sentinel is).
 #[repr(C)]
@@ -352,7 +352,7 @@ impl ExecutionContext {
 
     /// Allocate an empty `List<T>` header (`length == capacity == 0`, no
     /// buffer yet) in the arena selected by `region`. Every failure is
-    /// reported through `self.fail` and returns a null pointer — never a
+    /// reported through `self.fail` and returns a null pointer â€” never a
     /// panic, never a trap, never a partially written header (nothing is
     /// written to the header until every validation has passed). Capacity
     /// is not reserved ahead of time: growth is a future operation.
@@ -405,6 +405,224 @@ impl ExecutionContext {
         }
         self.record_allocation(AllocationCategory::Object, size_of::<AsterList>());
         header_ptr
+    }
+
+    /// Every invariant a well-formed `AsterList` header must satisfy,
+    /// independent of any particular operation. Shared by `Length` and `Add`
+    /// so there is exactly one definition of "a valid list header" â€” never
+    /// duplicated, never re-derived ad hoc at each call site.
+    ///
+    /// # Safety
+    ///
+    /// `list` must be non-null and point to a header this runtime allocated.
+    fn validate_list_header(&mut self, list: *const AsterList) -> bool {
+        // SAFETY: caller guarantees `list` is non-null and runtime-owned;
+        // every field is read once, transiently, into locals below.
+        #[allow(unsafe_code)]
+        let (length, capacity, element_size, element_align, data_is_null) = unsafe {
+            (
+                (*list).length,
+                (*list).capacity,
+                (*list).element_size,
+                (*list).element_align,
+                (*list).data.is_null(),
+            )
+        };
+        if length < 0 {
+            self.fail("list header has a negative length");
+            return false;
+        }
+        if capacity < 0 {
+            self.fail("list header has a negative capacity");
+            return false;
+        }
+        if length > capacity {
+            self.fail("list header has a length greater than its capacity");
+            return false;
+        }
+        if element_size == 0 {
+            self.fail("list header has a zero element size");
+            return false;
+        }
+        if !element_align.is_power_of_two() {
+            self.fail("list header has a non-power-of-two element alignment");
+            return false;
+        }
+        if capacity == 0 {
+            if !data_is_null {
+                self.fail("list header has a data pointer despite zero capacity");
+                return false;
+            }
+        } else if data_is_null {
+            self.fail("list header has a null data pointer despite a positive capacity");
+            return false;
+        }
+        true
+    }
+
+    /// Grows a list's buffer geometrically (`0 -> 4`, then doubling) and
+    /// copies the `length` existing elements into it. Returns `None` (after
+    /// calling `self.fail`) on any overflow, missing temporary scope, or
+    /// arena failure; the caller must return immediately in that case,
+    /// leaving the header untouched.
+    fn grow_list_buffer(
+        &mut self,
+        data: *mut u8,
+        length: i32,
+        capacity: i32,
+        element_size: u32,
+        element_align: u32,
+        region: ListRegion,
+    ) -> Option<(*mut u8, i32)> {
+        let new_capacity = if capacity == 0 {
+            Some(4_i32)
+        } else {
+            capacity.checked_mul(2)
+        };
+        let Some(new_capacity) = new_capacity else {
+            self.fail("list capacity overflow while growing");
+            return None;
+        };
+        let Ok(new_capacity_usize) = usize::try_from(new_capacity) else {
+            self.fail("list capacity overflow while growing");
+            return None;
+        };
+        let Some(byte_size) =
+            new_capacity_usize.checked_mul(usize::try_from(element_size).unwrap_or(0))
+        else {
+            self.fail("list buffer size overflow while growing");
+            return None;
+        };
+        if byte_size == 0 {
+            self.fail("list buffer size overflow while growing");
+            return None;
+        }
+        if region == ListRegion::Temporary && self.temporary_scopes.is_empty() {
+            self.fail("temporary list growth requires an active temporary scope");
+            return None;
+        }
+        let new_data = {
+            let align = usize::try_from(element_align).unwrap_or(1);
+            let arena = if region == ListRegion::Temporary {
+                &mut self.temporary_arena
+            } else {
+                &mut self.arena
+            };
+            arena.alloc(byte_size, align)
+        };
+        let old_byte_len =
+            usize::try_from(length).unwrap_or(0) * usize::try_from(element_size).unwrap_or(0);
+        if !data.is_null() && old_byte_len > 0 {
+            // SAFETY: `data` (the previous buffer) holds `old_byte_len` valid
+            // bytes, already validated by the caller; `new_data` is
+            // `byte_size >= old_byte_len` freshly allocated bytes with no
+            // other reference to them yet.
+            #[allow(unsafe_code)]
+            unsafe {
+                ptr::copy_nonoverlapping(data, new_data, old_byte_len);
+            }
+        }
+        self.record_allocation(AllocationCategory::Object, byte_size);
+        Some((new_data, new_capacity))
+    }
+
+    /// Appends one element to `list`'s buffer, growing it geometrically
+    /// (`0 -> 4`, then doubling) when full. Every failure is reported
+    /// through `self.fail` and leaves the header exactly as it was before
+    /// this call (`length` unchanged, no partial growth applied) â€” never a
+    /// panic, a trap, or a partially updated header. `source` needs to
+    /// remain valid only for the duration of this call; nothing about it is
+    /// retained past it.
+    fn list_add(
+        &mut self,
+        list: *mut AsterList,
+        expected_element_size: u32,
+        expected_element_align: u32,
+        expected_element_type_key: u64,
+        source: *const u8,
+    ) {
+        if list.is_null() {
+            self.fail("list.Add received a null list");
+            return;
+        }
+        if source.is_null() {
+            self.fail("list.Add received a null source value");
+            return;
+        }
+        if !self.validate_list_header(list) {
+            return;
+        }
+        // SAFETY: `list` was just validated above; every field is read once,
+        // transiently, into locals below.
+        #[allow(unsafe_code)]
+        let (length, capacity, element_size, element_align, element_type_key, region, data) = unsafe {
+            (
+                (*list).length,
+                (*list).capacity,
+                (*list).element_size,
+                (*list).element_align,
+                (*list).element_type_key,
+                (*list).region,
+                (*list).data,
+            )
+        };
+        if expected_element_size != element_size {
+            self.fail(format!(
+                "list.Add element size mismatch: expected {expected_element_size}, header has {element_size}"
+            ));
+            return;
+        }
+        if expected_element_align != element_align {
+            self.fail(format!(
+                "list.Add element alignment mismatch: expected {expected_element_align}, header has {element_align}"
+            ));
+            return;
+        }
+        if expected_element_type_key != element_type_key {
+            self.fail("list.Add element type key mismatch");
+            return;
+        }
+
+        let (data, capacity) = if length == capacity {
+            let Some(grown) =
+                self.grow_list_buffer(data, length, capacity, element_size, element_align, region)
+            else {
+                return;
+            };
+            grown
+        } else {
+            (data, capacity)
+        };
+
+        let Some(new_length) = length.checked_add(1) else {
+            self.fail("list length overflow");
+            return;
+        };
+        let offset =
+            usize::try_from(length).unwrap_or(0) * usize::try_from(element_size).unwrap_or(0);
+        // SAFETY: `data` has room for at least `length + 1` elements of
+        // `element_size` bytes (unchanged with spare capacity, or freshly
+        // grown above); `source` was validated non-null and the caller
+        // guarantees it is readable for `element_size` bytes for the
+        // duration of this call.
+        #[allow(unsafe_code)]
+        unsafe {
+            ptr::copy_nonoverlapping(
+                source,
+                data.add(offset),
+                usize::try_from(element_size).unwrap_or(0),
+            );
+        }
+
+        // SAFETY: `list` was validated above; every field is updated
+        // together, only after the new element was fully written, so no
+        // partially updated header is ever observable.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*list).data = data;
+            (*list).capacity = capacity;
+            (*list).length = new_length;
+        }
     }
 
     pub(crate) fn allocate_object(&mut self, size: u32) -> *mut u8 {
@@ -628,11 +846,44 @@ pub extern "C" fn aster_rt_list_length(
     if context.is_null() || list.is_null() {
         return 0;
     }
-    // SAFETY: list headers are owned by the live context passed alongside it.
+    // SAFETY: generated functions receive the live host-owned context as their
+    // hidden first parameter, and invocation cannot outlive that context.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    if !context.validate_list_header(list) {
+        return 0;
+    }
+    // SAFETY: list headers are owned by the live context passed alongside it,
+    // and the header was just validated above.
     #[allow(unsafe_code)]
     unsafe {
         (*list).length
     }
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_list_add(
+    context: *mut ExecutionContext,
+    list: *mut AsterList,
+    expected_element_size: i32,
+    expected_element_align: i32,
+    expected_element_type_key: i64,
+    source_value_address: *const u8,
+) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: generated functions receive the live host-owned context as their
+    // hidden first parameter, and invocation cannot outlive that context.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let size = u32::try_from(expected_element_size).unwrap_or(0);
+    let align = u32::try_from(expected_element_align).unwrap_or(0);
+    // `as u64` is a bit-preserving reinterpretation, exactly like
+    // `aster_rt_list_new`'s `element_type_key` handling.
+    #[allow(clippy::cast_sign_loss)]
+    let type_key = expected_element_type_key as u64;
+    context.list_add(list, size, align, type_key, source_value_address);
 }
 
 #[cfg(test)]
@@ -792,6 +1043,289 @@ mod tests {
         #[allow(unsafe_code)]
         unsafe {
             assert_eq!((*list).region(), ListRegion::Temporary);
+        }
+    }
+
+    fn source_address(value: &i32) -> *const u8 {
+        (std::ptr::from_ref(value)).cast::<u8>()
+    }
+
+    #[test]
+    fn list_add_appends_and_increments_length() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let value = 10_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        assert!(context.take_error().is_none());
+        assert_eq!(aster_rt_list_length(context_pointer, list), 1);
+        // SAFETY: `list` was just written to above and is not aliased.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!((*list).capacity(), 4);
+            assert_eq!(std::ptr::read((*list).data.cast::<i32>()), 10);
+        }
+    }
+
+    #[test]
+    fn list_add_grows_geometrically_and_preserves_every_previous_element() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let expected_capacities = [4, 4, 4, 4, 8, 8, 8, 8, 16, 16, 16, 16, 16, 16, 16, 16, 32];
+        for (index, &expected_capacity) in expected_capacities.iter().enumerate() {
+            let value = i32::try_from(index).expect("small index");
+            aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+            assert!(context.take_error().is_none(), "add {index} failed");
+            // SAFETY: `list` was just written to above and is not aliased.
+            #[allow(unsafe_code)]
+            unsafe {
+                assert_eq!((*list).capacity(), expected_capacity, "after add {index}");
+            }
+        }
+        assert_eq!(
+            aster_rt_list_length(context_pointer, list),
+            i32::try_from(expected_capacities.len()).unwrap()
+        );
+        for index in 0..expected_capacities.len() {
+            // SAFETY: every slot up to `length` was written by a successful
+            // `aster_rt_list_add` above.
+            #[allow(unsafe_code)]
+            let stored = unsafe { std::ptr::read((*list).data.cast::<i32>().add(index)) };
+            assert_eq!(stored, i32::try_from(index).unwrap(), "element {index}");
+        }
+    }
+
+    #[test]
+    fn list_add_does_not_grow_when_space_remains() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        // SAFETY: `list` was just written to above and is not aliased.
+        #[allow(unsafe_code)]
+        let data_after_first_add = unsafe { (*list).data };
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        // SAFETY: same as above.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!((*list).data, data_after_first_add, "buffer must not move");
+            assert_eq!((*list).capacity(), 4, "capacity must not change");
+        }
+    }
+
+    #[test]
+    fn list_add_rejects_a_null_list() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let value = 1_i32;
+        aster_rt_list_add(
+            context_pointer,
+            std::ptr::null_mut(),
+            4,
+            4,
+            1,
+            source_address(&value),
+        );
+        assert!(context.take_error().is_some());
+    }
+
+    #[test]
+    fn list_add_rejects_a_null_source() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, std::ptr::null());
+        assert!(context.take_error().is_some());
+        assert_eq!(aster_rt_list_length(context_pointer, list), 0);
+    }
+
+    #[test]
+    fn list_add_rejects_element_size_mismatch() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 8, 4, 1, source_address(&value));
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("size mismatch"))
+        );
+        assert_eq!(aster_rt_list_length(context_pointer, list), 0);
+    }
+
+    #[test]
+    fn list_add_rejects_element_align_mismatch() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 8, 1, source_address(&value));
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("alignment mismatch"))
+        );
+        assert_eq!(aster_rt_list_length(context_pointer, list), 0);
+    }
+
+    #[test]
+    fn list_add_rejects_element_type_key_mismatch() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 2, source_address(&value));
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("type key mismatch"))
+        );
+        assert_eq!(aster_rt_list_length(context_pointer, list), 0);
+    }
+
+    #[test]
+    fn list_add_rejects_a_header_with_negative_length() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        // SAFETY: `list` was just allocated above; this simulates a
+        // corrupted header for a synthetic MIR/runtime test.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*list).length = -1;
+        }
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("negative length"))
+        );
+    }
+
+    #[test]
+    fn list_add_rejects_a_header_with_length_greater_than_capacity() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        // SAFETY: same as above.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*list).length = 5;
+        }
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("length greater than"))
+        );
+    }
+
+    #[test]
+    fn list_add_rejects_a_header_with_positive_capacity_but_null_data() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        // SAFETY: same as above.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*list).capacity = 4;
+        }
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("null data pointer"))
+        );
+    }
+
+    #[test]
+    fn list_add_rejects_capacity_overflow_while_growing() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        // SAFETY: simulates a list that has already grown to the edge of
+        // `i32`, so the next doubling must overflow â€” this is otherwise
+        // unreachable without billions of real `Add` calls.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*list).length = i32::MAX;
+            (*list).capacity = i32::MAX;
+            (*list).data = source_address(&1_i32).cast_mut();
+        }
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("capacity overflow"))
+        );
+        assert_eq!(aster_rt_list_length(context_pointer, list), i32::MAX);
+    }
+
+    #[test]
+    fn list_add_requires_an_active_temporary_scope_to_grow_a_temporary_list() {
+        // A temporary list cannot realistically outlive its creating scope
+        // (leaving the scope zeroes its header's memory, so a stale header
+        // is caught by the "zero element size" check well before this one).
+        // This instead simulates the only other way the runtime could see a
+        // well-formed `Temporary`-region header with no active scope: a
+        // persistent (never-rewound) header whose `region` field a synthetic
+        // MIR/runtime test set to `Temporary` directly.
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        // SAFETY: `list` was just allocated above and is not aliased.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*list).region = ListRegion::Temporary;
+        }
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("temporary list growth"))
+        );
+        assert_eq!(aster_rt_list_length(context_pointer, list), 0);
+    }
+
+    #[test]
+    fn list_add_stores_reference_identity_not_a_structural_copy() {
+        // A "class reference" element is, at this ABI layer, just a pointer;
+        // `Add` must copy that pointer's bits (identity), never dereference
+        // or clone whatever it points to.
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let pointer_size = i32::try_from(std::mem::size_of::<*const i32>()).unwrap();
+        let pointer_align = i32::try_from(std::mem::align_of::<*const i32>()).unwrap();
+        let list = aster_rt_list_new(context_pointer, pointer_size, pointer_align, 7);
+        let referenced = 42_i32;
+        let reference: *const i32 = &raw const referenced;
+        let reference_address = std::ptr::from_ref(&reference).cast::<u8>();
+        aster_rt_list_add(
+            context_pointer,
+            list,
+            pointer_size,
+            pointer_align,
+            7,
+            reference_address,
+        );
+        assert!(context.take_error().is_none());
+        // SAFETY: `list` was just written to above and is not aliased.
+        #[allow(unsafe_code)]
+        unsafe {
+            let stored = std::ptr::read((*list).data.cast::<*const i32>());
+            assert_eq!(
+                stored, reference,
+                "stored pointer must be the same identity"
+            );
+            assert_eq!(*stored, 42);
         }
     }
 

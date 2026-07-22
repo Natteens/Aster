@@ -76,6 +76,16 @@ impl FunctionLowerer {
                     .expect("validated list produces a value");
                 Some(self.temporary(expression.type_.clone(), mir::RvalueKind::ListLength(list)))
             }
+            hir::ExpressionKind::ListAdd { list, value } => {
+                let list = self
+                    .lower_expression(list)
+                    .expect("validated list produces a value");
+                let value = self
+                    .lower_expression(value)
+                    .expect("validated value produces a value");
+                self.instruction(mir::Instruction::ListAdd { list, value });
+                None
+            }
             hir::ExpressionKind::StringLength(value) => {
                 let value = self
                     .lower_expression(value)

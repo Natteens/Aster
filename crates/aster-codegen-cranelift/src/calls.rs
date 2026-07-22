@@ -708,6 +708,53 @@ impl Codegen {
         let list = builder.inst_results(call)[0];
         self.store_scalar(builder, destination, list, state)
     }
+
+    /// `list.Add(value)`: materializes `value`'s full representation at a
+    /// stable address (an aggregate's address, already produced by
+    /// `translate_operand`; otherwise a fresh stack slot holding the
+    /// translated scalar/pointer value) and hands it to the universal
+    /// `aster_rt_list_add`, which copies exactly `element_size` bytes from
+    /// that address — never a `transmute`, never a type-specific ABI.
+    pub(super) fn translate_list_add(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        list: &mir::Operand,
+        value: &mir::Operand,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let list_value = self.translate_operand(builder, list, state)?;
+        let layout = self.layouts.type_layout(&value.type_)?;
+        let source_address = if is_aggregate(&value.type_) {
+            self.translate_operand(builder, value, state)?
+        } else {
+            let value_ssa = self.translate_operand(builder, value, state)?;
+            let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                layout.size,
+                layout.align_shift,
+            ));
+            builder.ins().stack_store(value_ssa, slot, 0);
+            builder.ins().stack_addr(self.pointer_type, slot, 0)
+        };
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids["aster_rt_list_add"], builder.func);
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("list.Add is missing its ExecutionContext"))?;
+        let size = builder.ins().iconst(types::I32, i64::from(layout.size));
+        let align = builder
+            .ins()
+            .iconst(types::I32, i64::from(1_u32 << layout.align_shift));
+        #[allow(clippy::cast_possible_wrap)]
+        let type_key_bits = mir::type_key(&value.type_) as i64;
+        let type_key = builder.ins().iconst(types::I64, type_key_bits);
+        builder.ins().call(
+            function_ref,
+            &[context, list_value, size, align, type_key, source_address],
+        );
+        Ok(())
+    }
 }
 
 /// The concrete `SymbolId` (as an `i64` immediate) carried by a resolved

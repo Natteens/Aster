@@ -462,12 +462,33 @@ impl Analyzer<'_> {
                     }
                 } else {
                     let receiver = self.expression(object);
-                    if matches!(receiver, Type::List(_)) {
-                        self.diagnostics.push(Diagnostic::error(
-                            format!("list has no member `{name}`"),
-                            callee.span,
-                        ));
-                        return Type::Unknown;
+                    if let Type::List(element_type) = &receiver {
+                        if name != "Add" {
+                            self.diagnostics.push(Diagnostic::error(
+                                format!("list has no member `{name}`"),
+                                callee.span,
+                            ));
+                            return Type::Unknown;
+                        }
+                        if arguments.len() != 1 {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    format!(
+                                        "`List<T>.Add` expects 1 argument, found {}",
+                                        arguments.len()
+                                    ),
+                                    span,
+                                )
+                                .with_help("pass exactly one value of the list's element type"),
+                            );
+                            return Type::Unknown;
+                        }
+                        self.require_assignable_value(
+                            element_type,
+                            &argument_types[0],
+                            &arguments[0],
+                        );
+                        return Type::Void;
                     }
                     let interface_dispatch = matches!(receiver, Type::Interface(_));
                     let (Type::User(type_name)

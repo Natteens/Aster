@@ -305,11 +305,7 @@ fn validate_instruction(
             element_type,
             length,
             ..
-        } => {
-            validate_place(destination, function_name)?;
-            validate_value_type(element_type, function_name)?;
-            validate_operand(length, function_name)
-        }
+        } => validate_allocate_array(destination, element_type, length, function_name),
         mir::Instruction::AllocateObject {
             destination, class, ..
         } => {
@@ -334,7 +330,27 @@ fn validate_instruction(
             enums,
             locals,
         ),
+        mir::Instruction::ListAdd { list, value } => validate_list_add(
+            list,
+            value,
+            function_name,
+            classes,
+            structs,
+            interfaces,
+            enums,
+        ),
     }
+}
+
+fn validate_allocate_array(
+    destination: &mir::Place,
+    element_type: &mir::Type,
+    length: &mir::Operand,
+    function_name: &str,
+) -> Result<(), BackendError> {
+    validate_place(destination, function_name)?;
+    validate_value_type(element_type, function_name)?;
+    validate_operand(length, function_name)
 }
 
 fn validate_call_intrinsic(
@@ -405,6 +421,41 @@ fn validate_allocate_list(
                 type_name_owned(&expected),
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_list_add(
+    list: &mir::Operand,
+    value: &mir::Operand,
+    function_name: &str,
+    classes: &HashSet<mir::SymbolId>,
+    structs: &HashSet<mir::SymbolId>,
+    interfaces: &HashSet<mir::SymbolId>,
+    enums: &HashSet<mir::SymbolId>,
+) -> Result<(), BackendError> {
+    validate_operand(list, function_name)?;
+    validate_operand(value, function_name)?;
+    let mir::Type::List(element_type) = &list.type_ else {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a `ListAdd` whose receiver is not `List<T>` (found `{}`)",
+            type_name_owned(&list.type_)
+        )));
+    };
+    validate_list_element_type(
+        element_type,
+        function_name,
+        classes,
+        structs,
+        interfaces,
+        enums,
+    )?;
+    if value.type_ != **element_type {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a `ListAdd` on `{}` receiving a value of type `{}`",
+            type_name_owned(&list.type_),
+            type_name_owned(&value.type_),
+        )));
     }
     Ok(())
 }
@@ -1709,5 +1760,134 @@ mod tests {
         let error = validate_module(&module)
             .expect_err("List<decimal> has no runtime representation and must be rejected");
         assert!(error.message().contains("decimal"));
+    }
+
+    /// `ListAdd` has real source syntax (unlike `AllocateList`/`ListLength`
+    /// when their own validation tests were written), but semantic analysis
+    /// already prevents a `List<A>`/value-`B` mismatch from ever compiling —
+    /// so, like those, every scenario here is hand-built MIR.
+    fn list_add_module(list_type: mir::Type, value_type: mir::Type) -> mir::Module {
+        let list_local = mir::LocalId(0);
+        let value_local = mir::LocalId(1);
+        mir::Module {
+            structs: Vec::new(),
+            classes: Vec::new(),
+            interfaces: Vec::new(),
+            enums: Vec::new(),
+            interface_implementations: Vec::new(),
+            functions: vec![mir::Function {
+                constructor: false,
+                symbol: mir::SymbolId(1),
+                owner: None,
+                name: "Add".to_owned(),
+                visibility: mir::Visibility::Public,
+                parameters: vec![
+                    mir::Local {
+                        id: list_local,
+                        symbol: None,
+                        name: "list".to_owned(),
+                        type_: list_type.clone(),
+                        mutable: false,
+                        temporary: false,
+                    },
+                    mir::Local {
+                        id: value_local,
+                        symbol: None,
+                        name: "value".to_owned(),
+                        type_: value_type.clone(),
+                        mutable: false,
+                        temporary: false,
+                    },
+                ],
+                locals: Vec::new(),
+                return_type: mir::Type::Void,
+                entry: mir::BasicBlockId(0),
+                blocks: vec![mir::BasicBlock {
+                    id: mir::BasicBlockId(0),
+                    instructions: vec![mir::Instruction::ListAdd {
+                        list: mir::Operand {
+                            type_: list_type,
+                            kind: mir::OperandKind::Copy(mir::Place::Local(list_local)),
+                        },
+                        value: mir::Operand {
+                            type_: value_type,
+                            kind: mir::OperandKind::Copy(mir::Place::Local(value_local)),
+                        },
+                    }],
+                    terminator: mir::Terminator::Return(None),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn list_add_accepts_a_well_formed_call() {
+        let module = list_add_module(mir::Type::List(Box::new(mir::Type::Int)), mir::Type::Int);
+        validate_module(&module).expect("List<int>.Add(int) is well-formed");
+    }
+
+    #[test]
+    fn list_add_rejects_a_non_list_receiver() {
+        let module = list_add_module(mir::Type::Int, mir::Type::Int);
+        let error = validate_module(&module)
+            .expect_err("ListAdd on a non-List<T> receiver must be rejected");
+        assert!(error.message().contains("receiver is not"));
+    }
+
+    #[test]
+    fn list_add_rejects_a_mismatched_value_type() {
+        let module = list_add_module(mir::Type::List(Box::new(mir::Type::Int)), mir::Type::Long);
+        let error = validate_module(&module).expect_err("List<int>.Add(long) must be rejected");
+        assert!(error.message().contains("List<int>"));
+        assert!(error.message().contains("long"));
+    }
+
+    #[test]
+    fn list_add_rejects_a_decimal_element() {
+        let module = list_add_module(
+            mir::Type::List(Box::new(mir::Type::Decimal)),
+            mir::Type::Decimal,
+        );
+        let error =
+            validate_module(&module).expect_err("List<decimal> has no runtime representation");
+        assert!(error.message().contains("decimal"));
+    }
+
+    #[test]
+    fn list_add_rejects_an_unknown_class_element() {
+        let unknown_class = mir::Type::Class(mir::SymbolId(999));
+        let module = list_add_module(
+            mir::Type::List(Box::new(unknown_class.clone())),
+            unknown_class,
+        );
+        let error = validate_module(&module)
+            .expect_err("a List<T> element class absent from the module must be rejected");
+        assert!(error.message().contains("element class is unknown"));
+    }
+
+    #[test]
+    fn list_add_rejects_a_nested_list_mismatch() {
+        let module = list_add_module(
+            mir::Type::List(Box::new(mir::Type::List(Box::new(mir::Type::Int)))),
+            mir::Type::List(Box::new(mir::Type::Long)),
+        );
+        let error =
+            validate_module(&module).expect_err("List<List<int>>.Add(List<long>) must be rejected");
+        assert!(error.message().contains("List<List<int>>"));
+    }
+
+    #[test]
+    fn list_add_accepts_a_known_class_element() {
+        let class_symbol = mir::SymbolId(42);
+        let mut module = list_add_module(
+            mir::Type::List(Box::new(mir::Type::Class(class_symbol))),
+            mir::Type::Class(class_symbol),
+        );
+        module.classes.push(mir::ClassDefinition {
+            symbol: class_symbol,
+            name: "Widget".to_owned(),
+            fields: Vec::new(),
+        });
+        validate_module(&module).expect("List<Widget>.Add(Widget) with Widget declared is valid");
     }
 }

@@ -537,6 +537,16 @@ fn instruction_escape(
         mir::Instruction::AllocateArray { .. }
         | mir::Instruction::AllocateObject { .. }
         | mir::Instruction::AllocateList { .. } => None,
+        // Storing a reference into a list's buffer is an aggregate store,
+        // exactly like `Assign{target: Field/Index, value: Use(alias)}`
+        // (`assignment_escape` above): conservatively persistent, regardless
+        // of the list's own classification. Only the *value* operand can
+        // escape here; `list` itself never does merely by receiving an
+        // `Add` (mirrors `ArrayLength`/`ListLength` not forcing their own
+        // receiver to escape).
+        mir::Instruction::ListAdd { value, .. } => direct_alias(value, aliases)
+            .is_some()
+            .then_some(EscapeReason::Stored),
     }
 }
 
@@ -1183,6 +1193,64 @@ mod tests {
         assert_eq!(
             list_regions(source, "Make"),
             vec![mir::AllocationRegion::Persistent]
+        );
+    }
+
+    // --- List B2A: `values.Add(value)` and its effect on escape analysis ---
+
+    #[test]
+    fn a_reference_added_to_a_list_is_persistent() {
+        let source = "public class Box { public int value; public Box(int value) { this.value = value; } } \
+                       public int Run() { List<Box> values = new List<Box>(); Box box = new Box(10); values.Add(box); return box.value; }";
+        let classifications = classifications(source, "Run");
+        assert!(
+            classifications.contains(&EscapeClassification::Persistent(EscapeReason::Stored)),
+            "{classifications:#?}"
+        );
+    }
+
+    #[test]
+    fn an_alias_of_a_value_added_to_a_list_is_also_persistent() {
+        let source = "public class Box { public int value; public Box(int value) { this.value = value; } } \
+                       public int Run() { List<Box> values = new List<Box>(); Box first = new Box(10); Box second = first; values.Add(second); return first.value; }";
+        let classifications = classifications(source, "Run");
+        assert!(
+            classifications
+                .iter()
+                .filter(|classification| matches!(
+                    classification,
+                    EscapeClassification::Persistent(EscapeReason::Stored)
+                ))
+                .count()
+                >= 1,
+            "{classifications:#?}"
+        );
+    }
+
+    #[test]
+    fn calling_add_does_not_by_itself_force_the_list_to_escape() {
+        // Adding to a list is not, on its own, a reason for the *list*
+        // (as opposed to the value passed to `Add`) to escape — mirrors how
+        // `ArrayLength`/`ListLength` never force their own receiver to
+        // escape either.
+        let source = "public int Run() { List<int> values = new List<int>(); values.Add(1); values.Add(2); return values.Length; }";
+        assert_eq!(
+            list_regions(source, "Run"),
+            vec![mir::AllocationRegion::Temporary]
+        );
+    }
+
+    #[test]
+    fn transitive_storage_through_a_helper_function_is_persistent() {
+        let source = "public class Box { public int value; public Box(int value) { this.value = value; } } \
+                       public void StoreInto(List<Box> values, Box value) { values.Add(value); } \
+                       public int Run() { List<Box> values = new List<Box>(); Box box = new Box(10); StoreInto(values, box); return box.value; }";
+        let classifications = classifications(source, "Run");
+        assert!(
+            classifications.contains(&EscapeClassification::Persistent(
+                EscapeReason::PassedToCall
+            )),
+            "{classifications:#?}"
         );
     }
 }

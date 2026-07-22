@@ -177,16 +177,29 @@ fn list_of_int_is_not_assignable_to_list_of_long() {
 }
 
 #[test]
-fn list_has_no_member_operations_beyond_length() {
-    let source = "public int Run(List<int> values) { values.Add(1); return values.Length; }";
-    let diagnostics =
-        aster_compiler::compile(source).expect_err("`Add` is not implemented in List B1");
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("no member `Add`")),
-        "missing `Add` rejection in {diagnostics:#?}"
-    );
+fn list_has_no_member_operations_beyond_length_and_add() {
+    for (source, expected) in [
+        (
+            "public int Run(List<int> values) { return values.Get(0); }",
+            "no member `Get`",
+        ),
+        (
+            "public int Run(List<int> values) { values.Set(0, 1); return 0; }",
+            "no member `Set`",
+        ),
+        (
+            "public int Run(List<int> values) { values.RemoveAt(0); return 0; }",
+            "no member `RemoveAt`",
+        ),
+    ] {
+        let diagnostics = aster_compiler::compile(source).expect_err("member not yet implemented");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(expected)),
+            "missing `{expected}` in {diagnostics:#?}"
+        );
+    }
 }
 
 // --- List B1: `new List<T>()` and `.Length` -----------------------------
@@ -329,6 +342,130 @@ fn a_class_field_named_length_still_uses_ordinary_member_resolution() {
     let source = "public class Widget { public int Length; public Widget() { Length = 5; } } \
                   public int Run() { Widget widget = new Widget(); return widget.Length; }";
     aster_compiler::compile(source).expect("a class field named `Length` is unaffected by List");
+}
+
+// --- List B2A: `values.Add(value)` -------------------------------------
+
+#[test]
+fn list_add_accepts_a_compatible_value() {
+    let source = "public int Run() { List<int> values = new List<int>(); values.Add(1); return values.Length; }";
+    aster_compiler::compile(source).expect("List<int>.Add(int) is well-formed");
+}
+
+#[test]
+fn list_add_returns_void() {
+    let source =
+        "public int Run() { List<int> values = new List<int>(); int x = values.Add(1); return x; }";
+    let diagnostics = aster_compiler::compile(source).expect_err("Add returns void, not int");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("void")),
+        "missing a void-related mismatch in {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn list_add_diagnostics_are_specific() {
+    for (source, expected) in [
+        (
+            "public int Run() { List<int> values = new List<int>(); values.Add(); return 0; }",
+            "expects 1 argument, found 0",
+        ),
+        (
+            "public int Run() { List<int> values = new List<int>(); values.Add(1, 2); return 0; }",
+            "expects 1 argument, found 2",
+        ),
+        (
+            "public int Run() { List<int> values = new List<int>(); values.Add(\"text\"); return 0; }",
+            "expected",
+        ),
+    ] {
+        let diagnostics = aster_compiler::compile(source).expect_err("invalid `Add` usage");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(expected)),
+            "missing `{expected}` in {diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn an_ordinary_add_method_on_a_class_still_resolves_normally() {
+    let source = "public class Accumulator { public int total; public Accumulator() {} \
+                  public void Add(int value) { total = total + value; } } \
+                  public int Run() { Accumulator accumulator = new Accumulator(); \
+                  accumulator.Add(10); return accumulator.total; }";
+    aster_compiler::compile(source).expect("a class's own `Add` method is unaffected by List");
+}
+
+#[test]
+fn a_struct_with_an_add_method_still_resolves_normally() {
+    let source = "public struct Wrapper { public int total; } \
+                  public int AddTo(Wrapper wrapper, int value) { return wrapper.total + value; } \
+                  public int Run() { Wrapper wrapper = Wrapper { total: 1 }; return AddTo(wrapper, 2); }";
+    aster_compiler::compile(source)
+        .expect("an unrelated free function named `Add`-like is unaffected");
+}
+
+#[test]
+fn list_add_evaluates_receiver_then_argument_exactly_once_each() {
+    let source = "public List<int> GetList() { return new List<int>(); } \
+                  public int GetValue() { return 1; } \
+                  public int Run() { GetList().Add(GetValue()); return 0; }";
+    let compilation = aster_compiler::compile(source).expect("GetList().Add(GetValue()) compiles");
+    let run = compilation
+        .mir
+        .functions
+        .iter()
+        .find(|function| function.name == "Run" && function.owner.is_none())
+        .expect("Run is declared");
+    let get_list = compilation
+        .mir
+        .functions
+        .iter()
+        .find(|function| function.name == "GetList" && function.owner.is_none())
+        .expect("GetList is declared")
+        .symbol;
+    let get_value = compilation
+        .mir
+        .functions
+        .iter()
+        .find(|function| function.name == "GetValue" && function.owner.is_none())
+        .expect("GetValue is declared")
+        .symbol;
+    let calls = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction {
+            aster_mir::Instruction::Call { function, .. } => Some(*function),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|&&function| function == get_list)
+            .count(),
+        1,
+        "GetList() must be evaluated exactly once: {calls:?}"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|&&function| function == get_value)
+            .count(),
+        1,
+        "GetValue() must be evaluated exactly once: {calls:?}"
+    );
+    let list_position = calls.iter().position(|&function| function == get_list);
+    let value_position = calls.iter().position(|&function| function == get_value);
+    assert!(
+        list_position < value_position,
+        "GetList() must be called before GetValue(): {calls:?}"
+    );
 }
 
 #[test]

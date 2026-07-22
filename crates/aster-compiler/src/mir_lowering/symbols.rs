@@ -196,6 +196,10 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
             }
         }
         hir::ExpressionKind::NewArray { length, .. } => collect_expression(length, max),
+        hir::ExpressionKind::ListAdd { list, value } => {
+            collect_expression(list, max);
+            collect_expression(value, max);
+        }
         hir::ExpressionKind::Index { array, index } => {
             collect_expression(array, max);
             collect_expression(index, max);

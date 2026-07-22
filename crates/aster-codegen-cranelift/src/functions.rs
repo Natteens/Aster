@@ -163,6 +163,9 @@ impl Codegen {
                 element_type,
                 region,
             } => self.translate_list_allocation(builder, destination, element_type, *region, state),
+            mir::Instruction::ListAdd { list, value } => {
+                self.translate_list_add(builder, list, value, state)
+            }
         }
     }
 }
