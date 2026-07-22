@@ -91,15 +91,27 @@ pub(crate) struct ResolvedEnumCase {
 }
 
 /// A resolved postfix `?` operator. Records the concrete official-`Result`
-/// enums and case positions so HIR lowering can attach symbols and tags without
-/// re-resolving any type or inspecting names.
+/// or official-`Option` enum and case positions so HIR lowering can attach
+/// symbols and tags without re-resolving any type or inspecting names. The
+/// two variants are kept structurally distinct (rather than one shape with
+/// an optional error) because `Option`'s `None` carries no payload at all,
+/// unlike `Result`'s `Error`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ResolvedPropagation {
-    pub result_type: String,
-    pub ok_index: usize,
-    pub error_index: usize,
-    pub function_result_type: String,
-    pub function_error_index: usize,
+pub(crate) enum ResolvedPropagation {
+    Result {
+        result_type: String,
+        ok_index: usize,
+        error_index: usize,
+        function_result_type: String,
+        function_error_index: usize,
+    },
+    Option {
+        option_type: String,
+        some_index: usize,
+        none_index: usize,
+        function_option_type: String,
+        function_none_index: usize,
+    },
 }
 
 #[derive(Clone, Debug, Default)]

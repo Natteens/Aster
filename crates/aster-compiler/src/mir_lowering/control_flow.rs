@@ -402,6 +402,73 @@ impl FunctionLowerer {
         self.enum_field(value_local, ok_case, ok_field, success_type)
     }
 
+    /// Postfix `?` on the official `aster.core.Option<T>`: the same
+    /// evaluate-once, inspect-tag, branch-and-return shape as
+    /// [`Self::lower_propagate_result`], except `None` carries no payload to
+    /// extract -- the early return is a zero-field `EnumConstruct` for the
+    /// enclosing function's own `Option<U>.None`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn lower_propagate_option(
+        &mut self,
+        operand: &hir::Expression,
+        success_type: &hir::Type,
+        some_case: hir::SymbolId,
+        some_field: hir::SymbolId,
+        none_tag: u32,
+        return_type: &hir::Type,
+        return_none_case: hir::SymbolId,
+        return_none_tag: u32,
+    ) -> mir::Operand {
+        let value_operand = self
+            .lower_expression(operand)
+            .expect("validated `?` operand produces a value");
+        let value_local = self.new_temporary(operand.type_.clone());
+        self.assign(
+            mir::Place::Local(value_local),
+            mir::Rvalue {
+                type_: operand.type_.clone(),
+                kind: mir::RvalueKind::Use(value_operand),
+            },
+        );
+        let discriminant = self.temporary(
+            mir::Type::UInt,
+            mir::RvalueKind::Discriminant(mir::Operand {
+                type_: operand.type_.clone(),
+                kind: mir::OperandKind::Copy(mir::Place::Local(value_local)),
+            }),
+        );
+        let is_none = self.temporary(
+            mir::Type::Bool,
+            mir::RvalueKind::Binary {
+                left: discriminant,
+                operator: mir::BinaryOperator::Equal,
+                right: mir::Operand {
+                    type_: mir::Type::UInt,
+                    kind: mir::OperandKind::Constant(mir::Constant::Integer(none_tag.to_string())),
+                },
+            },
+        );
+        let none_block = self.new_block();
+        let some_block = self.new_block();
+        self.terminate_current(mir::Terminator::Branch {
+            condition: is_none,
+            then_block: none_block,
+            else_block: some_block,
+        });
+        self.current = Some(none_block);
+        let propagated = self.temporary(
+            return_type.clone(),
+            mir::RvalueKind::EnumConstruct {
+                case: return_none_case,
+                tag: return_none_tag,
+                fields: vec![],
+            },
+        );
+        self.terminate_current(mir::Terminator::Return(Some(propagated)));
+        self.current = Some(some_block);
+        self.enum_field(value_local, some_case, some_field, success_type)
+    }
+
     fn enum_field(
         &mut self,
         base: mir::LocalId,

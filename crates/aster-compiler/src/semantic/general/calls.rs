@@ -667,6 +667,23 @@ impl Analyzer<'_> {
                 ));
                 return Type::Unknown;
             }
+            (
+                "TryParseBool" | "TryParseInt" | "TryParseUInt" | "TryParseLong" | "TryParseULong",
+                0,
+            ) => match self.try_parse_operation(name, span) {
+                Some(result) => result,
+                None => return Type::Unknown,
+            },
+            (
+                "TryParseBool" | "TryParseInt" | "TryParseUInt" | "TryParseLong" | "TryParseULong",
+                found,
+            ) => {
+                self.diagnostics.push(Diagnostic::error(
+                    format!("`string.{name}` expects 0 arguments, found {found}"),
+                    span,
+                ));
+                return Type::Unknown;
+            }
             _ => {
                 self.diagnostics.push(Diagnostic::error(
                     format!("string has no method `{name}`"),
@@ -698,6 +715,54 @@ impl Analyzer<'_> {
             .string_operations
             .insert(self.model_key(span), operation);
         result
+    }
+
+    /// Resolves one zero-argument `string.TryParse*()` call to its
+    /// `StringOperation` and `Option<target>` result type. `None` means a
+    /// diagnostic was already pushed and the caller should return
+    /// `Type::Unknown`.
+    fn try_parse_operation(
+        &mut self,
+        name: &str,
+        span: Span,
+    ) -> Option<(StringOperation, Vec<Type>, Type)> {
+        let operation = match name {
+            "TryParseBool" => StringOperation::TryParseBool,
+            "TryParseInt" => StringOperation::TryParseInt,
+            "TryParseUInt" => StringOperation::TryParseUInt,
+            "TryParseLong" => StringOperation::TryParseLong,
+            _ => StringOperation::TryParseULong,
+        };
+        let target = operation
+            .parse_target_name()
+            .expect("TryParse* always names a parse target");
+        // `official_option` being absent means `aster.core` was never linked
+        // in at all; reuse the same discovered nominal identity `?` already
+        // trusts, rather than guessing a type spelling of its own.
+        if self.context.official_option.is_none() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!("`string.{name}` requires `aster.core.Option<{target}>`"),
+                    span,
+                )
+                .with_help("add `using aster.core;` to this file"),
+            );
+            return None;
+        }
+        let option_name = crate::standard_library::option_specialization_name(target);
+        if !self.context.types.contains_key(&option_name) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "`string.{name}` requires the `Option<{target}>` specialization, which was not generated"
+                    ),
+                    span,
+                )
+                .with_help("this indicates an internal compiler error, not a source mistake"),
+            );
+            return None;
+        }
+        Some((operation, Vec::new(), Type::Enum(option_name)))
     }
 
     fn resolve_overload(

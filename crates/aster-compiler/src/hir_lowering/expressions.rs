@@ -314,6 +314,18 @@ impl Lowerer<'_> {
                         hir::StringOperation::IndexOf => hir::Type::Int,
                         hir::StringOperation::SubstringFrom
                         | hir::StringOperation::SubstringRange => hir::Type::String,
+                        hir::StringOperation::TryParseBool
+                        | hir::StringOperation::TryParseInt
+                        | hir::StringOperation::TryParseUInt
+                        | hir::StringOperation::TryParseLong
+                        | hir::StringOperation::TryParseULong => {
+                            let target = operation
+                                .parse_target_name()
+                                .expect("TryParse* always names a parse target");
+                            let option_name =
+                                crate::standard_library::option_specialization_name(target);
+                            hir::Type::Enum(self.types[option_name.as_str()])
+                        }
                     };
                     return hir::Expression {
                         type_,
@@ -539,37 +551,72 @@ impl Lowerer<'_> {
             ast::ExpressionKind::Try { operand } => {
                 let resolved = self.model.propagations[&model_key].clone();
                 let value = self.expression(operand);
-                let (ok_case, ok_fields) =
-                    self.enum_cases[&(resolved.result_type.clone(), resolved.ok_index)].clone();
-                let (error_case, error_fields) =
-                    self.enum_cases[&(resolved.result_type.clone(), resolved.error_index)].clone();
-                let (return_error_case, return_error_fields) = self.enum_cases[&(
-                    resolved.function_result_type.clone(),
-                    resolved.function_error_index,
-                )]
-                    .clone();
-                let ok_field = ok_fields[0];
-                let error_field = error_fields[0];
-                let return_error_field = return_error_fields[0];
-                let success_type = self.symbol_types[&ok_field].clone();
-                let error_type = self.symbol_types[&error_field].clone();
-                hir::Expression {
-                    type_: success_type.clone(),
-                    kind: hir::ExpressionKind::PropagateResult {
-                        operand: Box::new(value),
-                        success_type,
-                        error_type,
-                        ok_case,
-                        ok_field,
-                        ok_tag: tag(resolved.ok_index),
-                        error_case,
-                        error_field,
-                        error_tag: tag(resolved.error_index),
-                        return_type: self.current_return.clone(),
-                        return_error_case,
-                        return_error_field,
-                        return_error_tag: tag(resolved.function_error_index),
-                    },
+                match resolved {
+                    crate::semantic::ResolvedPropagation::Result {
+                        result_type,
+                        ok_index,
+                        error_index,
+                        function_result_type,
+                        function_error_index,
+                    } => {
+                        let (ok_case, ok_fields) =
+                            self.enum_cases[&(result_type.clone(), ok_index)].clone();
+                        let (error_case, error_fields) =
+                            self.enum_cases[&(result_type, error_index)].clone();
+                        let (return_error_case, return_error_fields) =
+                            self.enum_cases[&(function_result_type, function_error_index)].clone();
+                        let ok_field = ok_fields[0];
+                        let error_field = error_fields[0];
+                        let return_error_field = return_error_fields[0];
+                        let success_type = self.symbol_types[&ok_field].clone();
+                        let error_type = self.symbol_types[&error_field].clone();
+                        hir::Expression {
+                            type_: success_type.clone(),
+                            kind: hir::ExpressionKind::PropagateResult {
+                                operand: Box::new(value),
+                                success_type,
+                                error_type,
+                                ok_case,
+                                ok_field,
+                                ok_tag: tag(ok_index),
+                                error_case,
+                                error_field,
+                                error_tag: tag(error_index),
+                                return_type: self.current_return.clone(),
+                                return_error_case,
+                                return_error_field,
+                                return_error_tag: tag(function_error_index),
+                            },
+                        }
+                    }
+                    crate::semantic::ResolvedPropagation::Option {
+                        option_type,
+                        some_index,
+                        none_index,
+                        function_option_type,
+                        function_none_index,
+                    } => {
+                        let (some_case, some_fields) =
+                            self.enum_cases[&(option_type.clone(), some_index)].clone();
+                        let (return_none_case, _) =
+                            self.enum_cases[&(function_option_type, function_none_index)].clone();
+                        let some_field = some_fields[0];
+                        let success_type = self.symbol_types[&some_field].clone();
+                        hir::Expression {
+                            type_: success_type.clone(),
+                            kind: hir::ExpressionKind::PropagateOption {
+                                operand: Box::new(value),
+                                success_type,
+                                some_case,
+                                some_field,
+                                some_tag: tag(some_index),
+                                none_tag: tag(none_index),
+                                return_type: self.current_return.clone(),
+                                return_none_case,
+                                return_none_tag: tag(function_none_index),
+                            },
+                        }
+                    }
                 }
             }
             ast::ExpressionKind::Conditional {

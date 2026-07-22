@@ -97,6 +97,20 @@ impl Codegen {
                     state,
                 );
             }
+            mir::Intrinsic::StringTryParseBool
+            | mir::Intrinsic::StringTryParseInt
+            | mir::Intrinsic::StringTryParseUInt
+            | mir::Intrinsic::StringTryParseLong
+            | mir::Intrinsic::StringTryParseULong => {
+                return self.translate_string_try_parse(
+                    builder,
+                    destination,
+                    intrinsic,
+                    arguments,
+                    return_type,
+                    state,
+                );
+            }
             mir::Intrinsic::AsyncSpawn
             | mir::Intrinsic::AsyncState
             | mir::Intrinsic::AsyncSetState
@@ -178,7 +192,12 @@ impl Codegen {
             | mir::Intrinsic::AsyncSetResult
             | mir::Intrinsic::ParallelFor
             | mir::Intrinsic::ParallelForEach
-            | mir::Intrinsic::ParallelReduce => {
+            | mir::Intrinsic::ParallelReduce
+            | mir::Intrinsic::StringTryParseBool
+            | mir::Intrinsic::StringTryParseInt
+            | mir::Intrinsic::StringTryParseUInt
+            | mir::Intrinsic::StringTryParseLong
+            | mir::Intrinsic::StringTryParseULong => {
                 unreachable!("handled by the dedicated translators above")
             }
         };
@@ -603,6 +622,98 @@ impl Codegen {
             .ins()
             .call(function_ref, &[context, array_pointer, count_value]);
         self.store_intrinsic_result(builder, destination, call, state)
+    }
+
+    /// `string.TryParseBool/Int/UInt/Long/ULong()`: the runtime writes the
+    /// complete `Option<T>` representation directly into the destination
+    /// address, exactly like any other aggregate result (`AllocateObject`,
+    /// `ListGet`). `total_size`, `some_tag`/`none_tag`, and `payload_offset`
+    /// all come from `Layouts`, the same shared layout system every other
+    /// aggregate uses -- never a parallel, TryParse-specific computation.
+    fn translate_string_try_parse(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: Option<&mir::Place>,
+        intrinsic: mir::Intrinsic,
+        arguments: &[mir::Operand],
+        return_type: &mir::Type,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let [receiver] = arguments else {
+            return Err(BackendError::new(
+                "string.TryParse* requires exactly one receiver argument",
+            ));
+        };
+        let destination = destination
+            .ok_or_else(|| BackendError::new("string.TryParse* requires a destination"))?;
+        let mir::Type::Enum(symbol) = return_type else {
+            return Err(BackendError::new(
+                "string.TryParse* must return a concrete Option<T>",
+            ));
+        };
+        let (some_tag, none_tag, payload_offset) = {
+            let definition = self.layouts.enums.get(symbol).ok_or_else(|| {
+                BackendError::new("string.TryParse* returns an unknown enum type")
+            })?;
+            let none_case = definition
+                .cases
+                .iter()
+                .find(|case| case.fields.is_empty())
+                .ok_or_else(|| {
+                    BackendError::new("string.TryParse* target is not shaped like Option<T>")
+                })?;
+            let some_case = definition
+                .cases
+                .iter()
+                .find(|case| case.fields.len() == 1)
+                .ok_or_else(|| {
+                    BackendError::new("string.TryParse* target is not shaped like Option<T>")
+                })?;
+            let value_field = &some_case.fields[0];
+            let field_layout = self
+                .layouts
+                .fields
+                .get(&value_field.symbol)
+                .ok_or_else(|| {
+                    BackendError::new("string.TryParse* payload field has no computed layout")
+                })?;
+            (some_case.tag, none_case.tag, field_layout.offset)
+        };
+        let layout = self.layouts.type_layout(return_type)?;
+
+        let receiver_value = self.translate_operand(builder, receiver, state)?;
+        let destination_address = self.place_address(builder, destination, state)?;
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("string.TryParse* is missing its ExecutionContext"))?;
+        let symbol_name = match intrinsic {
+            mir::Intrinsic::StringTryParseBool => "aster_rt_string_try_parse_bool",
+            mir::Intrinsic::StringTryParseInt => "aster_rt_string_try_parse_int",
+            mir::Intrinsic::StringTryParseUInt => "aster_rt_string_try_parse_uint",
+            mir::Intrinsic::StringTryParseLong => "aster_rt_string_try_parse_long",
+            mir::Intrinsic::StringTryParseULong => "aster_rt_string_try_parse_ulong",
+            _ => unreachable!("caller matched only string-try-parse intrinsics"),
+        };
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids[symbol_name], builder.func);
+        let total_size = builder.ins().iconst(types::I32, i64::from(layout.size));
+        let some_tag_value = builder.ins().iconst(types::I32, i64::from(some_tag));
+        let none_tag_value = builder.ins().iconst(types::I32, i64::from(none_tag));
+        let payload_offset_value = builder.ins().iconst(types::I32, i64::from(payload_offset));
+        builder.ins().call(
+            function_ref,
+            &[
+                context,
+                receiver_value,
+                destination_address,
+                total_size,
+                some_tag_value,
+                none_tag_value,
+                payload_offset_value,
+            ],
+        );
+        Ok(())
     }
 
     fn store_intrinsic_result(

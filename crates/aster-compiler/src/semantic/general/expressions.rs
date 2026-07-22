@@ -1,10 +1,10 @@
 use super::{
     Analyzer, AssignmentOperator, BinaryOperator, Binding, Diagnostic, Expression, ExpressionKind,
-    HashSet, IncrementOperator, IntegerFit, InterpolatedPart, Literal, Primitive, PropertyInfo,
-    ResolvedPropagation, ResolvedPropertyAssignment, ResultCases, Span, Type, TypeKind, TypeName,
-    TypeRef, UnaryOperator, UnsignedFit, Visibility, classify_integer, classify_unsigned,
-    compatible, constant_integer, evaluate, fits_long, fits_ulong, integer_value, promoted_numeric,
-    resolve_type_readonly, zero_initializable,
+    HashSet, IncrementOperator, IntegerFit, InterpolatedPart, Literal, OptionCases, Primitive,
+    PropertyInfo, ResolvedPropagation, ResolvedPropertyAssignment, ResultCases, Span, Type,
+    TypeKind, TypeName, TypeRef, UnaryOperator, UnsignedFit, Visibility, classify_integer,
+    classify_unsigned, compatible, constant_integer, evaluate, fits_long, fits_ulong,
+    integer_value, promoted_numeric, resolve_type_readonly, zero_initializable,
 };
 
 impl Analyzer<'_> {
@@ -56,43 +56,43 @@ impl Analyzer<'_> {
 
     fn try_propagate(&mut self, operand: &Expression, span: Span) -> Type {
         let operand_type = self.expression(operand);
-        let Type::Enum(result_name) = operand_type else {
+        let Type::Enum(operand_name) = operand_type else {
             if operand_type != Type::Unknown {
                 self.diagnostics.push(
                     Diagnostic::error(
                         format!(
-                            "`?` requires an `aster.core.Result<T, E>` value, found `{}`",
+                            "`?` requires an `aster.core.Result<T, E>` or `aster.core.Option<T>` value, found `{}`",
                             operand_type.display()
                         ),
                         span,
                     )
-                    .with_help("`?` propagates the `Error` case of an `aster.core.Result`"),
+                    .with_help("`?` propagates the `Error` case of a `Result` or the `None` case of an `Option`"),
                 );
             }
             return Type::Unknown;
         };
-        if !self.is_official_result(&result_name) {
-            if self.is_official_option(&result_name) {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        "`?` does not support `aster.core.Option<T>` yet".to_owned(),
-                        span,
-                    )
-                    .with_help("match the option with `switch`; `?` propagates `Result` only"),
-                );
-            } else {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        format!(
-                            "`?` works only with `aster.core.Result<T, E>`, not `{result_name}`"
-                        ),
-                        span,
-                    )
-                    .with_help("only the official `aster.core.Result` supports `?`"),
-                );
-            }
-            return Type::Unknown;
+        if self.is_official_result(&operand_name) {
+            return self.try_propagate_result(operand_name, span);
         }
+        if self.is_official_option(&operand_name) {
+            return self.try_propagate_option(operand_name, span);
+        }
+        self.diagnostics.push(
+            Diagnostic::error(
+                format!(
+                    "`?` works only with the official `aster.core.Result<T, E>` or `aster.core.Option<T>`, not `{operand_name}`"
+                ),
+                span,
+            )
+            .with_help(
+                "only the official `aster.core.Result`/`aster.core.Option` support `?`; a \
+                 same-named or structurally similar enum does not qualify",
+            ),
+        );
+        Type::Unknown
+    }
+
+    fn try_propagate_result(&mut self, result_name: String, span: Span) -> Type {
         let Some(operand_result) = self.result_cases(&result_name) else {
             self.internal_result_error(&result_name, span);
             return Type::Unknown;
@@ -136,12 +136,54 @@ impl Analyzer<'_> {
         }
         self.model.propagations.insert(
             self.model_key(span),
-            ResolvedPropagation {
+            ResolvedPropagation::Result {
                 result_type: result_name,
                 ok_index: operand_result.ok_index,
                 error_index: operand_result.error_index,
                 function_result_type: return_name,
                 function_error_index: function_result.error_index,
+            },
+        );
+        success_type
+    }
+
+    /// Analyze a postfix `?` whose operand is the official `aster.core.Option<T>`:
+    /// verify the enclosing function returns the official `Option<U>` (`U`
+    /// need not equal `T`, since `None` carries no payload to convert), and
+    /// record the concrete resolution for HIR lowering. Returns `T`.
+    fn try_propagate_option(&mut self, option_name: String, span: Span) -> Type {
+        let Some(operand_option) = self.option_cases(&option_name) else {
+            self.internal_option_error(&option_name, span);
+            return Type::Unknown;
+        };
+        let success_type = operand_option.success.clone();
+        if self.model_context.starts_with("#global:") {
+            self.diagnostics.push(
+                Diagnostic::error("`?` cannot be used outside a function".to_owned(), span)
+                    .with_help("`?` needs an enclosing function to receive the `None` return"),
+            );
+            return success_type;
+        }
+        let Type::Enum(return_name) = self.return_type.clone() else {
+            self.require_option_return(span);
+            return success_type;
+        };
+        if !self.is_official_option(&return_name) {
+            self.require_option_return(span);
+            return success_type;
+        }
+        let Some(function_option) = self.option_cases(&return_name) else {
+            self.internal_option_error(&return_name, span);
+            return success_type;
+        };
+        self.model.propagations.insert(
+            self.model_key(span),
+            ResolvedPropagation::Option {
+                option_type: option_name,
+                some_index: operand_option.some_index,
+                none_index: operand_option.none_index,
+                function_option_type: return_name,
+                function_none_index: function_option.none_index,
             },
         );
         success_type
@@ -162,11 +204,37 @@ impl Analyzer<'_> {
         );
     }
 
+    fn require_option_return(&mut self, span: Span) {
+        self.diagnostics.push(
+            Diagnostic::error(
+                format!(
+                    "`?` on an `aster.core.Option<T>` requires the enclosing function to return \
+                     the official `aster.core.Option<U>`, but it returns `{}`",
+                    self.return_type.display()
+                ),
+                span,
+            )
+            .with_help("return an `Option` so the `None` case can propagate"),
+        );
+    }
+
     fn internal_result_error(&mut self, name: &str, span: Span) {
         self.diagnostics.push(
             Diagnostic::error(
                 format!(
                     "internal compiler error: `{name}` is not a well-formed `aster.core.Result`"
+                ),
+                span,
+            )
+            .with_help("the embedded `aster.core` standard library appears inconsistent"),
+        );
+    }
+
+    fn internal_option_error(&mut self, name: &str, span: Span) {
+        self.diagnostics.push(
+            Diagnostic::error(
+                format!(
+                    "internal compiler error: `{name}` is not a well-formed `aster.core.Option`"
                 ),
                 span,
             )
@@ -197,6 +265,32 @@ impl Analyzer<'_> {
             error_index,
             success: ok_case.fields[0].1.clone(),
             error: error_case.fields[0].1.clone(),
+        })
+    }
+
+    /// Locate the `Some` and `None` cases of an already nominally-verified
+    /// official `Option` enum, returning their positions and `Some`'s
+    /// payload type. `None` is required to carry zero fields.
+    fn option_cases(&self, name: &str) -> Option<OptionCases> {
+        let info = self.context.types.get(name)?;
+        if info.enum_cases.len() != 2 {
+            return None;
+        }
+        let find = |case_name: &str| {
+            info.enum_cases
+                .iter()
+                .enumerate()
+                .find(|(_, case)| case.name == case_name)
+        };
+        let (some_index, some_case) = find("Some")?;
+        let (none_index, none_case) = find("None")?;
+        if some_case.fields.len() != 1 || !none_case.fields.is_empty() {
+            return None;
+        }
+        Some(OptionCases {
+            some_index,
+            none_index,
+            success: some_case.fields[0].1.clone(),
         })
     }
 

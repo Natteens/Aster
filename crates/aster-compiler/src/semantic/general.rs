@@ -101,6 +101,14 @@ struct ResultCases {
     error: Type,
 }
 
+/// Resolved `Some`/`None` positions and the `Some` payload type of an
+/// official `Option`. `None` carries no payload, unlike `Result`'s `Error`.
+struct OptionCases {
+    some_index: usize,
+    none_index: usize,
+    success: Type,
+}
+
 #[derive(Clone, Debug, Default)]
 struct Context {
     types: HashMap<String, TypeInfo>,

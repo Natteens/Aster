@@ -147,6 +147,11 @@ impl FunctionLowerer {
                     hir::StringOperation::IndexOf => mir::Intrinsic::StringIndexOf,
                     hir::StringOperation::SubstringFrom => mir::Intrinsic::StringSubstringFrom,
                     hir::StringOperation::SubstringRange => mir::Intrinsic::StringSubstringRange,
+                    hir::StringOperation::TryParseBool => mir::Intrinsic::StringTryParseBool,
+                    hir::StringOperation::TryParseInt => mir::Intrinsic::StringTryParseInt,
+                    hir::StringOperation::TryParseUInt => mir::Intrinsic::StringTryParseUInt,
+                    hir::StringOperation::TryParseLong => mir::Intrinsic::StringTryParseLong,
+                    hir::StringOperation::TryParseULong => mir::Intrinsic::StringTryParseULong,
                 };
                 let destination = self.new_temporary(expression.type_.clone());
                 let place = mir::Place::Local(destination);
@@ -267,6 +272,26 @@ impl FunctionLowerer {
                 *return_error_case,
                 *return_error_field,
                 *return_error_tag,
+            )),
+            hir::ExpressionKind::PropagateOption {
+                operand,
+                success_type,
+                some_case,
+                some_field,
+                none_tag,
+                return_type,
+                return_none_case,
+                return_none_tag,
+                ..
+            } => Some(self.lower_propagate_option(
+                operand,
+                success_type,
+                *some_case,
+                *some_field,
+                *none_tag,
+                return_type,
+                *return_none_case,
+                *return_none_tag,
             )),
             hir::ExpressionKind::Binary {
                 left,

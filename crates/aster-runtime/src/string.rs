@@ -607,14 +607,256 @@ fn substring_boundary_error(
     }
 }
 
+/// Writes the complete `Option<T>` representation `TryParse*` returns.
+///
+/// The destination is zeroed first, so a failed parse (`None`) and any
+/// trailing enum padding are always fully initialized, never a partial
+/// representation; then the tag is written, and, on success, the payload
+/// bytes at `payload_offset`. `some_tag`/`none_tag`/`payload_offset` are
+/// compiler-computed facts about the concrete `Option<T>` specialization
+/// (from the same shared `Layouts` system codegen already uses elsewhere),
+/// not assumptions this function makes on its own.
+///
+/// # Safety
+///
+/// `destination` must point to at least `total_size` writable bytes, aligned
+/// for the concrete `Option<T>` layout, owned exclusively by the caller for
+/// the duration of this call.
+#[allow(unsafe_code)]
+unsafe fn write_option_result<T>(
+    destination: *mut u8,
+    total_size: usize,
+    payload_offset: usize,
+    parsed: Option<T>,
+    some_tag: i32,
+    none_tag: i32,
+) {
+    // SAFETY: forwarded from the caller. Unaligned reads/writes are used
+    // deliberately: `destination` is aligned for the concrete `Option<T>` as
+    // a whole, but `*mut u8` carries no alignment guarantee `rustc` can
+    // verify statically, and this is not a hot path worth an `#[allow]`.
+    unsafe {
+        ptr::write_bytes(destination, 0, total_size);
+        match parsed {
+            Some(value) => {
+                ptr::write_unaligned(destination.cast::<i32>(), some_tag);
+                ptr::write_unaligned(destination.add(payload_offset).cast::<T>(), value);
+            }
+            None => ptr::write_unaligned(destination.cast::<i32>(), none_tag),
+        }
+    }
+}
+
+/// Shared entry point for every `TryParse*` runtime symbol: validates the
+/// context/receiver/destination (the only checks that guard against ABI
+/// corruption; a normal parse failure never reaches `context.fail`), then
+/// delegates to `parse` and writes the resulting `Option<T>`.
+#[allow(clippy::too_many_arguments)]
+fn string_try_parse<T>(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    destination: *mut u8,
+    total_size: i32,
+    some_tag: i32,
+    none_tag: i32,
+    payload_offset: i32,
+    operation: &str,
+    parse: impl FnOnce(&str) -> Option<T>,
+) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: generated code passes its live context and a string reference
+    // owned by that context or the live JIT module.
+    #[allow(unsafe_code)]
+    let (context, text) = unsafe { (&mut *context, view(value)) };
+    let Some(text) = text else {
+        context.fail(format!(
+            "String.{operation} received an invalid UTF-8 string reference"
+        ));
+        return;
+    };
+    if destination.is_null() {
+        context.fail(format!("String.{operation} received a null destination"));
+        return;
+    }
+    let (Ok(total_size), Ok(payload_offset)) =
+        (usize::try_from(total_size), usize::try_from(payload_offset))
+    else {
+        context.fail(format!(
+            "String.{operation} received a malformed Option<T> layout"
+        ));
+        return;
+    };
+    if payload_offset > total_size {
+        context.fail(format!(
+            "String.{operation} destination layout is too small for its payload"
+        ));
+        return;
+    }
+    let parsed = parse(text);
+    // SAFETY: `destination` is caller-owned for the duration of this call
+    // (a stack slot or place address sized by the same `Layouts` system that
+    // produced `total_size`/`payload_offset`); `total_size` was just bounds-
+    // checked above against `payload_offset`.
+    #[allow(unsafe_code)]
+    unsafe {
+        write_option_result(
+            destination,
+            total_size,
+            payload_offset,
+            parsed,
+            some_tag,
+            none_tag,
+        );
+    }
+}
+
+/// `"true"`/`"false"` only, ASCII case-insensitive, no allocation, no
+/// whitespace, no alternate spellings.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn aster_rt_string_try_parse_bool(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    destination: *mut u8,
+    total_size: i32,
+    some_tag: i32,
+    none_tag: i32,
+    payload_offset: i32,
+) {
+    string_try_parse(
+        context,
+        value,
+        destination,
+        total_size,
+        some_tag,
+        none_tag,
+        payload_offset,
+        "TryParseBool",
+        |text| {
+            if text.eq_ignore_ascii_case("true") {
+                Some(true)
+            } else if text.eq_ignore_ascii_case("false") {
+                Some(false)
+            } else {
+                None
+            }
+        },
+    );
+}
+
+/// Consumes the entire string as an ASCII, optionally `+`/`-`-signed `int`;
+/// `str::parse::<i32>` already implements this contract exactly, including
+/// the signed-minimum boundary without an intermediate positive overflow.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn aster_rt_string_try_parse_int(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    destination: *mut u8,
+    total_size: i32,
+    some_tag: i32,
+    none_tag: i32,
+    payload_offset: i32,
+) {
+    string_try_parse(
+        context,
+        value,
+        destination,
+        total_size,
+        some_tag,
+        none_tag,
+        payload_offset,
+        "TryParseInt",
+        |text| text.parse::<i32>().ok(),
+    );
+}
+
+/// Consumes the entire string as an ASCII, optionally `+`-signed `uint`;
+/// `str::parse::<u32>` rejects `-`, including `-0`, and any overflow.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn aster_rt_string_try_parse_uint(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    destination: *mut u8,
+    total_size: i32,
+    some_tag: i32,
+    none_tag: i32,
+    payload_offset: i32,
+) {
+    string_try_parse(
+        context,
+        value,
+        destination,
+        total_size,
+        some_tag,
+        none_tag,
+        payload_offset,
+        "TryParseUInt",
+        |text| text.parse::<u32>().ok(),
+    );
+}
+
+/// Consumes the entire string as an ASCII, optionally `+`/`-`-signed `long`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn aster_rt_string_try_parse_long(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    destination: *mut u8,
+    total_size: i32,
+    some_tag: i32,
+    none_tag: i32,
+    payload_offset: i32,
+) {
+    string_try_parse(
+        context,
+        value,
+        destination,
+        total_size,
+        some_tag,
+        none_tag,
+        payload_offset,
+        "TryParseLong",
+        |text| text.parse::<i64>().ok(),
+    );
+}
+
+/// Consumes the entire string as an ASCII, optionally `+`-signed `ulong`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn aster_rt_string_try_parse_ulong(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    destination: *mut u8,
+    total_size: i32,
+    some_tag: i32,
+    none_tag: i32,
+    payload_offset: i32,
+) {
+    string_try_parse(
+        context,
+        value,
+        destination,
+        total_size,
+        some_tag,
+        none_tag,
+        payload_offset,
+        "TryParseULong",
+        |text| text.parse::<u64>().ok(),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AsterStrHeader, aster_rt_string_concat, aster_rt_string_contains,
         aster_rt_string_ends_with, aster_rt_string_eq, aster_rt_string_index_of,
         aster_rt_string_length, aster_rt_string_starts_with, aster_rt_string_substring_from,
-        aster_rt_string_substring_range, aster_rt_string_substring_range_temporary, encode_str,
-        view,
+        aster_rt_string_substring_range, aster_rt_string_substring_range_temporary,
+        aster_rt_string_try_parse_bool, aster_rt_string_try_parse_int, encode_str, view,
     };
     use crate::{
         ExecutionContext,
@@ -827,5 +1069,171 @@ mod tests {
                 .take_error()
                 .is_some_and(|error| error.contains("String.Contains") && error.contains("UTF-8"))
         );
+    }
+
+    /// A destination buffer large enough for any `Option<T>` this task
+    /// targets: a 4-byte tag plus an 8-byte payload, rounded up.
+    fn option_destination() -> Vec<u64> {
+        vec![0_u64; 2]
+    }
+
+    #[test]
+    fn try_parse_rejects_invalid_utf8_in_a_controlled_buffer_without_touching_destination() {
+        let mut invalid = aligned("1");
+        // SAFETY: same technique as `string_methods_reject_invalid_utf8_in_a_valid_sized_buffer`.
+        #[allow(unsafe_code)]
+        unsafe {
+            invalid
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(size_of::<AsterStrHeader>())
+                .write(0xff);
+        }
+        let mut destination = option_destination();
+        let destination_ptr = destination.as_mut_ptr().cast::<u8>();
+        let mut context = ExecutionContext::new();
+        aster_rt_string_try_parse_int(
+            &raw mut context,
+            pointer(&invalid),
+            destination_ptr,
+            16,
+            1,
+            0,
+            8,
+        );
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("TryParseInt") && error.contains("UTF-8"))
+        );
+        // The destination is never touched on this ABI-corruption path; every
+        // byte stays exactly as it started (zeroed), matching `Option<T>`
+        // never being partially initialized from a call that never publishes
+        // a result.
+        assert_eq!(destination, option_destination());
+    }
+
+    #[test]
+    fn try_parse_error_does_not_contaminate_a_later_valid_call() {
+        let mut invalid = aligned("1");
+        // SAFETY: same technique as above.
+        #[allow(unsafe_code)]
+        unsafe {
+            invalid
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(size_of::<AsterStrHeader>())
+                .write(0xff);
+        }
+        let mut context = ExecutionContext::new();
+        let mut destination = option_destination();
+        let destination_ptr = destination.as_mut_ptr().cast::<u8>();
+        aster_rt_string_try_parse_int(
+            &raw mut context,
+            pointer(&invalid),
+            destination_ptr,
+            16,
+            1,
+            0,
+            8,
+        );
+        assert!(context.take_error().is_some());
+
+        let valid = aligned("42");
+        aster_rt_string_try_parse_int(
+            &raw mut context,
+            pointer(&valid),
+            destination_ptr,
+            16,
+            1,
+            0,
+            8,
+        );
+        assert!(context.take_error().is_none());
+        // SAFETY: `destination` was just written by the call above.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!(std::ptr::read_unaligned(destination_ptr.cast::<i32>()), 1);
+            assert_eq!(
+                std::ptr::read_unaligned(destination_ptr.add(8).cast::<i32>()),
+                42
+            );
+        }
+    }
+
+    #[test]
+    fn try_parse_writes_the_complete_option_representation_on_success_and_failure() {
+        let mut context = ExecutionContext::new();
+        let mut destination = option_destination();
+        let destination_ptr = destination.as_mut_ptr().cast::<u8>();
+
+        let some_text = aligned("123");
+        aster_rt_string_try_parse_int(
+            &raw mut context,
+            pointer(&some_text),
+            destination_ptr,
+            16,
+            1,
+            0,
+            8,
+        );
+        assert!(context.take_error().is_none());
+        // SAFETY: just written above.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!(std::ptr::read_unaligned(destination_ptr.cast::<i32>()), 1);
+            assert_eq!(
+                std::ptr::read_unaligned(destination_ptr.add(8).cast::<i32>()),
+                123
+            );
+        }
+
+        let none_text = aligned("not a number");
+        aster_rt_string_try_parse_int(
+            &raw mut context,
+            pointer(&none_text),
+            destination_ptr,
+            16,
+            1,
+            0,
+            8,
+        );
+        assert!(context.take_error().is_none());
+        // SAFETY: just written above; every byte (including the stale
+        // payload from the previous `Some`) must be zeroed, not just the
+        // tag, so `None`'s representation is never partial.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!(std::ptr::read_unaligned(destination_ptr.cast::<i32>()), 0);
+            assert_eq!(
+                std::ptr::read_unaligned(destination_ptr.add(8).cast::<i32>()),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn try_parse_bool_accepts_case_insensitive_ascii_without_allocating_a_lowercase_copy() {
+        let mut context = ExecutionContext::with_stats();
+        let mut destination = option_destination();
+        let destination_ptr = destination.as_mut_ptr().cast::<u8>();
+        let text = aligned("fAlSe");
+        aster_rt_string_try_parse_bool(
+            &raw mut context,
+            pointer(&text),
+            destination_ptr,
+            16,
+            1,
+            0,
+            4,
+        );
+        assert!(context.take_error().is_none());
+        assert_eq!(context.memory_stats().string_allocations, 0);
+        // SAFETY: just written above.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!(std::ptr::read_unaligned(destination_ptr.cast::<i32>()), 1);
+            assert_eq!(std::ptr::read(destination_ptr.add(4).cast::<u8>()), 0);
+        }
     }
 }

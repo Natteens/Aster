@@ -25,6 +25,8 @@ use crate::string::{
     aster_rt_string_join_temporary, aster_rt_string_length, aster_rt_string_starts_with,
     aster_rt_string_substring_from, aster_rt_string_substring_from_temporary,
     aster_rt_string_substring_range, aster_rt_string_substring_range_temporary,
+    aster_rt_string_try_parse_bool, aster_rt_string_try_parse_int, aster_rt_string_try_parse_long,
+    aster_rt_string_try_parse_uint, aster_rt_string_try_parse_ulong,
 };
 
 /// Backend-neutral value type used in runtime signatures.
@@ -440,6 +442,86 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             signature: RuntimeSignature {
                 parameters: &[RuntimeType::Pointer, RuntimeType::Pointer, RuntimeType::I32],
                 result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_try_parse_bool",
+            address: aster_rt_string_try_parse_bool as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_try_parse_int",
+            address: aster_rt_string_try_parse_int as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_try_parse_uint",
+            address: aster_rt_string_try_parse_uint as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_try_parse_long",
+            address: aster_rt_string_try_parse_long as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_try_parse_ulong",
+            address: aster_rt_string_try_parse_ulong as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                ],
+                result: None,
             },
         },
         RuntimeFunction {

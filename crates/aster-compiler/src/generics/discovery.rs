@@ -1,8 +1,23 @@
 use super::{
     BinaryOperator, Block, Diagnostic, Expression, ExpressionKind, FunctionDeclaration, HashMap,
-    InterpolatedPart, Member, Monomorphizer, Statement, TypeDeclaration, TypeRef, literal_type,
-    variable_type,
+    InterpolatedPart, Member, Monomorphizer, Statement, TypeDeclaration, TypeName, TypeRef,
+    literal_type, variable_type,
 };
+
+/// Every built-in `string.TryParse*()` method name, paired with the concrete
+/// primitive its `Option<T>` specialization must exist for. A fixed method
+/// call name in source is enough to request the specialization eagerly here,
+/// even when the receiver's own type cannot be inferred by this pass's
+/// best-effort textual tracking (e.g. `helper().TryParseInt()`); the real
+/// receiver-type gate is semantic analysis's `receiver == Type::String`
+/// check, not this discovery pass.
+const TRY_PARSE_TARGETS: [(&str, &str); 5] = [
+    ("TryParseBool", "bool"),
+    ("TryParseInt", "int"),
+    ("TryParseUInt", "uint"),
+    ("TryParseLong", "long"),
+    ("TryParseULong", "ulong"),
+];
 
 impl Monomorphizer {
     pub(super) fn function(&mut self, function: &mut FunctionDeclaration) {
@@ -336,6 +351,24 @@ impl Monomorphizer {
         match &callee.kind {
             ExpressionKind::Name(name) => self.returns.get(name).cloned().unwrap_or_default(),
             ExpressionKind::Member { object, name } => {
+                if arguments.is_empty()
+                    && let Some((_, target)) =
+                        TRY_PARSE_TARGETS.iter().find(|(method, _)| method == name)
+                {
+                    let option_base =
+                        format!("{}::Option", crate::standard_library::CORE_NAMESPACE);
+                    let option_type = crate::standard_library::option_specialization_name(target);
+                    // `Option` may be absent (no `using aster.core;`); leave
+                    // that as a normal, reported diagnostic from semantic
+                    // analysis's own existence check rather than panicking
+                    // here on a missing template.
+                    if self.enum_templates.contains_key(&option_base)
+                        && let Some(concrete) = TypeName::parse(&option_type)
+                    {
+                        self.instantiate_type(&concrete.base, &concrete.arguments, span);
+                    }
+                    return option_type;
+                }
                 let owner = self.infer_readonly(object, environment);
                 self.methods
                     .get(&(owner, name.clone()))

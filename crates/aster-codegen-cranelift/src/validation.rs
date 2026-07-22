@@ -111,6 +111,144 @@ pub(super) fn validate_module(module: &mir::Module) -> Result<(), BackendError> 
             &implementations,
         )?;
     }
+    let enum_definitions = module
+        .enums
+        .iter()
+        .map(|definition| (definition.symbol, definition))
+        .collect::<HashMap<_, _>>();
+    for function in &module.functions {
+        validate_string_try_parse_targets(function, &enum_definitions)?;
+        validate_enum_construct_shapes(function, &enum_definitions)?;
+    }
+    Ok(())
+}
+
+/// Every `EnumConstruct` (built by enum literals, `switch` desugaring, and
+/// postfix `?`'s `Result`/`Option` propagation alike) must name a `case`
+/// symbol that is actually one of `value.type_`'s declared cases, with a
+/// matching `tag` and exactly the fields that case declares (by symbol and
+/// type, in order). Runs once per function over the whole module's enum
+/// definitions, the same data `validate_string_try_parse_targets` uses,
+/// rather than a construct-site-specific check duplicated per caller.
+fn validate_enum_construct_shapes(
+    function: &mir::Function,
+    enum_definitions: &HashMap<mir::SymbolId, &mir::EnumDefinition>,
+) -> Result<(), BackendError> {
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            let mir::Instruction::Assign { value, .. } = instruction else {
+                continue;
+            };
+            let mir::RvalueKind::EnumConstruct { case, tag, fields } = &value.kind else {
+                continue;
+            };
+            let mir::Type::Enum(symbol) = &value.type_ else {
+                return Err(BackendError::new(format!(
+                    "function `{}` has an `EnumConstruct` whose declared type is not an enum",
+                    function.name
+                )));
+            };
+            let definition = enum_definitions.get(symbol).ok_or_else(|| {
+                BackendError::new(format!(
+                    "function `{}` has an `EnumConstruct` for an unknown enum type",
+                    function.name
+                ))
+            })?;
+            let matched = definition
+                .cases
+                .iter()
+                .find(|case_definition| case_definition.symbol == *case);
+            let Some(matched) = matched else {
+                return Err(BackendError::new(format!(
+                    "function `{}` has an `EnumConstruct` whose case symbol is not one of `{}`'s cases",
+                    function.name, definition.name
+                )));
+            };
+            if matched.tag != *tag {
+                return Err(BackendError::new(format!(
+                    "function `{}` has an `EnumConstruct` for case `{}` with tag {tag}, expected {}",
+                    function.name, matched.name, matched.tag
+                )));
+            }
+            if fields.len() != matched.fields.len() {
+                return Err(BackendError::new(format!(
+                    "function `{}` has an `EnumConstruct` for case `{}` with {} field(s), expected {}",
+                    function.name,
+                    matched.name,
+                    fields.len(),
+                    matched.fields.len()
+                )));
+            }
+            for (provided, expected) in fields.iter().zip(&matched.fields) {
+                if provided.field != expected.symbol || provided.value.type_ != expected.type_ {
+                    return Err(BackendError::new(format!(
+                        "function `{}` has an `EnumConstruct` for case `{}` with a field that does not match its declaration",
+                        function.name, matched.name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The exact `Option<T>` shape `string.TryParse*()` must return: precisely
+/// two cases, one carrying zero fields (`None`) and the other carrying
+/// exactly one field of the primitive `intrinsic` targets (`Some`). Runs
+/// once per function over the whole module's enum definitions -- data
+/// `validate_intrinsic_shape` does not have -- rather than threading it
+/// through every layer of the generic per-instruction validators above.
+fn validate_string_try_parse_targets(
+    function: &mir::Function,
+    enum_definitions: &HashMap<mir::SymbolId, &mir::EnumDefinition>,
+) -> Result<(), BackendError> {
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            let mir::Instruction::CallIntrinsic {
+                intrinsic,
+                return_type,
+                ..
+            } = instruction
+            else {
+                continue;
+            };
+            let expected = match intrinsic {
+                mir::Intrinsic::StringTryParseBool => mir::Type::Bool,
+                mir::Intrinsic::StringTryParseInt => mir::Type::Int,
+                mir::Intrinsic::StringTryParseUInt => mir::Type::UInt,
+                mir::Intrinsic::StringTryParseLong => mir::Type::Long,
+                mir::Intrinsic::StringTryParseULong => mir::Type::ULong,
+                _ => continue,
+            };
+            let mir::Type::Enum(symbol) = return_type else {
+                return Err(BackendError::new(format!(
+                    "function `{}` has {intrinsic:?} returning `{}`, expected `Option<{}>`",
+                    function.name,
+                    type_name_owned(return_type),
+                    type_name(&expected)
+                )));
+            };
+            let definition = enum_definitions.get(symbol).ok_or_else(|| {
+                BackendError::new(format!(
+                    "function `{}` has {intrinsic:?} returning an unknown enum type",
+                    function.name
+                ))
+            })?;
+            let none_case = definition.cases.iter().find(|case| case.fields.is_empty());
+            let some_case = definition
+                .cases
+                .iter()
+                .find(|case| case.fields.len() == 1 && case.fields[0].type_ == expected);
+            if definition.cases.len() != 2 || none_case.is_none() || some_case.is_none() {
+                return Err(BackendError::new(format!(
+                    "function `{}` has {intrinsic:?} returning `{}`, which is not `Option<{}>`",
+                    function.name,
+                    definition.name,
+                    type_name(&expected)
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -504,6 +642,11 @@ fn is_string_method_intrinsic(intrinsic: mir::Intrinsic) -> bool {
             | mir::Intrinsic::StringSubstringFromTemporary
             | mir::Intrinsic::StringSubstringRange
             | mir::Intrinsic::StringSubstringRangeTemporary
+            | mir::Intrinsic::StringTryParseBool
+            | mir::Intrinsic::StringTryParseInt
+            | mir::Intrinsic::StringTryParseUInt
+            | mir::Intrinsic::StringTryParseLong
+            | mir::Intrinsic::StringTryParseULong
     )
 }
 
@@ -926,6 +1069,21 @@ fn validate_intrinsic_shape(
         }
         mir::Intrinsic::ReportRuntimeError(_) => {
             destination.is_none() && return_type == &mir::Type::Void && arguments.is_empty()
+        }
+        // `string.TryParse*()`: exactly one `string` receiver, aridade zero,
+        // and a destination whose type is *some* concrete enum. The deeper
+        // check -- that the enum is actually shaped like `Option<T>` for the
+        // matching `T` -- needs the module's enum definitions, which this
+        // function does not have; `validate_string_try_parse_targets` (run
+        // once over the whole module from `validate_module`) covers that.
+        mir::Intrinsic::StringTryParseBool
+        | mir::Intrinsic::StringTryParseInt
+        | mir::Intrinsic::StringTryParseUInt
+        | mir::Intrinsic::StringTryParseLong
+        | mir::Intrinsic::StringTryParseULong => {
+            destination.is_some()
+                && matches!(return_type, mir::Type::Enum(_))
+                && matches!(arguments, [receiver] if receiver.type_ == mir::Type::String)
         }
         mir::Intrinsic::TaskRun => {
             destination.is_some()

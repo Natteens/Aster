@@ -292,7 +292,7 @@ fn rejects_user_defined_result() {
          public Result<int, string> F(Result<int, string> input) {\n\
              int v = input?;\n\
              return Result<int, string>.Success(v); }",
-        "`?` works only with `aster.core.Result",
+        "`?` works only with the official `aster.core.Result",
     );
 }
 
@@ -307,7 +307,7 @@ fn rejects_structurally_identical_enum_by_identity() {
          public Result<int, string> F(Outcome<int, string> input) {\n\
              int v = input?;\n\
              return Result<int, string>.Ok(v); }",
-        "`?` works only with `aster.core.Result",
+        "`?` works only with the official `aster.core.Result",
     );
 }
 
@@ -334,18 +334,49 @@ fn rejects_result_in_nested_user_namespace() {
                 "[application]\nentry = \"app.Program.Main\"\n",
             ),
         ],
-        "`?` works only with `aster.core.Result",
+        "`?` works only with the official `aster.core.Result",
     );
 }
 
 #[test]
-fn rejects_option_propagation() {
+fn accepts_option_propagation_when_the_function_returns_option() {
+    // `Option<T>?` is now supported (postfix `?` on the official
+    // `aster.core.Option<T>`), but only inside a function returning the
+    // official `aster.core.Option<U>` (`U` need not equal `T`).
+    let compilation = compile(
+        "using aster.core;\n\
+         public Option<int> F(Option<int> option) {\n\
+             int v = option?;\n\
+             return Option<int>.Some(v); }",
+    )
+    .expect("Option<T>? inside an Option<U>-returning function should compile");
+    let _ = compilation;
+}
+
+#[test]
+fn rejects_option_propagation_inside_a_result_returning_function() {
+    // Cross-propagation stays forbidden: `Option<T>?` inside a function
+    // returning `Result<U, E>` is rejected, with a message naming the
+    // required official `Option<U>` return type.
     rejects(
         "using aster.core;\n\
          public Result<int, string> F(Option<int> option) {\n\
              int v = option?;\n\
              return Result<int, string>.Ok(v); }",
-        "does not support `aster.core.Option",
+        "requires the enclosing function to return",
+    );
+}
+
+#[test]
+fn rejects_result_propagation_inside_an_option_returning_function() {
+    // The opposite cross-propagation direction is also forbidden:
+    // `Result<T,E>?` inside a function returning `Option<U>` is rejected.
+    rejects(
+        "using aster.core;\n\
+         public Option<int> F(Result<int, string> input) {\n\
+             int v = input?;\n\
+             return Option<int>.Some(v); }",
+        "`?` requires the enclosing function to return `aster.core.Result",
     );
 }
 

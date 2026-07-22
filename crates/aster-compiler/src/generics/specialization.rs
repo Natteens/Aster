@@ -113,7 +113,7 @@ impl Monomorphizer {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn instantiate_type(
+    pub(super) fn instantiate_type(
         &mut self,
         name: &str,
         concrete: &[TypeName],

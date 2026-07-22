@@ -199,6 +199,35 @@ pub enum StringOperation {
     IndexOf,
     SubstringFrom,
     SubstringRange,
+    /// `text.TryParseBool()`/`TryParseInt()`/`TryParseUInt()`/`TryParseLong()`/
+    /// `TryParseULong()`: deterministic, allocation-free parsing into the
+    /// official `Option<T>` for the matching primitive. Takes no arguments.
+    TryParseBool,
+    TryParseInt,
+    TryParseUInt,
+    TryParseLong,
+    TryParseULong,
+}
+
+impl StringOperation {
+    /// The primitive name (as spelled in Aster source) `TryParse*` targets.
+    /// `None` for every non-parsing operation.
+    #[must_use]
+    pub const fn parse_target_name(self) -> Option<&'static str> {
+        match self {
+            Self::TryParseBool => Some("bool"),
+            Self::TryParseInt => Some("int"),
+            Self::TryParseUInt => Some("uint"),
+            Self::TryParseLong => Some("long"),
+            Self::TryParseULong => Some("ulong"),
+            Self::Contains
+            | Self::StartsWith
+            | Self::EndsWith
+            | Self::IndexOf
+            | Self::SubstringFrom
+            | Self::SubstringRange => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -329,6 +358,22 @@ pub enum ExpressionKind {
         return_error_case: SymbolId,
         return_error_field: SymbolId,
         return_error_tag: u32,
+    },
+    /// Postfix `?` on the official `aster.core.Option<T>`: evaluate `operand`
+    /// once, and either continue with the `Some` payload (this expression's
+    /// `type_`, `T`) or early-return the enclosing function's
+    /// `Option<U>.None` -- `U` need not equal `T`. Every case, field, and tag
+    /// is resolved here so no later stage inspects names.
+    PropagateOption {
+        operand: Box<Expression>,
+        success_type: Type,
+        some_case: SymbolId,
+        some_field: SymbolId,
+        some_tag: u32,
+        none_tag: u32,
+        return_type: Type,
+        return_none_case: SymbolId,
+        return_none_tag: u32,
     },
     Binary {
         left: Box<Expression>,

@@ -18,6 +18,16 @@ const CORE_SOURCE: &str = include_str!("../../../stdlib/aster/core/core.aster");
 /// bootstrap and then compare resolved identities, never raw type spellings.
 pub(crate) const CORE_NAMESPACE: &str = "aster.core";
 
+/// The concrete, namespace-qualified `Option<target>` specialization name
+/// (e.g. `aster.core::Option<int>`) that `string.TryParse*()` targets.
+/// `target` is one of the primitive names `StringOperation::parse_target_name`
+/// returns (`"bool"`, `"int"`, `"uint"`, `"long"`, `"ulong"`). The single
+/// place every layer (generic-type discovery, semantic analysis, HIR
+/// lowering) derives this spelling from, so it can never drift between them.
+pub(crate) fn option_specialization_name(target: &str) -> String {
+    format!("{CORE_NAMESPACE}::Option<{target}>")
+}
+
 #[derive(Clone)]
 pub(crate) struct StandardLibrary {
     modules: HashMap<&'static str, &'static str>,

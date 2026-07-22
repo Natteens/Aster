@@ -288,6 +288,17 @@ pub enum Intrinsic {
     /// `Accumulate(TAccumulator, TElement) -> TAccumulator`; `combine_symbol`
     /// resolves `Combine(TAccumulator, TAccumulator) -> TAccumulator`.
     ParallelReduce,
+    /// `text.TryParseBool()`/`TryParseInt()`/`TryParseUInt()`/`TryParseLong()`/
+    /// `TryParseULong()`. Argument: `[receiver]` (a `string`); `return_type`
+    /// is always the concrete `Option<T>` specialization matching the target
+    /// primitive. Writes the complete enum representation (tag and, on
+    /// success, payload) directly into the destination; never returns a bare
+    /// scalar or a partially-initialized enum.
+    StringTryParseBool,
+    StringTryParseInt,
+    StringTryParseUInt,
+    StringTryParseLong,
+    StringTryParseULong,
 }
 
 impl Intrinsic {
@@ -335,7 +346,12 @@ impl Intrinsic {
             | Self::AsyncSetResult
             | Self::ParallelFor
             | Self::ParallelForEach
-            | Self::ParallelReduce => None,
+            | Self::ParallelReduce
+            | Self::StringTryParseBool
+            | Self::StringTryParseInt
+            | Self::StringTryParseUInt
+            | Self::StringTryParseLong
+            | Self::StringTryParseULong => None,
         }
     }
 

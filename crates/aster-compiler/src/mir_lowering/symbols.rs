@@ -288,6 +288,18 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
             note(max, *return_error_field);
             collect_expression(operand, max);
         }
+        hir::ExpressionKind::PropagateOption {
+            operand,
+            some_case,
+            some_field,
+            return_none_case,
+            ..
+        } => {
+            note(max, *some_case);
+            note(max, *some_field);
+            note(max, *return_none_case);
+            collect_expression(operand, max);
+        }
         hir::ExpressionKind::Binary { left, right, .. } => {
             collect_expression(left, max);
             collect_expression(right, max);
