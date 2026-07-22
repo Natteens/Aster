@@ -6,16 +6,16 @@
 //! calls, use `Task.Run`, `Task<T>.Wait`, `Parallel.For`/`Parallel.ForEach`,
 //! or be an `async` function. Symmetrically, an `async` function's own
 //! ordinary (non-awaited) calls must never reach `Parallel.For`/`ForEach`.
-//! Both rules are checked over the same directly-resolved call graph, walked
-//! with a visited set so ordinary (non-concurrency) recursion terminates and
-//! is never itself an error.
+//! Both rules are checked over the same resolved call graph. Interface calls
+//! conservatively expand to every exact registered implementation. A visited
+//! set bounds ordinary (non-concurrency) recursion.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use aster_diagnostics::{Diagnostic, Span};
 use aster_syntax::{Block, FunctionDeclaration, Item, Member, Module, TypeDeclaration};
 
-use super::{CallableKey, Model};
+use super::{CallableKey, Context, Dispatch, Model, callable_key};
 
 /// Static facts about one declared function or method, keyed by the same
 /// [`CallableKey`] the resolved call graph in [`Model`] already uses.
@@ -26,25 +26,39 @@ struct FunctionFacts<'a> {
     body: Option<&'a Block>,
 }
 
-pub(super) fn validate(module: &Module, model: &Model, diagnostics: &mut Vec<Diagnostic>) {
+#[derive(Clone)]
+struct InterfaceDispatch {
+    interface_call: CallableKey,
+    implementation: CallableKey,
+}
+
+#[derive(Clone)]
+struct CallEdge {
+    target: CallableKey,
+    interface_dispatch: Option<InterfaceDispatch>,
+}
+
+struct ReachableUse {
+    offender: String,
+    reason: &'static str,
+    interface_dispatch: Option<InterfaceDispatch>,
+}
+
+pub(super) fn validate(
+    module: &Module,
+    context: &Context,
+    model: &Model,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     let mut facts: HashMap<CallableKey, FunctionFacts<'_>> = HashMap::new();
     let mut context_to_key: HashMap<String, CallableKey> = HashMap::new();
     collect_facts(module, &mut facts, &mut context_to_key);
 
-    // Direct call edges only (`Dispatch::Direct`/`Instance`, both resolved to
-    // a concrete declaration); interface dispatch has no statically known
-    // single target and is not walked here.
-    let mut callees: HashMap<CallableKey, Vec<CallableKey>> = HashMap::new();
-    for (node_key, resolved) in &model.calls {
-        if let Some(caller) = context_to_key.get(&node_key.context) {
-            callees
-                .entry(caller.clone())
-                .or_default()
-                .push(resolved.callable.clone());
-        }
-    }
+    let callees = build_call_graph(module, context, model, &context_to_key);
 
-    for (node_key, resolved) in &model.task_runs {
+    let mut task_runs = model.task_runs.iter().collect::<Vec<_>>();
+    task_runs.sort_by_key(|(key, _)| (key.context.as_str(), key.span.start, key.span.end));
+    for (node_key, resolved) in task_runs {
         check_target(
             &resolved.function,
             "Task.Run",
@@ -55,7 +69,9 @@ pub(super) fn validate(module: &Module, model: &Model, diagnostics: &mut Vec<Dia
             diagnostics,
         );
     }
-    for (node_key, resolved) in &model.parallel_for {
+    let mut parallel_for = model.parallel_for.iter().collect::<Vec<_>>();
+    parallel_for.sort_by_key(|(key, _)| (key.context.as_str(), key.span.start, key.span.end));
+    for (node_key, resolved) in parallel_for {
         check_target(
             &resolved.body,
             "Parallel.For",
@@ -66,7 +82,9 @@ pub(super) fn validate(module: &Module, model: &Model, diagnostics: &mut Vec<Dia
             diagnostics,
         );
     }
-    for (node_key, resolved) in &model.parallel_for_each {
+    let mut parallel_for_each = model.parallel_for_each.iter().collect::<Vec<_>>();
+    parallel_for_each.sort_by_key(|(key, _)| (key.context.as_str(), key.span.start, key.span.end));
+    for (node_key, resolved) in parallel_for_each {
         check_target(
             &resolved.body,
             "Parallel.ForEach",
@@ -78,12 +96,15 @@ pub(super) fn validate(module: &Module, model: &Model, diagnostics: &mut Vec<Dia
         );
     }
 
-    for (key, fact) in &facts {
+    let mut fact_keys = facts.keys().collect::<Vec<_>>();
+    fact_keys.sort_by(|left, right| callable_order(left, right));
+    for key in fact_keys {
+        let fact = &facts[key];
         if !fact.is_async {
             continue;
         }
         let Some(body) = fact.body else { continue };
-        if let Some((offender, reason)) = find_reachable(
+        if let Some(reachable) = find_reachable(
             key,
             &callees,
             &facts,
@@ -93,8 +114,8 @@ pub(super) fn validate(module: &Module, model: &Model, diagnostics: &mut Vec<Dia
             diagnostics.push(
                 Diagnostic::error(
                     format!(
-                        "async function `{}` transitively calls `{}`, which uses {reason}",
-                        fact.name, offender
+                        "async function `{}` transitively calls `{}`, which uses {}",
+                        fact.name, reachable.offender, reachable.reason
                     ),
                     body.span,
                 )
@@ -104,6 +125,47 @@ pub(super) fn validate(module: &Module, model: &Model, diagnostics: &mut Vec<Dia
             );
         }
     }
+}
+
+fn build_call_graph(
+    module: &Module,
+    context: &Context,
+    model: &Model,
+    context_to_key: &HashMap<String, CallableKey>,
+) -> HashMap<CallableKey, Vec<CallEdge>> {
+    let interface_targets = collect_interface_targets(module, context);
+    let mut callees: HashMap<CallableKey, Vec<CallEdge>> = HashMap::new();
+    let mut resolved_calls = model.calls.iter().collect::<Vec<_>>();
+    resolved_calls.sort_by(|(left, _), (right, _)| {
+        left.context
+            .cmp(&right.context)
+            .then(left.span.start.cmp(&right.span.start))
+            .then(left.span.end.cmp(&right.span.end))
+    });
+    for (node_key, resolved) in resolved_calls {
+        let Some(caller) = context_to_key.get(&node_key.context) else {
+            continue;
+        };
+        let edges = callees.entry(caller.clone()).or_default();
+        match resolved.dispatch {
+            Dispatch::Interface => {
+                if let Some(targets) = interface_targets.get(&resolved.callable) {
+                    edges.extend(targets.iter().cloned().map(|implementation| CallEdge {
+                        target: implementation.clone(),
+                        interface_dispatch: Some(InterfaceDispatch {
+                            interface_call: resolved.callable.clone(),
+                            implementation,
+                        }),
+                    }));
+                }
+            }
+            Dispatch::Direct | Dispatch::Instance => edges.push(CallEdge {
+                target: resolved.callable.clone(),
+                interface_dispatch: None,
+            }),
+        }
+    }
+    callees
 }
 
 /// Which concurrency uses to look for while walking a call graph.
@@ -122,7 +184,7 @@ fn check_target(
     operation: &str,
     submission_span: Span,
     facts: &HashMap<CallableKey, FunctionFacts<'_>>,
-    callees: &HashMap<CallableKey, Vec<CallableKey>>,
+    callees: &HashMap<CallableKey, Vec<CallEdge>>,
     model: &Model,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -139,17 +201,24 @@ fn check_target(
         );
         return;
     }
-    if let Some((offender, reason)) =
-        find_reachable(target, callees, facts, model, ConcurrencyFilter::Any)
-    {
-        diagnostics.push(
-            Diagnostic::error(
-                format!(
-                    "`{operation}` target `{target_name}` transitively calls `{offender}`, which uses {reason}"
-                ),
-                submission_span,
+    if let Some(reachable) = find_reachable(target, callees, facts, model, ConcurrencyFilter::Any) {
+        let message = if let Some(dispatch) = reachable.interface_dispatch {
+            format!(
+                "`{operation}` target `{target_name}` reaches nested concurrency through interface call `{interface_call}`; concrete implementation `{implementation}` reaches `{offender}`, which uses {reason}",
+                interface_call = callable_name(&dispatch.interface_call),
+                implementation = callable_name(&dispatch.implementation),
+                offender = reachable.offender,
+                reason = reachable.reason,
             )
-            .with_help("nested concurrency is not supported in this version"),
+        } else {
+            format!(
+                "`{operation}` target `{target_name}` transitively calls `{}`, which uses {}",
+                reachable.offender, reachable.reason
+            )
+        };
+        diagnostics.push(
+            Diagnostic::error(message, submission_span)
+                .with_help("nested concurrency is not supported in this version"),
         );
     }
 }
@@ -209,16 +278,20 @@ fn direct_use_in_body(body: &Block, context: &str, model: &Model) -> Option<&'st
 /// `start` itself) never loops.
 fn find_reachable(
     start: &CallableKey,
-    callees: &HashMap<CallableKey, Vec<CallableKey>>,
+    callees: &HashMap<CallableKey, Vec<CallEdge>>,
     facts: &HashMap<CallableKey, FunctionFacts<'_>>,
     model: &Model,
     filter: ConcurrencyFilter,
-) -> Option<(String, &'static str)> {
+) -> Option<ReachableUse> {
     let mut visited: HashSet<CallableKey> = HashSet::new();
     visited.insert(start.clone());
-    let mut queue: std::collections::VecDeque<CallableKey> =
-        callees.get(start).cloned().unwrap_or_default().into();
-    while let Some(current) = queue.pop_front() {
+    let mut queue: VecDeque<(CallableKey, Option<InterfaceDispatch>)> = callees
+        .get(start)
+        .into_iter()
+        .flatten()
+        .map(|edge| (edge.target.clone(), edge.interface_dispatch.clone()))
+        .collect();
+    while let Some((current, interface_dispatch)) = queue.pop_front() {
         if !visited.insert(current.clone()) {
             continue;
         }
@@ -254,13 +327,99 @@ fn find_reachable(
             }),
         };
         if let Some(reason) = reason {
-            return Some((fact.name.clone(), reason));
+            return Some(ReachableUse {
+                offender: fact.name.clone(),
+                reason,
+                interface_dispatch,
+            });
         }
         if let Some(next) = callees.get(&current) {
-            queue.extend(next.iter().cloned());
+            queue.extend(next.iter().map(|edge| {
+                (
+                    edge.target.clone(),
+                    edge.interface_dispatch
+                        .clone()
+                        .or_else(|| interface_dispatch.clone()),
+                )
+            }));
         }
     }
     None
+}
+
+/// Build the conservative targets of each resolved interface method from the
+/// same concrete type table and exact signatures used by interface validation.
+fn collect_interface_targets(
+    module: &Module,
+    context: &Context,
+) -> HashMap<CallableKey, Vec<CallableKey>> {
+    let mut targets: HashMap<CallableKey, Vec<CallableKey>> = HashMap::new();
+    for item in &module.items {
+        let Item::Class(class) = item else { continue };
+        let Some(class_info) = context.types.get(&class.name) else {
+            continue;
+        };
+        for interface_name in &class_info.implemented_interfaces {
+            let Some(interface) = module.items.iter().find_map(|item| match item {
+                Item::Interface(interface) if interface.name == *interface_name => Some(interface),
+                _ => None,
+            }) else {
+                continue;
+            };
+            let Some(interface_info) = context.types.get(interface_name) else {
+                continue;
+            };
+            for member in &interface.members {
+                let Member::Method(required_declaration) = member else {
+                    continue;
+                };
+                let required_key = callable_key(
+                    &required_declaration.name,
+                    required_declaration.span.start,
+                    None,
+                    Some(interface_name),
+                );
+                let Some(required) = interface_info
+                    .methods
+                    .get(&required_declaration.name)
+                    .into_iter()
+                    .flatten()
+                    .find(|candidate| candidate.key == required_key)
+                else {
+                    continue;
+                };
+                let Some(implementation) = class_info
+                    .methods
+                    .get(&required_declaration.name)
+                    .into_iter()
+                    .flatten()
+                    .find(|candidate| {
+                        !candidate.is_static && candidate.signature == required.signature
+                    })
+                else {
+                    continue;
+                };
+                let implementations = targets.entry(required.key.clone()).or_default();
+                if !implementations.contains(&implementation.key) {
+                    implementations.push(implementation.key.clone());
+                }
+            }
+        }
+    }
+    targets
+}
+
+fn callable_name(key: &CallableKey) -> String {
+    key.owner
+        .as_ref()
+        .map_or_else(|| key.name.clone(), |owner| format!("{owner}.{}", key.name))
+}
+
+fn callable_order(left: &CallableKey, right: &CallableKey) -> std::cmp::Ordering {
+    left.owner
+        .cmp(&right.owner)
+        .then(left.name.cmp(&right.name))
+        .then(left.declaration_start.cmp(&right.declaration_start))
 }
 
 fn collect_facts<'a>(

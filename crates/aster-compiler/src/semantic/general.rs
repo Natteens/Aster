@@ -48,7 +48,7 @@ pub(super) fn validate(module: &Module, diagnostics: &mut Vec<Diagnostic>, model
     declarations::validate_bodies(module, &context, diagnostics, model);
     // Runs after every call/Task.Run/Parallel resolution has been recorded in
     // `model`, so the call graph it walks is complete.
-    nested_concurrency::validate(module, model, diagnostics);
+    nested_concurrency::validate(module, &context, model, diagnostics);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
