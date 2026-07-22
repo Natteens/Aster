@@ -293,6 +293,94 @@ fn check_never_touches_stdin_or_program_output() {
     assert!(!stdout(&output).contains("should not run"));
 }
 
+#[test]
+fn aster_check_rejects_console_io_reachable_from_a_task_run_body() {
+    let directory = temporary_directory("check-worker-io");
+    let main = directory.join("main.aster");
+    fs::write(
+        &main,
+        "using aster.io;\n\
+         public int Body() { WriteLine(\"from a worker\"); return 0; }\n\
+         public int Main() { Task<int> task = Task.Run(Body); return task.Wait(); }",
+    )
+    .expect("write worker console io program");
+    let check_output = aster(["check", main.to_str().expect("UTF-8 temporary path")]);
+    let run_output = aster([
+        "run",
+        main.to_str().expect("UTF-8 temporary path"),
+        "--function",
+        "Main",
+    ]);
+    fs::remove_dir_all(&directory).expect("remove temporary directory");
+    assert!(
+        !check_output.status.success(),
+        "`aster check` must reject console I/O reachable from a Task.Run body just like `aster run` does"
+    );
+    assert!(!run_output.status.success());
+    assert!(
+        stderr(&check_output).contains("Task.Run"),
+        "{}",
+        stderr(&check_output)
+    );
+}
+
+/// The M1E mandatory integrated program (M1A search/substring, M1B1/M1B2
+/// parsing, M1C `ToString`, M1D console I/O, all together), run through the
+/// real CLI subprocess with piped stdin/captured stdout.
+#[test]
+fn integrated_m1_program_runs_via_aster_run_subprocess() {
+    let directory = temporary_directory("m1-integrated");
+    let main = directory.join("main.aster");
+    fs::write(
+        &main,
+        "using aster.core;\nusing aster.io;\n\
+         public int Main() {\n\
+             Write(\"Input: \");\n\
+             Option<string> maybeLine = ReadLine();\n\
+             switch (maybeLine) { case Some(line): return Process(line); case None: return 1; }\n\
+         }\n\
+         public int Process(string line) {\n\
+             if (!line.Contains(\":\")) { WriteLine(\"invalid\"); return 1; }\n\
+             int separator = line.IndexOf(\":\");\n\
+             string name = line.Substring(0, separator);\n\
+             string valueText = line.Substring(separator + 1);\n\
+             Option<double> parsed = valueText.TryParseDouble();\n\
+             switch (parsed) { case Some(value): return PrintResult(name, value); case None: return 2; }\n\
+         }\n\
+         public int PrintResult(string name, double value) {\n\
+             WriteLine($\"{name}: {value.ToString()}\");\n\
+             return 0;\n\
+         }",
+    )
+    .expect("write integrated M1 program");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args([
+            "run",
+            main.to_str().expect("UTF-8 temporary path"),
+            "--function",
+            "Main",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn Aster binary");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(b"count:7\n")
+        .expect("write to child stdin");
+    let output = child.wait_with_output().expect("wait for Aster binary");
+    fs::remove_dir_all(&directory).expect("remove temporary directory");
+    assert!(output.status.success(), "{}", stderr(&output));
+    // `Main` returns `int`, so the CLI also prints that value (here `0`,
+    // `PrintResult`'s success code) as its own trailing line, after the
+    // program's own console output.
+    assert_eq!(stdout(&output), "Input: count: 7\n0\n");
+    assert_eq!(output.status.code(), Some(0));
+}
+
 fn aster<const N: usize>(arguments: [&str; N]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_aster"))
         .args(arguments)

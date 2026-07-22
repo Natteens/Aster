@@ -261,3 +261,17 @@ pub fn execute_symbol_with_stats(
     validate_invocable_entry(entry, &entry.name)?;
     execute_resolved(module, entry, true, None)
 }
+
+/// Runs the same structural MIR validation every `execute*` function performs
+/// (shapes, symbols, regions, worker-body restrictions like console I/O in a
+/// `Task.Run`/`Parallel.*` body) without finalizing or running any code. Lets
+/// verification-only tools (`aster check`) reject invalid MIR before
+/// execution, reusing the one validator/call-graph analysis `execute*`
+/// already runs instead of a second, divergent check.
+///
+/// # Errors
+///
+/// Returns a controlled error describing the first structural violation found.
+pub fn validate(module: &mir::Module) -> Result<(), BackendError> {
+    validate_module(module)
+}

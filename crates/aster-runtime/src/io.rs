@@ -209,8 +209,13 @@ pub extern "C" fn aster_rt_io_write_line(
 /// Strip exactly one logical line terminator: a trailing `\n`, and then a
 /// trailing `\r` if one remains. Never trims anything else.
 fn strip_line_terminator(bytes: &[u8]) -> &[u8] {
-    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
-    bytes.strip_suffix(b"\r").unwrap_or(bytes)
+    // A trailing `\r` is only part of a CRLF terminator, and thus only
+    // stripped, when a `\n` was actually found and stripped first. A lone
+    // trailing `\r` (no `\n`, e.g. at EOF) is ordinary content.
+    match bytes.strip_suffix(b"\n") {
+        Some(rest) => rest.strip_suffix(b"\r").unwrap_or(rest),
+        None => bytes,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -379,6 +384,12 @@ mod tests {
         assert_eq!(strip_line_terminator(b"\n"), b"");
         assert_eq!(strip_line_terminator(b"  hello  \n"), b"  hello  ");
         assert_eq!(strip_line_terminator(b"hello\r\r\n"), b"hello\r");
+        assert_eq!(strip_line_terminator(b"\r\n"), b"");
+        // A lone trailing `\r` with no `\n` (e.g. `"hello\r"` immediately
+        // followed by EOF) is not a CRLF terminator and must be preserved as
+        // ordinary content.
+        assert_eq!(strip_line_terminator(b"hello\r"), b"hello\r");
+        assert_eq!(strip_line_terminator(b"\r"), b"\r");
     }
 
     #[test]

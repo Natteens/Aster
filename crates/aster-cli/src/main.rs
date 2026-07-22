@@ -146,6 +146,15 @@ fn process_file(command: &str, file_name: &str) -> Result<(), ()> {
                 }
                 return Err(());
             }
+            // `check`/`dump-hir`/`dump-mir` never execute the program, but
+            // must still reject anything `run` would reject structurally
+            // (e.g. console I/O reachable from a worker body) -- reusing the
+            // same validator `execute*` runs, never a second call-graph
+            // analysis.
+            if let Err(error) = aster_codegen_cranelift::validate(&compilation.mir) {
+                eprintln!("error: {error}");
+                return Err(());
+            }
             match command {
                 "dump-hir" => println!("{}", compilation.hir),
                 "dump-mir" => println!("{}", compilation.mir),
