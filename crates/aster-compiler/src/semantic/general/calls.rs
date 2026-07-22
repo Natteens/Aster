@@ -463,32 +463,62 @@ impl Analyzer<'_> {
                 } else {
                     let receiver = self.expression(object);
                     if let Type::List(element_type) = &receiver {
-                        if name != "Add" {
-                            self.diagnostics.push(Diagnostic::error(
-                                format!("list has no member `{name}`"),
-                                callee.span,
-                            ));
-                            return Type::Unknown;
-                        }
-                        if arguments.len() != 1 {
-                            self.diagnostics.push(
-                                Diagnostic::error(
-                                    format!(
-                                        "`List<T>.Add` expects 1 argument, found {}",
-                                        arguments.len()
-                                    ),
-                                    span,
-                                )
-                                .with_help("pass exactly one value of the list's element type"),
+                        if name == "Add" {
+                            if arguments.len() != 1 {
+                                self.diagnostics.push(
+                                    Diagnostic::error(
+                                        format!(
+                                            "`List<T>.Add` expects 1 argument, found {}",
+                                            arguments.len()
+                                        ),
+                                        span,
+                                    )
+                                    .with_help("pass exactly one value of the list's element type"),
+                                );
+                                return Type::Unknown;
+                            }
+                            self.require_assignable_value(
+                                element_type,
+                                &argument_types[0],
+                                &arguments[0],
                             );
-                            return Type::Unknown;
+                            return Type::Void;
                         }
-                        self.require_assignable_value(
-                            element_type,
-                            &argument_types[0],
-                            &arguments[0],
-                        );
-                        return Type::Void;
+                        if name == "Get" {
+                            if arguments.len() != 1 {
+                                self.diagnostics.push(
+                                    Diagnostic::error(
+                                        format!(
+                                            "`List<T>.Get` expects 1 argument, found {}",
+                                            arguments.len()
+                                        ),
+                                        span,
+                                    )
+                                    .with_help("pass a single `int` index"),
+                                );
+                                return Type::Unknown;
+                            }
+                            if argument_types[0] != Type::Int && argument_types[0] != Type::Unknown
+                            {
+                                self.diagnostics.push(
+                                    Diagnostic::error(
+                                        format!(
+                                            "`List<T>.Get` requires an `int` index, found `{}`",
+                                            argument_types[0].display()
+                                        ),
+                                        arguments[0].span,
+                                    )
+                                    .with_help("convert the index to `int`"),
+                                );
+                                return Type::Unknown;
+                            }
+                            return (**element_type).clone();
+                        }
+                        self.diagnostics.push(Diagnostic::error(
+                            format!("list has no member `{name}`"),
+                            callee.span,
+                        ));
+                        return Type::Unknown;
                     }
                     let interface_dispatch = matches!(receiver, Type::Interface(_));
                     let (Type::User(type_name)

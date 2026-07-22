@@ -166,6 +166,12 @@ impl Codegen {
             mir::Instruction::ListAdd { list, value } => {
                 self.translate_list_add(builder, list, value, state)
             }
+            mir::Instruction::ListGet {
+                destination,
+                list,
+                index,
+                element_type,
+            } => self.translate_list_get(builder, destination, list, index, element_type, state),
         }
     }
 }

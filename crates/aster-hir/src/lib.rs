@@ -236,6 +236,14 @@ pub enum ExpressionKind {
         list: Box<Expression>,
         value: Box<Expression>,
     },
+    /// `list.Get(index)`: always produces a value copy, never a pointer
+    /// into the list's buffer. `element_type` is this expression's own
+    /// `type_`, restated here structurally instead of re-derived by name.
+    ListGet {
+        list: Box<Expression>,
+        index: Box<Expression>,
+        element_type: Type,
+    },
     Member {
         object: Box<Expression>,
         symbol: SymbolId,

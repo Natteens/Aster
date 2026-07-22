@@ -1,8 +1,9 @@
 //! End-to-end tests for `List<T>`: the public constructor `new List<T>()`,
-//! the read-only `.Length` property (List B1), and `values.Add(value)` with
-//! geometric buffer growth (List B2A), through the full pipeline (parser,
-//! semantic analysis, HIR, MIR, escape analysis, codegen, JIT execution).
-//! `Get`/`Set`/`RemoveAt` do not exist yet.
+//! the read-only `.Length` property (List B1), `values.Add(value)` with
+//! geometric buffer growth (List B2A), and `values.Get(index)` with
+//! value-copy/identity-preserving semantics (List B2B), through the full
+//! pipeline (parser, semantic analysis, HIR, MIR, escape analysis, codegen,
+//! JIT execution). `Set`/`RemoveAt`/the indexer do not exist yet.
 
 use std::fmt::Write as _;
 
@@ -74,30 +75,6 @@ fn a_list_of_decimal_is_still_rejected() {
             .any(|message| message.contains("`List<decimal>` cannot be used")),
         "expected `List<decimal>` to be rejected, got {errors:?}"
     );
-}
-
-#[test]
-fn get_set_and_remove_at_remain_unavailable() {
-    for (source, expected) in [
-        (
-            "public int Main() { List<int> values = new List<int>(); return values.Get(0); }",
-            "no member `Get`",
-        ),
-        (
-            "public int Main() { List<int> values = new List<int>(); values.Set(0, 1); return 0; }",
-            "no member `Set`",
-        ),
-        (
-            "public int Main() { List<int> values = new List<int>(); values.RemoveAt(0); return 0; }",
-            "no member `RemoveAt`",
-        ),
-    ] {
-        let errors = compile_errors(source);
-        assert!(
-            errors.iter().any(|message| message.contains(expected)),
-            "expected `{expected}` in {errors:?}"
-        );
-    }
 }
 
 // --- List B2A: `values.Add(value)` --------------------------------------
@@ -302,4 +279,369 @@ fn arrays_and_objects_are_unaffected_by_list_construction() {
         }
         ";
     assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(4)));
+}
+
+// --- List B2B: `values.Get(index)` ---------------------------------------
+
+#[test]
+fn get_returns_first_middle_and_last_elements() {
+    let source = "
+        public int Main()
+        {
+            List<int> values = new List<int>();
+            values.Add(10);
+            values.Add(20);
+            values.Add(30);
+            return values.Get(0) * 100 + values.Get(1) * 10 + values.Get(2);
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(1230)));
+}
+
+#[test]
+fn get_works_after_several_growths() {
+    let mut source =
+        String::from("public int Main() { List<int> values = new List<int>(); int total = 0;");
+    for i in 0..20 {
+        let _ = write!(source, "values.Add({i});");
+    }
+    for i in 0..20 {
+        let _ = write!(source, "total = total + values.Get({i});");
+    }
+    source.push_str("return total; }");
+    assert_eq!(run(&source, "Main"), Ok(ExecutionValue::Int((0..20).sum())));
+}
+
+#[test]
+fn repeated_get_calls_are_consistent() {
+    let source = "
+        public int Main()
+        {
+            List<int> values = new List<int>();
+            values.Add(42);
+            int a = values.Get(0);
+            int b = values.Get(0);
+            int c = values.Get(0);
+            return a + b + c;
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(126)));
+}
+
+#[test]
+fn two_independent_lists_read_independently() {
+    let source = "
+        public int Main()
+        {
+            List<int> a = new List<int>();
+            List<int> b = new List<int>();
+            a.Add(1);
+            b.Add(2);
+            b.Add(3);
+            return a.Get(0) * 100 + b.Get(1);
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(103)));
+}
+
+#[test]
+fn an_alias_reads_the_same_content() {
+    let source = "
+        public int Main()
+        {
+            List<int> a = new List<int>();
+            a.Add(7);
+            List<int> b = a;
+            return b.Get(0);
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(7)));
+}
+
+#[test]
+fn get_does_not_change_length() {
+    let source = "
+        public int Main()
+        {
+            List<int> values = new List<int>();
+            values.Add(1);
+            values.Add(2);
+            values.Get(0);
+            values.Get(1);
+            return values.Length;
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(2)));
+}
+
+#[test]
+fn get_and_add_work_for_every_required_element_type() {
+    for (source, expected) in [
+        (
+            "public int Main() { List<int> v = new List<int>(); v.Add(11); return v.Get(0); }",
+            ExecutionValue::Int(11),
+        ),
+        (
+            "public long Main() { List<long> v = new List<long>(); v.Add(11L); return v.Get(0); }",
+            ExecutionValue::Long(11),
+        ),
+        (
+            "public uint Main() { List<uint> v = new List<uint>(); v.Add(11U); return v.Get(0); }",
+            ExecutionValue::UInt(11),
+        ),
+        (
+            "public ulong Main() { List<ulong> v = new List<ulong>(); v.Add(11UL); return v.Get(0); }",
+            ExecutionValue::ULong(11),
+        ),
+        (
+            "public float Main() { List<float> v = new List<float>(); v.Add(1.5f); return v.Get(0); }",
+            ExecutionValue::float(1.5),
+        ),
+        (
+            "public double Main() { List<double> v = new List<double>(); v.Add(1.5d); return v.Get(0); }",
+            ExecutionValue::double(1.5),
+        ),
+        (
+            "public bool Main() { List<bool> v = new List<bool>(); v.Add(true); return v.Get(0); }",
+            ExecutionValue::Bool(true),
+        ),
+        (
+            "public char Main() { List<char> v = new List<char>(); v.Add('x'); return v.Get(0); }",
+            ExecutionValue::Char('x'),
+        ),
+        (
+            "public string Main() { List<string> v = new List<string>(); v.Add(\"hi\"); return v.Get(0); }",
+            ExecutionValue::String("hi".to_owned()),
+        ),
+    ] {
+        assert_eq!(run(source, "Main"), Ok(expected), "`{source}`");
+    }
+}
+
+#[test]
+fn get_returns_the_same_class_identity_as_add() {
+    // Mutating the field through the value `Get` returned must be observed
+    // through the original reference too — proof of shared identity, since
+    // a copy would leave the original untouched.
+    let source = "
+        public class Box { public int value; public Box(int value) { this.value = value; } }
+        public int Main()
+        {
+            Box box = new Box(1);
+            List<Box> values = new List<Box>();
+            values.Add(box);
+            Box loaded = values.Get(0);
+            loaded.value = 99;
+            return box.value;
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(99)));
+}
+
+#[test]
+fn get_preserves_interface_dispatch() {
+    let source = "
+        public interface IShape { int Area(); }
+        public class Square : IShape { public int side; public Square(int side) { this.side = side; } public int Area() { return side * side; } }
+        public int Main()
+        {
+            IShape shape = new Square(4);
+            List<IShape> values = new List<IShape>();
+            values.Add(shape);
+            IShape loaded = values.Get(0);
+            return loaded.Area();
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(16)));
+}
+
+#[test]
+fn get_returns_the_same_array_identity_as_add() {
+    let source = "
+        public int Main()
+        {
+            int[] array = [1, 2, 3];
+            List<int[]> values = new List<int[]>();
+            values.Add(array);
+            int[] loaded = values.Get(0);
+            loaded[0] = 99;
+            return array[0];
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(99)));
+}
+
+#[test]
+fn get_returns_the_same_nested_list_identity_as_add() {
+    let source = "
+        public int Main()
+        {
+            List<int> inner = new List<int>();
+            inner.Add(5);
+            List<List<int>> outer = new List<List<int>>();
+            outer.Add(inner);
+            List<int> loaded = outer.Get(0);
+            loaded.Add(6);
+            return inner.Length;
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(2)));
+}
+
+#[test]
+fn get_produces_a_struct_copy_not_a_reference_to_the_slot() {
+    let source = "
+        public struct Point { public int x; public bool flag; public long y; }
+        public int Main()
+        {
+            List<Point> values = new List<Point>();
+            values.Add(Point { x: 1, flag: true, y: 2L });
+            Point copy = values.Get(0);
+            copy.x = 99;
+            Point again = values.Get(0);
+            return again.x;
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(1)));
+}
+
+#[test]
+fn get_preserves_a_reference_field_inside_a_struct() {
+    let source = "
+        public class Box { public int value; public Box(int value) { this.value = value; } }
+        public struct Wrapper { public Box inner; }
+        public int Main()
+        {
+            Box box = new Box(10);
+            List<Wrapper> values = new List<Wrapper>();
+            values.Add(Wrapper { inner: box });
+            Wrapper loaded = values.Get(0);
+            loaded.inner.value = 55;
+            return box.value;
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(55)));
+}
+
+#[test]
+fn get_preserves_enum_tag_and_scalar_payload() {
+    let source = "
+        public enum Shape { Circle(int radius), Square }
+        public int Main()
+        {
+            List<Shape> values = new List<Shape>();
+            values.Add(Shape.Circle(7));
+            values.Add(Shape.Square);
+            Shape first = values.Get(0);
+            switch (first) {
+                case Circle(r): return r;
+                case Square: return -1;
+            }
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(7)));
+}
+
+#[test]
+fn get_preserves_a_reference_payload_inside_an_enum() {
+    let source = "
+        public class Box { public int value; public Box(int value) { this.value = value; } }
+        public enum MaybeBox { None, Some(Box inner) }
+        public int Main()
+        {
+            Box box = new Box(3);
+            List<MaybeBox> values = new List<MaybeBox>();
+            values.Add(MaybeBox.Some(box));
+            MaybeBox loaded = values.Get(0);
+            switch (loaded) {
+                case Some(b): return b.value;
+                case None: return -1;
+            }
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(3)));
+}
+
+#[test]
+fn get_works_for_a_generic_specialization() {
+    let source = "
+        public class Box<T> { private T value; public Box(T value) { this.value = value; } public T Get() { return value; } }
+        public int Main()
+        {
+            List<Box<int>> values = new List<Box<int>>();
+            values.Add(new Box<int>(9));
+            Box<int> loaded = values.Get(0);
+            return loaded.Get();
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(9)));
+}
+
+#[test]
+fn a_helper_returning_get_of_a_parameter_keeps_the_reference_valid() {
+    let source = "
+        public class Box { public int value; public Box(int value) { this.value = value; } }
+        public Box Read(List<Box> values) { return values.Get(0); }
+        public int Main()
+        {
+            List<Box> values = new List<Box>();
+            values.Add(new Box(21));
+            Box loaded = Read(values);
+            return loaded.value;
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(21)));
+}
+
+#[test]
+fn get_and_add_still_reject_decimal() {
+    let errors = compile_errors(
+        "public int Main() { List<decimal> values = new List<decimal>(); values.Add(1.5m); return 0; }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("`List<decimal>` cannot be used")),
+        "expected `List<decimal>` to be rejected, got {errors:?}"
+    );
+}
+
+#[test]
+fn set_remove_at_and_the_indexer_remain_unavailable() {
+    for (source, expected) in [
+        (
+            "public int Main() { List<int> values = new List<int>(); values.Add(1); values.Set(0, 2); return 0; }",
+            "no member `Set`",
+        ),
+        (
+            "public int Main() { List<int> values = new List<int>(); values.Add(1); values.RemoveAt(0); return 0; }",
+            "no member `RemoveAt`",
+        ),
+        (
+            "public int Main() { List<int> values = new List<int>(); values.Add(1); return values[0]; }",
+            "cannot be indexed",
+        ),
+    ] {
+        let errors = compile_errors(source);
+        assert!(
+            errors.iter().any(|message| message.contains(expected)),
+            "expected `{expected}` in {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn a_value_read_through_a_zero_arg_helper_still_cannot_cross_a_worker_boundary() {
+    let errors = compile_errors(
+        "public class Box { public int value; public Box(int value) { this.value = value; } } \
+         public List<Box> MakeList() { List<Box> values = new List<Box>(); values.Add(new Box(1)); return values; } \
+         public Box ReadFirst() { return MakeList().Get(0); } \
+         public int Main() { Task<Box> task = Task.Run(ReadFirst); return 0; }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("cross a worker boundary")),
+        "expected the non-transferable-result diagnostic, got {errors:?}"
+    );
 }

@@ -625,6 +625,94 @@ impl ExecutionContext {
         }
     }
 
+    /// Copies element `index`'s bytes into `destination`. Never modifies
+    /// `list` (no growth, no length/capacity change), never returns a
+    /// pointer into the buffer, and never retains `destination` past this
+    /// call. Every failure is reported through `self.fail`; `destination`
+    /// is left untouched on failure.
+    fn list_get(
+        &mut self,
+        list: *const AsterList,
+        expected_element_size: u32,
+        expected_element_align: u32,
+        expected_element_type_key: u64,
+        index: i32,
+        destination: *mut u8,
+    ) {
+        if list.is_null() {
+            self.fail("list.Get received a null list");
+            return;
+        }
+        if destination.is_null() {
+            self.fail("list.Get received a null destination");
+            return;
+        }
+        if !self.validate_list_header(list) {
+            return;
+        }
+        // SAFETY: `list` was just validated above; every field is read once,
+        // transiently, into locals below.
+        #[allow(unsafe_code)]
+        let (length, element_size, element_align, element_type_key, data) = unsafe {
+            (
+                (*list).length,
+                (*list).element_size,
+                (*list).element_align,
+                (*list).element_type_key,
+                (*list).data,
+            )
+        };
+        if expected_element_size != element_size {
+            self.fail(format!(
+                "list.Get element size mismatch: expected {expected_element_size}, header has {element_size}"
+            ));
+            return;
+        }
+        if expected_element_align != element_align {
+            self.fail(format!(
+                "list.Get element alignment mismatch: expected {expected_element_align}, header has {element_align}"
+            ));
+            return;
+        }
+        if expected_element_type_key != element_type_key {
+            self.fail("list.Get element type key mismatch");
+            return;
+        }
+        if index < 0 {
+            self.fail(format!(
+                "List.Get index {index} is negative (length {length})"
+            ));
+            return;
+        }
+        if index >= length {
+            self.fail(format!(
+                "List.Get index {index} is out of bounds for length {length}"
+            ));
+            return;
+        }
+        let Some(offset) = usize::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_mul(usize::try_from(element_size).unwrap_or(0)))
+        else {
+            self.fail("list.Get index * element size overflow");
+            return;
+        };
+        // SAFETY: `0 <= index < length` and the header's invariants (checked
+        // by `validate_list_header`) guarantee `data` holds `length *
+        // element_size` valid bytes, so `offset..offset+element_size` lies
+        // inside it; `destination` was validated non-null and the caller
+        // guarantees it is writable for `element_size` bytes for the
+        // duration of this call.
+        #[allow(unsafe_code)]
+        unsafe {
+            ptr::copy_nonoverlapping(
+                data.add(offset),
+                destination,
+                usize::try_from(element_size).unwrap_or(0),
+            );
+        }
+    }
+
     pub(crate) fn allocate_object(&mut self, size: u32) -> *mut u8 {
         let bytes = usize::try_from(size.max(1)).unwrap_or(1);
         let pointer = self.arena.alloc(bytes, 8);
@@ -884,6 +972,30 @@ pub extern "C" fn aster_rt_list_add(
     #[allow(clippy::cast_sign_loss)]
     let type_key = expected_element_type_key as u64;
     context.list_add(list, size, align, type_key, source_value_address);
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_list_get(
+    context: *mut ExecutionContext,
+    list: *const AsterList,
+    expected_element_size: i32,
+    expected_element_align: i32,
+    expected_element_type_key: i64,
+    index: i32,
+    destination_address: *mut u8,
+) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: generated functions receive the live host-owned context as their
+    // hidden first parameter, and invocation cannot outlive that context.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let size = u32::try_from(expected_element_size).unwrap_or(0);
+    let align = u32::try_from(expected_element_align).unwrap_or(0);
+    #[allow(clippy::cast_sign_loss)]
+    let type_key = expected_element_type_key as u64;
+    context.list_get(list, size, align, type_key, index, destination_address);
 }
 
 #[cfg(test)]
@@ -1327,6 +1439,233 @@ mod tests {
             );
             assert_eq!(*stored, 42);
         }
+    }
+
+    fn destination(value: &mut i32) -> *mut u8 {
+        (std::ptr::from_mut(value)).cast::<u8>()
+    }
+
+    #[test]
+    fn list_get_reads_the_correct_element() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        for value in [10_i32, 20, 30] {
+            aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        }
+        assert!(context.take_error().is_none());
+        for (index, expected) in [(0_i32, 10_i32), (1, 20), (2, 30)] {
+            let mut out = 0_i32;
+            aster_rt_list_get(context_pointer, list, 4, 4, 1, index, destination(&mut out));
+            assert!(context.take_error().is_none(), "Get({index}) failed");
+            assert_eq!(out, expected, "Get({index})");
+        }
+    }
+
+    #[test]
+    fn list_get_does_not_modify_the_list() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        let mut out = 0_i32;
+        aster_rt_list_get(context_pointer, list, 4, 4, 1, 0, destination(&mut out));
+        assert_eq!(aster_rt_list_length(context_pointer, list), 1);
+        // SAFETY: `list` is valid and not aliased.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!((*list).capacity(), 4);
+        }
+    }
+
+    #[test]
+    fn list_get_rejects_a_null_list() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let mut out = 0_i32;
+        aster_rt_list_get(
+            context_pointer,
+            std::ptr::null(),
+            4,
+            4,
+            1,
+            0,
+            destination(&mut out),
+        );
+        assert!(context.take_error().is_some());
+    }
+
+    #[test]
+    fn list_get_rejects_a_null_destination() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        aster_rt_list_get(context_pointer, list, 4, 4, 1, 0, std::ptr::null_mut());
+        assert!(context.take_error().is_some());
+    }
+
+    #[test]
+    fn list_get_rejects_element_size_mismatch() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        let mut out = 0_i32;
+        aster_rt_list_get(context_pointer, list, 8, 4, 1, 0, destination(&mut out));
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("size mismatch"))
+        );
+    }
+
+    #[test]
+    fn list_get_rejects_element_align_mismatch() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        let mut out = 0_i32;
+        aster_rt_list_get(context_pointer, list, 4, 8, 1, 0, destination(&mut out));
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("alignment mismatch"))
+        );
+    }
+
+    #[test]
+    fn list_get_rejects_element_type_key_mismatch() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        let mut out = 0_i32;
+        aster_rt_list_get(context_pointer, list, 4, 4, 2, 0, destination(&mut out));
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("type key mismatch"))
+        );
+    }
+
+    #[test]
+    fn list_get_rejects_a_negative_index() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        let mut out = 0_i32;
+        aster_rt_list_get(context_pointer, list, 4, 4, 1, -1, destination(&mut out));
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("negative"))
+        );
+    }
+
+    #[test]
+    fn list_get_rejects_an_index_on_an_empty_list() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let mut out = 0_i32;
+        aster_rt_list_get(context_pointer, list, 4, 4, 1, 0, destination(&mut out));
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("out of bounds"))
+        );
+    }
+
+    #[test]
+    fn list_get_rejects_an_index_equal_to_length() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        let mut out = 0_i32;
+        aster_rt_list_get(context_pointer, list, 4, 4, 1, 1, destination(&mut out));
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("out of bounds"))
+        );
+    }
+
+    #[test]
+    fn list_get_rejects_an_index_far_beyond_length() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        let mut out = 0_i32;
+        aster_rt_list_get(context_pointer, list, 4, 4, 1, 1000, destination(&mut out));
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("out of bounds"))
+        );
+    }
+
+    #[test]
+    fn list_get_rejects_a_header_with_negative_length() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        // SAFETY: `list` was just allocated above; this simulates a
+        // corrupted header for a synthetic MIR/runtime test.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*list).length = -1;
+        }
+        let mut out = 0_i32;
+        aster_rt_list_get(context_pointer, list, 4, 4, 1, 0, destination(&mut out));
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("negative length"))
+        );
+    }
+
+    #[test]
+    fn list_get_error_does_not_contaminate_a_later_valid_call() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let value = 7_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        let mut out = 0_i32;
+        aster_rt_list_get(context_pointer, list, 4, 4, 1, 5, destination(&mut out));
+        assert!(context.take_error().is_some());
+        aster_rt_list_get(context_pointer, list, 4, 4, 1, 0, destination(&mut out));
+        assert!(context.take_error().is_none());
+        assert_eq!(out, 7);
+    }
+
+    #[test]
+    fn list_get_does_not_grow_the_arena_across_many_calls() {
+        let mut context = ExecutionContext::with_stats();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        let used_before = context.memory_stats().used_bytes;
+        for _ in 0..1000 {
+            let mut out = 0_i32;
+            aster_rt_list_get(context_pointer, list, 4, 4, 1, 0, destination(&mut out));
+        }
+        assert!(context.take_error().is_none());
+        assert_eq!(context.memory_stats().used_bytes, used_before);
     }
 
     #[test]

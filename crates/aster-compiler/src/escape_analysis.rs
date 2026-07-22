@@ -534,9 +534,17 @@ fn instruction_escape(
                     .any(|argument| direct_alias(argument, aliases).is_some()))
             .then_some(EscapeReason::PassedToIntrinsic)
         }
+        // Reading/allocating never escapes the receiver on its own. A
+        // reference value returned by `Get` needs no rule of its own here:
+        // it is only ever a copy of something already forced `Persistent`
+        // when it was `Add`ed (or, for a reference embedded in a struct/
+        // enum, when that struct/enum literal was constructed — see
+        // `assignment_escape`'s `Contained` case) — never a fresh
+        // allocation, and never owned by the list's slot.
         mir::Instruction::AllocateArray { .. }
         | mir::Instruction::AllocateObject { .. }
-        | mir::Instruction::AllocateList { .. } => None,
+        | mir::Instruction::AllocateList { .. }
+        | mir::Instruction::ListGet { .. } => None,
         // Storing a reference into a list's buffer is an aggregate store,
         // exactly like `Assign{target: Field/Index, value: Use(alias)}`
         // (`assignment_escape` above): conservatively persistent, regardless
@@ -1250,6 +1258,55 @@ mod tests {
             classifications.contains(&EscapeClassification::Persistent(
                 EscapeReason::PassedToCall
             )),
+            "{classifications:#?}"
+        );
+    }
+
+    // --- List B2B: `values.Get(index)` and its effect on escape analysis ---
+
+    #[test]
+    fn a_reference_read_back_through_get_remains_valid_after_being_added() {
+        // `Get`'s result is only ever a copy of something already forced
+        // `Persistent` by the corresponding `Add` (see the `ListAdd` arm of
+        // `instruction_escape`); this just confirms the combination compiles
+        // and the underlying reference is still classified `Persistent`.
+        let source = "public class Box { public int value; public Box(int value) { this.value = value; } } \
+                       public int Run() { List<Box> values = new List<Box>(); Box box = new Box(10); values.Add(box); \
+                       Box loaded = values.Get(0); return loaded.value; }";
+        let classifications = classifications(source, "Run");
+        assert!(
+            classifications.contains(&EscapeClassification::Persistent(EscapeReason::Stored)),
+            "{classifications:#?}"
+        );
+    }
+
+    #[test]
+    fn a_reference_field_inside_a_struct_added_to_a_list_is_persistent() {
+        // The reference is forced `Persistent` the moment it is embedded in
+        // the struct literal (`RvalueKind::Aggregate`'s `Contained` case in
+        // `assignment_escape`, pre-existing and unrelated to `List`), before
+        // the struct is ever added to any list — demonstrating the existing
+        // architecture already handles this without any List-specific rule.
+        let source = "public class Box { public int value; public Box(int value) { this.value = value; } } \
+                       public struct Wrapper { public Box Value; } \
+                       public int Run() { List<Wrapper> values = new List<Wrapper>(); Box box = new Box(10); \
+                       Wrapper w = Wrapper { Value: box }; values.Add(w); return box.value; }";
+        let classifications = classifications(source, "Run");
+        assert!(
+            classifications.contains(&EscapeClassification::Persistent(EscapeReason::Contained)),
+            "{classifications:#?}"
+        );
+    }
+
+    #[test]
+    fn a_reference_payload_inside_an_enum_added_to_a_list_is_persistent() {
+        let source = "public class Box { public int value; public Box(int value) { this.value = value; } } \
+                       public enum MaybeBox { None, Some(Box inner) } \
+                       public int Run() { List<MaybeBox> values = new List<MaybeBox>(); Box box = new Box(10); \
+                       MaybeBox m = MaybeBox.Some(box); values.Add(m); return box.value; }";
+        let classifications = classifications(source, "Run");
+        assert!(
+            classifications.contains(&EscapeClassification::Persistent(EscapeReason::Contained)),
             "{classifications:#?}"
         );
     }

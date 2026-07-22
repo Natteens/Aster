@@ -1,7 +1,7 @@
 use super::{
-    BackendError, Codegen, FuncId, FunctionBuilder, FunctionState, HashMap, InstBuilder, Module,
-    StackSlotData, StackSlotKind, cast_value, is_aggregate, mir, scalar_from_bits, scalar_kind,
-    scalar_to_bits, type_name, types,
+    BackendError, Codegen, FuncId, FunctionBuilder, FunctionState, HashMap, InstBuilder, MemFlags,
+    Module, StackSlotData, StackSlotKind, cast_value, is_aggregate, mir, scalar_from_bits,
+    scalar_kind, scalar_to_bits, type_name, types,
 };
 
 impl Codegen {
@@ -753,6 +753,70 @@ impl Codegen {
             function_ref,
             &[context, list_value, size, align, type_key, source_address],
         );
+        Ok(())
+    }
+
+    /// `list.Get(index)`: writes the copied element into a fresh address —
+    /// the destination place itself for an aggregate (structs/enums/
+    /// interfaces already model returning a value as "write into this
+    /// address"), or a temporary stack slot for a scalar/reference, reloaded
+    /// with the correct Cranelift type afterward. Never surfaces the
+    /// buffer's own address.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn translate_list_get(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: &mir::Place,
+        list: &mir::Operand,
+        index: &mir::Operand,
+        element_type: &mir::Type,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let list_value = self.translate_operand(builder, list, state)?;
+        let index_value = self.translate_operand(builder, index, state)?;
+        let layout = self.layouts.type_layout(element_type)?;
+        let write_address = if is_aggregate(element_type) {
+            self.place_address(builder, destination, state)?
+        } else {
+            let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                layout.size,
+                layout.align_shift,
+            ));
+            builder.ins().stack_addr(self.pointer_type, slot, 0)
+        };
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids["aster_rt_list_get"], builder.func);
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("list.Get is missing its ExecutionContext"))?;
+        let size = builder.ins().iconst(types::I32, i64::from(layout.size));
+        let align = builder
+            .ins()
+            .iconst(types::I32, i64::from(1_u32 << layout.align_shift));
+        #[allow(clippy::cast_possible_wrap)]
+        let type_key_bits = mir::type_key(element_type) as i64;
+        let type_key = builder.ins().iconst(types::I64, type_key_bits);
+        builder.ins().call(
+            function_ref,
+            &[
+                context,
+                list_value,
+                size,
+                align,
+                type_key,
+                index_value,
+                write_address,
+            ],
+        );
+        if !is_aggregate(element_type) {
+            let value_type = self.clif_value_type(element_type)?;
+            let loaded = builder
+                .ins()
+                .load(value_type, MemFlags::new(), write_address, 0);
+            self.store_scalar(builder, destination, loaded, state)?;
+        }
         Ok(())
     }
 }

@@ -313,6 +313,22 @@ impl Lowerer<'_> {
                         };
                     }
                 }
+                if let ast::ExpressionKind::Member { object, name } = &callee.kind
+                    && name == "Get"
+                {
+                    let object = self.expression(object);
+                    if let hir::Type::List(element_type) = object.type_.clone() {
+                        let index = self.expression(&arguments[0]);
+                        return hir::Expression {
+                            type_: (*element_type).clone(),
+                            kind: hir::ExpressionKind::ListGet {
+                                list: Box::new(object),
+                                index: Box::new(index),
+                                element_type: *element_type,
+                            },
+                        };
+                    }
+                }
                 if is_parallel_for_callee(callee) {
                     let resolved = &self.model.parallel_for[&model_key];
                     let body = self.callable_symbols[&resolved.body];

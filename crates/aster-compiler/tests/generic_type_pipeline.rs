@@ -177,12 +177,8 @@ fn list_of_int_is_not_assignable_to_list_of_long() {
 }
 
 #[test]
-fn list_has_no_member_operations_beyond_length_and_add() {
+fn list_has_no_member_operations_beyond_length_add_and_get() {
     for (source, expected) in [
-        (
-            "public int Run(List<int> values) { return values.Get(0); }",
-            "no member `Get`",
-        ),
         (
             "public int Run(List<int> values) { values.Set(0, 1); return 0; }",
             "no member `Set`",
@@ -190,6 +186,10 @@ fn list_has_no_member_operations_beyond_length_and_add() {
         (
             "public int Run(List<int> values) { values.RemoveAt(0); return 0; }",
             "no member `RemoveAt`",
+        ),
+        (
+            "public int Run(List<int> values) { return values[0]; }",
+            "cannot be indexed",
         ),
     ] {
         let diagnostics = aster_compiler::compile(source).expect_err("member not yet implemented");
@@ -465,6 +465,120 @@ fn list_add_evaluates_receiver_then_argument_exactly_once_each() {
     assert!(
         list_position < value_position,
         "GetList() must be called before GetValue(): {calls:?}"
+    );
+}
+
+// --- List B2B: `values.Get(index)` --------------------------------------
+
+#[test]
+fn list_get_accepts_a_valid_call_and_returns_the_element_type() {
+    let source = "public int Run() { List<int> values = new List<int>(); values.Add(1); \
+                  int first = values.Get(0); return first; }";
+    aster_compiler::compile(source).expect("List<int>.Get(int) returns int");
+}
+
+#[test]
+fn list_get_diagnostics_are_specific() {
+    for (source, expected) in [
+        (
+            "public int Run() { List<int> values = new List<int>(); return values.Get(); }",
+            "expects 1 argument, found 0",
+        ),
+        (
+            "public int Run() { List<int> values = new List<int>(); return values.Get(0, 1); }",
+            "expects 1 argument, found 2",
+        ),
+        (
+            "public int Run() { List<int> values = new List<int>(); return values.Get(1L); }",
+            "requires an `int` index",
+        ),
+        (
+            "public int Run() { List<int> values = new List<int>(); return values.Get(\"0\"); }",
+            "requires an `int` index",
+        ),
+    ] {
+        let diagnostics = aster_compiler::compile(source).expect_err("invalid `Get` usage");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(expected)),
+            "missing `{expected}` in {diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn an_ordinary_get_method_on_a_class_still_resolves_normally() {
+    let source = "public class Store { public int value; public Store() {} \
+                  public int Get() { return value; } } \
+                  public int Run() { Store store = new Store(); return store.Get(); }";
+    aster_compiler::compile(source).expect("a class's own `Get` method is unaffected by List");
+}
+
+#[test]
+fn a_free_function_named_get_from_still_resolves_normally() {
+    let source = "public struct Wrapper { public int total; } \
+                  public int GetFrom(Wrapper wrapper) { return wrapper.total; } \
+                  public int Run() { Wrapper wrapper = Wrapper { total: 5 }; return GetFrom(wrapper); }";
+    aster_compiler::compile(source).expect("an unrelated free function is unaffected by List.Get");
+}
+
+#[test]
+fn list_get_evaluates_receiver_then_index_exactly_once_each() {
+    let source = "public List<int> GetList() { List<int> values = new List<int>(); values.Add(1); return values; } \
+                  public int GetIndex() { return 0; } \
+                  public int Run() { return GetList().Get(GetIndex()); }";
+    let compilation = aster_compiler::compile(source).expect("GetList().Get(GetIndex()) compiles");
+    let run = compilation
+        .mir
+        .functions
+        .iter()
+        .find(|function| function.name == "Run" && function.owner.is_none())
+        .expect("Run is declared");
+    let get_list = compilation
+        .mir
+        .functions
+        .iter()
+        .find(|function| function.name == "GetList" && function.owner.is_none())
+        .expect("GetList is declared")
+        .symbol;
+    let get_index = compilation
+        .mir
+        .functions
+        .iter()
+        .find(|function| function.name == "GetIndex" && function.owner.is_none())
+        .expect("GetIndex is declared")
+        .symbol;
+    let calls = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction {
+            aster_mir::Instruction::Call { function, .. } => Some(*function),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|&&function| function == get_list)
+            .count(),
+        1,
+        "GetList() must be evaluated exactly once: {calls:?}"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|&&function| function == get_index)
+            .count(),
+        1,
+        "GetIndex() must be evaluated exactly once: {calls:?}"
+    );
+    let list_position = calls.iter().position(|&function| function == get_list);
+    let index_position = calls.iter().position(|&function| function == get_index);
+    assert!(
+        list_position < index_position,
+        "GetList() must be called before GetIndex(): {calls:?}"
     );
 }
 

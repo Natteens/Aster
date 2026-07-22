@@ -183,6 +183,17 @@ pub enum Instruction {
         list: Operand,
         value: Operand,
     },
+    /// `list.Get(index)`: copies element `index` into `destination` — never
+    /// a pointer into the buffer. `element_type` is carried explicitly
+    /// (mirrors `AllocateList`) since `destination` alone cannot express the
+    /// expected type; `list.type_` must equal `List(element_type)` and
+    /// `destination`'s declared type must equal `element_type` exactly.
+    ListGet {
+        destination: Place,
+        list: Operand,
+        index: Operand,
+        element_type: Type,
+    },
 }
 
 /// Runtime services reachable from generated code. Backends map each variant

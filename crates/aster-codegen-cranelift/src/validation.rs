@@ -253,25 +253,15 @@ fn validate_instruction(
             function,
             arguments,
             return_type,
-        } => {
-            if let Some(destination) = destination {
-                validate_place(destination, function_name)?;
-            }
-            validate_return_type(return_type, function_name)?;
-            for argument in arguments {
-                validate_operand(argument, function_name)?;
-            }
-            let called = signatures.get(function).ok_or_else(|| {
-                BackendError::new(format!(
-                    "function `{function_name}` calls an unsupported external function with symbol {}",
-                    function.0
-                ))
-            })?;
-            if called.owner.is_some_and(|owner| !classes.contains(&owner)) {
-                return Err(unsupported(function_name, "struct method calls"));
-            }
-            Ok(())
-        }
+        } => validate_call(
+            destination.as_ref(),
+            *function,
+            arguments,
+            return_type,
+            function_name,
+            signatures,
+            classes,
+        ),
         mir::Instruction::CallInterface {
             destination,
             receiver,
@@ -308,14 +298,7 @@ fn validate_instruction(
         } => validate_allocate_array(destination, element_type, length, function_name),
         mir::Instruction::AllocateObject {
             destination, class, ..
-        } => {
-            validate_place(destination, function_name)?;
-            if classes.contains(class) {
-                Ok(())
-            } else {
-                Err(unsupported(function_name, "allocation of a non-class type"))
-            }
-        }
+        } => validate_allocate_object(destination, *class, function_name, classes),
         mir::Instruction::AllocateList {
             destination,
             element_type,
@@ -339,6 +322,23 @@ fn validate_instruction(
             interfaces,
             enums,
         ),
+        mir::Instruction::ListGet {
+            destination,
+            list,
+            index,
+            element_type,
+        } => validate_list_get(
+            destination,
+            list,
+            index,
+            element_type,
+            function_name,
+            classes,
+            structs,
+            interfaces,
+            enums,
+            locals,
+        ),
     }
 }
 
@@ -351,6 +351,49 @@ fn validate_allocate_array(
     validate_place(destination, function_name)?;
     validate_value_type(element_type, function_name)?;
     validate_operand(length, function_name)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_call(
+    destination: Option<&mir::Place>,
+    function: mir::SymbolId,
+    arguments: &[mir::Operand],
+    return_type: &mir::Type,
+    function_name: &str,
+    signatures: &HashMap<mir::SymbolId, &mir::Function>,
+    classes: &HashSet<mir::SymbolId>,
+) -> Result<(), BackendError> {
+    if let Some(destination) = destination {
+        validate_place(destination, function_name)?;
+    }
+    validate_return_type(return_type, function_name)?;
+    for argument in arguments {
+        validate_operand(argument, function_name)?;
+    }
+    let called = signatures.get(&function).ok_or_else(|| {
+        BackendError::new(format!(
+            "function `{function_name}` calls an unsupported external function with symbol {}",
+            function.0
+        ))
+    })?;
+    if called.owner.is_some_and(|owner| !classes.contains(&owner)) {
+        return Err(unsupported(function_name, "struct method calls"));
+    }
+    Ok(())
+}
+
+fn validate_allocate_object(
+    destination: &mir::Place,
+    class: mir::SymbolId,
+    function_name: &str,
+    classes: &HashSet<mir::SymbolId>,
+) -> Result<(), BackendError> {
+    validate_place(destination, function_name)?;
+    if classes.contains(&class) {
+        Ok(())
+    } else {
+        Err(unsupported(function_name, "allocation of a non-class type"))
+    }
 }
 
 fn validate_call_intrinsic(
@@ -419,6 +462,61 @@ fn validate_allocate_list(
                 "function `{function_name}` has an `AllocateList` whose destination is declared `{}`, but the instruction constructs `{}`",
                 type_name_owned(declared),
                 type_name_owned(&expected),
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_list_get(
+    destination: &mir::Place,
+    list: &mir::Operand,
+    index: &mir::Operand,
+    element_type: &mir::Type,
+    function_name: &str,
+    classes: &HashSet<mir::SymbolId>,
+    structs: &HashSet<mir::SymbolId>,
+    interfaces: &HashSet<mir::SymbolId>,
+    enums: &HashSet<mir::SymbolId>,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    validate_place(destination, function_name)?;
+    validate_operand(list, function_name)?;
+    validate_operand(index, function_name)?;
+    if index.type_ != mir::Type::Int {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a `ListGet` whose index is not `int` (found `{}`)",
+            type_name_owned(&index.type_)
+        )));
+    }
+    let expected_list_type = mir::Type::List(Box::new(element_type.clone()));
+    if list.type_ != expected_list_type {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a `ListGet` on `{}`, but the instruction constructs `{}`",
+            type_name_owned(&list.type_),
+            type_name_owned(&expected_list_type),
+        )));
+    }
+    validate_list_element_type(
+        element_type,
+        function_name,
+        classes,
+        structs,
+        interfaces,
+        enums,
+    )?;
+    if let mir::Place::Local(local) = destination {
+        let declared = locals.get(local).ok_or_else(|| {
+            BackendError::new(format!(
+                "function `{function_name}` has a `ListGet` writing into an undeclared local"
+            ))
+        })?;
+        if *declared != *element_type {
+            return Err(BackendError::new(format!(
+                "function `{function_name}` has a `ListGet` whose destination is declared `{}`, but the instruction produces `{}`",
+                type_name_owned(declared),
+                type_name_owned(element_type),
             )));
         }
     }
@@ -1889,5 +1987,186 @@ mod tests {
             fields: Vec::new(),
         });
         validate_module(&module).expect("List<Widget>.Add(Widget) with Widget declared is valid");
+    }
+
+    /// `ListGet` has real source syntax, but semantic analysis already
+    /// prevents a receiver/index/result mismatch from ever compiling — so,
+    /// like `AllocateList`/`ListAdd`, every scenario here is hand-built MIR.
+    fn list_get_module(
+        list_type: mir::Type,
+        index_type: mir::Type,
+        declared_result_type: mir::Type,
+        element_type: mir::Type,
+    ) -> mir::Module {
+        let list_local = mir::LocalId(0);
+        let index_local = mir::LocalId(1);
+        let result_local = mir::LocalId(2);
+        mir::Module {
+            structs: Vec::new(),
+            classes: Vec::new(),
+            interfaces: Vec::new(),
+            enums: Vec::new(),
+            interface_implementations: Vec::new(),
+            functions: vec![mir::Function {
+                constructor: false,
+                symbol: mir::SymbolId(1),
+                owner: None,
+                name: "Get".to_owned(),
+                visibility: mir::Visibility::Public,
+                parameters: vec![
+                    mir::Local {
+                        id: list_local,
+                        symbol: None,
+                        name: "list".to_owned(),
+                        type_: list_type.clone(),
+                        mutable: false,
+                        temporary: false,
+                    },
+                    mir::Local {
+                        id: index_local,
+                        symbol: None,
+                        name: "index".to_owned(),
+                        type_: index_type.clone(),
+                        mutable: false,
+                        temporary: false,
+                    },
+                ],
+                locals: vec![mir::Local {
+                    id: result_local,
+                    symbol: None,
+                    name: "result".to_owned(),
+                    type_: declared_result_type,
+                    mutable: true,
+                    temporary: false,
+                }],
+                return_type: mir::Type::Void,
+                entry: mir::BasicBlockId(0),
+                blocks: vec![mir::BasicBlock {
+                    id: mir::BasicBlockId(0),
+                    instructions: vec![mir::Instruction::ListGet {
+                        destination: mir::Place::Local(result_local),
+                        list: mir::Operand {
+                            type_: list_type,
+                            kind: mir::OperandKind::Copy(mir::Place::Local(list_local)),
+                        },
+                        index: mir::Operand {
+                            type_: index_type,
+                            kind: mir::OperandKind::Copy(mir::Place::Local(index_local)),
+                        },
+                        element_type,
+                    }],
+                    terminator: mir::Terminator::Return(None),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn list_get_accepts_a_well_formed_call() {
+        let module = list_get_module(
+            mir::Type::List(Box::new(mir::Type::Int)),
+            mir::Type::Int,
+            mir::Type::Int,
+            mir::Type::Int,
+        );
+        validate_module(&module).expect("List<int>.Get(int) -> int is well-formed");
+    }
+
+    #[test]
+    fn list_get_rejects_a_non_list_receiver() {
+        let module = list_get_module(
+            mir::Type::Int,
+            mir::Type::Int,
+            mir::Type::Int,
+            mir::Type::Int,
+        );
+        let error = validate_module(&module)
+            .expect_err("ListGet on a non-List<T> receiver must be rejected");
+        assert!(error.message().contains("constructs `List<int>`"));
+    }
+
+    #[test]
+    fn list_get_rejects_a_non_int_index() {
+        let module = list_get_module(
+            mir::Type::List(Box::new(mir::Type::Int)),
+            mir::Type::Long,
+            mir::Type::Int,
+            mir::Type::Int,
+        );
+        let error =
+            validate_module(&module).expect_err("ListGet index must be `int`, never `long`");
+        assert!(error.message().contains("index is not `int`"));
+    }
+
+    #[test]
+    fn list_get_rejects_a_destination_type_mismatch() {
+        let module = list_get_module(
+            mir::Type::List(Box::new(mir::Type::Int)),
+            mir::Type::Int,
+            mir::Type::Long,
+            mir::Type::Int,
+        );
+        let error = validate_module(&module).expect_err(
+            "a destination declared `long` receiving a `List<int>.Get` must be rejected",
+        );
+        assert!(error.message().contains("declared `long`"));
+        assert!(error.message().contains("produces `int`"));
+    }
+
+    #[test]
+    fn list_get_rejects_a_decimal_element() {
+        let module = list_get_module(
+            mir::Type::List(Box::new(mir::Type::Decimal)),
+            mir::Type::Int,
+            mir::Type::Decimal,
+            mir::Type::Decimal,
+        );
+        let error =
+            validate_module(&module).expect_err("List<decimal> has no runtime representation");
+        assert!(error.message().contains("decimal"));
+    }
+
+    #[test]
+    fn list_get_rejects_an_unknown_class_element() {
+        let unknown_class = mir::Type::Class(mir::SymbolId(999));
+        let module = list_get_module(
+            mir::Type::List(Box::new(unknown_class.clone())),
+            mir::Type::Int,
+            unknown_class.clone(),
+            unknown_class,
+        );
+        let error = validate_module(&module)
+            .expect_err("a List<T> element class absent from the module must be rejected");
+        assert!(error.message().contains("element class is unknown"));
+    }
+
+    #[test]
+    fn list_get_rejects_a_nested_list_mismatch() {
+        let module = list_get_module(
+            mir::Type::List(Box::new(mir::Type::List(Box::new(mir::Type::Int)))),
+            mir::Type::Int,
+            mir::Type::List(Box::new(mir::Type::Long)),
+            mir::Type::List(Box::new(mir::Type::Long)),
+        );
+        let error = validate_module(&module)
+            .expect_err("List<List<int>>.Get() must not produce List<long>");
+        assert!(error.message().contains("List<List<int>>"));
+    }
+
+    #[test]
+    fn list_get_accepts_a_known_class_element() {
+        let class_symbol = mir::SymbolId(42);
+        let mut module = list_get_module(
+            mir::Type::List(Box::new(mir::Type::Class(class_symbol))),
+            mir::Type::Int,
+            mir::Type::Class(class_symbol),
+            mir::Type::Class(class_symbol),
+        );
+        module.classes.push(mir::ClassDefinition {
+            symbol: class_symbol,
+            name: "Widget".to_owned(),
+            fields: Vec::new(),
+        });
+        validate_module(&module).expect("List<Widget>.Get(int) with Widget declared is valid");
     }
 }

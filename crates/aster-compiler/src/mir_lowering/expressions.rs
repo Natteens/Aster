@@ -86,6 +86,19 @@ impl FunctionLowerer {
                 self.instruction(mir::Instruction::ListAdd { list, value });
                 None
             }
+            hir::ExpressionKind::ListGet {
+                list,
+                index,
+                element_type,
+            } => {
+                let list = self
+                    .lower_expression(list)
+                    .expect("validated list produces a value");
+                let index = self
+                    .lower_expression(index)
+                    .expect("validated index produces a value");
+                Some(self.lower_list_get(list, index, element_type))
+            }
             hir::ExpressionKind::StringLength(value) => {
                 let value = self
                     .lower_expression(value)
@@ -673,6 +686,26 @@ impl FunctionLowerer {
         mir::Operand {
             type_: type_.clone(),
             kind: mir::OperandKind::Copy(mir::Place::Local(local)),
+        }
+    }
+
+    fn lower_list_get(
+        &mut self,
+        list: mir::Operand,
+        index: mir::Operand,
+        element_type: &hir::Type,
+    ) -> mir::Operand {
+        let local = self.new_temporary(element_type.clone());
+        let destination = mir::Place::Local(local);
+        self.instruction(mir::Instruction::ListGet {
+            destination: destination.clone(),
+            list,
+            index,
+            element_type: element_type.clone(),
+        });
+        mir::Operand {
+            type_: element_type.clone(),
+            kind: mir::OperandKind::Copy(destination),
         }
     }
 
