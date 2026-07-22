@@ -200,13 +200,16 @@ pub enum StringOperation {
     SubstringFrom,
     SubstringRange,
     /// `text.TryParseBool()`/`TryParseInt()`/`TryParseUInt()`/`TryParseLong()`/
-    /// `TryParseULong()`: deterministic, allocation-free parsing into the
-    /// official `Option<T>` for the matching primitive. Takes no arguments.
+    /// `TryParseULong()`/`TryParseFloat()`/`TryParseDouble()`: deterministic,
+    /// allocation-free parsing into the official `Option<T>` for the
+    /// matching primitive. Takes no arguments.
     TryParseBool,
     TryParseInt,
     TryParseUInt,
     TryParseLong,
     TryParseULong,
+    TryParseFloat,
+    TryParseDouble,
 }
 
 impl StringOperation {
@@ -220,6 +223,8 @@ impl StringOperation {
             Self::TryParseUInt => Some("uint"),
             Self::TryParseLong => Some("long"),
             Self::TryParseULong => Some("ulong"),
+            Self::TryParseFloat => Some("float"),
+            Self::TryParseDouble => Some("double"),
             Self::Contains
             | Self::StartsWith
             | Self::EndsWith

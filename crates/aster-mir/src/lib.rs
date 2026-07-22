@@ -299,6 +299,8 @@ pub enum Intrinsic {
     StringTryParseUInt,
     StringTryParseLong,
     StringTryParseULong,
+    StringTryParseFloat,
+    StringTryParseDouble,
 }
 
 impl Intrinsic {
@@ -351,7 +353,9 @@ impl Intrinsic {
             | Self::StringTryParseInt
             | Self::StringTryParseUInt
             | Self::StringTryParseLong
-            | Self::StringTryParseULong => None,
+            | Self::StringTryParseULong
+            | Self::StringTryParseFloat
+            | Self::StringTryParseDouble => None,
         }
     }
 

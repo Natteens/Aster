@@ -101,7 +101,9 @@ impl Codegen {
             | mir::Intrinsic::StringTryParseInt
             | mir::Intrinsic::StringTryParseUInt
             | mir::Intrinsic::StringTryParseLong
-            | mir::Intrinsic::StringTryParseULong => {
+            | mir::Intrinsic::StringTryParseULong
+            | mir::Intrinsic::StringTryParseFloat
+            | mir::Intrinsic::StringTryParseDouble => {
                 return self.translate_string_try_parse(
                     builder,
                     destination,
@@ -197,7 +199,9 @@ impl Codegen {
             | mir::Intrinsic::StringTryParseInt
             | mir::Intrinsic::StringTryParseUInt
             | mir::Intrinsic::StringTryParseLong
-            | mir::Intrinsic::StringTryParseULong => {
+            | mir::Intrinsic::StringTryParseULong
+            | mir::Intrinsic::StringTryParseFloat
+            | mir::Intrinsic::StringTryParseDouble => {
                 unreachable!("handled by the dedicated translators above")
             }
         };
@@ -692,6 +696,8 @@ impl Codegen {
             mir::Intrinsic::StringTryParseUInt => "aster_rt_string_try_parse_uint",
             mir::Intrinsic::StringTryParseLong => "aster_rt_string_try_parse_long",
             mir::Intrinsic::StringTryParseULong => "aster_rt_string_try_parse_ulong",
+            mir::Intrinsic::StringTryParseFloat => "aster_rt_string_try_parse_float",
+            mir::Intrinsic::StringTryParseDouble => "aster_rt_string_try_parse_double",
             _ => unreachable!("caller matched only string-try-parse intrinsics"),
         };
         let function_ref = self

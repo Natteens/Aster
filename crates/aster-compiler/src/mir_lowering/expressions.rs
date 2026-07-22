@@ -152,6 +152,8 @@ impl FunctionLowerer {
                     hir::StringOperation::TryParseUInt => mir::Intrinsic::StringTryParseUInt,
                     hir::StringOperation::TryParseLong => mir::Intrinsic::StringTryParseLong,
                     hir::StringOperation::TryParseULong => mir::Intrinsic::StringTryParseULong,
+                    hir::StringOperation::TryParseFloat => mir::Intrinsic::StringTryParseFloat,
+                    hir::StringOperation::TryParseDouble => mir::Intrinsic::StringTryParseDouble,
                 };
                 let destination = self.new_temporary(expression.type_.clone());
                 let place = mir::Place::Local(destination);

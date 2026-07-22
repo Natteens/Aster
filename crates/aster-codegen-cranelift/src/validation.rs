@@ -218,6 +218,8 @@ fn validate_string_try_parse_targets(
                 mir::Intrinsic::StringTryParseUInt => mir::Type::UInt,
                 mir::Intrinsic::StringTryParseLong => mir::Type::Long,
                 mir::Intrinsic::StringTryParseULong => mir::Type::ULong,
+                mir::Intrinsic::StringTryParseFloat => mir::Type::Float,
+                mir::Intrinsic::StringTryParseDouble => mir::Type::Double,
                 _ => continue,
             };
             let mir::Type::Enum(symbol) = return_type else {
@@ -647,6 +649,8 @@ fn is_string_method_intrinsic(intrinsic: mir::Intrinsic) -> bool {
             | mir::Intrinsic::StringTryParseUInt
             | mir::Intrinsic::StringTryParseLong
             | mir::Intrinsic::StringTryParseULong
+            | mir::Intrinsic::StringTryParseFloat
+            | mir::Intrinsic::StringTryParseDouble
     )
 }
 
@@ -1080,7 +1084,9 @@ fn validate_intrinsic_shape(
         | mir::Intrinsic::StringTryParseInt
         | mir::Intrinsic::StringTryParseUInt
         | mir::Intrinsic::StringTryParseLong
-        | mir::Intrinsic::StringTryParseULong => {
+        | mir::Intrinsic::StringTryParseULong
+        | mir::Intrinsic::StringTryParseFloat
+        | mir::Intrinsic::StringTryParseDouble => {
             destination.is_some()
                 && matches!(return_type, mir::Type::Enum(_))
                 && matches!(arguments, [receiver] if receiver.type_ == mir::Type::String)

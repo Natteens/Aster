@@ -25,7 +25,8 @@ use crate::string::{
     aster_rt_string_join_temporary, aster_rt_string_length, aster_rt_string_starts_with,
     aster_rt_string_substring_from, aster_rt_string_substring_from_temporary,
     aster_rt_string_substring_range, aster_rt_string_substring_range_temporary,
-    aster_rt_string_try_parse_bool, aster_rt_string_try_parse_int, aster_rt_string_try_parse_long,
+    aster_rt_string_try_parse_bool, aster_rt_string_try_parse_double,
+    aster_rt_string_try_parse_float, aster_rt_string_try_parse_int, aster_rt_string_try_parse_long,
     aster_rt_string_try_parse_uint, aster_rt_string_try_parse_ulong,
 };
 
@@ -511,6 +512,38 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
         RuntimeFunction {
             name: "aster_rt_string_try_parse_ulong",
             address: aster_rt_string_try_parse_ulong as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_try_parse_float",
+            address: aster_rt_string_try_parse_float as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_try_parse_double",
+            address: aster_rt_string_try_parse_double as *const u8,
             signature: RuntimeSignature {
                 parameters: &[
                     RuntimeType::Pointer,

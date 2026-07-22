@@ -668,14 +668,16 @@ impl Analyzer<'_> {
                 return Type::Unknown;
             }
             (
-                "TryParseBool" | "TryParseInt" | "TryParseUInt" | "TryParseLong" | "TryParseULong",
+                "TryParseBool" | "TryParseInt" | "TryParseUInt" | "TryParseLong" | "TryParseULong"
+                | "TryParseFloat" | "TryParseDouble",
                 0,
             ) => match self.try_parse_operation(name, span) {
                 Some(result) => result,
                 None => return Type::Unknown,
             },
             (
-                "TryParseBool" | "TryParseInt" | "TryParseUInt" | "TryParseLong" | "TryParseULong",
+                "TryParseBool" | "TryParseInt" | "TryParseUInt" | "TryParseLong" | "TryParseULong"
+                | "TryParseFloat" | "TryParseDouble",
                 found,
             ) => {
                 self.diagnostics.push(Diagnostic::error(
@@ -731,7 +733,9 @@ impl Analyzer<'_> {
             "TryParseInt" => StringOperation::TryParseInt,
             "TryParseUInt" => StringOperation::TryParseUInt,
             "TryParseLong" => StringOperation::TryParseLong,
-            _ => StringOperation::TryParseULong,
+            "TryParseULong" => StringOperation::TryParseULong,
+            "TryParseFloat" => StringOperation::TryParseFloat,
+            _ => StringOperation::TryParseDouble,
         };
         let target = operation
             .parse_target_name()

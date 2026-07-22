@@ -11,12 +11,14 @@ use super::{
 /// best-effort textual tracking (e.g. `helper().TryParseInt()`); the real
 /// receiver-type gate is semantic analysis's `receiver == Type::String`
 /// check, not this discovery pass.
-const TRY_PARSE_TARGETS: [(&str, &str); 5] = [
+const TRY_PARSE_TARGETS: [(&str, &str); 7] = [
     ("TryParseBool", "bool"),
     ("TryParseInt", "int"),
     ("TryParseUInt", "uint"),
     ("TryParseLong", "long"),
     ("TryParseULong", "ulong"),
+    ("TryParseFloat", "float"),
+    ("TryParseDouble", "double"),
 ];
 
 impl Monomorphizer {

@@ -318,7 +318,9 @@ impl Lowerer<'_> {
                         | hir::StringOperation::TryParseInt
                         | hir::StringOperation::TryParseUInt
                         | hir::StringOperation::TryParseLong
-                        | hir::StringOperation::TryParseULong => {
+                        | hir::StringOperation::TryParseULong
+                        | hir::StringOperation::TryParseFloat
+                        | hir::StringOperation::TryParseDouble => {
                             let target = operation
                                 .parse_target_name()
                                 .expect("TryParse* always names a parse target");

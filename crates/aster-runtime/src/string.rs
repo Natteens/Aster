@@ -849,6 +849,121 @@ pub extern "C" fn aster_rt_string_try_parse_ulong(
     );
 }
 
+/// Whether `text` matches the ASCII, culture-invariant decimal grammar
+/// `TryParseFloat`/`TryParseDouble` accept: `sign? significand exponent?`,
+/// where `significand` is `digits ("." digits?)? | "." digits` (at least one
+/// digit somewhere in the significand) and `exponent` is `("e"|"E") sign?
+/// digits`. The whole string must be consumed.
+///
+/// This exists specifically because `str::parse::<f32/f64>()` accepts
+/// several forms this grammar does not (`"NaN"`, `"inf"`, `"Infinity"`, and
+/// their sign/case variants): every one of those has no digit in the
+/// position this grammar requires, so scanning for the grammar first, then
+/// only calling `parse` once it matches, rejects them without checking any
+/// literal spelling.
+fn is_valid_float_grammar(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    if i < len && (bytes[i] == b'+' || bytes[i] == b'-') {
+        i += 1;
+    }
+    let mut has_digits = false;
+    while i < len && bytes[i].is_ascii_digit() {
+        i += 1;
+        has_digits = true;
+    }
+    if i < len && bytes[i] == b'.' {
+        i += 1;
+        while i < len && bytes[i].is_ascii_digit() {
+            i += 1;
+            has_digits = true;
+        }
+    }
+    if !has_digits {
+        return false;
+    }
+    if i < len && (bytes[i] == b'e' || bytes[i] == b'E') {
+        i += 1;
+        if i < len && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        let mut has_exponent_digits = false;
+        while i < len && bytes[i].is_ascii_digit() {
+            i += 1;
+            has_exponent_digits = true;
+        }
+        if !has_exponent_digits {
+            return false;
+        }
+    }
+    i == len
+}
+
+/// Consumes the entire string as the ASCII decimal grammar above and parses
+/// directly into `f32`; overflow past `f32::MAX`/`f32::MIN` is `None`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn aster_rt_string_try_parse_float(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    destination: *mut u8,
+    total_size: i32,
+    some_tag: i32,
+    none_tag: i32,
+    payload_offset: i32,
+) {
+    string_try_parse(
+        context,
+        value,
+        destination,
+        total_size,
+        some_tag,
+        none_tag,
+        payload_offset,
+        "TryParseFloat",
+        |text| {
+            if !is_valid_float_grammar(text) {
+                return None;
+            }
+            let value = text.parse::<f32>().ok()?;
+            value.is_finite().then_some(value)
+        },
+    );
+}
+
+/// Consumes the entire string as the ASCII decimal grammar above and parses
+/// directly into `f64`; overflow past `f64::MAX`/`f64::MIN` is `None`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn aster_rt_string_try_parse_double(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    destination: *mut u8,
+    total_size: i32,
+    some_tag: i32,
+    none_tag: i32,
+    payload_offset: i32,
+) {
+    string_try_parse(
+        context,
+        value,
+        destination,
+        total_size,
+        some_tag,
+        none_tag,
+        payload_offset,
+        "TryParseDouble",
+        |text| {
+            if !is_valid_float_grammar(text) {
+                return None;
+            }
+            let value = text.parse::<f64>().ok()?;
+            value.is_finite().then_some(value)
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -856,7 +971,9 @@ mod tests {
         aster_rt_string_ends_with, aster_rt_string_eq, aster_rt_string_index_of,
         aster_rt_string_length, aster_rt_string_starts_with, aster_rt_string_substring_from,
         aster_rt_string_substring_range, aster_rt_string_substring_range_temporary,
-        aster_rt_string_try_parse_bool, aster_rt_string_try_parse_int, encode_str, view,
+        aster_rt_string_try_parse_bool, aster_rt_string_try_parse_double,
+        aster_rt_string_try_parse_float, aster_rt_string_try_parse_int, encode_str,
+        is_valid_float_grammar, view,
     };
     use crate::{
         ExecutionContext,
@@ -1234,6 +1351,241 @@ mod tests {
         unsafe {
             assert_eq!(std::ptr::read_unaligned(destination_ptr.cast::<i32>()), 1);
             assert_eq!(std::ptr::read(destination_ptr.add(4).cast::<u8>()), 0);
+        }
+    }
+
+    #[test]
+    fn float_grammar_accepts_every_required_valid_form() {
+        for text in [
+            "0",
+            "+0",
+            "-0",
+            "1",
+            "-1",
+            "0001",
+            "1.0",
+            "1.",
+            ".5",
+            "-.5",
+            "+0.25",
+            "1e3",
+            "1E3",
+            "1e+3",
+            "1e-3",
+            "-1.25e+10",
+        ] {
+            assert!(is_valid_float_grammar(text), "{text:?} should be valid");
+        }
+    }
+
+    #[test]
+    fn float_grammar_rejects_every_required_invalid_form() {
+        for text in [
+            "",
+            "+",
+            "-",
+            ".",
+            "+.",
+            "-.",
+            "e10",
+            "1e",
+            "1e+",
+            "1e-",
+            "1.2.3",
+            "1e2e3",
+            " 1.0",
+            "1.0 ",
+            "1_000.0",
+            "1,5",
+            "\u{FF11}\u{FF12}.\u{FF15}",
+            "0x1.0",
+            "1f",
+            "1d",
+            "NaN",
+            "nan",
+            "inf",
+            "-INF",
+            "Infinity",
+            "+Infinity",
+            "-Infinity",
+        ] {
+            assert!(!is_valid_float_grammar(text), "{text:?} should be invalid");
+        }
+    }
+
+    #[test]
+    fn try_parse_double_preserves_negative_zero_bit_pattern() {
+        // `0.0 == -0.0` in IEEE-754, so only a bit-level comparison actually
+        // distinguishes them; `Option<double>`'s payload must carry the
+        // exact bits `str::parse` produced, not merely an equal-by-value
+        // double.
+        for (text, expected_bits) in [
+            ("-0", 0x8000_0000_0000_0000_u64),
+            ("-0.0", 0x8000_0000_0000_0000_u64),
+            ("0", 0),
+            ("0.0", 0),
+        ] {
+            let mut context = ExecutionContext::new();
+            let mut destination = option_destination();
+            let destination_ptr = destination.as_mut_ptr().cast::<u8>();
+            let input = aligned(text);
+            aster_rt_string_try_parse_double(
+                &raw mut context,
+                pointer(&input),
+                destination_ptr,
+                16,
+                1,
+                0,
+                8,
+            );
+            assert!(context.take_error().is_none());
+            // SAFETY: just written above.
+            #[allow(unsafe_code)]
+            unsafe {
+                assert_eq!(std::ptr::read_unaligned(destination_ptr.cast::<i32>()), 1);
+                let bits = std::ptr::read_unaligned(destination_ptr.add(8).cast::<u64>());
+                assert_eq!(bits, expected_bits, "{text:?} produced the wrong sign bit");
+            }
+        }
+    }
+
+    #[test]
+    fn try_parse_float_preserves_negative_zero_bit_pattern() {
+        for (text, expected_bits) in [
+            ("-0", 0x8000_0000_u32),
+            ("-0.0", 0x8000_0000_u32),
+            ("0", 0),
+            ("0.0", 0),
+        ] {
+            let mut context = ExecutionContext::new();
+            let mut destination = option_destination();
+            let destination_ptr = destination.as_mut_ptr().cast::<u8>();
+            let input = aligned(text);
+            aster_rt_string_try_parse_float(
+                &raw mut context,
+                pointer(&input),
+                destination_ptr,
+                8,
+                1,
+                0,
+                4,
+            );
+            assert!(context.take_error().is_none());
+            // SAFETY: just written above.
+            #[allow(unsafe_code)]
+            unsafe {
+                assert_eq!(std::ptr::read_unaligned(destination_ptr.cast::<i32>()), 1);
+                let bits = std::ptr::read_unaligned(destination_ptr.add(4).cast::<u32>());
+                assert_eq!(bits, expected_bits, "{text:?} produced the wrong sign bit");
+            }
+        }
+    }
+
+    #[test]
+    fn try_parse_double_rejects_nan_and_infinity_text_and_overflow() {
+        let mut context = ExecutionContext::new();
+        let mut destination = option_destination();
+        let destination_ptr = destination.as_mut_ptr().cast::<u8>();
+        for text in ["NaN", "inf", "-Infinity", "1.7976931348623159e308"] {
+            let input = aligned(text);
+            aster_rt_string_try_parse_double(
+                &raw mut context,
+                pointer(&input),
+                destination_ptr,
+                16,
+                1,
+                0,
+                8,
+            );
+            assert!(context.take_error().is_none());
+            // SAFETY: just written above.
+            #[allow(unsafe_code)]
+            unsafe {
+                assert_eq!(
+                    std::ptr::read_unaligned(destination_ptr.cast::<i32>()),
+                    0,
+                    "{text:?} should be None"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn try_parse_float_rejects_invalid_utf8_in_a_controlled_buffer_without_touching_destination() {
+        let mut invalid = aligned("1.0");
+        // SAFETY: same technique as the other invalid-UTF-8 tests above:
+        // only the payload byte is changed, preserving the allocation shape.
+        #[allow(unsafe_code)]
+        unsafe {
+            invalid
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(size_of::<AsterStrHeader>())
+                .write(0xff);
+        }
+        let mut destination = option_destination();
+        let destination_ptr = destination.as_mut_ptr().cast::<u8>();
+        let mut context = ExecutionContext::new();
+        aster_rt_string_try_parse_float(
+            &raw mut context,
+            pointer(&invalid),
+            destination_ptr,
+            8,
+            1,
+            0,
+            4,
+        );
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("TryParseFloat") && error.contains("UTF-8"))
+        );
+        assert_eq!(destination, option_destination());
+    }
+
+    #[test]
+    fn try_parse_float_error_does_not_contaminate_a_later_valid_call() {
+        let mut invalid = aligned("1.0");
+        // SAFETY: same technique as above.
+        #[allow(unsafe_code)]
+        unsafe {
+            invalid
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(size_of::<AsterStrHeader>())
+                .write(0xff);
+        }
+        let mut context = ExecutionContext::new();
+        let mut destination = option_destination();
+        let destination_ptr = destination.as_mut_ptr().cast::<u8>();
+        aster_rt_string_try_parse_float(
+            &raw mut context,
+            pointer(&invalid),
+            destination_ptr,
+            8,
+            1,
+            0,
+            4,
+        );
+        assert!(context.take_error().is_some());
+
+        let valid = aligned("2.5");
+        aster_rt_string_try_parse_float(
+            &raw mut context,
+            pointer(&valid),
+            destination_ptr,
+            8,
+            1,
+            0,
+            4,
+        );
+        assert!(context.take_error().is_none());
+        // SAFETY: `destination` was just written by the call above.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!(std::ptr::read_unaligned(destination_ptr.cast::<i32>()), 1);
+            let value = std::ptr::read_unaligned(destination_ptr.add(4).cast::<f32>());
+            assert!((value - 2.5).abs() < f32::EPSILON);
         }
     }
 }
