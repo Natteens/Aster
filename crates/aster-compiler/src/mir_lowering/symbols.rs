@@ -200,7 +200,8 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
             collect_expression(list, max);
             collect_expression(value, max);
         }
-        hir::ExpressionKind::ListGet { list, index, .. } => {
+        hir::ExpressionKind::ListRemoveAt { list, index }
+        | hir::ExpressionKind::ListGet { list, index, .. } => {
             collect_expression(list, max);
             collect_expression(index, max);
         }

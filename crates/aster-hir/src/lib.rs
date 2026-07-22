@@ -244,6 +244,11 @@ pub enum ExpressionKind {
         index: Box<Expression>,
         element_type: Type,
     },
+    /// `list.RemoveAt(index)`: always typed `void`.
+    ListRemoveAt {
+        list: Box<Expression>,
+        index: Box<Expression>,
+    },
     Member {
         object: Box<Expression>,
         symbol: SymbolId,

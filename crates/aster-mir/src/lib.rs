@@ -194,6 +194,14 @@ pub enum Instruction {
         index: Operand,
         element_type: Type,
     },
+    /// `list.RemoveAt(index)`: shifts every element after `index` one slot
+    /// left and decrements `length`. Never touches `capacity`/`data`. The
+    /// element type is derivable from `list.type_` (must be `List(T)`), so
+    /// it is not stored redundantly here, exactly like `ListAdd`.
+    ListRemoveAt {
+        list: Operand,
+        index: Operand,
+    },
 }
 
 /// Runtime services reachable from generated code. Backends map each variant

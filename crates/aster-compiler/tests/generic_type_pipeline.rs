@@ -177,15 +177,11 @@ fn list_of_int_is_not_assignable_to_list_of_long() {
 }
 
 #[test]
-fn list_has_no_member_operations_beyond_length_add_and_get() {
+fn list_has_no_member_operations_beyond_length_add_get_and_remove_at() {
     for (source, expected) in [
         (
             "public int Run(List<int> values) { values.Set(0, 1); return 0; }",
             "no member `Set`",
-        ),
-        (
-            "public int Run(List<int> values) { values.RemoveAt(0); return 0; }",
-            "no member `RemoveAt`",
         ),
         (
             "public int Run(List<int> values) { return values[0]; }",
@@ -529,6 +525,122 @@ fn list_get_evaluates_receiver_then_index_exactly_once_each() {
                   public int GetIndex() { return 0; } \
                   public int Run() { return GetList().Get(GetIndex()); }";
     let compilation = aster_compiler::compile(source).expect("GetList().Get(GetIndex()) compiles");
+    let run = compilation
+        .mir
+        .functions
+        .iter()
+        .find(|function| function.name == "Run" && function.owner.is_none())
+        .expect("Run is declared");
+    let get_list = compilation
+        .mir
+        .functions
+        .iter()
+        .find(|function| function.name == "GetList" && function.owner.is_none())
+        .expect("GetList is declared")
+        .symbol;
+    let get_index = compilation
+        .mir
+        .functions
+        .iter()
+        .find(|function| function.name == "GetIndex" && function.owner.is_none())
+        .expect("GetIndex is declared")
+        .symbol;
+    let calls = run
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction {
+            aster_mir::Instruction::Call { function, .. } => Some(*function),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|&&function| function == get_list)
+            .count(),
+        1,
+        "GetList() must be evaluated exactly once: {calls:?}"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|&&function| function == get_index)
+            .count(),
+        1,
+        "GetIndex() must be evaluated exactly once: {calls:?}"
+    );
+    let list_position = calls.iter().position(|&function| function == get_list);
+    let index_position = calls.iter().position(|&function| function == get_index);
+    assert!(
+        list_position < index_position,
+        "GetList() must be called before GetIndex(): {calls:?}"
+    );
+}
+
+// --- List C: `values.RemoveAt(index)` -----------------------------------
+
+#[test]
+fn list_remove_at_accepts_a_valid_call_and_returns_void() {
+    let source = "public int Run() { List<int> values = new List<int>(); values.Add(1); \
+                  values.RemoveAt(0); return values.Length; }";
+    aster_compiler::compile(source).expect("List<int>.RemoveAt(int) is well-formed");
+}
+
+#[test]
+fn list_remove_at_diagnostics_are_specific() {
+    for (source, expected) in [
+        (
+            "public int Run() { List<int> values = new List<int>(); values.Add(1); values.RemoveAt(); return 0; }",
+            "expects 1 argument, found 0",
+        ),
+        (
+            "public int Run() { List<int> values = new List<int>(); values.Add(1); values.RemoveAt(0, 1); return 0; }",
+            "expects 1 argument, found 2",
+        ),
+        (
+            "public int Run() { List<int> values = new List<int>(); values.Add(1); values.RemoveAt(1L); return 0; }",
+            "requires an `int` index",
+        ),
+        (
+            "public int Run() { List<int> values = new List<int>(); values.Add(1); values.RemoveAt(\"0\"); return 0; }",
+            "requires an `int` index",
+        ),
+    ] {
+        let diagnostics = aster_compiler::compile(source).expect_err("invalid `RemoveAt` usage");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(expected)),
+            "missing `{expected}` in {diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn an_ordinary_remove_at_method_on_a_class_still_resolves_normally() {
+    let source = "public class Store { public int value; public Store() {} \
+                  public void RemoveAt(int index) { value = index; } } \
+                  public int Run() { Store store = new Store(); store.RemoveAt(3); return store.value; }";
+    aster_compiler::compile(source).expect("a class's own `RemoveAt` method is unaffected by List");
+}
+
+#[test]
+fn a_free_function_named_remove_at_like_still_resolves_normally() {
+    let source = "public struct Wrapper { public int total; } \
+                  public int RemoveFrom(Wrapper wrapper) { return wrapper.total; } \
+                  public int Run() { Wrapper wrapper = Wrapper { total: 9 }; return RemoveFrom(wrapper); }";
+    aster_compiler::compile(source)
+        .expect("an unrelated free function is unaffected by List.RemoveAt");
+}
+
+#[test]
+fn list_remove_at_evaluates_receiver_then_index_exactly_once_each() {
+    let source = "public List<int> GetList() { List<int> values = new List<int>(); values.Add(1); values.Add(2); return values; } \
+                  public int GetIndex() { return 0; } \
+                  public int Run() { GetList().RemoveAt(GetIndex()); return 0; }";
+    let compilation =
+        aster_compiler::compile(source).expect("GetList().RemoveAt(GetIndex()) compiles");
     let run = compilation
         .mir
         .functions

@@ -172,6 +172,9 @@ impl Codegen {
                 index,
                 element_type,
             } => self.translate_list_get(builder, destination, list, index, element_type, state),
+            mir::Instruction::ListRemoveAt { list, index } => {
+                self.translate_list_remove_at(builder, list, index, state)
+            }
         }
     }
 }

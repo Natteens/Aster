@@ -607,15 +607,11 @@ fn get_and_add_still_reject_decimal() {
 }
 
 #[test]
-fn set_remove_at_and_the_indexer_remain_unavailable() {
+fn set_and_the_indexer_remain_unavailable() {
     for (source, expected) in [
         (
             "public int Main() { List<int> values = new List<int>(); values.Add(1); values.Set(0, 2); return 0; }",
             "no member `Set`",
-        ),
-        (
-            "public int Main() { List<int> values = new List<int>(); values.Add(1); values.RemoveAt(0); return 0; }",
-            "no member `RemoveAt`",
         ),
         (
             "public int Main() { List<int> values = new List<int>(); values.Add(1); return values[0]; }",
@@ -644,4 +640,467 @@ fn a_value_read_through_a_zero_arg_helper_still_cannot_cross_a_worker_boundary()
             .any(|message| message.contains("cross a worker boundary")),
         "expected the non-transferable-result diagnostic, got {errors:?}"
     );
+}
+
+// --- List C: `values.RemoveAt(index)` -------------------------------------
+
+#[test]
+fn remove_at_first_shifts_the_rest_left() {
+    let source = "
+        public int Main()
+        {
+            List<int> values = new List<int>();
+            values.Add(10);
+            values.Add(20);
+            values.Add(30);
+            values.RemoveAt(0);
+            return values.Get(0) * 100 + values.Get(1);
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(2030)));
+}
+
+#[test]
+fn remove_at_middle_shifts_only_the_tail() {
+    let source = "
+        public int Main()
+        {
+            List<int> values = new List<int>();
+            values.Add(10);
+            values.Add(20);
+            values.Add(30);
+            values.RemoveAt(1);
+            return values.Get(0) * 100 + values.Get(1);
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(1030)));
+}
+
+#[test]
+fn remove_at_last_leaves_the_earlier_elements_untouched() {
+    let source = "
+        public int Main()
+        {
+            List<int> values = new List<int>();
+            values.Add(10);
+            values.Add(20);
+            values.Add(30);
+            values.RemoveAt(2);
+            return values.Length * 100 + values.Get(0) * 10 + values.Get(1);
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(320)));
+}
+
+#[test]
+fn remove_at_the_only_element_leaves_an_empty_list() {
+    let source = "
+        public int Main()
+        {
+            List<int> values = new List<int>();
+            values.Add(10);
+            values.RemoveAt(0);
+            return values.Length;
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(0)));
+}
+
+#[test]
+fn remove_at_repeatedly_until_empty_then_add_again() {
+    let source = "
+        public int Main()
+        {
+            List<int> values = new List<int>();
+            values.Add(1);
+            values.Add(2);
+            values.Add(3);
+            values.RemoveAt(0);
+            values.RemoveAt(0);
+            values.RemoveAt(0);
+            values.Add(9);
+            return values.Length * 100 + values.Get(0);
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(109)));
+}
+
+#[test]
+fn add_after_remove_at_reuses_capacity_without_growing_beyond_it() {
+    // Forces growth to 8, removes down to 4 remaining, then re-adds 4 more —
+    // all of which must fit in the already-grown buffer.
+    let mut source = String::from("public int Main() { List<int> values = new List<int>();");
+    for i in 0..8 {
+        let _ = write!(source, "values.Add({i});");
+    }
+    for _ in 0..4 {
+        source.push_str("values.RemoveAt(0);");
+    }
+    for i in 100..104 {
+        let _ = write!(source, "values.Add({i});");
+    }
+    source.push_str("return values.Length; }");
+    assert_eq!(run(&source, "Main"), Ok(ExecutionValue::Int(8)));
+}
+
+#[test]
+fn get_length_after_remove_at_are_all_consistent() {
+    let source = "
+        public int Main()
+        {
+            List<int> values = new List<int>();
+            values.Add(1);
+            values.Add(2);
+            values.Add(3);
+            values.Add(4);
+            values.RemoveAt(1);
+            int length = values.Length;
+            int first = values.Get(0);
+            int second = values.Get(1);
+            int third = values.Get(2);
+            return length * 1000 + first * 100 + second * 10 + third;
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(3134)));
+}
+
+#[test]
+fn two_independent_lists_remove_independently() {
+    let source = "
+        public int Main()
+        {
+            List<int> a = new List<int>();
+            List<int> b = new List<int>();
+            a.Add(1);
+            a.Add(2);
+            b.Add(10);
+            b.Add(20);
+            a.RemoveAt(0);
+            return a.Get(0) * 100 + b.Length;
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(202)));
+}
+
+#[test]
+fn an_alias_observes_the_removal() {
+    let source = "
+        public int Main()
+        {
+            List<int> a = new List<int>();
+            a.Add(1);
+            a.Add(2);
+            List<int> b = a;
+            b.RemoveAt(0);
+            return a.Length * 10 + a.Get(0);
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(12)));
+}
+
+#[test]
+fn remove_at_and_add_work_for_every_required_element_type() {
+    for (source, expected) in [
+        (
+            "public int Main() { List<int> v = new List<int>(); v.Add(1); v.Add(2); v.RemoveAt(0); return v.Get(0); }",
+            ExecutionValue::Int(2),
+        ),
+        (
+            "public long Main() { List<long> v = new List<long>(); v.Add(1L); v.Add(2L); v.RemoveAt(0); return v.Get(0); }",
+            ExecutionValue::Long(2),
+        ),
+        (
+            "public uint Main() { List<uint> v = new List<uint>(); v.Add(1U); v.Add(2U); v.RemoveAt(0); return v.Get(0); }",
+            ExecutionValue::UInt(2),
+        ),
+        (
+            "public ulong Main() { List<ulong> v = new List<ulong>(); v.Add(1UL); v.Add(2UL); v.RemoveAt(0); return v.Get(0); }",
+            ExecutionValue::ULong(2),
+        ),
+        (
+            "public float Main() { List<float> v = new List<float>(); v.Add(1.5f); v.Add(2.5f); v.RemoveAt(0); return v.Get(0); }",
+            ExecutionValue::float(2.5),
+        ),
+        (
+            "public double Main() { List<double> v = new List<double>(); v.Add(1.5d); v.Add(2.5d); v.RemoveAt(0); return v.Get(0); }",
+            ExecutionValue::double(2.5),
+        ),
+        (
+            "public bool Main() { List<bool> v = new List<bool>(); v.Add(false); v.Add(true); v.RemoveAt(0); return v.Get(0); }",
+            ExecutionValue::Bool(true),
+        ),
+        (
+            "public char Main() { List<char> v = new List<char>(); v.Add('a'); v.Add('b'); v.RemoveAt(0); return v.Get(0); }",
+            ExecutionValue::Char('b'),
+        ),
+        (
+            "public string Main() { List<string> v = new List<string>(); v.Add(\"a\"); v.Add(\"b\"); v.RemoveAt(0); return v.Get(0); }",
+            ExecutionValue::String("b".to_owned()),
+        ),
+    ] {
+        assert_eq!(run(source, "Main"), Ok(expected), "`{source}`");
+    }
+}
+
+#[test]
+fn remove_at_preserves_class_identity_of_the_remaining_element() {
+    let source = "
+        public class Box { public int value; public Box(int value) { this.value = value; } }
+        public int Main()
+        {
+            Box a = new Box(1);
+            Box b = new Box(2);
+            List<Box> values = new List<Box>();
+            values.Add(a);
+            values.Add(b);
+            values.RemoveAt(0);
+            Box loaded = values.Get(0);
+            loaded.value = 99;
+            return b.value;
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(99)));
+}
+
+#[test]
+fn remove_at_preserves_array_identity_of_the_remaining_element() {
+    let source = "
+        public int Main()
+        {
+            int[] a = [1, 1];
+            int[] b = [2, 2];
+            List<int[]> values = new List<int[]>();
+            values.Add(a);
+            values.Add(b);
+            values.RemoveAt(0);
+            int[] loaded = values.Get(0);
+            loaded[0] = 99;
+            return b[0];
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(99)));
+}
+
+#[test]
+fn remove_at_preserves_nested_list_identity_of_the_remaining_element() {
+    let source = "
+        public int Main()
+        {
+            List<int> inner = new List<int>();
+            inner.Add(1);
+            List<int> other = new List<int>();
+            other.Add(2);
+            List<List<int>> outer = new List<List<int>>();
+            outer.Add(other);
+            outer.Add(inner);
+            outer.RemoveAt(0);
+            List<int> loaded = outer.Get(0);
+            loaded.Add(5);
+            return inner.Length;
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(2)));
+}
+
+#[test]
+fn remove_at_preserves_interface_dispatch_of_the_remaining_element() {
+    let source = "
+        public interface IShape { int Area(); }
+        public class Square : IShape { public int side; public Square(int side) { this.side = side; } public int Area() { return side * side; } }
+        public int Main()
+        {
+            IShape first = new Square(2);
+            IShape second = new Square(4);
+            List<IShape> values = new List<IShape>();
+            values.Add(first);
+            values.Add(second);
+            values.RemoveAt(0);
+            IShape loaded = values.Get(0);
+            return loaded.Area();
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(16)));
+}
+
+#[test]
+fn remove_at_shifts_a_struct_with_padding_byte_for_byte() {
+    let source = "
+        public struct Point { public int x; public bool flag; public long y; }
+        public int Main()
+        {
+            List<Point> values = new List<Point>();
+            values.Add(Point { x: 1, flag: true, y: 2L });
+            values.Add(Point { x: 3, flag: false, y: 4L });
+            values.RemoveAt(0);
+            Point remaining = values.Get(0);
+            return remaining.x;
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(3)));
+}
+
+#[test]
+fn remove_at_preserves_a_reference_field_inside_a_remaining_struct() {
+    let source = "
+        public class Box { public int value; public Box(int value) { this.value = value; } }
+        public struct Wrapper { public Box inner; }
+        public int Main()
+        {
+            Box a = new Box(1);
+            Box b = new Box(2);
+            List<Wrapper> values = new List<Wrapper>();
+            values.Add(Wrapper { inner: a });
+            values.Add(Wrapper { inner: b });
+            values.RemoveAt(0);
+            Wrapper loaded = values.Get(0);
+            loaded.inner.value = 77;
+            return b.value;
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(77)));
+}
+
+#[test]
+fn remove_at_shifts_enum_without_payload() {
+    let source = "
+        public enum Color { Red, Green, Blue }
+        public int Main()
+        {
+            List<Color> values = new List<Color>();
+            values.Add(Color.Red);
+            values.Add(Color.Blue);
+            values.RemoveAt(0);
+            Color remaining = values.Get(0);
+            switch (remaining) {
+                case Red: return 0;
+                case Green: return 1;
+                case Blue: return 2;
+            }
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(2)));
+}
+
+#[test]
+fn remove_at_shifts_enum_with_scalar_payload() {
+    let source = "
+        public enum Shape { Circle(int radius), Square }
+        public int Main()
+        {
+            List<Shape> values = new List<Shape>();
+            values.Add(Shape.Square);
+            values.Add(Shape.Circle(9));
+            values.RemoveAt(0);
+            Shape remaining = values.Get(0);
+            switch (remaining) {
+                case Circle(r): return r;
+                case Square: return -1;
+            }
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(9)));
+}
+
+#[test]
+fn remove_at_preserves_a_reference_payload_inside_a_remaining_enum() {
+    let source = "
+        public class Box { public int value; public Box(int value) { this.value = value; } }
+        public enum MaybeBox { None, Some(Box inner) }
+        public int Main()
+        {
+            Box box = new Box(5);
+            List<MaybeBox> values = new List<MaybeBox>();
+            values.Add(MaybeBox.None);
+            values.Add(MaybeBox.Some(box));
+            values.RemoveAt(0);
+            MaybeBox loaded = values.Get(0);
+            switch (loaded) {
+                case Some(b): return b.value;
+                case None: return -1;
+            }
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(5)));
+}
+
+#[test]
+fn remove_at_works_for_a_generic_specialization() {
+    let source = "
+        public class Box<T> { private T value; public Box(T value) { this.value = value; } public T Get() { return value; } }
+        public int Main()
+        {
+            List<Box<int>> values = new List<Box<int>>();
+            values.Add(new Box<int>(1));
+            values.Add(new Box<int>(2));
+            values.RemoveAt(0);
+            Box<int> loaded = values.Get(0);
+            return loaded.Get();
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(2)));
+}
+
+#[test]
+fn remove_at_still_rejects_decimal() {
+    let errors = compile_errors(
+        "public int Main() { List<decimal> values = new List<decimal>(); values.Add(1.5m); values.RemoveAt(0); return 0; }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("`List<decimal>` cannot be used")),
+        "expected `List<decimal>` to be rejected, got {errors:?}"
+    );
+}
+
+#[test]
+fn set_and_the_indexer_remain_unavailable_after_remove_at() {
+    for (source, expected) in [
+        (
+            "public int Main() { List<int> values = new List<int>(); values.Add(1); values.RemoveAt(0); values.Set(0, 2); return 0; }",
+            "no member `Set`",
+        ),
+        (
+            "public int Main() { List<int> values = new List<int>(); values.Add(1); values.RemoveAt(0); return values[0]; }",
+            "cannot be indexed",
+        ),
+    ] {
+        let errors = compile_errors(source);
+        assert!(
+            errors.iter().any(|message| message.contains(expected)),
+            "expected `{expected}` in {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn a_list_still_cannot_cross_a_worker_boundary_after_remove_at() {
+    let errors = compile_errors(
+        "public List<int> Make() { List<int> values = new List<int>(); values.Add(1); values.Add(2); values.RemoveAt(0); return values; } \
+         public int Main() { Task<List<int>> task = Task.Run(Make); return 0; }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("cross a worker boundary")),
+        "expected the non-transferable-result diagnostic, got {errors:?}"
+    );
+}
+
+#[test]
+fn arrays_add_get_and_length_are_unaffected_by_remove_at() {
+    let source = "
+        public class Box { public int value; public Box(int value) { this.value = value; } }
+        public int Main()
+        {
+            int[] array = [1, 2, 3];
+            Box box = new Box(array[0]);
+            List<int> values = new List<int>();
+            values.Add(10);
+            values.Add(20);
+            values.RemoveAt(0);
+            return array.Length + box.value + values.Length + values.Get(0);
+        }
+        ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(25)));
 }

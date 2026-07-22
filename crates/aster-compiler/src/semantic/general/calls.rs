@@ -514,6 +514,36 @@ impl Analyzer<'_> {
                             }
                             return (**element_type).clone();
                         }
+                        if name == "RemoveAt" {
+                            if arguments.len() != 1 {
+                                self.diagnostics.push(
+                                    Diagnostic::error(
+                                        format!(
+                                            "`List<T>.RemoveAt` expects 1 argument, found {}",
+                                            arguments.len()
+                                        ),
+                                        span,
+                                    )
+                                    .with_help("pass a single `int` index"),
+                                );
+                                return Type::Unknown;
+                            }
+                            if argument_types[0] != Type::Int && argument_types[0] != Type::Unknown
+                            {
+                                self.diagnostics.push(
+                                    Diagnostic::error(
+                                        format!(
+                                            "`List<T>.RemoveAt` requires an `int` index, found `{}`",
+                                            argument_types[0].display()
+                                        ),
+                                        arguments[0].span,
+                                    )
+                                    .with_help("convert the index to `int`"),
+                                );
+                                return Type::Unknown;
+                            }
+                            return Type::Void;
+                        }
                         self.diagnostics.push(Diagnostic::error(
                             format!("list has no member `{name}`"),
                             callee.span,

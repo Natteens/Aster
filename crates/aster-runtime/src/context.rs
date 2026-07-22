@@ -713,6 +713,168 @@ impl ExecutionContext {
         }
     }
 
+    /// Computes every checked offset `RemoveAt` needs: the removed slot's
+    /// offset, the offset of the first element after it, how many bytes to
+    /// shift, the new `length`, and the offset of the slot that falls out of
+    /// range once `length` shrinks. Returns `None` (after calling
+    /// `self.fail`) on any overflow — the caller must return immediately
+    /// without touching the header or buffer.
+    fn compute_remove_at_offsets(
+        &mut self,
+        length: i32,
+        index: i32,
+        element_size_usize: usize,
+    ) -> Option<(usize, usize, usize, i32, usize)> {
+        let Some(index_offset) = usize::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_mul(element_size_usize))
+        else {
+            self.fail("list.RemoveAt index * element size overflow");
+            return None;
+        };
+        let Some(next_index) = index.checked_add(1) else {
+            self.fail("list.RemoveAt index overflow");
+            return None;
+        };
+        let Some(source_offset) = usize::try_from(next_index)
+            .ok()
+            .and_then(|next_index| next_index.checked_mul(element_size_usize))
+        else {
+            self.fail("list.RemoveAt (index + 1) * element size overflow");
+            return None;
+        };
+        let Some(remaining) = length.checked_sub(next_index) else {
+            self.fail("list.RemoveAt remaining element count underflow");
+            return None;
+        };
+        let Some(remaining_usize) = usize::try_from(remaining).ok() else {
+            self.fail("list.RemoveAt remaining element count overflow");
+            return None;
+        };
+        let Some(move_bytes) = remaining_usize.checked_mul(element_size_usize) else {
+            self.fail("list.RemoveAt byte count overflow");
+            return None;
+        };
+        let Some(new_length) = length.checked_sub(1) else {
+            self.fail("list.RemoveAt length underflow");
+            return None;
+        };
+        let Some(old_last_offset) = usize::try_from(new_length)
+            .ok()
+            .and_then(|new_length| new_length.checked_mul(element_size_usize))
+        else {
+            self.fail("list.RemoveAt old last slot offset overflow");
+            return None;
+        };
+        Some((
+            index_offset,
+            source_offset,
+            move_bytes,
+            new_length,
+            old_last_offset,
+        ))
+    }
+
+    /// Removes element `index`, shifting every later element one slot left
+    /// with an overlap-safe move (source/destination ranges can overlap, so
+    /// `memcpy`/`copy_nonoverlapping` would be UB), then zeroes the vacated
+    /// last slot and decrements `length`. Never allocates, never touches
+    /// `capacity`/`data`. Every failure is reported through `self.fail` and
+    /// leaves the header and buffer exactly as they were (every check runs
+    /// before any byte is written).
+    fn list_remove_at(
+        &mut self,
+        list: *mut AsterList,
+        expected_element_size: u32,
+        expected_element_align: u32,
+        expected_element_type_key: u64,
+        index: i32,
+    ) {
+        if list.is_null() {
+            self.fail("list.RemoveAt received a null list");
+            return;
+        }
+        if !self.validate_list_header(list) {
+            return;
+        }
+        // SAFETY: `list` was just validated above; every field is read once,
+        // transiently, into locals below.
+        #[allow(unsafe_code)]
+        let (length, element_size, element_align, element_type_key, data) = unsafe {
+            (
+                (*list).length,
+                (*list).element_size,
+                (*list).element_align,
+                (*list).element_type_key,
+                (*list).data,
+            )
+        };
+        if expected_element_size != element_size {
+            self.fail(format!(
+                "list.RemoveAt element size mismatch: expected {expected_element_size}, header has {element_size}"
+            ));
+            return;
+        }
+        if expected_element_align != element_align {
+            self.fail(format!(
+                "list.RemoveAt element alignment mismatch: expected {expected_element_align}, header has {element_align}"
+            ));
+            return;
+        }
+        if expected_element_type_key != element_type_key {
+            self.fail("list.RemoveAt element type key mismatch");
+            return;
+        }
+        if index < 0 {
+            self.fail(format!(
+                "List.RemoveAt index {index} is negative (length {length})"
+            ));
+            return;
+        }
+        if index >= length {
+            self.fail(format!(
+                "List.RemoveAt index {index} is out of bounds for length {length}"
+            ));
+            return;
+        }
+
+        let element_size_usize = usize::try_from(element_size).unwrap_or(0);
+        let Some((index_offset, source_offset, move_bytes, new_length, old_last_offset)) =
+            self.compute_remove_at_offsets(length, index, element_size_usize)
+        else {
+            return;
+        };
+
+        if move_bytes > 0 {
+            // SAFETY: `source_offset..source_offset+move_bytes` and
+            // `index_offset..index_offset+move_bytes` both lie within the
+            // buffer (bounded by `length * element_size`, guaranteed by the
+            // header invariants and `index < length` checked above); the two
+            // ranges may overlap, so `ptr::copy` (memmove-equivalent) is used
+            // instead of `copy_nonoverlapping`.
+            #[allow(unsafe_code)]
+            unsafe {
+                ptr::copy(data.add(source_offset), data.add(index_offset), move_bytes);
+            }
+        }
+        // SAFETY: `old_last_offset` is the last valid element's offset before
+        // this removal (`(length - 1) * element_size`), still within the
+        // buffer; zeroing it after the move and before publishing the new
+        // `length` below is safe since it is about to fall outside the new
+        // `length` and is never observed by the language.
+        #[allow(unsafe_code)]
+        unsafe {
+            ptr::write_bytes(data.add(old_last_offset), 0, element_size_usize);
+        }
+        // SAFETY: `list` was validated above; `data`/`capacity` are
+        // untouched, only `length` changes, and only after the shift and
+        // clear above have both fully completed.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*list).length = new_length;
+        }
+    }
+
     pub(crate) fn allocate_object(&mut self, size: u32) -> *mut u8 {
         let bytes = usize::try_from(size.max(1)).unwrap_or(1);
         let pointer = self.arena.alloc(bytes, 8);
@@ -996,6 +1158,29 @@ pub extern "C" fn aster_rt_list_get(
     #[allow(clippy::cast_sign_loss)]
     let type_key = expected_element_type_key as u64;
     context.list_get(list, size, align, type_key, index, destination_address);
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_list_remove_at(
+    context: *mut ExecutionContext,
+    list: *mut AsterList,
+    expected_element_size: i32,
+    expected_element_align: i32,
+    expected_element_type_key: i64,
+    index: i32,
+) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: generated functions receive the live host-owned context as their
+    // hidden first parameter, and invocation cannot outlive that context.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let size = u32::try_from(expected_element_size).unwrap_or(0);
+    let align = u32::try_from(expected_element_align).unwrap_or(0);
+    #[allow(clippy::cast_sign_loss)]
+    let type_key = expected_element_type_key as u64;
+    context.list_remove_at(list, size, align, type_key, index);
 }
 
 #[cfg(test)]
@@ -1666,6 +1851,318 @@ mod tests {
         }
         assert!(context.take_error().is_none());
         assert_eq!(context.memory_stats().used_bytes, used_before);
+    }
+
+    #[test]
+    fn list_remove_at_shifts_later_elements_left() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        for value in [10_i32, 20, 30, 40] {
+            aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        }
+        aster_rt_list_remove_at(context_pointer, list, 4, 4, 1, 1);
+        assert!(context.take_error().is_none());
+        assert_eq!(aster_rt_list_length(context_pointer, list), 3);
+        for (index, expected) in [(0_i32, 10_i32), (1, 30), (2, 40)] {
+            let mut out = 0_i32;
+            aster_rt_list_get(context_pointer, list, 4, 4, 1, index, destination(&mut out));
+            assert_eq!(out, expected, "Get({index}) after RemoveAt(1)");
+        }
+    }
+
+    #[test]
+    fn list_remove_at_clears_the_old_last_slot() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        for value in [10_i32, 20, 30] {
+            aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        }
+        aster_rt_list_remove_at(context_pointer, list, 4, 4, 1, 0);
+        assert!(context.take_error().is_none());
+        // SAFETY: `list` is valid and not aliased; offset 2 (the pre-removal
+        // last index) is within the buffer's allocated capacity.
+        #[allow(unsafe_code)]
+        unsafe {
+            let old_last = (*list).data.cast::<i32>().add(2);
+            assert_eq!(std::ptr::read(old_last), 0, "old last slot must be zeroed");
+        }
+    }
+
+    #[test]
+    fn list_remove_at_does_not_change_capacity_or_data() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        for value in [1_i32, 2, 3] {
+            aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        }
+        // SAFETY: `list` is valid and not aliased.
+        #[allow(unsafe_code)]
+        let (capacity_before, data_before) = unsafe { ((*list).capacity(), (*list).data) };
+        aster_rt_list_remove_at(context_pointer, list, 4, 4, 1, 1);
+        assert!(context.take_error().is_none());
+        // SAFETY: same as above.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!((*list).capacity(), capacity_before);
+            assert_eq!((*list).data, data_before);
+        }
+    }
+
+    #[test]
+    fn list_remove_at_does_not_allocate() {
+        let mut context = ExecutionContext::with_stats();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        for value in [1_i32, 2, 3, 4] {
+            aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        }
+        let used_before = context.memory_stats().used_bytes;
+        for _ in 0..1000 {
+            aster_rt_list_remove_at(context_pointer, list, 4, 4, 1, 0);
+            let value = 1_i32;
+            aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        }
+        assert!(context.take_error().is_none());
+        assert_eq!(context.memory_stats().used_bytes, used_before);
+    }
+
+    #[test]
+    fn list_remove_at_and_add_reuse_the_same_buffer() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        for value in [1_i32, 2, 3, 4] {
+            aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        }
+        // SAFETY: `list` is valid and not aliased.
+        #[allow(unsafe_code)]
+        let data_before = unsafe { (*list).data };
+        aster_rt_list_remove_at(context_pointer, list, 4, 4, 1, 0);
+        let value = 99_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        assert!(context.take_error().is_none());
+        // SAFETY: same as above.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!(
+                (*list).data,
+                data_before,
+                "buffer must be reused, not reallocated"
+            );
+            assert_eq!((*list).capacity(), 4);
+        }
+    }
+
+    #[test]
+    fn list_remove_at_removing_every_element_leaves_a_valid_empty_list() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        for value in [1_i32, 2, 3] {
+            aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        }
+        for _ in 0..3 {
+            aster_rt_list_remove_at(context_pointer, list, 4, 4, 1, 0);
+        }
+        assert!(context.take_error().is_none());
+        assert_eq!(aster_rt_list_length(context_pointer, list), 0);
+        // SAFETY: `list` is valid and not aliased.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!((*list).capacity(), 4, "capacity is preserved, never shrunk");
+        }
+        let value = 42_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        assert!(context.take_error().is_none());
+        assert_eq!(aster_rt_list_length(context_pointer, list), 1);
+    }
+
+    #[test]
+    fn list_remove_at_rejects_a_null_list() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        aster_rt_list_remove_at(context_pointer, std::ptr::null_mut(), 4, 4, 1, 0);
+        assert!(context.take_error().is_some());
+    }
+
+    #[test]
+    fn list_remove_at_rejects_element_size_mismatch() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        aster_rt_list_remove_at(context_pointer, list, 8, 4, 1, 0);
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("size mismatch"))
+        );
+        assert_eq!(aster_rt_list_length(context_pointer, list), 1);
+    }
+
+    #[test]
+    fn list_remove_at_rejects_element_align_mismatch() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        aster_rt_list_remove_at(context_pointer, list, 4, 8, 1, 0);
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("alignment mismatch"))
+        );
+    }
+
+    #[test]
+    fn list_remove_at_rejects_element_type_key_mismatch() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        aster_rt_list_remove_at(context_pointer, list, 4, 4, 2, 0);
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("type key mismatch"))
+        );
+    }
+
+    #[test]
+    fn list_remove_at_rejects_a_negative_index() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        aster_rt_list_remove_at(context_pointer, list, 4, 4, 1, -1);
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("negative"))
+        );
+        assert_eq!(aster_rt_list_length(context_pointer, list), 1);
+    }
+
+    #[test]
+    fn list_remove_at_rejects_an_index_on_an_empty_list() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        aster_rt_list_remove_at(context_pointer, list, 4, 4, 1, 0);
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("out of bounds"))
+        );
+    }
+
+    #[test]
+    fn list_remove_at_rejects_an_index_equal_to_length() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        aster_rt_list_remove_at(context_pointer, list, 4, 4, 1, 1);
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("out of bounds"))
+        );
+        assert_eq!(aster_rt_list_length(context_pointer, list), 1);
+    }
+
+    #[test]
+    fn list_remove_at_rejects_an_index_far_beyond_length() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let value = 1_i32;
+        aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        aster_rt_list_remove_at(context_pointer, list, 4, 4, 1, 1000);
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("out of bounds"))
+        );
+    }
+
+    #[test]
+    fn list_remove_at_rejects_a_header_with_negative_length() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        // SAFETY: `list` was just allocated above; this simulates a
+        // corrupted header for a synthetic MIR/runtime test.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*list).length = -1;
+        }
+        aster_rt_list_remove_at(context_pointer, list, 4, 4, 1, 0);
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("negative length"))
+        );
+    }
+
+    #[test]
+    fn list_remove_at_error_leaves_the_buffer_byte_for_byte_unchanged() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        for value in [10_i32, 20, 30] {
+            aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        }
+        // SAFETY: `list` is valid and not aliased.
+        #[allow(unsafe_code)]
+        let snapshot = unsafe {
+            [
+                std::ptr::read((*list).data.cast::<i32>()),
+                std::ptr::read((*list).data.cast::<i32>().add(1)),
+                std::ptr::read((*list).data.cast::<i32>().add(2)),
+            ]
+        };
+        aster_rt_list_remove_at(context_pointer, list, 4, 4, 1, 50);
+        assert!(context.take_error().is_some());
+        assert_eq!(aster_rt_list_length(context_pointer, list), 3);
+        // SAFETY: same as above.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!(
+                [
+                    std::ptr::read((*list).data.cast::<i32>()),
+                    std::ptr::read((*list).data.cast::<i32>().add(1)),
+                    std::ptr::read((*list).data.cast::<i32>().add(2)),
+                ],
+                snapshot
+            );
+        }
+    }
+
+    #[test]
+    fn list_remove_at_error_does_not_contaminate_a_later_valid_call() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        for value in [10_i32, 20] {
+            aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value));
+        }
+        aster_rt_list_remove_at(context_pointer, list, 4, 4, 1, 5);
+        assert!(context.take_error().is_some());
+        aster_rt_list_remove_at(context_pointer, list, 4, 4, 1, 0);
+        assert!(context.take_error().is_none());
+        assert_eq!(aster_rt_list_length(context_pointer, list), 1);
+        let mut out = 0_i32;
+        aster_rt_list_get(context_pointer, list, 4, 4, 1, 0, destination(&mut out));
+        assert_eq!(out, 20);
     }
 
     #[test]

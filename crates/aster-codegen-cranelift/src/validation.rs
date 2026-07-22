@@ -231,6 +231,7 @@ fn validate_function(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn validate_instruction(
     instruction: &mir::Instruction,
     function_name: &str,
@@ -245,8 +246,7 @@ fn validate_instruction(
 ) -> Result<(), BackendError> {
     match instruction {
         mir::Instruction::Assign { target, value } => {
-            validate_place(target, function_name)?;
-            validate_rvalue(value, function_name, implementations)
+            validate_assign(target, value, function_name, implementations)
         }
         mir::Instruction::Call {
             destination,
@@ -339,6 +339,15 @@ fn validate_instruction(
             enums,
             locals,
         ),
+        mir::Instruction::ListRemoveAt { list, index } => validate_list_remove_at(
+            list,
+            index,
+            function_name,
+            classes,
+            structs,
+            interfaces,
+            enums,
+        ),
     }
 }
 
@@ -351,6 +360,16 @@ fn validate_allocate_array(
     validate_place(destination, function_name)?;
     validate_value_type(element_type, function_name)?;
     validate_operand(length, function_name)
+}
+
+fn validate_assign(
+    target: &mir::Place,
+    value: &mir::Rvalue,
+    function_name: &str,
+    implementations: &HashSet<(mir::SymbolId, mir::SymbolId)>,
+) -> Result<(), BackendError> {
+    validate_place(target, function_name)?;
+    validate_rvalue(value, function_name, implementations)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -556,6 +575,39 @@ fn validate_list_add(
         )));
     }
     Ok(())
+}
+
+fn validate_list_remove_at(
+    list: &mir::Operand,
+    index: &mir::Operand,
+    function_name: &str,
+    classes: &HashSet<mir::SymbolId>,
+    structs: &HashSet<mir::SymbolId>,
+    interfaces: &HashSet<mir::SymbolId>,
+    enums: &HashSet<mir::SymbolId>,
+) -> Result<(), BackendError> {
+    validate_operand(list, function_name)?;
+    validate_operand(index, function_name)?;
+    if index.type_ != mir::Type::Int {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a `ListRemoveAt` whose index is not `int` (found `{}`)",
+            type_name_owned(&index.type_)
+        )));
+    }
+    let mir::Type::List(element_type) = &list.type_ else {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a `ListRemoveAt` whose receiver is not `List<T>` (found `{}`)",
+            type_name_owned(&list.type_)
+        )));
+    };
+    validate_list_element_type(
+        element_type,
+        function_name,
+        classes,
+        structs,
+        interfaces,
+        enums,
+    )
 }
 
 /// Whether `element_type` is a concrete type `List<T>` may hold: known to
@@ -2168,5 +2220,134 @@ mod tests {
             fields: Vec::new(),
         });
         validate_module(&module).expect("List<Widget>.Get(int) with Widget declared is valid");
+    }
+
+    /// `ListRemoveAt` has real source syntax, but semantic analysis already
+    /// prevents a receiver/index mismatch from ever compiling — so, like
+    /// `AllocateList`/`ListAdd`/`ListGet`, every scenario here is hand-built
+    /// MIR.
+    fn list_remove_at_module(list_type: mir::Type, index_type: mir::Type) -> mir::Module {
+        let list_local = mir::LocalId(0);
+        let index_local = mir::LocalId(1);
+        mir::Module {
+            structs: Vec::new(),
+            classes: Vec::new(),
+            interfaces: Vec::new(),
+            enums: Vec::new(),
+            interface_implementations: Vec::new(),
+            functions: vec![mir::Function {
+                constructor: false,
+                symbol: mir::SymbolId(1),
+                owner: None,
+                name: "RemoveAt".to_owned(),
+                visibility: mir::Visibility::Public,
+                parameters: vec![
+                    mir::Local {
+                        id: list_local,
+                        symbol: None,
+                        name: "list".to_owned(),
+                        type_: list_type.clone(),
+                        mutable: false,
+                        temporary: false,
+                    },
+                    mir::Local {
+                        id: index_local,
+                        symbol: None,
+                        name: "index".to_owned(),
+                        type_: index_type.clone(),
+                        mutable: false,
+                        temporary: false,
+                    },
+                ],
+                locals: Vec::new(),
+                return_type: mir::Type::Void,
+                entry: mir::BasicBlockId(0),
+                blocks: vec![mir::BasicBlock {
+                    id: mir::BasicBlockId(0),
+                    instructions: vec![mir::Instruction::ListRemoveAt {
+                        list: mir::Operand {
+                            type_: list_type,
+                            kind: mir::OperandKind::Copy(mir::Place::Local(list_local)),
+                        },
+                        index: mir::Operand {
+                            type_: index_type,
+                            kind: mir::OperandKind::Copy(mir::Place::Local(index_local)),
+                        },
+                    }],
+                    terminator: mir::Terminator::Return(None),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn list_remove_at_accepts_a_well_formed_call() {
+        let module =
+            list_remove_at_module(mir::Type::List(Box::new(mir::Type::Int)), mir::Type::Int);
+        validate_module(&module).expect("List<int>.RemoveAt(int) is well-formed");
+    }
+
+    #[test]
+    fn list_remove_at_rejects_a_non_list_receiver() {
+        let module = list_remove_at_module(mir::Type::Int, mir::Type::Int);
+        let error = validate_module(&module)
+            .expect_err("ListRemoveAt on a non-List<T> receiver must be rejected");
+        assert!(error.message().contains("receiver is not"));
+    }
+
+    #[test]
+    fn list_remove_at_rejects_a_non_int_index() {
+        let module =
+            list_remove_at_module(mir::Type::List(Box::new(mir::Type::Int)), mir::Type::Long);
+        let error =
+            validate_module(&module).expect_err("ListRemoveAt index must be `int`, never `long`");
+        assert!(error.message().contains("index is not `int`"));
+    }
+
+    #[test]
+    fn list_remove_at_rejects_a_decimal_element() {
+        let module = list_remove_at_module(
+            mir::Type::List(Box::new(mir::Type::Decimal)),
+            mir::Type::Int,
+        );
+        let error =
+            validate_module(&module).expect_err("List<decimal> has no runtime representation");
+        assert!(error.message().contains("decimal"));
+    }
+
+    #[test]
+    fn list_remove_at_rejects_an_unknown_class_element() {
+        let unknown_class = mir::Type::Class(mir::SymbolId(999));
+        let module =
+            list_remove_at_module(mir::Type::List(Box::new(unknown_class)), mir::Type::Int);
+        let error = validate_module(&module)
+            .expect_err("a List<T> element class absent from the module must be rejected");
+        assert!(error.message().contains("element class is unknown"));
+    }
+
+    #[test]
+    fn list_remove_at_rejects_a_nested_list_element_with_a_bad_inner_element() {
+        let module = list_remove_at_module(
+            mir::Type::List(Box::new(mir::Type::List(Box::new(mir::Type::Decimal)))),
+            mir::Type::Int,
+        );
+        let error = validate_module(&module)
+            .expect_err("List<List<decimal>> must be rejected via the inner element check");
+        assert!(error.message().contains("decimal"));
+    }
+
+    #[test]
+    fn list_remove_at_accepts_a_known_class_element() {
+        let class_symbol = mir::SymbolId(42);
+        let mut module = list_remove_at_module(
+            mir::Type::List(Box::new(mir::Type::Class(class_symbol))),
+            mir::Type::Int,
+        );
+        module.classes.push(mir::ClassDefinition {
+            symbol: class_symbol,
+            name: "Widget".to_owned(),
+            fields: Vec::new(),
+        });
+        validate_module(&module).expect("List<Widget>.RemoveAt(int) with Widget declared is valid");
     }
 }

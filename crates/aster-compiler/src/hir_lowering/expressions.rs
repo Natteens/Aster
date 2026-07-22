@@ -329,6 +329,21 @@ impl Lowerer<'_> {
                         };
                     }
                 }
+                if let ast::ExpressionKind::Member { object, name } = &callee.kind
+                    && name == "RemoveAt"
+                {
+                    let object = self.expression(object);
+                    if matches!(object.type_, hir::Type::List(_)) {
+                        let index = self.expression(&arguments[0]);
+                        return hir::Expression {
+                            type_: hir::Type::Void,
+                            kind: hir::ExpressionKind::ListRemoveAt {
+                                list: Box::new(object),
+                                index: Box::new(index),
+                            },
+                        };
+                    }
+                }
                 if is_parallel_for_callee(callee) {
                     let resolved = &self.model.parallel_for[&model_key];
                     let body = self.callable_symbols[&resolved.body];

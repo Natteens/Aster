@@ -541,10 +541,15 @@ fn instruction_escape(
         // enum, when that struct/enum literal was constructed — see
         // `assignment_escape`'s `Contained` case) — never a fresh
         // allocation, and never owned by the list's slot.
+        // `RemoveAt` rearranges elements already inside the buffer (each
+        // already classified when it was `Add`ed) and introduces no new
+        // operand that could alias anything — a purely local mutation of
+        // the list's own storage, neutral to every allocation's lifetime.
         mir::Instruction::AllocateArray { .. }
         | mir::Instruction::AllocateObject { .. }
         | mir::Instruction::AllocateList { .. }
-        | mir::Instruction::ListGet { .. } => None,
+        | mir::Instruction::ListGet { .. }
+        | mir::Instruction::ListRemoveAt { .. } => None,
         // Storing a reference into a list's buffer is an aggregate store,
         // exactly like `Assign{target: Field/Index, value: Use(alias)}`
         // (`assignment_escape` above): conservatively persistent, regardless
@@ -1307,6 +1312,35 @@ mod tests {
         let classifications = classifications(source, "Run");
         assert!(
             classifications.contains(&EscapeClassification::Persistent(EscapeReason::Contained)),
+            "{classifications:#?}"
+        );
+    }
+
+    // --- List C: `values.RemoveAt(index)` and its effect on escape analysis
+
+    #[test]
+    fn calling_remove_at_does_not_by_itself_force_the_list_to_escape() {
+        // `RemoveAt` introduces no new operand that could alias anything and
+        // must not force its own receiver to escape, exactly like `Add`/`Get`.
+        let source = "public int Run() { List<int> values = new List<int>(); values.Add(1); \
+                       values.Add(2); values.RemoveAt(0); return values.Length; }";
+        assert_eq!(
+            list_regions(source, "Run"),
+            vec![mir::AllocationRegion::Temporary]
+        );
+    }
+
+    #[test]
+    fn remove_at_does_not_weaken_the_persistence_forced_by_add() {
+        // The value removed from the list was already forced `Persistent`
+        // the moment it was `Add`ed; calling `RemoveAt` afterward must not
+        // change that classification.
+        let source = "public class Box { public int value; public Box(int value) { this.value = value; } } \
+                       public int Run() { List<Box> values = new List<Box>(); Box box = new Box(10); \
+                       values.Add(box); values.RemoveAt(0); return box.value; }";
+        let classifications = classifications(source, "Run");
+        assert!(
+            classifications.contains(&EscapeClassification::Persistent(EscapeReason::Stored)),
             "{classifications:#?}"
         );
     }

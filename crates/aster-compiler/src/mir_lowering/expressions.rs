@@ -99,6 +99,16 @@ impl FunctionLowerer {
                     .expect("validated index produces a value");
                 Some(self.lower_list_get(list, index, element_type))
             }
+            hir::ExpressionKind::ListRemoveAt { list, index } => {
+                let list = self
+                    .lower_expression(list)
+                    .expect("validated list produces a value");
+                let index = self
+                    .lower_expression(index)
+                    .expect("validated index produces a value");
+                self.instruction(mir::Instruction::ListRemoveAt { list, index });
+                None
+            }
             hir::ExpressionKind::StringLength(value) => {
                 let value = self
                     .lower_expression(value)

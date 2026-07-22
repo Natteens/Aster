@@ -756,6 +756,43 @@ impl Codegen {
         Ok(())
     }
 
+    /// `list.RemoveAt(index)`: the element type is derived from `list.type_`
+    /// (validated to be `List(T)` before this ever runs), exactly like
+    /// `ListAdd`/`ListGet` derive size/align/type key rather than storing
+    /// them redundantly.
+    pub(super) fn translate_list_remove_at(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        list: &mir::Operand,
+        index: &mir::Operand,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let mir::Type::List(element_type) = &list.type_ else {
+            return Err(BackendError::new("ListRemoveAt receiver is not List<T>"));
+        };
+        let list_value = self.translate_operand(builder, list, state)?;
+        let index_value = self.translate_operand(builder, index, state)?;
+        let layout = self.layouts.type_layout(element_type)?;
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids["aster_rt_list_remove_at"], builder.func);
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("list.RemoveAt is missing its ExecutionContext"))?;
+        let size = builder.ins().iconst(types::I32, i64::from(layout.size));
+        let align = builder
+            .ins()
+            .iconst(types::I32, i64::from(1_u32 << layout.align_shift));
+        #[allow(clippy::cast_possible_wrap)]
+        let type_key_bits = mir::type_key(element_type) as i64;
+        let type_key = builder.ins().iconst(types::I64, type_key_bits);
+        builder.ins().call(
+            function_ref,
+            &[context, list_value, size, align, type_key, index_value],
+        );
+        Ok(())
+    }
+
     /// `list.Get(index)`: writes the copied element into a fresh address —
     /// the destination place itself for an aggregate (structs/enums/
     /// interfaces already model returning a value as "write into this
