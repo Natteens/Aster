@@ -1,3 +1,4 @@
+mod stdlib_discovery;
 mod watch;
 
 use std::{env, fs, path::Path, process::ExitCode};
@@ -30,7 +31,8 @@ fn run(mut arguments: impl Iterator<Item = String>) -> Result<(), ()> {
                 );
                 return Err(());
             }
-            process_file(command, &file_name)
+            let stdlib = stdlib_discovery::discover()?;
+            process_file(command, &file_name, &stdlib)
         }
         Some(command @ ("run" | "watch")) => {
             let usage =
@@ -67,10 +69,11 @@ fn run(mut arguments: impl Iterator<Item = String>) -> Result<(), ()> {
                     }
                 }
             }
+            let stdlib = stdlib_discovery::discover()?;
             if command == "watch" {
-                watch::watch_file(&file_name, function_name.as_deref())
+                watch::watch_file(&file_name, function_name.as_deref(), &stdlib)
             } else {
-                run_file(&file_name, function_name.as_deref(), memory_stats)
+                run_file(&file_name, function_name.as_deref(), memory_stats, &stdlib)
             }
         }
         Some("--version" | "-V") => {
@@ -129,9 +132,13 @@ fn validate_source_file(path: &Path) -> Result<(), ()> {
     Ok(())
 }
 
-fn process_file(command: &str, file_name: &str) -> Result<(), ()> {
+fn process_file(
+    command: &str,
+    file_name: &str,
+    stdlib: &aster_compiler::StandardLibrary,
+) -> Result<(), ()> {
     validate_source_file(Path::new(file_name))?;
-    match aster_compiler::compile_project(Path::new(file_name)) {
+    match aster_compiler::compile_project_with_stdlib(Path::new(file_name), stdlib.clone()) {
         Ok(project) => {
             let compilation = &project.compilation;
             for diagnostic in project_diagnostics(&project) {
@@ -178,17 +185,23 @@ fn process_file(command: &str, file_name: &str) -> Result<(), ()> {
     }
 }
 
-fn run_file(file_name: &str, function_name: Option<&str>, memory_stats: bool) -> Result<(), ()> {
+fn run_file(
+    file_name: &str,
+    function_name: Option<&str>,
+    memory_stats: bool,
+    stdlib: &aster_compiler::StandardLibrary,
+) -> Result<(), ()> {
     validate_source_file(Path::new(file_name))?;
-    let project = match aster_compiler::compile_project(Path::new(file_name)) {
-        Ok(compilation) => compilation,
-        Err(diagnostics) => {
-            for diagnostic in diagnostics {
-                eprintln!("{}", diagnostic.render());
+    let project =
+        match aster_compiler::compile_project_with_stdlib(Path::new(file_name), stdlib.clone()) {
+            Ok(compilation) => compilation,
+            Err(diagnostics) => {
+                for diagnostic in diagnostics {
+                    eprintln!("{}", diagnostic.render());
+                }
+                return Err(());
             }
-            return Err(());
-        }
-    };
+        };
     for diagnostic in project_diagnostics(&project) {
         eprintln!("{}", diagnostic.render());
     }
@@ -323,9 +336,15 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
+    use aster_compiler::StandardLibrary;
+
     use super::{process_file, run, run_file};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn embedded() -> StandardLibrary {
+        StandardLibrary::embedded()
+    }
 
     #[test]
     fn help_accepts_dump_hir_command() {
@@ -338,7 +357,11 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("aster-dump-hir-{}-{id}.aster", std::process::id()));
         fs::write(&path, "public int Value() { return 1; }").expect("write test source");
-        let result = process_file("dump-hir", path.to_str().expect("UTF-8 test path"));
+        let result = process_file(
+            "dump-hir",
+            path.to_str().expect("UTF-8 test path"),
+            &embedded(),
+        );
         fs::remove_file(path).expect("remove test source");
         assert!(result.is_ok());
     }
@@ -349,7 +372,11 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("aster-dump-mir-{}-{id}.aster", std::process::id()));
         fs::write(&path, "public int Value() { return 1; }").expect("write test source");
-        let result = process_file("dump-mir", path.to_str().expect("UTF-8 test path"));
+        let result = process_file(
+            "dump-mir",
+            path.to_str().expect("UTF-8 test path"),
+            &embedded(),
+        );
         fs::remove_file(path).expect("remove test source");
         assert!(result.is_ok());
     }
@@ -357,7 +384,11 @@ mod tests {
     #[test]
     fn check_command_remains_available() {
         let path = test_file("check", "public int Value() { return 1; }");
-        let result = process_file("check", path.to_str().expect("UTF-8 test path"));
+        let result = process_file(
+            "check",
+            path.to_str().expect("UTF-8 test path"),
+            &embedded(),
+        );
         fs::remove_file(path).expect("remove test source");
         assert!(result.is_ok());
     }
@@ -365,7 +396,7 @@ mod tests {
     #[test]
     fn check_does_not_require_main_but_validates_an_existing_manifest() {
         let library = test_file("library", "public int Value() { return 1; }");
-        assert!(process_file("check", library.to_str().expect("UTF-8 path")).is_ok());
+        assert!(process_file("check", library.to_str().expect("UTF-8 path"), &embedded()).is_ok());
         fs::remove_file(library).expect("remove library source");
 
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
@@ -376,7 +407,7 @@ mod tests {
             .expect("write invalid manifest");
         let root = directory.join("main.aster");
         fs::write(&root, "public int Value() { return 1; }").expect("write source");
-        assert!(process_file("check", root.to_str().expect("UTF-8 path")).is_err());
+        assert!(process_file("check", root.to_str().expect("UTF-8 path"), &embedded()).is_err());
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 
@@ -387,6 +418,7 @@ mod tests {
             path.to_str().expect("UTF-8 test path"),
             Some("Calculate"),
             false,
+            &embedded(),
         );
         fs::remove_file(path).expect("remove test source");
         assert!(result.is_ok());
@@ -398,7 +430,12 @@ mod tests {
             "main",
             "public class Program { public static int Main() { return 42; } }",
         );
-        let result = run_file(path.to_str().expect("UTF-8 test path"), None, false);
+        let result = run_file(
+            path.to_str().expect("UTF-8 test path"),
+            None,
+            false,
+            &embedded(),
+        );
         fs::remove_file(path).expect("remove test source");
         assert!(result.is_ok());
     }
@@ -417,6 +454,7 @@ mod tests {
             root.to_str().expect("UTF-8 test path"),
             Some("Calculate"),
             false,
+            &embedded(),
         );
         fs::remove_dir_all(directory).expect("remove test project");
         assert!(result.is_ok());
@@ -444,7 +482,12 @@ mod tests {
             "namespace app; public class Program { public static int Main() { return Answer(); } }",
         )
         .expect("write root source");
-        let result = run_file(root.to_str().expect("UTF-8 test path"), None, false);
+        let result = run_file(
+            root.to_str().expect("UTF-8 test path"),
+            None,
+            false,
+            &embedded(),
+        );
         fs::remove_dir_all(directory).expect("remove test project");
         assert!(result.is_ok());
     }
@@ -467,6 +510,7 @@ mod tests {
             root.to_str().expect("UTF-8 test path"),
             Some("app::Double"),
             false,
+            &embedded(),
         );
         fs::remove_dir_all(directory).expect("remove test project");
         assert!(result.is_err());
@@ -483,8 +527,18 @@ mod tests {
     #[test]
     fn memory_stats_flag_does_not_change_result() {
         let path = test_file("stats-flag", "public int Run() { return 7; }");
-        let without = run_file(path.to_str().expect("UTF-8"), Some("Run"), false);
-        let with = run_file(path.to_str().expect("UTF-8"), Some("Run"), true);
+        let without = run_file(
+            path.to_str().expect("UTF-8"),
+            Some("Run"),
+            false,
+            &embedded(),
+        );
+        let with = run_file(
+            path.to_str().expect("UTF-8"),
+            Some("Run"),
+            true,
+            &embedded(),
+        );
         fs::remove_file(&path).expect("remove test file");
         assert!(without.is_ok());
         assert!(with.is_ok());
@@ -496,7 +550,7 @@ mod tests {
             "stats-class",
             "public class Program { public static int Main() { return 1; } }",
         );
-        let result = run_file(path.to_str().expect("UTF-8"), None, true);
+        let result = run_file(path.to_str().expect("UTF-8"), None, true, &embedded());
         fs::remove_file(&path).expect("remove test file");
         assert!(result.is_ok());
     }

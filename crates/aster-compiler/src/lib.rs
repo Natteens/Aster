@@ -12,6 +12,8 @@ mod semantic;
 mod standard_library;
 mod type_names;
 
+use std::path::Path;
+
 use aster_diagnostics::{Diagnostic, Severity};
 use aster_syntax::{Module, Token, lex, parse};
 
@@ -23,6 +25,20 @@ pub use aster_mir as mir;
 pub use project::{
     ProjectCompilation, ProjectDiagnostic, ProjectSource, ProjectSourceOrigin, compile_project,
 };
+pub use standard_library::StandardLibrary;
+
+/// Compile a project using a custom standard library (e.g. loaded from an
+/// installed location via [`StandardLibrary::from_path`]).
+///
+/// # Errors
+///
+/// Returns sourced diagnostics for any compilation failure.
+pub fn compile_project_with_stdlib(
+    path: &Path,
+    stdlib: StandardLibrary,
+) -> Result<ProjectCompilation, Vec<ProjectDiagnostic>> {
+    project::compile_project_with_standard_library(path, stdlib)
+}
 
 /// Successful output of validation plus HIR and MIR lowering.
 #[derive(Clone, Debug, PartialEq)]

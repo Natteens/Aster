@@ -95,7 +95,7 @@ pub fn compile_project(path: &Path) -> Result<ProjectCompilation, Vec<ProjectDia
     compile_project_with_standard_library(path, StandardLibrary::embedded())
 }
 
-fn compile_project_with_standard_library(
+pub(crate) fn compile_project_with_standard_library(
     path: &Path,
     standard_library: StandardLibrary,
 ) -> Result<ProjectCompilation, Vec<ProjectDiagnostic>> {

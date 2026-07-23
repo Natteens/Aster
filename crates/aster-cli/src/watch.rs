@@ -13,6 +13,8 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use aster_compiler::StandardLibrary;
+
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(150);
 
 /// Observable state of the watched file at one instant.
@@ -79,12 +81,16 @@ impl ChangeDetector {
 /// Watch a file, rebuilding and re-running the selected function after every
 /// stable change. Errors are reported without stopping the watcher; `Ctrl+C`
 /// terminates the process. Runs until interrupted.
-pub(crate) fn watch_file(file_name: &str, function_name: Option<&str>) -> Result<(), ()> {
+pub(crate) fn watch_file(
+    file_name: &str,
+    function_name: Option<&str>,
+    stdlib: &StandardLibrary,
+) -> Result<(), ()> {
     let path = Path::new(file_name).to_owned();
     // Validate readability once so an unusable path fails fast.
     crate::read_source(file_name)?;
     println!("[watch] watching `{file_name}` — press Ctrl+C to stop");
-    let initial = build_and_run(file_name, function_name);
+    let initial = build_and_run(file_name, function_name, stdlib);
     let mut failing = !initial.succeeded;
     let mut dependencies = initial.dependencies.unwrap_or_else(|| vec![path.clone()]);
     let mut detector = DependencyChangeDetector::built(dependency_snapshot(&dependencies));
@@ -92,7 +98,7 @@ pub(crate) fn watch_file(file_name: &str, function_name: Option<&str>) -> Result
         thread::sleep(POLL_INTERVAL);
         if detector.observe(dependency_snapshot(&dependencies)) == WatchDecision::Rebuild {
             println!("[watch] change detected, rebuilding");
-            let rebuilt = build_and_run(file_name, function_name);
+            let rebuilt = build_and_run(file_name, function_name, stdlib);
             let succeeded = rebuilt.succeeded;
             if let Some(new_dependencies) = rebuilt.dependencies {
                 dependencies = new_dependencies;
@@ -113,24 +119,29 @@ struct BuildOutcome {
     dependencies: Option<Vec<PathBuf>>,
 }
 
-fn build_and_run(file_name: &str, function_name: Option<&str>) -> BuildOutcome {
+fn build_and_run(
+    file_name: &str,
+    function_name: Option<&str>,
+    stdlib: &StandardLibrary,
+) -> BuildOutcome {
     let frontend_started = Instant::now();
-    let project = match aster_compiler::compile_project(Path::new(file_name)) {
-        Ok(compilation) => compilation,
-        Err(diagnostics) => {
-            for diagnostic in diagnostics {
-                eprintln!("{}", diagnostic.render());
+    let project =
+        match aster_compiler::compile_project_with_stdlib(Path::new(file_name), stdlib.clone()) {
+            Ok(compilation) => compilation,
+            Err(diagnostics) => {
+                for diagnostic in diagnostics {
+                    eprintln!("{}", diagnostic.render());
+                }
+                eprintln!("[watch] compilation failed; still watching");
+                return BuildOutcome {
+                    succeeded: false,
+                    // A failed rebuild must keep the last successful graph. Otherwise an
+                    // invalid save in a namespace dependency would remove that file from the
+                    // watch set and fixing it would never trigger recovery.
+                    dependencies: None,
+                };
             }
-            eprintln!("[watch] compilation failed; still watching");
-            return BuildOutcome {
-                succeeded: false,
-                // A failed rebuild must keep the last successful graph. Otherwise an
-                // invalid save in a namespace dependency would remove that file from the
-                // watch set and fixing it would never trigger recovery.
-                dependencies: None,
-            };
-        }
-    };
+        };
     let frontend_time = frontend_started.elapsed();
     for diagnostic in crate::project_diagnostics(&project) {
         eprintln!("{}", diagnostic.render());
@@ -223,10 +234,16 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
+    use aster_compiler::StandardLibrary;
+
     use super::{
         ChangeDetector, DependencyChangeDetector, Snapshot, WatchDecision, build_and_run,
         watched_paths,
     };
+
+    fn embedded() -> StandardLibrary {
+        StandardLibrary::embedded()
+    }
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -311,7 +328,7 @@ mod tests {
             "namespace app; public class Program { public static int Main() { return 42; } }",
         )
         .expect("write source");
-        let outcome = build_and_run(root.to_str().expect("UTF-8 path"), None);
+        let outcome = build_and_run(root.to_str().expect("UTF-8 path"), None, &embedded());
         assert!(outcome.succeeded);
         let project = aster_compiler::compile_project(&root).expect("compile test project");
         assert!(
@@ -343,13 +360,13 @@ mod tests {
             r#"public class Program { public static int Main() { string text = "Ol" + "á"; return text.Length; } }"#,
         )
         .expect("write first string program");
-        assert!(build_and_run(root.to_str().expect("UTF-8 path"), None).succeeded);
+        assert!(build_and_run(root.to_str().expect("UTF-8 path"), None, &embedded()).succeeded);
         fs::write(
             &root,
             r#"public class Program { public static int Main() { string text = "Ast" + "er"; return text.Length; } }"#,
         )
         .expect("write rebuilt string program");
-        assert!(build_and_run(root.to_str().expect("UTF-8 path"), None).succeeded);
+        assert!(build_and_run(root.to_str().expect("UTF-8 path"), None, &embedded()).succeeded);
         fs::remove_dir_all(directory).expect("remove test directory");
     }
 
@@ -372,7 +389,7 @@ mod tests {
         )
         .expect("write root");
 
-        let initial = build_and_run(root.to_str().expect("UTF-8 path"), None);
+        let initial = build_and_run(root.to_str().expect("UTF-8 path"), None, &embedded());
         let dependencies = initial.dependencies.expect("successful dependency graph");
         assert!(
             dependencies
@@ -381,7 +398,7 @@ mod tests {
 
         fs::write(&dependency, "namespace app; public int Value( {")
             .expect("write invalid namespace dependency");
-        let failed = build_and_run(root.to_str().expect("UTF-8 path"), None);
+        let failed = build_and_run(root.to_str().expect("UTF-8 path"), None, &embedded());
         assert!(!failed.succeeded);
         assert!(failed.dependencies.is_none());
         assert!(

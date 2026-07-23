@@ -1,10 +1,16 @@
-//! Embedded sources for official `aster.*` namespaces.
+//! Standard library sources for official `aster.*` namespaces.
 //!
-//! The checked-in files are the public source of truth. Embedding them keeps
-//! namespace discovery independent of the process working directory and prevents
-//! user projects from shadowing official namespaces.
+//! The embedded sources (via `include_str!`) are the source of truth for
+//! development builds and always serve as the fallback. At runtime, the CLI
+//! can load an external stdlib from disk (`ASTER_STDLIB` or exe-relative path);
+//! `StandardLibrary::from_path` validates the layout before use.
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use aster_hir::{FileIoResultLayout, Intrinsic, RuntimeErrorKind};
 
@@ -14,6 +20,15 @@ const CORE_SOURCE: &str = include_str!("../../../stdlib/aster/core/core.aster");
 const IO_SOURCE: &str = include_str!("../../../stdlib/aster/io/io.aster");
 const COLLECTIONS_SOURCE: &str =
     include_str!("../../../stdlib/aster/collections/collections.aster");
+
+/// All stdlib modules with their on-disk paths relative to the stdlib root.
+const STDLIB_MODULES: &[(&str, &str)] = &[
+    ("aster.math", "aster/math.aster"),
+    ("aster.text", "aster/text/text.aster"),
+    ("aster.core", "aster/core/core.aster"),
+    ("aster.io", "aster/io/io.aster"),
+    ("aster.collections", "aster/collections/collections.aster"),
+];
 
 /// Namespace of the official core standard library, and the single source of
 /// truth for where the official `Result`/`Option` declarations live. Passes that
@@ -50,20 +65,27 @@ pub(crate) fn dictionary_entry_specialization_name(key: &str, value: &str) -> St
     )
 }
 
+/// Stdlib module sources, either embedded at compile time or loaded from disk.
+///
+/// Use [`StandardLibrary::embedded()`] for the embedded dev fallback, or
+/// [`StandardLibrary::from_path()`] to load from an installed location.
 #[derive(Clone)]
-pub(crate) struct StandardLibrary {
-    modules: HashMap<&'static str, &'static str>,
+pub struct StandardLibrary {
+    modules: HashMap<&'static str, Cow<'static, str>>,
 }
 
 impl StandardLibrary {
-    pub(crate) fn embedded() -> Self {
+    /// Create a stdlib from the sources embedded in the binary at compile time.
+    /// Always succeeds; used as the development fallback.
+    #[must_use]
+    pub fn embedded() -> Self {
         Self {
             modules: HashMap::from([
-                ("aster.math", MATH_SOURCE),
-                ("aster.text", TEXT_SOURCE),
-                ("aster.core", CORE_SOURCE),
-                ("aster.io", IO_SOURCE),
-                ("aster.collections", COLLECTIONS_SOURCE),
+                ("aster.math", Cow::Borrowed(MATH_SOURCE)),
+                ("aster.text", Cow::Borrowed(TEXT_SOURCE)),
+                ("aster.core", Cow::Borrowed(CORE_SOURCE)),
+                ("aster.io", Cow::Borrowed(IO_SOURCE)),
+                ("aster.collections", Cow::Borrowed(COLLECTIONS_SOURCE)),
             ]),
         }
     }
@@ -75,8 +97,44 @@ impl StandardLibrary {
         }
     }
 
-    pub(crate) fn source(&self, module: &str) -> Option<&'static str> {
-        self.modules.get(module).copied()
+    /// Load stdlib sources from a directory on disk.
+    ///
+    /// `path` must be the stdlib root: a directory containing `aster/math.aster`,
+    /// `aster/core/core.aster`, etc. Returns a descriptive error string if the
+    /// directory is missing, is a file, or any required source file cannot be read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string describing what was wrong with the stdlib path.
+    pub fn from_path(path: &Path) -> Result<Self, String> {
+        let metadata = fs::metadata(path).map_err(|error| {
+            format!(
+                "stdlib path `{}` is not accessible: {error}",
+                path.display()
+            )
+        })?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "stdlib path `{}` is a file, not a directory",
+                path.display()
+            ));
+        }
+        let mut modules = HashMap::new();
+        for (name, relative) in STDLIB_MODULES {
+            let file_path = path.join(relative);
+            let source = fs::read_to_string(&file_path).map_err(|error| {
+                format!(
+                    "stdlib file `{}` could not be read: {error}",
+                    file_path.display()
+                )
+            })?;
+            modules.insert(*name, Cow::Owned(source));
+        }
+        Ok(Self { modules })
+    }
+
+    pub(crate) fn source(&self, module: &str) -> Option<&str> {
+        self.modules.get(module).map(Cow::as_ref)
     }
 
     pub(crate) fn intrinsic_bindings(&self) -> HashMap<String, Intrinsic> {
