@@ -111,6 +111,11 @@ pub struct AsterList {
     /// is safe because equality (not ordering) is all iteration ever checks.
     version: u64,
     region: ListRegion,
+    /// Depth of `temporary_scopes` when this header was allocated, or 0 for
+    /// Persistent lists. Buffer allocations in `grow_list_buffer` that happen
+    /// inside a deeper nested scope (i.e. a helper function) are promoted to
+    /// the permanent arena so they survive the helper's temp-scope rewind.
+    birth_scope_depth: u32,
 }
 
 /// Native header for one concrete insertion-ordered `Dictionary<K, V>`.
@@ -133,6 +138,10 @@ pub struct AsterDictionary {
     owner_id: u64,
     key_kind: DictionaryKeyKind,
     region: ListRegion,
+    /// Depth of `temporary_scopes` when this header was allocated, or 0 for
+    /// Persistent dictionaries. Buffer allocations inside a deeper nested scope
+    /// are promoted to the permanent arena so they survive the helper's rewind.
+    birth_scope_depth: u32,
 }
 
 impl AsterDictionary {
@@ -681,6 +690,11 @@ impl ExecutionContext {
             (*header_ptr).element_type_key = element_type_key;
             (*header_ptr).version = 0;
             (*header_ptr).region = region;
+            (*header_ptr).birth_scope_depth = if region == ListRegion::Temporary {
+                u32::try_from(self.temporary_scopes.len()).unwrap_or(u32::MAX)
+            } else {
+                0
+            };
         }
         self.record_allocation(AllocationCategory::Object, size_of::<AsterList>());
         header_ptr
@@ -749,6 +763,11 @@ impl ExecutionContext {
                 owner_id: self.dictionary_owner_id,
                 key_kind,
                 region,
+                birth_scope_depth: if region == ListRegion::Temporary {
+                    u32::try_from(self.temporary_scopes.len()).unwrap_or(u32::MAX)
+                } else {
+                    0
+                },
             };
         }
         self.record_allocation(AllocationCategory::Object, size_of::<AsterDictionary>());
@@ -971,6 +990,7 @@ impl ExecutionContext {
         entry_capacity: i32,
         layout: DictionaryEntryLayout,
         region: ListRegion,
+        birth_scope_depth: u32,
     ) -> Option<(*mut u32, *mut u8)> {
         let Some((bucket_bytes, entry_bytes)) =
             self.dictionary_active_bytes(bucket_capacity, entry_capacity, layout)
@@ -984,8 +1004,14 @@ impl ExecutionContext {
             self.fail("temporary Dictionary growth requires an active temporary scope");
             return None;
         }
+        // Use the temporary arena only when we are still inside the same scope
+        // that created the header (scopes.len() == birth_scope_depth). If a
+        // nested helper has pushed an additional scope, the buffers must go into
+        // the permanent arena so they are not reclaimed when the helper exits.
+        let use_temporary = region == ListRegion::Temporary
+            && self.temporary_scopes.len() == birth_scope_depth as usize;
         let (buckets, entries) = {
-            let arena = if region == ListRegion::Temporary {
+            let arena = if use_temporary {
                 &mut self.temporary_arena
             } else {
                 &mut self.arena
@@ -1134,7 +1160,7 @@ impl ExecutionContext {
         new_entry_capacity: i32,
     ) -> bool {
         #[allow(unsafe_code)]
-        let (old_entries, old_count, length, region, layout) = unsafe {
+        let (old_entries, old_count, length, region, birth_scope_depth, layout) = unsafe {
             let Some(layout) = dictionary_entry_layout(
                 (*dictionary).key_size,
                 (*dictionary).key_align,
@@ -1149,6 +1175,7 @@ impl ExecutionContext {
                 (*dictionary).entry_count,
                 (*dictionary).length,
                 (*dictionary).region,
+                (*dictionary).birth_scope_depth,
                 layout,
             )
         };
@@ -1164,6 +1191,7 @@ impl ExecutionContext {
             new_entry_capacity,
             layout,
             region,
+            birth_scope_depth,
         ) else {
             return false;
         };
@@ -1737,6 +1765,7 @@ impl ExecutionContext {
     /// calling `self.fail`) on any overflow, missing temporary scope, or
     /// arena failure; the caller must return immediately in that case,
     /// leaving the header untouched.
+    #[allow(clippy::too_many_arguments)]
     fn grow_list_buffer(
         &mut self,
         data: *mut u8,
@@ -1745,6 +1774,7 @@ impl ExecutionContext {
         element_size: u32,
         element_align: u32,
         region: ListRegion,
+        birth_scope_depth: u32,
     ) -> Option<(*mut u8, i32)> {
         let new_capacity = if capacity == 0 {
             Some(4_i32)
@@ -1779,9 +1809,15 @@ impl ExecutionContext {
             ));
             return None;
         }
+        // Use the temporary arena only when we are still inside the same scope
+        // that created the header (scopes.len() == birth_scope_depth). If a
+        // nested helper has pushed an additional scope, the buffers must go into
+        // the permanent arena so they are not reclaimed when the helper exits.
+        let use_temporary = region == ListRegion::Temporary
+            && self.temporary_scopes.len() == birth_scope_depth as usize;
         let new_data = {
             let align = usize::try_from(element_align).unwrap_or(1);
-            let arena = if region == ListRegion::Temporary {
+            let arena = if use_temporary {
                 &mut self.temporary_arena
             } else {
                 &mut self.arena
@@ -1833,7 +1869,16 @@ impl ExecutionContext {
         // SAFETY: `list` was just validated above; every field is read once,
         // transiently, into locals below.
         #[allow(unsafe_code)]
-        let (length, capacity, element_size, element_align, element_type_key, region, data) = unsafe {
+        let (
+            length,
+            capacity,
+            element_size,
+            element_align,
+            element_type_key,
+            region,
+            birth_scope_depth,
+            data,
+        ) = unsafe {
             (
                 (*list).length,
                 (*list).capacity,
@@ -1841,6 +1886,7 @@ impl ExecutionContext {
                 (*list).element_align,
                 (*list).element_type_key,
                 (*list).region,
+                (*list).birth_scope_depth,
                 (*list).data,
             )
         };
@@ -1862,9 +1908,15 @@ impl ExecutionContext {
         }
 
         let (data, capacity) = if length == capacity {
-            let Some(grown) =
-                self.grow_list_buffer(data, length, capacity, element_size, element_align, region)
-            else {
+            let Some(grown) = self.grow_list_buffer(
+                data,
+                length,
+                capacity,
+                element_size,
+                element_align,
+                region,
+                birth_scope_depth,
+            ) else {
                 return;
             };
             grown

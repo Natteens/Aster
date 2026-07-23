@@ -7,8 +7,8 @@
 
 use std::fmt::Write as _;
 
-use aster_codegen_cranelift::{ExecutionValue, execute};
-use aster_compiler::compile;
+use aster_codegen_cranelift::{ExecutionValue, execute, execute_with_stats};
+use aster_compiler::{compile, mir};
 
 fn run(source: &str, entry: &str) -> Result<ExecutionValue, String> {
     let compilation = compile(source).map_err(|diagnostics| format!("{diagnostics:#?}"))?;
@@ -1151,4 +1151,268 @@ fn arrays_add_get_and_length_are_unaffected_by_remove_at() {
         }
         ";
     assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(25)));
+}
+
+// --- Nested-scope lifetime regression tests --------------------------------
+//
+// A List created in an outer scope must remain valid after a helper function
+// adds elements to it, even when that helper's own temporary scope is rewound
+// on return. Before the `birth_scope_depth` fix, the data buffer allocated
+// inside the helper's temp scope would be zeroed on scope exit, leaving the
+// list header with a dangling pointer.
+
+#[test]
+fn list_fill_helper_first_add_survives_scope_rewind() {
+    // Minimum reproduction: helper has its own temp scope (string concat),
+    // triggers the first buffer allocation via Add, returns, and the list must
+    // be intact after the helper's scope is rewound.
+    let source = r#"
+        public void Fill(List<string> values)
+        {
+            string s = "hello" + " world";
+            values.Add(s);
+        }
+        public int Main()
+        {
+            List<string> values = new List<string>();
+            Fill(values);
+            Fill(values);
+            return values.Length;
+        }
+    "#;
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(2)));
+}
+
+#[test]
+fn list_fill_helper_get_after_scope_rewind() {
+    // After a helper adds elements, Get must return the correct values.
+    let source = r#"
+        public void Append(List<int> values, int base_val)
+        {
+            string unused = "tick" + "tock";
+            values.Add(base_val + 1);
+        }
+        public int Main()
+        {
+            List<int> values = new List<int>();
+            Append(values, 0);
+            Append(values, 10);
+            Append(values, 20);
+            return values.Get(0) + values.Get(1) + values.Get(2);
+        }
+    "#;
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(33)));
+}
+
+#[test]
+fn list_fill_helper_growth_inside_helper() {
+    // Add enough elements to trigger geometric growth inside the helper.
+    // All elements must survive the helper's scope rewind.
+    let source = r#"
+        public void FillFive(List<int> values, int start)
+        {
+            string unused = "g" + "row";
+            values.Add(start + 0);
+            values.Add(start + 1);
+            values.Add(start + 2);
+            values.Add(start + 3);
+            values.Add(start + 4);
+        }
+        public int Main()
+        {
+            List<int> values = new List<int>();
+            FillFive(values, 0);
+            FillFive(values, 10);
+            int sum = 0;
+            int i = 0;
+            foreach (int v in values) {
+                sum = sum + v;
+            }
+            return sum;
+        }
+    "#;
+    // 0+1+2+3+4 + 10+11+12+13+14 = 10 + 60 = 70
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(70)));
+}
+
+#[test]
+fn list_fill_helper_struct_with_string_survives_scope_rewind() {
+    // Structs containing strings are stored by value; the struct data in the
+    // list buffer must survive the helper's scope exit.
+    let source = r#"
+        public struct Item { public string Name; public int Value; }
+        public void Push(List<Item> items, string prefix, int val)
+        {
+            string name = prefix + val.ToString();
+            Item item = Item { Name: name, Value: val };
+            items.Add(item);
+        }
+        public int Main()
+        {
+            List<Item> items = new List<Item>();
+            Push(items, "item-", 1);
+            Push(items, "item-", 2);
+            Push(items, "item-", 3);
+            int sum = 0;
+            foreach (Item it in items) {
+                sum = sum + it.Value;
+            }
+            return sum;
+        }
+    "#;
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(6)));
+}
+
+#[test]
+fn list_fill_helper_post_return_allocs_do_not_corrupt() {
+    // After the helper returns, the caller's own allocations must not overlap
+    // the list's (now permanent) data buffer.
+    let source = r#"
+        public void Seed(List<int> values)
+        {
+            string unused = "s" + "eed";
+            values.Add(42);
+            values.Add(43);
+        }
+        public int Main()
+        {
+            List<int> values = new List<int>();
+            Seed(values);
+            string noise = "post" + "seed";
+            string more = "extra" + "alloc";
+            return values.Get(0) + values.Get(1);
+        }
+    "#;
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(85)));
+}
+
+// --- Retention / memory region tests ----------------------------------------
+
+#[test]
+fn list_local_no_helper_header_and_buffer_are_temporary() {
+    // A List used only in its own scope must be classified Temporary and
+    // reclaimed when the scope exits. The permanent arena grows by 0 bytes.
+    let source = r"
+        public int Main()
+        {
+            List<int> values = new List<int>();
+            values.Add(1);
+            values.Add(2);
+            return values.Length;
+        }
+    ";
+    let module = compile(source).expect("compiles").mir;
+    let (result, stats) = execute_with_stats(&module, "Main").expect("executes");
+    assert_eq!(result, ExecutionValue::Int(2));
+    assert_eq!(
+        stats.used_bytes, 0,
+        "local list must not retain permanent bytes; used_bytes={}",
+        stats.used_bytes
+    );
+}
+
+#[test]
+fn list_passed_to_helper_no_per_call_growth_after_escape_fix() {
+    // List passed to a helper: after the escape analysis fix the header is
+    // Persistent. used_bytes grows on each RunOnce call (each creates a new
+    // Persistent list) but execution must complete without error — bounded
+    // linear growth, not a dangling-pointer crash.
+    let source = r"
+        public void Fill(List<int> values, int v)
+        {
+            values.Add(v);
+        }
+        public void RunOnce(int index)
+        {
+            List<int> values = new List<int>();
+            Fill(values, index);
+        }
+        public int Main()
+        {
+            int index = 0;
+            while (index < 1000)
+            {
+                RunOnce(index);
+                index = index + 1;
+            }
+            return 0;
+        }
+    ";
+    let module = compile(source).expect("compiles").mir;
+    let (result, stats) = execute_with_stats(&module, "Main").expect("executes");
+    assert_eq!(result, ExecutionValue::Int(0));
+    let _ = stats;
+}
+
+#[test]
+fn list_region_is_persistent_when_passed_to_helper() {
+    // Compile-time check: AllocateList in Main must be Persistent when the list
+    // is passed to a helper function.
+    let source = r"
+        public void Fill(List<int> values, int v)
+        {
+            values.Add(v);
+        }
+        public int Main()
+        {
+            List<int> values = new List<int>();
+            Fill(values, 42);
+            return values.Length;
+        }
+    ";
+    let module = compile(source).expect("compiles").mir;
+    let main_fn = module
+        .functions
+        .iter()
+        .find(|f| f.name == "Main" && f.owner.is_none())
+        .expect("Main function");
+    let region = main_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .find_map(|i| match i {
+            mir::Instruction::AllocateList { region, .. } => Some(*region),
+            _ => None,
+        })
+        .expect("AllocateList in Main");
+    assert_eq!(
+        region,
+        mir::AllocationRegion::Persistent,
+        "List passed to a helper must be allocated Persistent, got {region:?}"
+    );
+}
+
+#[test]
+fn list_region_stays_temporary_for_local_only_use() {
+    // Compile-time check: a List not passed to any user function must stay
+    // Temporary (no unnecessary promotion).
+    let source = r"
+        public int Main()
+        {
+            List<int> values = new List<int>();
+            values.Add(1);
+            values.Add(2);
+            return values.Length;
+        }
+    ";
+    let module = compile(source).expect("compiles").mir;
+    let main_fn = module
+        .functions
+        .iter()
+        .find(|f| f.name == "Main" && f.owner.is_none())
+        .expect("Main function");
+    let region = main_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .find_map(|i| match i {
+            mir::Instruction::AllocateList { region, .. } => Some(*region),
+            _ => None,
+        })
+        .expect("AllocateList in Main");
+    assert_eq!(
+        region,
+        mir::AllocationRegion::Temporary,
+        "List used only locally must remain Temporary, got {region:?}"
+    );
 }

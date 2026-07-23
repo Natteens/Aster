@@ -489,6 +489,21 @@ fn instruction_escape(
                     .then_some(EscapeReason::PassedToCall);
             };
 
+            // List<T> and Dictionary<K,V> may allocate or reallocate internal
+            // buffers inside the callee's temporary scope. Without effect
+            // analysis those buffers would be freed on the callee's return
+            // while the header still holds a pointer to them. Promote the
+            // collection to Persistent whenever it crosses a call boundary.
+            if arguments.iter().any(|argument| {
+                direct_alias(argument, aliases).is_some()
+                    && matches!(
+                        argument.type_,
+                        mir::Type::List(_) | mir::Type::Dictionary(_, _)
+                    )
+            }) {
+                return Some(EscapeReason::PassedToCall);
+            }
+
             if arguments.iter().enumerate().any(|(index, argument)| {
                 direct_alias(argument, aliases).is_some()
                     && summary
