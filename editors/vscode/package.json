@@ -2,7 +2,7 @@
     "name": "aster-language",
     "displayName": "Aster Language",
     "description": "Syntax highlighting, snippets, and editing support for the Aster programming language.",
-    "version": "0.37.0",
+    "version": "0.37.1",
     "publisher": "aster-lang",
     "license": "Apache-2.0",
     "repository": {
