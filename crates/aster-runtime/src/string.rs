@@ -377,6 +377,166 @@ pub extern "C" fn aster_rt_string_length(
     }
 }
 
+/// Returns the exact UTF-8 payload length in bytes -- not a scalar count,
+/// unlike [`aster_rt_string_length`]. Used only by `foreach`'s cursor
+/// lowering over `string`; never a public Aster API. O(1): reads the
+/// header field directly, never walks the payload the way computing a
+/// scalar count must.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_byte_length(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+) -> i32 {
+    if context.is_null() || value.is_null() {
+        return 0;
+    }
+    // SAFETY: generated code passes the live context and an ABI string owned
+    // by that context or the live JIT module.
+    #[allow(unsafe_code)]
+    let (context, len) = unsafe { (&mut *context, (*value).len) };
+    if let Ok(len) = i32::try_from(len) {
+        len
+    } else {
+        context.fail("string foreach byte length exceeds the supported `int` range");
+        0
+    }
+}
+
+/// Borrow the raw UTF-8 payload bytes behind an ABI string pointer, without
+/// validating the whole payload as UTF-8 (unlike [`view`]). Callers that
+/// need only a bounded window -- like `foreach`'s per-scalar cursor decode
+/// -- validate exactly that window themselves, keeping per-step cost O(1)
+/// instead of O(remaining bytes); walking the whole remaining string on
+/// every step would make a full iteration quadratic.
+///
+/// # Safety
+///
+/// Same contract as [`view`]: `string`, when non-null, must point to a live,
+/// 8-byte-aligned allocation in the documented layout.
+#[allow(unsafe_code)]
+unsafe fn raw_bytes<'a>(string: *const AsterStrHeader) -> Option<&'a [u8]> {
+    if string.is_null() {
+        return None;
+    }
+    // SAFETY: forwarded caller contract, identical to `view`'s.
+    #[allow(unsafe_code)]
+    unsafe {
+        let len = (*string).len;
+        let payload = string.cast::<u8>().add(size_of::<AsterStrHeader>());
+        Some(std::slice::from_raw_parts(payload, len))
+    }
+}
+
+/// Decodes exactly one Unicode scalar value starting at byte offset `cursor`
+/// in `bytes`, returning it together with its UTF-8 width (1-4). Reads and
+/// validates at most 4 bytes -- never rescans from the start -- so a full
+/// `foreach` iteration is O(total bytes), not O(scalars * string length).
+/// Rejects (with a specific message, never a panic): a cursor at or past the
+/// end, an invalid leading byte, a truncated sequence, malformed
+/// continuation bytes, an overlong encoding, a surrogate code point, and any
+/// scalar above `U+10FFFF` -- every one of these is exactly what Rust's own
+/// `str::from_utf8` already rejects for a byte slice, applied here to a
+/// bounded window instead of the whole remaining payload.
+fn decode_scalar_at(bytes: &[u8], cursor: usize) -> Result<(char, usize), &'static str> {
+    let len = bytes.len();
+    if cursor >= len {
+        return Err("string foreach cursor is out of bounds");
+    }
+    let lead = bytes[cursor];
+    let width = if lead & 0x80 == 0 {
+        1
+    } else if lead & 0xE0 == 0xC0 {
+        2
+    } else if lead & 0xF0 == 0xE0 {
+        3
+    } else if lead & 0xF8 == 0xF0 {
+        4
+    } else {
+        return Err("string foreach found an invalid UTF-8 leading byte");
+    };
+    if len - cursor < width {
+        return Err("string foreach found a truncated UTF-8 sequence");
+    }
+    let slice = &bytes[cursor..cursor + width];
+    let text =
+        std::str::from_utf8(slice).map_err(|_| "string foreach found an invalid UTF-8 sequence")?;
+    let mut chars = text.chars();
+    let scalar = chars
+        .next()
+        .ok_or("string foreach found an invalid UTF-8 sequence")?;
+    if chars.next().is_some() {
+        return Err("string foreach found an invalid UTF-8 sequence");
+    }
+    Ok((scalar, width))
+}
+
+/// Decodes one Unicode scalar value at `cursor` (a byte offset) and writes
+/// it, and the resulting next cursor, to the two out-parameters. Returns
+/// `1` on success, `0` on a controlled failure (already reported through
+/// `context.fail`, which does not unwind on its own -- generated code must
+/// branch on this return value itself, never assume the loop should keep
+/// going). On failure, neither destination is written -- never a
+/// partial/garbage scalar or cursor. Used only by `foreach`'s cursor
+/// lowering over `string`; never a public Aster API.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_decode_next(
+    context: *mut ExecutionContext,
+    string: *const AsterStrHeader,
+    cursor: i32,
+    scalar_destination: *mut i32,
+    next_cursor_destination: *mut i32,
+) -> i8 {
+    if context.is_null() {
+        return 0;
+    }
+    // SAFETY: generated functions receive the live host-owned context as their
+    // hidden first parameter, and invocation cannot outlive that context.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    if scalar_destination.is_null() || next_cursor_destination.is_null() {
+        context.fail("string foreach received a null decode destination");
+        return 0;
+    }
+    // SAFETY: generated code passes a live ABI string owned by the live
+    // context or JIT module; only the raw bytes are taken here, never the
+    // full-string UTF-8 revalidation `view` performs.
+    #[allow(unsafe_code)]
+    let bytes = unsafe { raw_bytes(string) };
+    let Some(bytes) = bytes else {
+        context.fail("string foreach received an invalid string reference");
+        return 0;
+    };
+    let Ok(cursor) = usize::try_from(cursor) else {
+        context.fail("string foreach cursor is negative");
+        return 0;
+    };
+    let (scalar, width) = match decode_scalar_at(bytes, cursor) {
+        Ok(decoded) => decoded,
+        Err(message) => {
+            context.fail(message);
+            return 0;
+        }
+    };
+    let Some(next_cursor) = cursor.checked_add(width) else {
+        context.fail("string foreach cursor overflow");
+        return 0;
+    };
+    let Ok(next_cursor) = i32::try_from(next_cursor) else {
+        context.fail("string foreach cursor overflow");
+        return 0;
+    };
+    #[allow(clippy::cast_possible_wrap)]
+    let scalar_bits = scalar as i32;
+    // SAFETY: both destinations were validated non-null above; the caller
+    // guarantees each is writable for one `i32`.
+    #[allow(unsafe_code)]
+    unsafe {
+        *scalar_destination = scalar_bits;
+        *next_cursor_destination = next_cursor;
+    }
+    1
+}
+
 fn string_predicate(
     context: *mut ExecutionContext,
     value: *const AsterStrHeader,

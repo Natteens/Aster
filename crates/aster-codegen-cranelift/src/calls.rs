@@ -1521,6 +1521,64 @@ impl Codegen {
         }
         Ok(())
     }
+
+    /// `foreach`'s cursor decode over `string`: the decoded scalar and the
+    /// next cursor are always plain scalars (`char`/`int`, never
+    /// aggregates), so each gets its own small stack slot -- never the
+    /// string's own buffer address -- reloaded and stored into its declared
+    /// destination place. The call's own boolean result is stored into a
+    /// third destination the generated CFG branches on immediately
+    /// afterward, rather than assuming the loop should keep going.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn translate_string_decode_next(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        string: &mir::Operand,
+        cursor: &mir::Operand,
+        char_destination: &mir::Place,
+        next_cursor_destination: &mir::Place,
+        ok_destination: &mir::Place,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let string_value = self.translate_operand(builder, string, state)?;
+        let cursor_value = self.translate_operand(builder, cursor, state)?;
+        let scalar_slot =
+            builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 4, 2));
+        let next_cursor_slot =
+            builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 4, 2));
+        let scalar_address = builder.ins().stack_addr(self.pointer_type, scalar_slot, 0);
+        let next_cursor_address = builder
+            .ins()
+            .stack_addr(self.pointer_type, next_cursor_slot, 0);
+        let function_ref = self.jit.declare_func_in_func(
+            self.runtime_ids["aster_rt_string_decode_next"],
+            builder.func,
+        );
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new("string foreach decode is missing its ExecutionContext")
+        })?;
+        let call = builder.ins().call(
+            function_ref,
+            &[
+                context,
+                string_value,
+                cursor_value,
+                scalar_address,
+                next_cursor_address,
+            ],
+        );
+        let ok = builder.inst_results(call)[0];
+        let scalar = builder
+            .ins()
+            .load(types::I32, MemFlags::new(), scalar_address, 0);
+        let next_cursor = builder
+            .ins()
+            .load(types::I32, MemFlags::new(), next_cursor_address, 0);
+        self.store_scalar(builder, char_destination, scalar, state)?;
+        self.store_scalar(builder, next_cursor_destination, next_cursor, state)?;
+        self.store_scalar(builder, ok_destination, ok, state)?;
+        Ok(())
+    }
 }
 
 /// The concrete `SymbolId` (as an `i64` immediate) carried by a resolved

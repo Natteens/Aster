@@ -196,19 +196,16 @@ impl Analyzer<'_> {
                 ..
             } => {
                 let collection_type = self.expression(collection);
+                let collection_is_string = collection_type == Type::String;
                 let declared_type = self.resolve_local_type(element_type);
                 let actual_type = match collection_type {
                     Type::Array(element) | Type::List(element) => *element,
-                    Type::String => {
-                        self.diagnostics.push(
-                            Diagnostic::error(
-                                "foreach over `string` is not supported yet",
-                                collection.span,
-                            )
-                            .with_help("use string operations until string iteration is available"),
-                        );
-                        Type::Unknown
-                    }
+                    // Iterating a `string` produces Unicode scalar values,
+                    // not bytes/UTF-16 units/grapheme clusters, so the
+                    // element type is always exactly `char` -- never a type
+                    // parsed out of the collection expression itself, since
+                    // `string` has no declared element type to extract.
+                    Type::String => Type::Char,
                     Type::Unknown => Type::Unknown,
                     other => {
                         self.diagnostics.push(
@@ -225,17 +222,30 @@ impl Analyzer<'_> {
                     && declared_type != Type::Unknown
                     && actual_type != declared_type
                 {
-                    self.diagnostics.push(
-                        Diagnostic::error(
-                            format!(
-                                "foreach element type `{}` does not match array element type `{}`",
-                                declared_type.display(),
-                                actual_type.display()
-                            ),
-                            element_type.span,
-                        )
-                        .with_help("use the array element type for the foreach variable"),
-                    );
+                    if collection_is_string {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                format!(
+                                    "foreach over string requires element type `char`, found `{}`",
+                                    declared_type.display()
+                                ),
+                                element_type.span,
+                            )
+                            .with_help("declare the foreach variable as `char`"),
+                        );
+                    } else {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                format!(
+                                    "foreach element type `{}` does not match array element type `{}`",
+                                    declared_type.display(),
+                                    actual_type.display()
+                                ),
+                                element_type.span,
+                            )
+                            .with_help("use the array element type for the foreach variable"),
+                        );
+                    }
                 }
                 self.scopes.push(HashMap::new());
                 self.declare(

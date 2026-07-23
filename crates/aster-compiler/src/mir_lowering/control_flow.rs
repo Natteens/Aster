@@ -239,10 +239,10 @@ impl FunctionLowerer {
         collection: &hir::Expression,
         body: &hir::Block,
     ) {
-        if matches!(collection.type_, hir::Type::List(_)) {
-            self.lower_foreach_over_list(element, collection, body);
-        } else {
-            self.lower_foreach_over_array(element, collection, body);
+        match collection.type_ {
+            hir::Type::List(_) => self.lower_foreach_over_list(element, collection, body),
+            hir::Type::String => self.lower_foreach_over_string(element, collection, body),
+            _ => self.lower_foreach_over_array(element, collection, body),
         }
     }
 
@@ -566,6 +566,153 @@ impl FunctionLowerer {
                         kind: mir::OperandKind::Constant(one_constant(&hir::Type::Int)),
                     },
                 },
+            },
+        );
+        self.terminate_current(mir::Terminator::Goto(condition_id));
+        self.current = Some(exit_id);
+    }
+
+    /// `foreach` over a `string` (M3D): iterates Unicode scalar values via a
+    /// private linear UTF-8 byte cursor, never a byte/UTF-16/grapheme
+    /// iteration. Captures the string and its byte length once (never the
+    /// scalar count from `string.Length`, which would need its own O(n)
+    /// scan and still wouldn't give a byte cursor). Each iteration decodes
+    /// exactly one scalar via `StringDecodeNext` (at most 4 bytes touched,
+    /// never rescanning from the start), producing both the `char` element
+    /// and the next cursor in the same call; a decode failure -- reported
+    /// through `ExecutionContext::fail` inside the runtime call itself --
+    /// is detected via `ok_destination` and ends the loop immediately
+    /// (exactly like exhausting the length), never continuing over a
+    /// cursor that might not have advanced. `continue` -> `update_id`
+    /// merely copies the already-decoded next cursor into the loop cursor
+    /// (no re-decode), so it advances exactly once regardless of whether
+    /// the scalar was single- or multi-byte.
+    #[allow(clippy::too_many_lines)]
+    fn lower_foreach_over_string(
+        &mut self,
+        element: &hir::Variable,
+        collection: &hir::Expression,
+        body: &hir::Block,
+    ) {
+        let collection_operand = self
+            .lower_expression(collection)
+            .expect("validated foreach collection produces a value");
+        let string_local = self.new_temporary(hir::Type::String);
+        self.assign(
+            mir::Place::Local(string_local),
+            mir::Rvalue {
+                type_: hir::Type::String,
+                kind: mir::RvalueKind::Use(collection_operand),
+            },
+        );
+        let string_operand = mir::Operand {
+            type_: hir::Type::String,
+            kind: mir::OperandKind::Copy(mir::Place::Local(string_local)),
+        };
+        let byte_length_local = self.new_temporary(hir::Type::Int);
+        self.assign(
+            mir::Place::Local(byte_length_local),
+            mir::Rvalue {
+                type_: hir::Type::Int,
+                kind: mir::RvalueKind::StringByteLength(string_operand.clone()),
+            },
+        );
+        let cursor_local = self.new_temporary(hir::Type::Int);
+        self.assign(
+            mir::Place::Local(cursor_local),
+            mir::Rvalue {
+                type_: hir::Type::Int,
+                kind: mir::RvalueKind::Use(mir::Operand {
+                    type_: hir::Type::Int,
+                    kind: mir::OperandKind::Constant(mir::Constant::Integer("0".to_owned())),
+                }),
+            },
+        );
+        let next_cursor_local = self.new_temporary(hir::Type::Int);
+        let decode_ok_local = self.new_temporary(hir::Type::Bool);
+        let element_local = self.source_local(
+            element.symbol,
+            element.name.clone(),
+            element.type_.clone(),
+            false,
+        );
+        self.locals.push(element_local.clone());
+
+        let condition_id = self.new_block();
+        let decode_id = self.new_block();
+        let body_id = self.new_block();
+        let update_id = self.new_block();
+        let exit_id = self.new_block();
+        self.terminate_current(mir::Terminator::Goto(condition_id));
+
+        self.current = Some(condition_id);
+        let condition_local = self.new_temporary(hir::Type::Bool);
+        self.assign(
+            mir::Place::Local(condition_local),
+            mir::Rvalue {
+                type_: hir::Type::Bool,
+                kind: mir::RvalueKind::Binary {
+                    left: mir::Operand {
+                        type_: hir::Type::Int,
+                        kind: mir::OperandKind::Copy(mir::Place::Local(cursor_local)),
+                    },
+                    operator: mir::BinaryOperator::Less,
+                    right: mir::Operand {
+                        type_: hir::Type::Int,
+                        kind: mir::OperandKind::Copy(mir::Place::Local(byte_length_local)),
+                    },
+                },
+            },
+        );
+        self.terminate_current(mir::Terminator::Branch {
+            condition: mir::Operand {
+                type_: hir::Type::Bool,
+                kind: mir::OperandKind::Copy(mir::Place::Local(condition_local)),
+            },
+            then_block: decode_id,
+            else_block: exit_id,
+        });
+
+        self.current = Some(decode_id);
+        self.instruction(mir::Instruction::StringDecodeNext {
+            string: string_operand,
+            cursor: mir::Operand {
+                type_: hir::Type::Int,
+                kind: mir::OperandKind::Copy(mir::Place::Local(cursor_local)),
+            },
+            char_destination: mir::Place::Local(element_local.id),
+            next_cursor_destination: mir::Place::Local(next_cursor_local),
+            ok_destination: mir::Place::Local(decode_ok_local),
+        });
+        self.terminate_current(mir::Terminator::Branch {
+            condition: mir::Operand {
+                type_: hir::Type::Bool,
+                kind: mir::OperandKind::Copy(mir::Place::Local(decode_ok_local)),
+            },
+            then_block: body_id,
+            else_block: exit_id,
+        });
+
+        self.loops.push(LoopTargets {
+            break_block: exit_id,
+            continue_block: update_id,
+        });
+        self.current = Some(body_id);
+        self.lower_block(body);
+        if let Some(block) = self.current.take() {
+            self.terminate(block, mir::Terminator::Goto(update_id));
+        }
+        self.loops.pop();
+
+        self.current = Some(update_id);
+        self.assign(
+            mir::Place::Local(cursor_local),
+            mir::Rvalue {
+                type_: hir::Type::Int,
+                kind: mir::RvalueKind::Use(mir::Operand {
+                    type_: hir::Type::Int,
+                    kind: mir::OperandKind::Copy(mir::Place::Local(next_cursor_local)),
+                }),
             },
         );
         self.terminate_current(mir::Terminator::Goto(condition_id));

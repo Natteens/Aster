@@ -23,10 +23,10 @@ use crate::log::aster_rt_log;
 use crate::math::{aster_rt_integer_arithmetic_error, aster_rt_math_domain_error};
 use crate::object::{aster_rt_object_new, aster_rt_object_new_temporary};
 use crate::string::{
-    aster_rt_string_concat, aster_rt_string_concat_temporary, aster_rt_string_contains,
-    aster_rt_string_ends_with, aster_rt_string_eq, aster_rt_string_from_bool,
-    aster_rt_string_from_bool_temporary, aster_rt_string_from_char,
-    aster_rt_string_from_char_temporary, aster_rt_string_from_double,
+    aster_rt_string_byte_length, aster_rt_string_concat, aster_rt_string_concat_temporary,
+    aster_rt_string_contains, aster_rt_string_decode_next, aster_rt_string_ends_with,
+    aster_rt_string_eq, aster_rt_string_from_bool, aster_rt_string_from_bool_temporary,
+    aster_rt_string_from_char, aster_rt_string_from_char_temporary, aster_rt_string_from_double,
     aster_rt_string_from_double_temporary, aster_rt_string_from_float,
     aster_rt_string_from_float_temporary, aster_rt_string_from_long,
     aster_rt_string_from_long_temporary, aster_rt_string_from_ulong,
@@ -284,6 +284,28 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             signature: RuntimeSignature {
                 parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
                 result: Some(RuntimeType::I32),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_byte_length",
+            address: aster_rt_string_byte_length as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::I32),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_decode_next",
+            address: aster_rt_string_decode_next as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                ],
+                result: Some(RuntimeType::I8),
             },
         },
         RuntimeFunction {

@@ -582,11 +582,17 @@ fn instruction_escape(
         // already classified when it was `Add`ed) and introduces no new
         // operand that could alias anything — a purely local mutation of
         // the list's own storage, neutral to every allocation's lifetime.
+        // `StringDecodeNext` only ever produces a `char` (never a tracked
+        // reference type) and never stores its `string` operand anywhere,
+        // so reading via it can never cause that operand to escape --
+        // exactly like `ArrayLength`/`ListLength`/`ListGet` not forcing
+        // their own receiver to escape.
         mir::Instruction::AllocateArray { .. }
         | mir::Instruction::AllocateObject { .. }
         | mir::Instruction::AllocateList { .. }
         | mir::Instruction::ListGet { .. }
-        | mir::Instruction::ListRemoveAt { .. } => None,
+        | mir::Instruction::ListRemoveAt { .. }
+        | mir::Instruction::StringDecodeNext { .. } => None,
         // Storing a reference into a list's buffer is an aggregate store,
         // exactly like `Assign{target: Field/Index, value: Use(alias)}`
         // (`assignment_escape` above): conservatively persistent, regardless
@@ -635,6 +641,9 @@ fn assignment_escape(
         mir::RvalueKind::ArrayLength(operand) if direct_alias(operand, aliases).is_some() => None,
         mir::RvalueKind::ListLength(operand) if direct_alias(operand, aliases).is_some() => None,
         mir::RvalueKind::ListVersion(operand) if direct_alias(operand, aliases).is_some() => None,
+        mir::RvalueKind::StringByteLength(operand) if direct_alias(operand, aliases).is_some() => {
+            None
+        }
         // Reading an aliased enum's tag (how `switch`/`?` choose a case)
         // only inspects the discriminant, never the payload -- safe on its
         // own regardless of whether the enum escapes. Never observed before
@@ -653,6 +662,7 @@ fn rvalue_uses_alias(value: &mir::Rvalue, aliases: &HashSet<mir::LocalId>) -> bo
         | mir::RvalueKind::ArrayLength(operand)
         | mir::RvalueKind::ListLength(operand)
         | mir::RvalueKind::ListVersion(operand)
+        | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
         | mir::RvalueKind::Unary { operand, .. } => direct_alias(operand, aliases).is_some(),
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {

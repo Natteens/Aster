@@ -175,6 +175,21 @@ impl Codegen {
             mir::Instruction::ListRemoveAt { list, index } => {
                 self.translate_list_remove_at(builder, list, index, state)
             }
+            mir::Instruction::StringDecodeNext {
+                string,
+                cursor,
+                char_destination,
+                next_cursor_destination,
+                ok_destination,
+            } => self.translate_string_decode_next(
+                builder,
+                string,
+                cursor,
+                char_destination,
+                next_cursor_destination,
+                ok_destination,
+                state,
+            ),
         }
     }
 }

@@ -60,6 +60,18 @@ impl Codegen {
                 let call = builder.ins().call(function_ref, &[context, list]);
                 Ok(builder.inst_results(call)[0])
             }
+            mir::RvalueKind::StringByteLength(value) => {
+                let function_ref = self.jit.declare_func_in_func(
+                    self.runtime_ids["aster_rt_string_byte_length"],
+                    builder.func,
+                );
+                let context = state.execution_context.ok_or_else(|| {
+                    BackendError::new("string byte length is missing its ExecutionContext")
+                })?;
+                let value = self.translate_operand(builder, value, state)?;
+                let call = builder.ins().call(function_ref, &[context, value]);
+                Ok(builder.inst_results(call)[0])
+            }
             mir::RvalueKind::Cast(operand) => {
                 let source = operand.type_.clone();
                 let operand = self.translate_operand(builder, operand, state)?;

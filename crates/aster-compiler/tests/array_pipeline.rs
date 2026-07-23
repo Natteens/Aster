@@ -176,6 +176,40 @@ fn foreach_over_a_list_is_typed_and_lowers_to_an_indexed_cfg() {
 }
 
 #[test]
+fn foreach_over_a_string_is_typed_and_lowers_to_a_utf8_cursor_cfg() {
+    // M3D: `string` is now a valid `foreach` collection (M3B/M3C only
+    // accepted arrays/`List<T>`), always producing `char`. Confirms the
+    // version-checked shape `lower_foreach_over_string` actually produces: a
+    // `StringByteLength` read and a `StringDecodeNext` (never `ArrayLength`,
+    // `ListLength`, `Place::Index`, or `ListGet`).
+    let compilation = aster_compiler::compile(
+        "public int Run() { string text = \"ab\"; int total = 0; foreach (char value in text) { total += 1; } return total; }",
+    )
+    .expect("valid string foreach");
+    let function = &compilation.mir.functions[0];
+    let instructions = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    assert!(instructions.iter().any(|instruction| matches!(
+        instruction,
+        mir::Instruction::Assign {
+            value: mir::Rvalue {
+                kind: mir::RvalueKind::StringByteLength(_),
+                ..
+            },
+            ..
+        }
+    )));
+    assert!(
+        instructions
+            .iter()
+            .any(|instruction| matches!(instruction, mir::Instruction::StringDecodeNext { .. }))
+    );
+}
+
+#[test]
 fn foreach_diagnostics_preserve_array_only_and_readonly_rules() {
     for (source, message) in [
         (
@@ -183,8 +217,8 @@ fn foreach_diagnostics_preserve_array_only_and_readonly_rules() {
             "does not match array element type",
         ),
         (
-            "public int Run() { string value = \"x\"; foreach (char item in value) { } return 0; }",
-            "string` is not supported",
+            "public int Run() { string value = \"x\"; foreach (int item in value) { } return 0; }",
+            "requires element type",
         ),
         (
             "public int Run() { int[] values = [1]; foreach (int value in values) { value = 2; } return 0; }",

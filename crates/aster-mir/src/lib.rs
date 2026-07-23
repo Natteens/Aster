@@ -202,6 +202,25 @@ pub enum Instruction {
         list: Operand,
         index: Operand,
     },
+    /// Decodes exactly one Unicode scalar value at byte offset `cursor` in
+    /// `string`'s UTF-8 payload: writes the scalar to `char_destination`
+    /// (always `Type::Char`) and the resulting next cursor to
+    /// `next_cursor_destination` (always `Type::Int`), and reports whether
+    /// decoding succeeded via `ok_destination` (always `Type::Bool`).
+    /// Reads/validates at most 4 bytes -- never rescans from the start of
+    /// the string -- so `foreach`'s cursor lowering over `string` stays
+    /// O(total bytes). On failure, `ExecutionContext::fail` has already
+    /// been called and neither `char_destination` nor
+    /// `next_cursor_destination` is written; generated code must branch on
+    /// `ok_destination` itself rather than assume the loop should continue.
+    /// Never a public Aster API.
+    StringDecodeNext {
+        string: Operand,
+        cursor: Operand,
+        char_destination: Place,
+        next_cursor_destination: Place,
+        ok_destination: Place,
+    },
 }
 
 /// Runtime services reachable from generated code. Backends map each variant
@@ -626,6 +645,10 @@ pub enum RvalueKind {
     /// once, then compared before each element read); never exposed as an
     /// Aster-level property.
     ListVersion(Operand),
+    /// Reads a `string`'s UTF-8 payload length in bytes (never a scalar
+    /// count -- see `string.Length`). Used only by `foreach`'s cursor
+    /// lowering over `string`; never exposed as an Aster-level property.
+    StringByteLength(Operand),
     /// Convert the operand to this rvalue's type.
     Cast(Operand),
     MakeInterface {

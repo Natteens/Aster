@@ -757,7 +757,86 @@ fn validate_instruction(
             interfaces,
             enums,
         ),
+        mir::Instruction::StringDecodeNext {
+            string,
+            cursor,
+            char_destination,
+            next_cursor_destination,
+            ok_destination,
+        } => validate_string_decode_next(
+            string,
+            cursor,
+            char_destination,
+            next_cursor_destination,
+            ok_destination,
+            function_name,
+            locals,
+        ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_string_decode_next(
+    string: &mir::Operand,
+    cursor: &mir::Operand,
+    char_destination: &mir::Place,
+    next_cursor_destination: &mir::Place,
+    ok_destination: &mir::Place,
+    function_name: &str,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    validate_operand(string, function_name)?;
+    validate_operand(cursor, function_name)?;
+    validate_place(char_destination, function_name)?;
+    validate_place(next_cursor_destination, function_name)?;
+    validate_place(ok_destination, function_name)?;
+    if string.type_ != mir::Type::String {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a `StringDecodeNext` on a non-`string` receiver (found `{}`)",
+            type_name_owned(&string.type_)
+        )));
+    }
+    if cursor.type_ != mir::Type::Int {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a `StringDecodeNext` whose cursor is not `int` (found `{}`)",
+            type_name_owned(&cursor.type_)
+        )));
+    }
+    let destinations = [
+        (char_destination, mir::Type::Char, "char_destination"),
+        (
+            next_cursor_destination,
+            mir::Type::Int,
+            "next_cursor_destination",
+        ),
+        (ok_destination, mir::Type::Bool, "ok_destination"),
+    ];
+    let mut seen_locals = HashSet::new();
+    for (place, expected_type, label) in destinations {
+        let mir::Place::Local(local) = place else {
+            return Err(BackendError::new(format!(
+                "function `{function_name}` has a `StringDecodeNext` whose `{label}` is not a local"
+            )));
+        };
+        let declared = locals.get(local).ok_or_else(|| {
+            BackendError::new(format!(
+                "function `{function_name}` has a `StringDecodeNext` writing `{label}` into an undeclared local"
+            ))
+        })?;
+        if *declared != expected_type {
+            return Err(BackendError::new(format!(
+                "function `{function_name}` has a `StringDecodeNext` whose `{label}` is declared `{}`, expected `{}`",
+                type_name_owned(declared),
+                type_name_owned(&expected_type),
+            )));
+        }
+        if !seen_locals.insert(*local) {
+            return Err(BackendError::new(format!(
+                "function `{function_name}` has a `StringDecodeNext` writing more than one destination into the same local"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_allocate_array(
@@ -1637,6 +1716,20 @@ fn validate_rvalue(
             if value.type_ != mir::Type::Long {
                 return Err(BackendError::new(format!(
                     "function `{function_name}` has a `ListVersion` whose result type is not `long`"
+                )));
+            }
+            Ok(())
+        }
+        mir::RvalueKind::StringByteLength(operand) => {
+            validate_operand(operand, function_name)?;
+            if operand.type_ != mir::Type::String {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` has a `StringByteLength` reading a non-`string` receiver"
+                )));
+            }
+            if value.type_ != mir::Type::Int {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` has a `StringByteLength` whose result type is not `int`"
                 )));
             }
             Ok(())
