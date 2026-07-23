@@ -612,6 +612,79 @@ fn aster_run_lists_real_direct_files_in_ordinal_order_and_reuses_the_paths() {
     assert_eq!(stdout(&output).trim(), "5");
 }
 
+/// Closing proof for M2 against the real host backend: the ASTER program
+/// enumerates only direct files, recovers an invalid UTF-8 input through
+/// `Result`, and writes its own deterministic summary through `WriteAllText`.
+#[test]
+fn aster_run_executes_the_filesystem_indexer_end_to_end() {
+    let directory = temporary_directory("filesystem-indexer");
+    let input = directory.join("input");
+    let output_directory = directory.join("output");
+    fs::create_dir(&input).expect("create input directory");
+    fs::create_dir(&output_directory).expect("create output directory");
+    fs::write(input.join("b.txt"), "β").expect("write b");
+    fs::write(input.join("a.txt"), "alfa").expect("write a");
+    fs::write(input.join("empty.txt"), "").expect("write empty");
+    fs::write(input.join("binary.dat"), [0xff_u8, 0xfe]).expect("write binary");
+    fs::create_dir(input.join("nested")).expect("create nested directory");
+    fs::write(input.join("nested").join("ignored.txt"), "ignored").expect("write nested file");
+
+    let main = directory.join("main.aster");
+    let input = input
+        .to_str()
+        .expect("UTF-8 temporary path")
+        .replace('\\', "\\\\");
+    let output = output_directory
+        .to_str()
+        .expect("UTF-8 temporary path")
+        .replace('\\', "\\\\");
+    fs::write(
+        &main,
+        format!(
+            "using aster.core;\nusing aster.io;\n\
+             public Result<int, IOError> Index() {{\n\
+                 string[] files = ListFiles(\"{input}\")?;\n\
+                 if (files.Length != 4 || !files[0].EndsWith(\"a.txt\") || !files[1].EndsWith(\"b.txt\") || !files[2].EndsWith(\"binary.dat\") || !files[3].EndsWith(\"empty.txt\")) {{\n\
+                     return Result<int, IOError>.Error(IOError {{ Kind: IOErrorKind.Other, OsCode: 0 }});\n\
+                 }}\n\
+                 int readable = 0;\n\
+                 int invalid = 0;\n\
+                 int characters = 0;\n\
+                 for (int i = 0; i < files.Length; i++) {{\n\
+                     switch (ReadAllText(files[i])) {{\n\
+                         case Ok(text): readable = readable + 1; characters = characters + text.Length;\n\
+                         case Error(error): switch (error.Kind) {{\n\
+                             case InvalidUtf8: invalid = invalid + 1;\n\
+                             default: return Result<int, IOError>.Error(error);\n\
+                         }}\n\
+                     }}\n\
+                 }}\n\
+                 string summaryPath = CombinePath(\"{output}\", \"summary.txt\")?;\n\
+                 string summary = \"readable=\" + readable.ToString() + \";invalid=\" + invalid.ToString() + \";chars=\" + characters.ToString();\n\
+                 int written = WriteAllText(summaryPath, summary)?;\n\
+                 if (written != summary.Length) {{ return Result<int, IOError>.Error(IOError {{ Kind: IOErrorKind.Other, OsCode: 0 }}); }}\n\
+                 return Result<int, IOError>.Ok(readable * 100 + invalid * 10 + characters);\n\
+             }}\n\
+             public int Main() {{ switch (Index()) {{ case Ok(value): return value; case Error(error): return -1; }} }}"
+        ),
+    )
+    .expect("write indexer program");
+
+    let execution = aster([
+        "run",
+        main.to_str().expect("UTF-8 temporary path"),
+        "--function",
+        "Main",
+    ]);
+    let summary = fs::read_to_string(output_directory.join("summary.txt")).expect("read summary");
+    fs::remove_dir_all(&directory).expect("remove temporary directory");
+
+    assert!(execution.status.success(), "{}", stderr(&execution));
+    assert_eq!(execution.status.code(), Some(0));
+    assert_eq!(stdout(&execution).trim(), "315");
+    assert_eq!(summary, "readable=3;invalid=1;chars=5");
+}
+
 #[test]
 fn aster_check_and_run_both_reject_list_files_in_a_worker() {
     let directory = temporary_directory("check-worker-list-files");
@@ -625,6 +698,8 @@ fn aster_check_and_run_both_reject_list_files_in_a_worker() {
     )
     .expect("write worker ListFiles program");
     let check_output = aster(["check", main.to_str().expect("UTF-8 temporary path")]);
+    let hir_dump = aster(["dump-hir", main.to_str().expect("UTF-8 temporary path")]);
+    let mir_dump = aster(["dump-mir", main.to_str().expect("UTF-8 temporary path")]);
     let run_output = aster([
         "run",
         main.to_str().expect("UTF-8 temporary path"),
@@ -633,12 +708,16 @@ fn aster_check_and_run_both_reject_list_files_in_a_worker() {
     ]);
     fs::remove_dir_all(&directory).expect("remove temporary directory");
     assert!(!check_output.status.success());
+    assert!(!hir_dump.status.success());
+    assert!(!mir_dump.status.success());
     assert!(!run_output.status.success());
     assert!(
         stderr(&check_output).contains("ListFiles"),
         "{}",
         stderr(&check_output)
     );
+    assert!(stderr(&hir_dump).contains("ListFiles"));
+    assert!(stderr(&mir_dump).contains("ListFiles"));
 }
 
 fn aster<const N: usize>(arguments: [&str; N]) -> Output {
