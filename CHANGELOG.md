@@ -1,5 +1,7 @@
 # Changelog
 
+## [0.34.0](https://github.com/Natteens/Aster/compare/v0.33.0...v0.34.0) (2026-07-23)
+
 ## [0.33.0](https://github.com/Natteens/Aster/compare/v0.32.0...v0.33.0) (2026-07-23)
 
 ## [0.32.0](https://github.com/Natteens/Aster/compare/v0.31.0...v0.32.0) (2026-07-22)
