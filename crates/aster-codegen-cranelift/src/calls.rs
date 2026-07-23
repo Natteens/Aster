@@ -1,6 +1,6 @@
 use super::{
     BackendError, Codegen, FuncId, FunctionBuilder, FunctionState, HashMap, InstBuilder, MemFlags,
-    Module, StackSlotData, StackSlotKind, cast_value, is_aggregate, mir, scalar_from_bits,
+    Module, StackSlotData, StackSlotKind, Value, cast_value, is_aggregate, mir, scalar_from_bits,
     scalar_kind, scalar_to_bits, type_name, types,
 };
 
@@ -1374,6 +1374,365 @@ impl Codegen {
         self.store_scalar(builder, destination, list, state)
     }
 
+    pub(super) fn translate_dictionary_allocation(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: &mir::Place,
+        key_type: &mir::Type,
+        value_type: &mir::Type,
+        region: mir::AllocationRegion,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let symbol = match region {
+            mir::AllocationRegion::Persistent => "aster_rt_dictionary_new",
+            mir::AllocationRegion::Temporary => "aster_rt_dictionary_new_temporary",
+        };
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids[symbol], builder.func);
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new("dictionary allocation is missing its ExecutionContext")
+        })?;
+        let key = self.layouts.type_layout(key_type)?;
+        let value = self.layouts.type_layout(value_type)?;
+        let key_kind = builder
+            .ins()
+            .iconst(types::I32, dictionary_key_kind(key_type)?);
+        let key_size = builder.ins().iconst(types::I32, i64::from(key.size));
+        let key_align = builder
+            .ins()
+            .iconst(types::I32, i64::from(1_u32 << key.align_shift));
+        let value_size = builder.ins().iconst(types::I32, i64::from(value.size));
+        let value_align = builder
+            .ins()
+            .iconst(types::I32, i64::from(1_u32 << value.align_shift));
+        #[allow(clippy::cast_possible_wrap)]
+        let key_type_key = builder
+            .ins()
+            .iconst(types::I64, mir::type_key(key_type) as i64);
+        #[allow(clippy::cast_possible_wrap)]
+        let value_type_key = builder
+            .ins()
+            .iconst(types::I64, mir::type_key(value_type) as i64);
+        let call = builder.ins().call(
+            function_ref,
+            &[
+                context,
+                key_kind,
+                key_size,
+                key_align,
+                key_type_key,
+                value_size,
+                value_align,
+                value_type_key,
+            ],
+        );
+        self.store_scalar(builder, destination, builder.inst_results(call)[0], state)
+    }
+
+    fn dictionary_operand_address(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        operand: &mir::Operand,
+        state: &FunctionState,
+    ) -> Result<Value, BackendError> {
+        if is_aggregate(&operand.type_) {
+            return self.translate_operand(builder, operand, state);
+        }
+        let layout = self.layouts.type_layout(&operand.type_)?;
+        let value = self.translate_operand(builder, operand, state)?;
+        let slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            layout.size,
+            layout.align_shift,
+        ));
+        builder.ins().stack_store(value, slot, 0);
+        Ok(builder.ins().stack_addr(self.pointer_type, slot, 0))
+    }
+
+    fn dictionary_runtime_metadata(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        key_type: &mir::Type,
+        value_type: &mir::Type,
+    ) -> Result<[Value; 7], BackendError> {
+        let key = self.layouts.type_layout(key_type)?;
+        let value = self.layouts.type_layout(value_type)?;
+        let key_kind = builder
+            .ins()
+            .iconst(types::I32, dictionary_key_kind(key_type)?);
+        let key_size = builder.ins().iconst(types::I32, i64::from(key.size));
+        let key_align = builder
+            .ins()
+            .iconst(types::I32, i64::from(1_u32 << key.align_shift));
+        #[allow(clippy::cast_possible_wrap)]
+        let key_type_key = builder
+            .ins()
+            .iconst(types::I64, mir::type_key(key_type) as i64);
+        let value_size = builder.ins().iconst(types::I32, i64::from(value.size));
+        let value_align = builder
+            .ins()
+            .iconst(types::I32, i64::from(1_u32 << value.align_shift));
+        #[allow(clippy::cast_possible_wrap)]
+        let value_type_key = builder
+            .ins()
+            .iconst(types::I64, mir::type_key(value_type) as i64);
+        Ok([
+            key_kind,
+            key_size,
+            key_align,
+            key_type_key,
+            value_size,
+            value_align,
+            value_type_key,
+        ])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn translate_dictionary_add_or_set(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: &mir::Place,
+        dictionary: &mir::Operand,
+        key: &mir::Operand,
+        value: &mir::Operand,
+        replace: bool,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let mir::Type::Dictionary(key_type, value_type) = &dictionary.type_ else {
+            return Err(BackendError::new(
+                "Dictionary Add/Set receiver is not Dictionary<K, V>",
+            ));
+        };
+        let dictionary_value = self.translate_operand(builder, dictionary, state)?;
+        let key_address = self.dictionary_operand_address(builder, key, state)?;
+        let value_address = self.dictionary_operand_address(builder, value, state)?;
+        let metadata = self.dictionary_runtime_metadata(builder, key_type, value_type)?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new("Dictionary Add/Set is missing its ExecutionContext")
+        })?;
+        let symbol = if replace {
+            "aster_rt_dictionary_set"
+        } else {
+            "aster_rt_dictionary_add"
+        };
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids[symbol], builder.func);
+        let mut arguments = vec![context, dictionary_value];
+        arguments.extend(metadata);
+        arguments.extend([key_address, value_address]);
+        let call = builder.ins().call(function_ref, &arguments);
+        self.store_scalar(builder, destination, builder.inst_results(call)[0], state)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn translate_dictionary_contains_or_remove(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: &mir::Place,
+        dictionary: &mir::Operand,
+        key: &mir::Operand,
+        remove: bool,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let mir::Type::Dictionary(key_type, value_type) = &dictionary.type_ else {
+            return Err(BackendError::new(
+                "Dictionary ContainsKey/Remove receiver is not Dictionary<K, V>",
+            ));
+        };
+        let dictionary_value = self.translate_operand(builder, dictionary, state)?;
+        let key_address = self.dictionary_operand_address(builder, key, state)?;
+        let metadata = self.dictionary_runtime_metadata(builder, key_type, value_type)?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new("Dictionary operation is missing its ExecutionContext")
+        })?;
+        let symbol = if remove {
+            "aster_rt_dictionary_remove"
+        } else {
+            "aster_rt_dictionary_contains_key"
+        };
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids[symbol], builder.func);
+        let mut arguments = vec![context, dictionary_value];
+        arguments.extend(metadata);
+        arguments.push(key_address);
+        let call = builder.ins().call(function_ref, &arguments);
+        self.store_scalar(builder, destination, builder.inst_results(call)[0], state)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn translate_dictionary_try_get(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: &mir::Place,
+        dictionary: &mir::Operand,
+        key: &mir::Operand,
+        value_type: &mir::Type,
+        option_layout: mir::DictionaryOptionLayout,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let mir::Type::Dictionary(key_type, dictionary_value_type) = &dictionary.type_ else {
+            return Err(BackendError::new(
+                "Dictionary.TryGet receiver is not Dictionary<K, V>",
+            ));
+        };
+        if dictionary_value_type.as_ref() != value_type {
+            return Err(BackendError::new(
+                "Dictionary.TryGet value metadata disagrees with its receiver",
+            ));
+        }
+        let (option_type, payload_offset) =
+            self.dictionary_option_layout(value_type, option_layout)?;
+        let option_type = mir::Type::Enum(option_type);
+        let total_size = self.layouts.type_layout(&option_type)?.size;
+        let dictionary_value = self.translate_operand(builder, dictionary, state)?;
+        let key_address = self.dictionary_operand_address(builder, key, state)?;
+        let destination_address = self.place_address(builder, destination, state)?;
+        let metadata =
+            self.dictionary_runtime_metadata(builder, key_type, dictionary_value_type)?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new("Dictionary.TryGet is missing its ExecutionContext")
+        })?;
+        let function_ref = self.jit.declare_func_in_func(
+            self.runtime_ids["aster_rt_dictionary_try_get"],
+            builder.func,
+        );
+        let mut arguments = vec![context, dictionary_value];
+        arguments.extend(metadata);
+        arguments.extend([
+            key_address,
+            destination_address,
+            builder.ins().iconst(types::I32, i64::from(total_size)),
+            builder
+                .ins()
+                .iconst(types::I32, i64::from(option_layout.some_tag)),
+            builder
+                .ins()
+                .iconst(types::I32, i64::from(option_layout.none_tag)),
+            builder.ins().iconst(types::I32, i64::from(payload_offset)),
+        ]);
+        builder.ins().call(function_ref, &arguments);
+        Ok(())
+    }
+
+    fn dictionary_option_layout(
+        &self,
+        value_type: &mir::Type,
+        layout: mir::DictionaryOptionLayout,
+    ) -> Result<(mir::SymbolId, u32), BackendError> {
+        for (symbol, definition) in &self.layouts.enums {
+            let some = definition.cases.iter().find(|case| {
+                case.symbol == layout.some_case
+                    && case.tag == layout.some_tag
+                    && case.fields.len() == 1
+                    && case.fields[0].symbol == layout.some_field
+                    && case.fields[0].type_ == *value_type
+            });
+            let none = definition.cases.iter().find(|case| {
+                case.symbol == layout.none_case
+                    && case.tag == layout.none_tag
+                    && case.fields.is_empty()
+            });
+            if some.is_some() && none.is_some() {
+                let field = self.layouts.fields.get(&layout.some_field).ok_or_else(|| {
+                    BackendError::new("Dictionary.TryGet payload has no computed layout")
+                })?;
+                return Ok((*symbol, field.offset));
+            }
+        }
+        Err(BackendError::new(
+            "Dictionary.TryGet carries invalid nominal Option metadata",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn translate_dictionary_entries(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: &mir::Place,
+        dictionary: &mir::Operand,
+        key_type: &mir::Type,
+        value_type: &mir::Type,
+        entry_type: &mir::Type,
+        entry_layout: mir::DictionaryEntryLayout,
+        region: mir::AllocationRegion,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let mir::Type::Dictionary(receiver_key, receiver_value) = &dictionary.type_ else {
+            return Err(BackendError::new(
+                "Dictionary.Entries receiver is not Dictionary<K, V>",
+            ));
+        };
+        if receiver_key.as_ref() != key_type || receiver_value.as_ref() != value_type {
+            return Err(BackendError::new(
+                "Dictionary.Entries metadata disagrees with its receiver",
+            ));
+        }
+        let mir::Type::User(entry_symbol) = entry_type else {
+            return Err(BackendError::new(
+                "Dictionary.Entries entry type is not a concrete struct",
+            ));
+        };
+        let entry_definition = self.layouts.structs.get(entry_symbol).ok_or_else(|| {
+            BackendError::new("Dictionary.Entries entry type is not defined by the module")
+        })?;
+        if !entry_definition
+            .fields
+            .iter()
+            .any(|field| field.symbol == entry_layout.key_field)
+            || !entry_definition
+                .fields
+                .iter()
+                .any(|field| field.symbol == entry_layout.value_field)
+        {
+            return Err(BackendError::new(
+                "Dictionary.Entries fields do not belong to its nominal entry type",
+            ));
+        }
+        let key_field = self
+            .layouts
+            .fields
+            .get(&entry_layout.key_field)
+            .ok_or_else(|| BackendError::new("DictionaryEntry.Key has no computed layout"))?;
+        let value_field = self
+            .layouts
+            .fields
+            .get(&entry_layout.value_field)
+            .ok_or_else(|| BackendError::new("DictionaryEntry.Value has no computed layout"))?;
+        if key_field.type_ != *key_type || value_field.type_ != *value_type {
+            return Err(BackendError::new(
+                "Dictionary.Entries carries incompatible field metadata",
+            ));
+        }
+        let entry_size = self.layouts.type_layout(entry_type)?.size;
+        let key_offset = key_field.offset;
+        let value_offset = value_field.offset;
+        let dictionary_value = self.translate_operand(builder, dictionary, state)?;
+        let metadata = self.dictionary_runtime_metadata(builder, key_type, value_type)?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new("Dictionary.Entries is missing its ExecutionContext")
+        })?;
+        let function_ref = self.jit.declare_func_in_func(
+            self.runtime_ids["aster_rt_dictionary_entries"],
+            builder.func,
+        );
+        let mut arguments = vec![context, dictionary_value];
+        arguments.extend(metadata);
+        arguments.extend([
+            builder.ins().iconst(types::I32, i64::from(entry_size)),
+            builder.ins().iconst(types::I32, i64::from(key_offset)),
+            builder.ins().iconst(types::I32, i64::from(value_offset)),
+            builder.ins().iconst(
+                types::I8,
+                i64::from(region == mir::AllocationRegion::Temporary),
+            ),
+        ]);
+        let call = builder.ins().call(function_ref, &arguments);
+        self.store_scalar(builder, destination, builder.inst_results(call)[0], state)
+    }
+
     /// `list.Add(value)`: materializes `value`'s full representation at a
     /// stable address (an aggregate's address, already produced by
     /// `translate_operand`; otherwise a fresh stack slot holding the
@@ -1591,4 +1950,26 @@ fn function_symbol(operand: &mir::Operand) -> Result<i64, BackendError> {
             "expected a resolved function operand for a concurrency intrinsic",
         )),
     }
+}
+
+fn dictionary_key_kind(type_: &mir::Type) -> Result<i64, BackendError> {
+    let kind = match type_ {
+        mir::Type::Bool => aster_runtime::DictionaryKeyKind::Bool,
+        mir::Type::Char => aster_runtime::DictionaryKeyKind::Char,
+        mir::Type::SByte => aster_runtime::DictionaryKeyKind::SByte,
+        mir::Type::Byte => aster_runtime::DictionaryKeyKind::Byte,
+        mir::Type::Short => aster_runtime::DictionaryKeyKind::Short,
+        mir::Type::UShort => aster_runtime::DictionaryKeyKind::UShort,
+        mir::Type::Int => aster_runtime::DictionaryKeyKind::Int,
+        mir::Type::UInt => aster_runtime::DictionaryKeyKind::UInt,
+        mir::Type::Long => aster_runtime::DictionaryKeyKind::Long,
+        mir::Type::ULong => aster_runtime::DictionaryKeyKind::ULong,
+        mir::Type::String => aster_runtime::DictionaryKeyKind::String,
+        _ => {
+            return Err(BackendError::new(
+                "unsupported concrete Dictionary key type reached codegen",
+            ));
+        }
+    };
+    Ok(i64::from(kind as u8))
 }

@@ -16,7 +16,7 @@ impl Analyzer<'_> {
             && self.context.official_result.is_some()
     }
 
-    fn is_official_option(&self, name: &str) -> bool {
+    pub(super) fn is_official_option(&self, name: &str) -> bool {
         self.context.official_option.as_deref()
             == TypeName::parse(name).map(|parsed| parsed.base).as_deref()
             && self.context.official_option.is_some()
@@ -271,7 +271,7 @@ impl Analyzer<'_> {
     /// Locate the `Some` and `None` cases of an already nominally-verified
     /// official `Option` enum, returning their positions and `Some`'s
     /// payload type. `None` is required to carry zero fields.
-    fn option_cases(&self, name: &str) -> Option<OptionCases> {
+    pub(super) fn option_cases(&self, name: &str) -> Option<OptionCases> {
         let info = self.context.types.get(name)?;
         if info.enum_cases.len() != 2 {
             return None;
@@ -1169,6 +1169,13 @@ impl Analyzer<'_> {
                             "Length reflects the list's element count and cannot be set directly",
                         ),
                     );
+                    return Type::Unknown;
+                }
+                Type::Dictionary(_, _) => {
+                    self.diagnostics.push(Diagnostic::error(
+                        "dictionary Length is read-only",
+                        target.span,
+                    ));
                     return Type::Unknown;
                 }
                 _ => {}

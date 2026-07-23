@@ -62,6 +62,11 @@ pub(super) fn validate_invocable_entry(
             "entry function `{function_name}` returns a List<T>; call it from a scalar entry function instead"
         )));
     }
+    if matches!(function.return_type, mir::Type::Dictionary(_, _)) {
+        return Err(BackendError::new(format!(
+            "entry function `{function_name}` returns a Dictionary<K, V>; call it from a scalar entry function instead"
+        )));
+    }
     Ok(())
 }
 
@@ -729,6 +734,81 @@ fn validate_instruction(
             enums,
             locals,
         ),
+        mir::Instruction::AllocateDictionary {
+            destination,
+            key_type,
+            value_type,
+            ..
+        } => validate_allocate_dictionary(
+            destination,
+            key_type,
+            value_type,
+            function_name,
+            classes,
+            structs,
+            interfaces,
+            enums,
+            locals,
+        ),
+        mir::Instruction::DictionaryAdd {
+            destination,
+            dictionary,
+            key,
+            value,
+        }
+        | mir::Instruction::DictionarySet {
+            destination,
+            dictionary,
+            key,
+            value,
+        } => {
+            validate_dictionary_mutation(destination, dictionary, key, value, function_name, locals)
+        }
+        mir::Instruction::DictionaryTryGet {
+            destination,
+            dictionary,
+            key,
+            value_type,
+            option_layout,
+        } => validate_dictionary_try_get(
+            destination,
+            dictionary,
+            key,
+            value_type,
+            *option_layout,
+            function_name,
+            enums,
+            locals,
+        ),
+        mir::Instruction::DictionaryContainsKey {
+            destination,
+            dictionary,
+            key,
+        }
+        | mir::Instruction::DictionaryRemove {
+            destination,
+            dictionary,
+            key,
+        } => validate_dictionary_key_operation(destination, dictionary, key, function_name, locals),
+        mir::Instruction::DictionaryEntries {
+            destination,
+            dictionary,
+            key_type,
+            value_type,
+            entry_type,
+            entry_layout,
+            ..
+        } => validate_dictionary_entries(
+            destination,
+            dictionary,
+            key_type,
+            value_type,
+            entry_type,
+            *entry_layout,
+            function_name,
+            structs,
+            locals,
+        ),
         mir::Instruction::ListAdd { list, value } => validate_list_add(
             list,
             value,
@@ -779,6 +859,238 @@ fn validate_instruction(
             function_name,
             locals,
         ),
+    }
+}
+
+fn declared_local_type<'a>(
+    place: &mir::Place,
+    function_name: &str,
+    operation: &str,
+    locals: &'a HashMap<mir::LocalId, mir::Type>,
+) -> Result<&'a mir::Type, BackendError> {
+    let mir::Place::Local(local) = place else {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a `{operation}` destination that is not a local"
+        )));
+    };
+    locals.get(local).ok_or_else(|| {
+        BackendError::new(format!(
+            "function `{function_name}` has a `{operation}` destination that is undeclared"
+        ))
+    })
+}
+
+fn validate_dictionary_receiver_and_key<'a>(
+    dictionary: &'a mir::Operand,
+    key: &mir::Operand,
+    function_name: &str,
+    operation: &str,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(&'a mir::Type, &'a mir::Type), BackendError> {
+    validate_operand(dictionary, function_name)?;
+    validate_operand(key, function_name)?;
+    validate_dictionary_operand_locals(dictionary, operation, function_name, locals)?;
+    validate_dictionary_operand_locals(key, operation, function_name, locals)?;
+    let mir::Type::Dictionary(key_type, value_type) = &dictionary.type_ else {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a `{operation}` receiver that is not `Dictionary<K, V>`"
+        )));
+    };
+    validate_dictionary_key_type(key_type, function_name)?;
+    if key.type_ != **key_type {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a `{operation}` key incompatible with its Dictionary specialization"
+        )));
+    }
+    Ok((key_type, value_type))
+}
+
+fn validate_dictionary_mutation(
+    destination: &mir::Place,
+    dictionary: &mir::Operand,
+    key: &mir::Operand,
+    value: &mir::Operand,
+    function_name: &str,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    let (_, value_type) = validate_dictionary_receiver_and_key(
+        dictionary,
+        key,
+        function_name,
+        "Dictionary mutation",
+        locals,
+    )?;
+    validate_operand(value, function_name)?;
+    if value.type_ != *value_type {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a Dictionary value incompatible with its specialization"
+        )));
+    }
+    let declared = declared_local_type(destination, function_name, "Dictionary mutation", locals)?;
+    if *declared != mir::Type::Bool {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a Dictionary mutation destination that is not `bool`"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_dictionary_key_operation(
+    destination: &mir::Place,
+    dictionary: &mir::Operand,
+    key: &mir::Operand,
+    function_name: &str,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    validate_dictionary_receiver_and_key(
+        dictionary,
+        key,
+        function_name,
+        "Dictionary key operation",
+        locals,
+    )?;
+    let declared = declared_local_type(
+        destination,
+        function_name,
+        "Dictionary key operation",
+        locals,
+    )?;
+    if *declared != mir::Type::Bool {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a Dictionary key-operation destination that is not `bool`"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_dictionary_try_get(
+    destination: &mir::Place,
+    dictionary: &mir::Operand,
+    key: &mir::Operand,
+    value_type: &mir::Type,
+    option_layout: mir::DictionaryOptionLayout,
+    function_name: &str,
+    enums: &HashSet<mir::SymbolId>,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    let (_, dictionary_value_type) = validate_dictionary_receiver_and_key(
+        dictionary,
+        key,
+        function_name,
+        "DictionaryTryGet",
+        locals,
+    )?;
+    if dictionary_value_type != value_type {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a `DictionaryTryGet` value type incompatible with its specialization"
+        )));
+    }
+    let declared = declared_local_type(destination, function_name, "DictionaryTryGet", locals)?;
+    let mir::Type::Enum(symbol) = declared else {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a `DictionaryTryGet` destination that is not an enum"
+        )));
+    };
+    if !enums.contains(symbol) || option_layout.some_tag == option_layout.none_tag {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has invalid nominal Option metadata for `DictionaryTryGet`"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_dictionary_entries(
+    destination: &mir::Place,
+    dictionary: &mir::Operand,
+    key_type: &mir::Type,
+    value_type: &mir::Type,
+    entry_type: &mir::Type,
+    entry_layout: mir::DictionaryEntryLayout,
+    function_name: &str,
+    structs: &HashSet<mir::SymbolId>,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    validate_operand(dictionary, function_name)?;
+    validate_dictionary_operand_locals(dictionary, "DictionaryEntries", function_name, locals)?;
+    let expected_dictionary =
+        mir::Type::Dictionary(Box::new(key_type.clone()), Box::new(value_type.clone()));
+    if dictionary.type_ != expected_dictionary {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has `DictionaryEntries` metadata incompatible with its receiver"
+        )));
+    }
+    validate_dictionary_key_type(key_type, function_name)?;
+    let mir::Type::User(entry_symbol) = entry_type else {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a `DictionaryEntries` entry type that is not a concrete struct"
+        )));
+    };
+    if !structs.contains(entry_symbol) || entry_layout.key_field == entry_layout.value_field {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has invalid nominal `DictionaryEntry<K, V>` metadata"
+        )));
+    }
+    let declared = declared_local_type(destination, function_name, "DictionaryEntries", locals)?;
+    let expected = mir::Type::Array(Box::new(entry_type.clone()));
+    if *declared != expected {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a `DictionaryEntries` destination with the wrong array element type"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_dictionary_operand_locals(
+    operand: &mir::Operand,
+    operation: &str,
+    function_name: &str,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    let mir::OperandKind::Copy(place) = &operand.kind else {
+        return Ok(());
+    };
+    validate_dictionary_place_locals(place, operation, function_name, locals)?;
+    if let mir::Place::Local(local) = place {
+        let declared = &locals[local];
+        if declared != &operand.type_ {
+            return Err(BackendError::new(format!(
+                "function `{function_name}` passes a `{operation}` operand declared `{declared:?}` but typed `{:?}`",
+                operand.type_
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_dictionary_place_locals(
+    place: &mir::Place,
+    operation: &str,
+    function_name: &str,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    match place {
+        mir::Place::Local(local) => {
+            if locals.contains_key(local) {
+                Ok(())
+            } else {
+                Err(BackendError::new(format!(
+                    "function `{function_name}` passes undeclared local {local:?} to {operation}"
+                )))
+            }
+        }
+        mir::Place::Field { base, .. } | mir::Place::EnumField { base, .. } => {
+            validate_dictionary_place_locals(base, operation, function_name, locals)
+        }
+        mir::Place::Index { array, index, .. } => {
+            validate_dictionary_operand_locals(array, operation, function_name, locals)?;
+            validate_dictionary_operand_locals(index, operation, function_name, locals)
+        }
+        mir::Place::ObjectField { object, .. } => {
+            validate_dictionary_operand_locals(object, operation, function_name, locals)
+        }
+        mir::Place::Symbol(_) => Ok(()),
     }
 }
 
@@ -865,17 +1177,21 @@ fn validate_assign(
     implementations: &HashSet<(mir::SymbolId, mir::SymbolId)>,
 ) -> Result<(), BackendError> {
     validate_place(target, function_name)?;
-    if let mir::Place::Local(id) = target
-        && let Some(declared) = locals.get(id)
-        && *declared != value.type_
-    {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` assigns a value of type `{}` into a local declared `{}`",
-            type_name(&value.type_),
-            type_name(declared)
-        )));
+    if let mir::Place::Local(id) = target {
+        let declared = locals.get(id).ok_or_else(|| {
+            BackendError::new(format!(
+                "function `{function_name}` assigns into undeclared local {id:?}"
+            ))
+        })?;
+        if *declared != value.type_ {
+            return Err(BackendError::new(format!(
+                "function `{function_name}` assigns a value of type `{}` into a local declared `{}`",
+                type_name(&value.type_),
+                type_name(declared)
+            )));
+        }
     }
-    validate_rvalue(value, function_name, implementations)
+    validate_rvalue(value, function_name, implementations, locals)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1092,6 +1408,124 @@ fn validate_allocate_list(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn validate_allocate_dictionary(
+    destination: &mir::Place,
+    key_type: &mir::Type,
+    value_type: &mir::Type,
+    function_name: &str,
+    classes: &HashSet<mir::SymbolId>,
+    structs: &HashSet<mir::SymbolId>,
+    interfaces: &HashSet<mir::SymbolId>,
+    enums: &HashSet<mir::SymbolId>,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    validate_place(destination, function_name)?;
+    validate_dictionary_key_type(key_type, function_name)?;
+    validate_dictionary_value_type(
+        value_type,
+        function_name,
+        classes,
+        structs,
+        interfaces,
+        enums,
+    )?;
+    if let mir::Place::Local(local) = destination {
+        let declared = locals.get(local).ok_or_else(|| {
+            BackendError::new(format!(
+                "function `{function_name}` allocates a `Dictionary<K, V>` into an undeclared local"
+            ))
+        })?;
+        let expected =
+            mir::Type::Dictionary(Box::new(key_type.clone()), Box::new(value_type.clone()));
+        if *declared != expected {
+            return Err(BackendError::new(format!(
+                "function `{function_name}` has an `AllocateDictionary` whose destination type does not match its concrete specialization"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_dictionary_key_type(key: &mir::Type, function_name: &str) -> Result<(), BackendError> {
+    if matches!(
+        key,
+        mir::Type::Bool
+            | mir::Type::Char
+            | mir::Type::SByte
+            | mir::Type::Byte
+            | mir::Type::Short
+            | mir::Type::UShort
+            | mir::Type::Int
+            | mir::Type::UInt
+            | mir::Type::Long
+            | mir::Type::ULong
+            | mir::Type::String
+    ) {
+        Ok(())
+    } else {
+        Err(BackendError::new(format!(
+            "function `{function_name}` has a Dictionary key type unsupported in ASTER 1.0: `{}`",
+            type_name_owned(key)
+        )))
+    }
+}
+
+fn validate_dictionary_value_type(
+    value: &mir::Type,
+    function_name: &str,
+    classes: &HashSet<mir::SymbolId>,
+    structs: &HashSet<mir::SymbolId>,
+    interfaces: &HashSet<mir::SymbolId>,
+    enums: &HashSet<mir::SymbolId>,
+) -> Result<(), BackendError> {
+    match value {
+        mir::Type::User(symbol) if !structs.contains(symbol) => {
+            return Err(BackendError::new(format!(
+                "function `{function_name}` has a Dictionary value struct unknown to the module"
+            )));
+        }
+        mir::Type::Class(symbol) if !classes.contains(symbol) => {
+            return Err(BackendError::new(format!(
+                "function `{function_name}` has a Dictionary value class unknown to the module"
+            )));
+        }
+        mir::Type::Interface(symbol) if !interfaces.contains(symbol) => {
+            return Err(BackendError::new(format!(
+                "function `{function_name}` has a Dictionary value interface unknown to the module"
+            )));
+        }
+        mir::Type::Enum(symbol) if !enums.contains(symbol) => {
+            return Err(BackendError::new(format!(
+                "function `{function_name}` has a Dictionary value enum unknown to the module"
+            )));
+        }
+        mir::Type::Dictionary(key, nested) => {
+            validate_dictionary_key_type(key, function_name)?;
+            return validate_dictionary_value_type(
+                nested,
+                function_name,
+                classes,
+                structs,
+                interfaces,
+                enums,
+            );
+        }
+        mir::Type::List(element) => {
+            return validate_list_element_type(
+                element,
+                function_name,
+                classes,
+                structs,
+                interfaces,
+                enums,
+            );
+        }
+        _ => {}
+    }
+    validate_value_type(value, function_name)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn validate_list_get(
     destination: &mir::Place,
     list: &mir::Operand,
@@ -1272,6 +1706,11 @@ fn validate_list_element_type(
 fn type_name_owned(type_: &mir::Type) -> String {
     match type_ {
         mir::Type::List(element) => format!("List<{}>", type_name_owned(element)),
+        mir::Type::Dictionary(key, value) => format!(
+            "Dictionary<{}, {}>",
+            type_name_owned(key),
+            type_name_owned(value)
+        ),
         mir::Type::Array(element) => format!("{}[]", type_name_owned(element)),
         mir::Type::Task(result) => format!("Task<{}>", type_name_owned(result)),
         other => type_name(other).to_owned(),
@@ -1672,10 +2111,12 @@ fn function_operand_matches(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_rvalue(
     value: &mir::Rvalue,
     function_name: &str,
     implementations: &HashSet<(mir::SymbolId, mir::SymbolId)>,
+    locals: &HashMap<mir::LocalId, mir::Type>,
 ) -> Result<(), BackendError> {
     validate_value_type(&value.type_, function_name)?;
     if matches!(value.type_, mir::Type::Float | mir::Type::Double)
@@ -1709,6 +2150,26 @@ fn validate_rvalue(
             if value.type_ != mir::Type::Int {
                 return Err(BackendError::new(format!(
                     "function `{function_name}` has a `ListLength` whose result type is not `int`"
+                )));
+            }
+            Ok(())
+        }
+        mir::RvalueKind::DictionaryLength(dictionary) => {
+            validate_operand(dictionary, function_name)?;
+            validate_dictionary_operand_locals(
+                dictionary,
+                "DictionaryLength",
+                function_name,
+                locals,
+            )?;
+            if !matches!(dictionary.type_, mir::Type::Dictionary(_, _)) {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` has a `DictionaryLength` reading a non-`Dictionary<K, V>` receiver"
+                )));
+            }
+            if value.type_ != mir::Type::Int {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` has a `DictionaryLength` whose result type is not `int`"
                 )));
             }
             Ok(())
@@ -1902,6 +2363,10 @@ fn validate_value_type(type_: &mir::Type, function_name: &str) -> Result<(), Bac
         // already gets. Nominal existence for `T` is checked specifically
         // where a list is actually allocated (`validate_list_element_type`).
         return validate_value_type(element, function_name);
+    }
+    if let mir::Type::Dictionary(key, value) = type_ {
+        validate_dictionary_key_type(key, function_name)?;
+        return validate_value_type(value, function_name);
     }
     if executable_value_type(type_)
         || matches!(

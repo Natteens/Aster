@@ -175,6 +175,24 @@ impl Lowerer<'_> {
                     kind: hir::ExpressionKind::NewList { element_type },
                 }
             }
+            ast::ExpressionKind::NewObject { type_name, .. }
+                if type_name.starts_with("Dictionary<") =>
+            {
+                let type_ = self.resolve_type(&ast::TypeRef::new(type_name, expression.span));
+                let hir::Type::Dictionary(key_type, value_type) = type_.clone() else {
+                    return hir::Expression {
+                        type_: hir::Type::Unknown,
+                        kind: hir::ExpressionKind::Literal(hir::Literal::Integer("0".to_owned())),
+                    };
+                };
+                hir::Expression {
+                    type_,
+                    kind: hir::ExpressionKind::NewDictionary {
+                        key_type: *key_type,
+                        value_type: *value_type,
+                    },
+                }
+            }
             ast::ExpressionKind::NewObject {
                 type_name,
                 arguments,
@@ -230,6 +248,12 @@ impl Lowerer<'_> {
                     return hir::Expression {
                         type_: hir::Type::Int,
                         kind: hir::ExpressionKind::ListLength(Box::new(object)),
+                    };
+                }
+                if matches!(object.type_, hir::Type::Dictionary(_, _)) {
+                    return hir::Expression {
+                        type_: hir::Type::Int,
+                        kind: hir::ExpressionKind::DictionaryLength(Box::new(object)),
                     };
                 }
                 if let Some(key) = self.model.property_reads.get(&model_key) {
@@ -394,6 +418,125 @@ impl Lowerer<'_> {
                                 list: Box::new(object),
                                 index: Box::new(index),
                             },
+                        };
+                    }
+                }
+                if let ast::ExpressionKind::Member { object, name } = &callee.kind
+                    && self.model.dictionary_operations.contains_key(&model_key)
+                {
+                    let object = self.expression(object);
+                    if let hir::Type::Dictionary(key_type, value_type) = object.type_.clone() {
+                        let mut lowered_arguments = arguments
+                            .iter()
+                            .map(|argument| self.expression(argument))
+                            .collect::<Vec<_>>();
+                        if let Some(key) = lowered_arguments.first_mut() {
+                            *key = convert(key.clone(), &key_type);
+                        }
+                        if let Some(value) = lowered_arguments.get_mut(1) {
+                            *value = convert(value.clone(), &value_type);
+                        }
+                        let mut lowered_arguments = lowered_arguments.into_iter();
+                        let mut key = || {
+                            Box::new(
+                                lowered_arguments
+                                    .next()
+                                    .expect("validated Dictionary key argument"),
+                            )
+                        };
+                        return match name.as_str() {
+                            "Add" => hir::Expression {
+                                type_: hir::Type::Bool,
+                                kind: hir::ExpressionKind::DictionaryAdd {
+                                    dictionary: Box::new(object),
+                                    key: key(),
+                                    value: Box::new(
+                                        lowered_arguments
+                                            .next()
+                                            .expect("validated Dictionary value argument"),
+                                    ),
+                                },
+                            },
+                            "Set" => hir::Expression {
+                                type_: hir::Type::Bool,
+                                kind: hir::ExpressionKind::DictionarySet {
+                                    dictionary: Box::new(object),
+                                    key: key(),
+                                    value: Box::new(
+                                        lowered_arguments
+                                            .next()
+                                            .expect("validated Dictionary value argument"),
+                                    ),
+                                },
+                            },
+                            "ContainsKey" => hir::Expression {
+                                type_: hir::Type::Bool,
+                                kind: hir::ExpressionKind::DictionaryContainsKey {
+                                    dictionary: Box::new(object),
+                                    key: key(),
+                                },
+                            },
+                            "Remove" => hir::Expression {
+                                type_: hir::Type::Bool,
+                                kind: hir::ExpressionKind::DictionaryRemove {
+                                    dictionary: Box::new(object),
+                                    key: key(),
+                                },
+                            },
+                            "TryGet" => {
+                                let crate::semantic::ResolvedDictionaryOperation::TryGet {
+                                    option_type,
+                                    some_index,
+                                    none_index,
+                                } = &self.model.dictionary_operations[&model_key]
+                                else {
+                                    unreachable!("TryGet carries resolved Option metadata")
+                                };
+                                let (some_case, some_fields) =
+                                    self.enum_cases[&(option_type.clone(), *some_index)].clone();
+                                let (none_case, _) =
+                                    self.enum_cases[&(option_type.clone(), *none_index)].clone();
+                                let some_field = some_fields[0];
+                                hir::Expression {
+                                    type_: hir::Type::Enum(self.types[option_type]),
+                                    kind: hir::ExpressionKind::DictionaryTryGet {
+                                        dictionary: Box::new(object),
+                                        key: key(),
+                                        value_type: (*value_type).clone(),
+                                        option_layout: hir::DictionaryOptionLayout {
+                                            some_case,
+                                            some_field,
+                                            some_tag: tag(*some_index),
+                                            none_case,
+                                            none_tag: tag(*none_index),
+                                        },
+                                    },
+                                }
+                            }
+                            "Entries" => {
+                                let crate::semantic::ResolvedDictionaryOperation::Entries {
+                                    entry_type,
+                                } = &self.model.dictionary_operations[&model_key]
+                                else {
+                                    unreachable!("Entries carries resolved entry metadata")
+                                };
+                                let entry_symbol = self.types[entry_type];
+                                let entry_type_hir = hir::Type::User(entry_symbol);
+                                hir::Expression {
+                                    type_: hir::Type::Array(Box::new(entry_type_hir.clone())),
+                                    kind: hir::ExpressionKind::DictionaryEntries {
+                                        dictionary: Box::new(object),
+                                        key_type: (*key_type).clone(),
+                                        value_type: (*value_type).clone(),
+                                        entry_type: entry_type_hir,
+                                        entry_layout: hir::DictionaryEntryLayout {
+                                            key_field: self.members[&entry_symbol]["Key"],
+                                            value_field: self.members[&entry_symbol]["Value"],
+                                        },
+                                    },
+                                }
+                            }
+                            _ => unreachable!("semantic analysis validated Dictionary method"),
                         };
                     }
                 }

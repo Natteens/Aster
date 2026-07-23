@@ -1,7 +1,10 @@
 //! Per-execution ownership and the array/list runtime ABI.
 
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
 use std::mem::{align_of, size_of};
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arena::{ArenaMark, MAX_ALIGN, PagedArena};
 use crate::string::AsterStrHeader;
@@ -34,6 +37,51 @@ pub enum ListRegion {
     Temporary,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DictionaryKeyKind {
+    Bool = 1,
+    Char = 2,
+    SByte = 3,
+    Byte = 4,
+    Short = 5,
+    UShort = 6,
+    Int = 7,
+    UInt = 8,
+    Long = 9,
+    ULong = 10,
+    String = 11,
+}
+
+impl DictionaryKeyKind {
+    fn from_abi(value: i32) -> Option<Self> {
+        Some(match value {
+            1 => Self::Bool,
+            2 => Self::Char,
+            3 => Self::SByte,
+            4 => Self::Byte,
+            5 => Self::Short,
+            6 => Self::UShort,
+            7 => Self::Int,
+            8 => Self::UInt,
+            9 => Self::Long,
+            10 => Self::ULong,
+            11 => Self::String,
+            _ => return None,
+        })
+    }
+}
+
+fn dictionary_key_kind_size(kind: DictionaryKeyKind) -> usize {
+    match kind {
+        DictionaryKeyKind::Bool | DictionaryKeyKind::SByte | DictionaryKeyKind::Byte => 1,
+        DictionaryKeyKind::Short | DictionaryKeyKind::UShort => 2,
+        DictionaryKeyKind::Char | DictionaryKeyKind::Int | DictionaryKeyKind::UInt => 4,
+        DictionaryKeyKind::Long | DictionaryKeyKind::ULong => 8,
+        DictionaryKeyKind::String => size_of::<*const AsterStrHeader>(),
+    }
+}
+
 /// Runtime-owned header for one `List<T>` instance. `T`'s content never lives
 /// inline in the value that names the list (that value is always a pointer
 /// to this header, exactly like `Array`/`Class`); this struct owns the
@@ -63,6 +111,134 @@ pub struct AsterList {
     /// is safe because equality (not ordering) is all iteration ever checks.
     version: u64,
     region: ListRegion,
+}
+
+/// Native header for one concrete insertion-ordered `Dictionary<K, V>`.
+/// Buckets and entries are allocated lazily in the same arena as this header.
+/// Hash seeds remain per-context; snapshots need no iterator/version state.
+#[repr(C)]
+pub struct AsterDictionary {
+    buckets: *mut u32,
+    entries: *mut u8,
+    length: i32,
+    bucket_capacity: i32,
+    entry_capacity: i32,
+    entry_count: i32,
+    key_size: u32,
+    key_align: u32,
+    value_size: u32,
+    value_align: u32,
+    key_type_key: u64,
+    value_type_key: u64,
+    owner_id: u64,
+    key_kind: DictionaryKeyKind,
+    region: ListRegion,
+}
+
+impl AsterDictionary {
+    #[must_use]
+    pub fn region(&self) -> ListRegion {
+        self.region
+    }
+}
+
+const DICTIONARY_EMPTY_BUCKET: u32 = u32::MAX;
+const DICTIONARY_INITIAL_CAPACITY: i32 = 8;
+const DICTIONARY_MAX_ENTRIES: i32 = 100_000;
+const DICTIONARY_MAX_ACTIVE_BYTES: usize = 64 * 1024 * 1024;
+const DICTIONARY_ENTRY_HEADER_SIZE: usize = 16;
+
+#[derive(Clone, Copy)]
+struct DictionaryEntryLayout {
+    key_offset: usize,
+    value_offset: usize,
+    stride: usize,
+    align: usize,
+}
+
+fn checked_align_up(value: usize, alignment: usize) -> Option<usize> {
+    value
+        .checked_add(alignment.checked_sub(1)?)
+        .map(|value| value & !(alignment - 1))
+}
+
+fn dictionary_entry_layout(
+    key_size: u32,
+    key_align: u32,
+    value_size: u32,
+    value_align: u32,
+) -> Option<DictionaryEntryLayout> {
+    let key_align = usize::try_from(key_align).ok()?;
+    let value_align = usize::try_from(value_align).ok()?;
+    if !key_align.is_power_of_two()
+        || !value_align.is_power_of_two()
+        || key_align > MAX_ALIGN
+        || value_align > MAX_ALIGN
+    {
+        return None;
+    }
+    let key_offset = checked_align_up(DICTIONARY_ENTRY_HEADER_SIZE, key_align)?;
+    let value_offset = checked_align_up(
+        key_offset.checked_add(usize::try_from(key_size).ok()?)?,
+        value_align,
+    )?;
+    let align = 8_usize.max(key_align).max(value_align);
+    let stride = checked_align_up(
+        value_offset.checked_add(usize::try_from(value_size).ok()?)?,
+        align,
+    )?;
+    Some(DictionaryEntryLayout {
+        key_offset,
+        value_offset,
+        stride,
+        align,
+    })
+}
+
+#[inline]
+fn sip_round(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64) {
+    *v0 = v0.wrapping_add(*v1);
+    *v1 = v1.rotate_left(13);
+    *v1 ^= *v0;
+    *v0 = v0.rotate_left(32);
+    *v2 = v2.wrapping_add(*v3);
+    *v3 = v3.rotate_left(16);
+    *v3 ^= *v2;
+    *v0 = v0.wrapping_add(*v3);
+    *v3 = v3.rotate_left(21);
+    *v3 ^= *v0;
+    *v2 = v2.wrapping_add(*v1);
+    *v1 = v1.rotate_left(17);
+    *v1 ^= *v2;
+    *v2 = v2.rotate_left(32);
+}
+
+fn siphash13(k0: u64, k1: u64, bytes: &[u8]) -> u64 {
+    let mut v0 = k0 ^ 0x736f_6d65_7073_6575;
+    let mut v1 = k1 ^ 0x646f_7261_6e64_6f6d;
+    let mut v2 = k0 ^ 0x6c79_6765_6e65_7261;
+    let mut v3 = k1 ^ 0x7465_6462_7974_6573;
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let mut word = [0_u8; 8];
+        word.copy_from_slice(chunk);
+        let message = u64::from_le_bytes(word);
+        v3 ^= message;
+        sip_round(&mut v0, &mut v1, &mut v2, &mut v3);
+        v0 ^= message;
+    }
+    let mut tail = (bytes.len() as u64) << 56;
+    for (index, byte) in chunks.remainder().iter().enumerate() {
+        tail |= u64::from(*byte) << (index * 8);
+    }
+    v3 ^= tail;
+    sip_round(&mut v0, &mut v1, &mut v2, &mut v3);
+    v0 ^= tail;
+    v2 ^= 0xff;
+    for _ in 0..3 {
+        sip_round(&mut v0, &mut v1, &mut v2, &mut v3);
+    }
+    v0 ^ v1 ^ v2 ^ v3
 }
 
 impl AsterList {
@@ -161,6 +337,21 @@ pub struct ExecutionContext {
     /// first use; a host (tests, or a future CLI override) can inject an
     /// in-memory backend first via [`Self::set_filesystem_backend`].
     filesystem: Option<Box<dyn crate::filesystem::FileSystemBackend>>,
+    dictionary_hash_k0: u64,
+    dictionary_hash_k1: u64,
+    dictionary_owner_id: u64,
+}
+
+static NEXT_DICTIONARY_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+
+fn dictionary_context_identity() -> (u64, u64, u64) {
+    let state = RandomState::new();
+    let mut first = state.build_hasher();
+    first.write_u64(0x6173_7465_722d_6b30);
+    let mut second = state.build_hasher();
+    second.write_u64(0x6173_7465_722d_6b31);
+    let owner = NEXT_DICTIONARY_OWNER_ID.fetch_add(1, Ordering::Relaxed);
+    (first.finish(), second.finish(), owner)
 }
 
 impl Default for ExecutionContext {
@@ -172,6 +363,8 @@ impl Default for ExecutionContext {
 impl ExecutionContext {
     #[must_use]
     pub fn new() -> Self {
+        let (dictionary_hash_k0, dictionary_hash_k1, dictionary_owner_id) =
+            dictionary_context_identity();
         Self {
             arena: PagedArena::new(),
             temporary_arena: PagedArena::new(),
@@ -182,11 +375,16 @@ impl ExecutionContext {
             task_runtime: None,
             console: None,
             filesystem: None,
+            dictionary_hash_k0,
+            dictionary_hash_k1,
+            dictionary_owner_id,
         }
     }
 
     #[must_use]
     pub fn with_stats() -> Self {
+        let (dictionary_hash_k0, dictionary_hash_k1, dictionary_owner_id) =
+            dictionary_context_identity();
         Self {
             arena: PagedArena::new(),
             temporary_arena: PagedArena::new(),
@@ -197,6 +395,9 @@ impl ExecutionContext {
             task_runtime: None,
             console: None,
             filesystem: None,
+            dictionary_hash_k0,
+            dictionary_hash_k1,
+            dictionary_owner_id,
         }
     }
 
@@ -483,6 +684,993 @@ impl ExecutionContext {
         }
         self.record_allocation(AllocationCategory::Object, size_of::<AsterList>());
         header_ptr
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn allocate_dictionary_in_region(
+        &mut self,
+        key_kind: DictionaryKeyKind,
+        key_size: u32,
+        key_align: u32,
+        key_type_key: u64,
+        value_size: u32,
+        value_align: u32,
+        value_type_key: u64,
+        region: ListRegion,
+    ) -> *mut AsterDictionary {
+        if self.error.is_some() {
+            return ptr::null_mut();
+        }
+        if key_size == 0 || value_size == 0 {
+            self.fail("dictionary key and value sizes must be greater than zero");
+            return ptr::null_mut();
+        }
+        if usize::try_from(key_size).ok() != Some(dictionary_key_kind_size(key_kind)) {
+            self.fail("dictionary key size does not match its concrete key kind");
+            return ptr::null_mut();
+        }
+        for (name, align) in [("key", key_align), ("value", value_align)] {
+            if !align.is_power_of_two() || align as usize > MAX_ALIGN {
+                self.fail(format!("dictionary {name} alignment must be a supported nonzero power of two, got {align}"));
+                return ptr::null_mut();
+            }
+        }
+        if region == ListRegion::Temporary && self.temporary_scopes.is_empty() {
+            self.fail("temporary dictionary allocation requires an active temporary scope");
+            return ptr::null_mut();
+        }
+        let header = {
+            let arena = if region == ListRegion::Temporary {
+                &mut self.temporary_arena
+            } else {
+                &mut self.arena
+            };
+            #[allow(clippy::cast_ptr_alignment)]
+            arena
+                .alloc(size_of::<AsterDictionary>(), align_of::<AsterDictionary>())
+                .cast::<AsterDictionary>()
+        };
+        // SAFETY: fresh, aligned arena memory is unpublished until every field is initialized.
+        #[allow(unsafe_code)]
+        unsafe {
+            *header = AsterDictionary {
+                buckets: ptr::null_mut(),
+                entries: ptr::null_mut(),
+                length: 0,
+                bucket_capacity: 0,
+                entry_capacity: 0,
+                entry_count: 0,
+                key_size,
+                key_align,
+                value_size,
+                value_align,
+                key_type_key,
+                value_type_key,
+                owner_id: self.dictionary_owner_id,
+                key_kind,
+                region,
+            };
+        }
+        self.record_allocation(AllocationCategory::Object, size_of::<AsterDictionary>());
+        header
+    }
+
+    fn validate_dictionary_header(&mut self, dictionary: *const AsterDictionary) -> bool {
+        #[allow(unsafe_code)]
+        let (
+            length,
+            bucket_capacity,
+            entry_capacity,
+            count,
+            buckets,
+            entries,
+            key_size,
+            key_align,
+            value_size,
+            value_align,
+            owner_id,
+            key_kind,
+        ) = unsafe {
+            (
+                (*dictionary).length,
+                (*dictionary).bucket_capacity,
+                (*dictionary).entry_capacity,
+                (*dictionary).entry_count,
+                (*dictionary).buckets,
+                (*dictionary).entries,
+                (*dictionary).key_size,
+                (*dictionary).key_align,
+                (*dictionary).value_size,
+                (*dictionary).value_align,
+                (*dictionary).owner_id,
+                (*dictionary).key_kind,
+            )
+        };
+        if length < 0 || count < 0 || length > count {
+            self.fail("dictionary header has invalid length or entry count");
+            return false;
+        }
+        if usize::try_from(key_size).ok() != Some(dictionary_key_kind_size(key_kind)) {
+            self.fail("dictionary header key size does not match its key kind");
+            return false;
+        }
+        if key_size == 0
+            || value_size == 0
+            || !key_align.is_power_of_two()
+            || !value_align.is_power_of_two()
+            || key_align as usize > MAX_ALIGN
+            || value_align as usize > MAX_ALIGN
+        {
+            self.fail("dictionary header has invalid key or value layout metadata");
+            return false;
+        }
+        if owner_id != self.dictionary_owner_id {
+            self.fail("dictionary belongs to a different ExecutionContext");
+            return false;
+        }
+        if bucket_capacity < 0 || entry_capacity < 0 || count > entry_capacity {
+            self.fail("dictionary header has invalid capacity metadata");
+            return false;
+        }
+        if bucket_capacity == 0 {
+            if !buckets.is_null() || entry_capacity != 0 || !entries.is_null() || count != 0 {
+                self.fail("empty dictionary header has inconsistent storage pointers");
+                return false;
+            }
+        } else if bucket_capacity.count_ones() != 1
+            || buckets.is_null()
+            || entry_capacity <= 0
+            || entries.is_null()
+        {
+            self.fail("dictionary header has invalid active storage");
+            return false;
+        }
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_dictionary_operation(
+        &mut self,
+        dictionary: *const AsterDictionary,
+        key_kind: DictionaryKeyKind,
+        key_size: u32,
+        key_align: u32,
+        key_type_key: u64,
+        value_size: u32,
+        value_align: u32,
+        value_type_key: u64,
+        operation: &str,
+    ) -> bool {
+        if dictionary.is_null() {
+            self.fail(format!("Dictionary.{operation} received a null Dictionary"));
+            return false;
+        }
+        if !self.validate_dictionary_header(dictionary) {
+            return false;
+        }
+        #[allow(unsafe_code)]
+        let matches = unsafe {
+            (*dictionary).key_kind == key_kind
+                && (*dictionary).key_size == key_size
+                && (*dictionary).key_align == key_align
+                && (*dictionary).key_type_key == key_type_key
+                && (*dictionary).value_size == value_size
+                && (*dictionary).value_align == value_align
+                && (*dictionary).value_type_key == value_type_key
+        };
+        if !matches {
+            self.fail(format!(
+                "Dictionary.{operation} concrete key/value metadata does not match the header"
+            ));
+        }
+        matches
+    }
+
+    fn dictionary_key_bytes<'a>(
+        &mut self,
+        kind: DictionaryKeyKind,
+        address: *const u8,
+        key_size: u32,
+        operation: &str,
+    ) -> Option<&'a [u8]> {
+        if address.is_null() {
+            self.fail(format!(
+                "Dictionary.{operation} received a null key address"
+            ));
+            return None;
+        }
+        if kind == DictionaryKeyKind::String {
+            if usize::try_from(key_size).ok()? != size_of::<*const AsterStrHeader>() {
+                self.fail(format!(
+                    "Dictionary.{operation} string key layout has the wrong size"
+                ));
+                return None;
+            }
+            #[allow(unsafe_code)]
+            let string = unsafe { ptr::read_unaligned(address.cast::<*const AsterStrHeader>()) };
+            // SAFETY: generated code supplies a live ASTER string pointer.
+            #[allow(unsafe_code)]
+            let Some(value) = (unsafe { crate::string::view(string) }) else {
+                self.fail(format!(
+                    "Dictionary.{operation} received an invalid UTF-8 string key"
+                ));
+                return None;
+            };
+            return Some(value.as_bytes());
+        }
+        let expected_size = match kind {
+            DictionaryKeyKind::Bool | DictionaryKeyKind::SByte | DictionaryKeyKind::Byte => 1,
+            DictionaryKeyKind::Short | DictionaryKeyKind::UShort => 2,
+            DictionaryKeyKind::Char | DictionaryKeyKind::Int | DictionaryKeyKind::UInt => 4,
+            DictionaryKeyKind::Long | DictionaryKeyKind::ULong => 8,
+            DictionaryKeyKind::String => unreachable!("handled above"),
+        };
+        if key_size != expected_size {
+            self.fail(format!(
+                "Dictionary.{operation} key size does not match its key kind"
+            ));
+            return None;
+        }
+        // SAFETY: generated code supplies a readable value slot of `key_size`
+        // bytes. Integer and char values already use canonical little-endian
+        // bit representations on the supported targets.
+        #[allow(unsafe_code)]
+        Some(unsafe { std::slice::from_raw_parts(address, usize::try_from(key_size).unwrap_or(0)) })
+    }
+
+    fn dictionary_hash_key(
+        &mut self,
+        kind: DictionaryKeyKind,
+        address: *const u8,
+        key_size: u32,
+        operation: &str,
+    ) -> Option<u64> {
+        let bytes = self.dictionary_key_bytes(kind, address, key_size, operation)?;
+        Some(siphash13(
+            self.dictionary_hash_k0,
+            self.dictionary_hash_k1,
+            bytes,
+        ))
+    }
+
+    fn dictionary_keys_equal(
+        &mut self,
+        kind: DictionaryKeyKind,
+        left: *const u8,
+        right: *const u8,
+        key_size: u32,
+        operation: &str,
+    ) -> Option<bool> {
+        let left = self.dictionary_key_bytes(kind, left, key_size, operation)?;
+        let right = self.dictionary_key_bytes(kind, right, key_size, operation)?;
+        Some(left == right)
+    }
+
+    fn dictionary_active_bytes(
+        &mut self,
+        bucket_capacity: i32,
+        entry_capacity: i32,
+        layout: DictionaryEntryLayout,
+    ) -> Option<(usize, usize)> {
+        let bucket_bytes = usize::try_from(bucket_capacity)
+            .ok()?
+            .checked_mul(size_of::<u32>())?;
+        let entry_bytes = usize::try_from(entry_capacity)
+            .ok()?
+            .checked_mul(layout.stride)?;
+        if bucket_bytes.checked_add(entry_bytes)? > DICTIONARY_MAX_ACTIVE_BYTES {
+            self.fail("Dictionary active storage exceeds the 64 MiB limit");
+            return None;
+        }
+        Some((bucket_bytes, entry_bytes))
+    }
+
+    fn dictionary_allocate_buffers(
+        &mut self,
+        bucket_capacity: i32,
+        entry_capacity: i32,
+        layout: DictionaryEntryLayout,
+        region: ListRegion,
+    ) -> Option<(*mut u32, *mut u8)> {
+        let Some((bucket_bytes, entry_bytes)) =
+            self.dictionary_active_bytes(bucket_capacity, entry_capacity, layout)
+        else {
+            if self.error.is_none() {
+                self.fail("Dictionary buffer size overflow");
+            }
+            return None;
+        };
+        if region == ListRegion::Temporary && self.temporary_scopes.is_empty() {
+            self.fail("temporary Dictionary growth requires an active temporary scope");
+            return None;
+        }
+        let (buckets, entries) = {
+            let arena = if region == ListRegion::Temporary {
+                &mut self.temporary_arena
+            } else {
+                &mut self.arena
+            };
+            #[allow(clippy::cast_ptr_alignment)]
+            let buckets = arena.alloc(bucket_bytes, align_of::<u32>()).cast::<u32>();
+            (buckets, arena.alloc(entry_bytes, layout.align))
+        };
+        for index in 0..bucket_capacity {
+            #[allow(unsafe_code)]
+            unsafe {
+                buckets
+                    .add(usize::try_from(index).unwrap_or(0))
+                    .write(DICTIONARY_EMPTY_BUCKET);
+            }
+        }
+        self.record_allocation(AllocationCategory::Object, bucket_bytes);
+        self.record_allocation(AllocationCategory::Object, entry_bytes);
+        Some((buckets, entries))
+    }
+
+    fn dictionary_entry_pointer(
+        entries: *mut u8,
+        index: i32,
+        layout: DictionaryEntryLayout,
+    ) -> Option<*mut u8> {
+        let offset = usize::try_from(index).ok()?.checked_mul(layout.stride)?;
+        Some(entries.wrapping_add(offset))
+    }
+
+    #[allow(unsafe_code)]
+    unsafe fn dictionary_entry_hash(entry: *const u8) -> u64 {
+        unsafe { ptr::read_unaligned(entry.cast::<u64>()) }
+    }
+
+    #[allow(unsafe_code)]
+    unsafe fn dictionary_entry_next(entry: *const u8) -> u32 {
+        unsafe { ptr::read_unaligned(entry.add(8).cast::<u32>()) }
+    }
+
+    #[allow(unsafe_code)]
+    unsafe fn dictionary_entry_live(entry: *const u8) -> u8 {
+        unsafe { ptr::read(entry.add(12)) }
+    }
+
+    #[allow(unsafe_code)]
+    unsafe fn set_dictionary_entry_next(entry: *mut u8, next: u32) {
+        unsafe {
+            ptr::write_unaligned(entry.add(8).cast::<u32>(), next);
+        }
+    }
+
+    fn dictionary_find(
+        &mut self,
+        dictionary: *mut AsterDictionary,
+        key: *const u8,
+        hash: u64,
+        operation: &str,
+    ) -> Result<Option<(u32, u32, usize)>, ()> {
+        #[allow(unsafe_code)]
+        let (bucket_capacity, entry_count, buckets, entries, kind, key_size, layout) = unsafe {
+            let Some(layout) = dictionary_entry_layout(
+                (*dictionary).key_size,
+                (*dictionary).key_align,
+                (*dictionary).value_size,
+                (*dictionary).value_align,
+            ) else {
+                self.fail(format!(
+                    "Dictionary.{operation} has an invalid entry layout"
+                ));
+                return Err(());
+            };
+            (
+                (*dictionary).bucket_capacity,
+                (*dictionary).entry_count,
+                (*dictionary).buckets,
+                (*dictionary).entries,
+                (*dictionary).key_kind,
+                (*dictionary).key_size,
+                layout,
+            )
+        };
+        if bucket_capacity == 0 {
+            return Ok(None);
+        }
+        let bucket =
+            usize::try_from(hash & (u64::try_from(bucket_capacity).unwrap_or(1) - 1)).unwrap_or(0);
+        #[allow(unsafe_code)]
+        let mut current = unsafe { *buckets.add(bucket) };
+        let mut previous = DICTIONARY_EMPTY_BUCKET;
+        let mut steps = 0_i32;
+        while current != DICTIONARY_EMPTY_BUCKET {
+            if steps >= entry_count || current >= u32::try_from(entry_count).unwrap_or(0) {
+                self.fail(format!(
+                    "Dictionary.{operation} encountered an invalid or cyclic bucket chain"
+                ));
+                return Err(());
+            }
+            let Some(entry) = Self::dictionary_entry_pointer(
+                entries,
+                i32::try_from(current).unwrap_or(-1),
+                layout,
+            ) else {
+                self.fail(format!("Dictionary.{operation} entry offset overflow"));
+                return Err(());
+            };
+            #[allow(unsafe_code)]
+            let (stored_hash, live, next) = unsafe {
+                (
+                    Self::dictionary_entry_hash(entry),
+                    Self::dictionary_entry_live(entry),
+                    Self::dictionary_entry_next(entry),
+                )
+            };
+            if live > 1 {
+                self.fail(format!(
+                    "Dictionary.{operation} encountered an invalid live marker"
+                ));
+                return Err(());
+            }
+            if live == 1
+                && stored_hash == hash
+                && self
+                    .dictionary_keys_equal(
+                        kind,
+                        entry.wrapping_add(layout.key_offset),
+                        key,
+                        key_size,
+                        operation,
+                    )
+                    .ok_or(())?
+            {
+                return Ok(Some((current, previous, bucket)));
+            }
+            previous = current;
+            current = next;
+            steps += 1;
+        }
+        Ok(None)
+    }
+
+    fn dictionary_rebuild(
+        &mut self,
+        dictionary: *mut AsterDictionary,
+        new_bucket_capacity: i32,
+        new_entry_capacity: i32,
+    ) -> bool {
+        #[allow(unsafe_code)]
+        let (old_entries, old_count, length, region, layout) = unsafe {
+            let Some(layout) = dictionary_entry_layout(
+                (*dictionary).key_size,
+                (*dictionary).key_align,
+                (*dictionary).value_size,
+                (*dictionary).value_align,
+            ) else {
+                self.fail("Dictionary rebuild has an invalid entry layout");
+                return false;
+            };
+            (
+                (*dictionary).entries,
+                (*dictionary).entry_count,
+                (*dictionary).length,
+                (*dictionary).region,
+                layout,
+            )
+        };
+        if new_bucket_capacity.count_ones() != 1
+            || new_entry_capacity < length
+            || new_entry_capacity <= 0
+        {
+            self.fail("Dictionary rebuild requested invalid capacities");
+            return false;
+        }
+        let Some((new_buckets, new_entries)) = self.dictionary_allocate_buffers(
+            new_bucket_capacity,
+            new_entry_capacity,
+            layout,
+            region,
+        ) else {
+            return false;
+        };
+        let mut new_count = 0_i32;
+        for old_index in 0..old_count {
+            let Some(old_entry) = Self::dictionary_entry_pointer(old_entries, old_index, layout)
+            else {
+                self.fail("Dictionary rebuild source offset overflow");
+                return false;
+            };
+            #[allow(unsafe_code)]
+            let live = unsafe { Self::dictionary_entry_live(old_entry) };
+            if live > 1 {
+                self.fail("Dictionary rebuild found an invalid live marker");
+                return false;
+            }
+            if live == 0 {
+                continue;
+            }
+            let Some(new_entry) = Self::dictionary_entry_pointer(new_entries, new_count, layout)
+            else {
+                self.fail("Dictionary rebuild destination offset overflow");
+                return false;
+            };
+            #[allow(unsafe_code)]
+            unsafe {
+                ptr::copy_nonoverlapping(old_entry, new_entry, layout.stride);
+            }
+            #[allow(unsafe_code)]
+            let hash = unsafe { Self::dictionary_entry_hash(new_entry) };
+            let bucket =
+                usize::try_from(hash & (u64::try_from(new_bucket_capacity).unwrap_or(1) - 1))
+                    .unwrap_or(0);
+            #[allow(unsafe_code)]
+            let head = unsafe { *new_buckets.add(bucket) };
+            #[allow(unsafe_code)]
+            unsafe {
+                Self::set_dictionary_entry_next(new_entry, head);
+                *new_buckets.add(bucket) = u32::try_from(new_count).unwrap_or(u32::MAX);
+            }
+            new_count += 1;
+        }
+        if new_count != length {
+            self.fail("Dictionary rebuild live-entry count does not match Length");
+            return false;
+        }
+        #[allow(unsafe_code)]
+        unsafe {
+            (*dictionary).buckets = new_buckets;
+            (*dictionary).entries = new_entries;
+            (*dictionary).bucket_capacity = new_bucket_capacity;
+            (*dictionary).entry_capacity = new_entry_capacity;
+            (*dictionary).entry_count = new_count;
+        }
+        true
+    }
+
+    fn dictionary_prepare_insert(&mut self, dictionary: *mut AsterDictionary) -> bool {
+        #[allow(unsafe_code)]
+        let (length, count, entry_capacity, bucket_capacity) = unsafe {
+            (
+                (*dictionary).length,
+                (*dictionary).entry_count,
+                (*dictionary).entry_capacity,
+                (*dictionary).bucket_capacity,
+            )
+        };
+        let Some(new_length) = length.checked_add(1) else {
+            self.fail("Dictionary Length overflow");
+            return false;
+        };
+        if new_length > DICTIONARY_MAX_ENTRIES {
+            self.fail("Dictionary exceeds the maximum of 100000 live entries");
+            return false;
+        }
+        if bucket_capacity == 0 {
+            return self.dictionary_rebuild(
+                dictionary,
+                DICTIONARY_INITIAL_CAPACITY,
+                DICTIONARY_INITIAL_CAPACITY,
+            );
+        }
+        let load_limit = bucket_capacity.saturating_mul(3) / 4;
+        let needs_bucket_growth = new_length > load_limit;
+        let needs_entry_growth = count == entry_capacity;
+        if !needs_bucket_growth && !needs_entry_growth {
+            return true;
+        }
+        let tombstones = count - length;
+        let new_entry_capacity = if needs_entry_growth && tombstones == 0 {
+            let Some(capacity) = entry_capacity.checked_mul(2) else {
+                self.fail("Dictionary entry capacity overflow");
+                return false;
+            };
+            capacity
+        } else {
+            entry_capacity
+        };
+        let new_bucket_capacity = if needs_bucket_growth {
+            let Some(capacity) = bucket_capacity.checked_mul(2) else {
+                self.fail("Dictionary bucket capacity overflow");
+                return false;
+            };
+            capacity
+        } else {
+            bucket_capacity
+        };
+        self.dictionary_rebuild(dictionary, new_bucket_capacity, new_entry_capacity)
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn dictionary_add_or_set(
+        &mut self,
+        dictionary: *mut AsterDictionary,
+        key_kind: DictionaryKeyKind,
+        key_size: u32,
+        key_align: u32,
+        key_type_key: u64,
+        value_size: u32,
+        value_align: u32,
+        value_type_key: u64,
+        key: *const u8,
+        value: *const u8,
+        replace: bool,
+    ) -> i8 {
+        if self.error.is_some() {
+            return 0;
+        }
+        let operation = if replace { "Set" } else { "Add" };
+        if value.is_null() {
+            self.fail(format!(
+                "Dictionary.{operation} received a null value address"
+            ));
+            return 0;
+        }
+        if !self.validate_dictionary_operation(
+            dictionary,
+            key_kind,
+            key_size,
+            key_align,
+            key_type_key,
+            value_size,
+            value_align,
+            value_type_key,
+            operation,
+        ) {
+            return 0;
+        }
+        let Some(hash) = self.dictionary_hash_key(key_kind, key, key_size, operation) else {
+            return 0;
+        };
+        let Ok(found) = self.dictionary_find(dictionary, key, hash, operation) else {
+            return 0;
+        };
+        if let Some((index, _, _)) = found {
+            if replace {
+                #[allow(unsafe_code)]
+                let (entries, layout) = unsafe {
+                    (
+                        (*dictionary).entries,
+                        dictionary_entry_layout(key_size, key_align, value_size, value_align)
+                            .expect("validated layout"),
+                    )
+                };
+                let Some(entry) = Self::dictionary_entry_pointer(
+                    entries,
+                    i32::try_from(index).unwrap_or(-1),
+                    layout,
+                ) else {
+                    self.fail("Dictionary.Set entry offset overflow");
+                    return 0;
+                };
+                #[allow(unsafe_code)]
+                unsafe {
+                    ptr::copy(
+                        value,
+                        entry.add(layout.value_offset),
+                        usize::try_from(value_size).unwrap_or(0),
+                    );
+                }
+                return 1;
+            }
+            return 0;
+        }
+        if !self.dictionary_prepare_insert(dictionary) {
+            return 0;
+        }
+        #[allow(unsafe_code)]
+        let (entries, buckets, count, length, bucket_capacity, layout) = unsafe {
+            (
+                (*dictionary).entries,
+                (*dictionary).buckets,
+                (*dictionary).entry_count,
+                (*dictionary).length,
+                (*dictionary).bucket_capacity,
+                dictionary_entry_layout(key_size, key_align, value_size, value_align)
+                    .expect("validated layout"),
+            )
+        };
+        let Some(entry) = Self::dictionary_entry_pointer(entries, count, layout) else {
+            self.fail(format!("Dictionary.{operation} entry offset overflow"));
+            return 0;
+        };
+        let bucket =
+            usize::try_from(hash & (u64::try_from(bucket_capacity).unwrap_or(1) - 1)).unwrap_or(0);
+        #[allow(unsafe_code)]
+        let head = unsafe { *buckets.add(bucket) };
+        #[allow(unsafe_code)]
+        unsafe {
+            ptr::write_unaligned(entry.cast::<u64>(), hash);
+            Self::set_dictionary_entry_next(entry, head);
+            ptr::write(entry.add(12), 1);
+            ptr::copy_nonoverlapping(
+                key,
+                entry.add(layout.key_offset),
+                usize::try_from(key_size).unwrap_or(0),
+            );
+            ptr::copy_nonoverlapping(
+                value,
+                entry.add(layout.value_offset),
+                usize::try_from(value_size).unwrap_or(0),
+            );
+            *buckets.add(bucket) = u32::try_from(count).unwrap_or(u32::MAX);
+            (*dictionary).entry_count = count + 1;
+            (*dictionary).length = length + 1;
+        }
+        i8::from(!replace)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dictionary_contains_or_remove(
+        &mut self,
+        dictionary: *mut AsterDictionary,
+        key_kind: DictionaryKeyKind,
+        key_size: u32,
+        key_align: u32,
+        key_type_key: u64,
+        value_size: u32,
+        value_align: u32,
+        value_type_key: u64,
+        key: *const u8,
+        remove: bool,
+    ) -> i8 {
+        if self.error.is_some() {
+            return 0;
+        }
+        let operation = if remove { "Remove" } else { "ContainsKey" };
+        if !self.validate_dictionary_operation(
+            dictionary,
+            key_kind,
+            key_size,
+            key_align,
+            key_type_key,
+            value_size,
+            value_align,
+            value_type_key,
+            operation,
+        ) {
+            return 0;
+        }
+        let Some(hash) = self.dictionary_hash_key(key_kind, key, key_size, operation) else {
+            return 0;
+        };
+        let Ok(found) = self.dictionary_find(dictionary, key, hash, operation) else {
+            return 0;
+        };
+        let Some((index, previous, bucket)) = found else {
+            return 0;
+        };
+        if !remove {
+            return 1;
+        }
+        #[allow(unsafe_code)]
+        let (entries, buckets, layout, length) = unsafe {
+            (
+                (*dictionary).entries,
+                (*dictionary).buckets,
+                dictionary_entry_layout(key_size, key_align, value_size, value_align)
+                    .expect("validated layout"),
+                (*dictionary).length,
+            )
+        };
+        let entry =
+            Self::dictionary_entry_pointer(entries, i32::try_from(index).unwrap_or(-1), layout)
+                .expect("validated index");
+        #[allow(unsafe_code)]
+        let next = unsafe { Self::dictionary_entry_next(entry) };
+        #[allow(unsafe_code)]
+        unsafe {
+            if previous == DICTIONARY_EMPTY_BUCKET {
+                *buckets.add(bucket) = next;
+            } else {
+                let previous_entry = Self::dictionary_entry_pointer(
+                    entries,
+                    i32::try_from(previous).unwrap_or(-1),
+                    layout,
+                )
+                .expect("validated previous index");
+                Self::set_dictionary_entry_next(previous_entry, next);
+            }
+            ptr::write(entry.add(12), 0);
+            (*dictionary).length = length - 1;
+        }
+        1
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dictionary_try_get(
+        &mut self,
+        dictionary: *mut AsterDictionary,
+        key_kind: DictionaryKeyKind,
+        key_size: u32,
+        key_align: u32,
+        key_type_key: u64,
+        value_size: u32,
+        value_align: u32,
+        value_type_key: u64,
+        key: *const u8,
+        destination: *mut u8,
+        total_size: u32,
+        some_tag: u32,
+        none_tag: u32,
+        payload_offset: u32,
+    ) {
+        if self.error.is_some() {
+            return;
+        }
+        if destination.is_null() {
+            self.fail("Dictionary.TryGet received a null destination");
+            return;
+        }
+        if !self.validate_dictionary_operation(
+            dictionary,
+            key_kind,
+            key_size,
+            key_align,
+            key_type_key,
+            value_size,
+            value_align,
+            value_type_key,
+            "TryGet",
+        ) {
+            return;
+        }
+        let Some(payload_end) = payload_offset.checked_add(value_size) else {
+            self.fail("Dictionary.TryGet Option payload layout overflow");
+            return;
+        };
+        if total_size < 4 || payload_end > total_size {
+            self.fail("Dictionary.TryGet Option payload lies outside its destination");
+            return;
+        }
+        let Some(hash) = self.dictionary_hash_key(key_kind, key, key_size, "TryGet") else {
+            return;
+        };
+        let Ok(found) = self.dictionary_find(dictionary, key, hash, "TryGet") else {
+            return;
+        };
+        #[allow(unsafe_code)]
+        unsafe {
+            ptr::write_bytes(destination, 0, usize::try_from(total_size).unwrap_or(0));
+        }
+        let tag = if let Some((index, _, _)) = found {
+            #[allow(unsafe_code)]
+            let (entries, layout) = unsafe {
+                (
+                    (*dictionary).entries,
+                    dictionary_entry_layout(key_size, key_align, value_size, value_align)
+                        .expect("validated layout"),
+                )
+            };
+            let entry =
+                Self::dictionary_entry_pointer(entries, i32::try_from(index).unwrap_or(-1), layout)
+                    .expect("validated index");
+            #[allow(unsafe_code)]
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    entry.add(layout.value_offset),
+                    destination.add(usize::try_from(payload_offset).unwrap_or(0)),
+                    usize::try_from(value_size).unwrap_or(0),
+                );
+            }
+            some_tag
+        } else {
+            none_tag
+        };
+        #[allow(unsafe_code)]
+        unsafe {
+            ptr::write_unaligned(destination.cast::<u32>(), tag);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dictionary_entries(
+        &mut self,
+        dictionary: *mut AsterDictionary,
+        key_kind: DictionaryKeyKind,
+        key_size: u32,
+        key_align: u32,
+        key_type_key: u64,
+        value_size: u32,
+        value_align: u32,
+        value_type_key: u64,
+        entry_size: u32,
+        key_offset: u32,
+        value_offset: u32,
+        region: ListRegion,
+    ) -> *mut AsterArray {
+        if self.error.is_some() {
+            return ptr::null_mut();
+        }
+        if !self.validate_dictionary_operation(
+            dictionary,
+            key_kind,
+            key_size,
+            key_align,
+            key_type_key,
+            value_size,
+            value_align,
+            value_type_key,
+            "Entries",
+        ) {
+            return ptr::null_mut();
+        }
+        let Some(key_end) = key_offset.checked_add(key_size) else {
+            self.fail("Dictionary.Entries key field layout overflow");
+            return ptr::null_mut();
+        };
+        let Some(value_end) = value_offset.checked_add(value_size) else {
+            self.fail("Dictionary.Entries value field layout overflow");
+            return ptr::null_mut();
+        };
+        if entry_size == 0
+            || key_end > entry_size
+            || value_end > entry_size
+            || key_offset % key_align != 0
+            || value_offset % value_align != 0
+        {
+            self.fail("Dictionary.Entries has invalid DictionaryEntry field layout");
+            return ptr::null_mut();
+        }
+        #[allow(unsafe_code)]
+        let (length, count, entries, layout) = unsafe {
+            (
+                (*dictionary).length,
+                (*dictionary).entry_count,
+                (*dictionary).entries,
+                dictionary_entry_layout(key_size, key_align, value_size, value_align)
+                    .expect("validated layout"),
+            )
+        };
+        let mut live = 0_i32;
+        for index in 0..count {
+            let entry =
+                Self::dictionary_entry_pointer(entries, index, layout).expect("validated index");
+            #[allow(unsafe_code)]
+            let marker = unsafe { Self::dictionary_entry_live(entry) };
+            if marker > 1 {
+                self.fail("Dictionary.Entries encountered an invalid live marker");
+                return ptr::null_mut();
+            }
+            live += i32::from(marker);
+        }
+        if live != length {
+            self.fail("Dictionary.Entries live-entry count does not match Length");
+            return ptr::null_mut();
+        }
+        let array =
+            self.allocate_array_in_region(length, entry_size, region == ListRegion::Temporary);
+        if array.is_null() {
+            return ptr::null_mut();
+        }
+        #[allow(unsafe_code)]
+        let output = unsafe { (*array).data };
+        let mut output_index = 0_i32;
+        for index in 0..count {
+            let entry =
+                Self::dictionary_entry_pointer(entries, index, layout).expect("validated index");
+            #[allow(unsafe_code)]
+            let marker = unsafe { Self::dictionary_entry_live(entry) };
+            if marker == 0 {
+                continue;
+            }
+            let destination_offset = usize::try_from(output_index)
+                .ok()
+                .and_then(|index| index.checked_mul(usize::try_from(entry_size).ok()?))
+                .expect("validated snapshot size");
+            #[allow(unsafe_code)]
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    entry.add(layout.key_offset),
+                    output
+                        .add(destination_offset)
+                        .add(usize::try_from(key_offset).unwrap_or(0)),
+                    usize::try_from(key_size).unwrap_or(0),
+                );
+                ptr::copy_nonoverlapping(
+                    entry.add(layout.value_offset),
+                    output
+                        .add(destination_offset)
+                        .add(usize::try_from(value_offset).unwrap_or(0)),
+                    usize::try_from(value_size).unwrap_or(0),
+                );
+            }
+            output_index += 1;
+        }
+        array
     }
 
     /// Every invariant a well-formed `AsterList` header must satisfy,
@@ -1203,6 +2391,390 @@ pub extern "C" fn aster_rt_list_length(
     }
 }
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_dictionary_new(
+    context: *mut ExecutionContext,
+    key_kind: i32,
+    key_size: i32,
+    key_align: i32,
+    key_type_key: i64,
+    value_size: i32,
+    value_align: i32,
+    value_type_key: i64,
+) -> *mut AsterDictionary {
+    if context.is_null() {
+        return ptr::null_mut();
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let Some(key_kind) = DictionaryKeyKind::from_abi(key_kind) else {
+        context.fail("Dictionary allocation received an invalid key kind");
+        return ptr::null_mut();
+    };
+    #[allow(clippy::cast_sign_loss)]
+    let key_type_key = key_type_key as u64;
+    #[allow(clippy::cast_sign_loss)]
+    let value_type_key = value_type_key as u64;
+    context.allocate_dictionary_in_region(
+        key_kind,
+        u32::try_from(key_size).unwrap_or(0),
+        u32::try_from(key_align).unwrap_or(0),
+        key_type_key,
+        u32::try_from(value_size).unwrap_or(0),
+        u32::try_from(value_align).unwrap_or(0),
+        value_type_key,
+        ListRegion::Persistent,
+    )
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_dictionary_new_temporary(
+    context: *mut ExecutionContext,
+    key_kind: i32,
+    key_size: i32,
+    key_align: i32,
+    key_type_key: i64,
+    value_size: i32,
+    value_align: i32,
+    value_type_key: i64,
+) -> *mut AsterDictionary {
+    if context.is_null() {
+        return ptr::null_mut();
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let Some(key_kind) = DictionaryKeyKind::from_abi(key_kind) else {
+        context.fail("Dictionary allocation received an invalid key kind");
+        return ptr::null_mut();
+    };
+    #[allow(clippy::cast_sign_loss)]
+    let key_type_key = key_type_key as u64;
+    #[allow(clippy::cast_sign_loss)]
+    let value_type_key = value_type_key as u64;
+    context.allocate_dictionary_in_region(
+        key_kind,
+        u32::try_from(key_size).unwrap_or(0),
+        u32::try_from(key_align).unwrap_or(0),
+        key_type_key,
+        u32::try_from(value_size).unwrap_or(0),
+        u32::try_from(value_align).unwrap_or(0),
+        value_type_key,
+        ListRegion::Temporary,
+    )
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_dictionary_length(
+    context: *mut ExecutionContext,
+    dictionary: *const AsterDictionary,
+) -> i32 {
+    if context.is_null() {
+        return 0;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    if context.error.is_some() {
+        return 0;
+    }
+    if dictionary.is_null() {
+        context.fail("Dictionary.Length received a null Dictionary");
+        return 0;
+    }
+    if !context.validate_dictionary_header(dictionary) {
+        return 0;
+    }
+    #[allow(unsafe_code)]
+    unsafe {
+        (*dictionary).length
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_dictionary_add(
+    context: *mut ExecutionContext,
+    dictionary: *mut AsterDictionary,
+    key_kind: i32,
+    key_size: i32,
+    key_align: i32,
+    key_type_key: i64,
+    value_size: i32,
+    value_align: i32,
+    value_type_key: i64,
+    key: *const u8,
+    value: *const u8,
+) -> i8 {
+    dictionary_add_or_set_abi(
+        context,
+        dictionary,
+        key_kind,
+        key_size,
+        key_align,
+        key_type_key,
+        value_size,
+        value_align,
+        value_type_key,
+        key,
+        value,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_dictionary_set(
+    context: *mut ExecutionContext,
+    dictionary: *mut AsterDictionary,
+    key_kind: i32,
+    key_size: i32,
+    key_align: i32,
+    key_type_key: i64,
+    value_size: i32,
+    value_align: i32,
+    value_type_key: i64,
+    key: *const u8,
+    value: *const u8,
+) -> i8 {
+    dictionary_add_or_set_abi(
+        context,
+        dictionary,
+        key_kind,
+        key_size,
+        key_align,
+        key_type_key,
+        value_size,
+        value_align,
+        value_type_key,
+        key,
+        value,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dictionary_add_or_set_abi(
+    context: *mut ExecutionContext,
+    dictionary: *mut AsterDictionary,
+    key_kind: i32,
+    key_size: i32,
+    key_align: i32,
+    key_type_key: i64,
+    value_size: i32,
+    value_align: i32,
+    value_type_key: i64,
+    key: *const u8,
+    value: *const u8,
+    replace: bool,
+) -> i8 {
+    if context.is_null() {
+        return 0;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let Some(key_kind) = DictionaryKeyKind::from_abi(key_kind) else {
+        context.fail("Dictionary operation received an invalid key kind");
+        return 0;
+    };
+    #[allow(clippy::cast_sign_loss)]
+    context.dictionary_add_or_set(
+        dictionary,
+        key_kind,
+        u32::try_from(key_size).unwrap_or(0),
+        u32::try_from(key_align).unwrap_or(0),
+        key_type_key as u64,
+        u32::try_from(value_size).unwrap_or(0),
+        u32::try_from(value_align).unwrap_or(0),
+        value_type_key as u64,
+        key,
+        value,
+        replace,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_dictionary_contains_key(
+    context: *mut ExecutionContext,
+    dictionary: *mut AsterDictionary,
+    key_kind: i32,
+    key_size: i32,
+    key_align: i32,
+    key_type_key: i64,
+    value_size: i32,
+    value_align: i32,
+    value_type_key: i64,
+    key: *const u8,
+) -> i8 {
+    dictionary_contains_or_remove_abi(
+        context,
+        dictionary,
+        key_kind,
+        key_size,
+        key_align,
+        key_type_key,
+        value_size,
+        value_align,
+        value_type_key,
+        key,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_dictionary_remove(
+    context: *mut ExecutionContext,
+    dictionary: *mut AsterDictionary,
+    key_kind: i32,
+    key_size: i32,
+    key_align: i32,
+    key_type_key: i64,
+    value_size: i32,
+    value_align: i32,
+    value_type_key: i64,
+    key: *const u8,
+) -> i8 {
+    dictionary_contains_or_remove_abi(
+        context,
+        dictionary,
+        key_kind,
+        key_size,
+        key_align,
+        key_type_key,
+        value_size,
+        value_align,
+        value_type_key,
+        key,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dictionary_contains_or_remove_abi(
+    context: *mut ExecutionContext,
+    dictionary: *mut AsterDictionary,
+    key_kind: i32,
+    key_size: i32,
+    key_align: i32,
+    key_type_key: i64,
+    value_size: i32,
+    value_align: i32,
+    value_type_key: i64,
+    key: *const u8,
+    remove: bool,
+) -> i8 {
+    if context.is_null() {
+        return 0;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let Some(key_kind) = DictionaryKeyKind::from_abi(key_kind) else {
+        context.fail("Dictionary operation received an invalid key kind");
+        return 0;
+    };
+    #[allow(clippy::cast_sign_loss)]
+    context.dictionary_contains_or_remove(
+        dictionary,
+        key_kind,
+        u32::try_from(key_size).unwrap_or(0),
+        u32::try_from(key_align).unwrap_or(0),
+        key_type_key as u64,
+        u32::try_from(value_size).unwrap_or(0),
+        u32::try_from(value_align).unwrap_or(0),
+        value_type_key as u64,
+        key,
+        remove,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_dictionary_try_get(
+    context: *mut ExecutionContext,
+    dictionary: *mut AsterDictionary,
+    key_kind: i32,
+    key_size: i32,
+    key_align: i32,
+    key_type_key: i64,
+    value_size: i32,
+    value_align: i32,
+    value_type_key: i64,
+    key: *const u8,
+    destination: *mut u8,
+    total_size: i32,
+    some_tag: i32,
+    none_tag: i32,
+    payload_offset: i32,
+) {
+    if context.is_null() {
+        return;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let Some(key_kind) = DictionaryKeyKind::from_abi(key_kind) else {
+        context.fail("Dictionary.TryGet received an invalid key kind");
+        return;
+    };
+    #[allow(clippy::cast_sign_loss)]
+    context.dictionary_try_get(
+        dictionary,
+        key_kind,
+        u32::try_from(key_size).unwrap_or(0),
+        u32::try_from(key_align).unwrap_or(0),
+        key_type_key as u64,
+        u32::try_from(value_size).unwrap_or(0),
+        u32::try_from(value_align).unwrap_or(0),
+        value_type_key as u64,
+        key,
+        destination,
+        u32::try_from(total_size).unwrap_or(0),
+        u32::try_from(some_tag).unwrap_or(0),
+        u32::try_from(none_tag).unwrap_or(0),
+        u32::try_from(payload_offset).unwrap_or(u32::MAX),
+    );
+}
+
+#[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_dictionary_entries(
+    context: *mut ExecutionContext,
+    dictionary: *mut AsterDictionary,
+    key_kind: i32,
+    key_size: i32,
+    key_align: i32,
+    key_type_key: i64,
+    value_size: i32,
+    value_align: i32,
+    value_type_key: i64,
+    entry_size: i32,
+    key_offset: i32,
+    value_offset: i32,
+    temporary: i8,
+) -> *mut AsterArray {
+    if context.is_null() {
+        return ptr::null_mut();
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let Some(key_kind) = DictionaryKeyKind::from_abi(key_kind) else {
+        context.fail("Dictionary.Entries received an invalid key kind");
+        return ptr::null_mut();
+    };
+    #[allow(clippy::cast_sign_loss)]
+    context.dictionary_entries(
+        dictionary,
+        key_kind,
+        u32::try_from(key_size).unwrap_or(0),
+        u32::try_from(key_align).unwrap_or(0),
+        key_type_key as u64,
+        u32::try_from(value_size).unwrap_or(0),
+        u32::try_from(value_align).unwrap_or(0),
+        value_type_key as u64,
+        u32::try_from(entry_size).unwrap_or(0),
+        u32::try_from(key_offset).unwrap_or(u32::MAX),
+        u32::try_from(value_offset).unwrap_or(u32::MAX),
+        if temporary == 0 {
+            ListRegion::Persistent
+        } else {
+            ListRegion::Temporary
+        },
+    )
+}
+
 /// Reads the current structural-modification counter. See `foreach`'s
 /// fail-fast lowering: captured once before the loop, then compared before
 /// every element read. Never exposed as an Aster-level property.
@@ -1328,6 +2900,8 @@ pub extern "C" fn aster_rt_list_remove_at(
 mod tests {
     use super::*;
     use crate::object::{aster_rt_object_new, aster_rt_object_new_temporary};
+    use std::collections::BTreeMap;
+    use std::time::Instant;
 
     #[test]
     fn empty_list_header_satisfies_every_invariant() {
@@ -1355,6 +2929,1409 @@ mod tests {
             context
                 .take_error()
                 .is_some_and(|error| error.contains("size"))
+        );
+    }
+
+    #[test]
+    fn empty_dictionary_header_is_valid_and_allocates_no_buffers() {
+        let mut context = ExecutionContext::new();
+        let dictionary = context.allocate_dictionary_in_region(
+            DictionaryKeyKind::Long,
+            8,
+            8,
+            1,
+            4,
+            4,
+            2,
+            ListRegion::Persistent,
+        );
+        assert!(!dictionary.is_null());
+        assert_eq!(aster_rt_dictionary_length(&raw mut context, dictionary), 0);
+        // SAFETY: this test owns the fresh runtime header and only observes it.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!((*dictionary).bucket_capacity, 0);
+            assert_eq!((*dictionary).entry_capacity, 0);
+            assert_eq!((*dictionary).entry_count, 0);
+            assert_eq!((*dictionary).region(), ListRegion::Persistent);
+        }
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    fn dictionary_rejects_invalid_layout_without_publishing_a_header() {
+        let mut context = ExecutionContext::new();
+        assert!(
+            context
+                .allocate_dictionary_in_region(
+                    DictionaryKeyKind::Int,
+                    4,
+                    3,
+                    1,
+                    4,
+                    4,
+                    2,
+                    ListRegion::Persistent,
+                )
+                .is_null()
+        );
+        assert!(context.take_error().is_some());
+    }
+
+    #[test]
+    fn dictionary_failures_are_first_error_wins_and_context_local() {
+        let mut failing = ExecutionContext::new();
+        assert!(
+            failing
+                .allocate_dictionary_in_region(
+                    DictionaryKeyKind::Int,
+                    4,
+                    3,
+                    1,
+                    4,
+                    4,
+                    2,
+                    ListRegion::Persistent,
+                )
+                .is_null()
+        );
+        let first = failing
+            .take_error()
+            .expect("invalid alignment records an error");
+        // Restore the first error through a second controlled failure: the context's
+        // normal first-error policy must not be replaced by later operations.
+        failing.fail(first.clone());
+        assert!(
+            failing
+                .allocate_dictionary_in_region(
+                    DictionaryKeyKind::Int,
+                    0,
+                    4,
+                    1,
+                    4,
+                    4,
+                    2,
+                    ListRegion::Persistent,
+                )
+                .is_null()
+        );
+        assert_eq!(failing.take_error(), Some(first));
+
+        let mut independent = ExecutionContext::new();
+        let dictionary = independent.allocate_dictionary_in_region(
+            DictionaryKeyKind::Int,
+            4,
+            4,
+            1,
+            8,
+            8,
+            2,
+            ListRegion::Persistent,
+        );
+        assert!(!dictionary.is_null());
+        assert_eq!(
+            aster_rt_dictionary_length(&raw mut independent, dictionary),
+            0
+        );
+        assert!(independent.take_error().is_none());
+    }
+
+    #[test]
+    fn dictionary_owner_and_corrupted_chain_fail_without_cross_context_contamination() {
+        let mut owner = ExecutionContext::new();
+        let dictionary = owner.allocate_dictionary_in_region(
+            DictionaryKeyKind::Int,
+            4,
+            4,
+            1,
+            4,
+            4,
+            2,
+            ListRegion::Persistent,
+        );
+        let key = 7_i32;
+        let value = 42_i32;
+        assert_eq!(
+            owner.dictionary_add_or_set(
+                dictionary,
+                DictionaryKeyKind::Int,
+                4,
+                4,
+                1,
+                4,
+                4,
+                2,
+                (&raw const key).cast(),
+                (&raw const value).cast(),
+                false,
+            ),
+            1
+        );
+
+        let mut wrong_context = ExecutionContext::new();
+        assert_eq!(
+            aster_rt_dictionary_length(&raw mut wrong_context, dictionary),
+            0
+        );
+        let ownership_error = wrong_context.take_error().expect("ownership error");
+        assert!(
+            ownership_error.contains("ExecutionContext"),
+            "{ownership_error}"
+        );
+        assert_eq!(aster_rt_dictionary_length(&raw mut owner, dictionary), 1);
+        assert!(owner.take_error().is_none());
+
+        // Corrupt only the bucket index in a valid, owned allocation. No
+        // arbitrary pointer is fabricated or dereferenced.
+        let hash = owner
+            .dictionary_hash_key(DictionaryKeyKind::Int, (&raw const key).cast(), 4, "test")
+            .expect("hash");
+        // SAFETY: the header and bucket buffer were allocated by `owner`.
+        #[allow(unsafe_code)]
+        unsafe {
+            let bucket = usize::try_from(
+                hash & (u64::try_from((*dictionary).bucket_capacity).expect("capacity") - 1),
+            )
+            .expect("bucket");
+            *(*dictionary).buckets.add(bucket) =
+                u32::try_from((*dictionary).entry_count).expect("entry count");
+        }
+        assert_eq!(
+            owner.dictionary_contains_or_remove(
+                dictionary,
+                DictionaryKeyKind::Int,
+                4,
+                4,
+                1,
+                4,
+                4,
+                2,
+                (&raw const key).cast(),
+                false,
+            ),
+            0
+        );
+        let chain_error = owner.take_error().expect("chain error");
+        assert!(
+            chain_error.contains("invalid") || chain_error.contains("cyclic"),
+            "{chain_error}"
+        );
+
+        let mut independent = ExecutionContext::new();
+        let valid = independent.allocate_dictionary_in_region(
+            DictionaryKeyKind::Int,
+            4,
+            4,
+            1,
+            4,
+            4,
+            2,
+            ListRegion::Persistent,
+        );
+        assert_eq!(aster_rt_dictionary_length(&raw mut independent, valid), 0);
+        assert!(independent.take_error().is_none());
+    }
+
+    #[test]
+    fn dictionary_first_error_prevents_later_publication_or_replacement() {
+        let mut context = ExecutionContext::new();
+        context.fail("first dictionary failure");
+        let dictionary = context.allocate_dictionary_in_region(
+            DictionaryKeyKind::Int,
+            4,
+            4,
+            1,
+            4,
+            4,
+            2,
+            ListRegion::Persistent,
+        );
+        assert!(dictionary.is_null());
+        context.fail("later dictionary failure");
+        assert_eq!(
+            context.take_error().as_deref(),
+            Some("first dictionary failure")
+        );
+    }
+
+    #[test]
+    fn siphash13_matches_reference_vectors() {
+        let key0 = 0x0706_0504_0302_0100;
+        let key1 = 0x0f0e_0d0c_0b0a_0908;
+        let input = (0_u8..64).collect::<Vec<_>>();
+        let expected = [
+            0xabac_0158_050f_c4dc,
+            0xc9f4_9bf3_7d57_ca93,
+            0x82cb_9b02_4dc7_d44d,
+            0x8bf8_0ab8_e7dd_f7fb,
+            0xcf75_5760_88d3_8328,
+        ];
+        for (length, expected) in expected.into_iter().enumerate() {
+            assert_eq!(siphash13(key0, key1, &input[..length]), expected);
+        }
+    }
+
+    #[test]
+    fn dictionary_hashes_every_key_kind_from_its_canonical_bytes() {
+        let mut context = ExecutionContext::new();
+        context.dictionary_hash_k0 = 0x0706_0504_0302_0100;
+        context.dictionary_hash_k1 = 0x0f0e_0d0c_0b0a_0908;
+        macro_rules! check {
+            ($kind:expr, $value:expr, $bytes:expr) => {{
+                let value = $value;
+                let bytes = $bytes;
+                assert_eq!(
+                    context
+                        .dictionary_hash_key(
+                            $kind,
+                            (&raw const value).cast(),
+                            u32::try_from(bytes.len()).expect("key size"),
+                            "test",
+                        )
+                        .expect("hash"),
+                    siphash13(
+                        context.dictionary_hash_k0,
+                        context.dictionary_hash_k1,
+                        &bytes,
+                    )
+                );
+            }};
+        }
+        check!(DictionaryKeyKind::Bool, 1_u8, [1_u8]);
+        check!(
+            DictionaryKeyKind::Char,
+            u32::from('\u{1f642}'),
+            u32::from('\u{1f642}').to_le_bytes()
+        );
+        check!(DictionaryKeyKind::SByte, i8::MIN, i8::MIN.to_le_bytes());
+        check!(DictionaryKeyKind::Byte, u8::MAX, u8::MAX.to_le_bytes());
+        check!(DictionaryKeyKind::Short, i16::MIN, i16::MIN.to_le_bytes());
+        check!(DictionaryKeyKind::UShort, u16::MAX, u16::MAX.to_le_bytes());
+        check!(DictionaryKeyKind::Int, i32::MIN, i32::MIN.to_le_bytes());
+        check!(DictionaryKeyKind::UInt, u32::MAX, u32::MAX.to_le_bytes());
+        check!(DictionaryKeyKind::Long, i64::MIN, i64::MIN.to_le_bytes());
+        check!(DictionaryKeyKind::ULong, u64::MAX, u64::MAX.to_le_bytes());
+
+        let string = context.allocate_string_parts(&["a\0\u{00e9}"]);
+        assert_eq!(
+            context
+                .dictionary_hash_key(
+                    DictionaryKeyKind::String,
+                    (&raw const string).cast(),
+                    u32::try_from(size_of::<*const AsterStrHeader>()).expect("pointer"),
+                    "test",
+                )
+                .expect("string hash"),
+            siphash13(
+                context.dictionary_hash_k0,
+                context.dictionary_hash_k1,
+                "a\0\u{00e9}".as_bytes(),
+            )
+        );
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    fn dictionary_public_order_does_not_depend_on_context_seed() {
+        fn build(k0: u64, k1: u64) -> Vec<(i32, i32)> {
+            let mut context = ExecutionContext::new();
+            context.dictionary_hash_k0 = k0;
+            context.dictionary_hash_k1 = k1;
+            let dictionary = context.allocate_dictionary_in_region(
+                DictionaryKeyKind::Int,
+                4,
+                4,
+                1,
+                4,
+                4,
+                2,
+                ListRegion::Persistent,
+            );
+            for key in [9_i32, 1, 7, 3, 5] {
+                let value = key * 10;
+                assert_eq!(
+                    context.dictionary_add_or_set(
+                        dictionary,
+                        DictionaryKeyKind::Int,
+                        4,
+                        4,
+                        1,
+                        4,
+                        4,
+                        2,
+                        (&raw const key).cast(),
+                        (&raw const value).cast(),
+                        false,
+                    ),
+                    1
+                );
+            }
+            live_int_entries(dictionary)
+        }
+        assert_eq!(build(1, 2), build(0xfeed, 0xbeef));
+    }
+
+    #[test]
+    fn dictionary_collision_chain_supports_head_middle_and_tail_removal() {
+        let mut context = ExecutionContext::new();
+        context.dictionary_hash_k0 = 1;
+        context.dictionary_hash_k1 = 2;
+        let mut colliding = Vec::new();
+        for candidate in 0_i32..10_000 {
+            let hash = context
+                .dictionary_hash_key(
+                    DictionaryKeyKind::Int,
+                    (&raw const candidate).cast(),
+                    4,
+                    "test",
+                )
+                .expect("hash");
+            if hash.trailing_zeros() >= 3 {
+                colliding.push(candidate);
+                if colliding.len() == 4 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(colliding.len(), 4);
+        let dictionary = context.allocate_dictionary_in_region(
+            DictionaryKeyKind::Int,
+            4,
+            4,
+            1,
+            4,
+            4,
+            2,
+            ListRegion::Persistent,
+        );
+        for key in &colliding {
+            assert_eq!(
+                context.dictionary_add_or_set(
+                    dictionary,
+                    DictionaryKeyKind::Int,
+                    4,
+                    4,
+                    1,
+                    4,
+                    4,
+                    2,
+                    ptr::from_ref(key).cast(),
+                    ptr::from_ref(key).cast(),
+                    false,
+                ),
+                1
+            );
+        }
+        for index in [3_usize, 1, 0] {
+            let key = colliding[index];
+            assert_eq!(
+                context.dictionary_contains_or_remove(
+                    dictionary,
+                    DictionaryKeyKind::Int,
+                    4,
+                    4,
+                    1,
+                    4,
+                    4,
+                    2,
+                    (&raw const key).cast(),
+                    true,
+                ),
+                1
+            );
+        }
+        let remaining = colliding[2];
+        assert_eq!(
+            context.dictionary_contains_or_remove(
+                dictionary,
+                DictionaryKeyKind::Int,
+                4,
+                4,
+                1,
+                4,
+                4,
+                2,
+                (&raw const remaining).cast(),
+                false,
+            ),
+            1
+        );
+        assert_eq!(live_int_entries(dictionary), vec![(remaining, remaining)]);
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn dictionary_growth_tombstones_and_snapshot_preserve_insertion_order() {
+        let mut context = ExecutionContext::with_stats();
+        context.dictionary_hash_k0 = 0x0706_0504_0302_0100;
+        context.dictionary_hash_k1 = 0x0f0e_0d0c_0b0a_0908;
+        let dictionary = context.allocate_dictionary_in_region(
+            DictionaryKeyKind::Int,
+            4,
+            4,
+            1,
+            4,
+            4,
+            2,
+            ListRegion::Persistent,
+        );
+        assert!(!dictionary.is_null());
+        for key in 0_i32..1_000 {
+            let value = key * 2;
+            assert_eq!(
+                context.dictionary_add_or_set(
+                    dictionary,
+                    DictionaryKeyKind::Int,
+                    4,
+                    4,
+                    1,
+                    4,
+                    4,
+                    2,
+                    (&raw const key).cast(),
+                    (&raw const value).cast(),
+                    false,
+                ),
+                1
+            );
+        }
+        for key in (0_i32..1_000).step_by(2) {
+            assert_eq!(
+                context.dictionary_contains_or_remove(
+                    dictionary,
+                    DictionaryKeyKind::Int,
+                    4,
+                    4,
+                    1,
+                    4,
+                    4,
+                    2,
+                    (&raw const key).cast(),
+                    true,
+                ),
+                1
+            );
+        }
+        for key in (0_i32..1_000).step_by(2) {
+            let value = key * 3;
+            assert_eq!(
+                context.dictionary_add_or_set(
+                    dictionary,
+                    DictionaryKeyKind::Int,
+                    4,
+                    4,
+                    1,
+                    4,
+                    4,
+                    2,
+                    (&raw const key).cast(),
+                    (&raw const value).cast(),
+                    false,
+                ),
+                1
+            );
+        }
+        let before_snapshot = context.memory_stats().clone();
+        let snapshot = context.dictionary_entries(
+            dictionary,
+            DictionaryKeyKind::Int,
+            4,
+            4,
+            1,
+            4,
+            4,
+            2,
+            8,
+            0,
+            4,
+            ListRegion::Persistent,
+        );
+        assert!(!snapshot.is_null());
+        assert_eq!(
+            context.memory_stats().total_allocations - before_snapshot.total_allocations,
+            1
+        );
+        assert_eq!(
+            context.memory_stats().array_allocations - before_snapshot.array_allocations,
+            1
+        );
+        assert_eq!(
+            context.memory_stats().string_allocations,
+            before_snapshot.string_allocations
+        );
+        // SAFETY: the runtime allocated a 1000-element array of two i32 fields.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!((*snapshot).length, 1_000);
+            let pairs = std::slice::from_raw_parts((*snapshot).data.cast::<i32>(), 2_000);
+            assert_eq!(&pairs[..4], &[1, 2, 3, 6]);
+            assert_eq!(&pairs[998..1002], &[999, 1998, 0, 0]);
+            assert_eq!(&pairs[1998..], &[998, 2994]);
+            assert_eq!((*dictionary).bucket_capacity.count_ones(), 1);
+            assert_eq!((*dictionary).length, 1_000);
+        }
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    fn dictionary_read_operations_and_duplicates_do_not_allocate() {
+        let mut context = ExecutionContext::with_stats();
+        let dictionary = context.allocate_dictionary_in_region(
+            DictionaryKeyKind::Int,
+            4,
+            4,
+            1,
+            4,
+            4,
+            2,
+            ListRegion::Persistent,
+        );
+        let key = 7_i32;
+        let value = 42_i32;
+        assert_eq!(
+            context.dictionary_add_or_set(
+                dictionary,
+                DictionaryKeyKind::Int,
+                4,
+                4,
+                1,
+                4,
+                4,
+                2,
+                (&raw const key).cast(),
+                (&raw const value).cast(),
+                false,
+            ),
+            1
+        );
+        let before = context.memory_stats().clone();
+        for _ in 0..1_000 {
+            assert_eq!(aster_rt_dictionary_length(&raw mut context, dictionary), 1);
+            assert_eq!(
+                context.dictionary_contains_or_remove(
+                    dictionary,
+                    DictionaryKeyKind::Int,
+                    4,
+                    4,
+                    1,
+                    4,
+                    4,
+                    2,
+                    (&raw const key).cast(),
+                    false,
+                ),
+                1
+            );
+            assert_eq!(
+                context.dictionary_add_or_set(
+                    dictionary,
+                    DictionaryKeyKind::Int,
+                    4,
+                    4,
+                    1,
+                    4,
+                    4,
+                    2,
+                    (&raw const key).cast(),
+                    (&raw const value).cast(),
+                    false,
+                ),
+                0
+            );
+            let mut option = [0_u8; 8];
+            context.dictionary_try_get(
+                dictionary,
+                DictionaryKeyKind::Int,
+                4,
+                4,
+                1,
+                4,
+                4,
+                2,
+                (&raw const key).cast(),
+                option.as_mut_ptr(),
+                8,
+                1,
+                0,
+                4,
+            );
+            assert_eq!(u32::from_ne_bytes(option[..4].try_into().expect("tag")), 1);
+            assert_eq!(
+                i32::from_ne_bytes(option[4..].try_into().expect("value")),
+                42
+            );
+        }
+        assert_eq!(context.memory_stats(), &before);
+        assert!(context.take_error().is_none());
+    }
+
+    fn live_int_entries(dictionary: *const AsterDictionary) -> Vec<(i32, i32)> {
+        // SAFETY: callers pass a runtime-created Dictionary<int, int> whose
+        // header remains owned by the live test context.
+        #[allow(unsafe_code)]
+        unsafe {
+            let layout = dictionary_entry_layout(4, 4, 4, 4).expect("i32 entry layout");
+            let mut entries = Vec::new();
+            for index in 0..(*dictionary).entry_count {
+                let entry = ExecutionContext::dictionary_entry_pointer(
+                    (*dictionary).entries,
+                    index,
+                    layout,
+                )
+                .expect("validated entry");
+                if ExecutionContext::dictionary_entry_live(entry) == 1 {
+                    entries.push((
+                        ptr::read_unaligned(entry.add(layout.key_offset).cast::<i32>()),
+                        ptr::read_unaligned(entry.add(layout.value_offset).cast::<i32>()),
+                    ));
+                }
+            }
+            entries
+        }
+    }
+
+    fn live_string_entries(dictionary: *const AsterDictionary) -> Vec<(String, i32)> {
+        // SAFETY: callers pass a runtime-created Dictionary<string, int>.
+        // Every string pointer was allocated persistently by the same live
+        // context before insertion.
+        #[allow(unsafe_code)]
+        unsafe {
+            let pointer_size = u32::try_from(size_of::<*const AsterStrHeader>()).expect("pointer");
+            let pointer_align =
+                u32::try_from(align_of::<*const AsterStrHeader>()).expect("pointer");
+            let layout =
+                dictionary_entry_layout(pointer_size, pointer_align, 4, 4).expect("string entry");
+            let mut entries = Vec::new();
+            for index in 0..(*dictionary).entry_count {
+                let entry = ExecutionContext::dictionary_entry_pointer(
+                    (*dictionary).entries,
+                    index,
+                    layout,
+                )
+                .expect("validated entry");
+                if ExecutionContext::dictionary_entry_live(entry) == 1 {
+                    let key = ptr::read_unaligned(
+                        entry.add(layout.key_offset).cast::<*const AsterStrHeader>(),
+                    );
+                    entries.push((
+                        crate::string::view(key)
+                            .expect("valid stored string")
+                            .to_owned(),
+                        ptr::read_unaligned(entry.add(layout.value_offset).cast::<i32>()),
+                    ));
+                }
+            }
+            entries
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn dictionary_differential_int_model_matches_every_operation_and_order() {
+        let mut context = ExecutionContext::with_stats();
+        context.dictionary_hash_k0 = 0x0706_0504_0302_0100;
+        context.dictionary_hash_k1 = 0x0f0e_0d0c_0b0a_0908;
+        let dictionary = context.allocate_dictionary_in_region(
+            DictionaryKeyKind::Int,
+            4,
+            4,
+            1,
+            4,
+            4,
+            2,
+            ListRegion::Persistent,
+        );
+        let mut values = BTreeMap::<i32, i32>::new();
+        let mut order = Vec::<i32>::new();
+        let mut state = 0x4d34_2d69_6e74_u64;
+        for step in 0_i32..5_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let key = i32::try_from(state % 97).expect("small key") - 48;
+            let value = step.wrapping_mul(31).wrapping_add(key);
+            match (state >> 32) % 6 {
+                0 => {
+                    let expected = !values.contains_key(&key);
+                    let actual = context.dictionary_add_or_set(
+                        dictionary,
+                        DictionaryKeyKind::Int,
+                        4,
+                        4,
+                        1,
+                        4,
+                        4,
+                        2,
+                        (&raw const key).cast(),
+                        (&raw const value).cast(),
+                        false,
+                    ) != 0;
+                    assert_eq!(actual, expected);
+                    if expected {
+                        values.insert(key, value);
+                        order.push(key);
+                    }
+                }
+                1 => {
+                    let expected = values.contains_key(&key);
+                    let actual = context.dictionary_add_or_set(
+                        dictionary,
+                        DictionaryKeyKind::Int,
+                        4,
+                        4,
+                        1,
+                        4,
+                        4,
+                        2,
+                        (&raw const key).cast(),
+                        (&raw const value).cast(),
+                        true,
+                    ) != 0;
+                    assert_eq!(actual, expected);
+                    if !expected {
+                        order.push(key);
+                    }
+                    values.insert(key, value);
+                }
+                2 => {
+                    let actual = context.dictionary_contains_or_remove(
+                        dictionary,
+                        DictionaryKeyKind::Int,
+                        4,
+                        4,
+                        1,
+                        4,
+                        4,
+                        2,
+                        (&raw const key).cast(),
+                        false,
+                    ) != 0;
+                    assert_eq!(actual, values.contains_key(&key));
+                }
+                3 => {
+                    let expected = values.remove(&key).is_some();
+                    let actual = context.dictionary_contains_or_remove(
+                        dictionary,
+                        DictionaryKeyKind::Int,
+                        4,
+                        4,
+                        1,
+                        4,
+                        4,
+                        2,
+                        (&raw const key).cast(),
+                        true,
+                    ) != 0;
+                    assert_eq!(actual, expected);
+                    if expected {
+                        order.retain(|existing| *existing != key);
+                    }
+                }
+                4 => {
+                    let mut option = [0_u8; 8];
+                    context.dictionary_try_get(
+                        dictionary,
+                        DictionaryKeyKind::Int,
+                        4,
+                        4,
+                        1,
+                        4,
+                        4,
+                        2,
+                        (&raw const key).cast(),
+                        option.as_mut_ptr(),
+                        8,
+                        1,
+                        0,
+                        4,
+                    );
+                    let actual = if u32::from_ne_bytes(option[..4].try_into().expect("tag")) == 1 {
+                        Some(i32::from_ne_bytes(option[4..].try_into().expect("payload")))
+                    } else {
+                        None
+                    };
+                    assert_eq!(actual, values.get(&key).copied());
+                }
+                _ => {}
+            }
+            let expected = order
+                .iter()
+                .map(|key| (*key, values[key]))
+                .collect::<Vec<_>>();
+            assert_eq!(live_int_entries(dictionary), expected);
+            // SAFETY: the header belongs to this live context.
+            #[allow(unsafe_code)]
+            unsafe {
+                assert_eq!(
+                    (*dictionary).length,
+                    i32::try_from(values.len()).expect("small model")
+                );
+            }
+        }
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn dictionary_differential_string_model_is_ordinal_and_ordered() {
+        let mut context = ExecutionContext::with_stats();
+        context.dictionary_hash_k0 = 7;
+        context.dictionary_hash_k1 = 11;
+        let pointer_size = u32::try_from(size_of::<*const AsterStrHeader>()).expect("pointer");
+        let pointer_align = u32::try_from(align_of::<*const AsterStrHeader>()).expect("pointer");
+        let keys = [
+            "",
+            "A",
+            "a",
+            "\u{00e9}",
+            "e\u{0301}",
+            "a\0b",
+            "\u{03b2}",
+            "\u{1f642}",
+            "word-0",
+            "word-1",
+            "word-2",
+            "word-3",
+            "word-4",
+        ];
+        let pointers = keys
+            .iter()
+            .map(|key| context.allocate_string_parts(&[key]))
+            .collect::<Vec<_>>();
+        let dictionary = context.allocate_dictionary_in_region(
+            DictionaryKeyKind::String,
+            pointer_size,
+            pointer_align,
+            3,
+            4,
+            4,
+            4,
+            ListRegion::Persistent,
+        );
+        let mut values = BTreeMap::<String, i32>::new();
+        let mut order = Vec::<String>::new();
+        let mut state = 0x4d34_2d73_7472_u64;
+        for step in 0_i32..2_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let key_index = usize::try_from(state % keys.len() as u64).expect("key index");
+            let key = keys[key_index];
+            let key_pointer = pointers[key_index];
+            let value = step.wrapping_mul(17);
+            match (state >> 29) % 6 {
+                0 => {
+                    let expected = !values.contains_key(key);
+                    let actual = context.dictionary_add_or_set(
+                        dictionary,
+                        DictionaryKeyKind::String,
+                        pointer_size,
+                        pointer_align,
+                        3,
+                        4,
+                        4,
+                        4,
+                        (&raw const key_pointer).cast(),
+                        (&raw const value).cast(),
+                        false,
+                    ) != 0;
+                    assert_eq!(actual, expected);
+                    if expected {
+                        values.insert(key.to_owned(), value);
+                        order.push(key.to_owned());
+                    }
+                }
+                1 => {
+                    let expected = values.contains_key(key);
+                    let actual = context.dictionary_add_or_set(
+                        dictionary,
+                        DictionaryKeyKind::String,
+                        pointer_size,
+                        pointer_align,
+                        3,
+                        4,
+                        4,
+                        4,
+                        (&raw const key_pointer).cast(),
+                        (&raw const value).cast(),
+                        true,
+                    ) != 0;
+                    assert_eq!(actual, expected);
+                    if !expected {
+                        order.push(key.to_owned());
+                    }
+                    values.insert(key.to_owned(), value);
+                }
+                2 => {
+                    assert_eq!(
+                        context.dictionary_contains_or_remove(
+                            dictionary,
+                            DictionaryKeyKind::String,
+                            pointer_size,
+                            pointer_align,
+                            3,
+                            4,
+                            4,
+                            4,
+                            (&raw const key_pointer).cast(),
+                            false,
+                        ) != 0,
+                        values.contains_key(key)
+                    );
+                }
+                3 => {
+                    let expected = values.remove(key).is_some();
+                    assert_eq!(
+                        context.dictionary_contains_or_remove(
+                            dictionary,
+                            DictionaryKeyKind::String,
+                            pointer_size,
+                            pointer_align,
+                            3,
+                            4,
+                            4,
+                            4,
+                            (&raw const key_pointer).cast(),
+                            true,
+                        ) != 0,
+                        expected
+                    );
+                    if expected {
+                        order.retain(|existing| existing != key);
+                    }
+                }
+                4 => {
+                    let mut option = [0_u8; 8];
+                    context.dictionary_try_get(
+                        dictionary,
+                        DictionaryKeyKind::String,
+                        pointer_size,
+                        pointer_align,
+                        3,
+                        4,
+                        4,
+                        4,
+                        (&raw const key_pointer).cast(),
+                        option.as_mut_ptr(),
+                        8,
+                        1,
+                        0,
+                        4,
+                    );
+                    let actual = if u32::from_ne_bytes(option[..4].try_into().expect("tag")) == 1 {
+                        Some(i32::from_ne_bytes(option[4..].try_into().expect("payload")))
+                    } else {
+                        None
+                    };
+                    assert_eq!(actual, values.get(key).copied());
+                }
+                _ => {}
+            }
+            let expected = order
+                .iter()
+                .map(|key| (key.clone(), values[key]))
+                .collect::<Vec<_>>();
+            assert_eq!(live_string_entries(dictionary), expected);
+        }
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn dictionary_limits_and_large_operation_phases_are_atomic() {
+        let started = Instant::now();
+        let mut context = ExecutionContext::with_stats();
+        let dictionary = context.allocate_dictionary_in_region(
+            DictionaryKeyKind::Int,
+            4,
+            4,
+            1,
+            4,
+            4,
+            2,
+            ListRegion::Persistent,
+        );
+        for key in 0_i32..DICTIONARY_MAX_ENTRIES {
+            assert_eq!(
+                context.dictionary_add_or_set(
+                    dictionary,
+                    DictionaryKeyKind::Int,
+                    4,
+                    4,
+                    1,
+                    4,
+                    4,
+                    2,
+                    (&raw const key).cast(),
+                    (&raw const key).cast(),
+                    false,
+                ),
+                1
+            );
+        }
+        for key in 0_i32..DICTIONARY_MAX_ENTRIES {
+            assert_eq!(
+                context.dictionary_contains_or_remove(
+                    dictionary,
+                    DictionaryKeyKind::Int,
+                    4,
+                    4,
+                    1,
+                    4,
+                    4,
+                    2,
+                    (&raw const key).cast(),
+                    false,
+                ),
+                1
+            );
+        }
+        for key in (0_i32..DICTIONARY_MAX_ENTRIES).step_by(2) {
+            assert_eq!(
+                context.dictionary_contains_or_remove(
+                    dictionary,
+                    DictionaryKeyKind::Int,
+                    4,
+                    4,
+                    1,
+                    4,
+                    4,
+                    2,
+                    (&raw const key).cast(),
+                    true,
+                ),
+                1
+            );
+        }
+        for key in (0_i32..DICTIONARY_MAX_ENTRIES).step_by(2) {
+            assert_eq!(
+                context.dictionary_add_or_set(
+                    dictionary,
+                    DictionaryKeyKind::Int,
+                    4,
+                    4,
+                    1,
+                    4,
+                    4,
+                    2,
+                    (&raw const key).cast(),
+                    (&raw const key).cast(),
+                    false,
+                ),
+                1
+            );
+        }
+        let extra = DICTIONARY_MAX_ENTRIES;
+        assert_eq!(
+            context.dictionary_add_or_set(
+                dictionary,
+                DictionaryKeyKind::Int,
+                4,
+                4,
+                1,
+                4,
+                4,
+                2,
+                (&raw const extra).cast(),
+                (&raw const extra).cast(),
+                false,
+            ),
+            0
+        );
+        // SAFETY: the header remains owned by this live context. The failed
+        // insertion must not publish a partial entry or change Length.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!((*dictionary).length, DICTIONARY_MAX_ENTRIES);
+        }
+        let error = context.take_error().expect("limit failure");
+        assert!(error.contains("100000"), "{error}");
+        eprintln!(
+            "dictionary 100k stress: {:?}; stats={:?}",
+            started.elapsed(),
+            context.memory_stats()
+        );
+    }
+
+    #[test]
+    fn dictionary_active_byte_limit_fails_before_publishing_buffers() {
+        let mut context = ExecutionContext::with_stats();
+        let value_size = 8 * 1024 * 1024;
+        let dictionary = context.allocate_dictionary_in_region(
+            DictionaryKeyKind::Int,
+            4,
+            4,
+            1,
+            value_size,
+            1,
+            2,
+            ListRegion::Persistent,
+        );
+        assert!(!dictionary.is_null());
+        let before = context.memory_stats().clone();
+        let key = 1_i32;
+        let value = vec![0_u8; usize::try_from(value_size).expect("value size")];
+        assert_eq!(
+            context.dictionary_add_or_set(
+                dictionary,
+                DictionaryKeyKind::Int,
+                4,
+                4,
+                1,
+                value_size,
+                1,
+                2,
+                (&raw const key).cast(),
+                value.as_ptr(),
+                false,
+            ),
+            0
+        );
+        // SAFETY: the failed first insertion must leave the controlled header
+        // in its original empty state and publish neither buffer.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!((*dictionary).length, 0);
+            assert_eq!((*dictionary).entry_count, 0);
+            assert_eq!((*dictionary).entry_capacity, 0);
+            assert_eq!((*dictionary).bucket_capacity, 0);
+            assert!((*dictionary).entries.is_null());
+            assert!((*dictionary).buckets.is_null());
+        }
+        assert_eq!(context.memory_stats(), &before);
+        let error = context.take_error().expect("active byte limit");
+        assert!(error.contains("64 MiB"), "{error}");
+    }
+
+    #[test]
+    fn dictionary_active_byte_limit_accepts_exactly_64_mib_and_rejects_one_stride_more() {
+        let layout = DictionaryEntryLayout {
+            key_offset: 0,
+            value_offset: 0,
+            stride: 8,
+            align: 8,
+        };
+        let mut exact = ExecutionContext::new();
+        assert_eq!(
+            exact.dictionary_active_bytes(0, 8 * 1024 * 1024, layout),
+            Some((0, DICTIONARY_MAX_ACTIVE_BYTES))
+        );
+        assert!(exact.take_error().is_none());
+
+        let mut over = ExecutionContext::new();
+        assert!(
+            over.dictionary_active_bytes(0, 8 * 1024 * 1024 + 1, layout)
+                .is_none()
+        );
+        assert!(
+            over.take_error()
+                .is_some_and(|error| error.contains("64 MiB"))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn dictionary_allocation_metrics_match_header_buffers_and_snapshot() {
+        let mut context = ExecutionContext::with_stats();
+        let initial = context.memory_stats().clone();
+        let dictionary = context.allocate_dictionary_in_region(
+            DictionaryKeyKind::Int,
+            4,
+            4,
+            1,
+            4,
+            4,
+            2,
+            ListRegion::Persistent,
+        );
+        let after_header = context.memory_stats().clone();
+        assert_eq!(
+            after_header.total_allocations - initial.total_allocations,
+            1
+        );
+        assert_eq!(
+            after_header.object_allocations - initial.object_allocations,
+            1
+        );
+        assert_eq!(after_header.string_allocations, 0);
+
+        let alias = dictionary;
+        for _ in 0..1_000 {
+            assert_eq!(aster_rt_dictionary_length(&raw mut context, alias), 0);
+        }
+        assert_eq!(context.memory_stats(), &after_header);
+
+        let key = 1_i32;
+        let value = 2_i32;
+        assert_eq!(
+            context.dictionary_add_or_set(
+                dictionary,
+                DictionaryKeyKind::Int,
+                4,
+                4,
+                1,
+                4,
+                4,
+                2,
+                (&raw const key).cast(),
+                (&raw const value).cast(),
+                false,
+            ),
+            1
+        );
+        let after_first_insert = context.memory_stats().clone();
+        assert_eq!(
+            after_first_insert.total_allocations - after_header.total_allocations,
+            2
+        );
+        assert_eq!(
+            after_first_insert.object_allocations - after_header.object_allocations,
+            2
+        );
+        assert_eq!(after_first_insert.string_allocations, 0);
+
+        let second_key = 2_i32;
+        let second_value = 3_i32;
+        assert_eq!(
+            context.dictionary_add_or_set(
+                dictionary,
+                DictionaryKeyKind::Int,
+                4,
+                4,
+                1,
+                4,
+                4,
+                2,
+                (&raw const second_key).cast(),
+                (&raw const second_value).cast(),
+                false,
+            ),
+            1
+        );
+        assert_eq!(
+            context.dictionary_add_or_set(
+                dictionary,
+                DictionaryKeyKind::Int,
+                4,
+                4,
+                1,
+                4,
+                4,
+                2,
+                (&raw const second_key).cast(),
+                (&raw const value).cast(),
+                true,
+            ),
+            1
+        );
+        assert_eq!(
+            context.dictionary_contains_or_remove(
+                dictionary,
+                DictionaryKeyKind::Int,
+                4,
+                4,
+                1,
+                4,
+                4,
+                2,
+                (&raw const second_key).cast(),
+                false,
+            ),
+            1
+        );
+        assert_eq!(
+            context.dictionary_contains_or_remove(
+                dictionary,
+                DictionaryKeyKind::Int,
+                4,
+                4,
+                1,
+                4,
+                4,
+                2,
+                (&raw const second_key).cast(),
+                true,
+            ),
+            1
+        );
+        assert_eq!(context.memory_stats(), &after_first_insert);
+
+        let snapshot = context.dictionary_entries(
+            dictionary,
+            DictionaryKeyKind::Int,
+            4,
+            4,
+            1,
+            4,
+            4,
+            2,
+            8,
+            0,
+            4,
+            ListRegion::Persistent,
+        );
+        assert!(!snapshot.is_null());
+        let after_snapshot = context.memory_stats().clone();
+        assert_eq!(
+            after_snapshot.total_allocations - after_first_insert.total_allocations,
+            1
+        );
+        assert_eq!(
+            after_snapshot.array_allocations - after_first_insert.array_allocations,
+            1
+        );
+        assert_eq!(after_snapshot.string_allocations, 0);
+        eprintln!(
+            "dictionary metric deltas: initial={initial:?}; header={after_header:?}; first_insert={after_first_insert:?}; snapshot={after_snapshot:?}"
+        );
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    fn ten_thousand_empty_dictionaries_follow_arena_recovery_rules() {
+        let mut temporary = ExecutionContext::with_stats();
+        temporary.enter_temporary_scope();
+        for _ in 0..10_000 {
+            let dictionary = temporary.allocate_dictionary_in_region(
+                DictionaryKeyKind::Int,
+                4,
+                4,
+                1,
+                4,
+                4,
+                2,
+                ListRegion::Temporary,
+            );
+            assert!(!dictionary.is_null());
+        }
+        let temporary_peak = temporary.memory_stats().clone();
+        temporary.leave_temporary_scope();
+        let temporary_after_rewind = temporary.memory_stats().clone();
+        assert_eq!(temporary_after_rewind.used_bytes, 0);
+        assert_eq!(temporary_after_rewind.object_allocations, 10_000);
+        assert_eq!(temporary_after_rewind.string_allocations, 0);
+
+        let mut persistent = ExecutionContext::with_stats();
+        for _ in 0..10_000 {
+            let dictionary = persistent.allocate_dictionary_in_region(
+                DictionaryKeyKind::Int,
+                4,
+                4,
+                1,
+                4,
+                4,
+                2,
+                ListRegion::Persistent,
+            );
+            assert!(!dictionary.is_null());
+        }
+        assert!(persistent.memory_stats().used_bytes > 0);
+        assert_eq!(persistent.memory_stats().object_allocations, 10_000);
+        assert_eq!(persistent.memory_stats().string_allocations, 0);
+        eprintln!(
+            "empty dictionary stress: temporary_peak={temporary_peak:?}; temporary_after_rewind={temporary_after_rewind:?}; persistent={:?}",
+            persistent.memory_stats()
         );
     }
 

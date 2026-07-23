@@ -5,7 +5,9 @@
 
 use std::fmt;
 
-pub use aster_hir::{FileIoResultLayout, SymbolId, Type, Visibility};
+pub use aster_hir::{
+    DictionaryEntryLayout, DictionaryOptionLayout, FileIoResultLayout, SymbolId, Type, Visibility,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LocalId(pub u32);
@@ -171,6 +173,52 @@ pub enum Instruction {
     AllocateList {
         destination: Place,
         element_type: Type,
+        region: AllocationRegion,
+    },
+    /// Allocate an empty `Dictionary<K, V>` header. Buckets and entries are
+    /// created lazily by the first insertion; hash seeds remain per-context.
+    AllocateDictionary {
+        destination: Place,
+        key_type: Type,
+        value_type: Type,
+        region: AllocationRegion,
+    },
+    DictionaryAdd {
+        destination: Place,
+        dictionary: Operand,
+        key: Operand,
+        value: Operand,
+    },
+    DictionarySet {
+        destination: Place,
+        dictionary: Operand,
+        key: Operand,
+        value: Operand,
+    },
+    DictionaryTryGet {
+        destination: Place,
+        dictionary: Operand,
+        key: Operand,
+        value_type: Type,
+        option_layout: DictionaryOptionLayout,
+    },
+    DictionaryContainsKey {
+        destination: Place,
+        dictionary: Operand,
+        key: Operand,
+    },
+    DictionaryRemove {
+        destination: Place,
+        dictionary: Operand,
+        key: Operand,
+    },
+    DictionaryEntries {
+        destination: Place,
+        dictionary: Operand,
+        key_type: Type,
+        value_type: Type,
+        entry_type: Type,
+        entry_layout: DictionaryEntryLayout,
         region: AllocationRegion,
     },
     /// `list.Add(value)`: appends `value` to `list`'s buffer, growing it if
@@ -640,6 +688,7 @@ pub enum RvalueKind {
     /// Reads the `length` field of a `List<T>` header (see
     /// `aster_runtime::AsterList`).
     ListLength(Operand),
+    DictionaryLength(Operand),
     /// Reads the current structural-modification counter from a `List<T>`
     /// header. Used only by `foreach`'s fail-fast mutation check (captured
     /// once, then compared before each element read); never exposed as an
@@ -762,6 +811,7 @@ pub fn type_key(type_: &Type) -> u64 {
             Type::Array(element) => walk(element, mix(hash, 19)),
             Type::Task(result) => walk(result, mix(hash, 20)),
             Type::List(element) => walk(element, mix(hash, 21)),
+            Type::Dictionary(key, value) => walk(value, walk(key, mix(hash, 22))),
             Type::Unknown => mix(hash, 22),
         }
     }

@@ -122,6 +122,15 @@ impl Monomorphizer {
                     ),
                 );
             }
+            if name == "Dictionary" {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!("`{name}` is reserved for the built-in `Dictionary<K, V>` type and cannot be declared as a generic {kind} template"),
+                        span,
+                    )
+                    .with_help("rename this type; `Dictionary<K, V>` is a built-in type, not something a program can declare"),
+                );
+            }
         }
     }
 }

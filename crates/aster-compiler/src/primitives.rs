@@ -31,6 +31,7 @@ pub(crate) fn of_hir(type_: &aster_hir::Type) -> Option<Primitive> {
         | Type::Array(_)
         | Type::Task(_)
         | Type::List(_)
+        | Type::Dictionary(_, _)
         | Type::Unknown => {
             return None;
         }

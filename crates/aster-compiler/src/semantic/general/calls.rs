@@ -1,7 +1,8 @@
 use super::{
     Analyzer, Callable, Diagnostic, Dispatch, Expression, ExpressionKind, Primitive, ResolvedCall,
-    ResolvedEnumCase, ResolvedParallelFor, ResolvedParallelForEach, ResolvedParallelReduce,
-    ResolvedTaskRun, Signature, Span, Type, TypeKind, TypeRef, Visibility, resolve_type_readonly,
+    ResolvedDictionaryOperation, ResolvedEnumCase, ResolvedParallelFor, ResolvedParallelForEach,
+    ResolvedParallelReduce, ResolvedTaskRun, Signature, Span, Type, TypeKind, TypeRef, Visibility,
+    resolve_type_readonly,
 };
 use aster_hir::StringOperation;
 
@@ -34,6 +35,23 @@ impl Analyzer<'_> {
             // malformed element silently resolves to `Unknown` here without a
             // second, redundant diagnostic.
             return resolve_type_readonly(&TypeRef::new(type_name, span), self.context);
+        }
+        if type_name == "Dictionary" || type_name.starts_with("Dictionary<") {
+            if !arguments.is_empty() {
+                self.diagnostics.push(Diagnostic::error(
+                    "`new Dictionary<K, V>()` takes no arguments",
+                    span,
+                ));
+                for argument in arguments {
+                    self.expression(argument);
+                }
+                return Type::Unknown;
+            }
+            let type_ = resolve_type_readonly(&TypeRef::new(type_name, span), self.context);
+            if type_ == Type::Unknown {
+                self.diagnostics.push(Diagnostic::error(format!("type `{type_name}` is not a valid concrete `Dictionary<K, V>` specialization"), span));
+            }
+            return type_;
         }
         let Some(info) = self.context.types.get(type_name) else {
             self.diagnostics.push(Diagnostic::error(
@@ -219,6 +237,16 @@ impl Analyzer<'_> {
             }
             self.diagnostics.push(Diagnostic::error(
                 format!("list has no member `{name}`"),
+                span,
+            ));
+            return Type::Unknown;
+        }
+        if matches!(object_type, Type::Dictionary(_, _)) {
+            if name == "Length" {
+                return Type::Int;
+            }
+            self.diagnostics.push(Diagnostic::error(
+                format!("dictionary has no member `{name}`"),
                 span,
             ));
             return Type::Unknown;
@@ -571,6 +599,107 @@ impl Analyzer<'_> {
                             callee.span,
                         ));
                         return Type::Unknown;
+                    }
+                    if let Type::Dictionary(key_type, value_type) = &receiver {
+                        let expected_arity = match name.as_str() {
+                            "Add" | "Set" => Some(2),
+                            "TryGet" | "ContainsKey" | "Remove" => Some(1),
+                            "Entries" => Some(0),
+                            _ => None,
+                        };
+                        let Some(expected_arity) = expected_arity else {
+                            self.diagnostics.push(Diagnostic::error(
+                                format!("dictionary has no member `{name}`"),
+                                callee.span,
+                            ));
+                            return Type::Unknown;
+                        };
+                        if arguments.len() != expected_arity {
+                            self.diagnostics.push(Diagnostic::error(
+                                format!(
+                                    "`Dictionary<K, V>.{name}` expects {expected_arity} argument(s), found {}",
+                                    arguments.len()
+                                ),
+                                span,
+                            ));
+                            return Type::Unknown;
+                        }
+                        if let Some(argument) = arguments.first() {
+                            self.require_assignable_value(key_type, &argument_types[0], argument);
+                        }
+                        if let Some(argument) = arguments.get(1) {
+                            self.require_assignable_value(value_type, &argument_types[1], argument);
+                        }
+                        match name.as_str() {
+                            "Add" | "Set" | "ContainsKey" | "Remove" => {
+                                self.model.dictionary_operations.insert(
+                                    self.model_key(span),
+                                    ResolvedDictionaryOperation::Basic,
+                                );
+                                return Type::Bool;
+                            }
+                            "TryGet" => {
+                                let option_name =
+                                    crate::standard_library::option_specialization_name(
+                                        &value_type.display(),
+                                    );
+                                let Some(option) = self.option_cases(&option_name) else {
+                                    self.diagnostics.push(
+                                        Diagnostic::error(
+                                            format!(
+                                                "`Dictionary<K, V>.TryGet` requires the official `{option_name}` type"
+                                            ),
+                                            span,
+                                        )
+                                        .with_help("add `using aster.core;`"),
+                                    );
+                                    return Type::Unknown;
+                                };
+                                if !self.is_official_option(&option_name) {
+                                    self.diagnostics.push(Diagnostic::error(
+                                        "`Dictionary<K, V>.TryGet` requires the official `aster.core.Option<V>`",
+                                        span,
+                                    ));
+                                    return Type::Unknown;
+                                }
+                                self.model.dictionary_operations.insert(
+                                    self.model_key(span),
+                                    ResolvedDictionaryOperation::TryGet {
+                                        option_type: option_name.clone(),
+                                        some_index: option.some_index,
+                                        none_index: option.none_index,
+                                    },
+                                );
+                                return Type::Enum(option_name);
+                            }
+                            "Entries" => {
+                                let entry_name =
+                                    crate::standard_library::dictionary_entry_specialization_name(
+                                        &key_type.display(),
+                                        &value_type.display(),
+                                    );
+                                if !self.context.types.contains_key(&entry_name) {
+                                    self.diagnostics.push(
+                                        Diagnostic::error(
+                                            format!(
+                                                "`Dictionary<K, V>.Entries` requires the official `{entry_name}` type"
+                                            ),
+                                            span,
+                                        )
+                                        .with_help("add `using aster.collections;`"),
+                                    );
+                                    return Type::Unknown;
+                                }
+                                self.model.dictionary_operations.insert(
+                                    self.model_key(span),
+                                    ResolvedDictionaryOperation::Entries {
+                                        entry_type: entry_name.clone(),
+                                    },
+                                );
+                                return Type::Array(Box::new(Type::User(entry_name)));
+                            }
+                            _ => unreachable!("matched Dictionary method above"),
+                        }
                     }
                     let interface_dispatch = matches!(receiver, Type::Interface(_));
                     let (Type::User(type_name)

@@ -824,6 +824,166 @@ fn m3f_integrated_program_runs_via_aster_run_subprocess_on_real_filesystem() {
     );
 }
 
+#[test]
+#[allow(clippy::too_many_lines)]
+fn m4f_dictionary_program_runs_via_cli_on_real_filesystem() {
+    let directory = temporary_directory("m4f-dictionary");
+    let input = directory.join("input");
+    let output = directory.join("output");
+    fs::create_dir_all(input.join("nested")).expect("create M4F input tree");
+    fs::create_dir_all(&output).expect("create M4F output directory");
+    fs::write(input.join("a.txt"), "alpha").expect("write a.txt");
+    fs::write(input.join("b.txt"), "beta").expect("write b.txt");
+    fs::write(input.join("empty.txt"), "").expect("write empty.txt");
+    fs::write(input.join("invalid.bin"), [0xFF_u8, 0xFE]).expect("write invalid.bin");
+    fs::write(input.join("unicode.txt"), "\u{03B1}\u{03B2}\u{03B3}").expect("write unicode.txt");
+    fs::write(input.join("nested").join("ignored.txt"), "ignored").expect("write ignored.txt");
+
+    let main = directory.join("m4f_main.aster");
+    fs::write(
+        &main,
+        r#"
+            using aster.core;
+            using aster.io;
+            using aster.collections;
+
+            public Result<int, IOError> Analyze(string inputDir, string outputDir)
+            {
+                string[] files = ListFiles(inputDir)?;
+                Dictionary<string, int> fileCounts = new Dictionary<string, int>();
+                Dictionary<char, int> characterCounts = new Dictionary<char, int>();
+                Dictionary<string, int> categories = new Dictionary<string, int>();
+                List<int> scalarCounts = new List<int>();
+                categories.Add("valid", 0);
+                categories.Add("invalid", 0);
+
+                foreach (string file in files)
+                {
+                    switch (ReadAllText(file))
+                    {
+                        case Ok(text):
+                            int count = 0;
+                            foreach (char scalar in text)
+                            {
+                                count = count + 1;
+                                switch (characterCounts.TryGet(scalar))
+                                {
+                                    case Some(current):
+                                        characterCounts.Set(scalar, current + 1);
+                                    case None:
+                                        characterCounts.Add(scalar, 1);
+                                }
+                            }
+                            fileCounts.Add(file, count);
+                            scalarCounts.Add(count);
+                            switch (categories.TryGet("valid"))
+                            {
+                                case Some(current):
+                                    categories.Set("valid", current + 1);
+                                case None:
+                                    return Result<int, IOError>.Ok(-10);
+                            }
+                        case Error(error):
+                            if (error.Kind != IOErrorKind.InvalidUtf8)
+                            {
+                                return Result<int, IOError>.Error(error);
+                            }
+                            switch (categories.TryGet("invalid"))
+                            {
+                                case Some(current):
+                                    categories.Set("invalid", current + 1);
+                                case None:
+                                    return Result<int, IOError>.Ok(-11);
+                            }
+                    }
+                }
+
+                if (fileCounts.ContainsKey("input/nested/ignored.txt"))
+                {
+                    return Result<int, IOError>.Ok(-12);
+                }
+                DictionaryEntry<string, int>[] fileEntries = fileCounts.Entries();
+                DictionaryEntry<char, int>[] characterEntries = characterCounts.Entries();
+                categories.Remove("valid");
+                categories.Add("valid", scalarCounts.Length);
+                DictionaryEntry<string, int>[] categoryEntries = categories.Entries();
+
+                int total = 0;
+                foreach (DictionaryEntry<string, int> entry in fileEntries)
+                {
+                    total = total + entry.Value;
+                }
+                int listTotal = 0;
+                foreach (int value in scalarCounts) { listTotal = listTotal + value; }
+                if (total != listTotal) { return Result<int, IOError>.Ok(-13); }
+                if (categoryEntries[0].Key != "invalid"
+                    || categoryEntries[1].Key != "valid")
+                {
+                    return Result<int, IOError>.Ok(-14);
+                }
+
+                string resultPath = CombinePath(outputDir, "result.txt")?;
+                string summary =
+                    "files=" + fileEntries.Length.ToString()
+                    + ";total=" + total.ToString()
+                    + ";unique=" + characterEntries.Length.ToString()
+                    + ";categories=" + categoryEntries[0].Key + "," + categoryEntries[1].Key;
+                int written = WriteAllText(resultPath, summary)?;
+                return Result<int, IOError>.Ok(
+                    fileEntries.Length + total + characterEntries.Length
+                    + categoryEntries.Length
+                );
+            }
+
+            public int Main()
+            {
+                switch (Analyze("input", "output"))
+                {
+                    case Ok(value): return value;
+                    case Error(error): return -1;
+                }
+            }
+        "#,
+    )
+    .expect("write M4F program");
+
+    let main_path = main.to_str().expect("UTF-8 temporary path");
+    let check = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["check", main_path])
+        .current_dir(&directory)
+        .output()
+        .expect("run aster check");
+    let hir = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["dump-hir", main_path])
+        .current_dir(&directory)
+        .output()
+        .expect("run aster dump-hir");
+    let mir = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["dump-mir", main_path])
+        .current_dir(&directory)
+        .output()
+        .expect("run aster dump-mir");
+    let run = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args(["run", main_path, "--function", "Main"])
+        .current_dir(&directory)
+        .output()
+        .expect("run M4F program");
+
+    let written = fs::read_to_string(output.join("result.txt")).ok();
+    fs::remove_dir_all(&directory).expect("remove M4F temporary directory");
+
+    assert!(check.status.success(), "{}", stderr(&check));
+    assert!(hir.status.success(), "{}", stderr(&hir));
+    assert!(mir.status.success(), "{}", stderr(&mir));
+    assert!(run.status.success(), "{}", stderr(&run));
+    assert_eq!(stdout(&run).trim(), "28", "unexpected summary: {written:?}");
+    assert_eq!(run.status.code(), Some(0));
+    assert_eq!(
+        written.as_deref(),
+        Some("files=4;total=12;unique=10;categories=invalid,valid")
+    );
+}
+
 fn aster<const N: usize>(arguments: [&str; N]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_aster"))
         .args(arguments)

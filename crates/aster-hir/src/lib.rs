@@ -38,6 +38,9 @@ pub enum Type {
     /// like `Array`/`Task`; the element type `T` must already be concrete
     /// and executable when this variant exists.
     List(Box<Type>),
+    /// `Dictionary<K, V>`: a native nominal reference type with keyed
+    /// operations and deterministic insertion-order snapshots.
+    Dictionary(Box<Type>, Box<Type>),
     Unknown,
 }
 
@@ -104,6 +107,25 @@ pub struct FileIoResultLayout {
     /// `PermissionDenied`, `AlreadyExists`, `InvalidPath`, `InvalidUtf8`,
     /// `NotFile`, `NotDirectory`, `LimitExceeded`, `Other`).
     pub portable_kind_cases: [SymbolId; 9],
+}
+
+/// Concrete nominal metadata for the official `aster.core.Option<V>` used by
+/// `Dictionary<K, V>.TryGet`. All symbols are resolved before MIR/codegen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DictionaryOptionLayout {
+    pub some_case: SymbolId,
+    pub some_field: SymbolId,
+    pub some_tag: u32,
+    pub none_case: SymbolId,
+    pub none_tag: u32,
+}
+
+/// Concrete nominal metadata for one official
+/// `aster.collections.DictionaryEntry<K, V>` specialization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DictionaryEntryLayout {
+    pub key_field: SymbolId,
+    pub value_field: SymbolId,
 }
 
 impl FileIoResultLayout {
@@ -337,6 +359,11 @@ pub enum ExpressionKind {
     NewList {
         element_type: Type,
     },
+    /// `new Dictionary<K, V>()`: allocates only the empty native header.
+    NewDictionary {
+        key_type: Type,
+        value_type: Type,
+    },
     Index {
         array: Box<Expression>,
         index: Box<Expression>,
@@ -362,6 +389,39 @@ pub enum ExpressionKind {
     },
     /// `list.Length`: reads the `length` field of a `List<T>` header.
     ListLength(Box<Expression>),
+    /// `dictionary.Length`: reads the native header's live-entry count.
+    DictionaryLength(Box<Expression>),
+    DictionaryAdd {
+        dictionary: Box<Expression>,
+        key: Box<Expression>,
+        value: Box<Expression>,
+    },
+    DictionarySet {
+        dictionary: Box<Expression>,
+        key: Box<Expression>,
+        value: Box<Expression>,
+    },
+    DictionaryTryGet {
+        dictionary: Box<Expression>,
+        key: Box<Expression>,
+        value_type: Type,
+        option_layout: DictionaryOptionLayout,
+    },
+    DictionaryContainsKey {
+        dictionary: Box<Expression>,
+        key: Box<Expression>,
+    },
+    DictionaryRemove {
+        dictionary: Box<Expression>,
+        key: Box<Expression>,
+    },
+    DictionaryEntries {
+        dictionary: Box<Expression>,
+        key_type: Type,
+        value_type: Type,
+        entry_type: Type,
+        entry_layout: DictionaryEntryLayout,
+    },
     /// `list.Add(value)`: appends `value`, growing the buffer if needed.
     /// Always typed `void`. `value`'s type is exactly the list's element
     /// type (already converted, if needed, by the time this is built).

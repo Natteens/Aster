@@ -1,0 +1,7 @@
+namespace aster.collections;
+
+public struct DictionaryEntry<K, V>
+{
+    public K Key;
+    public V Value;
+}

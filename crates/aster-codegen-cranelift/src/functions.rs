@@ -97,6 +97,7 @@ impl Codegen {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn translate_instruction(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
@@ -163,6 +164,105 @@ impl Codegen {
                 element_type,
                 region,
             } => self.translate_list_allocation(builder, destination, element_type, *region, state),
+            mir::Instruction::AllocateDictionary {
+                destination,
+                key_type,
+                value_type,
+                region,
+            } => self.translate_dictionary_allocation(
+                builder,
+                destination,
+                key_type,
+                value_type,
+                *region,
+                state,
+            ),
+            mir::Instruction::DictionaryAdd {
+                destination,
+                dictionary,
+                key,
+                value,
+            } => self.translate_dictionary_add_or_set(
+                builder,
+                destination,
+                dictionary,
+                key,
+                value,
+                false,
+                state,
+            ),
+            mir::Instruction::DictionarySet {
+                destination,
+                dictionary,
+                key,
+                value,
+            } => self.translate_dictionary_add_or_set(
+                builder,
+                destination,
+                dictionary,
+                key,
+                value,
+                true,
+                state,
+            ),
+            mir::Instruction::DictionaryTryGet {
+                destination,
+                dictionary,
+                key,
+                value_type,
+                option_layout,
+            } => self.translate_dictionary_try_get(
+                builder,
+                destination,
+                dictionary,
+                key,
+                value_type,
+                *option_layout,
+                state,
+            ),
+            mir::Instruction::DictionaryContainsKey {
+                destination,
+                dictionary,
+                key,
+            } => self.translate_dictionary_contains_or_remove(
+                builder,
+                destination,
+                dictionary,
+                key,
+                false,
+                state,
+            ),
+            mir::Instruction::DictionaryRemove {
+                destination,
+                dictionary,
+                key,
+            } => self.translate_dictionary_contains_or_remove(
+                builder,
+                destination,
+                dictionary,
+                key,
+                true,
+                state,
+            ),
+            mir::Instruction::DictionaryEntries {
+                destination,
+                dictionary,
+                key_type,
+                value_type,
+                entry_type,
+                entry_layout,
+                region,
+            } => self.translate_dictionary_entries(
+                builder,
+                destination,
+                dictionary,
+                key_type,
+                value_type,
+                entry_type,
+                *entry_layout,
+                *region,
+                state,
+            ),
             mir::Instruction::ListAdd { list, value } => {
                 self.translate_list_add(builder, list, value, state)
             }
@@ -209,6 +309,14 @@ fn function_uses_temporary_allocations(function: &mir::Function) -> bool {
                 ..
             }
             | mir::Instruction::AllocateList {
+                region: mir::AllocationRegion::Temporary,
+                ..
+            }
+            | mir::Instruction::AllocateDictionary {
+                region: mir::AllocationRegion::Temporary,
+                ..
+            }
+            | mir::Instruction::DictionaryEntries {
                 region: mir::AllocationRegion::Temporary,
                 ..
             } => true,

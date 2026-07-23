@@ -186,7 +186,10 @@ impl Layouts {
         }
         if matches!(
             type_,
-            mir::Type::Array(_) | mir::Type::Class(_) | mir::Type::List(_)
+            mir::Type::Array(_)
+                | mir::Type::Class(_)
+                | mir::Type::List(_)
+                | mir::Type::Dictionary(_, _)
         ) {
             return Ok(TypeLayout {
                 size: self.pointer_bytes,
@@ -245,7 +248,10 @@ impl Layouts {
         }
         if matches!(
             type_,
-            mir::Type::Array(_) | mir::Type::Class(_) | mir::Type::List(_)
+            mir::Type::Array(_)
+                | mir::Type::Class(_)
+                | mir::Type::List(_)
+                | mir::Type::Dictionary(_, _)
         ) {
             return Ok(TypeLayout {
                 size: self.pointer_bytes,
@@ -287,6 +293,7 @@ impl Layouts {
             | mir::Type::Interface(_)
             | mir::Type::Enum(_)
             | mir::Type::List(_)
+            | mir::Type::Dictionary(_, _)
             | mir::Type::Void
             | mir::Type::Unknown => false,
             mir::Type::User(symbol) => self.structs.get(symbol).is_some_and(|definition| {

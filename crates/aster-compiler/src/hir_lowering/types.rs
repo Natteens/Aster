@@ -26,6 +26,19 @@ impl Lowerer<'_> {
         }
         if let Some(inner) = type_ref
             .name
+            .strip_prefix("Dictionary<")
+            .and_then(|rest| rest.strip_suffix('>'))
+        {
+            if let Some((key, value)) = dictionary_arguments(inner) {
+                return hir::Type::Dictionary(
+                    Box::new(self.resolve_type(&ast::TypeRef::new(key, type_ref.span))),
+                    Box::new(self.resolve_type(&ast::TypeRef::new(value, type_ref.span))),
+                );
+            }
+            return hir::Type::Unknown;
+        }
+        if let Some(inner) = type_ref
+            .name
             .strip_prefix("List<")
             .and_then(|rest| rest.strip_suffix('>'))
         {
@@ -63,6 +76,19 @@ impl Lowerer<'_> {
                 }
             })
     }
+}
+
+fn dictionary_arguments(text: &str) -> Option<(&str, &str)> {
+    let mut depth = 0_i32;
+    for (index, character) in text.char_indices() {
+        match character {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => return Some((text[..index].trim(), text[index + 1..].trim())),
+            _ => {}
+        }
+    }
+    None
 }
 
 pub(super) fn literal_value(literal: &ast::Literal) -> (hir::Literal, hir::Type) {

@@ -12,12 +12,22 @@ const MATH_SOURCE: &str = include_str!("../../../stdlib/aster/math.aster");
 const TEXT_SOURCE: &str = include_str!("../../../stdlib/aster/text/text.aster");
 const CORE_SOURCE: &str = include_str!("../../../stdlib/aster/core/core.aster");
 const IO_SOURCE: &str = include_str!("../../../stdlib/aster/io/io.aster");
+const COLLECTIONS_SOURCE: &str =
+    include_str!("../../../stdlib/aster/collections/collections.aster");
 
 /// Namespace of the official core standard library, and the single source of
 /// truth for where the official `Result`/`Option` declarations live. Passes that
 /// need the identity of an official type derive it from this constant during
 /// bootstrap and then compare resolved identities, never raw type spellings.
 pub(crate) const CORE_NAMESPACE: &str = "aster.core";
+pub(crate) const COLLECTIONS_NAMESPACE: &str = "aster.collections";
+
+fn canonical_generic_argument(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect()
+}
 
 /// The concrete, namespace-qualified `Option<target>` specialization name
 /// (e.g. `aster.core::Option<int>`) that `string.TryParse*()` targets.
@@ -26,7 +36,18 @@ pub(crate) const CORE_NAMESPACE: &str = "aster.core";
 /// place every layer (generic-type discovery, semantic analysis, HIR
 /// lowering) derives this spelling from, so it can never drift between them.
 pub(crate) fn option_specialization_name(target: &str) -> String {
-    format!("{CORE_NAMESPACE}::Option<{target}>")
+    format!(
+        "{CORE_NAMESPACE}::Option<{}>",
+        canonical_generic_argument(target)
+    )
+}
+
+pub(crate) fn dictionary_entry_specialization_name(key: &str, value: &str) -> String {
+    format!(
+        "{COLLECTIONS_NAMESPACE}::DictionaryEntry<{},{}>",
+        canonical_generic_argument(key),
+        canonical_generic_argument(value)
+    )
 }
 
 #[derive(Clone)]
@@ -42,6 +63,7 @@ impl StandardLibrary {
                 ("aster.text", TEXT_SOURCE),
                 ("aster.core", CORE_SOURCE),
                 ("aster.io", IO_SOURCE),
+                ("aster.collections", COLLECTIONS_SOURCE),
             ]),
         }
     }
@@ -111,7 +133,10 @@ impl StandardLibrary {
         for segment in module.split('.') {
             path.push(segment);
         }
-        if matches!(module, "aster.text" | "aster.core" | "aster.io") {
+        if matches!(
+            module,
+            "aster.text" | "aster.core" | "aster.io" | "aster.collections"
+        ) {
             path.push(
                 module
                     .rsplit('.')

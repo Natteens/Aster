@@ -9,6 +9,7 @@ impl Monomorphizer {
         type_ref.name = self.concretize_type_name(&type_ref.name, type_ref.span);
     }
 
+    #[allow(clippy::too_many_lines)]
     fn concretize_type_name(&mut self, name: &str, span: aster_diagnostics::Span) -> String {
         let Some(mut type_name) = TypeName::parse(name) else {
             self.diagnostics.push(Diagnostic::error(
@@ -68,6 +69,49 @@ impl Monomorphizer {
                     );
                     return type_name.to_string();
                 }
+            }
+            return type_name.to_string();
+        }
+        if type_name.base == "Dictionary" {
+            if type_name.arguments.len() != 2 {
+                self.diagnostics.push(Diagnostic::error(
+                    format!(
+                        "`Dictionary` expects 2 type arguments, found {}",
+                        type_name.arguments.len()
+                    ),
+                    span,
+                ));
+                return type_name.to_string();
+            }
+            let key = &type_name.arguments[0];
+            let supported_key = !key.array
+                && key.arguments.is_empty()
+                && matches!(
+                    key.base.as_str(),
+                    "bool"
+                        | "char"
+                        | "sbyte"
+                        | "byte"
+                        | "short"
+                        | "ushort"
+                        | "int"
+                        | "uint"
+                        | "long"
+                        | "ulong"
+                        | "string"
+                );
+            if !supported_key {
+                self.diagnostics.push(Diagnostic::error(
+                    format!("type `{key}` is not supported as a Dictionary key in ASTER 1.0"),
+                    span,
+                ));
+            }
+            let value = &type_name.arguments[1];
+            if value.arguments.is_empty() && !value.array && value.base == "void" {
+                self.diagnostics.push(Diagnostic::error(
+                    "`Dictionary<K, void>` is not supported",
+                    span,
+                ));
             }
             return type_name.to_string();
         }

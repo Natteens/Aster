@@ -31,6 +31,7 @@ pub(super) enum Type {
     /// `List<T>`, recognized structurally like `Task<T>`: a reserved,
     /// compiler-intrinsic reference type, never a user-declared generic.
     List(Box<Type>),
+    Dictionary(Box<Type>, Box<Type>),
     Unknown,
 }
 
@@ -44,6 +45,9 @@ impl Type {
             Self::Array(element) => format!("{}[]", element.display()),
             Self::Task(result) => format!("Task<{}>", result.display()),
             Self::List(element) => format!("List<{}>", element.display()),
+            Self::Dictionary(key, value) => {
+                format!("Dictionary<{}, {}>", key.display(), value.display())
+            }
             Self::Unknown => "<unknown>".to_owned(),
             _ => self
                 .primitive()
@@ -79,6 +83,7 @@ impl Type {
             | Self::Array(_)
             | Self::Task(_)
             | Self::List(_)
+            | Self::Dictionary(_, _)
             | Self::Unknown => {
                 return None;
             }
@@ -164,6 +169,25 @@ pub(super) fn resolve_type_readonly(type_ref: &TypeRef, context: &Context) -> Ty
     }
     if let Some(inner) = type_ref
         .name
+        .strip_prefix("Dictionary<")
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
+        let Some((key, value)) = dictionary_arguments(inner) else {
+            return Type::Unknown;
+        };
+        let key = resolve_type_readonly(&TypeRef::new(key, type_ref.span), context);
+        let value = resolve_type_readonly(&TypeRef::new(value, type_ref.span), context);
+        return if matches!(key, Type::Unknown)
+            || matches!(value, Type::Void | Type::Unknown)
+            || !dictionary_key_supported(&key)
+        {
+            Type::Unknown
+        } else {
+            Type::Dictionary(Box::new(key), Box::new(value))
+        };
+    }
+    if let Some(inner) = type_ref
+        .name
         .strip_prefix("List<")
         .and_then(|rest| rest.strip_suffix('>'))
     {
@@ -241,6 +265,7 @@ pub(super) fn zero_initializable(
         | Type::Interface(_)
         | Type::Enum(_)
         | Type::List(_)
+        | Type::Dictionary(_, _)
         | Type::Void
         | Type::Unknown => false,
         Type::User(name) => {
@@ -257,6 +282,36 @@ pub(super) fn zero_initializable(
         }
         _ => true,
     }
+}
+
+pub(super) fn dictionary_key_supported(type_: &Type) -> bool {
+    matches!(
+        type_,
+        Type::Bool
+            | Type::Char
+            | Type::SByte
+            | Type::Byte
+            | Type::Short
+            | Type::UShort
+            | Type::Int
+            | Type::UInt
+            | Type::Long
+            | Type::ULong
+            | Type::String
+    )
+}
+
+fn dictionary_arguments(text: &str) -> Option<(&str, &str)> {
+    let mut depth = 0_i32;
+    for (index, character) in text.char_indices() {
+        match character {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => return Some((text[..index].trim(), text[index + 1..].trim())),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The common type of two numeric operands, per the documented promotion table.

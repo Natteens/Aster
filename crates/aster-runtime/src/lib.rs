@@ -22,10 +22,13 @@ pub mod registry;
 pub mod string;
 
 pub use context::{
-    AsterArray, AsterList, ExecutionContext, ListRegion, MemoryStats, aster_rt_array_element,
-    aster_rt_array_length, aster_rt_list_add, aster_rt_list_get, aster_rt_list_length,
-    aster_rt_list_new, aster_rt_list_new_temporary, aster_rt_list_remove_at, aster_rt_list_version,
-    aster_rt_list_version_mismatch,
+    AsterArray, AsterDictionary, AsterList, DictionaryKeyKind, ExecutionContext, ListRegion,
+    MemoryStats, aster_rt_array_element, aster_rt_array_length, aster_rt_dictionary_add,
+    aster_rt_dictionary_contains_key, aster_rt_dictionary_entries, aster_rt_dictionary_length,
+    aster_rt_dictionary_new, aster_rt_dictionary_new_temporary, aster_rt_dictionary_remove,
+    aster_rt_dictionary_set, aster_rt_dictionary_try_get, aster_rt_list_add, aster_rt_list_get,
+    aster_rt_list_length, aster_rt_list_new, aster_rt_list_new_temporary, aster_rt_list_remove_at,
+    aster_rt_list_version, aster_rt_list_version_mismatch,
 };
 pub use filesystem::{
     FailingFileSystemBackend, FileSystemBackend, FileSystemError, MAX_FILE_BYTES, MAX_LIST_FILES,

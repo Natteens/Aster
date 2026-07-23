@@ -387,6 +387,42 @@ impl Monomorphizer {
                     return option_type;
                 }
                 let owner = self.infer_readonly(object, environment);
+                if let Some(dictionary) = TypeName::parse(&owner)
+                    && (dictionary.base == "Dictionary"
+                        || dictionary.base
+                            == format!(
+                                "{}::Dictionary",
+                                crate::standard_library::COLLECTIONS_NAMESPACE
+                            ))
+                    && dictionary.arguments.len() == 2
+                {
+                    let key = dictionary.arguments[0].to_string();
+                    let value = dictionary.arguments[1].to_string();
+                    if name == "TryGet" {
+                        let option_base =
+                            format!("{}::Option", crate::standard_library::CORE_NAMESPACE);
+                        let option_type =
+                            crate::standard_library::option_specialization_name(&value);
+                        if self.enum_templates.contains_key(&option_base)
+                            && let Some(concrete) = TypeName::parse(&option_type)
+                        {
+                            self.instantiate_type(&concrete.base, &concrete.arguments, span);
+                        }
+                        return option_type;
+                    }
+                    if name == "Entries" {
+                        let entry_type =
+                            crate::standard_library::dictionary_entry_specialization_name(
+                                &key, &value,
+                            );
+                        if let Some(concrete) = TypeName::parse(&entry_type)
+                            && self.type_templates.contains_key(&concrete.base)
+                        {
+                            self.instantiate_type(&concrete.base, &concrete.arguments, span);
+                        }
+                        return format!("{entry_type}[]");
+                    }
+                }
                 self.methods
                     .get(&(owner, name.clone()))
                     .cloned()

@@ -90,6 +90,19 @@ pub(crate) struct ResolvedEnumCase {
     pub case_index: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ResolvedDictionaryOperation {
+    Basic,
+    TryGet {
+        option_type: String,
+        some_index: usize,
+        none_index: usize,
+    },
+    Entries {
+        entry_type: String,
+    },
+}
+
 /// A resolved postfix `?` operator. Records the concrete official-`Result`
 /// or official-`Option` enum and case positions so HIR lowering can attach
 /// symbols and tags without re-resolving any type or inspecting names. The
@@ -128,6 +141,7 @@ pub(crate) struct Model {
     pub switch_cases: HashMap<ModelNodeKey, ResolvedEnumCase>,
     pub propagations: HashMap<ModelNodeKey, ResolvedPropagation>,
     pub string_operations: HashMap<ModelNodeKey, StringOperation>,
+    pub dictionary_operations: HashMap<ModelNodeKey, ResolvedDictionaryOperation>,
     /// Validated `value.ToString()` call sites on one of the eight
     /// fundamental primitives. Membership alone is enough for HIR lowering:
     /// the receiver's own lowered type supplies the exact primitive.
@@ -165,7 +179,7 @@ pub(super) fn validate(module: &Module) -> (Vec<Diagnostic>, Model) {
     (diagnostics, model)
 }
 
-/// `Task`, `Parallel`, and `List` are reserved, intrinsic names
+/// `Task`, `Parallel`, `List`, and `Dictionary` are reserved, intrinsic names
 /// (`aster.core.Task<T>`, see `hir::Type::Task`, the
 /// `Parallel.For`/`Parallel.ForEach` surface, and `aster.core.List<T>`, see
 /// `hir::Type::List`): no class, struct, interface, or enum declaration
@@ -199,6 +213,15 @@ fn validate_no_reserved_type_names(module: &Module, diagnostics: &mut Vec<Diagno
                     span,
                 )
                 .with_help("rename this type; `List<T>` is a built-in name, not something a program can declare"),
+            );
+        }
+        if name == "Dictionary" {
+            diagnostics.push(
+                Diagnostic::error(
+                    format!("`Dictionary` is reserved for the built-in `Dictionary<K, V>` type and cannot be declared as a {kind}"),
+                    span,
+                )
+                .with_help("rename this type; `Dictionary<K, V>` is a built-in name, not something a program can declare"),
             );
         }
     }

@@ -49,6 +49,18 @@ impl Codegen {
                 let call = builder.ins().call(function_ref, &[context, list]);
                 Ok(builder.inst_results(call)[0])
             }
+            mir::RvalueKind::DictionaryLength(dictionary) => {
+                let function_ref = self.jit.declare_func_in_func(
+                    self.runtime_ids["aster_rt_dictionary_length"],
+                    builder.func,
+                );
+                let context = state.execution_context.ok_or_else(|| {
+                    BackendError::new("dictionary length is missing its ExecutionContext")
+                })?;
+                let dictionary = self.translate_operand(builder, dictionary, state)?;
+                let call = builder.ins().call(function_ref, &[context, dictionary]);
+                Ok(builder.inst_results(call)[0])
+            }
             mir::RvalueKind::ListVersion(list) => {
                 let function_ref = self
                     .jit
@@ -515,6 +527,7 @@ pub(super) fn type_name(type_: &mir::Type) -> &'static str {
             mir::Type::Array(_) => "array",
             mir::Type::Task(_) => "task",
             mir::Type::List(_) => "list",
+            mir::Type::Dictionary(_, _) => "dictionary",
             mir::Type::Unknown => "unknown",
             _ => unreachable!("every primitive MIR type has an aster-types adapter"),
         },
@@ -549,6 +562,7 @@ pub(super) fn primitive(type_: &mir::Type) -> Option<Primitive> {
         | mir::Type::Array(_)
         | mir::Type::Task(_)
         | mir::Type::List(_)
+        | mir::Type::Dictionary(_, _)
         | mir::Type::Unknown => {
             return None;
         }

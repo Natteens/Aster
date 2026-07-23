@@ -163,7 +163,9 @@ fn collect_variable(variable: &hir::Variable, max: &mut u32) {
 #[allow(clippy::too_many_lines)]
 fn collect_expression(expression: &hir::Expression, max: &mut u32) {
     match &expression.kind {
-        hir::ExpressionKind::Literal(_) | hir::ExpressionKind::NewList { .. } => {}
+        hir::ExpressionKind::Literal(_)
+        | hir::ExpressionKind::NewList { .. }
+        | hir::ExpressionKind::NewDictionary { .. } => {}
         hir::ExpressionKind::Symbol(symbol) => note(max, *symbol),
         hir::ExpressionKind::StructLiteral {
             struct_symbol,
@@ -209,6 +211,46 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
             collect_expression(list, max);
             collect_expression(value, max);
         }
+        hir::ExpressionKind::DictionaryAdd {
+            dictionary,
+            key,
+            value,
+        }
+        | hir::ExpressionKind::DictionarySet {
+            dictionary,
+            key,
+            value,
+        } => {
+            collect_expression(dictionary, max);
+            collect_expression(key, max);
+            collect_expression(value, max);
+        }
+        hir::ExpressionKind::DictionaryTryGet {
+            dictionary,
+            key,
+            option_layout,
+            ..
+        } => {
+            collect_expression(dictionary, max);
+            collect_expression(key, max);
+            note(max, option_layout.some_case);
+            note(max, option_layout.some_field);
+            note(max, option_layout.none_case);
+        }
+        hir::ExpressionKind::DictionaryContainsKey { dictionary, key }
+        | hir::ExpressionKind::DictionaryRemove { dictionary, key } => {
+            collect_expression(dictionary, max);
+            collect_expression(key, max);
+        }
+        hir::ExpressionKind::DictionaryEntries {
+            dictionary,
+            entry_layout,
+            ..
+        } => {
+            collect_expression(dictionary, max);
+            note(max, entry_layout.key_field);
+            note(max, entry_layout.value_field);
+        }
         hir::ExpressionKind::ListRemoveAt { list, index }
         | hir::ExpressionKind::ListGet { list, index, .. } => {
             collect_expression(list, max);
@@ -221,6 +263,7 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
         hir::ExpressionKind::ArrayLength(operand)
         | hir::ExpressionKind::StringLength(operand)
         | hir::ExpressionKind::ListLength(operand)
+        | hir::ExpressionKind::DictionaryLength(operand)
         | hir::ExpressionKind::Convert { operand }
         | hir::ExpressionKind::Unary { operand, .. } => {
             collect_expression(operand, max);

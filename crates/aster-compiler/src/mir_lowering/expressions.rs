@@ -58,6 +58,10 @@ impl FunctionLowerer {
             hir::ExpressionKind::NewList { element_type } => {
                 Some(self.lower_new_list(&expression.type_, element_type))
             }
+            hir::ExpressionKind::NewDictionary {
+                key_type,
+                value_type,
+            } => Some(self.lower_new_dictionary(&expression.type_, key_type, value_type)),
             hir::ExpressionKind::Index { .. } | hir::ExpressionKind::Member { .. } => {
                 Some(self.place_operand(expression))
             }
@@ -75,6 +79,142 @@ impl FunctionLowerer {
                     .lower_expression(list)
                     .expect("validated list produces a value");
                 Some(self.temporary(expression.type_.clone(), mir::RvalueKind::ListLength(list)))
+            }
+            hir::ExpressionKind::DictionaryLength(dictionary) => {
+                let dictionary = self
+                    .lower_expression(dictionary)
+                    .expect("validated dictionary produces a value");
+                Some(self.temporary(
+                    expression.type_.clone(),
+                    mir::RvalueKind::DictionaryLength(dictionary),
+                ))
+            }
+            hir::ExpressionKind::DictionaryAdd {
+                dictionary,
+                key,
+                value,
+            }
+            | hir::ExpressionKind::DictionarySet {
+                dictionary,
+                key,
+                value,
+            } => {
+                let dictionary = self
+                    .lower_expression(dictionary)
+                    .expect("validated dictionary produces a value");
+                let key = self
+                    .lower_expression(key)
+                    .expect("validated dictionary key produces a value");
+                let value = self
+                    .lower_expression(value)
+                    .expect("validated dictionary value produces a value");
+                let destination = self.new_temporary(hir::Type::Bool);
+                let place = mir::Place::Local(destination);
+                let instruction =
+                    if matches!(&expression.kind, hir::ExpressionKind::DictionaryAdd { .. }) {
+                        mir::Instruction::DictionaryAdd {
+                            destination: place.clone(),
+                            dictionary,
+                            key,
+                            value,
+                        }
+                    } else {
+                        mir::Instruction::DictionarySet {
+                            destination: place.clone(),
+                            dictionary,
+                            key,
+                            value,
+                        }
+                    };
+                self.instruction(instruction);
+                Some(mir::Operand {
+                    type_: mir::Type::Bool,
+                    kind: mir::OperandKind::Copy(place),
+                })
+            }
+            hir::ExpressionKind::DictionaryTryGet {
+                dictionary,
+                key,
+                value_type,
+                option_layout,
+            } => {
+                let dictionary = self
+                    .lower_expression(dictionary)
+                    .expect("validated dictionary produces a value");
+                let key = self
+                    .lower_expression(key)
+                    .expect("validated dictionary key produces a value");
+                let destination = self.new_temporary(expression.type_.clone());
+                let place = mir::Place::Local(destination);
+                self.instruction(mir::Instruction::DictionaryTryGet {
+                    destination: place.clone(),
+                    dictionary,
+                    key,
+                    value_type: value_type.clone(),
+                    option_layout: *option_layout,
+                });
+                Some(mir::Operand {
+                    type_: expression.type_.clone(),
+                    kind: mir::OperandKind::Copy(place),
+                })
+            }
+            hir::ExpressionKind::DictionaryContainsKey { dictionary, key }
+            | hir::ExpressionKind::DictionaryRemove { dictionary, key } => {
+                let dictionary = self
+                    .lower_expression(dictionary)
+                    .expect("validated dictionary produces a value");
+                let key = self
+                    .lower_expression(key)
+                    .expect("validated dictionary key produces a value");
+                let destination = self.new_temporary(hir::Type::Bool);
+                let place = mir::Place::Local(destination);
+                let instruction = if matches!(
+                    &expression.kind,
+                    hir::ExpressionKind::DictionaryContainsKey { .. }
+                ) {
+                    mir::Instruction::DictionaryContainsKey {
+                        destination: place.clone(),
+                        dictionary,
+                        key,
+                    }
+                } else {
+                    mir::Instruction::DictionaryRemove {
+                        destination: place.clone(),
+                        dictionary,
+                        key,
+                    }
+                };
+                self.instruction(instruction);
+                Some(mir::Operand {
+                    type_: mir::Type::Bool,
+                    kind: mir::OperandKind::Copy(place),
+                })
+            }
+            hir::ExpressionKind::DictionaryEntries {
+                dictionary,
+                key_type,
+                value_type,
+                entry_type,
+                entry_layout,
+            } => {
+                let dictionary = self
+                    .lower_expression(dictionary)
+                    .expect("validated dictionary produces a value");
+                let destination = self.new_temporary(expression.type_.clone());
+                let place = mir::Place::Local(destination);
+                self.instruction(mir::Instruction::DictionaryEntries {
+                    destination: place.clone(),
+                    dictionary,
+                    key_type: key_type.clone(),
+                    value_type: value_type.clone(),
+                    entry_type: entry_type.clone(),
+                    entry_layout: *entry_layout,
+                    region: mir::AllocationRegion::Persistent,
+                });
+                Some(mir::Operand {
+                    type_: expression.type_.clone(),
+                    kind: mir::OperandKind::Copy(place),
+                })
             }
             hir::ExpressionKind::ListAdd { list, value } => {
                 let list = self
@@ -765,6 +905,25 @@ impl FunctionLowerer {
         mir::Operand {
             type_: type_.clone(),
             kind: mir::OperandKind::Copy(mir::Place::Local(local)),
+        }
+    }
+
+    fn lower_new_dictionary(
+        &mut self,
+        type_: &hir::Type,
+        key_type: &hir::Type,
+        value_type: &hir::Type,
+    ) -> mir::Operand {
+        let destination = self.new_temporary(type_.clone());
+        self.instruction(mir::Instruction::AllocateDictionary {
+            destination: mir::Place::Local(destination),
+            key_type: key_type.clone(),
+            value_type: value_type.clone(),
+            region: mir::AllocationRegion::Persistent,
+        });
+        mir::Operand {
+            type_: type_.clone(),
+            kind: mir::OperandKind::Copy(mir::Place::Local(destination)),
         }
     }
 

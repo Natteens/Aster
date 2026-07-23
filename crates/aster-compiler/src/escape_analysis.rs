@@ -279,6 +279,7 @@ fn is_tracked_reference_type(type_: &mir::Type) -> bool {
             | mir::Type::Array(_)
             | mir::Type::String
             | mir::Type::List(_)
+            | mir::Type::Dictionary(_, _)
             // An enum (e.g. `Option<string>`) is a value type, but plain
             // copies of it (`switch`'s scrutinee binding, an intermediate
             // temporary) must still propagate an alias of a tracked origin
@@ -297,6 +298,8 @@ fn is_dynamic_allocation(instruction: &mir::Instruction) -> bool {
         mir::Instruction::AllocateObject { .. }
             | mir::Instruction::AllocateArray { .. }
             | mir::Instruction::AllocateList { .. }
+            | mir::Instruction::AllocateDictionary { .. }
+            | mir::Instruction::DictionaryEntries { .. }
     ) || matches!(
         instruction,
         mir::Instruction::CallIntrinsic { intrinsic, .. }
@@ -308,7 +311,9 @@ fn allocation_destination(instruction: &mir::Instruction) -> Option<&mir::Place>
     match instruction {
         mir::Instruction::AllocateObject { destination, .. }
         | mir::Instruction::AllocateArray { destination, .. }
-        | mir::Instruction::AllocateList { destination, .. } => Some(destination),
+        | mir::Instruction::AllocateList { destination, .. }
+        | mir::Instruction::AllocateDictionary { destination, .. }
+        | mir::Instruction::DictionaryEntries { destination, .. } => Some(destination),
         mir::Instruction::CallIntrinsic {
             destination,
             intrinsic,
@@ -327,6 +332,12 @@ fn set_allocation_region(instruction: &mut mir::Instruction, region: mir::Alloca
             region: current, ..
         }
         | mir::Instruction::AllocateList {
+            region: current, ..
+        }
+        | mir::Instruction::AllocateDictionary {
+            region: current, ..
+        }
+        | mir::Instruction::DictionaryEntries {
             region: current, ..
         } => *current = region,
         mir::Instruction::CallIntrinsic { intrinsic, .. }
@@ -590,6 +601,11 @@ fn instruction_escape(
         mir::Instruction::AllocateArray { .. }
         | mir::Instruction::AllocateObject { .. }
         | mir::Instruction::AllocateList { .. }
+        | mir::Instruction::AllocateDictionary { .. }
+        | mir::Instruction::DictionaryTryGet { .. }
+        | mir::Instruction::DictionaryContainsKey { .. }
+        | mir::Instruction::DictionaryRemove { .. }
+        | mir::Instruction::DictionaryEntries { .. }
         | mir::Instruction::ListGet { .. }
         | mir::Instruction::ListRemoveAt { .. }
         | mir::Instruction::StringDecodeNext { .. } => None,
@@ -603,6 +619,11 @@ fn instruction_escape(
         mir::Instruction::ListAdd { value, .. } => direct_alias(value, aliases)
             .is_some()
             .then_some(EscapeReason::Stored),
+        mir::Instruction::DictionaryAdd { key, value, .. }
+        | mir::Instruction::DictionarySet { key, value, .. } => {
+            (direct_alias(key, aliases).is_some() || direct_alias(value, aliases).is_some())
+                .then_some(EscapeReason::Stored)
+        }
     }
 }
 
@@ -640,6 +661,9 @@ fn assignment_escape(
         }
         mir::RvalueKind::ArrayLength(operand) if direct_alias(operand, aliases).is_some() => None,
         mir::RvalueKind::ListLength(operand) if direct_alias(operand, aliases).is_some() => None,
+        mir::RvalueKind::DictionaryLength(operand) if direct_alias(operand, aliases).is_some() => {
+            None
+        }
         mir::RvalueKind::ListVersion(operand) if direct_alias(operand, aliases).is_some() => None,
         mir::RvalueKind::StringByteLength(operand) if direct_alias(operand, aliases).is_some() => {
             None
@@ -661,6 +685,7 @@ fn rvalue_uses_alias(value: &mir::Rvalue, aliases: &HashSet<mir::LocalId>) -> bo
         | mir::RvalueKind::Discriminant(operand)
         | mir::RvalueKind::ArrayLength(operand)
         | mir::RvalueKind::ListLength(operand)
+        | mir::RvalueKind::DictionaryLength(operand)
         | mir::RvalueKind::ListVersion(operand)
         | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
