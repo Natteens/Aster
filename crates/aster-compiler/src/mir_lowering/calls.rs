@@ -173,6 +173,23 @@ impl FunctionLowerer {
                     kind: mir::OperandKind::Copy(destination),
                 })
             }
+            hir::Intrinsic::FileListFiles(layout) => {
+                let directory = self
+                    .lower_expression(&arguments[0])
+                    .expect("validated ListFiles directory argument produces a value");
+                let local = self.new_temporary(return_type.clone());
+                let destination = mir::Place::Local(local);
+                self.instruction(mir::Instruction::CallIntrinsic {
+                    destination: Some(destination.clone()),
+                    intrinsic: mir::Intrinsic::FileListFiles(layout),
+                    arguments: vec![directory],
+                    return_type: return_type.clone(),
+                });
+                Some(mir::Operand {
+                    type_: return_type.clone(),
+                    kind: mir::OperandKind::Copy(destination),
+                })
+            }
         }
     }
 }

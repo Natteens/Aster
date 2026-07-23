@@ -335,6 +335,12 @@ pub enum Intrinsic {
     /// the `Result<int, IOError>` specialization (bytes written on success).
     /// No string escapes this intrinsic, so it has no temporary counterpart.
     FileWriteAllText(FileIoResultLayout),
+    /// `aster.io.ListFiles(string)`: lists direct regular-file paths through
+    /// the host filesystem backend. Both the returned `string[]` and every
+    /// contained string are allocated in this single selected region.
+    FileListFiles(FileIoResultLayout),
+    /// Temporary-arena counterpart of [`Self::FileListFiles`].
+    FileListFilesTemporary(FileIoResultLayout),
 }
 
 impl Intrinsic {
@@ -398,7 +404,21 @@ impl Intrinsic {
             | Self::StringTryParseDouble
             | Self::ConsoleWrite
             | Self::ConsoleWriteLine
-            | Self::FileWriteAllText(_) => None,
+            | Self::FileWriteAllText(_)
+            | Self::FileListFiles(_)
+            | Self::FileListFilesTemporary(_) => None,
+        }
+    }
+
+    /// Region carried by every intrinsic that creates ASTER-managed dynamic
+    /// storage. Unlike [`Self::string_allocation_region`], this includes
+    /// aggregate-producing intrinsics such as `ListFiles`.
+    #[must_use]
+    pub const fn allocation_region(self) -> Option<AllocationRegion> {
+        match self {
+            Self::FileListFiles(_) => Some(AllocationRegion::Persistent),
+            Self::FileListFilesTemporary(_) => Some(AllocationRegion::Temporary),
+            _ => self.string_allocation_region(),
         }
     }
 
@@ -496,6 +516,22 @@ impl Intrinsic {
                 AllocationRegion::Temporary,
             ) => Self::FileReadAllTextTemporary(layout),
             _ => self,
+        }
+    }
+
+    /// Return the equivalent dynamic-allocation intrinsic for `region`.
+    #[must_use]
+    pub const fn with_allocation_region(self, region: AllocationRegion) -> Self {
+        match (self, region) {
+            (
+                Self::FileListFiles(layout) | Self::FileListFilesTemporary(layout),
+                AllocationRegion::Persistent,
+            ) => Self::FileListFiles(layout),
+            (
+                Self::FileListFiles(layout) | Self::FileListFilesTemporary(layout),
+                AllocationRegion::Temporary,
+            ) => Self::FileListFilesTemporary(layout),
+            _ => self.with_string_allocation_region(region),
         }
     }
 }

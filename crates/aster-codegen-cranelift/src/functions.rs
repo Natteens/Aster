@@ -198,7 +198,7 @@ fn function_uses_temporary_allocations(function: &mir::Function) -> bool {
                 ..
             } => true,
             mir::Instruction::CallIntrinsic { intrinsic, .. } => {
-                intrinsic.string_allocation_region() == Some(mir::AllocationRegion::Temporary)
+                intrinsic.allocation_region() == Some(mir::AllocationRegion::Temporary)
             }
             _ => false,
         })

@@ -133,6 +133,17 @@ public Result<int, IOError> WriteAllText(string path, string content)
     return Result<int, IOError>.Error(IOError { Kind: IOErrorKind.Other, OsCode: 0 });
 }
 
+/// Return the regular files immediately contained by `directory`. The host
+/// opens, enumerates, and closes the directory within this one call; ASTER
+/// never receives a directory handle. Results are complete paths relative to
+/// the supplied argument, ordinally sorted, non-recursive, and exclude
+/// directories, symlinks, and other non-regular entries. This declaration's
+/// body is never executed: the host intrinsic owns the operation.
+public Result<string[], IOError> ListFiles(string directory)
+{
+    return Result<string[], IOError>.Error(IOError { Kind: IOErrorKind.Other, OsCode: 0 });
+}
+
 public void Write(string value)
 {
 }

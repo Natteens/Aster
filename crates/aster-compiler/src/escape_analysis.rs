@@ -300,7 +300,7 @@ fn is_dynamic_allocation(instruction: &mir::Instruction) -> bool {
     ) || matches!(
         instruction,
         mir::Instruction::CallIntrinsic { intrinsic, .. }
-            if intrinsic.string_allocation_region().is_some()
+            if intrinsic.allocation_region().is_some()
     )
 }
 
@@ -313,7 +313,7 @@ fn allocation_destination(instruction: &mir::Instruction) -> Option<&mir::Place>
             destination,
             intrinsic,
             ..
-        } if intrinsic.string_allocation_region().is_some() => destination.as_ref(),
+        } if intrinsic.allocation_region().is_some() => destination.as_ref(),
         _ => None,
     }
 }
@@ -330,9 +330,9 @@ fn set_allocation_region(instruction: &mut mir::Instruction, region: mir::Alloca
             region: current, ..
         } => *current = region,
         mir::Instruction::CallIntrinsic { intrinsic, .. }
-            if intrinsic.string_allocation_region().is_some() =>
+            if intrinsic.allocation_region().is_some() =>
         {
-            *intrinsic = intrinsic.with_string_allocation_region(region);
+            *intrinsic = intrinsic.with_allocation_region(region);
         }
         _ => unreachable!("only dynamic allocations receive storage regions"),
     }
@@ -561,6 +561,8 @@ fn instruction_escape(
                     | mir::Intrinsic::FileReadAllText(_)
                     | mir::Intrinsic::FileReadAllTextTemporary(_)
                     | mir::Intrinsic::FileWriteAllText(_)
+                    | mir::Intrinsic::FileListFiles(_)
+                    | mir::Intrinsic::FileListFilesTemporary(_)
                     | mir::Intrinsic::ReportRuntimeError(_)
             );
             (!borrows_only

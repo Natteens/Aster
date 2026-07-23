@@ -431,6 +431,9 @@ impl Lowerer<'_> {
             hir::Intrinsic::FileWriteAllText(_) => {
                 hir::Intrinsic::FileWriteAllText(self.resolve_file_io_result_layout(return_type))
             }
+            hir::Intrinsic::FileListFiles(_) => {
+                hir::Intrinsic::FileListFiles(self.resolve_file_io_result_layout(return_type))
+            }
             other => other,
         }
     }

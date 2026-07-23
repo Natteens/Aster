@@ -155,7 +155,9 @@ impl Codegen {
             }
             mir::Intrinsic::FileReadAllText(_)
             | mir::Intrinsic::FileReadAllTextTemporary(_)
-            | mir::Intrinsic::FileWriteAllText(_) => {
+            | mir::Intrinsic::FileWriteAllText(_)
+            | mir::Intrinsic::FileListFiles(_)
+            | mir::Intrinsic::FileListFilesTemporary(_) => {
                 return self.translate_file_io(
                     builder,
                     destination,
@@ -262,7 +264,9 @@ impl Codegen {
             | mir::Intrinsic::ConsoleReadLineTemporary
             | mir::Intrinsic::FileReadAllText(_)
             | mir::Intrinsic::FileReadAllTextTemporary(_)
-            | mir::Intrinsic::FileWriteAllText(_) => {
+            | mir::Intrinsic::FileWriteAllText(_)
+            | mir::Intrinsic::FileListFiles(_)
+            | mir::Intrinsic::FileListFilesTemporary(_) => {
                 unreachable!("handled by the dedicated translators above")
             }
         };
@@ -1105,6 +1109,8 @@ impl Codegen {
                 ("aster.io.ReadAllText", symbols)
             }
             mir::Intrinsic::FileWriteAllText(symbols) => ("aster.io.WriteAllText", symbols),
+            mir::Intrinsic::FileListFiles(symbols)
+            | mir::Intrinsic::FileListFilesTemporary(symbols) => ("aster.io.ListFiles", symbols),
             _ => unreachable!("caller matched only file-io intrinsics"),
         };
         let layout = self.result_io_error_layout(return_type, &symbols, operation)?;
@@ -1172,6 +1178,38 @@ impl Codegen {
                     &[
                         context,
                         path_value,
+                        destination_address,
+                        total_size,
+                        ok_tag,
+                        error_tag,
+                        ok_offset,
+                        error_offset,
+                        kind_offset,
+                        oscode_offset,
+                        tags_pointer,
+                    ],
+                );
+            }
+            mir::Intrinsic::FileListFiles(_) | mir::Intrinsic::FileListFilesTemporary(_) => {
+                let [directory] = arguments else {
+                    return Err(BackendError::new(
+                        "aster.io.ListFiles requires exactly one argument",
+                    ));
+                };
+                let directory_value = self.translate_operand(builder, directory, state)?;
+                let symbol = match intrinsic {
+                    mir::Intrinsic::FileListFiles(_) => "aster_rt_io_list_files",
+                    mir::Intrinsic::FileListFilesTemporary(_) => "aster_rt_io_list_files_temporary",
+                    _ => unreachable!("caller matched only file-list intrinsics"),
+                };
+                let function_ref = self
+                    .jit
+                    .declare_func_in_func(self.runtime_ids[symbol], builder.func);
+                builder.ins().call(
+                    function_ref,
+                    &[
+                        context,
+                        directory_value,
                         destination_address,
                         total_size,
                         ok_tag,

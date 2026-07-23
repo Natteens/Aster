@@ -14,6 +14,8 @@
 //! exposes an owned file handle.
 
 use std::io::{self, Read as _, Write as _};
+use std::mem::size_of;
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::ExecutionContext;
@@ -24,6 +26,11 @@ use crate::string::{AsterStrHeader, view};
 /// `WriteAllText`, per operation. Not configurable in this milestone.
 pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Fixed, host-enforced limits for one `ListFiles` operation. They cap only
+/// the returned direct regular-file paths; neither value is user-configurable.
+pub const MAX_LIST_FILES: usize = 100_000;
+pub const MAX_LIST_PATH_BYTES: usize = 67_108_864;
+
 /// A filesystem operation's outcome, ahead of classification into
 /// [`PortableIoErrorKind`]. `NotFile` is synthesized by the backend (a
 /// directory, or another incompatible type, used where a regular file was
@@ -32,6 +39,9 @@ pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 pub enum FileSystemError {
     Io(io::Error),
     NotFile,
+    NotDirectory,
+    InvalidPath,
+    LimitExceeded,
 }
 
 /// Injectable filesystem backend for `aster.io.ReadAllText`/`WriteAllText`.
@@ -60,6 +70,31 @@ pub trait FileSystemBackend: Send {
     /// Returns an error if the underlying host write or flush fails, or the
     /// destination is not a regular file.
     fn write_all(&mut self, path: &str, content: &[u8]) -> Result<(), FileSystemError>;
+
+    /// List direct, regular, non-symlink files below `directory`. The
+    /// returned paths must already be full relative to `directory`, valid
+    /// UTF-8, ordinally sorted, and entirely validated against both limits.
+    /// A backend returns no partial list on an opening or iteration failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified host error, `NotDirectory`, `InvalidPath`, or
+    /// `LimitExceeded`; never a partial result.
+    ///
+    /// The default preserves source compatibility for host test backends that
+    /// intentionally only implement read/write; it is not reachable from the
+    /// standard or in-memory backend used by ASTER executions.
+    fn list_files(
+        &mut self,
+        _directory: &str,
+        _max_entries: usize,
+        _max_total_bytes: usize,
+    ) -> Result<Vec<String>, FileSystemError> {
+        Err(FileSystemError::Io(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "filesystem backend does not implement directory enumeration",
+        )))
+    }
 }
 
 /// Default backend: the process's real filesystem.
@@ -99,11 +134,50 @@ impl FileSystemBackend for StdFileSystemBackend {
         file.flush().map_err(FileSystemError::Io)?;
         Ok(())
     }
+
+    fn list_files(
+        &mut self,
+        directory: &str,
+        max_entries: usize,
+        max_total_bytes: usize,
+    ) -> Result<Vec<String>, FileSystemError> {
+        if !std::fs::metadata(directory)
+            .map_err(FileSystemError::Io)?
+            .is_dir()
+        {
+            return Err(FileSystemError::NotDirectory);
+        }
+
+        let mut paths = Vec::new();
+        let mut total_bytes = 0_usize;
+        for entry in std::fs::read_dir(directory).map_err(FileSystemError::Io)? {
+            let entry = entry.map_err(FileSystemError::Io)?;
+            let file_type = entry.file_type().map_err(FileSystemError::Io)?;
+            if file_type.is_symlink() || !file_type.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let Some(path) = path.to_str() else {
+                return Err(FileSystemError::InvalidPath);
+            };
+            collect_list_path(
+                &mut paths,
+                &mut total_bytes,
+                path,
+                max_entries,
+                max_total_bytes,
+            )?;
+        }
+        paths.sort();
+        Ok(paths)
+    }
 }
 
 enum MemoryEntry {
     File(Vec<u8>),
     Directory,
+    Symlink,
+    Other,
 }
 
 /// In-memory backend for tests: files live in a shared map, so tests never
@@ -141,6 +215,28 @@ impl MemoryFileSystemBackend {
         self
     }
 
+    /// Seed a symlink-like entry. Directory enumeration intentionally ignores
+    /// it without following its target.
+    #[must_use]
+    pub fn with_symlink(self, path: impl Into<String>) -> Self {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.into(), MemoryEntry::Symlink);
+        self
+    }
+
+    /// Seed an entry that is neither a file nor a directory (for example a
+    /// device or pipe in a host filesystem). Enumeration ignores it.
+    #[must_use]
+    pub fn with_other(self, path: impl Into<String>) -> Self {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.into(), MemoryEntry::Other);
+        self
+    }
+
     /// The bytes currently stored at `path`, if any (for assertions after a
     /// `WriteAllText` call through a clone sharing the same backing map).
     #[must_use]
@@ -161,10 +257,12 @@ impl FileSystemBackend for MemoryFileSystemBackend {
     fn read_all(&mut self, path: &str, probe_limit: u64) -> Result<Vec<u8>, FileSystemError> {
         let guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         match guard.get(path) {
-            Some(MemoryEntry::Directory) => Err(FileSystemError::NotFile),
             Some(MemoryEntry::File(bytes)) => {
                 let limit = usize::try_from(probe_limit).unwrap_or(usize::MAX);
                 Ok(bytes.iter().take(limit).copied().collect())
+            }
+            Some(MemoryEntry::Directory | MemoryEntry::Symlink | MemoryEntry::Other) => {
+                Err(FileSystemError::NotFile)
             }
             None => Err(FileSystemError::Io(io::Error::from(
                 io::ErrorKind::NotFound,
@@ -179,6 +277,43 @@ impl FileSystemBackend for MemoryFileSystemBackend {
         }
         guard.insert(path.to_owned(), MemoryEntry::File(content.to_vec()));
         Ok(())
+    }
+
+    fn list_files(
+        &mut self,
+        directory: &str,
+        max_entries: usize,
+        max_total_bytes: usize,
+    ) -> Result<Vec<String>, FileSystemError> {
+        let guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        match guard.get(directory) {
+            Some(MemoryEntry::Directory) => {}
+            Some(_) => return Err(FileSystemError::NotDirectory),
+            None => {
+                return Err(FileSystemError::Io(io::Error::from(
+                    io::ErrorKind::NotFound,
+                )));
+            }
+        }
+
+        let directory = Path::new(directory);
+        let mut paths = Vec::new();
+        let mut total_bytes = 0_usize;
+        for (path, entry) in guard.iter() {
+            if !matches!(entry, MemoryEntry::File(_)) || Path::new(path).parent() != Some(directory)
+            {
+                continue;
+            }
+            collect_list_path(
+                &mut paths,
+                &mut total_bytes,
+                path,
+                max_entries,
+                max_total_bytes,
+            )?;
+        }
+        paths.sort();
+        Ok(paths)
     }
 }
 
@@ -202,6 +337,15 @@ impl FileSystemBackend for FailingFileSystemBackend {
     }
 
     fn write_all(&mut self, _path: &str, _content: &[u8]) -> Result<(), FileSystemError> {
+        Err(FileSystemError::Io(io::Error::from(self.kind)))
+    }
+
+    fn list_files(
+        &mut self,
+        _directory: &str,
+        _max_entries: usize,
+        _max_total_bytes: usize,
+    ) -> Result<Vec<String>, FileSystemError> {
         Err(FileSystemError::Io(io::Error::from(self.kind)))
     }
 }
@@ -251,11 +395,39 @@ impl FileSystemBackend for PartialWriteFailureFileSystemBackend {
 fn classify(error: FileSystemError) -> (PortableIoErrorKind, i32) {
     match error {
         FileSystemError::NotFile => (PortableIoErrorKind::NotFile, 0),
+        FileSystemError::NotDirectory => (PortableIoErrorKind::NotDirectory, 0),
+        FileSystemError::InvalidPath => (PortableIoErrorKind::InvalidPath, 0),
+        FileSystemError::LimitExceeded => (PortableIoErrorKind::LimitExceeded, 0),
         FileSystemError::Io(error) => {
             let classified = classify_io_error(&error);
             (classified.kind, classified.os_code)
         }
     }
+}
+
+fn collect_list_path(
+    paths: &mut Vec<String>,
+    total_bytes: &mut usize,
+    path: &str,
+    max_entries: usize,
+    max_total_bytes: usize,
+) -> Result<(), FileSystemError> {
+    let next_count = paths
+        .len()
+        .checked_add(1)
+        .ok_or(FileSystemError::LimitExceeded)?;
+    if next_count > max_entries {
+        return Err(FileSystemError::LimitExceeded);
+    }
+    let next_total = total_bytes
+        .checked_add(path.len())
+        .ok_or(FileSystemError::LimitExceeded)?;
+    if next_total > max_total_bytes {
+        return Err(FileSystemError::LimitExceeded);
+    }
+    paths.push(path.to_owned());
+    *total_bytes = next_total;
+    Ok(())
 }
 
 /// Read the 9 `IOErrorKind` tag values the compiler computed, in the fixed
@@ -299,7 +471,7 @@ fn kind_tag(tags: &[i32; 9], kind: PortableIoErrorKind) -> i32 {
 /// for the concrete `Result<T, IOError>` layout, owned exclusively by the
 /// caller for the duration of this call.
 #[allow(unsafe_code)]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 unsafe fn write_result_io_error<T>(
     destination: *mut u8,
     total_size: usize,
@@ -458,6 +630,268 @@ fn read_all_text(
             &kind_tags,
         );
     }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn list_files(
+    context: *mut ExecutionContext,
+    directory: *const AsterStrHeader,
+    destination: *mut u8,
+    total_size: i32,
+    ok_tag: i32,
+    error_tag: i32,
+    ok_payload_offset: i32,
+    error_payload_offset: i32,
+    kind_offset: i32,
+    oscode_offset: i32,
+    kind_tags: *const i32,
+    temporary: bool,
+) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: generated code passes its live hidden ExecutionContext.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    if destination.is_null() {
+        context.fail("aster.io.ListFiles received a null destination");
+        return;
+    }
+    let (
+        Ok(total_size),
+        Ok(ok_payload_offset),
+        Ok(error_payload_offset),
+        Ok(kind_offset),
+        Ok(oscode_offset),
+    ) = (
+        usize::try_from(total_size),
+        usize::try_from(ok_payload_offset),
+        usize::try_from(error_payload_offset),
+        usize::try_from(kind_offset),
+        usize::try_from(oscode_offset),
+    )
+    else {
+        context.fail("aster.io.ListFiles received a negative layout size");
+        return;
+    };
+    // SAFETY: generated code passes a pointer to 9 compiler-computed tag
+    // constants (or null on a malformed layout, handled below).
+    #[allow(unsafe_code)]
+    let Some(kind_tags) = (unsafe { read_kind_tags(kind_tags) }) else {
+        context.fail("aster.io.ListFiles received a malformed IOErrorKind tag layout");
+        return;
+    };
+    // SAFETY: generated code passes its live context and a string reference
+    // owned by that context or the live JIT module.
+    #[allow(unsafe_code)]
+    let directory = unsafe { view(directory) };
+    let Some(directory) = directory else {
+        context.fail("aster.io.ListFiles received an invalid UTF-8 string reference");
+        return;
+    };
+
+    let mut paths = if directory.is_empty() || directory.contains('\0') {
+        Err((PortableIoErrorKind::InvalidPath, 0))
+    } else {
+        context
+            .filesystem_backend()
+            .list_files(directory, MAX_LIST_FILES, MAX_LIST_PATH_BYTES)
+            .map_err(classify)
+    };
+
+    let validation_error = if let Ok(paths) = &mut paths {
+        paths.sort();
+        if paths.len() > MAX_LIST_FILES {
+            Some(PortableIoErrorKind::LimitExceeded)
+        } else {
+            let mut total = 0_usize;
+            let mut error = None;
+            for path in paths.iter() {
+                if path.is_empty() || path.contains('\0') {
+                    error = Some(PortableIoErrorKind::InvalidPath);
+                    break;
+                }
+                let Some(next_total) = total.checked_add(path.len()) else {
+                    error = Some(PortableIoErrorKind::LimitExceeded);
+                    break;
+                };
+                if next_total > MAX_LIST_PATH_BYTES {
+                    error = Some(PortableIoErrorKind::LimitExceeded);
+                    break;
+                }
+                total = next_total;
+            }
+            error
+        }
+    } else {
+        None
+    };
+    if let Some(kind) = validation_error {
+        paths = Err((kind, 0));
+    }
+
+    let paths = match paths {
+        Ok(paths) => paths,
+        Err(error) => {
+            // SAFETY: as in `read_all_text`; no ASTER allocation has been
+            // published or attempted on this filesystem error path.
+            #[allow(unsafe_code)]
+            unsafe {
+                write_result_io_error(
+                    destination,
+                    total_size,
+                    ok_tag,
+                    error_tag,
+                    ok_payload_offset,
+                    error_payload_offset,
+                    kind_offset,
+                    oscode_offset,
+                    Err::<*mut AsterStrHeader, _>(error),
+                    &kind_tags,
+                );
+            }
+            return;
+        }
+    };
+    let Ok(length) = i32::try_from(paths.len()) else {
+        // The public limit keeps this unreachable, but preserve the no-partial
+        // contract if a backend is adversarial.
+        #[allow(unsafe_code)]
+        unsafe {
+            write_result_io_error(
+                destination,
+                total_size,
+                ok_tag,
+                error_tag,
+                ok_payload_offset,
+                error_payload_offset,
+                kind_offset,
+                oscode_offset,
+                Err::<*mut AsterStrHeader, _>((PortableIoErrorKind::LimitExceeded, 0)),
+                &kind_tags,
+            );
+        }
+        return;
+    };
+    let element_size = u32::try_from(size_of::<*const AsterStrHeader>()).unwrap_or(0);
+    if element_size == 0 {
+        context.fail("aster.io.ListFiles cannot represent string array elements");
+        return;
+    }
+    let array = if temporary {
+        context.allocate_temporary_array(length, element_size)
+    } else {
+        context.allocate_array(length, element_size)
+    };
+    if array.is_null() {
+        return;
+    }
+    for (index, path) in paths.iter().enumerate() {
+        let string = if temporary {
+            context.allocate_temporary_string_parts(&[path])
+        } else {
+            context.allocate_string_parts(&[path])
+        };
+        if string.is_null() {
+            return;
+        }
+        let Ok(index) = i32::try_from(index) else {
+            context.fail("aster.io.ListFiles entry index exceeds the ABI range");
+            return;
+        };
+        let element = crate::aster_rt_array_element(std::ptr::from_mut(context), array, index);
+        if element.is_null() {
+            context.fail("aster.io.ListFiles could not initialize its result array");
+            return;
+        }
+        // SAFETY: `array` was allocated above with exactly pointer-sized
+        // string elements; `index` is within its checked length; no ASTER
+        // code can observe the array before the complete Result is written.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::write_unaligned(element.cast::<*const AsterStrHeader>(), string);
+        }
+    }
+    // SAFETY: all strings and the array now belong to the same selected
+    // arena. Only after fully writing every element do we publish `Ok`.
+    #[allow(unsafe_code)]
+    unsafe {
+        write_result_io_error(
+            destination,
+            total_size,
+            ok_tag,
+            error_tag,
+            ok_payload_offset,
+            error_payload_offset,
+            kind_offset,
+            oscode_offset,
+            Ok(array),
+            &kind_tags,
+        );
+    }
+}
+
+/// List direct regular files into a persistent `Result<string[], IOError>`.
+/// Exported to generated code as `aster_rt_io_list_files`.
+#[allow(clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments)]
+pub extern "C" fn aster_rt_io_list_files(
+    context: *mut ExecutionContext,
+    directory: *const AsterStrHeader,
+    destination: *mut u8,
+    total_size: i32,
+    ok_tag: i32,
+    error_tag: i32,
+    ok_payload_offset: i32,
+    error_payload_offset: i32,
+    kind_offset: i32,
+    oscode_offset: i32,
+    kind_tags: *const i32,
+) {
+    list_files(
+        context,
+        directory,
+        destination,
+        total_size,
+        ok_tag,
+        error_tag,
+        ok_payload_offset,
+        error_payload_offset,
+        kind_offset,
+        oscode_offset,
+        kind_tags,
+        false,
+    );
+}
+
+/// Temporary-arena counterpart of [`aster_rt_io_list_files`].
+#[allow(clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments)]
+pub extern "C" fn aster_rt_io_list_files_temporary(
+    context: *mut ExecutionContext,
+    directory: *const AsterStrHeader,
+    destination: *mut u8,
+    total_size: i32,
+    ok_tag: i32,
+    error_tag: i32,
+    ok_payload_offset: i32,
+    error_payload_offset: i32,
+    kind_offset: i32,
+    oscode_offset: i32,
+    kind_tags: *const i32,
+) {
+    list_files(
+        context,
+        directory,
+        destination,
+        total_size,
+        ok_tag,
+        error_tag,
+        ok_payload_offset,
+        error_payload_offset,
+        kind_offset,
+        oscode_offset,
+        kind_tags,
+        true,
+    );
 }
 
 /// Read an entire UTF-8 text file into a persistent `Result<string, IOError>`.
@@ -663,6 +1097,63 @@ mod tests {
             .read_all("missing.txt", 1024)
             .expect_err("no such file");
         assert!(matches!(error, FileSystemError::Io(e) if e.kind() == io::ErrorKind::NotFound));
+    }
+
+    #[test]
+    fn memory_backend_lists_only_direct_regular_files_in_ordinal_order() {
+        let mut backend = MemoryFileSystemBackend::new()
+            .with_directory("root")
+            .with_file("root/b.txt", "b")
+            .with_file("root/A.txt", "a")
+            .with_file("root/a.txt", "a")
+            .with_file("root/Ã©.txt", "unicode")
+            .with_file("root/non_text.bin", [0_u8, 255])
+            .with_directory("root/Sub")
+            .with_file("root/Sub/nested.txt", "nested")
+            .with_symlink("root/link")
+            .with_other("root/pipe");
+
+        let paths = backend
+            .list_files("root", 100, 10_000)
+            .expect("directory should enumerate");
+        assert_eq!(
+            paths,
+            vec![
+                "root/A.txt",
+                "root/a.txt",
+                "root/b.txt",
+                "root/non_text.bin",
+                "root/Ã©.txt",
+            ]
+        );
+    }
+
+    #[test]
+    fn memory_backend_list_files_rejects_wrong_kind_and_enforces_limits() {
+        let mut file = MemoryFileSystemBackend::new().with_file("file", "content");
+        assert!(matches!(
+            file.list_files("file", 10, 100),
+            Err(FileSystemError::NotDirectory)
+        ));
+
+        let mut missing = MemoryFileSystemBackend::new();
+        assert!(matches!(
+            missing.list_files("missing", 10, 100),
+            Err(FileSystemError::Io(error)) if error.kind() == io::ErrorKind::NotFound
+        ));
+
+        let mut limited = MemoryFileSystemBackend::new()
+            .with_directory("root")
+            .with_file("root/a", "")
+            .with_file("root/b", "");
+        assert!(matches!(
+            limited.list_files("root", 1, 100),
+            Err(FileSystemError::LimitExceeded)
+        ));
+        assert!(matches!(
+            limited.list_files("root", 10, 5),
+            Err(FileSystemError::LimitExceeded)
+        ));
     }
 
     #[test]

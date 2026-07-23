@@ -70,6 +70,11 @@ pub enum Intrinsic {
     /// filesystem backend. Payload resolved the same way as
     /// [`Self::FileReadAllText`], against `Result<int, IOError>`.
     FileWriteAllText(FileIoResultLayout),
+    /// `aster.io.ListFiles(string) -> Result<string[], IOError>`: lists the
+    /// immediately contained regular files through the host filesystem
+    /// backend. The concrete `Result<string[], IOError>` layout is resolved
+    /// exactly once before MIR; the backend receives symbols, never names.
+    FileListFiles(FileIoResultLayout),
 }
 
 /// Every concrete symbol the M2D filesystem intrinsics need to construct a

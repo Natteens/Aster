@@ -573,6 +573,74 @@ fn aster_check_rejects_file_io_reachable_from_a_parallel_for_body() {
     );
 }
 
+#[test]
+fn aster_run_lists_real_direct_files_in_ordinal_order_and_reuses_the_paths() {
+    let directory = temporary_directory("list-files");
+    let data = directory.join("data");
+    fs::create_dir(&data).expect("create data directory");
+    fs::write(data.join("b.txt"), "b").expect("write b");
+    fs::write(data.join("a.txt"), "hello").expect("write a");
+    fs::write(data.join("empty.txt"), "").expect("write empty");
+    fs::write(data.join("non_text.bin"), [0_u8, 255]).expect("write binary");
+    fs::create_dir(data.join("Sub")).expect("create nested directory");
+    fs::write(data.join("Sub").join("nested.txt"), "nested").expect("write nested");
+    let main = directory.join("main.aster");
+    fs::write(
+        &main,
+        format!(
+            "using aster.core;\nusing aster.io;\n\
+             public int Main() {{\n\
+                 switch (ListFiles(\"{}\")) {{\n\
+                     case Ok(files):\n\
+                         if (files.Length != 4) {{ return -1; }}\n\
+                        switch (ReadAllText(files[0])) {{ case Ok(text): return text.Length; case Error(e): return -2; }}\n\
+                     case Error(e): return -3;\n\
+                 }}\n\
+             }}",
+            data.to_str().unwrap().replace('\\', "\\\\")
+        ),
+    )
+    .expect("write program");
+    let output = aster([
+        "run",
+        main.to_str().expect("UTF-8 temporary path"),
+        "--function",
+        "Main",
+    ]);
+    fs::remove_dir_all(&directory).expect("remove temporary directory");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "5");
+}
+
+#[test]
+fn aster_check_and_run_both_reject_list_files_in_a_worker() {
+    let directory = temporary_directory("check-worker-list-files");
+    let main = directory.join("main.aster");
+    fs::write(
+        &main,
+        "using aster.core;\nusing aster.io;\n\
+         public void Helper(int i) { ListFiles(\"data\"); }\n\
+         public void Body(int i) { Helper(i); }\n\
+         public int Main() { Parallel.For(0, 4, Body); return 0; }",
+    )
+    .expect("write worker ListFiles program");
+    let check_output = aster(["check", main.to_str().expect("UTF-8 temporary path")]);
+    let run_output = aster([
+        "run",
+        main.to_str().expect("UTF-8 temporary path"),
+        "--function",
+        "Main",
+    ]);
+    fs::remove_dir_all(&directory).expect("remove temporary directory");
+    assert!(!check_output.status.success());
+    assert!(!run_output.status.success());
+    assert!(
+        stderr(&check_output).contains("ListFiles"),
+        "{}",
+        stderr(&check_output)
+    );
+}
+
 fn aster<const N: usize>(arguments: [&str; N]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_aster"))
         .args(arguments)

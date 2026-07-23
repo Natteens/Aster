@@ -396,7 +396,7 @@ impl ExecutionContext {
         header_ptr
     }
 
-    fn allocate_array(&mut self, length: i32, element_size: u32) -> *mut AsterArray {
+    pub(crate) fn allocate_array(&mut self, length: i32, element_size: u32) -> *mut AsterArray {
         self.allocate_array_in_region(length, element_size, false)
     }
 

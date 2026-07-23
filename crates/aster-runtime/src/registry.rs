@@ -12,7 +12,8 @@ use crate::context::{
     aster_rt_temporary_scope_enter, aster_rt_temporary_scope_leave,
 };
 use crate::filesystem::{
-    aster_rt_io_read_all_text, aster_rt_io_read_all_text_temporary, aster_rt_io_write_all_text,
+    aster_rt_io_list_files, aster_rt_io_list_files_temporary, aster_rt_io_read_all_text,
+    aster_rt_io_read_all_text_temporary, aster_rt_io_write_all_text,
 };
 use crate::io::{
     aster_rt_io_read_line, aster_rt_io_read_line_temporary, aster_rt_io_write,
@@ -675,6 +676,46 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             signature: RuntimeSignature {
                 parameters: &[
                     RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::Pointer,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_io_list_files",
+            address: aster_rt_io_list_files as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::Pointer,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_io_list_files_temporary",
+            address: aster_rt_io_list_files_temporary as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
                     RuntimeType::Pointer,
                     RuntimeType::Pointer,
                     RuntimeType::Pointer,

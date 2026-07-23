@@ -159,7 +159,9 @@ fn validate_no_console_io_in_workers(module: &mir::Module) -> Result<(), Backend
                             | mir::Intrinsic::ConsoleReadLineTemporary
                             | mir::Intrinsic::FileReadAllText(_)
                             | mir::Intrinsic::FileReadAllTextTemporary(_)
-                            | mir::Intrinsic::FileWriteAllText(_),
+                            | mir::Intrinsic::FileWriteAllText(_)
+                            | mir::Intrinsic::FileListFiles(_)
+                            | mir::Intrinsic::FileListFilesTemporary(_),
                         ..
                     } => {
                         io_users.insert(function.symbol);
@@ -209,7 +211,7 @@ fn validate_no_console_io_in_workers(module: &mir::Module) -> Result<(), Backend
                         && reaches_io(target)
                     {
                         return Err(BackendError::new(format!(
-                            "function `{}` uses `{worker_name}` with a worker body that (directly or transitively) calls `aster.io.Write`/`WriteLine`/`ReadLine`/`ReadAllText`/`WriteAllText`, which is rejected in this version",
+                            "function `{}` uses `{worker_name}` with a worker body that (directly or transitively) calls `aster.io.Write`/`WriteLine`/`ReadLine`/`ReadAllText`/`WriteAllText`/`ListFiles`, which is rejected in this version",
                             function.name
                         )));
                     }
@@ -439,6 +441,10 @@ fn validate_file_io_result_shapes(
                 mir::Intrinsic::FileReadAllText(layout)
                 | mir::Intrinsic::FileReadAllTextTemporary(layout) => (mir::Type::String, layout),
                 mir::Intrinsic::FileWriteAllText(layout) => (mir::Type::Int, layout),
+                mir::Intrinsic::FileListFiles(layout)
+                | mir::Intrinsic::FileListFilesTemporary(layout) => {
+                    (mir::Type::Array(Box::new(mir::Type::String)), layout)
+                }
                 _ => continue,
             };
             let malformed = || {
@@ -1365,6 +1371,11 @@ fn validate_intrinsic_shape(
             destination.is_some()
                 && matches!(return_type, mir::Type::Enum(_))
                 && matches!(arguments, [path, content] if path.type_ == mir::Type::String && content.type_ == mir::Type::String)
+        }
+        mir::Intrinsic::FileListFiles(_) | mir::Intrinsic::FileListFilesTemporary(_) => {
+            destination.is_some()
+                && matches!(return_type, mir::Type::Enum(_))
+                && matches!(arguments, [directory] if directory.type_ == mir::Type::String)
         }
         mir::Intrinsic::TaskRun => {
             destination.is_some()

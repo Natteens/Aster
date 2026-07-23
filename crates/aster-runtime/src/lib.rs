@@ -27,8 +27,9 @@ pub use context::{
     aster_rt_list_new, aster_rt_list_new_temporary, aster_rt_list_remove_at,
 };
 pub use filesystem::{
-    FailingFileSystemBackend, FileSystemBackend, FileSystemError, MAX_FILE_BYTES,
-    MemoryFileSystemBackend, PartialWriteFailureFileSystemBackend, StdFileSystemBackend,
+    FailingFileSystemBackend, FileSystemBackend, FileSystemError, MAX_FILE_BYTES, MAX_LIST_FILES,
+    MAX_LIST_PATH_BYTES, MemoryFileSystemBackend, PartialWriteFailureFileSystemBackend,
+    StdFileSystemBackend, aster_rt_io_list_files, aster_rt_io_list_files_temporary,
     aster_rt_io_read_all_text, aster_rt_io_read_all_text_temporary, aster_rt_io_write_all_text,
 };
 pub use io::{

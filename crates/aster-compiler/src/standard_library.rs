@@ -97,6 +97,10 @@ impl StandardLibrary {
                     "aster.io::WriteAllText".to_owned(),
                     Intrinsic::FileWriteAllText(FileIoResultLayout::UNRESOLVED),
                 ),
+                (
+                    "aster.io::ListFiles".to_owned(),
+                    Intrinsic::FileListFiles(FileIoResultLayout::UNRESOLVED),
+                ),
             ]);
         }
         bindings

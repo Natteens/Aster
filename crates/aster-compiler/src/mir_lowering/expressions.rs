@@ -965,6 +965,7 @@ pub(super) fn lower_intrinsic(intrinsic: hir::Intrinsic) -> mir::Intrinsic {
         // symbols HIR lowering resolved pass straight through unchanged.
         hir::Intrinsic::FileReadAllText(layout) => mir::Intrinsic::FileReadAllText(layout),
         hir::Intrinsic::FileWriteAllText(layout) => mir::Intrinsic::FileWriteAllText(layout),
+        hir::Intrinsic::FileListFiles(layout) => mir::Intrinsic::FileListFiles(layout),
     }
 }
 
