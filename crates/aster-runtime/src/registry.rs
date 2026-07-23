@@ -8,8 +8,8 @@
 use crate::context::{
     aster_rt_array_element, aster_rt_array_length, aster_rt_array_new,
     aster_rt_array_new_temporary, aster_rt_list_add, aster_rt_list_get, aster_rt_list_length,
-    aster_rt_list_new, aster_rt_list_new_temporary, aster_rt_list_remove_at,
-    aster_rt_temporary_scope_enter, aster_rt_temporary_scope_leave,
+    aster_rt_list_new, aster_rt_list_new_temporary, aster_rt_list_remove_at, aster_rt_list_version,
+    aster_rt_list_version_mismatch, aster_rt_temporary_scope_enter, aster_rt_temporary_scope_leave,
 };
 use crate::filesystem::{
     aster_rt_io_list_files, aster_rt_io_list_files_temporary, aster_rt_io_read_all_text,
@@ -182,6 +182,22 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             signature: RuntimeSignature {
                 parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
                 result: Some(RuntimeType::I32),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_list_version",
+            address: aster_rt_list_version as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::I64),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_list_version_mismatch",
+            address: aster_rt_list_version_mismatch as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer],
+                result: None,
             },
         },
         RuntimeFunction {

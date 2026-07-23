@@ -132,15 +132,55 @@ fn foreach_is_typed_and_lowers_to_existing_array_cfg() {
 }
 
 #[test]
+fn foreach_over_a_list_is_typed_and_lowers_to_an_indexed_cfg() {
+    // M3C: `List<T>` is now a valid `foreach` collection (M3B only accepted
+    // arrays). Mirrors `foreach_is_typed_and_lowers_to_existing_array_cfg`
+    // above, but confirms the version-checked shape `lower_foreach_over_list`
+    // actually produces: a `ListLength` read, at least one `ListVersion`
+    // read, and a `ListGet` (never `ArrayLength`/`Place::Index`).
+    let compilation = aster_compiler::compile(
+        "public int Run() { List<int> values = new List<int>(); values.Add(1); int total = 0; foreach (int value in values) { total += value; } return total; }",
+    )
+    .expect("valid list foreach");
+    let function = &compilation.mir.functions[0];
+    let instructions = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    assert!(instructions.iter().any(|instruction| matches!(
+        instruction,
+        mir::Instruction::Assign {
+            value: mir::Rvalue {
+                kind: mir::RvalueKind::ListLength(_),
+                ..
+            },
+            ..
+        }
+    )));
+    assert!(instructions.iter().any(|instruction| matches!(
+        instruction,
+        mir::Instruction::Assign {
+            value: mir::Rvalue {
+                kind: mir::RvalueKind::ListVersion(_),
+                ..
+            },
+            ..
+        }
+    )));
+    assert!(
+        instructions
+            .iter()
+            .any(|instruction| matches!(instruction, mir::Instruction::ListGet { .. }))
+    );
+}
+
+#[test]
 fn foreach_diagnostics_preserve_array_only_and_readonly_rules() {
     for (source, message) in [
         (
             "public int Run() { int[] values = [1]; foreach (string value in values) { } return 0; }",
             "does not match array element type",
-        ),
-        (
-            "public int Run() { List<int> values = new List<int>(); foreach (int value in values) { } return 0; }",
-            "List<T>` is not supported",
         ),
         (
             "public int Run() { string value = \"x\"; foreach (char item in value) { } return 0; }",

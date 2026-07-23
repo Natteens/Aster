@@ -1334,7 +1334,7 @@ fn validate_intrinsic_shape(
                     .iter()
                     .all(|argument| argument.type_ == mir::Type::String)
         }
-        mir::Intrinsic::ReportRuntimeError(_) => {
+        mir::Intrinsic::ReportRuntimeError(_) | mir::Intrinsic::ListVersionMismatch => {
             destination.is_none() && return_type == &mir::Type::Void && arguments.is_empty()
         }
         // `string.TryParse*()`: exactly one `string` receiver, aridade zero,
@@ -1623,6 +1623,20 @@ fn validate_rvalue(
             if value.type_ != mir::Type::Int {
                 return Err(BackendError::new(format!(
                     "function `{function_name}` has a `ListLength` whose result type is not `int`"
+                )));
+            }
+            Ok(())
+        }
+        mir::RvalueKind::ListVersion(list) => {
+            validate_operand(list, function_name)?;
+            if !matches!(list.type_, mir::Type::List(_)) {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` has a `ListVersion` reading a non-`List<T>` receiver"
+                )));
+            }
+            if value.type_ != mir::Type::Long {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` has a `ListVersion` whose result type is not `long`"
                 )));
             }
             Ok(())

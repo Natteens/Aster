@@ -239,6 +239,23 @@ impl FunctionLowerer {
         collection: &hir::Expression,
         body: &hir::Block,
     ) {
+        if matches!(collection.type_, hir::Type::List(_)) {
+            self.lower_foreach_over_list(element, collection, body);
+        } else {
+            self.lower_foreach_over_array(element, collection, body);
+        }
+    }
+
+    /// `foreach` over an array: preserved exactly as M3B lowered it. Captures
+    /// `collection`/`Length` once, then an ordinary indexed CFG reading
+    /// `Place::Index` each iteration.
+    #[allow(clippy::too_many_lines)]
+    fn lower_foreach_over_array(
+        &mut self,
+        element: &hir::Variable,
+        collection: &hir::Expression,
+        body: &hir::Block,
+    ) {
         let collection_operand = self
             .lower_expression(collection)
             .expect("validated foreach collection produces a value");
@@ -337,6 +354,196 @@ impl FunctionLowerer {
                 }),
             },
         );
+        self.lower_block(body);
+        if let Some(block) = self.current.take() {
+            self.terminate(block, mir::Terminator::Goto(update_id));
+        }
+        self.loops.pop();
+
+        self.current = Some(update_id);
+        self.assign(
+            mir::Place::Local(index_local),
+            mir::Rvalue {
+                type_: hir::Type::Int,
+                kind: mir::RvalueKind::Binary {
+                    left: mir::Operand {
+                        type_: hir::Type::Int,
+                        kind: mir::OperandKind::Copy(mir::Place::Local(index_local)),
+                    },
+                    operator: mir::BinaryOperator::Add,
+                    right: mir::Operand {
+                        type_: hir::Type::Int,
+                        kind: mir::OperandKind::Constant(one_constant(&hir::Type::Int)),
+                    },
+                },
+            },
+        );
+        self.terminate_current(mir::Terminator::Goto(condition_id));
+        self.current = Some(exit_id);
+    }
+
+    /// `foreach` over a `List<T>` (M3C): captures the list, its length, and
+    /// its structural version once, then an indexed CFG reading `ListGet`
+    /// each iteration. Before every element read (the normal path and the
+    /// `continue` path both funnel through `condition_id` first), the
+    /// current version is re-read and compared against the captured one;
+    /// a mismatch reports a controlled runtime failure and ends the loop
+    /// exactly like exhausting the length, without reading a possibly
+    /// stale/reallocated buffer. `context.fail` does not unwind on its own
+    /// (see `ListVersionMismatch`), so the failing path is an ordinary
+    /// `Goto` to `exit_id`, not a function-level return.
+    #[allow(clippy::too_many_lines)]
+    fn lower_foreach_over_list(
+        &mut self,
+        element: &hir::Variable,
+        collection: &hir::Expression,
+        body: &hir::Block,
+    ) {
+        let collection_operand = self
+            .lower_expression(collection)
+            .expect("validated foreach collection produces a value");
+        let collection_local = self.new_temporary(collection.type_.clone());
+        self.assign(
+            mir::Place::Local(collection_local),
+            mir::Rvalue {
+                type_: collection.type_.clone(),
+                kind: mir::RvalueKind::Use(collection_operand),
+            },
+        );
+        let collection_operand = mir::Operand {
+            type_: collection.type_.clone(),
+            kind: mir::OperandKind::Copy(mir::Place::Local(collection_local)),
+        };
+        let length_local = self.new_temporary(hir::Type::Int);
+        self.assign(
+            mir::Place::Local(length_local),
+            mir::Rvalue {
+                type_: hir::Type::Int,
+                kind: mir::RvalueKind::ListLength(collection_operand.clone()),
+            },
+        );
+        let captured_version_local = self.new_temporary(hir::Type::Long);
+        self.assign(
+            mir::Place::Local(captured_version_local),
+            mir::Rvalue {
+                type_: hir::Type::Long,
+                kind: mir::RvalueKind::ListVersion(collection_operand.clone()),
+            },
+        );
+        let index_local = self.new_temporary(hir::Type::Int);
+        self.assign(
+            mir::Place::Local(index_local),
+            mir::Rvalue {
+                type_: hir::Type::Int,
+                kind: mir::RvalueKind::Use(mir::Operand {
+                    type_: hir::Type::Int,
+                    kind: mir::OperandKind::Constant(mir::Constant::Integer("0".to_owned())),
+                }),
+            },
+        );
+        let element_local = self.source_local(
+            element.symbol,
+            element.name.clone(),
+            element.type_.clone(),
+            false,
+        );
+        self.locals.push(element_local.clone());
+
+        let condition_id = self.new_block();
+        let version_check_id = self.new_block();
+        let fail_id = self.new_block();
+        let body_id = self.new_block();
+        let update_id = self.new_block();
+        let exit_id = self.new_block();
+        self.terminate_current(mir::Terminator::Goto(condition_id));
+
+        self.current = Some(condition_id);
+        let condition_local = self.new_temporary(hir::Type::Bool);
+        self.assign(
+            mir::Place::Local(condition_local),
+            mir::Rvalue {
+                type_: hir::Type::Bool,
+                kind: mir::RvalueKind::Binary {
+                    left: mir::Operand {
+                        type_: hir::Type::Int,
+                        kind: mir::OperandKind::Copy(mir::Place::Local(index_local)),
+                    },
+                    operator: mir::BinaryOperator::Less,
+                    right: mir::Operand {
+                        type_: hir::Type::Int,
+                        kind: mir::OperandKind::Copy(mir::Place::Local(length_local)),
+                    },
+                },
+            },
+        );
+        self.terminate_current(mir::Terminator::Branch {
+            condition: mir::Operand {
+                type_: hir::Type::Bool,
+                kind: mir::OperandKind::Copy(mir::Place::Local(condition_local)),
+            },
+            then_block: version_check_id,
+            else_block: exit_id,
+        });
+
+        self.current = Some(version_check_id);
+        let current_version_local = self.new_temporary(hir::Type::Long);
+        self.assign(
+            mir::Place::Local(current_version_local),
+            mir::Rvalue {
+                type_: hir::Type::Long,
+                kind: mir::RvalueKind::ListVersion(collection_operand.clone()),
+            },
+        );
+        let version_matches_local = self.new_temporary(hir::Type::Bool);
+        self.assign(
+            mir::Place::Local(version_matches_local),
+            mir::Rvalue {
+                type_: hir::Type::Bool,
+                kind: mir::RvalueKind::Binary {
+                    left: mir::Operand {
+                        type_: hir::Type::Long,
+                        kind: mir::OperandKind::Copy(mir::Place::Local(current_version_local)),
+                    },
+                    operator: mir::BinaryOperator::Equal,
+                    right: mir::Operand {
+                        type_: hir::Type::Long,
+                        kind: mir::OperandKind::Copy(mir::Place::Local(captured_version_local)),
+                    },
+                },
+            },
+        );
+        self.terminate_current(mir::Terminator::Branch {
+            condition: mir::Operand {
+                type_: hir::Type::Bool,
+                kind: mir::OperandKind::Copy(mir::Place::Local(version_matches_local)),
+            },
+            then_block: body_id,
+            else_block: fail_id,
+        });
+
+        self.current = Some(fail_id);
+        self.instruction(mir::Instruction::CallIntrinsic {
+            destination: None,
+            intrinsic: mir::Intrinsic::ListVersionMismatch,
+            arguments: Vec::new(),
+            return_type: hir::Type::Void,
+        });
+        self.terminate_current(mir::Terminator::Goto(exit_id));
+
+        self.loops.push(LoopTargets {
+            break_block: exit_id,
+            continue_block: update_id,
+        });
+        self.current = Some(body_id);
+        self.instruction(mir::Instruction::ListGet {
+            destination: mir::Place::Local(element_local.id),
+            list: collection_operand.clone(),
+            index: mir::Operand {
+                type_: hir::Type::Int,
+                kind: mir::OperandKind::Copy(mir::Place::Local(index_local)),
+            },
+            element_type: element.type_.clone(),
+        });
         self.lower_block(body);
         if let Some(block) = self.current.take() {
             self.terminate(block, mir::Terminator::Goto(update_id));

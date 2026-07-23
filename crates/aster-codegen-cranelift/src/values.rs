@@ -5,6 +5,7 @@ use super::{
 };
 
 impl Codegen {
+    #[allow(clippy::too_many_lines)]
     pub(super) fn translate_rvalue(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
@@ -43,6 +44,17 @@ impl Codegen {
                     .declare_func_in_func(self.runtime_ids["aster_rt_list_length"], builder.func);
                 let context = state.execution_context.ok_or_else(|| {
                     BackendError::new("list length is missing its ExecutionContext")
+                })?;
+                let list = self.translate_operand(builder, list, state)?;
+                let call = builder.ins().call(function_ref, &[context, list]);
+                Ok(builder.inst_results(call)[0])
+            }
+            mir::RvalueKind::ListVersion(list) => {
+                let function_ref = self
+                    .jit
+                    .declare_func_in_func(self.runtime_ids["aster_rt_list_version"], builder.func);
+                let context = state.execution_context.ok_or_else(|| {
+                    BackendError::new("list version is missing its ExecutionContext")
                 })?;
                 let list = self.translate_operand(builder, list, state)?;
                 let call = builder.ins().call(function_ref, &[context, list]);

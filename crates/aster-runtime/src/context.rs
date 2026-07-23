@@ -54,6 +54,14 @@ pub struct AsterList {
     /// (see `aster_mir::type_key`), computed once by the compiler and never
     /// recomputed or reinterpreted by this crate.
     element_type_key: u64,
+    /// Structural-modification counter, incremented after every successful
+    /// `Add`/`RemoveAt` (never on a failed operation, never on `Length`/
+    /// `Get`). `foreach` captures this once and compares before each element
+    /// read to fail fast on structural mutation during iteration -- never
+    /// exposed as an Aster-level property. 64 bits wide so overflow within
+    /// one valid execution is not a practical concern; a wrapping increment
+    /// is safe because equality (not ordering) is all iteration ever checks.
+    version: u64,
     region: ListRegion,
 }
 
@@ -81,6 +89,11 @@ impl AsterList {
     #[must_use]
     pub fn element_type_key(&self) -> u64 {
         self.element_type_key
+    }
+
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     #[must_use]
@@ -465,6 +478,7 @@ impl ExecutionContext {
             (*header_ptr).element_size = element_size;
             (*header_ptr).element_align = element_align;
             (*header_ptr).element_type_key = element_type_key;
+            (*header_ptr).version = 0;
             (*header_ptr).region = region;
         }
         self.record_allocation(AllocationCategory::Object, size_of::<AsterList>());
@@ -698,6 +712,7 @@ impl ExecutionContext {
             (*list).data = data;
             (*list).capacity = capacity;
             (*list).length = new_length;
+            (*list).version = (*list).version.wrapping_add(1);
         }
     }
 
@@ -948,6 +963,7 @@ impl ExecutionContext {
         #[allow(unsafe_code)]
         unsafe {
             (*list).length = new_length;
+            (*list).version = (*list).version.wrapping_add(1);
         }
     }
 
@@ -1185,6 +1201,50 @@ pub extern "C" fn aster_rt_list_length(
     unsafe {
         (*list).length
     }
+}
+
+/// Reads the current structural-modification counter. See `foreach`'s
+/// fail-fast lowering: captured once before the loop, then compared before
+/// every element read. Never exposed as an Aster-level property.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_list_version(
+    context: *mut ExecutionContext,
+    list: *const AsterList,
+) -> i64 {
+    if context.is_null() || list.is_null() {
+        return 0;
+    }
+    // SAFETY: generated functions receive the live host-owned context as their
+    // hidden first parameter, and invocation cannot outlive that context.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    if !context.validate_list_header(list) {
+        return 0;
+    }
+    // SAFETY: list headers are owned by the live context passed alongside it,
+    // and the header was just validated above.
+    #[allow(unsafe_code)]
+    let version = unsafe { (*list).version };
+    // Bit-preserving reinterpretation, exactly like `element_type_key`'s wire
+    // handling: the value is never used arithmetically outside this crate.
+    #[allow(clippy::cast_possible_wrap)]
+    let version = version as i64;
+    version
+}
+
+/// Reports the controlled runtime failure for `foreach` detecting `List<T>`
+/// structural modification during iteration. Takes no list argument: the
+/// message is fixed and does not depend on which list diverged.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_list_version_mismatch(context: *mut ExecutionContext) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: generated functions receive the live host-owned context as their
+    // hidden first parameter, and invocation cannot outlive that context.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    context.fail("list was structurally modified during foreach iteration");
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]

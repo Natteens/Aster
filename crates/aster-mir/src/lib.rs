@@ -246,6 +246,13 @@ pub enum Intrinsic {
     StringJoin,
     StringJoinTemporary,
     ReportRuntimeError(RuntimeErrorKind),
+    /// Reports a controlled runtime failure when `foreach` over a `List<T>`
+    /// detects the list was structurally modified (`Add`/`RemoveAt`) since
+    /// the loop captured its version. Takes no arguments and never has a
+    /// destination; like `ReportRuntimeError`, `context.fail` alone does not
+    /// unwind, so lowering follows this call with an ordinary `Goto` to the
+    /// loop's exit block rather than fabricating a function-level return.
+    ListVersionMismatch,
     /// `aster.core.Task.Run(function)`. The sole argument is always an
     /// `OperandKind::Function` operand naming the resolved, zero-parameter
     /// target; `return_type` is that function's return type.
@@ -382,6 +389,7 @@ impl Intrinsic {
             | Self::StringEndsWith
             | Self::StringIndexOf
             | Self::ReportRuntimeError(_)
+            | Self::ListVersionMismatch
             | Self::TaskRun
             | Self::TaskWait
             | Self::AsyncSpawn
@@ -613,6 +621,11 @@ pub enum RvalueKind {
     /// Reads the `length` field of a `List<T>` header (see
     /// `aster_runtime::AsterList`).
     ListLength(Operand),
+    /// Reads the current structural-modification counter from a `List<T>`
+    /// header. Used only by `foreach`'s fail-fast mutation check (captured
+    /// once, then compared before each element read); never exposed as an
+    /// Aster-level property.
+    ListVersion(Operand),
     /// Convert the operand to this rvalue's type.
     Cast(Operand),
     MakeInterface {

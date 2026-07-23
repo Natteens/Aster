@@ -24,7 +24,8 @@ pub mod string;
 pub use context::{
     AsterArray, AsterList, ExecutionContext, ListRegion, MemoryStats, aster_rt_array_element,
     aster_rt_array_length, aster_rt_list_add, aster_rt_list_get, aster_rt_list_length,
-    aster_rt_list_new, aster_rt_list_new_temporary, aster_rt_list_remove_at,
+    aster_rt_list_new, aster_rt_list_new_temporary, aster_rt_list_remove_at, aster_rt_list_version,
+    aster_rt_list_version_mismatch,
 };
 pub use filesystem::{
     FailingFileSystemBackend, FileSystemBackend, FileSystemError, MAX_FILE_BYTES, MAX_LIST_FILES,

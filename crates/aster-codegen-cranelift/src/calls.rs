@@ -228,6 +228,7 @@ impl Codegen {
                 }),
                 true,
             ),
+            mir::Intrinsic::ListVersionMismatch => ("aster_rt_list_version_mismatch", None, true),
             mir::Intrinsic::StringFromLong
             | mir::Intrinsic::StringFromLongTemporary
             | mir::Intrinsic::StringFromULong

@@ -198,17 +198,7 @@ impl Analyzer<'_> {
                 let collection_type = self.expression(collection);
                 let declared_type = self.resolve_local_type(element_type);
                 let actual_type = match collection_type {
-                    Type::Array(element) => *element,
-                    Type::List(_) => {
-                        self.diagnostics.push(
-                            Diagnostic::error(
-                                "foreach over `List<T>` is not supported yet",
-                                collection.span,
-                            )
-                            .with_help("use an indexed loop until List<T> iteration is available"),
-                        );
-                        Type::Unknown
-                    }
+                    Type::Array(element) | Type::List(element) => *element,
                     Type::String => {
                         self.diagnostics.push(
                             Diagnostic::error(

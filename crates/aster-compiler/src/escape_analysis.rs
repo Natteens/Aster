@@ -634,6 +634,7 @@ fn assignment_escape(
         }
         mir::RvalueKind::ArrayLength(operand) if direct_alias(operand, aliases).is_some() => None,
         mir::RvalueKind::ListLength(operand) if direct_alias(operand, aliases).is_some() => None,
+        mir::RvalueKind::ListVersion(operand) if direct_alias(operand, aliases).is_some() => None,
         // Reading an aliased enum's tag (how `switch`/`?` choose a case)
         // only inspects the discriminant, never the payload -- safe on its
         // own regardless of whether the enum escapes. Never observed before
@@ -651,6 +652,7 @@ fn rvalue_uses_alias(value: &mir::Rvalue, aliases: &HashSet<mir::LocalId>) -> bo
         | mir::RvalueKind::Discriminant(operand)
         | mir::RvalueKind::ArrayLength(operand)
         | mir::RvalueKind::ListLength(operand)
+        | mir::RvalueKind::ListVersion(operand)
         | mir::RvalueKind::Cast(operand)
         | mir::RvalueKind::Unary { operand, .. } => direct_alias(operand, aliases).is_some(),
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
