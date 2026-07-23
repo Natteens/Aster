@@ -1,0 +1,96 @@
+namespace app;
+
+using aster.core;
+using aster.io;
+using aster.collections;
+
+// Free function entry for the in-memory test harness (execute_with_filesystem).
+public int Main()
+{
+    switch (Index("input", "output"))
+    {
+        case Ok(total): return total;
+        case Error(error): return -1;
+    }
+}
+
+// CLI entry referenced by Aster.toml as "app.Program.Main".
+public class Program
+{
+    public static int Main()
+    {
+        switch (Index("input", "output"))
+        {
+            case Ok(total): return total;
+            case Error(error): return -1;
+        }
+    }
+}
+
+public Result<int, IOError> Index(string inputDir, string outputDir)
+{
+    string[] files = ListFiles(inputDir)?;
+
+    List<FileStats> fileStatsList = new List<FileStats>();
+    Dictionary<string, int> wordCounts = new Dictionary<string, int>();
+    Dictionary<char, int> charCounts = new Dictionary<char, int>();
+
+    int totalScalars = 0;
+    int totalLines = 0;
+    int totalWords = 0;
+    int totalReadable = 0;
+    int totalInvalidUtf8 = 0;
+    int totalErrors = 0;
+
+    foreach (string filePath in files)
+    {
+        switch (ReadAllText(filePath))
+        {
+            case Ok(content):
+                int scalarCount = 0;
+                foreach (char c in content)
+                {
+                    scalarCount = scalarCount + 1;
+                    switch (charCounts.TryGet(c))
+                    {
+                        case Some(n): charCounts.Set(c, n + 1);
+                        case None: charCounts.Add(c, 1);
+                    }
+                }
+                int lineCount = Analyzer.CountLines(content);
+                int wordCount = Analyzer.CountWords(content, wordCounts);
+                FileStats okStat = FileStats { Path: filePath, Status: FileStatus.Readable, Scalars: scalarCount, Lines: lineCount, Words: wordCount };
+                fileStatsList.Add(okStat);
+                totalScalars = totalScalars + scalarCount;
+                totalLines = totalLines + lineCount;
+                totalWords = totalWords + wordCount;
+                totalReadable = totalReadable + 1;
+            case Error(error):
+                FileStatus errStatus = FileStatus.ReadError;
+                if (error.Kind == IOErrorKind.InvalidUtf8)
+                {
+                    errStatus = FileStatus.InvalidUtf8;
+                    totalInvalidUtf8 = totalInvalidUtf8 + 1;
+                }
+                else
+                {
+                    totalErrors = totalErrors + 1;
+                }
+                FileStats errStat = FileStats { Path: filePath, Status: errStatus, Scalars: 0, Lines: 0, Words: 0 };
+                fileStatsList.Add(errStat);
+        }
+    }
+
+    string report = Report.Build(
+        fileStatsList, wordCounts, charCounts,
+        totalReadable, totalInvalidUtf8, totalErrors,
+        totalScalars, totalLines, totalWords
+    );
+
+    string reportPath = CombinePath(outputDir, "report.txt")?;
+    int written = WriteAllText(reportPath, report)?;
+
+    WriteLine("files=" + files.Length.ToString() + " readable=" + totalReadable.ToString() + " scalars=" + totalScalars.ToString());
+
+    return Result<int, IOError>.Ok(totalScalars);
+}

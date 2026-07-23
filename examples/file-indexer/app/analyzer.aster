@@ -1,0 +1,73 @@
+namespace app;
+
+using aster.core;
+using aster.collections;
+
+public class Analyzer
+{
+    public static bool IsWordChar(char c)
+    {
+        int code = (int)c;
+        if (code >= 65 && code <= 90) { return true; }
+        if (code >= 97 && code <= 122) { return true; }
+        if (code >= 48 && code <= 57) { return true; }
+        if (code == 95) { return true; }
+        return false;
+    }
+
+    // Contract: empty string → 0; non-empty → 1 + count of '\n'.
+    public static int CountLines(string text)
+    {
+        if (text.Length == 0) { return 0; }
+        int lines = 1;
+        foreach (char c in text)
+        {
+            if ((int)c == 10) { lines = lines + 1; }
+        }
+        return lines;
+    }
+
+    // Counts words in text, updating wordCounts in place.
+    // Returns the number of word occurrences (not unique words).
+    public static int CountWords(string text, Dictionary<string, int> wordCounts)
+    {
+        int wordCount = 0;
+        int inWord = 0;
+        string word = "";
+        foreach (char c in text)
+        {
+            if (IsWordChar(c))
+            {
+                if (inWord == 0)
+                {
+                    wordCount = wordCount + 1;
+                    inWord = 1;
+                }
+                word = word + c.ToString();
+            }
+            else
+            {
+                if (inWord == 1)
+                {
+                    switch (wordCounts.TryGet(word))
+                    {
+                        case Some(n): wordCounts.Set(word, n + 1);
+                        case None: wordCounts.Add(word, 1);
+                    }
+                    word = "";
+                    inWord = 0;
+                }
+            }
+        }
+        if (inWord == 1)
+        {
+            switch (wordCounts.TryGet(word))
+            {
+                case Some(n): wordCounts.Set(word, n + 1);
+                case None: wordCounts.Add(word, 1);
+            }
+        }
+        return wordCount;
+    }
+
+}

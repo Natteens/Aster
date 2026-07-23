@@ -1,0 +1,17 @@
+namespace app;
+
+public enum FileStatus
+{
+    Readable,
+    InvalidUtf8,
+    ReadError
+}
+
+public struct FileStats
+{
+    public string Path;
+    public FileStatus Status;
+    public int Scalars;
+    public int Lines;
+    public int Words;
+}

@@ -1,0 +1,58 @@
+namespace app;
+
+using aster.collections;
+
+public class Report
+{
+    public static string Build(
+        List<FileStats> fileStats,
+        Dictionary<string, int> wordCounts,
+        Dictionary<char, int> charCounts,
+        int totalReadable,
+        int totalInvalidUtf8,
+        int totalErrors,
+        int totalScalars,
+        int totalLines,
+        int totalWords
+    )
+    {
+        DictionaryEntry<string, int>[] wordEntries = wordCounts.Entries();
+
+        string report = "ASTER FILE INDEX\n";
+        report = report + "files.total=" + fileStats.Length.ToString() + "\n";
+        report = report + "files.readable=" + totalReadable.ToString() + "\n";
+        report = report + "files.invalid_utf8=" + totalInvalidUtf8.ToString() + "\n";
+        report = report + "files.read_errors=" + totalErrors.ToString() + "\n";
+        report = report + "scalars.total=" + totalScalars.ToString() + "\n";
+        report = report + "lines.total=" + totalLines.ToString() + "\n";
+        report = report + "words.total=" + totalWords.ToString() + "\n";
+        report = report + "words.unique=" + wordEntries.Length.ToString() + "\n";
+
+        report = report + "\n[files]\n";
+        foreach (FileStats stat in fileStats)
+        {
+            string statusStr = "read_error";
+            if (stat.Status == FileStatus.Readable) { statusStr = "readable"; }
+            if (stat.Status == FileStatus.InvalidUtf8) { statusStr = "invalid_utf8"; }
+            report = report + stat.Path + "|" + statusStr;
+            report = report + "|scalars=" + stat.Scalars.ToString();
+            report = report + "|lines=" + stat.Lines.ToString();
+            report = report + "|words=" + stat.Words.ToString() + "\n";
+        }
+
+        report = report + "\n[words]\n";
+        foreach (DictionaryEntry<string, int> entry in wordEntries)
+        {
+            report = report + entry.Key + "=" + entry.Value.ToString() + "\n";
+        }
+
+        report = report + "\n[characters]\n";
+        DictionaryEntry<char, int>[] charEntries = charCounts.Entries();
+        foreach (DictionaryEntry<char, int> entry in charEntries)
+        {
+            report = report + entry.Key.ToString() + "=" + entry.Value.ToString() + "\n";
+        }
+
+        return report;
+    }
+}
