@@ -720,6 +720,110 @@ fn aster_check_and_run_both_reject_list_files_in_a_worker() {
     assert!(stderr(&mir_dump).contains("ListFiles"));
 }
 
+/// M3F: the mandatory integrated program that exercises all three `foreach`
+/// paths (array, string, List) with the M2 filesystem APIs, run through a real
+/// `aster run` subprocess on a real temporary directory.
+///
+/// File structure mirroring the in-memory suite in `foreach_m3f_integration.rs`:
+/// ```
+/// input/a.txt          "alpha"       5 scalars
+/// input/b.txt          "beta"        4 scalars
+/// input/empty.txt      ""            0 scalars
+/// input/invalid.bin    [0xFF 0xFE]   skipped (InvalidUtf8)
+/// input/unicode.txt    "αβγ"         3 scalars (each 2 UTF-8 bytes)
+/// input/nested/        subdirectory  non-recursive → not listed
+/// output/              (written by the program)
+/// ```
+///
+/// Expected: counts=[5,4,0,3], total=12, result.txt="files=4;total=12"
+#[test]
+fn m3f_integrated_program_runs_via_aster_run_subprocess_on_real_filesystem() {
+    let directory = temporary_directory("m3f-integrated");
+
+    // Build the directory structure.
+    let input = directory.join("input");
+    let output = directory.join("output");
+    fs::create_dir_all(&input).expect("create input directory");
+    fs::create_dir_all(&output).expect("create output directory");
+    fs::create_dir_all(input.join("nested")).expect("create nested subdirectory");
+    fs::write(input.join("a.txt"), "alpha").expect("write a.txt");
+    fs::write(input.join("b.txt"), "beta").expect("write b.txt");
+    fs::write(input.join("empty.txt"), "").expect("write empty.txt");
+    fs::write(input.join("invalid.bin"), [0xFF_u8, 0xFE]).expect("write invalid.bin");
+    fs::write(input.join("unicode.txt"), "\u{03B1}\u{03B2}\u{03B3}").expect("write unicode.txt");
+    fs::write(input.join("nested").join("ignored.txt"), "ignored").expect("write ignored.txt");
+
+    // Write the ASTER program. It uses relative paths so the subprocess
+    // working directory must be `directory`.
+    let main = directory.join("m3f_main.aster");
+    fs::write(
+        &main,
+        "using aster.core;\nusing aster.io;\n\
+         public Result<int, IOError> Run(string inputDir, string outputDir) {\n\
+             string[] files = ListFiles(inputDir)?;\n\
+             List<int> counts = new List<int>();\n\
+             foreach (string file in files) {\n\
+                 switch (ReadAllText(file)) {\n\
+                     case Ok(text):\n\
+                         int count = 0;\n\
+                         foreach (char c in text) { count = count + 1; }\n\
+                         counts.Add(count);\n\
+                     case Error(error):\n\
+                         bool skip = error.Kind == IOErrorKind.InvalidUtf8;\n\
+                         if (!skip) { return Result<int, IOError>.Error(error); }\n\
+                 }\n\
+             }\n\
+             int total = 0;\n\
+             foreach (int count in counts) { total = total + count; }\n\
+             string resultPath = CombinePath(outputDir, \"result.txt\")?;\n\
+             string summary = \"files=\" + counts.Length.ToString() + \";total=\" + total.ToString();\n\
+             int written = WriteAllText(resultPath, summary)?;\n\
+             return Result<int, IOError>.Ok(total);\n\
+         }\n\
+         public int Main() {\n\
+             switch (Run(\"input\", \"output\")) {\n\
+                 case Ok(value): return value;\n\
+                 case Error(error): return -1;\n\
+             }\n\
+         }",
+    )
+    .expect("write M3F integrated program");
+
+    // Run `aster run` with the temp directory as working directory so that
+    // the relative paths "input" and "output" resolve correctly.
+    let run_output = Command::new(env!("CARGO_BIN_EXE_aster"))
+        .args([
+            "run",
+            main.to_str().expect("UTF-8 temporary path"),
+            "--function",
+            "Main",
+        ])
+        .current_dir(&directory)
+        .output()
+        .expect("spawn Aster binary");
+
+    let result_path = output.join("result.txt");
+    let written_summary = fs::read_to_string(&result_path).ok();
+    fs::remove_dir_all(&directory).expect("remove temporary directory");
+
+    // Verify process exit and printed return value.
+    assert!(run_output.status.success(), "{}", stderr(&run_output));
+    // `aster run` prints the int return value on a trailing line.
+    assert_eq!(
+        stdout(&run_output).trim(),
+        "12",
+        "returned total scalar count"
+    );
+    assert_eq!(run_output.status.code(), Some(0));
+
+    // Verify the written file.
+    assert_eq!(
+        written_summary.as_deref(),
+        Some("files=4;total=12"),
+        "WriteAllText output must match the computed summary"
+    );
+}
+
 fn aster<const N: usize>(arguments: [&str; N]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_aster"))
         .args(arguments)
