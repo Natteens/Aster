@@ -1001,7 +1001,7 @@ mod tests {
         let driver = PreparedProgram::prepare(&module).expect("driver prepares");
         let pointer = std::ptr::from_mut(&mut runtime).cast::<()>();
         let (value, _) = driver
-            .invoke(wrapper, false, Some(pointer), None)
+            .invoke(wrapper, false, Some(pointer), None, None)
             .expect("wrapper registers the async task");
         let ExecutionValue::Long(bits) = value else {
             panic!("wrapper must return a Task<T> handle");
@@ -1067,7 +1067,7 @@ mod tests {
         let driver = PreparedProgram::prepare(&module).expect("driver prepares");
         let pointer = std::ptr::from_mut(&mut runtime).cast::<()>();
         let (value, _) = driver
-            .invoke(wrapper, false, Some(pointer), None)
+            .invoke(wrapper, false, Some(pointer), None, None)
             .expect("wrapper registers the async task without running its body");
         let ExecutionValue::Long(bits) = value else {
             panic!("wrapper must return a Task<T> handle");

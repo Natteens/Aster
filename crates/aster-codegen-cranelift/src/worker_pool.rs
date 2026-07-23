@@ -228,7 +228,7 @@ fn worker_loop(
                 },
                 Respond::Task(reply),
             ) => {
-                let outcome = match program.invoke(symbol, collect_stats, None, None) {
+                let outcome = match program.invoke(symbol, collect_stats, None, None, None) {
                     Ok((value, stats)) => TaskOutcome::Completed(value, stats),
                     Err(error) => TaskOutcome::Failed(error),
                 };

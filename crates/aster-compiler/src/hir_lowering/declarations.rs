@@ -104,8 +104,14 @@ impl Lowerer<'_> {
                                 .insert(symbol, self.resolve_type(&field.type_ref));
                             fields.push(symbol);
                         }
-                        self.enum_cases
-                            .insert((declaration.name.clone(), index), (case_symbol, fields));
+                        self.enum_cases.insert(
+                            (declaration.name.clone(), index),
+                            (case_symbol, fields.clone()),
+                        );
+                        self.enum_case_by_name.insert(
+                            (declaration.name.clone(), case.name.clone()),
+                            (case_symbol, fields),
+                        );
                     }
                 }
             }
@@ -387,6 +393,11 @@ impl Lowerer<'_> {
         self.current_return = previous_return;
         self.current_receiver = previous_receiver;
         self.model_context = previous_model_context;
+        let intrinsic = self
+            .intrinsic_bindings
+            .get(&function.name)
+            .copied()
+            .map(|intrinsic| self.resolve_intrinsic_payload(intrinsic, &return_type));
         hir::Function {
             constructor: function.constructor,
             is_static: function.is_static,
@@ -394,11 +405,102 @@ impl Lowerer<'_> {
             symbol,
             name: function.name.clone(),
             visibility: visibility(function.visibility),
-            intrinsic: self.intrinsic_bindings.get(&function.name).copied(),
+            intrinsic,
             parameters,
             return_type,
             body,
         }
+    }
+
+    /// `StandardLibrary::intrinsic_bindings()` can only tag *which* intrinsic
+    /// a function is bound to -- it runs before any symbol exists. Filesystem
+    /// intrinsics carry a payload of concrete symbols (see
+    /// `hir::FileIoResultLayout`) that only HIR lowering can resolve, since it
+    /// is the first phase with both the function's concrete return type and
+    /// the case/field symbol tables (`enum_case_by_name`/`members`) populated.
+    /// Every other intrinsic passes through unchanged.
+    fn resolve_intrinsic_payload(
+        &self,
+        intrinsic: hir::Intrinsic,
+        return_type: &hir::Type,
+    ) -> hir::Intrinsic {
+        match intrinsic {
+            hir::Intrinsic::FileReadAllText(_) => {
+                hir::Intrinsic::FileReadAllText(self.resolve_file_io_result_layout(return_type))
+            }
+            hir::Intrinsic::FileWriteAllText(_) => {
+                hir::Intrinsic::FileWriteAllText(self.resolve_file_io_result_layout(return_type))
+            }
+            other => other,
+        }
+    }
+
+    /// Resolves every symbol `aster.io.ReadAllText`/`WriteAllText` need to
+    /// construct a `Result<T, IOError>` value, using the exact same
+    /// case/field resolution ordinary `Result<T,E>.Ok(...)`/`.Error(...)`
+    /// expressions already go through (`enum_case_by_name`, populated
+    /// alongside `enum_cases` in `predeclare`) -- never a name comparison
+    /// left for the backend. `return_type` must already be the concrete,
+    /// monomorphized `Result<T, IOError>` HIR lowering resolved for this
+    /// function's declared signature.
+    fn resolve_file_io_result_layout(&self, return_type: &hir::Type) -> hir::FileIoResultLayout {
+        let hir::Type::Enum(result_symbol) = return_type else {
+            panic!("aster.io.ReadAllText/WriteAllText must return a concrete Result<T, IOError>");
+        };
+        let result_name = self.type_name_of(*result_symbol);
+        let (ok_case, ok_fields) =
+            self.enum_case_by_name[&(result_name.to_owned(), "Ok".to_owned())].clone();
+        let (error_case, error_fields) =
+            self.enum_case_by_name[&(result_name.to_owned(), "Error".to_owned())].clone();
+        let [ok_field] = ok_fields[..] else {
+            panic!("aster.core.Result<T, IOError>'s Ok case must carry exactly one field");
+        };
+        let [error_field] = error_fields[..] else {
+            panic!("aster.core.Result<T, IOError>'s Error case must carry exactly one field");
+        };
+        let hir::Type::User(io_error_symbol) = self.symbol_types[&error_field] else {
+            panic!("aster.io.IOError must be a concrete struct");
+        };
+        let io_error_kind_field = self.members[&io_error_symbol]["Kind"];
+        let io_error_os_code_field = self.members[&io_error_symbol]["OsCode"];
+        let hir::Type::Enum(io_error_kind_symbol) = self.symbol_types[&io_error_kind_field] else {
+            panic!("aster.io.IOError.Kind must be a concrete enum");
+        };
+        let io_error_kind_name = self.type_name_of(io_error_kind_symbol);
+        let portable_kind_cases = [
+            "NotFound",
+            "PermissionDenied",
+            "AlreadyExists",
+            "InvalidPath",
+            "InvalidUtf8",
+            "NotFile",
+            "NotDirectory",
+            "LimitExceeded",
+            "Other",
+        ]
+        .map(|name| self.enum_case_by_name[&(io_error_kind_name.to_owned(), name.to_owned())].0);
+        hir::FileIoResultLayout {
+            ok_case,
+            ok_field,
+            error_case,
+            error_field,
+            io_error_kind_field,
+            io_error_os_code_field,
+            portable_kind_cases,
+        }
+    }
+
+    /// Reverse lookup of `self.types` (name -> symbol): the concrete type
+    /// symbols `resolve_file_io_result_layout` starts from (`Result<T,
+    /// IOError>`'s own symbol, then `IOError`'s, then `IOErrorKind`'s) are
+    /// known, but `enum_case_by_name` is indexed by declared name, so their
+    /// name must be recovered once to look their cases up.
+    fn type_name_of(&self, symbol: hir::SymbolId) -> &str {
+        self.types
+            .iter()
+            .find(|&(_, &value)| value == symbol)
+            .map(|(name, _)| name.as_str())
+            .expect("every resolved type symbol has a registered name")
     }
 
     fn field_initializer(

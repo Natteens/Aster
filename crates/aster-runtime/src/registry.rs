@@ -11,6 +11,9 @@ use crate::context::{
     aster_rt_list_new, aster_rt_list_new_temporary, aster_rt_list_remove_at,
     aster_rt_temporary_scope_enter, aster_rt_temporary_scope_leave,
 };
+use crate::filesystem::{
+    aster_rt_io_read_all_text, aster_rt_io_read_all_text_temporary, aster_rt_io_write_all_text,
+};
 use crate::io::{
     aster_rt_io_read_line, aster_rt_io_read_line_temporary, aster_rt_io_write,
     aster_rt_io_write_line,
@@ -622,6 +625,67 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
                     RuntimeType::I32,
                     RuntimeType::I32,
                     RuntimeType::I32,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_io_read_all_text",
+            address: aster_rt_io_read_all_text as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::Pointer,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_io_read_all_text_temporary",
+            address: aster_rt_io_read_all_text_temporary as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::Pointer,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_io_write_all_text",
+            address: aster_rt_io_write_all_text as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::Pointer,
                 ],
                 result: None,
             },

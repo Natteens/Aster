@@ -123,6 +123,7 @@ pub(super) fn validate_module(module: &mir::Module) -> Result<(), BackendError> 
         .collect::<HashMap<_, _>>();
     for function in &module.functions {
         validate_string_try_parse_targets(function, &enum_definitions)?;
+        validate_file_io_result_shapes(function, &enum_definitions, &struct_definitions)?;
         validate_enum_construct_shapes(function, &enum_definitions)?;
         validate_struct_literal_shapes(function, &struct_definitions)?;
     }
@@ -130,18 +131,18 @@ pub(super) fn validate_module(module: &mir::Module) -> Result<(), BackendError> 
     Ok(())
 }
 
-/// Console I/O is rejected anywhere reachable from a `Task.Run`/
-/// `Parallel.For`/`ForEach`/`Reduce` worker body: output order and input
-/// consumption would be non-deterministic across workers, and the console
-/// backend is neither shared nor synchronized. Builds the whole module's
-/// direct call graph once (`Instruction::Call` edges), marks every function
-/// whose body directly calls a `Console*` intrinsic, then, for every worker
-/// entry point found anywhere in the module, walks the graph from its
-/// `Function` operand(s) to see whether a console-using function is
-/// reachable.
+/// Console and filesystem I/O are rejected anywhere reachable from a
+/// `Task.Run`/`Parallel.For`/`ForEach`/`Reduce` worker body: output order,
+/// input consumption, and file access would be non-deterministic across
+/// workers, and neither backend is shared or synchronized. Builds the whole
+/// module's direct call graph once (`Instruction::Call` edges), marks every
+/// function whose body directly calls a `Console*`/`File*` I/O intrinsic,
+/// then, for every worker entry point found anywhere in the module, walks
+/// the graph from its `Function` operand(s) to see whether an I/O-using
+/// function is reachable.
 fn validate_no_console_io_in_workers(module: &mir::Module) -> Result<(), BackendError> {
     let mut callees: HashMap<mir::SymbolId, Vec<mir::SymbolId>> = HashMap::new();
-    let mut console_users: HashSet<mir::SymbolId> = HashSet::new();
+    let mut io_users: HashSet<mir::SymbolId> = HashSet::new();
     for function in &module.functions {
         let mut direct = Vec::new();
         for block in &function.blocks {
@@ -155,10 +156,13 @@ fn validate_no_console_io_in_workers(module: &mir::Module) -> Result<(), Backend
                             mir::Intrinsic::ConsoleWrite
                             | mir::Intrinsic::ConsoleWriteLine
                             | mir::Intrinsic::ConsoleReadLine
-                            | mir::Intrinsic::ConsoleReadLineTemporary,
+                            | mir::Intrinsic::ConsoleReadLineTemporary
+                            | mir::Intrinsic::FileReadAllText(_)
+                            | mir::Intrinsic::FileReadAllTextTemporary(_)
+                            | mir::Intrinsic::FileWriteAllText(_),
                         ..
                     } => {
-                        console_users.insert(function.symbol);
+                        io_users.insert(function.symbol);
                     }
                     _ => {}
                 }
@@ -166,14 +170,14 @@ fn validate_no_console_io_in_workers(module: &mir::Module) -> Result<(), Backend
         }
         callees.insert(function.symbol, direct);
     }
-    let reaches_console = |root: mir::SymbolId| -> bool {
+    let reaches_io = |root: mir::SymbolId| -> bool {
         let mut visited: HashSet<mir::SymbolId> = HashSet::new();
         let mut stack = vec![root];
         while let Some(symbol) = stack.pop() {
             if !visited.insert(symbol) {
                 continue;
             }
-            if console_users.contains(&symbol) {
+            if io_users.contains(&symbol) {
                 return true;
             }
             if let Some(direct) = callees.get(&symbol) {
@@ -202,10 +206,10 @@ fn validate_no_console_io_in_workers(module: &mir::Module) -> Result<(), Backend
                 };
                 for argument in arguments {
                     if let mir::OperandKind::Function(target) = argument.kind
-                        && reaches_console(target)
+                        && reaches_io(target)
                     {
                         return Err(BackendError::new(format!(
-                            "function `{}` uses `{worker_name}` with a worker body that (directly or transitively) calls `aster.io.Write`/`WriteLine`/`ReadLine`, which is rejected in this version",
+                            "function `{}` uses `{worker_name}` with a worker body that (directly or transitively) calls `aster.io.Write`/`WriteLine`/`ReadLine`/`ReadAllText`/`WriteAllText`, which is rejected in this version",
                             function.name
                         )));
                     }
@@ -399,6 +403,91 @@ fn validate_string_try_parse_targets(
                     definition.name,
                     type_name(&expected)
                 )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The exact `Result<T, IOError>` shape `aster.io.ReadAllText`/
+/// `WriteAllText` must return, checked by *symbol* equality against the
+/// `hir::FileIoResultLayout` HIR lowering resolved once for this intrinsic
+/// (never by comparing a case/field name here): the `Ok`/`Error` cases and
+/// `IOError`'s `Kind`/`OsCode` fields the intrinsic carries must actually
+/// exist, with matching symbols, in the concrete `Result`/`IOError`
+/// definitions the return type and `Error` payload resolve to. Runs once per
+/// function over the whole module's enum/struct definitions -- the same data
+/// `validate_string_try_parse_targets` uses for `Option<T>` -- so `aster
+/// check` rejects adulterated MIR here, before `aster run`'s codegen would
+/// (`Codegen::result_io_error_layout`) independently reject the same thing.
+fn validate_file_io_result_shapes(
+    function: &mir::Function,
+    enum_definitions: &HashMap<mir::SymbolId, &mir::EnumDefinition>,
+    struct_definitions: &HashMap<mir::SymbolId, &mir::StructDefinition>,
+) -> Result<(), BackendError> {
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            let mir::Instruction::CallIntrinsic {
+                intrinsic,
+                return_type,
+                ..
+            } = instruction
+            else {
+                continue;
+            };
+            let (expected_ok, layout) = match intrinsic {
+                mir::Intrinsic::FileReadAllText(layout)
+                | mir::Intrinsic::FileReadAllTextTemporary(layout) => (mir::Type::String, layout),
+                mir::Intrinsic::FileWriteAllText(layout) => (mir::Type::Int, layout),
+                _ => continue,
+            };
+            let malformed = || {
+                BackendError::new(format!(
+                    "function `{}` has {intrinsic:?} returning `{}`, which is not `Result<{}, IOError>`",
+                    function.name,
+                    type_name_owned(return_type),
+                    type_name(&expected_ok)
+                ))
+            };
+            let mir::Type::Enum(symbol) = return_type else {
+                return Err(malformed());
+            };
+            let definition = enum_definitions.get(symbol).ok_or_else(malformed)?;
+            let ok_case = definition
+                .cases
+                .iter()
+                .find(|case| case.symbol == layout.ok_case)
+                .ok_or_else(malformed)?;
+            let error_case = definition
+                .cases
+                .iter()
+                .find(|case| case.symbol == layout.error_case)
+                .ok_or_else(malformed)?;
+            if !matches!(ok_case.fields.as_slice(), [field] if field.symbol == layout.ok_field && field.type_ == expected_ok)
+            {
+                return Err(malformed());
+            }
+            let [error_field] = error_case.fields.as_slice() else {
+                return Err(malformed());
+            };
+            if error_field.symbol != layout.error_field {
+                return Err(malformed());
+            }
+            let mir::Type::User(io_error_symbol) = &error_field.type_ else {
+                return Err(malformed());
+            };
+            let io_error_definition = struct_definitions
+                .get(io_error_symbol)
+                .ok_or_else(malformed)?;
+            let has_kind = io_error_definition.fields.iter().any(|field| {
+                field.symbol == layout.io_error_kind_field
+                    && matches!(field.type_, mir::Type::Enum(_))
+            });
+            let has_oscode = io_error_definition.fields.iter().any(|field| {
+                field.symbol == layout.io_error_os_code_field && field.type_ == mir::Type::Int
+            });
+            if !has_kind || !has_oscode {
+                return Err(malformed());
             }
         }
     }
@@ -1261,6 +1350,21 @@ fn validate_intrinsic_shape(
             destination.is_some()
                 && matches!(return_type, mir::Type::Enum(_))
                 && arguments.is_empty()
+        }
+        // `aster.io.ReadAllText(string)`/`WriteAllText(string, string)`: a
+        // destination whose type is *some* concrete enum, with the declared
+        // arity and argument types. `validate_file_io_result_shapes` (run
+        // once over the whole module) confirms the enum is actually shaped
+        // like `Result<T, IOError>`.
+        mir::Intrinsic::FileReadAllText(_) | mir::Intrinsic::FileReadAllTextTemporary(_) => {
+            destination.is_some()
+                && matches!(return_type, mir::Type::Enum(_))
+                && matches!(arguments, [path] if path.type_ == mir::Type::String)
+        }
+        mir::Intrinsic::FileWriteAllText(_) => {
+            destination.is_some()
+                && matches!(return_type, mir::Type::Enum(_))
+                && matches!(arguments, [path, content] if path.type_ == mir::Type::String && content.type_ == mir::Type::String)
         }
         mir::Intrinsic::TaskRun => {
             destination.is_some()

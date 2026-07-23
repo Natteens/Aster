@@ -29,6 +29,12 @@ struct Lowerer<'a> {
     interface_types: HashSet<hir::SymbolId>,
     enum_types: HashSet<hir::SymbolId>,
     enum_cases: HashMap<(String, usize), (hir::SymbolId, Vec<hir::SymbolId>)>,
+    /// Same data as `enum_cases`, additionally indexed by declared case name.
+    /// Populated alongside it (see `declarations::predeclare`'s enum arm) so
+    /// M2D's filesystem intrinsics can resolve `Result<T, IOError>`'s `Ok`/
+    /// `Error` cases and `IOErrorKind`'s named cases to concrete symbols once,
+    /// during HIR lowering, instead of the backend comparing names.
+    enum_case_by_name: HashMap<(String, String), (hir::SymbolId, Vec<hir::SymbolId>)>,
     member_owners: HashMap<hir::SymbolId, hir::SymbolId>,
     current_receiver: Option<hir::SymbolId>,
     symbol_types: HashMap<hir::SymbolId, hir::Type>,
@@ -62,6 +68,7 @@ impl<'a> Lowerer<'a> {
             interface_types: HashSet::new(),
             enum_types: HashSet::new(),
             enum_cases: HashMap::new(),
+            enum_case_by_name: HashMap::new(),
             member_owners: HashMap::new(),
             current_receiver: None,
             symbol_types: HashMap::new(),

@@ -4,6 +4,24 @@ use super::{
     scalar_kind, scalar_to_bits, type_name, types,
 };
 
+/// Every layout fact needed to construct a concrete `Result<T, IOError>`
+/// value from the runtime side of the ABI. See
+/// [`Codegen::result_io_error_layout`].
+struct ResultIoErrorLayout {
+    total_size: u32,
+    ok_tag: u32,
+    error_tag: u32,
+    ok_offset: u32,
+    error_offset: u32,
+    kind_offset: u32,
+    oscode_offset: u32,
+    /// `IOErrorKind` case tags, indexed in the fixed order
+    /// `aster_runtime::PortableIoErrorKind`'s variants declare (`NotFound`,
+    /// `PermissionDenied`, `AlreadyExists`, `InvalidPath`, `InvalidUtf8`,
+    /// `NotFile`, `NotDirectory`, `LimitExceeded`, `Other`).
+    kind_case_tags: [u32; 9],
+}
+
 impl Codegen {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn translate_call(
@@ -135,6 +153,18 @@ impl Codegen {
                     state,
                 );
             }
+            mir::Intrinsic::FileReadAllText(_)
+            | mir::Intrinsic::FileReadAllTextTemporary(_)
+            | mir::Intrinsic::FileWriteAllText(_) => {
+                return self.translate_file_io(
+                    builder,
+                    destination,
+                    intrinsic,
+                    arguments,
+                    return_type,
+                    state,
+                );
+            }
             mir::Intrinsic::AsyncSpawn
             | mir::Intrinsic::AsyncState
             | mir::Intrinsic::AsyncSetState
@@ -229,7 +259,10 @@ impl Codegen {
             | mir::Intrinsic::ConsoleWrite
             | mir::Intrinsic::ConsoleWriteLine
             | mir::Intrinsic::ConsoleReadLine
-            | mir::Intrinsic::ConsoleReadLineTemporary => {
+            | mir::Intrinsic::ConsoleReadLineTemporary
+            | mir::Intrinsic::FileReadAllText(_)
+            | mir::Intrinsic::FileReadAllTextTemporary(_)
+            | mir::Intrinsic::FileWriteAllText(_) => {
                 unreachable!("handled by the dedicated translators above")
             }
         };
@@ -888,6 +921,302 @@ impl Codegen {
             }
             _ => unreachable!("caller matched only console intrinsics"),
         }
+    }
+
+    /// Every layout fact `aster.io.ReadAllText`/`WriteAllText` need to build
+    /// a concrete `Result<T, IOError>` value, resolved by *symbol* equality
+    /// only -- `symbols` was resolved once, during HIR lowering, from the
+    /// official declarations' own case/field names (see
+    /// `hir::FileIoResultLayout`); this function never compares a name. Each
+    /// symbol is looked up in the same `Layouts`/`EnumDefinition`/
+    /// `StructDefinition` data every other aggregate result already uses, so
+    /// a symbol that does not actually appear where expected (adulterated
+    /// MIR) is a controlled error, not a silent fallback.
+    #[allow(clippy::too_many_lines)]
+    fn result_io_error_layout(
+        &mut self,
+        return_type: &mir::Type,
+        symbols: &mir::FileIoResultLayout,
+        operation: &str,
+    ) -> Result<ResultIoErrorLayout, BackendError> {
+        let mir::Type::Enum(result_symbol) = return_type else {
+            return Err(BackendError::new(format!(
+                "{operation} must return a concrete Result<T, IOError>"
+            )));
+        };
+        let result_definition =
+            self.layouts
+                .enums
+                .get(result_symbol)
+                .cloned()
+                .ok_or_else(|| {
+                    BackendError::new(format!("{operation} returns an unknown enum type"))
+                })?;
+        let ok_case = result_definition
+            .cases
+            .iter()
+            .find(|case| case.symbol == symbols.ok_case)
+            .ok_or_else(|| {
+                BackendError::new(format!(
+                    "{operation} Ok case symbol does not match the resolved Result specialization"
+                ))
+            })?;
+        let error_case = result_definition
+            .cases
+            .iter()
+            .find(|case| case.symbol == symbols.error_case)
+            .ok_or_else(|| {
+                BackendError::new(format!(
+                    "{operation} Error case symbol does not match the resolved Result specialization"
+                ))
+            })?;
+        let ok_field = ok_case
+            .fields
+            .iter()
+            .find(|field| field.symbol == symbols.ok_field)
+            .ok_or_else(|| {
+                BackendError::new(format!(
+                    "{operation} Ok field symbol does not match the resolved Ok case"
+                ))
+            })?;
+        let error_field = error_case
+            .fields
+            .iter()
+            .find(|field| field.symbol == symbols.error_field)
+            .ok_or_else(|| {
+                BackendError::new(format!(
+                    "{operation} Error field symbol does not match the resolved Error case"
+                ))
+            })?;
+        let ok_offset = self
+            .layouts
+            .fields
+            .get(&ok_field.symbol)
+            .ok_or_else(|| BackendError::new(format!("{operation} Ok payload has no layout")))?
+            .offset;
+        let error_offset = self
+            .layouts
+            .fields
+            .get(&error_field.symbol)
+            .ok_or_else(|| BackendError::new(format!("{operation} Error payload has no layout")))?
+            .offset;
+        let mir::Type::User(io_error_symbol) = &error_field.type_ else {
+            return Err(BackendError::new(format!(
+                "{operation} Error payload is not a concrete IOError"
+            )));
+        };
+        let io_error_definition = self
+            .layouts
+            .structs
+            .get(io_error_symbol)
+            .cloned()
+            .ok_or_else(|| {
+                BackendError::new(format!("{operation} Error payload is not a known struct"))
+            })?;
+        let kind_field = io_error_definition
+            .fields
+            .iter()
+            .find(|field| field.symbol == symbols.io_error_kind_field)
+            .ok_or_else(|| {
+                BackendError::new(format!(
+                    "{operation} IOError.Kind field symbol does not match the resolved struct"
+                ))
+            })?;
+        let oscode_field = io_error_definition
+            .fields
+            .iter()
+            .find(|field| field.symbol == symbols.io_error_os_code_field)
+            .ok_or_else(|| {
+                BackendError::new(format!(
+                    "{operation} IOError.OsCode field symbol does not match the resolved struct"
+                ))
+            })?;
+        let kind_offset = self
+            .layouts
+            .fields
+            .get(&kind_field.symbol)
+            .ok_or_else(|| BackendError::new(format!("{operation} IOError.Kind has no layout")))?
+            .offset;
+        let oscode_offset = self
+            .layouts
+            .fields
+            .get(&oscode_field.symbol)
+            .ok_or_else(|| BackendError::new(format!("{operation} IOError.OsCode has no layout")))?
+            .offset;
+        let mir::Type::Enum(kind_symbol) = &kind_field.type_ else {
+            return Err(BackendError::new(format!(
+                "{operation} IOError.Kind is not a concrete enum"
+            )));
+        };
+        let kind_definition = self
+            .layouts
+            .enums
+            .get(kind_symbol)
+            .cloned()
+            .ok_or_else(|| {
+                BackendError::new(format!("{operation} IOErrorKind is not a known enum"))
+            })?;
+        let mut kind_case_tags = [0_u32; 9];
+        for (index, case_symbol) in symbols.portable_kind_cases.iter().enumerate() {
+            let case = kind_definition
+                .cases
+                .iter()
+                .find(|case| case.symbol == *case_symbol)
+                .ok_or_else(|| {
+                    BackendError::new(format!(
+                        "{operation} IOErrorKind case symbol at index {index} does not match the resolved enum"
+                    ))
+                })?;
+            kind_case_tags[index] = case.tag;
+        }
+        let layout = self.layouts.type_layout(return_type)?;
+        Ok(ResultIoErrorLayout {
+            total_size: layout.size,
+            ok_tag: ok_case.tag,
+            error_tag: error_case.tag,
+            ok_offset,
+            error_offset,
+            kind_offset,
+            oscode_offset,
+            kind_case_tags,
+        })
+    }
+
+    /// `aster.io.ReadAllText`/`WriteAllText`, bound to their official
+    /// declarations by `SymbolId` (never by name) at HIR lowering. Both
+    /// write a complete `Result<T, IOError>` directly into their
+    /// destination, using [`Self::result_io_error_layout`] for every tag and
+    /// offset -- exactly the same layout-driven ABI as `aster.io.ReadLine`/
+    /// `string.TryParse*`, generalized to a `Result` whose `Error` payload is
+    /// itself a struct.
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
+    fn translate_file_io(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: Option<&mir::Place>,
+        intrinsic: mir::Intrinsic,
+        arguments: &[mir::Operand],
+        return_type: &mir::Type,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let (operation, symbols) = match intrinsic {
+            mir::Intrinsic::FileReadAllText(symbols)
+            | mir::Intrinsic::FileReadAllTextTemporary(symbols) => {
+                ("aster.io.ReadAllText", symbols)
+            }
+            mir::Intrinsic::FileWriteAllText(symbols) => ("aster.io.WriteAllText", symbols),
+            _ => unreachable!("caller matched only file-io intrinsics"),
+        };
+        let layout = self.result_io_error_layout(return_type, &symbols, operation)?;
+        let destination = destination
+            .ok_or_else(|| BackendError::new(format!("{operation} requires a destination")))?;
+        let destination_address = self.place_address(builder, destination, state)?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(format!("{operation} is missing its ExecutionContext"))
+        })?;
+
+        let tags_slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            9 * 4,
+            2,
+        ));
+        for (index, tag) in layout.kind_case_tags.iter().enumerate() {
+            let value = builder.ins().iconst(types::I32, i64::from(*tag));
+            let offset = i32::try_from(index * 4)
+                .ok()
+                .ok_or_else(|| BackendError::new(format!("{operation} tag table overflowed")))?;
+            builder.ins().stack_store(value, tags_slot, offset);
+        }
+        let tags_pointer = builder.ins().stack_addr(self.pointer_type, tags_slot, 0);
+
+        let total_size = builder
+            .ins()
+            .iconst(types::I32, i64::from(layout.total_size));
+        let ok_tag = builder.ins().iconst(types::I32, i64::from(layout.ok_tag));
+        let error_tag = builder
+            .ins()
+            .iconst(types::I32, i64::from(layout.error_tag));
+        let ok_offset = builder
+            .ins()
+            .iconst(types::I32, i64::from(layout.ok_offset));
+        let error_offset = builder
+            .ins()
+            .iconst(types::I32, i64::from(layout.error_offset));
+        let kind_offset = builder
+            .ins()
+            .iconst(types::I32, i64::from(layout.kind_offset));
+        let oscode_offset = builder
+            .ins()
+            .iconst(types::I32, i64::from(layout.oscode_offset));
+
+        match intrinsic {
+            mir::Intrinsic::FileReadAllText(_) | mir::Intrinsic::FileReadAllTextTemporary(_) => {
+                let [path] = arguments else {
+                    return Err(BackendError::new(
+                        "aster.io.ReadAllText requires exactly one argument",
+                    ));
+                };
+                let path_value = self.translate_operand(builder, path, state)?;
+                let symbol = match intrinsic {
+                    mir::Intrinsic::FileReadAllText(_) => "aster_rt_io_read_all_text",
+                    mir::Intrinsic::FileReadAllTextTemporary(_) => {
+                        "aster_rt_io_read_all_text_temporary"
+                    }
+                    _ => unreachable!("caller matched only file-read intrinsics"),
+                };
+                let function_ref = self
+                    .jit
+                    .declare_func_in_func(self.runtime_ids[symbol], builder.func);
+                builder.ins().call(
+                    function_ref,
+                    &[
+                        context,
+                        path_value,
+                        destination_address,
+                        total_size,
+                        ok_tag,
+                        error_tag,
+                        ok_offset,
+                        error_offset,
+                        kind_offset,
+                        oscode_offset,
+                        tags_pointer,
+                    ],
+                );
+            }
+            mir::Intrinsic::FileWriteAllText(_) => {
+                let [path, content] = arguments else {
+                    return Err(BackendError::new(
+                        "aster.io.WriteAllText requires exactly two arguments",
+                    ));
+                };
+                let path_value = self.translate_operand(builder, path, state)?;
+                let content_value = self.translate_operand(builder, content, state)?;
+                let function_ref = self.jit.declare_func_in_func(
+                    self.runtime_ids["aster_rt_io_write_all_text"],
+                    builder.func,
+                );
+                builder.ins().call(
+                    function_ref,
+                    &[
+                        context,
+                        path_value,
+                        content_value,
+                        destination_address,
+                        total_size,
+                        ok_tag,
+                        error_tag,
+                        ok_offset,
+                        error_offset,
+                        kind_offset,
+                        oscode_offset,
+                        tags_pointer,
+                    ],
+                );
+            }
+            _ => unreachable!("caller matched only file-io intrinsics"),
+        }
+        Ok(())
     }
 
     fn store_intrinsic_result(

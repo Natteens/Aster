@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-pub use aster_hir::{SymbolId, Type, Visibility};
+pub use aster_hir::{FileIoResultLayout, SymbolId, Type, Visibility};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LocalId(pub u32);
@@ -319,6 +319,22 @@ pub enum Intrinsic {
     ConsoleReadLine,
     /// Temporary-arena counterpart of [`Self::ConsoleReadLine`].
     ConsoleReadLineTemporary,
+    /// `aster.io.ReadAllText(string)`: reads an entire file via the host
+    /// filesystem backend into a freshly allocated persistent
+    /// `Result<string, IOError>`. Argument: `[path]` (a `string`, only ever
+    /// borrowed); `return_type` is always the `Result<string, IOError>`
+    /// specialization. The payload's symbols are resolved once during HIR
+    /// lowering (see [`FileIoResultLayout`]); this backend never looks
+    /// anything up by name.
+    FileReadAllText(FileIoResultLayout),
+    /// Temporary-arena counterpart of [`Self::FileReadAllText`].
+    FileReadAllTextTemporary(FileIoResultLayout),
+    /// `aster.io.WriteAllText(string, string)`: creates or truncates the file
+    /// at `path` and writes `content`'s UTF-8 bytes in full. Arguments:
+    /// `[path, content]` (both only ever borrowed); `return_type` is always
+    /// the `Result<int, IOError>` specialization (bytes written on success).
+    /// No string escapes this intrinsic, so it has no temporary counterpart.
+    FileWriteAllText(FileIoResultLayout),
 }
 
 impl Intrinsic {
@@ -336,7 +352,8 @@ impl Intrinsic {
             | Self::StringJoin
             | Self::StringSubstringFrom
             | Self::StringSubstringRange
-            | Self::ConsoleReadLine => Some(AllocationRegion::Persistent),
+            | Self::ConsoleReadLine
+            | Self::FileReadAllText(_) => Some(AllocationRegion::Persistent),
             Self::StringConcatTemporary
             | Self::StringFromLongTemporary
             | Self::StringFromULongTemporary
@@ -347,7 +364,8 @@ impl Intrinsic {
             | Self::StringJoinTemporary
             | Self::StringSubstringFromTemporary
             | Self::StringSubstringRangeTemporary
-            | Self::ConsoleReadLineTemporary => Some(AllocationRegion::Temporary),
+            | Self::ConsoleReadLineTemporary
+            | Self::FileReadAllTextTemporary(_) => Some(AllocationRegion::Temporary),
             Self::Log
             | Self::LogWarning
             | Self::LogError
@@ -379,7 +397,8 @@ impl Intrinsic {
             | Self::StringTryParseFloat
             | Self::StringTryParseDouble
             | Self::ConsoleWrite
-            | Self::ConsoleWriteLine => None,
+            | Self::ConsoleWriteLine
+            | Self::FileWriteAllText(_) => None,
         }
     }
 
@@ -468,6 +487,14 @@ impl Intrinsic {
                 Self::ConsoleReadLine | Self::ConsoleReadLineTemporary,
                 AllocationRegion::Temporary,
             ) => Self::ConsoleReadLineTemporary,
+            (
+                Self::FileReadAllText(layout) | Self::FileReadAllTextTemporary(layout),
+                AllocationRegion::Persistent,
+            ) => Self::FileReadAllText(layout),
+            (
+                Self::FileReadAllText(layout) | Self::FileReadAllTextTemporary(layout),
+                AllocationRegion::Temporary,
+            ) => Self::FileReadAllTextTemporary(layout),
             _ => self,
         }
     }

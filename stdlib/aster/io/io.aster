@@ -100,6 +100,39 @@ public Result<string, IOError> CombinePath(string basePath, string childPath)
     return Result<string, IOError>.Ok(basePath + "/" + childPath);
 }
 
+/// Read an entire UTF-8 text file managed internally by the host: opened,
+/// read, and closed within this one call -- ASTER 1.0 exposes no owned file
+/// handle. Preserves the file's bytes exactly (LF/CRLF, embedded NUL,
+/// Unicode, leading/trailing whitespace); no trim, no newline normalization.
+/// Only a regular file is accepted (`IOErrorKind.NotFile` for a directory or
+/// other incompatible type). Invalid UTF-8 content is `IOErrorKind.
+/// InvalidUtf8`, never a lossy or partial string. `path` is validated like
+/// every other `aster.io` path argument (empty or embedded NUL is
+/// `IOErrorKind.InvalidPath`); callers are not required to call `CombinePath`
+/// first. Files larger than the internal 64 MiB limit are `IOErrorKind.
+/// LimitExceeded`. This declaration's body is never executed: the real
+/// behavior is the host intrinsic bound to this exact signature.
+public Result<string, IOError> ReadAllText(string path)
+{
+    return Result<string, IOError>.Error(IOError { Kind: IOErrorKind.Other, OsCode: 0 });
+}
+
+/// Create or truncate the file at `path` and write `content`'s UTF-8 bytes
+/// in full, then flush and close -- managed internally by the host, never
+/// exposing a handle. Never appends, never creates parent directories.
+/// Returns the number of UTF-8 *bytes* written (not Unicode scalars) on
+/// success. `IOErrorKind.NotFile` if `path` names an existing directory.
+/// `content` byte length above the internal 64 MiB limit is `IOErrorKind.
+/// LimitExceeded`, checked before the destination is touched. No atomicity
+/// is promised: a failure after the file was created or truncated may leave
+/// it empty, partially written, or created with no content. This
+/// declaration's body is never executed: the real behavior is the host
+/// intrinsic bound to this exact signature.
+public Result<int, IOError> WriteAllText(string path, string content)
+{
+    return Result<int, IOError>.Error(IOError { Kind: IOErrorKind.Other, OsCode: 0 });
+}
+
 public void Write(string value)
 {
 }

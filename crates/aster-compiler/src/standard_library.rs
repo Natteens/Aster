@@ -6,7 +6,7 @@
 
 use std::{collections::HashMap, path::PathBuf};
 
-use aster_hir::{Intrinsic, RuntimeErrorKind};
+use aster_hir::{FileIoResultLayout, Intrinsic, RuntimeErrorKind};
 
 const MATH_SOURCE: &str = include_str!("../../../stdlib/aster/math.aster");
 const TEXT_SOURCE: &str = include_str!("../../../stdlib/aster/text/text.aster");
@@ -83,6 +83,20 @@ impl StandardLibrary {
                     Intrinsic::ConsoleWriteLine,
                 ),
                 ("aster.io::ReadLine".to_owned(), Intrinsic::ConsoleReadLine),
+                (
+                    // Marker only: `hir_lowering::declarations::function`
+                    // replaces this placeholder payload with the real,
+                    // symbol-resolved `FileIoResultLayout` once it can
+                    // resolve `Result<string, IOError>`'s cases/fields (this
+                    // point, during `StandardLibrary` bootstrap, is too early
+                    // -- no symbols exist yet).
+                    "aster.io::ReadAllText".to_owned(),
+                    Intrinsic::FileReadAllText(FileIoResultLayout::UNRESOLVED),
+                ),
+                (
+                    "aster.io::WriteAllText".to_owned(),
+                    Intrinsic::FileWriteAllText(FileIoResultLayout::UNRESOLVED),
+                ),
             ]);
         }
         bindings

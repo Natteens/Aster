@@ -12,6 +12,7 @@
 
 mod arena;
 pub mod context;
+pub mod filesystem;
 pub mod io;
 pub mod io_error;
 pub mod log;
@@ -24,6 +25,11 @@ pub use context::{
     AsterArray, AsterList, ExecutionContext, ListRegion, MemoryStats, aster_rt_array_element,
     aster_rt_array_length, aster_rt_list_add, aster_rt_list_get, aster_rt_list_length,
     aster_rt_list_new, aster_rt_list_new_temporary, aster_rt_list_remove_at,
+};
+pub use filesystem::{
+    FailingFileSystemBackend, FileSystemBackend, FileSystemError, MAX_FILE_BYTES,
+    MemoryFileSystemBackend, PartialWriteFailureFileSystemBackend, StdFileSystemBackend,
+    aster_rt_io_read_all_text, aster_rt_io_read_all_text_temporary, aster_rt_io_write_all_text,
 };
 pub use io::{
     ConsoleBackend, FailingConsoleBackend, MemoryConsoleBackend, StdConsoleBackend,

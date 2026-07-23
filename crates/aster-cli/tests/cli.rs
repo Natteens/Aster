@@ -381,6 +381,198 @@ fn integrated_m1_program_runs_via_aster_run_subprocess() {
     assert_eq!(output.status.code(), Some(0));
 }
 
+/// M2D: `aster run` uses the real filesystem backend automatically (no
+/// injection point exists at the CLI level, unlike the in-memory backend
+/// `aster-codegen-cranelift`'s own test suite injects). Every path here is a
+/// unique file inside a fresh temporary directory, cleaned up even when the
+/// assertion fails would still leave the directory itself removed by the
+/// unconditional `fs::remove_dir_all` before any `assert!`.
+#[test]
+fn aster_run_reads_a_real_utf8_file_via_read_all_text() {
+    let directory = temporary_directory("read-all-text");
+    let input = directory.join("input.txt");
+    fs::write(&input, "Olá, ASTER! 🙂").expect("write real input file");
+    let main = directory.join("main.aster");
+    fs::write(
+        &main,
+        format!(
+            "using aster.core;\nusing aster.io;\n\
+             public int Main() {{\n\
+                 switch (ReadAllText(\"{}\")) {{\n\
+                     case Ok(text): return text.Length;\n\
+                     case Error(e): return -1;\n\
+                 }}\n\
+             }}",
+            input.to_str().unwrap().replace('\\', "\\\\")
+        ),
+    )
+    .expect("write program");
+    let output = aster([
+        "run",
+        main.to_str().expect("UTF-8 temporary path"),
+        "--function",
+        "Main",
+    ]);
+    fs::remove_dir_all(&directory).expect("remove temporary directory");
+    assert!(output.status.success(), "{}", stderr(&output));
+    // `string.Length` counts Unicode scalar values, not UTF-8 bytes.
+    assert_eq!(stdout(&output).trim(), "13");
+}
+
+#[test]
+fn aster_run_writes_a_real_file_creating_and_truncating_it() {
+    let directory = temporary_directory("write-all-text");
+    let output_path = directory.join("output.txt");
+    fs::write(&output_path, "stale content that must be truncated").expect("seed old content");
+    let main = directory.join("main.aster");
+    fs::write(
+        &main,
+        format!(
+            "using aster.core;\nusing aster.io;\n\
+             public int Main() {{\n\
+                 switch (WriteAllText(\"{}\", \"new\")) {{\n\
+                     case Ok(count): return count;\n\
+                     case Error(e): return -1;\n\
+                 }}\n\
+             }}",
+            output_path.to_str().unwrap().replace('\\', "\\\\")
+        ),
+    )
+    .expect("write program");
+    let output = aster([
+        "run",
+        main.to_str().expect("UTF-8 temporary path"),
+        "--function",
+        "Main",
+    ]);
+    let final_content = fs::read_to_string(&output_path).expect("read back real file");
+    fs::remove_dir_all(&directory).expect("remove temporary directory");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "3");
+    assert_eq!(final_content, "new");
+}
+
+#[test]
+fn aster_run_read_all_text_reports_not_found_for_a_missing_real_file() {
+    let directory = temporary_directory("read-missing");
+    let missing = directory.join("does-not-exist.txt");
+    let main = directory.join("main.aster");
+    fs::write(
+        &main,
+        format!(
+            "using aster.core;\nusing aster.io;\n\
+             public int Main() {{\n\
+                 switch (ReadAllText(\"{}\")) {{\n\
+                     case Ok(text): return -1;\n\
+                     case Error(e): switch (e.Kind) {{ case NotFound: return 0; default: return -2; }}\n\
+                 }}\n\
+             }}",
+            missing.to_str().unwrap().replace('\\', "\\\\")
+        ),
+    )
+    .expect("write program");
+    let output = aster([
+        "run",
+        main.to_str().expect("UTF-8 temporary path"),
+        "--function",
+        "Main",
+    ]);
+    fs::remove_dir_all(&directory).expect("remove temporary directory");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "0");
+}
+
+#[test]
+fn aster_run_read_all_text_reports_not_file_for_a_real_directory() {
+    let directory = temporary_directory("read-directory");
+    let main = directory.join("main.aster");
+    fs::write(
+        &main,
+        format!(
+            "using aster.core;\nusing aster.io;\n\
+             public int Main() {{\n\
+                 switch (ReadAllText(\"{}\")) {{\n\
+                     case Ok(text): return -1;\n\
+                     case Error(e): switch (e.Kind) {{ case NotFile: return 0; default: return -2; }}\n\
+                 }}\n\
+             }}",
+            directory.to_str().unwrap().replace('\\', "\\\\")
+        ),
+    )
+    .expect("write program");
+    let output = aster([
+        "run",
+        main.to_str().expect("UTF-8 temporary path"),
+        "--function",
+        "Main",
+    ]);
+    fs::remove_dir_all(&directory).expect("remove temporary directory");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "0");
+}
+
+#[test]
+fn aster_run_read_all_text_reports_invalid_utf8_for_a_real_file() {
+    let directory = temporary_directory("read-invalid-utf8");
+    let input = directory.join("invalid.txt");
+    fs::write(&input, [0xFF_u8, 0xFE]).expect("write invalid UTF-8 file");
+    let main = directory.join("main.aster");
+    fs::write(
+        &main,
+        format!(
+            "using aster.core;\nusing aster.io;\n\
+             public int Main() {{\n\
+                 switch (ReadAllText(\"{}\")) {{\n\
+                     case Ok(text): return -1;\n\
+                     case Error(e): switch (e.Kind) {{ case InvalidUtf8: return 0; default: return -2; }}\n\
+                 }}\n\
+             }}",
+            input.to_str().unwrap().replace('\\', "\\\\")
+        ),
+    )
+    .expect("write program");
+    let output = aster([
+        "run",
+        main.to_str().expect("UTF-8 temporary path"),
+        "--function",
+        "Main",
+    ]);
+    fs::remove_dir_all(&directory).expect("remove temporary directory");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "0");
+}
+
+#[test]
+fn aster_check_rejects_file_io_reachable_from_a_parallel_for_body() {
+    let directory = temporary_directory("check-worker-file-io");
+    let main = directory.join("main.aster");
+    fs::write(
+        &main,
+        "using aster.core;\nusing aster.io;\n\
+         public void Body(int i) { ReadAllText(\"a.txt\"); }\n\
+         public int Main() { Parallel.For(0, 4, Body); return 0; }",
+    )
+    .expect("write worker file io program");
+    let check_output = aster(["check", main.to_str().expect("UTF-8 temporary path")]);
+    let run_output = aster([
+        "run",
+        main.to_str().expect("UTF-8 temporary path"),
+        "--function",
+        "Main",
+    ]);
+    fs::remove_dir_all(&directory).expect("remove temporary directory");
+    assert!(
+        !check_output.status.success(),
+        "`aster check` must reject file I/O reachable from a Parallel.For body just like `aster run` does"
+    );
+    assert!(!run_output.status.success());
+    assert!(
+        stderr(&check_output).contains("ReadAllText"),
+        "{}",
+        stderr(&check_output)
+    );
+}
+
 fn aster<const N: usize>(arguments: [&str; N]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_aster"))
         .args(arguments)

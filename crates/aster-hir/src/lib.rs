@@ -59,6 +59,61 @@ pub enum Intrinsic {
     ConsoleWriteLine,
     /// `aster.io.ReadLine()`: reads one line into `Option<string>`; `None` on EOF.
     ConsoleReadLine,
+    /// `aster.io.ReadAllText(string) -> Result<string, IOError>`: reads an
+    /// entire UTF-8 text file via the host filesystem backend. The payload
+    /// is resolved once, here in HIR lowering (never by the backend), from
+    /// the official `aster.core.Result<string, IOError>`/`aster.io.IOError`/
+    /// `aster.io.IOErrorKind` declarations -- see [`FileIoResultLayout`].
+    FileReadAllText(FileIoResultLayout),
+    /// `aster.io.WriteAllText(string, string) -> Result<int, IOError>`:
+    /// creates or truncates a file and writes UTF-8 text via the host
+    /// filesystem backend. Payload resolved the same way as
+    /// [`Self::FileReadAllText`], against `Result<int, IOError>`.
+    FileWriteAllText(FileIoResultLayout),
+}
+
+/// Every concrete symbol the M2D filesystem intrinsics need to construct a
+/// `Result<T, IOError>` value, resolved exactly once during HIR lowering
+/// (from the official stdlib declarations' own, ordinary case/field
+/// resolution -- the same mechanism `ExpressionKind::PropagateResult`'s
+/// `ok_case`/`ok_field`/`error_case`/`error_field` already use for postfix
+/// `?`) and carried as plain data from then on. The backend looks these up in
+/// its own layout tables strictly by `SymbolId` equality; it never compares
+/// case, field, or variant names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileIoResultLayout {
+    /// `Result<T, IOError>`'s `Ok` case.
+    pub ok_case: SymbolId,
+    /// `Ok`'s single payload field (of type `T`).
+    pub ok_field: SymbolId,
+    /// `Result<T, IOError>`'s `Error` case.
+    pub error_case: SymbolId,
+    /// `Error`'s single payload field (of type `IOError`).
+    pub error_field: SymbolId,
+    /// `IOError.Kind`.
+    pub io_error_kind_field: SymbolId,
+    /// `IOError.OsCode`.
+    pub io_error_os_code_field: SymbolId,
+    /// `IOErrorKind`'s 9 cases, indexed in the fixed order
+    /// `aster_runtime::PortableIoErrorKind`'s variants declare (`NotFound`,
+    /// `PermissionDenied`, `AlreadyExists`, `InvalidPath`, `InvalidUtf8`,
+    /// `NotFile`, `NotDirectory`, `LimitExceeded`, `Other`).
+    pub portable_kind_cases: [SymbolId; 9],
+}
+
+impl FileIoResultLayout {
+    /// Sentinel used only as a placeholder in
+    /// `StandardLibrary::intrinsic_bindings()`, before HIR lowering resolves
+    /// the real symbols; never reaches MIR or the backend.
+    pub const UNRESOLVED: Self = Self {
+        ok_case: SymbolId(0),
+        ok_field: SymbolId(0),
+        error_case: SymbolId(0),
+        error_field: SymbolId(0),
+        io_error_kind_field: SymbolId(0),
+        io_error_os_code_field: SymbolId(0),
+        portable_kind_cases: [SymbolId(0); 9],
+    };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

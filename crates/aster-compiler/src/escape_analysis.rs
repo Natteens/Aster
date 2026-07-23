@@ -558,6 +558,9 @@ fn instruction_escape(
                     | mir::Intrinsic::StringTryParseDouble
                     | mir::Intrinsic::ConsoleWrite
                     | mir::Intrinsic::ConsoleWriteLine
+                    | mir::Intrinsic::FileReadAllText(_)
+                    | mir::Intrinsic::FileReadAllTextTemporary(_)
+                    | mir::Intrinsic::FileWriteAllText(_)
                     | mir::Intrinsic::ReportRuntimeError(_)
             );
             (!borrows_only

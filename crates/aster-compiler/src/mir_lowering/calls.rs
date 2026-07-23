@@ -136,6 +136,43 @@ impl FunctionLowerer {
                     kind: mir::OperandKind::Copy(destination),
                 })
             }
+            hir::Intrinsic::FileReadAllText(layout) => {
+                let path = self
+                    .lower_expression(&arguments[0])
+                    .expect("validated ReadAllText path argument produces a value");
+                let local = self.new_temporary(return_type.clone());
+                let destination = mir::Place::Local(local);
+                self.instruction(mir::Instruction::CallIntrinsic {
+                    destination: Some(destination.clone()),
+                    intrinsic: mir::Intrinsic::FileReadAllText(layout),
+                    arguments: vec![path],
+                    return_type: return_type.clone(),
+                });
+                Some(mir::Operand {
+                    type_: return_type.clone(),
+                    kind: mir::OperandKind::Copy(destination),
+                })
+            }
+            hir::Intrinsic::FileWriteAllText(layout) => {
+                let path = self
+                    .lower_expression(&arguments[0])
+                    .expect("validated WriteAllText path argument produces a value");
+                let content = self
+                    .lower_expression(&arguments[1])
+                    .expect("validated WriteAllText content argument produces a value");
+                let local = self.new_temporary(return_type.clone());
+                let destination = mir::Place::Local(local);
+                self.instruction(mir::Instruction::CallIntrinsic {
+                    destination: Some(destination.clone()),
+                    intrinsic: mir::Intrinsic::FileWriteAllText(layout),
+                    arguments: vec![path, content],
+                    return_type: return_type.clone(),
+                });
+                Some(mir::Operand {
+                    type_: return_type.clone(),
+                    kind: mir::OperandKind::Copy(destination),
+                })
+            }
         }
     }
 }

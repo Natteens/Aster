@@ -960,6 +960,11 @@ pub(super) fn lower_intrinsic(intrinsic: hir::Intrinsic) -> mir::Intrinsic {
         hir::Intrinsic::ConsoleWrite => mir::Intrinsic::ConsoleWrite,
         hir::Intrinsic::ConsoleWriteLine => mir::Intrinsic::ConsoleWriteLine,
         hir::Intrinsic::ConsoleReadLine => mir::Intrinsic::ConsoleReadLine,
+        // `FileIoResultLayout` is the identical type re-exported by both
+        // crates (`aster_mir::FileIoResultLayout` is `aster_hir`'s), so the
+        // symbols HIR lowering resolved pass straight through unchanged.
+        hir::Intrinsic::FileReadAllText(layout) => mir::Intrinsic::FileReadAllText(layout),
+        hir::Intrinsic::FileWriteAllText(layout) => mir::Intrinsic::FileWriteAllText(layout),
     }
 }
 

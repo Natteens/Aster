@@ -142,6 +142,12 @@ pub struct ExecutionContext {
     /// stdin/stdout on first use; a host (tests, or a future CLI override)
     /// can inject an in-memory backend first via [`Self::set_console_backend`].
     console: Option<Box<dyn crate::io::ConsoleBackend>>,
+    /// Filesystem backend for `aster.io.ReadAllText`/`WriteAllText`. Owned
+    /// per-context, never a global/singleton/registry, and never shared
+    /// automatically with workers. Lazily defaults to the real filesystem on
+    /// first use; a host (tests, or a future CLI override) can inject an
+    /// in-memory backend first via [`Self::set_filesystem_backend`].
+    filesystem: Option<Box<dyn crate::filesystem::FileSystemBackend>>,
 }
 
 impl Default for ExecutionContext {
@@ -162,6 +168,7 @@ impl ExecutionContext {
             stats: MemoryStats::default(),
             task_runtime: None,
             console: None,
+            filesystem: None,
         }
     }
 
@@ -176,6 +183,7 @@ impl ExecutionContext {
             stats: MemoryStats::default(),
             task_runtime: None,
             console: None,
+            filesystem: None,
         }
     }
 
@@ -228,6 +236,30 @@ impl ExecutionContext {
             self.console = Some(Box::new(crate::io::StdConsoleBackend::default()));
         }
         self.console.as_deref_mut().expect("just initialized above")
+    }
+
+    /// Inject the filesystem backend this context uses for `aster.io.
+    /// ReadAllText`/`WriteAllText`. Overwrites any previous backend
+    /// (including the lazily created default). Independent contexts never
+    /// share a backend; this is per-context state, not a global or
+    /// singleton, and is never propagated to workers automatically.
+    pub fn set_filesystem_backend(
+        &mut self,
+        backend: Box<dyn crate::filesystem::FileSystemBackend>,
+    ) {
+        self.filesystem = Some(backend);
+    }
+
+    /// The active filesystem backend, lazily defaulting to the real
+    /// filesystem on first use so a host that never calls
+    /// `set_filesystem_backend` still gets working file I/O.
+    pub(crate) fn filesystem_backend(&mut self) -> &mut dyn crate::filesystem::FileSystemBackend {
+        if self.filesystem.is_none() {
+            self.filesystem = Some(Box::new(crate::filesystem::StdFileSystemBackend::default()));
+        }
+        self.filesystem
+            .as_deref_mut()
+            .expect("just initialized above")
     }
 
     fn record_allocation(&mut self, category: AllocationCategory, requested: usize) {
