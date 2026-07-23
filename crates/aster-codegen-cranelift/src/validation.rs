@@ -612,12 +612,19 @@ fn validate_function(
             function.name, function.entry
         )));
     }
+    let declared_local_count = function.parameters.len() + function.locals.len();
     let locals = function
         .parameters
         .iter()
         .chain(&function.locals)
         .map(|local| (local.id, local.type_.clone()))
         .collect::<HashMap<_, _>>();
+    if locals.len() != declared_local_count {
+        return Err(BackendError::new(format!(
+            "function `{}` has duplicate local identifiers",
+            function.name
+        )));
+    }
     for block in &function.blocks {
         for instruction in &block.instructions {
             validate_instruction(
