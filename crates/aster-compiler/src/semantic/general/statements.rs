@@ -188,6 +188,85 @@ impl Analyzer<'_> {
                 self.scopes.pop();
                 Flow::CONTINUE
             }
+            Statement::ForEach {
+                element_type,
+                element_name,
+                collection,
+                body,
+                ..
+            } => {
+                let collection_type = self.expression(collection);
+                let declared_type = self.resolve_local_type(element_type);
+                let actual_type = match collection_type {
+                    Type::Array(element) => *element,
+                    Type::List(_) => {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "foreach over `List<T>` is not supported yet",
+                                collection.span,
+                            )
+                            .with_help("use an indexed loop until List<T> iteration is available"),
+                        );
+                        Type::Unknown
+                    }
+                    Type::String => {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "foreach over `string` is not supported yet",
+                                collection.span,
+                            )
+                            .with_help("use string operations until string iteration is available"),
+                        );
+                        Type::Unknown
+                    }
+                    Type::Unknown => Type::Unknown,
+                    other => {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                format!("type `{}` is not iterable", other.display()),
+                                collection.span,
+                            )
+                            .with_help("foreach currently accepts only arrays"),
+                        );
+                        Type::Unknown
+                    }
+                };
+                if actual_type != Type::Unknown
+                    && declared_type != Type::Unknown
+                    && actual_type != declared_type
+                {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            format!(
+                                "foreach element type `{}` does not match array element type `{}`",
+                                declared_type.display(),
+                                actual_type.display()
+                            ),
+                            element_type.span,
+                        )
+                        .with_help("use the array element type for the foreach variable"),
+                    );
+                }
+                self.scopes.push(HashMap::new());
+                self.declare(
+                    element_name,
+                    Binding {
+                        type_: declared_type,
+                        mutable: false,
+                        iteration_readonly: true,
+                        initialized: true,
+                        span: element_type.span,
+                        value: None,
+                    },
+                );
+                self.loop_depth += 1;
+                let before_body = self.scopes.clone();
+                self.block(body, true);
+                self.scopes = before_body;
+                self.loop_depth -= 1;
+                self.scopes.pop();
+                Flow::CONTINUE
+            }
             Statement::Switch {
                 value,
                 cases,
@@ -316,6 +395,7 @@ impl Analyzer<'_> {
                     Binding {
                         type_: type_.clone(),
                         mutable: true,
+                        iteration_readonly: false,
                         initialized: true,
                         span: case.span,
                         value: None,
@@ -415,6 +495,7 @@ impl Analyzer<'_> {
                 return Some(Binding {
                     type_: expected,
                     mutable: false,
+                    iteration_readonly: false,
                     initialized: true,
                     span: variable.span,
                     value,
@@ -424,6 +505,7 @@ impl Analyzer<'_> {
         Some(Binding {
             type_,
             mutable,
+            iteration_readonly: false,
             initialized: variable.initializer.is_some(),
             span: variable.span,
             value: None,

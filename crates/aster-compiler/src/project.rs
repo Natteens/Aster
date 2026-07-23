@@ -851,7 +851,13 @@ impl AstVisitorMut for Rewriter {
     }
 
     fn visit_statement_mut(&mut self, statement: &mut Statement) {
-        if matches!(statement, Statement::For { .. }) {
+        if let Statement::ForEach { element_name, .. } = statement {
+            let mut locals = self.current_locals().cloned().unwrap_or_default();
+            locals.insert(element_name.clone());
+            self.locals.push(locals);
+            walk_statement_mut(self, statement);
+            self.locals.pop();
+        } else if matches!(statement, Statement::For { .. }) {
             let locals = self.current_locals().cloned().unwrap_or_default();
             self.locals.push(locals);
             walk_statement_mut(self, statement);

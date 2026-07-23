@@ -654,7 +654,7 @@ fn validate_instruction(
 ) -> Result<(), BackendError> {
     match instruction {
         mir::Instruction::Assign { target, value } => {
-            validate_assign(target, value, function_name, implementations)
+            validate_assign(target, value, function_name, locals, implementations)
         }
         mir::Instruction::Call {
             destination,
@@ -775,9 +775,20 @@ fn validate_assign(
     target: &mir::Place,
     value: &mir::Rvalue,
     function_name: &str,
+    locals: &HashMap<mir::LocalId, mir::Type>,
     implementations: &HashSet<(mir::SymbolId, mir::SymbolId)>,
 ) -> Result<(), BackendError> {
     validate_place(target, function_name)?;
+    if let mir::Place::Local(id) = target
+        && let Some(declared) = locals.get(id)
+        && *declared != value.type_
+    {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` assigns a value of type `{}` into a local declared `{}`",
+            type_name(&value.type_),
+            type_name(declared)
+        )));
+    }
     validate_rvalue(value, function_name, implementations)
 }
 
@@ -1661,6 +1672,11 @@ fn validate_terminator(
             else_block,
         } => {
             validate_operand(condition, function_name)?;
+            if condition.type_ != mir::Type::Bool {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` has a `Branch` whose condition is not `bool`"
+                )));
+            }
             validate_block_target(*then_block, function_name, blocks)?;
             validate_block_target(*else_block, function_name, blocks)
         }
@@ -1700,6 +1716,15 @@ fn validate_operand(operand: &mir::Operand, function_name: &str) -> Result<(), B
             ))
         }),
         mir::OperandKind::Constant(_) | mir::OperandKind::Copy(mir::Place::Local(_)) => Ok(()),
+        mir::OperandKind::Copy(place @ mir::Place::Index { element_type, .. }) => {
+            validate_place(place, function_name)?;
+            if operand.type_ != *element_type {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` has an array-index read whose result type does not match the indexed place's element type"
+                )));
+            }
+            Ok(())
+        }
         mir::OperandKind::Copy(place) => validate_place(place, function_name),
         mir::OperandKind::Function(_) => Err(unsupported(function_name, "function values")),
     }

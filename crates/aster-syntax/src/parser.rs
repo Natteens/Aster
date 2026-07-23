@@ -662,6 +662,9 @@ impl Parser {
         if self.at(&TokenKind::For) {
             return self.for_statement();
         }
+        if self.at(&TokenKind::Foreach) {
+            return self.foreach_statement();
+        }
         if self.at(&TokenKind::Switch) {
             return self.switch_statement();
         }
@@ -779,6 +782,42 @@ impl Parser {
             initializer,
             condition,
             update,
+            body,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn foreach_statement(&mut self) -> Option<Statement> {
+        let start = self.expect(&TokenKind::Foreach)?.span.start;
+        self.expect(&TokenKind::LeftParen)?;
+        if self.at(&TokenKind::Var) {
+            let span = self.advance().span;
+            self.diagnostics.push(
+                Diagnostic::error("foreach requires an explicit element type", span)
+                    .with_help("write the concrete array element type before the variable name"),
+            );
+            return None;
+        }
+        let element_type = self.type_ref()?;
+        let (element_name, _) = self.identifier()?;
+        self.expect(&TokenKind::In)?;
+        let collection = self.expression()?;
+        self.expect(&TokenKind::RightParen)?;
+        let body = if self.at(&TokenKind::LeftBrace) {
+            self.block()?
+        } else {
+            let statement = self.statement()?;
+            let span = statement.span();
+            Block {
+                statements: vec![statement],
+                span,
+            }
+        };
+        let end = body.span.end;
+        Some(Statement::ForEach {
+            element_type,
+            element_name,
+            collection,
             body,
             span: Span::new(start, end),
         })
@@ -2152,10 +2191,44 @@ mod tests {
     }
 
     #[test]
-    fn old_foreach_statement_is_no_longer_accepted() {
+    fn rejects_the_removed_untyped_foreach_form() {
         let source = "public void F() { foreach (item) { } }";
         let tokens = lex(source).expect("lexing succeeds");
         assert!(parse(tokens).is_err());
+    }
+
+    #[test]
+    fn parses_typed_foreach_with_a_single_statement_body() {
+        let module = parse_source(
+            "public void F() { int[] values = [1]; foreach (int value in values) value++; }",
+        );
+        let statements = first_function_statements(&module);
+        let Statement::ForEach {
+            element_type,
+            element_name,
+            collection,
+            body,
+            ..
+        } = &statements[1]
+        else {
+            panic!("expected foreach statement");
+        };
+        assert_eq!(element_type.name, "int");
+        assert_eq!(element_name, "value");
+        assert!(matches!(collection.kind, ExpressionKind::Name(ref name) if name == "values"));
+        assert_eq!(body.statements.len(), 1);
+    }
+
+    #[test]
+    fn foreach_requires_an_explicit_type() {
+        let tokens =
+            lex("public void F() { foreach (var value in values) { } }").expect("lexing succeeds");
+        let diagnostics = parse(tokens).expect_err("var is not accepted by foreach");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("explicit element type"))
+        );
     }
 
     #[test]

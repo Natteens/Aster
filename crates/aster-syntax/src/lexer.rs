@@ -329,6 +329,8 @@ impl Lexer<'_> {
             "else" => TokenKind::Else,
             "while" => TokenKind::While,
             "for" => TokenKind::For,
+            "foreach" => TokenKind::Foreach,
+            "in" => TokenKind::In,
             "break" => TokenKind::Break,
             "continue" => TokenKind::Continue,
             "switch" => TokenKind::Switch,
@@ -543,7 +545,7 @@ mod tests {
 
     #[test]
     fn lexes_all_general_keywords() {
-        let source = "public internal protected private class struct interface const var void bool int long float double char string return if else while for break continue true false";
+        let source = "public internal protected private class struct interface const var void bool int long float double char string return if else while for foreach in break continue true false";
         let tokens = lex(source).expect("keywords should lex");
         let kinds = tokens
             .into_iter()
@@ -574,6 +576,8 @@ mod tests {
                 TokenKind::Else,
                 TokenKind::While,
                 TokenKind::For,
+                TokenKind::Foreach,
+                TokenKind::In,
                 TokenKind::Break,
                 TokenKind::Continue,
                 TokenKind::True,

@@ -1033,12 +1033,33 @@ impl Analyzer<'_> {
     /// anything).
     fn is_assignable_place(&mut self, expression: &Expression) -> bool {
         match &expression.kind {
-            ExpressionKind::Name(_) | ExpressionKind::This | ExpressionKind::Index { .. } => true,
+            ExpressionKind::Name(name) => self
+                .binding(name)
+                .is_none_or(|binding| !binding.iteration_readonly),
+            ExpressionKind::This | ExpressionKind::Index { .. } => true,
             ExpressionKind::Member { object, .. } => {
                 matches!(self.expression(object), Type::Class(_) | Type::Interface(_))
                     || self.is_assignable_place(object)
             }
             _ => false,
+        }
+    }
+
+    /// A foreach element is a copied value. A struct field reached through it
+    /// must not become a write-back alias, while a class member remains an
+    /// observable mutation through a copied reference.
+    fn foreach_readonly_binding(&mut self, expression: &Expression) -> Option<String> {
+        match &expression.kind {
+            ExpressionKind::Name(name) => self
+                .binding(name)
+                .is_some_and(|binding| binding.iteration_readonly)
+                .then(|| name.clone()),
+            ExpressionKind::Member { object, .. }
+                if matches!(self.expression(object), Type::User(_)) =>
+            {
+                self.foreach_readonly_binding(object)
+            }
+            _ => None,
         }
     }
 
@@ -1168,6 +1189,16 @@ impl Analyzer<'_> {
                 binding.initialized = true;
             }
             return result;
+        }
+        if let Some(name) = self.foreach_readonly_binding(target) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!("foreach variable `{name}` is read-only"),
+                    target.span,
+                )
+                .with_help("use an indexed loop to modify array elements"),
+            );
+            return Type::Unknown;
         }
         let ExpressionKind::Name(name) = &target.kind else {
             if !self.is_assignable_place(target) {

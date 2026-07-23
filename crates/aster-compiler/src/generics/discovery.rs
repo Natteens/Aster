@@ -166,6 +166,21 @@ impl Monomorphizer {
                 }
                 self.block(body, &mut loop_environment);
             }
+            Statement::ForEach {
+                element_type,
+                element_name,
+                collection,
+                body,
+                ..
+            } => {
+                if let Some(concrete) = environment.get(&element_type.name) {
+                    element_type.name.clone_from(concrete);
+                }
+                self.expression(collection, environment);
+                let mut loop_environment = environment.clone();
+                loop_environment.insert(element_name.clone(), element_type.name.clone());
+                self.block(body, &mut loop_environment);
+            }
             Statement::Switch {
                 value,
                 cases,

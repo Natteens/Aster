@@ -234,6 +234,13 @@ pub enum Statement {
         update: Option<Expression>,
         body: Block,
     },
+    /// A compiler-known array iteration construct. MIR lowering expands it
+    /// into indexed CFG before code generation.
+    ForEach {
+        element: Variable,
+        collection: Expression,
+        body: Block,
+    },
     Switch {
         value: Expression,
         cases: Vec<SwitchCase>,

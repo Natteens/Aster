@@ -76,6 +76,40 @@ impl Lowerer<'_> {
                     body,
                 }
             }
+            ast::Statement::ForEach {
+                element_type,
+                element_name,
+                collection,
+                body,
+                ..
+            } => {
+                // The collection is lowered before the iteration scope exists,
+                // so the element binding cannot be referenced from it.
+                let collection = self.expression(collection);
+                let element_type = self.resolve_type(element_type);
+                let symbol = self.allocate();
+                self.symbol_types.insert(symbol, element_type.clone());
+                let element = hir::Variable {
+                    symbol,
+                    name: element_name.clone(),
+                    visibility: None,
+                    type_: element_type,
+                    mutable: false,
+                    initializer: None,
+                };
+                self.scopes.push(HashMap::new());
+                self.scopes
+                    .last_mut()
+                    .expect("foreach scope")
+                    .insert(element.name.clone(), symbol);
+                let body = self.block(body);
+                self.scopes.pop();
+                hir::Statement::ForEach {
+                    element,
+                    collection,
+                    body,
+                }
+            }
             ast::Statement::Switch {
                 value,
                 cases,

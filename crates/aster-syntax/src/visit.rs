@@ -259,6 +259,16 @@ pub fn walk_statement_mut<V: AstVisitorMut + ?Sized>(visitor: &mut V, statement:
             }
             visitor.visit_block_mut(body);
         }
+        Statement::ForEach {
+            element_type,
+            collection,
+            body,
+            ..
+        } => {
+            visitor.visit_type_ref_mut(element_type);
+            visitor.visit_expression_mut(collection);
+            visitor.visit_block_mut(body);
+        }
         Statement::Switch {
             value,
             cases,

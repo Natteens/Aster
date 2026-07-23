@@ -870,6 +870,7 @@ fn validate_function_with_initialized_fields(
             Binding {
                 type_: resolve_type_readonly(&parameter.type_ref, context),
                 mutable: true,
+                iteration_readonly: false,
                 initialized: true,
                 span: parameter.span,
                 value: None,
@@ -985,6 +986,7 @@ fn validate_async_body(body: &aster_syntax::Block, diagnostics: &mut Vec<Diagnos
             Statement::If { span, .. }
             | Statement::While { span, .. }
             | Statement::For { span, .. }
+            | Statement::ForEach { span, .. }
             | Statement::Switch { span, .. }
             | Statement::Break(span)
             | Statement::Continue(span) => diagnostics.push(
@@ -1125,6 +1127,14 @@ pub(super) fn collect_statement_calls<'a>(statement: &'a Statement, out: &mut Ve
                 collect_statement_calls(statement, out);
             }
         }
+        Statement::ForEach {
+            collection, body, ..
+        } => {
+            collect_expression_calls(collection, out);
+            for statement in &body.statements {
+                collect_statement_calls(statement, out);
+            }
+        }
         Statement::Switch {
             value,
             cases,
@@ -1237,6 +1247,7 @@ fn collect_statement_awaits<'a>(statement: &'a Statement, out: &mut Vec<&'a Expr
         Statement::If { .. }
         | Statement::While { .. }
         | Statement::For { .. }
+        | Statement::ForEach { .. }
         | Statement::Switch { .. }
         | Statement::Break(_)
         | Statement::Continue(_) => {}

@@ -123,6 +123,15 @@ fn collect_statement(statement: &hir::Statement, max: &mut u32) {
             }
             collect_block(body, max);
         }
+        hir::Statement::ForEach {
+            element,
+            collection,
+            body,
+        } => {
+            note(max, element.symbol);
+            collect_expression(collection, max);
+            collect_block(body, max);
+        }
         hir::Statement::Switch {
             value,
             cases,

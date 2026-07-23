@@ -90,3 +90,77 @@ fn array_diagnostics_are_specific() {
         );
     }
 }
+
+#[test]
+fn foreach_is_typed_and_lowers_to_existing_array_cfg() {
+    let compilation = aster_compiler::compile(
+        "public int Run() { int[] values = [1, 2, 3]; int total = 0; foreach (int value in values) { total += value; } return total; }",
+    )
+    .expect("valid array foreach");
+    let hir::Item::Function(function) = &compilation.hir.items[0] else {
+        panic!("function");
+    };
+    assert!(matches!(
+        function.body.as_ref().unwrap().statements[2],
+        hir::Statement::ForEach { .. }
+    ));
+    let function = &compilation.mir.functions[0];
+    assert!(
+        function
+            .blocks
+            .iter()
+            .any(|block| matches!(block.terminator, mir::Terminator::Branch { .. }))
+    );
+    assert!(
+        function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .any(|instruction| {
+                matches!(
+                    instruction,
+                    mir::Instruction::Assign {
+                        value: mir::Rvalue {
+                            kind: mir::RvalueKind::ArrayLength(_),
+                            ..
+                        },
+                        ..
+                    }
+                )
+            })
+    );
+}
+
+#[test]
+fn foreach_diagnostics_preserve_array_only_and_readonly_rules() {
+    for (source, message) in [
+        (
+            "public int Run() { int[] values = [1]; foreach (string value in values) { } return 0; }",
+            "does not match array element type",
+        ),
+        (
+            "public int Run() { List<int> values = new List<int>(); foreach (int value in values) { } return 0; }",
+            "List<T>` is not supported",
+        ),
+        (
+            "public int Run() { string value = \"x\"; foreach (char item in value) { } return 0; }",
+            "string` is not supported",
+        ),
+        (
+            "public int Run() { int[] values = [1]; foreach (int value in values) { value = 2; } return 0; }",
+            "foreach variable `value` is read-only",
+        ),
+        (
+            "public struct Point { public int X; } public int Run() { Point[] values = [Point { X: 1 }]; foreach (Point value in values) { value.X = 2; } return 0; }",
+            "foreach variable `value` is read-only",
+        ),
+    ] {
+        let diagnostics = aster_compiler::compile(source).expect_err("source must be rejected");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(message)),
+            "missing `{message}` in {diagnostics:#?}"
+        );
+    }
+}

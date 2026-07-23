@@ -125,6 +125,7 @@ struct Context {
 struct Binding {
     type_: Type,
     mutable: bool,
+    iteration_readonly: bool,
     initialized: bool,
     span: Span,
     /// The evaluated value of a `const` binding; `None` for variables.
@@ -182,6 +183,7 @@ impl<'a> Analyzer<'a> {
                 Binding {
                     type_,
                     mutable: true,
+                    iteration_readonly: false,
                     initialized,
                     span: Span::default(),
                     value: None,

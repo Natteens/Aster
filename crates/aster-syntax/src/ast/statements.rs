@@ -1,6 +1,6 @@
 use aster_diagnostics::Span;
 
-use super::{Expression, VariableDeclaration};
+use super::{Expression, TypeRef, VariableDeclaration};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Block {
@@ -33,6 +33,13 @@ pub enum Statement {
         body: Block,
         span: Span,
     },
+    ForEach {
+        element_type: TypeRef,
+        element_name: String,
+        collection: Expression,
+        body: Block,
+        span: Span,
+    },
     Switch {
         value: Expression,
         cases: Vec<SwitchCase>,
@@ -53,6 +60,7 @@ impl Statement {
             | Self::If { span, .. }
             | Self::While { span, .. }
             | Self::For { span, .. }
+            | Self::ForEach { span, .. }
             | Self::Switch { span, .. }
             | Self::Break(span)
             | Self::Continue(span) => *span,
