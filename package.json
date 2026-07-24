@@ -4,6 +4,7 @@
   "version": "0.0.0-development",
   "description": "Release automation for the Aster workspace.",
   "scripts": {
+    "bundle": "node scripts/bundle.mjs",
     "release": "semantic-release",
     "release:dry-run": "semantic-release --dry-run",
     "release:sync-version": "node scripts/sync-release-version.mjs",

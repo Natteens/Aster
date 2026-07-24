@@ -1,6 +1,6 @@
 /target/
+/dist/
 **/*.rs.bk
-.claude/
 .idea/
 .vscode/
 *.aster.tmp
