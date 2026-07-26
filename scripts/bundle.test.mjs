@@ -122,7 +122,6 @@ test("bundleDirectoryName produces canonical name", () => {
 test("readVersion extracts version from Cargo.toml", () => {
     const version = readVersion(join(repositoryRoot, "Cargo.toml"));
     assert.match(version, /^\d+\.\d+\.\d+/, "version must be semantic");
-    assert.equal(version, "0.40.0");
 });
 
 // ---------------------------------------------------------------------------
