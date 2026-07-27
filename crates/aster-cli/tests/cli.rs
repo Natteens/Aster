@@ -14,8 +14,9 @@ fn global_help_and_version_describe_the_installed_binary() {
     assert!(help.status.success());
     let help = stdout(&help);
     assert!(help.contains("aster <COMMAND>"));
-    assert!(help.contains("run <FILE>"));
-    assert!(help.contains("check <FILE>"));
+    assert!(help.contains("new <NAME>"));
+    assert!(help.contains("run [FILE]"));
+    assert!(help.contains("check [FILE]"));
     assert!(help.contains("watch <FILE>"));
 
     let version = aster(["--version"]);
@@ -28,11 +29,14 @@ fn global_help_and_version_describe_the_installed_binary() {
 
 #[test]
 fn public_commands_have_focused_help() {
-    for command in ["run", "check", "watch"] {
+    for command in ["run", "check"] {
         let output = aster([command, "--help"]);
         assert!(output.status.success(), "{command} help should succeed");
-        assert!(stdout(&output).contains(&format!("Usage: aster {command} <FILE>")));
+        assert!(stdout(&output).contains(&format!("Usage: aster {command} [FILE]")));
     }
+    let watch = aster(["watch", "--help"]);
+    assert!(watch.status.success());
+    assert!(stdout(&watch).contains("Usage: aster watch <FILE>"));
 }
 
 #[test]

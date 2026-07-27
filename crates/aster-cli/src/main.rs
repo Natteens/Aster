@@ -1,7 +1,12 @@
+mod new_project;
 mod stdlib_discovery;
 mod watch;
 
-use std::{env, fs, path::Path, process::ExitCode};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 fn main() -> ExitCode {
     match run(env::args().skip(1)) {
@@ -12,70 +17,12 @@ fn main() -> ExitCode {
 
 fn run(mut arguments: impl Iterator<Item = String>) -> Result<(), ()> {
     match arguments.next().as_deref() {
+        Some("new") => run_new_command(&mut arguments),
         Some(command @ ("check" | "dump-hir" | "dump-mir")) => {
-            let Some(file_name) = arguments.next() else {
-                eprintln!("error: missing source file\n\nUsage: aster {command} <FILE>");
-                return Err(());
-            };
-            if matches!(file_name.as_str(), "--help" | "-h") {
-                if let Some(argument) = arguments.next() {
-                    eprintln!("error: unexpected argument `{argument}`");
-                    return Err(());
-                }
-                print_command_help(command);
-                return Ok(());
-            }
-            if let Some(argument) = arguments.next() {
-                eprintln!(
-                    "error: unexpected argument `{argument}`\n\nUsage: aster {command} <FILE>"
-                );
-                return Err(());
-            }
-            let stdlib = stdlib_discovery::discover()?;
-            process_file(command, &file_name, &stdlib)
+            run_validation_command(command, &mut arguments)
         }
-        Some(command @ ("run" | "watch")) => {
-            let usage =
-                format!("Usage: aster {command} <FILE> [--function <NAME>] [--memory-stats]");
-            let Some(file_name) = arguments.next() else {
-                eprintln!("error: missing source file\n\n{usage}");
-                return Err(());
-            };
-            if matches!(file_name.as_str(), "--help" | "-h") {
-                if let Some(argument) = arguments.next() {
-                    eprintln!("error: unexpected argument `{argument}`");
-                    return Err(());
-                }
-                print_command_help(command);
-                return Ok(());
-            }
-            let mut function_name: Option<String> = None;
-            let mut memory_stats = false;
-            while let Some(option) = arguments.next() {
-                match option.as_str() {
-                    "--function" => {
-                        let Some(name) = arguments.next() else {
-                            eprintln!("error: missing function name after `--function`\n\n{usage}");
-                            return Err(());
-                        };
-                        function_name = Some(name);
-                    }
-                    "--memory-stats" => {
-                        memory_stats = true;
-                    }
-                    _ => {
-                        eprintln!("error: unexpected argument `{option}`\n\n{usage}");
-                        return Err(());
-                    }
-                }
-            }
-            let stdlib = stdlib_discovery::discover()?;
-            if command == "watch" {
-                watch::watch_file(&file_name, function_name.as_deref(), &stdlib)
-            } else {
-                run_file(&file_name, function_name.as_deref(), memory_stats, &stdlib)
-            }
-        }
+        Some("run") => run_execute_command(&mut arguments),
+        Some("watch") => run_watch_command(&mut arguments),
         Some("--version" | "-V") => {
             if let Some(argument) = arguments.next() {
                 eprintln!("error: unexpected argument `{argument}`");
@@ -102,6 +49,139 @@ fn run(mut arguments: impl Iterator<Item = String>) -> Result<(), ()> {
             Err(())
         }
     }
+}
+
+fn run_new_command(arguments: &mut impl Iterator<Item = String>) -> Result<(), ()> {
+    let Some(name) = arguments.next() else {
+        eprintln!("error: missing project name\n\nUsage: aster new <NAME>");
+        return Err(());
+    };
+    if matches!(name.as_str(), "--help" | "-h") {
+        reject_extra_argument(arguments)?;
+        print_command_help("new");
+        return Ok(());
+    }
+    if let Some(argument) = arguments.next() {
+        eprintln!("error: unexpected argument `{argument}`\n\nUsage: aster new <NAME>");
+        return Err(());
+    }
+    let current_directory = env::current_dir().map_err(|error| {
+        eprintln!("error: could not determine current directory: {error}");
+    })?;
+    let path = new_project::create(&current_directory, &name).map_err(|error| {
+        eprintln!("error: {error}");
+    })?;
+    println!(
+        "ASTER project created\n\nName: {name}\nPath: {}\n\nNext steps:\n  cd {name}\n  aster check\n  aster run",
+        path.display()
+    );
+    Ok(())
+}
+
+fn run_validation_command(
+    command: &str,
+    arguments: &mut impl Iterator<Item = String>,
+) -> Result<(), ()> {
+    let file_name = arguments.next();
+    if matches!(file_name.as_deref(), Some("--help" | "-h")) {
+        reject_extra_argument(arguments)?;
+        print_command_help(command);
+        return Ok(());
+    }
+    if let Some(argument) = arguments.next() {
+        eprintln!("error: unexpected argument `{argument}`\n\nUsage: aster {command} [FILE]");
+        return Err(());
+    }
+    let file_name = resolve_source_argument(command, file_name)?;
+    let stdlib = stdlib_discovery::discover()?;
+    process_file(command, &file_name, &stdlib)
+}
+
+fn run_execute_command(arguments: &mut impl Iterator<Item = String>) -> Result<(), ()> {
+    let usage = "Usage: aster run [FILE] [--function <NAME>] [--memory-stats]";
+    let file_name = arguments.next();
+    if matches!(file_name.as_deref(), Some("--help" | "-h")) {
+        reject_extra_argument(arguments)?;
+        print_command_help("run");
+        return Ok(());
+    }
+    let file_name = resolve_source_argument("run", file_name)?;
+    let (function_name, memory_stats) = parse_execution_options(arguments, usage)?;
+    let stdlib = stdlib_discovery::discover()?;
+    run_file(&file_name, function_name.as_deref(), memory_stats, &stdlib)
+}
+
+fn run_watch_command(arguments: &mut impl Iterator<Item = String>) -> Result<(), ()> {
+    let usage = "Usage: aster watch <FILE> [--function <NAME>] [--memory-stats]";
+    let Some(file_name) = arguments.next() else {
+        eprintln!("error: missing source file\n\n{usage}");
+        return Err(());
+    };
+    if matches!(file_name.as_str(), "--help" | "-h") {
+        reject_extra_argument(arguments)?;
+        print_command_help("watch");
+        return Ok(());
+    }
+    let (function_name, _) = parse_execution_options(arguments, usage)?;
+    let stdlib = stdlib_discovery::discover()?;
+    watch::watch_file(&file_name, function_name.as_deref(), &stdlib)
+}
+
+fn parse_execution_options(
+    arguments: &mut impl Iterator<Item = String>,
+    usage: &str,
+) -> Result<(Option<String>, bool), ()> {
+    let mut function_name = None;
+    let mut memory_stats = false;
+    while let Some(option) = arguments.next() {
+        match option.as_str() {
+            "--function" => {
+                let Some(name) = arguments.next() else {
+                    eprintln!("error: missing function name after `--function`\n\n{usage}");
+                    return Err(());
+                };
+                function_name = Some(name);
+            }
+            "--memory-stats" => memory_stats = true,
+            _ => {
+                eprintln!("error: unexpected argument `{option}`\n\n{usage}");
+                return Err(());
+            }
+        }
+    }
+    Ok((function_name, memory_stats))
+}
+
+fn reject_extra_argument(arguments: &mut impl Iterator<Item = String>) -> Result<(), ()> {
+    if let Some(argument) = arguments.next() {
+        eprintln!("error: unexpected argument `{argument}`");
+        return Err(());
+    }
+    Ok(())
+}
+
+fn resolve_source_argument(command: &str, argument: Option<String>) -> Result<String, ()> {
+    if let Some(argument) = argument {
+        return Ok(argument);
+    }
+    let current_directory = env::current_dir().map_err(|error| {
+        eprintln!("error: could not determine current directory: {error}");
+    })?;
+    let manifest = current_directory.join("Aster.toml");
+    let source = current_directory.join("app").join("main.aster");
+    if manifest.is_file() {
+        return path_to_utf8(source);
+    }
+    eprintln!(
+        "error: missing source file and no Aster.toml was found in the current directory\n\nUsage: aster {command} [FILE]"
+    );
+    Err(())
+}
+
+fn path_to_utf8(path: PathBuf) -> Result<String, ()> {
+    path.into_os_string().into_string().map_err(|_| {
+        eprintln!("error: project source path is not valid UTF-8");
+    })
 }
 
 pub(crate) fn read_source(file_name: &str) -> Result<String, ()> {
@@ -298,26 +378,30 @@ fn print_memory_stats(stats: &aster_codegen_cranelift::MemoryStats) {
 
 fn print_help() {
     println!(
-        "Aster compiler\n\nUsage: aster <COMMAND>\n\nCommands:\n  check <FILE>                       Validate an Aster source file\n  dump-hir <FILE>                    Validate and print typed HIR without executing\n  dump-mir <FILE>                    Validate and print control-flow MIR without executing\n  run <FILE> [--function <NAME>] [--memory-stats]\n                                      Run application Main or an explicitly selected function\n  watch <FILE> [--function <NAME>]   Recompile and rerun on each file change\n\nOptions:\n  -h, --help                         Print help\n  -V, --version                      Print version"
+        "Aster compiler\n\nUsage: aster <COMMAND>\n\nCommands:\n  new <NAME>                         Create a new ASTER project\n  check [FILE]                       Validate an Aster project or source file\n  dump-hir [FILE]                    Validate and print typed HIR without executing\n  dump-mir [FILE]                    Validate and print control-flow MIR without executing\n  run [FILE] [--function <NAME>] [--memory-stats]\n                                      Run application Main or an explicitly selected function\n  watch <FILE> [--function <NAME>]   Recompile and rerun on each file change\n\nOptions:\n  -h, --help                         Print help\n  -V, --version                      Print version"
     );
 }
 
 fn print_command_help(command: &str) {
     let (usage, description) = match command {
+        "new" => (
+            "aster new <NAME>",
+            "Create a new ASTER project in a child of the current directory.",
+        ),
         "check" => (
-            "aster check <FILE>",
-            "Validate an Aster source file or project root source.",
+            "aster check [FILE]",
+            "Validate an Aster project or source file.",
         ),
         "dump-hir" => (
-            "aster dump-hir <FILE>",
+            "aster dump-hir [FILE]",
             "Validate and print typed HIR without executing.",
         ),
         "dump-mir" => (
-            "aster dump-mir <FILE>",
+            "aster dump-mir [FILE]",
             "Validate and print control-flow MIR without executing.",
         ),
         "run" => (
-            "aster run <FILE> [--function <NAME>] [--memory-stats]",
+            "aster run [FILE] [--function <NAME>] [--memory-stats]",
             "Run the application entry point or an explicitly selected function.",
         ),
         "watch" => (
