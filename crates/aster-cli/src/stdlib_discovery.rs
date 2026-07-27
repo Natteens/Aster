@@ -11,50 +11,98 @@
 //! 3. Embedded sources compiled into the binary — always available, used as
 //!    the development fallback when neither of the above applies.
 
-use std::{env, path::PathBuf};
+use std::{env, fmt, path::PathBuf};
 
 use aster_compiler::StandardLibrary;
 
 /// Environment variable that overrides stdlib discovery.
 pub const ASTER_STDLIB_ENV: &str = "ASTER_STDLIB";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StandardLibraryOrigin {
+    Environment(PathBuf),
+    ExecutableRelative(PathBuf),
+    Embedded,
+}
+
+#[derive(Clone)]
+pub struct DiscoveredStandardLibrary {
+    pub standard_library: StandardLibrary,
+    pub origin: StandardLibraryOrigin,
+}
+
+#[derive(Debug)]
+pub enum StandardLibraryDiscoveryError {
+    Environment { path: PathBuf, reason: String },
+    ExecutableRelative { path: PathBuf, reason: String },
+}
+
+impl fmt::Display for StandardLibraryDiscoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Environment { reason, .. } => write!(
+                formatter,
+                "{ASTER_STDLIB_ENV} is set but the stdlib is invalid:\n  {reason}\n\nSet {ASTER_STDLIB_ENV} to a valid stdlib directory or unset it to use the embedded fallback."
+            ),
+            Self::ExecutableRelative { path, reason } => write!(
+                formatter,
+                "an stdlib directory was found at `{}` but is incomplete:\n  {reason}\n\nReinstall ASTER or set {ASTER_STDLIB_ENV} to a valid stdlib directory.",
+                path.display()
+            ),
+        }
+    }
+}
+
 /// Discover the standard library using the priority chain documented in the
 /// module-level comment. Prints a diagnostic and returns `Err(())` only when
 /// `ASTER_STDLIB` is set but the path fails validation, or when a candidate
 /// directory is found via exe-relative lookup but is invalid (incomplete install).
 pub fn discover() -> Result<StandardLibrary, ()> {
+    discover_detailed()
+        .map(|discovered| discovered.standard_library)
+        .map_err(|error| eprintln!("error: {error}"))
+}
+
+pub fn discover_detailed() -> Result<DiscoveredStandardLibrary, StandardLibraryDiscoveryError> {
     // 1. ASTER_STDLIB env var — explicit, must succeed or fail loudly.
     if let Some(env_path) = env::var_os(ASTER_STDLIB_ENV) {
         let path = PathBuf::from(&env_path);
-        return StandardLibrary::from_path(&path).map_err(|error| {
-            eprintln!(
-                "error: {ASTER_STDLIB_ENV} is set but the stdlib is invalid:\n  {error}\n\nSet {ASTER_STDLIB_ENV} to a valid stdlib directory or unset it to use the embedded fallback."
-            );
-        });
+        return StandardLibrary::from_path(&path)
+            .map(|standard_library| DiscoveredStandardLibrary {
+                standard_library,
+                origin: StandardLibraryOrigin::Environment(path.clone()),
+            })
+            .map_err(|reason| StandardLibraryDiscoveryError::Environment { path, reason });
     }
 
     // 2. stdlib relative to the running executable: <exe>/../stdlib/
     if let Some(candidate) = exe_relative_stdlib() {
         if candidate.is_dir() {
             match StandardLibrary::from_path(&candidate) {
-                Ok(stdlib) => return Ok(stdlib),
+                Ok(standard_library) => {
+                    return Ok(DiscoveredStandardLibrary {
+                        standard_library,
+                        origin: StandardLibraryOrigin::ExecutableRelative(candidate.clone()),
+                    });
+                }
                 Err(error) => {
                     // A directory was found but it is incomplete — this is a
                     // broken installation. Error immediately rather than
                     // silently falling back, so the user knows to fix it.
-                    eprintln!(
-                        "error: an stdlib directory was found at `{}` but is incomplete:\n  {error}\n\nChecked:\n  - {}\n  - {ASTER_STDLIB_ENV} was not set\n\nReinstall ASTER or set {ASTER_STDLIB_ENV} to a valid stdlib directory.",
-                        candidate.display(),
-                        candidate.display(),
-                    );
-                    return Err(());
+                    return Err(StandardLibraryDiscoveryError::ExecutableRelative {
+                        path: candidate,
+                        reason: error,
+                    });
                 }
             }
         }
     }
 
     // 3. Embedded dev fallback — always succeeds.
-    Ok(StandardLibrary::embedded())
+    Ok(DiscoveredStandardLibrary {
+        standard_library: StandardLibrary::embedded(),
+        origin: StandardLibraryOrigin::Embedded,
+    })
 }
 
 /// Returns the exe-relative candidate path, or `None` if the exe path cannot

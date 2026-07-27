@@ -15,6 +15,7 @@ fn global_help_and_version_describe_the_installed_binary() {
     let help = stdout(&help);
     assert!(help.contains("aster <COMMAND>"));
     assert!(help.contains("new <NAME>"));
+    assert!(help.contains("doctor"));
     assert!(help.contains("run [FILE]"));
     assert!(help.contains("check [FILE]"));
     assert!(help.contains("watch <FILE>"));

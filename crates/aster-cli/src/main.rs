@@ -1,3 +1,4 @@
+mod doctor;
 mod new_project;
 mod stdlib_discovery;
 mod watch;
@@ -18,6 +19,10 @@ fn main() -> ExitCode {
 fn run(mut arguments: impl Iterator<Item = String>) -> Result<(), ()> {
     match arguments.next().as_deref() {
         Some("new") => run_new_command(&mut arguments),
+        Some("doctor") => {
+            reject_extra_argument(&mut arguments)?;
+            if doctor::run() { Ok(()) } else { Err(()) }
+        }
         Some(command @ ("check" | "dump-hir" | "dump-mir")) => {
             run_validation_command(command, &mut arguments)
         }
@@ -378,7 +383,7 @@ fn print_memory_stats(stats: &aster_codegen_cranelift::MemoryStats) {
 
 fn print_help() {
     println!(
-        "Aster compiler\n\nUsage: aster <COMMAND>\n\nCommands:\n  new <NAME>                         Create a new ASTER project\n  check [FILE]                       Validate an Aster project or source file\n  dump-hir [FILE]                    Validate and print typed HIR without executing\n  dump-mir [FILE]                    Validate and print control-flow MIR without executing\n  run [FILE] [--function <NAME>] [--memory-stats]\n                                      Run application Main or an explicitly selected function\n  watch <FILE> [--function <NAME>]   Recompile and rerun on each file change\n\nOptions:\n  -h, --help                         Print help\n  -V, --version                      Print version"
+        "Aster compiler\n\nUsage: aster <COMMAND>\n\nCommands:\n  new <NAME>                         Create a new ASTER project\n  doctor                             Diagnose the ASTER installation and environment\n  check [FILE]                       Validate an Aster project or source file\n  dump-hir [FILE]                    Validate and print typed HIR without executing\n  dump-mir [FILE]                    Validate and print control-flow MIR without executing\n  run [FILE] [--function <NAME>] [--memory-stats]\n                                      Run application Main or an explicitly selected function\n  watch <FILE> [--function <NAME>]   Recompile and rerun on each file change\n\nOptions:\n  -h, --help                         Print help\n  -V, --version                      Print version"
     );
 }
 

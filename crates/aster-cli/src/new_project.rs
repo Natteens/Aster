@@ -29,6 +29,14 @@ const RESERVED_WINDOWS_NAMES: [&str; 23] = [
 static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn create(parent: &Path, name: &str) -> Result<PathBuf, String> {
+    create_with_source(parent, name, MAIN_SOURCE)
+}
+
+pub(crate) fn create_with_source(
+    parent: &Path,
+    name: &str,
+    source: &str,
+) -> Result<PathBuf, String> {
     validate_name(name)?;
     validate_parent(parent)?;
 
@@ -67,8 +75,8 @@ pub(crate) fn create(parent: &Path, name: &str) -> Result<PathBuf, String> {
         fs::create_dir(&app)
             .map_err(|error| format!("could not create project source directory: {error}"))?;
         write_new_file(&staging.join("Aster.toml"), MANIFEST)?;
-        write_new_file(&app.join("main.aster"), MAIN_SOURCE)?;
-        validate_staging(&staging)?;
+        write_new_file(&app.join("main.aster"), source)?;
+        validate_staging(&staging, source)?;
 
         match fs::symlink_metadata(&destination) {
             Ok(_) => {
@@ -179,12 +187,12 @@ fn write_new_file(path: &Path, contents: &str) -> Result<(), String> {
         .map_err(|error| format!("could not finish `{}`: {error}", path.display()))
 }
 
-fn validate_staging(staging: &Path) -> Result<(), String> {
+fn validate_staging(staging: &Path, expected_source: &str) -> Result<(), String> {
     let manifest = fs::read_to_string(staging.join("Aster.toml"))
         .map_err(|error| format!("could not validate generated manifest: {error}"))?;
     let source = fs::read_to_string(staging.join("app/main.aster"))
         .map_err(|error| format!("could not validate generated source: {error}"))?;
-    if manifest != MANIFEST || source != MAIN_SOURCE {
+    if manifest != MANIFEST || source != expected_source {
         return Err("generated project content did not pass validation".into());
     }
     Ok(())
