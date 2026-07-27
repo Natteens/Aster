@@ -39,7 +39,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          ref: ${{ github.event_name == 'workflow_call' && inputs.release_sha || github.sha }}
+          ref: ${{ inputs.release_sha != '' && inputs.release_sha || github.sha }}
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -57,6 +57,7 @@ jobs:
           ASTER_RELEASE_VERSION: ${{ inputs.version }}
           ASTER_RELEASE_TAG: ${{ inputs.release_tag }}
           ASTER_RELEASE_SHA: ${{ inputs.release_sha }}
+          ASTER_RELEASE_MODE: ${{ inputs.release_sha != '' && 'automatic' || 'manual' }}
         run: node scripts/validate-release-ref.mjs
 
   build:
@@ -318,7 +319,9 @@ jobs:
       - validate
       - assemble
       - verify-assets
-    if: github.event_name == 'workflow_call' && needs.validate.outputs.is_release_tag == 'true'
+    if: >-
+      needs.validate.outputs.is_release_tag == 'true' &&
+      inputs.release_sha != ''
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

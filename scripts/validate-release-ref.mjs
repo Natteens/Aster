@@ -11,7 +11,7 @@ const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
 export function validateReleaseContext({
     version,
-    eventName,
+    mode,
     releaseVersion = "",
     releaseTag = "",
     releaseSha = "",
@@ -22,14 +22,14 @@ export function validateReleaseContext({
     if (!SEMVER.test(version)) {
         throw new Error("Canonical version must be MAJOR.MINOR.PATCH without prerelease data");
     }
-    if (eventName === "workflow_dispatch") {
+    if (mode === "manual") {
         if (releaseVersion || releaseTag || releaseSha) {
             throw new Error("Manual release validation does not accept publication inputs");
         }
         return { version, is_release_tag: "false", release_sha: checkedOutSha };
     }
-    if (eventName !== "workflow_call") {
-        throw new Error("Release workflow accepts only workflow_dispatch or workflow_call");
+    if (mode !== "automatic") {
+        throw new Error("Release mode must be automatic or manual");
     }
     if (!/^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(releaseTag)) {
         throw new Error(`Release tag is not valid: ${releaseTag}`);
@@ -52,7 +52,7 @@ export function validateReleaseContext({
 
 function taggedCommitIsOnMain(commit) {
     if (!/^[0-9a-f]{40}$/i.test(commit)) {
-        throw new Error("GITHUB_SHA is not a full commit identifier");
+        throw new Error("Release SHA is not a full commit identifier");
     }
     const result = spawnSync(
         "git",
@@ -80,23 +80,20 @@ function resolveGitCommit(repositoryRoot, revision) {
 
 export function validateCurrentReleaseEnvironment(repositoryRoot, environment = process.env) {
     const version = readVersion(join(repositoryRoot, "Cargo.toml"));
-    const eventName = environment.GITHUB_EVENT_NAME ?? "workflow_dispatch";
+    const mode = environment.ASTER_RELEASE_MODE ?? "";
     const releaseSha = environment.ASTER_RELEASE_SHA ?? "";
     const releaseTag = environment.ASTER_RELEASE_TAG ?? "";
     const checkedOutSha = resolveGitCommit(repositoryRoot, "HEAD");
     return validateReleaseContext({
         version,
-        eventName,
+        mode,
         releaseVersion: environment.ASTER_RELEASE_VERSION ?? "",
         releaseTag,
         releaseSha,
         checkedOutSha,
         tagSha:
-            eventName === "workflow_call"
-                ? resolveGitCommit(repositoryRoot, `${releaseTag}^{commit}`)
-                : "",
-        commitOnMain:
-            eventName === "workflow_call" ? taggedCommitIsOnMain(releaseSha) : true,
+            mode === "automatic" ? resolveGitCommit(repositoryRoot, `${releaseTag}^{commit}`) : "",
+        commitOnMain: mode === "automatic" ? taggedCommitIsOnMain(releaseSha) : true,
     });
 }
 

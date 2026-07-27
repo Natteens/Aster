@@ -10,6 +10,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const workflow = readFileSync(join(root, ".github", "workflows", "release.yml"), "utf8");
 const ci = readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8");
 const releaseConfig = readFileSync(join(root, "release.config.mjs"), "utf8");
+const releaseValidator = readFileSync(join(root, "scripts", "validate-release-ref.mjs"), "utf8");
 const packageManifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 const windowsInstaller = readFileSync(join(root, "install", "install.ps1"), "utf8");
 const linuxInstaller = readFileSync(join(root, "install", "install.sh"), "utf8");
@@ -49,7 +50,7 @@ test("release workflow is reusable for validated releases and manual runs have n
     assert.match(workflow, /cancel-in-progress: false/);
 });
 
-test("release workflow uses least privilege and publish is workflow-call-only", () => {
+test("release workflow uses least privilege and publishes only validated automatic inputs", () => {
     assert.match(workflow, /^permissions:\s*\n\s+contents: read/m);
     assert.match(workflow, /publish:[\s\S]*?permissions:\s*\n\s+contents: write/);
     for (const forbidden of [
@@ -65,8 +66,26 @@ test("release workflow uses least privilege and publish is workflow-call-only", 
     assert.equal(workflow.includes("secrets."), false);
     assert.match(
         workflow,
-        /if: github\.event_name == 'workflow_call' && needs\.validate\.outputs\.is_release_tag == 'true'/,
+        /if: >-\s*\n\s+needs\.validate\.outputs\.is_release_tag == 'true' &&\s*\n\s+inputs\.release_sha != ''/,
     );
+    assert.doesNotMatch(workflow, /github\.event_name == 'workflow_call'/);
+});
+
+test("automatic checkout and validation use release inputs even when the caller event is push", () => {
+    assert.match(
+        workflow,
+        /ref: \$\{\{ inputs\.release_sha != '' && inputs\.release_sha \|\| github\.sha \}\}/,
+    );
+    assert.match(
+        workflow,
+        /ASTER_RELEASE_MODE: \$\{\{ inputs\.release_sha != '' && 'automatic' \|\| 'manual' \}\}/,
+    );
+    assert.match(workflow, /ASTER_RELEASE_SHA: \$\{\{ inputs\.release_sha \}\}/);
+    assert.equal(
+        (workflow.match(/ref: \$\{\{ needs\.validate\.outputs\.release_sha \}\}/g) ?? []).length,
+        4,
+    );
+    assert.doesNotMatch(releaseValidator, /GITHUB_EVENT_NAME/);
 });
 
 test("main CI runs semantic-release after verification and directly calls M6F", () => {
