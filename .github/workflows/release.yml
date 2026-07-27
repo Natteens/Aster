@@ -1,0 +1,384 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  validate:
+    name: Validate release ref
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      is_release_tag: ${{ steps.release.outputs.is_release_tag }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci --ignore-scripts --prefer-offline --no-audit --no-fund
+
+      - name: Check public version consistency
+        run: node editors/vscode/scripts/sync-version.mjs --check
+
+      - name: Validate version and release ref
+        id: release
+        run: node scripts/validate-release-ref.mjs
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x64
+            runner: windows-latest
+          - target: linux-x64
+            runner: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci --ignore-scripts --prefer-offline --no-audit --no-fund
+
+      - name: Install Rust stable-gnu
+        if: matrix.target == 'windows-x64'
+        shell: pwsh
+        run: |
+          rustup toolchain install stable-gnu --profile minimal
+          rustup component add rustfmt clippy --toolchain stable-gnu
+          $mingw = @("C:\mingw64\bin", "C:\msys64\mingw64\bin") |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_ "gcc.exe") } |
+            Select-Object -First 1
+          if (-not $mingw) {
+            throw "A 64-bit GNU linker was not found on the Windows runner."
+          }
+          $mingw | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install Rust stable
+        if: matrix.target == 'linux-x64'
+        shell: bash
+        run: |
+          set -eu
+          rustup toolchain install stable --profile minimal
+          rustup component add rustfmt clippy --toolchain stable
+
+      - name: Report Windows toolchain
+        if: matrix.target == 'windows-x64'
+        shell: pwsh
+        run: |
+          rustc +stable-gnu --version
+          cargo +stable-gnu --version
+          rustup show active-toolchain
+          where.exe gcc
+          node --version
+          npm --version
+
+      - name: Report Linux toolchain
+        if: matrix.target == 'linux-x64'
+        shell: bash
+        run: |
+          set -eu
+          rustc +stable --version
+          cargo +stable --version
+          rustup show active-toolchain
+          node --version
+          npm --version
+
+      - name: Check versions
+        run: node editors/vscode/scripts/sync-version.mjs --check
+
+      - name: Windows quality gates
+        if: matrix.target == 'windows-x64'
+        shell: pwsh
+        run: |
+          cargo +stable-gnu fmt --all --check
+          cargo +stable-gnu clippy --workspace --all-targets --all-features -- -D warnings
+          cargo +stable-gnu test --workspace --all-targets
+          cargo +stable-gnu check --workspace --locked
+          npm run test:release-script
+          npm run test:installers
+
+      - name: Linux quality gates
+        if: matrix.target == 'linux-x64'
+        shell: bash
+        run: |
+          set -eu
+          cargo +stable fmt --all --check
+          cargo +stable clippy --workspace --all-targets --all-features -- -D warnings
+          cargo +stable test --workspace --all-targets
+          cargo +stable check --workspace --locked
+          npm run test:release-script
+          npm run test:installers
+
+      - name: Build Windows release binary
+        if: matrix.target == 'windows-x64'
+        shell: pwsh
+        run: cargo +stable-gnu build --release --locked -p aster-cli
+
+      - name: Build Linux release binary
+        if: matrix.target == 'linux-x64'
+        shell: bash
+        run: cargo +stable build --release --locked -p aster-cli
+
+      - name: Validate Windows release binary version
+        if: matrix.target == 'windows-x64'
+        shell: pwsh
+        env:
+          EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          $actual = (& .\target\release\aster.exe --version).Trim()
+          if ($actual -ne "aster $env:EXPECTED_VERSION") {
+            throw "release binary reported '$actual', expected 'aster $env:EXPECTED_VERSION'"
+          }
+
+      - name: Validate Linux release binary version
+        if: matrix.target == 'linux-x64'
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -eu
+          actual=$(./target/release/aster --version)
+          test "$actual" = "aster $EXPECTED_VERSION"
+
+      - name: Build bundle and deterministic artifact
+        shell: bash
+        if: matrix.target == 'linux-x64'
+        run: |
+          set -eu
+          npm run bundle
+          npm run package:release
+          first=$(node -e "const m=require('./dist/artifacts/release-artifact.json'); process.stdout.write(m.sha256)")
+          npm run package:release
+          second=$(node -e "const m=require('./dist/artifacts/release-artifact.json'); process.stdout.write(m.sha256)")
+          test "$first" = "$second"
+          node -e "const m=require('./dist/artifacts/release-artifact.json'); console.log('SHA-256: '+m.sha256); console.log('Size: '+m.size+' bytes')"
+
+      - name: Build bundle and deterministic artifact
+        shell: pwsh
+        if: matrix.target == 'windows-x64'
+        run: |
+          npm run bundle
+          npm run package:release
+          $first = (Get-Content dist\artifacts\release-artifact.json | ConvertFrom-Json).sha256
+          npm run package:release
+          $manifest = Get-Content dist\artifacts\release-artifact.json | ConvertFrom-Json
+          if ($first -ne $manifest.sha256) {
+            throw "package:release produced different SHA-256 values"
+          }
+          Write-Output "SHA-256: $($manifest.sha256)"
+          Write-Output "Size: $($manifest.size) bytes"
+
+      - name: Run installer lifecycle against the generated artifact
+        run: npm run test:installers
+
+      - name: Upload Windows release input
+        if: matrix.target == 'windows-x64'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-input-${{ matrix.target }}
+          path: |
+            dist/artifacts/aster-${{ needs.validate.outputs.version }}-windows-x64.zip
+            dist/artifacts/aster-${{ needs.validate.outputs.version }}-windows-x64.zip.sha256
+            dist/artifacts/release-artifact.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Linux release input
+        if: matrix.target == 'linux-x64'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-input-${{ matrix.target }}
+          path: |
+            dist/artifacts/aster-${{ needs.validate.outputs.version }}-linux-x64.tar.gz
+            dist/artifacts/aster-${{ needs.validate.outputs.version }}-linux-x64.tar.gz.sha256
+            dist/artifacts/release-artifact.json
+          if-no-files-found: error
+          retention-days: 7
+
+  assemble:
+    name: Assemble release assets
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci --ignore-scripts --prefer-offline --no-audit --no-fund
+
+      - name: Download Linux release input
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-input-linux-x64
+          path: dist/release-inputs/linux-x64
+
+      - name: Download Windows release input
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-input-windows-x64
+          path: dist/release-inputs/windows-x64
+
+      - name: Test release assembly
+        run: node --test scripts/prepare-release-assets.test.mjs scripts/validate-release-ref.test.mjs
+
+      - name: Prepare and validate release assets
+        run: |
+          npm run prepare:release-assets
+          node scripts/prepare-release-assets.mjs --validate
+
+      - name: Test published Linux scripts and aliases
+        env:
+          ASTER_RELEASE_ASSETS_DIR: dist/release-assets
+        run: node --test scripts/install-linux.test.mjs
+
+      - name: List release assets
+        run: node -e "const fs=require('node:fs'); for(const n of fs.readdirSync('dist/release-assets').sort()){console.log(n+' '+fs.statSync('dist/release-assets/'+n).size)}"
+
+      - name: Upload final release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: aster-${{ needs.validate.outputs.version }}-release-assets
+          path: dist/release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  verify-assets:
+    name: Verify published assets on ${{ matrix.target }}
+    needs:
+      - validate
+      - assemble
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x64
+            runner: windows-latest
+          - target: linux-x64
+            runner: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci --ignore-scripts --prefer-offline --no-audit --no-fund
+
+      - name: Download final release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: aster-${{ needs.validate.outputs.version }}-release-assets
+          path: dist/release-assets
+
+      - name: Validate final asset inventory and checksums
+        run: node scripts/prepare-release-assets.mjs --validate
+
+      - name: Run installer lifecycle from the final release tree
+        env:
+          ASTER_RELEASE_ASSETS_DIR: dist/release-assets
+        run: npm run test:installers
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - validate
+      - assemble
+      - verify-assets
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.validate.outputs.is_release_tag == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci --ignore-scripts --prefer-offline --no-audit --no-fund
+
+      - name: Download final release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: aster-${{ needs.validate.outputs.version }}-release-assets
+          path: dist/release-assets
+
+      - name: Validate and publish draft atomically
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          node scripts/prepare-release-assets.mjs --validate
+          test "$TAG" = "v$VERSION"
+          gh --version
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "error: release $TAG already exists" >&2
+            exit 1
+          fi
+          assets=(
+            "dist/release-assets/aster-$VERSION-windows-x64.zip"
+            "dist/release-assets/aster-$VERSION-windows-x64.zip.sha256"
+            "dist/release-assets/aster-windows-x64.zip"
+            "dist/release-assets/aster-windows-x64.zip.sha256"
+            "dist/release-assets/aster-$VERSION-linux-x64.tar.gz"
+            "dist/release-assets/aster-$VERSION-linux-x64.tar.gz.sha256"
+            "dist/release-assets/aster-linux-x64.tar.gz"
+            "dist/release-assets/aster-linux-x64.tar.gz.sha256"
+            "dist/release-assets/install.ps1"
+            "dist/release-assets/install.sh"
+            "dist/release-assets/uninstall.ps1"
+            "dist/release-assets/uninstall.sh"
+            "dist/release-assets/release-manifest.json"
+          )
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "ASTER $VERSION" --generate-notes
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "${assets[@]}"
+          expected=$(printf '%s\n' "${assets[@]##*/}" | sort)
+          actual=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | sort)
+          if test "$expected" != "$actual"; then
+            echo "error: uploaded release assets do not match the expected set" >&2
+            exit 1
+          fi
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest

@@ -27,19 +27,20 @@ import {
 } from "./package-release.mjs";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
-const installPowerShellPath = join(repositoryRoot, "install", "install.ps1");
-const installShellPath = join(repositoryRoot, "install", "install.sh");
-const uninstallPowerShellPath = join(repositoryRoot, "install", "uninstall.ps1");
-const uninstallShellPath = join(repositoryRoot, "install", "uninstall.sh");
+const finalAssets = process.env.ASTER_RELEASE_ASSETS_DIR
+    ? join(repositoryRoot, process.env.ASTER_RELEASE_ASSETS_DIR)
+    : null;
+const installerRoot = finalAssets ?? join(repositoryRoot, "install");
+const installPowerShellPath = join(installerRoot, "install.ps1");
+const installShellPath = join(installerRoot, "install.sh");
+const uninstallPowerShellPath = join(installerRoot, "uninstall.ps1");
+const uninstallShellPath = join(installerRoot, "uninstall.sh");
 const powerShellExecutable =
     "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 const shellExecutable = "C:\\Program Files\\Git\\bin\\sh.exe";
-const artifactManifestPath = join(
-    repositoryRoot,
-    "dist",
-    "artifacts",
-    "release-artifact.json",
-);
+const artifactManifestPath = finalAssets
+    ? join(finalAssets, "release-manifest.json")
+    : join(repositoryRoot, "dist", "artifacts", "release-artifact.json");
 const hostSupportsWindowsInstaller =
     process.platform === "win32" &&
     process.arch === "x64" &&
@@ -48,7 +49,17 @@ const hostHasTestShell = existsSync(shellExecutable);
 
 const realArtifact = (() => {
     if (!existsSync(artifactManifestPath)) return null;
-    const manifest = JSON.parse(readFileSync(artifactManifestPath, "utf8"));
+    const sourceManifest = JSON.parse(readFileSync(artifactManifestPath, "utf8"));
+    const aggregate = finalAssets
+        ? sourceManifest.assets.find((asset) => asset.target === "windows-x64")
+        : null;
+    const manifest = aggregate
+        ? {
+              version: sourceManifest.version,
+              target: aggregate.target,
+              archive: aggregate.alias,
+          }
+        : sourceManifest;
     if (manifest.target !== "windows-x64") return null;
     const archivePath = join(dirname(artifactManifestPath), manifest.archive);
     if (!existsSync(archivePath)) return null;
