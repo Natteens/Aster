@@ -22,20 +22,25 @@ jobs:
     name: Verify (Ubuntu)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt,clippy
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup component add rustfmt clippy --toolchain stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          key: verify
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-stable-${{ hashFiles('Cargo.lock') }}
 
       - run: npm ci --prefer-offline --no-audit --no-fund
 
@@ -50,3 +55,72 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --all-targets
+
+      - name: Check workspace
+        run: cargo check --workspace --locked
+
+      - name: Test release automation core
+        run: npm run test:release-core
+
+  semantic-release:
+    name: Version and tag release
+    needs: verify
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      !contains(github.event.head_commit.message, '[skip ci]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      released: ${{ steps.result.outputs.released }}
+      version: ${{ steps.result.outputs.version }}
+      release_tag: ${{ steps.result.outputs.release_tag }}
+      release_sha: ${{ steps.result.outputs.release_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci --ignore-scripts --prefer-offline --no-audit --no-fund
+
+      - name: Install Rust stable
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Capture validated main state
+        id: before
+        shell: bash
+        run: |
+          set -eu
+          version=$(node --input-type=module -e "import { readVersion } from './scripts/bundle.mjs'; console.log(readVersion('./Cargo.toml'))")
+          printf 'version=%s\nsha=%s\n' "$version" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Calculate version, commit changelog, and create tag
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: npm run release
+
+      - name: Validate semantic-release result
+        id: result
+        run: >-
+          node scripts/semantic-release-result.mjs
+          "${{ steps.before.outputs.version }}"
+          "${{ steps.before.outputs.sha }}"
+
+  release-pipeline:
+    name: Build and publish validated release
+    needs: semantic-release
+    if: needs.semantic-release.outputs.released == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      version: ${{ needs.semantic-release.outputs.version }}
+      release_tag: ${{ needs.semantic-release.outputs.release_tag }}
+      release_sha: ${{ needs.semantic-release.outputs.release_sha }}

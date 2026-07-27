@@ -7,11 +7,12 @@
     "bundle": "node scripts/bundle.mjs",
     "package:release": "node scripts/package-release.mjs",
     "prepare:release-assets": "node scripts/prepare-release-assets.mjs",
+    "test:release-core": "node --test scripts/bundle.test.mjs scripts/package-release.test.mjs scripts/prepare-release-assets.test.mjs scripts/release-workflow.test.mjs scripts/semantic-release-result.test.mjs scripts/sync-release-version.test.mjs scripts/validate-release-ref.test.mjs",
     "test:installers": "node --test scripts/install.test.mjs scripts/install-linux.test.mjs",
     "release": "semantic-release",
     "release:dry-run": "semantic-release --dry-run",
     "release:sync-version": "node scripts/sync-release-version.mjs",
-    "test:release-script": "node --test scripts/*.test.mjs",
+    "test:release-script": "npm run test:release-core && npm run test:installers",
     "test:benchmark-compare": "node --test benchmarks/memory/compare.test.mjs"
   },
   "devDependencies": {
@@ -19,7 +20,6 @@
     "@semantic-release/commit-analyzer": "13.0.1",
     "@semantic-release/exec": "7.1.0",
     "@semantic-release/git": "10.0.1",
-    "@semantic-release/github": "12.0.9",
     "@semantic-release/release-notes-generator": "14.1.1",
     "conventional-changelog-conventionalcommits": "10.2.1",
     "semantic-release": "25.0.8"

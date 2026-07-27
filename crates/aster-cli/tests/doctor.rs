@@ -1,8 +1,10 @@
 use std::{
-    env, fs,
+    env, fs, io,
     path::{Path, PathBuf},
     process::{Command, Output},
     sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::Duration,
 };
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -234,10 +236,25 @@ fn doctor(
     } else {
         env::join_paths([executable_directory.with_file_name("similar-bin")]).expect("join PATH")
     };
-    command
-        .env("PATH", path)
-        .output()
-        .expect("run aster doctor")
+    command.env("PATH", path);
+    output_with_executable_busy_retry(&mut command).expect("run aster doctor")
+}
+
+fn output_with_executable_busy_retry(command: &mut Command) -> io::Result<Output> {
+    const RETRIES: u32 = 5;
+    for attempt in 0..=RETRIES {
+        match command.output() {
+            Err(error) if is_executable_busy(&error) && attempt < RETRIES => {
+                thread::sleep(Duration::from_millis(10 * (1 << attempt)));
+            }
+            result => return result,
+        }
+    }
+    unreachable!("retry loop always returns on its final attempt")
+}
+
+fn is_executable_busy(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::ExecutableFileBusy
 }
 
 fn command(executable: &Path, cwd: &Path) -> Command {
@@ -340,4 +357,14 @@ fn stdout(output: &Output) -> String {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("UTF-8 stderr")
+}
+
+#[test]
+fn executable_busy_is_the_only_retryable_doctor_spawn_error() {
+    assert!(is_executable_busy(&io::Error::from(
+        io::ErrorKind::ExecutableFileBusy
+    )));
+    assert!(!is_executable_busy(&io::Error::from(
+        io::ErrorKind::PermissionDenied
+    )));
 }

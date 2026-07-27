@@ -29,12 +29,6 @@ export default {
             },
         ],
         [
-            "@semantic-release/exec",
-            {
-                prepareCmd: "cargo check --workspace --locked",
-            },
-        ],
-        [
             "@semantic-release/git",
             {
                 assets: [
@@ -46,14 +40,6 @@ export default {
                     "editors/vscode/package-lock.json",
                 ],
                 message: "chore(release): ${nextRelease.version} [skip ci]",
-            },
-        ],
-        [
-            "@semantic-release/github",
-            {
-                successCommentCondition: false,
-                failCommentCondition: false,
-                releasedLabels: false,
             },
         ],
     ],

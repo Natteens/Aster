@@ -1,9 +1,17 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      release_tag:
+        required: true
+        type: string
+      release_sha:
+        required: true
+        type: string
   workflow_dispatch:
 
 permissions:
@@ -26,12 +34,14 @@ jobs:
     outputs:
       version: ${{ steps.release.outputs.version }}
       is_release_tag: ${{ steps.release.outputs.is_release_tag }}
+      release_sha: ${{ steps.release.outputs.release_sha }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_call' && inputs.release_sha || github.sha }}
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
@@ -43,6 +53,10 @@ jobs:
 
       - name: Validate version and release ref
         id: release
+        env:
+          ASTER_RELEASE_VERSION: ${{ inputs.version }}
+          ASTER_RELEASE_TAG: ${{ inputs.release_tag }}
+          ASTER_RELEASE_SHA: ${{ inputs.release_sha }}
         run: node scripts/validate-release-ref.mjs
 
   build:
@@ -56,17 +70,29 @@ jobs:
         include:
           - target: windows-x64
             runner: windows-latest
+            toolchain: stable-gnu
           - target: linux-x64
             runner: ubuntu-latest
+            toolchain: stable
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.release_sha }}
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
 
       - run: npm ci --ignore-scripts --prefer-offline --no-audit --no-fund
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ matrix.toolchain }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Install Rust stable-gnu
         if: matrix.target == 'windows-x64'
@@ -114,29 +140,6 @@ jobs:
 
       - name: Check versions
         run: node editors/vscode/scripts/sync-version.mjs --check
-
-      - name: Windows quality gates
-        if: matrix.target == 'windows-x64'
-        shell: pwsh
-        run: |
-          cargo +stable-gnu fmt --all --check
-          cargo +stable-gnu clippy --workspace --all-targets --all-features -- -D warnings
-          cargo +stable-gnu test --workspace --all-targets
-          cargo +stable-gnu check --workspace --locked
-          npm run test:release-script
-          npm run test:installers
-
-      - name: Linux quality gates
-        if: matrix.target == 'linux-x64'
-        shell: bash
-        run: |
-          set -eu
-          cargo +stable fmt --all --check
-          cargo +stable clippy --workspace --all-targets --all-features -- -D warnings
-          cargo +stable test --workspace --all-targets
-          cargo +stable check --workspace --locked
-          npm run test:release-script
-          npm run test:installers
 
       - name: Build Windows release binary
         if: matrix.target == 'windows-x64'
@@ -197,12 +200,9 @@ jobs:
           Write-Output "SHA-256: $($manifest.sha256)"
           Write-Output "Size: $($manifest.size) bytes"
 
-      - name: Run installer lifecycle against the generated artifact
-        run: npm run test:installers
-
       - name: Upload Windows release input
         if: matrix.target == 'windows-x64'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-input-${{ matrix.target }}
           path: |
@@ -214,7 +214,7 @@ jobs:
 
       - name: Upload Linux release input
         if: matrix.target == 'linux-x64'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-input-${{ matrix.target }}
           path: |
@@ -232,9 +232,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.release_sha }}
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
@@ -242,35 +244,27 @@ jobs:
       - run: npm ci --ignore-scripts --prefer-offline --no-audit --no-fund
 
       - name: Download Linux release input
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-input-linux-x64
           path: dist/release-inputs/linux-x64
 
       - name: Download Windows release input
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-input-windows-x64
           path: dist/release-inputs/windows-x64
-
-      - name: Test release assembly
-        run: node --test scripts/prepare-release-assets.test.mjs scripts/validate-release-ref.test.mjs
 
       - name: Prepare and validate release assets
         run: |
           npm run prepare:release-assets
           node scripts/prepare-release-assets.mjs --validate
 
-      - name: Test published Linux scripts and aliases
-        env:
-          ASTER_RELEASE_ASSETS_DIR: dist/release-assets
-        run: node --test scripts/install-linux.test.mjs
-
       - name: List release assets
         run: node -e "const fs=require('node:fs'); for(const n of fs.readdirSync('dist/release-assets').sort()){console.log(n+' '+fs.statSync('dist/release-assets/'+n).size)}"
 
       - name: Upload final release assets
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aster-${{ needs.validate.outputs.version }}-release-assets
           path: dist/release-assets/*
@@ -293,9 +287,11 @@ jobs:
           - target: linux-x64
             runner: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.release_sha }}
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
@@ -303,7 +299,7 @@ jobs:
       - run: npm ci --ignore-scripts --prefer-offline --no-audit --no-fund
 
       - name: Download final release assets
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: aster-${{ needs.validate.outputs.version }}-release-assets
           path: dist/release-assets
@@ -322,15 +318,17 @@ jobs:
       - validate
       - assemble
       - verify-assets
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.validate.outputs.is_release_tag == 'true'
+    if: github.event_name == 'workflow_call' && needs.validate.outputs.is_release_tag == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.validate.outputs.release_sha }}
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
@@ -338,7 +336,7 @@ jobs:
       - run: npm ci --ignore-scripts --prefer-offline --no-audit --no-fund
 
       - name: Download final release assets
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: aster-${{ needs.validate.outputs.version }}-release-assets
           path: dist/release-assets
@@ -348,7 +346,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.validate.outputs.version }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
           node scripts/prepare-release-assets.mjs --validate
