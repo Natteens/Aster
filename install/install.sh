@@ -28,7 +28,7 @@ case "$(uname -m)" in
     *) fail "Unsupported Linux architecture: $(uname -m). Expected x86_64." ;;
 esac
 
-for tool in curl tar gzip mktemp sed grep wc cp mv chmod find dirname cut tr cat; do
+for tool in curl tar gzip mktemp sed grep wc cp mv chmod find dirname cut tr cat paste; do
     require_command "$tool"
 done
 
@@ -133,6 +133,10 @@ validate_managed_entries() {
 
 DIRECTORY_STATE=missing
 INSTALLED_VERSION=
+ORIGINAL_STATE_SCHEMA=
+ORIGINAL_STATE_PRODUCT=
+ORIGINAL_STATE_VERSION=
+ORIGINAL_STATE_TARGET=
 if [ -d "$INSTALL_DIR" ]; then
     if [ -z "$(find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
         DIRECTORY_STATE=empty
@@ -140,15 +144,19 @@ if [ -d "$INSTALL_DIR" ]; then
         STATE_FILE=$INSTALL_DIR/install-state.json
         [ -f "$STATE_FILE" ] ||
             fail "The installation directory is not empty and is not managed by the ASTER installer."
-        [ "$(json_number schema "$STATE_FILE")" = 1 ] ||
+        ORIGINAL_STATE_SCHEMA=$(json_number schema "$STATE_FILE")
+        [ "$ORIGINAL_STATE_SCHEMA" = 1 ] ||
             fail "install-state.json is invalid for this ASTER installer."
-        [ "$(json_string product "$STATE_FILE")" = "$PRODUCT" ] ||
+        ORIGINAL_STATE_PRODUCT=$(json_string product "$STATE_FILE")
+        [ "$ORIGINAL_STATE_PRODUCT" = "$PRODUCT" ] ||
             fail "install-state.json is invalid for this ASTER installer."
-        [ "$(json_string target "$STATE_FILE")" = "$TARGET" ] ||
+        ORIGINAL_STATE_TARGET=$(json_string target "$STATE_FILE")
+        [ "$ORIGINAL_STATE_TARGET" = "$TARGET" ] ||
             fail "install-state.json is invalid for this ASTER installer."
-        INSTALLED_VERSION=$(json_string version "$STATE_FILE")
-        [ -n "$INSTALLED_VERSION" ] ||
+        ORIGINAL_STATE_VERSION=$(json_string version "$STATE_FILE")
+        [ -n "$ORIGINAL_STATE_VERSION" ] ||
             fail "install-state.json is invalid for this ASTER installer."
+        INSTALLED_VERSION=$ORIGINAL_STATE_VERSION
         DIRECTORY_STATE=managed
         validate_managed_entries "$INSTALL_DIR"
     fi
@@ -222,23 +230,35 @@ fi
 
 LIST_FILE=$DOWNLOAD_DIR/archive-list.txt
 TYPE_FILE=$DOWNLOAD_DIR/archive-types.txt
+TYPE_KIND_FILE=$DOWNLOAD_DIR/archive-type-kinds.txt
+INVENTORY_FILE=$DOWNLOAD_DIR/archive-inventory.txt
 tar -tzf "$ARCHIVE_PATH" > "$LIST_FILE" || fail "The archive could not be listed."
 tar -tvzf "$ARCHIVE_PATH" > "$TYPE_FILE" || fail "The archive types could not be inspected."
 [ -s "$LIST_FILE" ] || fail "The archive is empty."
 
-while IFS= read -r line; do
-    type=$(printf '%s' "$line" | cut -c 1)
-    case "$type" in
-        -|d) ;;
-        *) fail "The archive contains a symlink, hardlink, device, FIFO, or unexpected type." ;;
-    esac
-done < "$TYPE_FILE"
+cut -c 1 "$TYPE_FILE" > "$TYPE_KIND_FILE"
+[ "$(wc -l < "$LIST_FILE")" -eq "$(wc -l < "$TYPE_KIND_FILE")" ] ||
+    fail "The archive inventory and type metadata do not match."
+paste "$TYPE_KIND_FILE" "$LIST_FILE" > "$INVENTORY_FILE"
 
 SEEN_FILE=$DOWNLOAD_DIR/archive-seen.txt
 : > "$SEEN_FILE"
 ROOT=
-while IFS= read -r entry; do
+TAB=$(printf '\t')
+while IFS="$TAB" read -r type entry; do
     [ -n "$entry" ] || fail "The archive contains an empty path."
+    if printf '%s' "$entry" | LC_ALL=C grep '[[:cntrl:]]' >/dev/null; then
+        fail "The archive contains a control character in an entry path."
+    fi
+    case "$type" in
+        d) entry=${entry%/}/ ;;
+        -)
+            case "$entry" in
+                */) fail "The archive contains a file entry with a directory path." ;;
+            esac
+            ;;
+        *) fail "The archive contains a symlink, hardlink, device, FIFO, or unexpected type." ;;
+    esac
     case "$entry" in
         /*|[A-Za-z]:/*) fail "The archive contains an absolute path." ;;
         *\\*) fail "The archive contains a backslash path." ;;
@@ -249,7 +269,7 @@ while IFS= read -r entry; do
     item_root=${entry%%/*}
     [ -n "$ROOT" ] || ROOT=$item_root
     [ "$item_root" = "$ROOT" ] || fail "The archive must contain exactly one root directory."
-done < "$LIST_FILE"
+done < "$INVENTORY_FILE"
 
 case "$ROOT" in
     aster-*-linux-x64) ;;
@@ -261,14 +281,18 @@ ARCHIVE_VERSION=${ARCHIVE_VERSION%-linux-x64}
 printf '%s' "$ARCHIVE_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$' ||
     fail "The archive version is invalid."
 
-while IFS= read -r entry; do
+while IFS="$TAB" read -r type entry; do
+    if [ "$type" = d ]; then
+        entry=${entry%/}/
+    fi
     relative=${entry#"$ROOT"}
     relative=${relative#/}
-    case "$relative" in
-        ""|LICENSE|install-manifest.json|bin/|bin/aster|stdlib/|stdlib/aster/|stdlib/aster/*) ;;
+    case "$type:$relative" in
+        "d:"|d:bin/|d:stdlib/|d:stdlib/aster/|d:stdlib/aster/*/) ;;
+        -:LICENSE|-:install-manifest.json|-:bin/aster|-:stdlib/aster/*) ;;
         *) fail "The archive contains an unexpected entry: $entry" ;;
     esac
-done < "$LIST_FILE"
+done < "$INVENTORY_FILE"
 
 for required in \
     "$ROOT/" \
@@ -279,7 +303,7 @@ for required in \
     "$ROOT/LICENSE" \
     "$ROOT/install-manifest.json"
 do
-    grep -Fqx -- "$required" "$LIST_FILE" || fail "The archive is missing required entry: $required"
+    grep -Fqx -- "$required" "$SEEN_FILE" || fail "The archive is missing required entry: $required"
 done
 
 tar -xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIR" || fail "The archive could not be extracted."
@@ -402,15 +426,24 @@ rollback_managed() {
     if ! mv -- "$BACKUP_DIR" "$INSTALL_DIR"; then
         fail "ASTER update failed: $original_error Rollback also failed. Installation: $INSTALL_DIR Backup: $BACKUP_DIR"
     fi
-    BACKUP_DIR=
-    restored_version=$(json_string version "$INSTALL_DIR/install-state.json")
-    [ "$restored_version" = "$INSTALLED_VERSION" ] ||
+    restored_state=$INSTALL_DIR/install-state.json
+    if ! (
+        [ -f "$restored_state" ] &&
+        [ ! -L "$restored_state" ] &&
+        [ "$(json_number schema "$restored_state")" = "$ORIGINAL_STATE_SCHEMA" ] &&
+        [ "$(json_string product "$restored_state")" = "$ORIGINAL_STATE_PRODUCT" ] &&
+        [ "$(json_string version "$restored_state")" = "$ORIGINAL_STATE_VERSION" ] &&
+        [ "$(json_string target "$restored_state")" = "$ORIGINAL_STATE_TARGET" ] &&
+        [ "$(json_string target "$restored_state")" = "$TARGET" ]
+    ); then
         fail "ASTER update failed: $original_error Rollback restored an incompatible marker. Installation: $INSTALL_DIR"
+    fi
     if [ "$PREVIOUS_HEALTHY" = 1 ]; then
-        if ! (validate_install_root "$INSTALL_DIR" "$INSTALLED_VERSION"; validate_cli "$INSTALL_DIR" "$INSTALLED_VERSION"); then
+        if ! (validate_install_root "$INSTALL_DIR" "$ORIGINAL_STATE_VERSION"; validate_cli "$INSTALL_DIR" "$ORIGINAL_STATE_VERSION"); then
             fail "ASTER update failed: $original_error Rollback restored files that failed validation. Installation: $INSTALL_DIR"
         fi
     fi
+    BACKUP_DIR=
     printf '%s\n' "error: ASTER update failed: $original_error" >&2
     printf '%s\n' "The previous installation was restored. Location: $INSTALL_DIR" >&2
     exit 1

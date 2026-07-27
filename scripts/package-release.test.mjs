@@ -257,6 +257,16 @@ test("TAR.GZ encoding is byte deterministic and preserves Linux executable mode"
         decoded.find((entry) => entry.name.endsWith("/bin/aster")).mode,
         0o755,
     );
+    assert.deepEqual(
+        decoded.filter((entry) => entry.type === "directory").map((entry) => entry.name),
+        [
+            `${root}/`,
+            `${root}/bin/`,
+            `${root}/stdlib/`,
+            `${root}/stdlib/aster/`,
+        ],
+        "the official TAR contract includes typed directory entries",
+    );
 });
 
 test("archive decoder dispatches only the format matching the target", () => {
@@ -435,6 +445,38 @@ test("packageBundle creates only the three expected artifacts and rebuilds them 
         ].sort());
         assert.equal(first.hash, second.hash);
         assert.equal(first.size, second.size);
+    } finally {
+        rmSync(fake.workspaceRoot, { recursive: true, force: true });
+    }
+});
+
+test("packageBundle Linux archive keeps the canonical typed directory inventory", () => {
+    const fake = createFakeBundle({ target: "linux-x64", binaryName: "aster" });
+    try {
+        const result = packageBundle({
+            workspaceRoot: fake.workspaceRoot,
+            distRoot: fake.distRoot,
+            bundleDir: fake.bundleDir,
+            version: fake.version,
+            target: fake.target,
+            binaryName: fake.binaryName,
+        });
+        const entries = decodeTarGzEntries(readFileSync(result.archivePath));
+        const directories = entries
+            .filter((entry) => entry.type === "directory")
+            .map((entry) => entry.name);
+        assert.ok(directories.includes(`${fake.dirName}/`));
+        assert.ok(directories.includes(`${fake.dirName}/bin/`));
+        assert.ok(directories.includes(`${fake.dirName}/stdlib/`));
+        assert.ok(directories.includes(`${fake.dirName}/stdlib/aster/`));
+        assert.ok(
+            entries.some(
+                (entry) =>
+                    entry.name === `${fake.dirName}/bin/aster` &&
+                    entry.type === "file" &&
+                    entry.mode === 0o755,
+            ),
+        );
     } finally {
         rmSync(fake.workspaceRoot, { recursive: true, force: true });
     }

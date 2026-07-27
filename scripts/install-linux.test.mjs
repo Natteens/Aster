@@ -7,6 +7,7 @@ import {
     mkdtempSync,
     mkdirSync,
     readFileSync,
+    readdirSync,
     rmSync,
     writeFileSync,
 } from "node:fs";
@@ -17,7 +18,11 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 
-import { sha256 } from "./package-release.mjs";
+import {
+    decodeTarGzEntries,
+    encodeTarGzEntries,
+    sha256,
+} from "./package-release.mjs";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const finalAssets = process.env.ASTER_RELEASE_ASSETS_DIR
@@ -53,6 +58,7 @@ function loadLinuxRelease() {
 }
 
 const linuxRelease = loadLinuxRelease();
+const installerSource = readFileSync(join(repositoryRoot, "install", "install.sh"), "utf8");
 
 function temporaryDirectory(label) {
     return mkdtempSync(join(tmpdir(), `aster-linux-installer-${label}-`));
@@ -147,6 +153,17 @@ function installerEnvironment(server, installDirectory) {
     };
 }
 
+test("Linux archive inventory correlates each path with its TAR type", () => {
+    assert.match(installerSource, /paste "\$TYPE_KIND_FILE" "\$LIST_FILE"/);
+    assert.match(installerSource, /d:bin\/\|d:stdlib\/\|d:stdlib\/aster\//);
+    assert.match(installerSource, /d:stdlib\/aster\/\*\/\)/);
+    assert.match(installerSource, /-:LICENSE\|-:install-manifest\.json\|-:bin\/aster/);
+    assert.doesNotMatch(
+        installerSource,
+        /""\|LICENSE\|install-manifest\.json\|bin\/\|bin\/aster/,
+    );
+});
+
 test(
     "Linux installer, repair, update, public CLI proof, and uninstall run through POSIX sh",
     {
@@ -225,64 +242,145 @@ test(
 );
 
 test(
-    "Linux rollback function restores the previous managed installation",
-    { skip: hostIsLinuxX64 ? false : "Linux x64 required" },
+    "Linux installer rejects an unexpected typed directory in the official TAR tree",
+    {
+        skip:
+            hostIsLinuxX64 && linuxRelease
+                ? false
+                : "Linux x64 release artifact is required",
+    },
     async () => {
-        const root = temporaryDirectory("rollback");
+        const root = temporaryDirectory("unexpected-directory");
         const installDirectory = join(root, "Aster");
-        const backupDirectory = join(root, "Aster.backup.controlled");
-        mkdirSync(installDirectory);
-        mkdirSync(backupDirectory);
-        writeFileSync(join(installDirectory, "new.txt"), "new");
-        writeFileSync(join(backupDirectory, "old.txt"), "old");
-        writeFileSync(
-            join(backupDirectory, "install-state.json"),
-            '{"schema":1,"product":"aster","version":"0.0.0","target":"linux-x64"}\n',
-        );
-        const source = linuxRelease
-            ? linuxRelease.install.toString("utf8")
-            : readFileSync(join(repositoryRoot, "install", "install.sh"), "utf8");
-        const jsonFunction = source.slice(
-            source.indexOf("json_string()"),
-            source.indexOf("json_number()"),
-        );
-        const rollbackFunction = source.slice(
-            source.indexOf("rollback_managed()"),
-            source.indexOf("PREVIOUS_HEALTHY=0"),
-        );
-        const script = `set -eu
+        const entries = decodeTarGzEntries(linuxRelease.archive);
+        const archiveRoot = `aster-${linuxRelease.version}-linux-x64`;
+        const release = {
+            ...linuxRelease,
+            archive: encodeTarGzEntries([
+                ...entries,
+                {
+                    name: `${archiveRoot}/unexpected/`,
+                    type: "directory",
+                    mode: 0o755,
+                },
+            ]),
+        };
+        const server = await startServer(release);
+        try {
+            const result = await runPipedScript(
+                `${server.baseUrl}/install.sh`,
+                installerEnvironment(server, installDirectory),
+            );
+            assert.notEqual(result.status, 0);
+            assert.match(result.stderr, /archive contains an unexpected entry/i);
+            assert.equal(existsSync(installDirectory), false);
+        } finally {
+            await server.close();
+            rmSync(root, { recursive: true, force: true });
+        }
+    },
+);
+
+test(
+    "Linux rollback validates the restored marker against the original installation",
+    { skip: hostIsLinuxX64 ? false : "Linux x64 required" },
+    async (context) => {
+        const canonicalState =
+            '{\n  "schema": 1,\n  "product": "aster",\n  "version": "0.0.0",\n  "target": "linux-x64"\n}\n';
+        const cases = [
+            {
+                name: "older version is restored semantically and without residual backup",
+                restoredState: canonicalState,
+                expected: /previous installation was restored/i,
+            },
+            {
+                name: "an actually changed restored marker is rejected",
+                restoredState:
+                    '{\n  "schema": 1,\n  "product": "aster",\n  "version": "0.0.1",\n  "target": "linux-x64"\n}\n',
+                expected: /restored an incompatible marker/i,
+            },
+            {
+                name: "a restored marker with a divergent target is rejected",
+                restoredState:
+                    '{\n  "schema": 1,\n  "product": "aster",\n  "version": "0.0.0",\n  "target": "windows-x64"\n}\n',
+                expected: /restored an incompatible marker/i,
+            },
+        ];
+        for (const rollbackCase of cases) {
+            await context.test(rollbackCase.name, async () => {
+                const root = temporaryDirectory("rollback");
+                const installDirectory = join(root, "Aster");
+                const backupDirectory = join(root, "Aster.backup.controlled");
+                mkdirSync(installDirectory);
+                mkdirSync(backupDirectory);
+                writeFileSync(join(installDirectory, "new.txt"), "new");
+                writeFileSync(join(backupDirectory, "old.txt"), "old");
+                writeFileSync(
+                    join(backupDirectory, "install-state.json"),
+                    rollbackCase.restoredState,
+                );
+                const source = linuxRelease
+                    ? linuxRelease.install.toString("utf8")
+                    : installerSource;
+                const jsonFunctions = source.slice(
+                    source.indexOf("json_string()"),
+                    source.indexOf("validate_managed_entries()"),
+                );
+                const rollbackFunction = source.slice(
+                    source.indexOf("rollback_managed()"),
+                    source.indexOf("PREVIOUS_HEALTHY=0"),
+                );
+                const script = `set -eu
 fail() { printf '%s\n' "error: $*" >&2; exit 1; }
-${jsonFunction}
+${jsonFunctions}
 ${rollbackFunction}
 INSTALL_DIR='${installDirectory.replaceAll("'", "'\\''")}'
 BACKUP_DIR='${backupDirectory.replaceAll("'", "'\\''")}'
 INSTALLED_VERSION=0.0.0
+ORIGINAL_STATE_SCHEMA=1
+ORIGINAL_STATE_PRODUCT=aster
+ORIGINAL_STATE_VERSION=0.0.0
+ORIGINAL_STATE_TARGET=linux-x64
+TARGET=linux-x64
+ARCHIVE_VERSION=9.9.9
 PREVIOUS_HEALTHY=0
 rollback_managed 'forced final validation failure'
 `;
-        try {
-            const result = await new Promise((resolve, reject) => {
-                const child = spawn("sh", ["-c", script]);
-                let stdout = "";
-                let stderr = "";
-                child.stdout.setEncoding("utf8");
-                child.stderr.setEncoding("utf8");
-                child.stdout.on("data", (chunk) => {
-                    stdout += chunk;
-                });
-                child.stderr.on("data", (chunk) => {
-                    stderr += chunk;
-                });
-                child.on("error", reject);
-                child.on("close", (status) => resolve({ status, stdout, stderr }));
+                try {
+                    const result = await new Promise((resolve, reject) => {
+                        const child = spawn("sh", ["-c", script]);
+                        let stdout = "";
+                        let stderr = "";
+                        child.stdout.setEncoding("utf8");
+                        child.stderr.setEncoding("utf8");
+                        child.stdout.on("data", (chunk) => {
+                            stdout += chunk;
+                        });
+                        child.stderr.on("data", (chunk) => {
+                            stderr += chunk;
+                        });
+                        child.on("error", reject);
+                        child.on("close", (status) =>
+                            resolve({ status, stdout, stderr }),
+                        );
+                    });
+                    assert.notEqual(result.status, 0);
+                    assert.match(result.stderr, rollbackCase.expected);
+                    assert.equal(
+                        readFileSync(join(installDirectory, "old.txt"), "utf8"),
+                        "old",
+                    );
+                    assert.equal(existsSync(join(installDirectory, "new.txt")), false);
+                    assert.equal(existsSync(backupDirectory), false);
+                    assert.deepEqual(readdirSync(root), ["Aster"]);
+                    assert.equal(
+                        readFileSync(join(installDirectory, "install-state.json"), "utf8"),
+                        rollbackCase.restoredState,
+                    );
+                } finally {
+                    rmSync(root, { recursive: true, force: true });
+                }
             });
-            assert.notEqual(result.status, 0);
-            assert.match(result.stderr, /previous installation was restored/i);
-            assert.equal(readFileSync(join(installDirectory, "old.txt"), "utf8"), "old");
-            assert.equal(existsSync(join(installDirectory, "new.txt")), false);
-            assert.equal(existsSync(backupDirectory), false);
-        } finally {
-            rmSync(root, { recursive: true, force: true });
         }
     },
 );
