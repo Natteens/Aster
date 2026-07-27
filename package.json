@@ -6,6 +6,7 @@
   "scripts": {
     "bundle": "node scripts/bundle.mjs",
     "package:release": "node scripts/package-release.mjs",
+    "test:installers": "node --test scripts/install.test.mjs",
     "release": "semantic-release",
     "release:dry-run": "semantic-release --dry-run",
     "release:sync-version": "node scripts/sync-release-version.mjs",
