@@ -13,7 +13,7 @@ fn global_help_and_version_describe_the_installed_binary() {
     let help = aster(["--help"]);
     assert!(help.status.success());
     let help = stdout(&help);
-    assert!(help.contains("aster <COMMAND>"));
+    assert!(help.contains("aster <command> [arguments]"));
     assert!(help.contains("new <NAME>"));
     assert!(help.contains("doctor"));
     assert!(help.contains("run [FILE]"));

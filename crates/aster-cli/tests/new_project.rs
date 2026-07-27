@@ -106,7 +106,7 @@ fn missing_and_extra_arguments_have_focused_errors() {
     let parent = temporary_directory("arguments");
     let missing = aster(&parent, ["new"]);
     assert!(!missing.status.success());
-    assert!(stderr(&missing).contains("Usage: aster new <NAME>"));
+    assert!(stderr(&missing).contains("usage: aster new <NAME>"));
 
     let extra = aster(&parent, ["new", "One", "Two"]);
     assert!(!extra.status.success());

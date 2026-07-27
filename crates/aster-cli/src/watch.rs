@@ -89,9 +89,12 @@ pub(crate) fn watch_file(
     let path = Path::new(file_name).to_owned();
     // Validate readability once so an unusable path fails fast.
     crate::read_source(file_name)?;
-    println!("[watch] watching `{file_name}` — press Ctrl+C to stop");
     let initial = build_and_run(file_name, function_name, stdlib);
-    let mut failing = !initial.succeeded;
+    if !initial.succeeded {
+        return Err(());
+    }
+    println!("[watch] watching `{file_name}` — press Ctrl+C to stop");
+    let mut failing = false;
     let mut dependencies = initial.dependencies.unwrap_or_else(|| vec![path.clone()]);
     let mut detector = DependencyChangeDetector::built(dependency_snapshot(&dependencies));
     loop {
@@ -132,7 +135,7 @@ fn build_and_run(
                 for diagnostic in diagnostics {
                     eprintln!("{}", diagnostic.render());
                 }
-                eprintln!("[watch] compilation failed; still watching");
+                eprintln!("[watch] compilation failed");
                 return BuildOutcome {
                     succeeded: false,
                     // A failed rebuild must keep the last successful graph. Otherwise an
@@ -167,7 +170,7 @@ fn build_and_run(
             dependencies,
         }
     } else {
-        eprintln!("[watch] execution failed; still watching");
+        eprintln!("[watch] execution failed");
         BuildOutcome {
             succeeded: false,
             dependencies,
