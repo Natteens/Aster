@@ -160,6 +160,27 @@ function Get-InstallDirectoryState {
     return [pscustomobject]@{ Kind = "Managed"; State = $state }
 }
 
+function Assert-ManagedInstallEntries {
+    param([Parameter(Mandatory = $true)][string]$InstallDirectory)
+    $allowed = @("bin", "stdlib", "LICENSE", "install-manifest.json", "install-state.json")
+    foreach ($entry in @(Get-ChildItem -Force -LiteralPath $InstallDirectory)) {
+        if ($allowed -notcontains $entry.Name) {
+            Throw-InstallerError "The managed installation contains an unexpected entry: $($entry.Name)"
+        }
+        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Throw-InstallerError "The managed installation contains a symlink or reparse point: $($entry.Name)"
+        }
+        if ($entry.PSIsContainer) {
+            foreach ($nested in @(Get-ChildItem -Recurse -Force -LiteralPath $entry.FullName)) {
+                if (($nested.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    $relative = $nested.FullName.Substring($InstallDirectory.Length).TrimStart('\', '/')
+                    Throw-InstallerError "The managed installation contains a symlink or reparse point: $relative"
+                }
+            }
+        }
+    }
+}
+
 function Get-LimitedDownload {
     param(
         [Parameter(Mandatory = $true)][Uri]$Uri,
@@ -492,6 +513,21 @@ function Test-InstalledCli {
     }
 }
 
+function Test-InstallationHealth {
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallDirectory,
+        [Parameter(Mandatory = $true)][string]$Version
+    )
+    try {
+        [void](Validate-InstallRoot $InstallDirectory $Version)
+        Test-InstalledCli $InstallDirectory $Version
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
 function Get-UpdatedWindowsPath {
     param(
         [AllowEmptyString()][string]$CurrentPath,
@@ -547,6 +583,55 @@ function Write-InstallState {
     )
 }
 
+function Publish-ManagedReplacement {
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallDirectory,
+        [Parameter(Mandatory = $true)][string]$StagingDirectory,
+        [Parameter(Mandatory = $true)][string]$Version,
+        [Parameter(Mandatory = $true)]$PreviousState,
+        [Parameter(Mandatory = $true)][bool]$PreviousWasHealthy,
+        [Parameter(Mandatory = $true)][scriptblock]$Validator
+    )
+    $backupDirectory = $InstallDirectory + ".backup-" + [Guid]::NewGuid().ToString("N")
+    $oldMoved = $false
+    $newPublished = $false
+    try {
+        [IO.Directory]::Move($InstallDirectory, $backupDirectory)
+        $oldMoved = $true
+        [IO.Directory]::Move($StagingDirectory, $InstallDirectory)
+        $newPublished = $true
+        Write-InstallState $InstallDirectory $Version
+        & $Validator $InstallDirectory $Version "Final"
+        Remove-Item -Recurse -Force -LiteralPath $backupDirectory
+        return
+    }
+    catch {
+        $originalError = $_.Exception.Message
+        if ($newPublished -and (Test-Path -LiteralPath $InstallDirectory)) {
+            Remove-Item -Recurse -Force -LiteralPath $InstallDirectory
+        }
+        try {
+            if ($oldMoved -and (Test-Path -LiteralPath $backupDirectory)) {
+                [IO.Directory]::Move($backupDirectory, $InstallDirectory)
+            }
+            $restored = Get-InstallDirectoryState $InstallDirectory
+            if (
+                $restored.Kind -ne "Managed" -or
+                [string]$restored.State.version -ne [string]$PreviousState.version
+            ) {
+                Throw-InstallerError "The restored install-state.json does not match the previous installation."
+            }
+            if ($PreviousWasHealthy) {
+                & $Validator $InstallDirectory ([string]$PreviousState.version) "Rollback"
+            }
+        }
+        catch {
+            Throw-InstallerError "ASTER update failed: $originalError Rollback also failed. Installation: $InstallDirectory Backup: $backupDirectory"
+        }
+        Throw-InstallerError "ASTER update failed: $originalError The previous installation was restored. Location: $InstallDirectory"
+    }
+}
+
 function Invoke-AsterInstall {
     Assert-WindowsX64
     $allowInsecure = $env:ASTER_INSTALL_ALLOW_INSECURE -eq "1"
@@ -568,6 +653,9 @@ function Invoke-AsterInstall {
     }
     $installDirectory = Assert-SafeInstallDirectory $installValue
     $directoryState = Get-InstallDirectoryState $installDirectory
+    if ($directoryState.Kind -eq "Managed") {
+        Assert-ManagedInstallEntries $installDirectory
+    }
 
     $downloadDirectory = Join-Path ([IO.Path]::GetTempPath()) ("aster-install-download-" + [Guid]::NewGuid().ToString("N"))
     $extractDirectory = Join-Path ([IO.Path]::GetTempPath()) ("aster-install-extract-" + [Guid]::NewGuid().ToString("N"))
@@ -590,28 +678,61 @@ function Invoke-AsterInstall {
         $extractedRoot = Join-Path $extractDirectory $archiveInfo.Root
         [void](Validate-InstallRoot $extractedRoot $archiveInfo.Version)
 
+        $installedVersion = $null
+        $previousWasHealthy = $false
+        $operation = "Install"
         if ($directoryState.Kind -eq "Managed") {
             $installedVersion = [string]$directoryState.State.version
-            if ($installedVersion -ne $archiveInfo.Version) {
-                Throw-InstallerError "ASTER is already installed with another version. Update support will be handled by the update workflow."
+            $previousWasHealthy = Test-InstallationHealth $installDirectory $installedVersion
+            if ($installedVersion -eq $archiveInfo.Version -and $previousWasHealthy) {
+                Add-AsterUserPath (Join-Path $installDirectory "bin")
+                Write-Host ""
+                Write-Host "ASTER is already installed and healthy"
+                Write-Host ""
+                Write-Host "Version: $installedVersion"
+                Write-Host "Location: $installDirectory"
+                return
             }
-            [void](Validate-InstallRoot $installDirectory $installedVersion)
-            Test-InstalledCli $installDirectory $installedVersion
-            Add-AsterUserPath (Join-Path $installDirectory "bin")
-            Write-Host ""
-            Write-Host "ASTER is already installed and valid"
-            Write-Host ""
-            Write-Host "Version: $installedVersion"
-            Write-Host "Target: $($script:Target)"
-            Write-Host "Location: $installDirectory"
-            return
+            $operation = if ($installedVersion -eq $archiveInfo.Version) { "Repair" } else { "Update" }
         }
 
         $parent = [IO.Path]::GetDirectoryName($installDirectory)
         [void][IO.Directory]::CreateDirectory($parent)
-        $stagingDirectory = Join-Path $parent (".aster-install-" + [Guid]::NewGuid().ToString("N"))
+        $stagingDirectory = $installDirectory + ".staging-" + [Guid]::NewGuid().ToString("N")
         Copy-Item -Recurse -LiteralPath $extractedRoot -Destination $stagingDirectory
         [void](Validate-InstallRoot $stagingDirectory $archiveInfo.Version)
+        Test-InstalledCli $stagingDirectory $archiveInfo.Version
+
+        if ($directoryState.Kind -eq "Managed") {
+            $validator = {
+                param($path, $version, $phase)
+                Test-InstalledCli $path $version
+            }
+            Publish-ManagedReplacement `
+                $installDirectory `
+                $stagingDirectory `
+                $archiveInfo.Version `
+                $directoryState.State `
+                $previousWasHealthy `
+                $validator
+            $stagingDirectory = $null
+            Add-AsterUserPath (Join-Path $installDirectory "bin")
+            Write-Host ""
+            if ($operation -eq "Repair") {
+                Write-Host "ASTER repaired successfully"
+                Write-Host ""
+                Write-Host "Version: $($archiveInfo.Version)"
+                Write-Host "Location: $installDirectory"
+            }
+            else {
+                Write-Host "ASTER updated successfully"
+                Write-Host ""
+                Write-Host "Previous version: $installedVersion"
+                Write-Host "Current version: $($archiveInfo.Version)"
+                Write-Host "Location: $installDirectory"
+            }
+            return
+        }
 
         if ($directoryState.Kind -eq "Empty") {
             [IO.Directory]::Delete($installDirectory)
@@ -621,8 +742,8 @@ function Invoke-AsterInstall {
         $stagingDirectory = $null
         $publishedNew = $true
 
-        Test-InstalledCli $installDirectory $archiveInfo.Version
         Write-InstallState $installDirectory $archiveInfo.Version
+        Test-InstalledCli $installDirectory $archiveInfo.Version
         Add-AsterUserPath (Join-Path $installDirectory "bin")
 
         Write-Host ""

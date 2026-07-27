@@ -114,6 +114,23 @@ json_number() {
     sed -n 's/^[[:space:]]*"'"$key"'"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*,\{0,1\}[[:space:]]*$/\1/p' "$file"
 }
 
+validate_managed_entries() {
+    root=$1
+    for path in "$root"/* "$root"/.[!.]* "$root"/..?*; do
+        [ -e "$path" ] || [ -L "$path" ] || continue
+        name=${path##*/}
+        case "$name" in
+            bin|stdlib|LICENSE|install-manifest.json|install-state.json) ;;
+            *) fail "The managed installation contains an unexpected entry: $name" ;;
+        esac
+        [ ! -L "$path" ] ||
+            fail "The managed installation contains a symlink: $name"
+        if [ -d "$path" ] && [ -n "$(find "$path" -type l -print -quit)" ]; then
+            fail "The managed installation contains a nested symlink: $name"
+        fi
+    done
+}
+
 DIRECTORY_STATE=missing
 INSTALLED_VERSION=
 if [ -d "$INSTALL_DIR" ]; then
@@ -133,12 +150,14 @@ if [ -d "$INSTALL_DIR" ]; then
         [ -n "$INSTALLED_VERSION" ] ||
             fail "install-state.json is invalid for this ASTER installer."
         DIRECTORY_STATE=managed
+        validate_managed_entries "$INSTALL_DIR"
     fi
 fi
 
 DOWNLOAD_DIR=$(mktemp -d "${TMPDIR:-/tmp}/aster-install-download.XXXXXX")
 EXTRACT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/aster-install-extract.XXXXXX")
 STAGING_DIR=
+BACKUP_DIR=
 PUBLISHED_NEW=0
 REMOVED_EMPTY=0
 
@@ -153,6 +172,9 @@ cleanup() {
     fi
     if [ -n "$STAGING_DIR" ] && [ -d "$STAGING_DIR" ]; then
         rm -rf -- "$STAGING_DIR"
+    fi
+    if [ -n "$BACKUP_DIR" ] && [ "$status" -eq 0 ] && [ -d "$BACKUP_DIR" ]; then
+        rm -rf -- "$BACKUP_DIR"
     fi
     rm -rf -- "$DOWNLOAD_DIR" "$EXTRACT_DIR"
     exit "$status"
@@ -336,8 +358,14 @@ add_path_block() {
     profile=$HOME/.profile
     begin='# >>> ASTER installer >>>'
     end='# <<< ASTER installer <<<'
-    if [ -f "$profile" ] && grep -Fqx "$begin" "$profile"; then
-        return
+    if [ -f "$profile" ]; then
+        begin_count=$(grep -Fxc "$begin" "$profile" || true)
+        end_count=$(grep -Fxc "$end" "$profile" || true)
+        if [ "$begin_count" -ne 0 ] || [ "$end_count" -ne 0 ]; then
+            [ "$begin_count" -eq 1 ] && [ "$end_count" -eq 1 ] ||
+                fail "The ASTER PATH block in .profile is incomplete or duplicated."
+            return
+        fi
     fi
     if [ -f "$profile" ]; then
         cp -- "$profile" "$profile.aster-backup"
@@ -351,41 +379,103 @@ add_path_block() {
     } >> "$profile"
 }
 
+write_install_state() {
+    directory=$1
+    version=$2
+    cat > "$directory/install-state.json" <<EOF
+{
+  "schema": 1,
+  "product": "aster",
+  "version": "$version",
+  "target": "linux-x64"
+}
+EOF
+}
+
+rollback_managed() {
+    original_error=$1
+    PUBLISHED_NEW=0
+    if [ -d "$INSTALL_DIR" ]; then
+        rm -rf -- "$INSTALL_DIR" ||
+            fail "ASTER update failed: $original_error Rollback also failed. Installation: $INSTALL_DIR Backup: $BACKUP_DIR"
+    fi
+    if ! mv -- "$BACKUP_DIR" "$INSTALL_DIR"; then
+        fail "ASTER update failed: $original_error Rollback also failed. Installation: $INSTALL_DIR Backup: $BACKUP_DIR"
+    fi
+    BACKUP_DIR=
+    restored_version=$(json_string version "$INSTALL_DIR/install-state.json")
+    [ "$restored_version" = "$INSTALLED_VERSION" ] ||
+        fail "ASTER update failed: $original_error Rollback restored an incompatible marker. Installation: $INSTALL_DIR"
+    if [ "$PREVIOUS_HEALTHY" = 1 ]; then
+        if ! (validate_install_root "$INSTALL_DIR" "$INSTALLED_VERSION"; validate_cli "$INSTALL_DIR" "$INSTALLED_VERSION"); then
+            fail "ASTER update failed: $original_error Rollback restored files that failed validation. Installation: $INSTALL_DIR"
+        fi
+    fi
+    printf '%s\n' "error: ASTER update failed: $original_error" >&2
+    printf '%s\n' "The previous installation was restored. Location: $INSTALL_DIR" >&2
+    exit 1
+}
+
+PREVIOUS_HEALTHY=0
 if [ "$DIRECTORY_STATE" = managed ]; then
-    [ "$INSTALLED_VERSION" = "$ARCHIVE_VERSION" ] ||
-        fail "ASTER is already installed with another version. Update support will be handled by the update workflow."
-    validate_install_root "$INSTALL_DIR" "$INSTALLED_VERSION"
-    validate_cli "$INSTALL_DIR" "$INSTALLED_VERSION"
-    add_path_block "$INSTALL_DIR/bin"
-    printf '\nASTER is already installed and valid\n\n'
-    printf 'Version: %s\nTarget: %s\nLocation: %s\n' "$INSTALLED_VERSION" "$TARGET" "$INSTALL_DIR"
-    exit 0
+    if (validate_install_root "$INSTALL_DIR" "$INSTALLED_VERSION"; validate_cli "$INSTALL_DIR" "$INSTALLED_VERSION") >/dev/null 2>&1; then
+        PREVIOUS_HEALTHY=1
+    fi
+    if [ "$INSTALLED_VERSION" = "$ARCHIVE_VERSION" ] && [ "$PREVIOUS_HEALTHY" = 1 ]; then
+        add_path_block "$INSTALL_DIR/bin"
+        printf '\nASTER is already installed and healthy\n\n'
+        printf 'Version: %s\nLocation: %s\n' "$INSTALLED_VERSION" "$INSTALL_DIR"
+        exit 0
+    fi
 fi
 
 PARENT=$(dirname "$INSTALL_DIR")
 mkdir -p -- "$PARENT"
-STAGING_DIR=$(mktemp -d "$PARENT/.aster-install.XXXXXX")
+STAGING_DIR=$(mktemp -d "$INSTALL_DIR.staging.XXXXXX")
 cp -R -- "$EXTRACTED_ROOT"/. "$STAGING_DIR"/
 chmod 755 "$STAGING_DIR/bin/aster"
 validate_install_root "$STAGING_DIR" "$ARCHIVE_VERSION"
+validate_cli "$STAGING_DIR" "$ARCHIVE_VERSION"
 
-if [ "$DIRECTORY_STATE" = empty ]; then
+if [ "$DIRECTORY_STATE" = managed ]; then
+    BACKUP_DIR=$(mktemp -d "$INSTALL_DIR.backup.XXXXXX")
+    rmdir -- "$BACKUP_DIR"
+    mv -- "$INSTALL_DIR" "$BACKUP_DIR"
+    if ! mv -- "$STAGING_DIR" "$INSTALL_DIR"; then
+        rollback_managed "The staged installation could not be published."
+    fi
+    STAGING_DIR=
+    PUBLISHED_NEW=1
+    if ! write_install_state "$INSTALL_DIR" "$ARCHIVE_VERSION"; then
+        rollback_managed "The new install-state.json could not be written."
+    fi
+    if ! (validate_install_root "$INSTALL_DIR" "$ARCHIVE_VERSION"; validate_cli "$INSTALL_DIR" "$ARCHIVE_VERSION"); then
+        rollback_managed "The published installation failed functional validation."
+    fi
+    PUBLISHED_NEW=0
+    if ! rm -rf -- "$BACKUP_DIR"; then
+        fail "ASTER was updated, but its backup could not be removed safely: $BACKUP_DIR"
+    fi
+    BACKUP_DIR=
+    add_path_block "$INSTALL_DIR/bin"
+    if [ "$INSTALLED_VERSION" = "$ARCHIVE_VERSION" ]; then
+        printf '\nASTER repaired successfully\n\n'
+        printf 'Version: %s\nLocation: %s\n' "$ARCHIVE_VERSION" "$INSTALL_DIR"
+    else
+        printf '\nASTER updated successfully\n\n'
+        printf 'Previous version: %s\nCurrent version: %s\nLocation: %s\n' \
+            "$INSTALLED_VERSION" "$ARCHIVE_VERSION" "$INSTALL_DIR"
+    fi
+    exit 0
+elif [ "$DIRECTORY_STATE" = empty ]; then
     rmdir -- "$INSTALL_DIR"
     REMOVED_EMPTY=1
 fi
 mv -- "$STAGING_DIR" "$INSTALL_DIR"
 STAGING_DIR=
 PUBLISHED_NEW=1
-
+write_install_state "$INSTALL_DIR" "$ARCHIVE_VERSION"
 validate_cli "$INSTALL_DIR" "$ARCHIVE_VERSION"
-cat > "$INSTALL_DIR/install-state.json" <<EOF
-{
-  "schema": 1,
-  "product": "aster",
-  "version": "$ARCHIVE_VERSION",
-  "target": "linux-x64"
-}
-EOF
 add_path_block "$INSTALL_DIR/bin"
 
 printf '\nASTER installed successfully\n\n'
