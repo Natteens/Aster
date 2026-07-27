@@ -8,11 +8,11 @@ repository.workspace = true
 description = "Compiler orchestration and semantic validation for Aster"
 
 [dependencies]
-aster-diagnostics = { path = "../aster-diagnostics", version = "0.46.0" }
-aster-hir = { path = "../aster-hir", version = "0.46.0" }
-aster-mir = { path = "../aster-mir", version = "0.46.0" }
-aster-syntax = { path = "../aster-syntax", version = "0.46.0" }
-aster-types = { path = "../aster-types", version = "0.46.0" }
+aster-diagnostics = { path = "../aster-diagnostics", version = "0.47.0" }
+aster-hir = { path = "../aster-hir", version = "0.47.0" }
+aster-mir = { path = "../aster-mir", version = "0.47.0" }
+aster-syntax = { path = "../aster-syntax", version = "0.47.0" }
+aster-types = { path = "../aster-types", version = "0.47.0" }
 toml = "0.8"
 
 [lints]
