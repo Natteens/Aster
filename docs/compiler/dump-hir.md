@@ -1,6 +1,6 @@
 # `aster dump-hir`
 
-`dump-hir` is a development-only inspection command for the Aster frontend:
+`dump-hir` is a development-only inspection command for the ASTER frontend:
 
 ```powershell
 aster dump-hir path\to\file.aster

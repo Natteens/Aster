@@ -1,13 +1,8 @@
-//! M1E: closure/integration/adversarial suite for Milestone M1 (Text,
-//! Parsing, Formatting, Terminal I/O). Does not test any single M1A-D
-//! feature in isolation again (see `string_methods.rs`, `string_try_parse.rs`,
+//! Cross-feature and adversarial coverage for text, parsing, formatting, and
+//! terminal I/O. Focused behavior lives in `string_methods.rs`, `string_try_parse.rs`,
 //! `string_try_parse_float.rs`, `option_try_propagation.rs`, `to_string.rs`,
-//! `console_io.rs`); covers only what only makes sense to test with several
-//! features combined: the mandatory end-to-end program, cross-feature
-//! evaluation order, nested-enum escape analysis, and console adversarial
-//! cases the M1D suite didn't exercise (lone `\r`, which M1E's audit found
-//! was mishandled -- see the `strip_line_terminator` fix in
-//! `aster-runtime/src/io.rs`).
+//! and `console_io.rs`; this suite covers cross-feature evaluation order,
+//! nested-enum escape analysis, and terminal edge cases such as a lone `\r`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

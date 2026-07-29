@@ -8,7 +8,7 @@
 //!     LICENSE
 //!     install-manifest.json
 //!
-//! Priority for stdlib at runtime (M6A1):
+//! Standard-library discovery priority at runtime:
 //!   ASTER_STDLIB  →  <exe-dir>/../stdlib/  →  embedded
 
 import {
@@ -218,7 +218,6 @@ export function validateBundle(bundleDir, { version, bundleTarget, binaryName } 
         if (!condition) throw new Error(`Bundle validation failed: ${message}`);
     }
 
-    // Binary
     if (binaryName) {
         const binaryPath = join(bundleDir, "bin", binaryName);
         check(
@@ -227,7 +226,6 @@ export function validateBundle(bundleDir, { version, bundleTarget, binaryName } 
         );
     }
 
-    // No .pdb files in bin/
     const binDir = join(bundleDir, "bin");
     if (existsSync(binDir)) {
         for (const entry of readdirSync(binDir)) {
@@ -235,14 +233,12 @@ export function validateBundle(bundleDir, { version, bundleTarget, binaryName } 
         }
     }
 
-    // stdlib/aster/ directory
     const stdlibAster = join(bundleDir, "stdlib", "aster");
     check(
         existsSync(stdlibAster) && statSync(stdlibAster).isDirectory(),
         "stdlib/aster/ directory not found",
     );
 
-    // Required stdlib modules
     for (const rel of REQUIRED_STDLIB_MODULES) {
         const full = join(bundleDir, "stdlib", rel.split("/").join(sep));
         check(existsSync(full), `required stdlib module missing from bundle: ${rel}`);
@@ -278,18 +274,14 @@ export function validateBundle(bundleDir, { version, bundleTarget, binaryName } 
         check(existsSync(join(bundleDir, ep.split("/").join(sep))), `manifest entrypoint does not exist in bundle: ${ep}`);
     }
 
-    // Stdlib and license paths must be relative
     check(!manifest.stdlib.startsWith("/"), "manifest stdlib must be relative");
     check(!manifest.license.startsWith("/"), "manifest license must be relative");
 
-    // No .git or target/ contamination
     check(!existsSync(join(bundleDir, ".git")), "bundle must not contain .git");
     check(!existsSync(join(bundleDir, "target")), "bundle must not contain target/");
 }
 
-// ---------------------------------------------------------------------------
 // Main entry point
-// ---------------------------------------------------------------------------
 
 const isMain = process.argv[1] === fileURLToPath(import.meta.url);
 

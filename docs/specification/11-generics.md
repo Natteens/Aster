@@ -116,5 +116,6 @@ Recommendation: keep invariance until real library APIs demonstrate a need.
 
 Generic methods with their own type parameters, generic constructors, constraints, variance,
 default arguments, partially applied types, generic class or interface inheritance, static members
-on generic types, generic standard collections, reflection, boxing, runtime type erasure, and
-executable struct methods remain outside this phase.
+on generic types, reflection, boxing, runtime type erasure, and executable struct methods remain
+unimplemented. Official `List<T>`, `Dictionary<K,V>`, `Option<T>`, and `Result<T,E>`
+specializations use the existing monomorphization pipeline.

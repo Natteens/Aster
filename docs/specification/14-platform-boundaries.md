@@ -3,7 +3,7 @@
 ## Objective
 
 Prevent features from being silently promoted into syntax or hidden runtime behavior by defining
-the responsibilities of Aster’s product layers.
+the responsibilities of ASTER’s product layers.
 
 ## Accepted boundaries
 
@@ -11,7 +11,9 @@ the responsibilities of Aster’s product layers.
 
 The language is the source grammar, type system, semantic rules, memory-safety model, and required
 compile-time diagnostics. `class`, `struct`, `interface`, variables, functions, and control flow
-belong here. No ECS keywords are currently accepted or scheduled.
+belong here. Compiler-known official types and operations have explicit typed HIR/MIR boundaries;
+they are never recognized by short name or layout in the backend. No ECS keywords are accepted or
+scheduled.
 
 ### Standard library
 
@@ -29,7 +31,7 @@ panic/termination machinery, platform abstractions, scheduler services, or loggi
 cannot be compiled away. A feature is not automatically runtime-backed merely because that is easy
 to implement.
 
-The initial `aster.math` implementation is ordinary Aster source except for a typed runtime-error
+The initial `aster.math` implementation is ordinary ASTER source except for a typed runtime-error
 bridge used by invalid `Abs` and `Clamp` inputs. That bridge records a controlled error in the
 per-run ExecutionContext; it is metadata supplied by the trusted standard-library provider, not a
 keyword or textual method-name check in the backend.
@@ -44,7 +46,7 @@ change program semantics without a corresponding language or library specificati
 
 ECS is only a research proposal for a possible future library and documented runtime hooks. It is
 not present in the compiler or SDK, and it is neither an implicit game engine nor a requirement for
-ordinary Aster programs.
+ordinary ASTER programs.
 
 ## Proposed syntax and ownership examples
 
@@ -109,12 +111,12 @@ allow optional packages such as higher-level libraries to version independently 
 with narrowly specified runtime hooks only where measurements prove them useful. No package or
 implementation schedule is currently accepted.
 
-### PROPOSED — Compiler knowledge of library features
+### ACCEPTED — Compiler knowledge of official types
 
-1. **No library-specific compiler behavior** — clean layering; may prevent desired static ECS analysis.
-2. **Recognized attributes/intrinsics** — controlled optimization and validation; creates privileged APIs.
-3. **Dedicated syntax lowering to library/runtime contracts** — best diagnostics; strongest coupling.
+ASTER uses a small compiler-known boundary for official nominal types and host services whose
+representation or validation cannot be expressed as ordinary source today. This includes
+collections, I/O, tasks, and parallel operations. Semantic analysis resolves an official symbol to
+typed HIR/MIR metadata; the backend never performs source-name or duck-typing lookup.
 
-**Recommendation:** PROPOSED — keep library-specific compiler behavior out of the current roadmap.
-Reconsider a small, documented intrinsic or metadata boundary only if future measurements establish
-a need that an ordinary library API cannot meet.
+New privileged behavior still requires a concrete representation, diagnostics, and runtime
+contract. Future ECS research does not gain compiler integration merely by being a library idea.

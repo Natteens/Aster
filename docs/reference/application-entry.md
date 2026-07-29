@@ -1,14 +1,16 @@
 # Application entry
 
 Use an application entry when a file represents a program you want to start, rather than a
-library you only want to check. Aster starts an ordinary public static method named `Main`:
+library you only want to check. ASTER starts an ordinary public static method named `Main`:
 
 ```aster
+using aster.io;
+
 public class Program
 {
     public static void Main()
     {
-        Log("Hello from Aster");
+        WriteLine("Hello from ASTER!");
     }
 }
 ```

@@ -1,6 +1,6 @@
 # Language tour
 
-Aster uses familiar, type-first syntax, but its design is built around concrete representation and
+ASTER uses familiar, type-first syntax, but its design is built around concrete representation and
 explicit behavior. This tour explains those ideas through small excerpts. For complete programs
 you can run directly, follow the [examples](../examples/README.md).
 
@@ -10,12 +10,16 @@ An application begins at one public static `Main` method, selected by convention
 `Aster.toml`:
 
 ```aster
+namespace app;
+
+using aster.io;
+
 public class Program
 {
     public static int Main()
     {
-        Log("Hello, Aster!");
-        return 42;
+        WriteLine("Hello from ASTER!");
+        return 0;
     }
 }
 ```
@@ -116,11 +120,16 @@ public int SumScores()
 }
 ```
 
-Strings are immutable UTF-8 values. Concatenation creates a new string, `==` compares content, and
-`Length` counts Unicode scalar values. Aster does not silently convert numbers or objects to text
-with `+`; use `$"Total: {quantity * price}"` to build text from values instead.
+`List<T>` grows explicitly through `Add`, while `Dictionary<K, V>` provides insertion, lookup,
+replacement, removal, and insertion-order entry snapshots. `foreach` works over arrays, lists, and
+strings without a public iterator or hidden iterator allocation.
 
-See [arrays](reference/arrays.md) and [strings](reference/strings.md) for their runtime boundaries.
+Strings are immutable UTF-8 values. Concatenation creates a new string, `==` compares content,
+indexing returns one Unicode scalar as `char`, and `Length` counts Unicode scalars. ASTER does not
+silently convert numbers or objects to text with `+`; use `$"Total: {quantity * price}"` instead.
+
+See [collections](reference/collections.md) and [strings](reference/strings.md) for their runtime
+boundaries.
 
 ## Generics become concrete programs
 
@@ -149,7 +158,7 @@ The runnable [generics](../examples/generics.aster) and
 
 ## Absence and errors are values
 
-The embedded `aster.core` namespace defines `Option<T>` and `Result<T, E>` as ordinary generic
+The `aster.core` namespace defines `Option<T>` and `Result<T, E>` as ordinary generic
 enums. Code handles their cases with an exhaustive `switch`:
 
 ```aster
@@ -176,7 +185,7 @@ Run [Option and Result](../examples/option_result.aster) and
 
 Folders establish default namespaces relative to the nearest `Aster.toml`. A `using` declaration
 loads another namespace; it does not download a package or search outside the project. Official
-`aster.*` namespaces come from the standard library embedded in the compiler.
+`aster.*` namespaces come from the standard library shipped with the toolchain.
 
 ```aster
 using aster.math;
@@ -193,10 +202,10 @@ The [namespace project](../examples/namespaces/app/main.aster) combines project 
 
 ## Current boundaries
 
-Aster currently executes through a JIT. It does not produce standalone binaries, resolve external
-packages, provide long-lived object ownership, or implement threads, async, automatic parallelism,
-GPU execution, or HVM lowering. Those are design or research questions rather than syntax waiting
-to be switched on.
+ASTER currently executes through a JIT. It does not produce standalone binaries, resolve external
+packages, or provide a general shared-memory threading model. Explicit `Task<T>`, `await`, and
+`Parallel` operations exist behind restricted worker-transfer boundaries; automatic parallelism,
+GPU execution, and HVM lowering remain research.
 
 The [roadmap](roadmap.md) separates implemented foundations, near-term work, and research. The
 [documentation index](README.md) leads to detailed language reference and compiler architecture.

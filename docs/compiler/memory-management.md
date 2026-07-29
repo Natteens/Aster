@@ -1,6 +1,6 @@
 # Memory management
 
-Aster currently uses execution-scoped arenas instead of a tracing garbage
+ASTER currently uses execution-scoped arenas instead of a tracing garbage
 collector or reference counting. Every JIT invocation owns one
 `ExecutionContext`, and that context owns two paged bump allocators.
 
@@ -15,7 +15,7 @@ function that created them returns. Typical reasons are:
 - passing it to a call whose summary cannot prove a non-escaping use;
 - any unsupported or uncertain aliasing pattern.
 
-The temporary arena holds objects, arrays, and dynamic strings that the
+The temporary arena holds objects, arrays, lists, dictionaries, and dynamic strings that the
 compiler proves do not escape their containing function.
 
 A generated function with at least one temporary allocation enters a temporary
@@ -28,8 +28,8 @@ callee cannot invalidate a caller's temporary values.
 
 Escape analysis runs after MIR lowering and before Cranelift validation. It:
 
-1. tracks local aliases of class, array, and string references;
-2. builds summaries for direct Aster calls;
+1. tracks local aliases of class, array, list, dictionary, and string references;
+2. builds summaries for direct ASTER calls;
 3. solves recursive call components to a monotone fixpoint;
 4. classifies every dynamic allocation;
 5. writes `AllocationRegion::Temporary` only for proven local candidates.
@@ -38,10 +38,14 @@ The analysis is intentionally conservative. Uncertainty selects persistent
 storage. There is no silent fallback in the backend: each MIR region maps to a
 specific runtime ABI function.
 
-## Arrays and strings
+## Collections and strings
 
 An array header and its element buffer always use the same arena. Rewinding
 cannot leave a live header pointing at reclaimed element storage.
+
+`List<T>` and `Dictionary<K,V>` headers and their current backing buffers also share one selected
+region. Growth can retain older arena buffers until the containing temporary scope rewinds or the
+execution context is dropped; there is no individual deallocation.
 
 String literals are not arena allocations; they live in the JIT module data
 section. Concatenation, interpolation, and scalar formatting create dynamic
@@ -53,8 +57,8 @@ region determines the lifetime.
 
 `aster run <FILE> --memory-stats` prints one snapshot after execution.
 
-- `allocations`, `objects`, `arrays`, and `strings` are cumulative logical
-  allocation counts.
+- `allocations`, `objects`, `arrays`, and `strings` are cumulative logical allocation counts.
+  Collection headers and backing buffers use the existing object/array accounting categories.
 - `requested` is cumulative logical requested storage. It excludes arena
   alignment padding and excludes the separate array header.
 - `used` is the current consumed storage across both arenas.
@@ -110,7 +114,7 @@ performance claim.
 
 ## Current boundary
 
-This model is designed for one bounded JIT execution. Aster does not yet
+This model is designed for one bounded JIT execution. ASTER does not yet
 provide long-lived ownership, individual deallocation, reference counting, or
 a garbage collector. Pages are released when the `ExecutionContext` is
 dropped. Future ownership work must preserve the explicit MIR region contract

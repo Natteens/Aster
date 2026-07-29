@@ -1,81 +1,49 @@
 # 06 — Control flow
 
-## Objective
+## Accepted syntax
 
-Describe explicit branching, looping, and early exit. This chapter does not define
-concurrency, task scheduling, ECS iteration, or lifecycle behavior.
-
-## Proposed syntax
+ASTER supports `if`/`else`, `while`, C-style `for`, compiler-known `foreach`, enum `switch`,
+`break`, `continue`, and `return`.
 
 ```aster
 if (temperature > limit)
 {
-    warn();
-}
-else
-{
-    continueWork();
+    Warn();
 }
 
-while (remaining > 0)
+for (int index = 0; index < values.Length; index++)
 {
-    remaining -= 1;
+    total += values[index];
 }
 
-for (int value in values)
+foreach (int value in values)
 {
-    Log("Valor processado");
+    total += value;
 }
 ```
 
-## Proposed rules
+## Rules
 
-- `if` and `while` conditions must have type `bool`.
-- Braces are required around control-flow bodies.
-- `else if` is proposed as an `else` followed by another `if`.
-- `while` repeats while its condition is true.
-- `for (Type name in expression)` is proposed for iteration; the iteration protocol is
-  not yet specified.
-- `break` exits the nearest loop and `continue` starts its next iteration.
+- Conditions have type `bool`.
+- Control-flow bodies use blocks.
+- C-style `for` has initializer, condition, and update clauses.
+- `foreach (T name in expression)` requires an explicit element type.
+- Arrays, `List<T>`, and strings are the only `foreach` collections.
+- The collection expression is evaluated once; no public iterator protocol is involved.
+- The iteration variable is read-only and scoped to the body.
+- `break` exits the nearest loop and `continue` advances that loop.
 - `return` exits the current function.
-- Code proven unreachable should produce at least a diagnostic; whether it is an error
-  remains open.
+- Statements proven unreachable receive a warning.
 
-## Valid design examples
+List iteration fails if the list is structurally modified while the loop is active. String
+iteration yields Unicode scalars as `char`.
 
-```aster
-if (ready)
-{
-    PerformWork();
-}
+## Enum `switch`
 
-while (running)
-{
-    if (shouldStop())
-    {
-        break;
-    }
-}
-```
+`switch` over an enum is exhaustive unless it has `default`. Cases do not fall through, and payload
+bindings are scoped to their direct arm. See [Enums](16-enums.md).
 
-## Invalid design examples
+## Not implemented
 
-```aster
-if (1) { PerformWork(); } // condition is not bool
-break;                    // not inside a loop
-continue;                 // not inside a loop
-```
-
-## Accepted enum switch
-
-`switch` over an enum is exhaustive unless it has `default`. Cases do not fall
-through, and payload bindings are scoped to their direct arm.
-
-## OPEN QUESTIONS
-
-- **OPEN QUESTION:** Is `if` an expression, a statement, or both?
-- **OPEN QUESTION:** Is there a `loop` construct for unconditional loops?
-- **OPEN QUESTION:** What iteration protocol powers `for`?
-- **OPEN QUESTION:** Are general `match`, nested patterns, guards, labels, and labeled breaks supported?
-- **OPEN QUESTION:** Are exceptions supported, or does error flow use explicit result values?
-- **OPEN QUESTION:** Is unreachable code an error or warning?
+`if` is not an expression. There is no unconditional `loop`, iterator protocol, loop label,
+general `match`, nested pattern, guard, switch expression, or exception control flow.

@@ -2,7 +2,7 @@
 
 ## Objective
 
-Define Aster’s accepted user-defined type categories while keeping inheritance,
+Define ASTER’s accepted user-defined type categories while keeping inheritance,
 memory management, layout, and dispatch choices explicit.
 
 ## Accepted syntax
@@ -82,9 +82,9 @@ Position position = Position { x: 10, y: 20 };
 - Structs do not use heap allocation by default. Comparable structs use structural equality.
 - Only public fields can be named by a literal or accessed from namespace-level functions.
 
-The aggregate ABI is internal to Aster, not a promised C ABI. Struct methods remain
+The aggregate ABI is internal to ASTER, not a promised C ABI. Struct methods remain
 frontend-only until HIR/MIR represent an explicit receiver correctly. A struct may be returned
-between Aster functions, but not directly as the CLI-selected entry result.
+between ASTER functions, but not directly as the CLI-selected entry result.
 
 ## Executable classes in the JIT
 
@@ -146,7 +146,7 @@ public struct Pair
 }
 ```
 
-## Decisões de construção e comportamento
+## Construction and behavior decisions
 
 ### ACCEPTED — Nominal class implementation
 

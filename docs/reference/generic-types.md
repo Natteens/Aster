@@ -42,7 +42,7 @@ Pair<int, string> pair = Pair<int, string>
 };
 ```
 
-Aster struct literals use `:` between a field and its value. Copying `Pair<int, string>` copies its
+ASTER struct literals use `:` between a field and its value. Copying `Pair<int, string>` copies its
 fields, just like any other struct. Arrays and classes used as fields retain their reference
 semantics.
 

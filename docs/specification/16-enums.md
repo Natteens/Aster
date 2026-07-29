@@ -1,12 +1,9 @@
-# Enums e seleção segura
+# Enums and safe selection
 
-## Objetivo
+Enums represent exactly one case from a closed set. A case may carry data, which supports states,
+absence, and expected failures without `null`, exceptions, or sentinel values.
 
-Enums representam um valor que está em exatamente um entre um conjunto fechado de casos. Um caso
-pode carregar dados. Essa forma permite modelar estados, ausência e falhas esperadas sem `null`,
-exceções ou valores sentinela.
-
-## Sintaxe aceita
+## Accepted syntax
 
 ```aster
 public enum Message
@@ -18,7 +15,7 @@ public enum Message
 Message message = Message.Move(20, 22);
 ```
 
-Enums genéricos são especializados com tipos concretos antes da geração de código:
+Generic enums are specialized with concrete types before code generation:
 
 ```aster
 public enum Option<T>
@@ -28,7 +25,7 @@ public enum Option<T>
 }
 ```
 
-## Switch
+## `switch`
 
 ```aster
 switch (message)
@@ -40,17 +37,17 @@ switch (message)
 }
 ```
 
-O valor selecionado é avaliado uma vez. Não existe fallthrough e `break` continua exclusivo de
-loops. Cada arm possui escopo próprio. Sem `default`, todos os casos devem aparecer; casos
-duplicados, inexistentes ou com número incorreto de bindings são erros.
+The selected value is evaluated once. Cases do not fall through, and `break` remains a loop-only
+statement. Each arm has its own scope. Without `default`, every case must appear; duplicate or
+unknown cases and incorrect payload binding counts are errors.
 
-## Representação
+## Representation
 
-Um enum concreto é um valor formado por uma tag interna e armazenamento alinhado para o maior
-payload. A tag não é parte da API e não pode ser convertida para inteiro. Cópia e igualdade leem
-somente o payload do caso ativo. Não existe boxing ou alocação no heap por padrão.
+A concrete enum is a value containing an internal tag and aligned storage for its largest payload.
+The tag is not public and cannot be converted to an integer. Copy and equality inspect only the
+active payload. Enums do not require boxing or a heap allocation by default.
 
-## Exemplos inválidos
+## Invalid examples
 
 ```aster
 switch (message)
@@ -60,20 +57,16 @@ switch (message)
 }
 ```
 
-O switch não cobre `Move` e não possui `default`.
+This switch omits `Move` and has no `default`.
 
 ```aster
 Message message = Message.Move(10);
 ```
 
-`Move` exige dois argumentos `int`.
+`Move` requires two `int` arguments.
 
-## Limites atuais
+## Current limits
 
-Pattern matching aninhado, guards, switch expression, discriminantes numéricos, flags, casts de
-enum, métodos em enum e valores default implícitos não existem.
-
-**OPEN QUESTION:** uma versão futura poderá adicionar padrões aninhados. As alternativas são
-padrões estruturais completos, padrões limitados a um nível ou métodos auxiliares explícitos. A
-recomendação PROPOSED é começar com padrões estruturais sem guards apenas depois que a análise de
-exaustividade suportar diagnósticos igualmente claros.
+Nested patterns, guards, switch expressions, numeric discriminants, flags, enum casts, enum methods,
+and implicit default values are not implemented. Nested structural patterns may be reconsidered
+after exhaustiveness diagnostics can remain equally precise.

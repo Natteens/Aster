@@ -1,26 +1,28 @@
 # Standard library
 
-Aster ships a small standard library embedded in the compiler. Its APIs are written in ordinary
-Aster source and pass through the same type checking, monomorphization, HIR, MIR, and JIT pipeline
-as project code.
+ASTER ships its standard library with the toolchain. An installed CLI resolves it relative to the
+executable; development binaries can use the embedded copy, and `ASTER_STDLIB` can select an
+explicit valid tree. An invalid higher-priority source fails instead of silently falling back.
 
-Use a standard-library namespace explicitly:
+Standard-library source passes through the same parser, linking, semantic analysis,
+monomorphization, HIR, MIR, and JIT pipeline as project code. Compiler-known nominal types and host
+intrinsics still resolve through official `aster.*` symbols rather than text or layout matching.
 
-```aster
-using aster.math;
-using aster.text;
-using aster.core;
-```
+## Namespaces
 
-- [`aster.math`](math.md) contains scalar `Abs`, `Min`, `Max`, and `Clamp` overloads.
-- [`aster.text`](strings.md) contains focused text helpers such as `String.IsEmpty`.
-- [`aster.core`](option-result.md) defines the generic `Option<T>` and `Result<T, E>` enums.
-- [Logging](logging.md) exposes `Log`, `Log.Warning`, and `Log.Error` through the runtime boundary.
+- `aster.core` defines [`Option<T>` and `Result<T, E>`](option-result.md).
+- `aster.io` provides [terminal and host-managed filesystem operations](io.md).
+- `aster.math` provides scalar [`Abs`, `Min`, `Max`, and `Clamp`](math.md) overloads.
+- `aster.text` provides immutable-text helpers documented with [strings](strings.md).
+- `aster.collections` defines the official
+  [`DictionaryEntry<K, V>` snapshot value](collections.md#dictionaryk-v).
 
-The `aster.*` prefix is reserved for this embedded library. A project cannot shadow an official
-namespace with local source. If an expected embedded source is missing, the compiler reports an
-installation error rather than searching the project.
+`List<T>`, `Dictionary<K, V>`, `Task<T>`, and `Parallel` are official nominal surfaces recognized
+by the compiler. Their executable operations are described in
+[Collections](collections.md) and [Concurrency](concurrency.md).
 
-The library is deliberately narrow. It has no general collection package, task API, engine API, or
-GPU surface today. Those areas require language and runtime decisions before a library can give them
-a stable contract.
+The `aster.*` prefix is reserved. Project source cannot shadow an official namespace or replace an
+official type with a class that has the same short name or layout.
+
+The library does not contain a package registry, dependency resolver, engine API, GPU API, or
+general shared-memory threading surface.

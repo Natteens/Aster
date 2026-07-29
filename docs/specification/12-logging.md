@@ -2,7 +2,7 @@
 
 ## Objective
 
-Define Aster’s accepted minimal logging API and the proposed build-profile filtering model.
+Define ASTER’s accepted minimal logging API and the proposed build-profile filtering model.
 Logging is a standard-library facility, not language syntax.
 
 ## Accepted syntax

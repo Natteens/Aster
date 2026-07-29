@@ -1,14 +1,11 @@
-# Aster examples
+# ASTER examples
 
-Install the local CLI by following [Getting started](../docs/getting-started.md) before running these
-programs.
+Install ASTER by following [Getting started](../docs/getting-started.md). The examples are checked
+into the compiler repository, so run the commands below from the repository root.
 
-The examples below form a short learning path. Each one uses the standard application entry point,
-so no explicit function name is needed.
+## Start with complete programs
 
-## Single-file examples
-
-1. **Hello** logs a message and returns a visible result.
+1. **Hello** prints a message and returns a visible result.
 
    ```console
    aster run examples/hello.aster
@@ -26,7 +23,7 @@ so no explicit function name is needed.
    aster run examples/objects.aster
    ```
 
-4. **Enums** uses an exhaustive `switch` over enum cases.
+4. **Enums** uses an exhaustive `switch`.
 
    ```console
    aster run examples/enums.aster
@@ -58,43 +55,39 @@ so no explicit function name is needed.
 
 ## Multifile projects
 
-Project commands still receive the root `.aster` source file. The nearest `Aster.toml` establishes
-the project root and application entry.
+Manifest-based projects can be checked and run from their own directory without passing a source
+file:
 
-- **Hello app** is the smallest manifest-based multifile application.
+```console
+cd examples/hello_app
+aster check
+aster run
+```
 
-  ```console
-  aster run examples/hello_app/app/main.aster
-  ```
+Other project examples include:
 
-- **Namespaces** demonstrates folders, `namespace`, `using`, and the embedded standard library.
+- `namespaces` for folder namespaces, `namespace`, and `using`;
+- `option_result` and `result_propagation_multifile` for errors across files;
+- `generic_types_multifile` for concrete generic specialization;
+- `file-indexer` for filesystem, collections, and reporting.
 
-  ```console
-  aster run examples/namespaces/app/main.aster
-  ```
+## Focused compiler examples
 
-## Focused examples
+The remaining programs isolate narrower behavior:
 
-The remaining valid programs explore narrower behavior used during compiler development:
-
-- `arrays`, `array_initialized`, and `array_structs` cover distinct allocation and value cases.
+- `arrays`, `array_initialized`, and `array_structs` cover allocation and value cases.
 - `integer_widths`, `numeric_types`, and `expressions` exercise numeric rules and evaluation order.
-- `classes_counter`, `class_composition`, `properties_and_equality`, and `structs` show different
+- `classes_counter`, `class_composition`, `properties_and_equality`, and `structs` show
   value/reference combinations.
-- `void_main` shows a `public static void Main()` entry point that produces no value, plus an
-  instance created explicitly with `new` whose methods use fields and sibling methods without
-  qualifying the receiver.
-- `string_interpolation` shows `$"...{expr}..."` building a `string` from an instance method's
-  result.
-- `generic_types`, `enum_payloads`, and the result-propagation variants cover concrete layouts that
-  reach the JIT.
-- the `multifile*` directories are integration programs for project linking and dispatch.
+- `string_interpolation` and `strings_basics` exercise UTF-8 text.
+- `generic_types`, `enum_payloads`, and the result-propagation variants cover concrete layouts.
+- the `multifile*` directories serve as project-linking integration programs.
 
-Some focused files expose a namespace-level function for explicit execution, for example:
+Some files expose a public namespace-level function instead of an application entry:
 
 ```console
 aster run examples/expressions.aster --function Run
 ```
 
-`decimal_frontend.aster` is intentionally check-only: it documents that decimal syntax and type
-checking exist while the JIT representation does not.
+`decimal_frontend.aster` is a negative compiler fixture. Decimal syntax is parsed and typed, but the
+executable subset rejects decimal layout before HIR/MIR execution.

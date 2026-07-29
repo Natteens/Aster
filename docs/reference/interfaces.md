@@ -38,7 +38,7 @@ Converting a class reference to one of its declared interfaces is implicit and s
 value still refers to the same object, so mutation through an interface is visible through the
 original class reference. Calls use the object's concrete implementation at runtime.
 
-Interface values can be used in locals, parameters, class fields, arrays and returns between Aster
+Interface values can be used in locals, parameters, class fields, arrays and returns between ASTER
 functions. They are non-null in the current language because `null` does not exist. Equality uses
 the identity of the underlying object. Downcasts, interface inheritance, default methods, struct
 implementations and generic constraints are not implemented yet.

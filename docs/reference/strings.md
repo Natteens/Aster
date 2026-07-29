@@ -8,11 +8,11 @@ string name = "Natte";
 string message = "Olá, " + name + "!";
 message += " Bem-vindo.";
 
-Log(message);
+WriteLine(message);
 int length = message.Length;
 ```
 
-Both operands of `+` must be strings. Aster does not silently turn numbers, booleans, characters,
+Both operands of `+` must be strings. ASTER does not silently turn numbers, booleans, characters,
 objects, arrays, or structs into text with `+`; use string interpolation instead.
 
 ## String interpolation
@@ -24,7 +24,7 @@ expression grammar — names, fields, properties, calls, operators, and more:
 int quantity = 4;
 int price = 15;
 
-Log($"Total: {quantity * price}");
+WriteLine($"Total: {quantity * price}");
 ```
 
 Each `{expression}` is evaluated exactly once, left to right, then converted to text and joined
@@ -46,7 +46,11 @@ Normal strings are unaffected: `"{like this}"` has no `$` prefix, so `{` and `}`
 than 11 UTF-8 bytes because `á` is multibyte, but its `Length` is 11. This is not a grapheme-cluster
 count: a user-perceived character made from multiple Unicode scalars counts once per scalar.
 
-`Length` is read-only, and text indexing is not implemented.
+`Length` is read-only. `text[index]` accepts an `int` Unicode-scalar index and returns `char`; it
+does not expose UTF-8 bytes or split a multibyte scalar.
+
+`foreach (char scalar in text)` decodes the same scalar sequence without allocating an iterator.
+Combining marks remain separate values because ASTER does not segment grapheme clusters.
 
 ## Empty strings
 
@@ -57,7 +61,7 @@ using aster.text;
 
 if (String.IsEmpty(message))
 {
-    Log("Mensagem vazia");
+    WriteLine("Mensagem vazia");
 }
 ```
 
@@ -79,6 +83,6 @@ dynamic concatenations allocate exactly one result for each binary `+` operation
 
 ## Current limits
 
-There is no general implicit `ToString`, indexing, substring, split, replace, regex, mutable
-buffer, or nullable string. Strings are not collections, and Aster exposes no raw string pointers.
-Interpolation has no format specifiers, alignment, culture, or raw/verbatim form.
+There is no general implicit `ToString`, split, replace, regex, mutable buffer, or nullable string.
+ASTER exposes neither UTF-8 bytes nor raw string pointers. Interpolation has no format specifiers,
+alignment, culture, or raw/verbatim form.

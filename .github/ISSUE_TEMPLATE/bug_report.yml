@@ -1,0 +1,58 @@
+name: Bug report
+description: Report reproducible incorrect behavior in ASTER
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please search existing issues first and reduce the problem to the smallest reproducible case.
+  - type: input
+    id: version
+    attributes:
+      label: ASTER version
+      description: Run `aster --version`.
+      placeholder: "aster x.y.z"
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Windows x64
+        - Linux x64
+        - Development checkout
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include the source, manifest when relevant, and exact command.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include exit code and diagnostics. Remove private paths or data.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I reproduced this with the version reported above.
+          required: true
+        - label: This report contains no secrets or private source code.
+          required: true

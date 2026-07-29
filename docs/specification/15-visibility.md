@@ -15,7 +15,7 @@ private
 ```
 
 Exactly one simple visibility modifier may appear on a declaration. Compound forms such as
-`protected internal` and `private protected` are not part of Aster at this stage.
+`protected internal` and `private protected` are not part of ASTER at this stage.
 
 ## Accepted rules
 
@@ -35,7 +35,7 @@ public class Player
 
 ### `internal`
 
-Accessible within the same Aster project, including across different namespaces. A file must still
+Accessible within the same ASTER project, including across different namespaces. A file must still
 use the other namespace to bring its names into scope. The project root is the nearest `Aster.toml`
 directory, or the root source directory when no manifest exists. It may be used for namespace-level
 declarations and type members.
@@ -87,7 +87,7 @@ public class Entity
 - Required interface members are public by contract.
 - Explicit modifiers are recommended for public API declarations.
 - Only one simple visibility modifier may be applied to one declaration.
-- Aster does not currently have compound accessibility, `friend`, file-only visibility, or other
+- ASTER does not currently have compound accessibility, `friend`, file-only visibility, or other
   visibility modifiers.
 
 ## Valid design example

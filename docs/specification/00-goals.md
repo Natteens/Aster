@@ -1,6 +1,6 @@
 # Design goals
 
-Aster explores a native language where low-level work can remain direct without forcing every
+ASTER explores a native language where low-level work can remain direct without forcing every
 program to read like systems code. These goals guide design decisions; they are not a list of
 implemented features. The [language reference](../reference/) and
 [implemented grammar](../compiler/grammar.md) describe what the compiler accepts today.
@@ -57,12 +57,12 @@ error or one-command example is as important to daily use as a well-factored com
 **Practical consequence:** supported behavior should be checkable with `aster check`, runnable with
 `aster run`, and documented from a user's point of view.
 
-## Parallelism is research
+## Parallelism stays explicit
 
-Safe, deterministic parallel execution is a long-term research direction, not a current feature.
-Aster has no automatic parallelism, thread API, GPU backend, or HVM integration today. Any future
-model must keep synchronization, scheduling cost, and observable behavior understandable. Research
-may learn from systems such as Bend and HVM without committing Aster to their architecture.
+ASTER provides restricted `Task<T>`, `await`, and `Parallel` operations with compiler-checked worker
+boundaries. It does not provide automatic parallelization, general shared-memory threads, a GPU
+backend, or HVM integration. Any extension must keep synchronization, transfer, scheduling cost,
+and observable behavior understandable.
 
 ## Status and open questions
 

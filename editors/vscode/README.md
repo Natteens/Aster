@@ -1,4 +1,4 @@
-# Aster for Visual Studio Code
+# ASTER for Visual Studio Code
 
 This extension makes VS Code understand `.aster` files. Open one and you get syntax
 highlighting, comment toggling with `Ctrl+/`, matching brackets with auto-closing, and a
@@ -24,7 +24,7 @@ special setup or extra windows.
 ## Colors and the Aster Night theme
 
 By default the extension follows your current color theme. It also ships an optional dark
-theme called **Aster Night**, tuned for Aster: blue and purple keywords, cyan primitive
+theme called **Aster Night**, tuned for ASTER: blue and purple keywords, cyan primitive
 types, turquoise type names, soft-yellow function calls (including `Log`, `Log.Warning`,
 and `Log.Error`), soft-orange strings, and muted comments. Red never appears on valid
 code — it is reserved for real problems, like an invalid escape sequence.
@@ -38,5 +38,5 @@ Works today: recognition of `.aster` files, syntax coloring, comments, bracket p
 basic indentation, folding, and snippets.
 
 Not available yet: semantic autocomplete, error squiggles while you type, rename, and
-go-to-definition. These need a language server — the future **Aster Language Server**
+go-to-definition. These need a language server — the future **ASTER Language Server**
 (`aster-lsp`) — and will arrive with it rather than being imitated here.

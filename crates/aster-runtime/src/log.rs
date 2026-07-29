@@ -1,7 +1,7 @@
 //! Standard-library logging surface: `Log`, `Log.Warning`, and `Log.Error`.
 //!
 //! Format: `[log] message` on stdout for normal messages, `[warning] message`
-//! and `[error] message` on stderr. No timestamps in this phase. `Log.Error`
+//! and `[error] message` on stderr. Messages have no timestamps. `Log.Error`
 //! never terminates the program; logging is not error handling.
 
 use crate::string::{AsterStrHeader, view};

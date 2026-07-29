@@ -22,8 +22,7 @@ use crate::ExecutionContext;
 use crate::io_error::{PortableIoErrorKind, classify_io_error};
 use crate::string::{AsterStrHeader, view};
 
-/// The single size limit ASTER 1.0 applies to both `ReadAllText` and
-/// `WriteAllText`, per operation. Not configurable in this milestone.
+/// The fixed per-operation size limit for `ReadAllText` and `WriteAllText`.
 pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Fixed, host-enforced limits for one `ListFiles` operation. They cap only

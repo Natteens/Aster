@@ -1,92 +1,109 @@
-# Aster
+# ASTER
 
 [![CI](https://github.com/Natteens/Aster/actions/workflows/ci.yml/badge.svg)](https://github.com/Natteens/Aster/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/Natteens/Aster?display_name=tag&sort=semver)](https://github.com/Natteens/Aster/releases/latest)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-Aster is an experimental native language that explores how low-level programming can feel direct
-without making every program look low-level. Its code is familiar and readable, while types,
-representations, errors, and runtime costs stay concrete.
+ASTER is an experimental native language with static nominal types, region-based memory, and a
+Cranelift JIT. The compiler and runtime are written in Rust.
 
-The compiler is written in Rust and executes programs natively through a Cranelift JIT. Aster is
-not production-ready: syntax, tooling, and the runtime model may still change.
+[Getting started](docs/getting-started.md) · [Documentation](docs/README.md) ·
+[Examples](examples/README.md) · [Contributing](CONTRIBUTING.md)
 
-## A first program
+> [!NOTE]
+> ASTER is not 1.0 yet. Syntax, APIs, and runtime details may change while the language develops.
+
+## Install
+
+Official installers are available for Windows x64 and Linux x64.
+
+**Windows PowerShell**
+
+```powershell
+irm https://github.com/Natteens/Aster/releases/latest/download/install.ps1 | iex
+```
+
+**Linux**
+
+```sh
+curl -fsSL https://github.com/Natteens/Aster/releases/latest/download/install.sh | sh
+```
+
+Open a new terminal, then check the installation:
+
+```console
+aster --version
+aster doctor
+```
+
+The installers verify the release checksum before installing. They do not require Rust, Cargo, or a
+clone of this repository. See [Getting started](docs/getting-started.md) for the complete flow.
+
+## Create your first project
+
+```console
+aster new HelloAster
+cd HelloAster
+aster check
+aster run
+```
+
+The generated program prints `Hello from ASTER!` and returns `0`.
+
+## A small ASTER program
 
 ```aster
+namespace app;
+
+using aster.io;
+
 public class Program
 {
     public static int Main()
     {
-        Log("Hello, Aster!");
-        return 42;
+        WriteLine("Hello from ASTER!");
+        return 0;
     }
 }
 ```
 
-After cloning the repository, install the CLI from its root with stable Rust 1.85 or newer:
+## What works today
 
-```console
-cargo install --path crates/aster-cli --locked --force
-```
+- Static, strong, nominal types with non-null references by default.
+- Classes, structs, interfaces, enums, properties, overloads, and monomorphized generics.
+- Arrays, `List<T>`, `Dictionary<K, V>`, `Option<T>`, and `Result<T, E>`.
+- Immutable UTF-8 strings and `char` values that represent Unicode scalars.
+- Region-based memory backed by temporary and persistent arenas.
+- Multifile projects, filesystem and terminal APIs, and a Cranelift JIT.
+- Restricted worker-based task and parallel operations with explicit transfer boundaries.
+- A CLI for project creation, diagnostics, checking, running, watching, and HIR/MIR inspection.
 
-The installed executable is named `aster`:
+The [language tour](docs/language-tour.md) introduces these features through code. The
+[compiler documentation](docs/README.md#compiler-internals) covers the pipeline and memory model.
 
-```console
-aster run examples/hello.aster
-aster check examples/hello.aster
-aster watch examples/hello.aster
-```
+## Current limits
 
-The first command logs a greeting and prints `42`.
+ASTER currently distributes native toolchains for Windows x64 and Linux x64. macOS and ARM are not
+official targets. There is no package manager or standalone AOT compiler yet, and the worker model
+does not provide general shared-memory threads.
 
-## Why Aster
+See the [roadmap](docs/roadmap.md) for planned work and research boundaries.
 
-Aster is guided by a few practical choices:
+## Documentation
 
-- **Concrete types.** Generic code is specialized before HIR and MIR, so layouts and calls do not
-  depend on hidden type erasure.
-- **Predictable behavior.** Evaluation order, dispatch, allocation, and value-versus-reference
-  semantics should be visible in the language model.
-- **Explicit failure.** Expected absence and errors travel through values such as `Option<T>` and
-  `Result<T, E>` instead of implicit nulls or exceptions.
-- **Usable tools.** Installation, diagnostics, examples, and the CLI are part of the language
-  experience, not an afterthought.
+- [Getting started](docs/getting-started.md)
+- [Language tour](docs/language-tour.md)
+- [CLI reference](docs/reference/cli.md)
+- [Language and standard library reference](docs/README.md#language-reference)
+- [Compiler internals](docs/README.md#compiler-internals)
+- [Runnable examples](examples/README.md)
 
-The complete principles and their practical consequences are in the
-[design goals](docs/specification/00-goals.md).
+## Contributing
 
-## Where the project stands
-
-Today Aster can run single-file and multifile programs with concrete primitives, arrays, classes,
-structs, interfaces, enums, properties, overloads, namespaces, and monomorphized generics. Its
-standard library includes focused math and text APIs together with `Option<T>` and `Result<T, E>`.
-
-The compiler follows a typed pipeline from AST to HIR, MIR, and Cranelift. It does not yet produce
-standalone executables, manage packages, provide long-lived object ownership, or offer a garbage
-collector. Automatic parallelism, threads, GPU execution, and HVM integration are research topics,
-not current features. Any future work in that area must preserve determinism and make its costs
-understandable; Aster is not committed to reproducing Bend's architecture.
-
-Dynamic objects, arrays, and strings are owned by per-execution paged arenas. Conservative escape
-analysis reclaims proven function-local allocations on return while keeping uncertain or escaping
-values persistent for the rest of the invocation. See [memory management](docs/compiler/memory-management.md)
-for the region rules, metrics, and reproducible benchmark.
-
-## Learn and explore
-
-- [Getting started](docs/getting-started.md) installs the CLI and builds a first program.
-- [Runnable examples](examples/README.md) provide a short learning path.
-- [Language tour](docs/language-tour.md) explains the main ideas through code.
-- [Documentation index](docs/README.md) separates guides, reference, compiler internals, and
-  research notes.
-
-## Development
-
-Aster is a Cargo workspace: the compiler, syntax tree, IRs, runtime, CLI, and Cranelift backend are
-separate crates. The VS Code extension lives in [`editors/vscode`](editors/vscode/README.md).
-
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before proposing language behavior or architectural changes.
-The official project is maintained at [Natteens/Aster](https://github.com/Natteens/Aster).
+Focused fixes, tests, and documentation improvements are welcome. Discuss new language behavior,
+runtime capabilities, or substantial architecture changes before implementing them. Start with
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-Aster is licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.
+ASTER is licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.

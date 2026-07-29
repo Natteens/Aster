@@ -1,56 +1,58 @@
 # Roadmap
 
-Aster is still at `0.0.0`. The current work is about making a coherent language and toolchain,
-not promising a production release date. The [technical roadmap](technical-roadmap.md) records
-dependency order and deeper compiler milestones; this page describes the public direction.
+ASTER develops in vertical slices. A language feature is complete only when syntax, semantic
+validation, HIR, MIR, the Cranelift JIT, diagnostics, tests, and a usable example agree on its
+behavior.
+
+This page describes public direction rather than a release schedule.
 
 ## Available now
 
-Aster has an end-to-end native JIT pipeline: source is parsed and linked, generic uses are
-monomorphized, semantic analysis produces typed HIR, HIR lowers to control-flow MIR, and Cranelift
-executes the result.
+The current toolchain includes:
 
-Programs can use concrete primitive and user-defined types, functions and methods, deterministic
-overloads, arrays, classes, structs, interfaces, enums, properties, namespaces, multifile projects,
-generic functions and types, `Option<T>`, `Result<T, E>`, and postfix `?`. The CLI checks, runs,
-watches, and exposes HIR/MIR dumps for compiler development.
+- static nominal types, classes, structs, interfaces, enums, and concrete generic specialization;
+- arrays, `List<T>`, `Dictionary<K, V>`, `Option<T>`, `Result<T, E>`, and compiler-known `foreach`;
+- immutable UTF-8 strings with Unicode-scalar `char`, indexing, and iteration;
+- region-based temporary and persistent allocation with conservative escape analysis;
+- terminal and host-managed filesystem operations;
+- multifile projects with `Aster.toml` and conventional `Main`;
+- restricted `Task<T>`, `await`, and `Parallel` operations with checked worker boundaries;
+- checking, JIT execution, watch mode, installation diagnostics, and HIR/MIR inspection;
+- official Windows x64 and Linux x64 release archives, installers, repair/update/rollback, and
+  uninstallers.
 
-This is an experimental JIT environment. Classes, arrays, and strings live for one execution;
-structs and enums are values. The standard library is embedded and intentionally small.
+## Toward 1.0
 
-## Near-term language work
+The work before 1.0 is about closing explicit boundaries:
 
-The next language work should close gaps rather than add disconnected syntax:
+- define long-lived ownership and any safe foreign-function or unsafe-code boundary;
+- improve diagnostics and reference coverage as the executable subset grows;
+- finish type-system decisions such as generic constraints and richer pattern handling;
+- specify compatibility expectations for source, projects, the runtime ABI, and the standard
+  library;
+- measure representative programs before choosing compiler optimizations;
+- keep the worker model deterministic and explicit as concurrency support develops;
+- decide the minimum dependency and package model without hiding downloads or build steps.
 
-- settle long-lived ownership and the boundary for unsafe or foreign code;
-- make unsupported type features explicit, including constraints and richer generic relationships;
-- improve pattern-oriented enum handling without weakening exhaustive checking;
-- define string and collection growth beyond the current immutable strings and fixed arrays;
-- keep diagnostics, examples, and reference documentation aligned with executable behavior.
+No item is complete merely because it parses. Unsupported layouts and operations must continue to
+fail before unsafe execution.
 
-No item is considered complete merely because it parses. It must preserve concrete types through
-semantics, HIR, MIR, execution, diagnostics, and tests.
+## Not available yet
 
-## Tooling and distribution
+ASTER does not currently provide:
 
-The CLI is installable locally, but Aster has no package manager, dependency registry, standalone
-binary output, or stable ABI. Future distribution work includes deciding how projects identify
-their root source, how the standard library is packaged, and whether AOT/object generation belongs
-in the first stable toolchain.
+- a package manager or dependency registry;
+- standalone AOT executables or a stable native ABI;
+- official macOS or ARM distributions;
+- general shared-memory threads or implicit automatic parallelization;
+- a language server, semantic editor features, or a formatter;
+- GPU compilation, HVM lowering, or an engine lifecycle.
 
-## Research, not current features
+## Research
 
-Automatic parallelism, explicit task APIs, GPU execution, HVM integration, hot reload, and optional
-engine-oriented libraries are research areas. None is implemented today.
+Hot reload, GPU targets, HVM-related execution models, and an optional ECS/engine layer remain
+research. Research notes live in [`docs/research`](research/) so they cannot be mistaken for
+compiler documentation or scheduled features.
 
-Any future concurrency or parallel execution model must prioritize safety, determinism, and
-understandable scheduling and synchronization costs. Aster may study systems such as Bend and HVM,
-but it has no commitment to copy their architecture. ECS and engine lifecycle conventions remain
-outside the core language unless a future proposal demonstrates a clear, optional boundary.
-
-## Toward `0.1.0`
-
-The first planned release will be scoped from language and JIT feedback. It should represent a
-documented, testable baseline rather than a claim of production readiness. Source compatibility,
-supported platforms, memory guarantees, and distribution expectations must be stated explicitly
-before that release is considered stable.
+Any future work in these areas must preserve concrete types, deterministic failure, explicit
+transfer and ownership rules, and understandable runtime costs.

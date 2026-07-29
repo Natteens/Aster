@@ -1,4 +1,4 @@
-//! End-to-end coverage for the complete nominal native Dictionary milestone.
+//! End-to-end coverage for the official nominal `Dictionary<K,V>`.
 
 #![allow(clippy::needless_raw_string_hashes)]
 

@@ -2,22 +2,23 @@
 
 Every `aster run` invocation owns one Rust `ExecutionContext`. `aster watch` calls the same
 execution function after each successful rebuild, so each run receives a new context and the
-previous one is dropped first. Generated Aster code never owns, frees, or retains this context.
+previous one is dropped first. Generated ASTER code never owns, frees, or retains this context.
 
-Every compiled Aster function receives a hidden context pointer as its first ABI parameter. Calls
-between Aster functions forward that pointer. It is not visible in source, HIR signatures, or the
+Every compiled ASTER function receives a hidden context pointer as its first ABI parameter. Calls
+between ASTER functions forward that pointer. It is not visible in source, HIR signatures, or the
 user-selected entry function.
 
 ## Ownership
 
-Dynamic allocations are stored in host-owned collections inside the context. Dropping the context
-drops every array header, backing buffer, and object allocation at once. There is no garbage collector, reference
-count, finalizer, process-global arena, or thread-local owner. No pointer from one execution can be
-supplied to another execution.
+Dynamic allocations live in the context's temporary or persistent arena. Dropping the context
+releases strings, arrays, `List<T>`, `Dictionary<K,V>`, class objects, and their backing storage
+together. There is no garbage collector, reference count, finalizer, process-global arena, or
+thread-local owner. No pointer from one execution can be supplied to another execution.
 
-This per-execution arena is intentionally simple: cleanup is deterministic while Aster has no
-general ownership syntax. It supports fixed-size arrays and class instances for the duration of
-one execution; it is not a promise that a future long-lived/AOT runtime will use the same policy.
+This per-execution model keeps cleanup deterministic while ASTER has no general ownership syntax.
+Escape analysis selects a region for compiler-known dynamic allocations; see
+[memory management](memory-management.md). It is not a promise that a future long-lived or AOT
+runtime will use the same policy.
 
 ## Object ABI
 
@@ -50,7 +51,8 @@ and reports the first runtime failure instead of the computed value.
 
 ## Current limits
 
-Arrays are fixed-length, mutable, non-null references. There are no slices, resizing, nested or
-multidimensional arrays, array `foreach`, escaping host references, or independent deallocation.
+Arrays are fixed-length, mutable, non-null references. `List<T>` can resize, while
+`Dictionary<K,V>` owns native insertion-ordered storage. There are no slices, multidimensional
+arrays, escaping host references, or independent deallocation.
 Class inheritance, finalizers, independent destruction, weak references and objects escaping the
 execution remain outside this implementation.

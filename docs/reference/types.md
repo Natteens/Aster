@@ -1,6 +1,6 @@
 # Primitive types
 
-Aster uses fixed-width numeric types. The frontend preserves each type through HIR and MIR;
+ASTER uses fixed-width numeric types. The frontend preserves each type through HIR and MIR;
 the JIT executes every type in this table except `decimal`.
 
 | Type | Size | Sign | Typical use | Execution |

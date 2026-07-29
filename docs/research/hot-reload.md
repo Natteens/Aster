@@ -1,14 +1,14 @@
-# Hot reload: future foundation
+# Hot-reload research
 
-This document describes how stateful hot reload *could* work in Aster later. Nothing here is
-implemented. What exists today is `aster watch` — **recompile and restart**: every rebuild
+This document describes how stateful hot reload could work in ASTER later. Nothing here is
+implemented. What exists today is `aster watch`: every rebuild
 produces a fresh JIT session, runs the selected function from scratch, and frees the previous
 module. No state survives. Real hot reload means replacing code inside a *running* program
 while preserving its state; the two must never be conflated.
 
 ## Function indirection table
 
-Today the JIT emits direct calls between compiled Aster functions. Hot reload requires one
+Today the JIT emits direct calls between compiled ASTER functions. Hot reload requires one
 level of indirection: calls go through a per-function slot in a table of function pointers.
 Swapping an implementation becomes an atomic pointer store instead of repatching call sites.
 The MIR → backend boundary already identifies callees by `SymbolId`, so the table can be
@@ -51,7 +51,7 @@ safe point or lazily on first touch; migration failure downgrades the reload to 
 
 - **Classes**: vtables (once virtual dispatch exists) are updated like the function table;
   instance layout changes trigger the migration path above.
-- **ECS**: if a future optional ECS package exists (`docs/future/ecs-package.md`), component
+- **ECS**: if a future optional ECS package exists ([ECS research](ecs.md)), component
   arrays would be the dominant state. Component layout changes would require per-archetype
   migration; system signature changes would re-register the system in the schedule. This is
   entirely speculative: ECS is not part of the language, compiler, or runtime today.
@@ -77,5 +77,4 @@ report *why*, then fall back to recompile-and-restart (what `aster watch` alread
 - MIR is backend-independent and identifies functions symbolically, leaving room for the
   indirection table without changes to the frontend.
 
-No indirection or versioning is added today; the only requirement on current code is to keep
-these boundaries clean, which costs nothing now.
+No indirection, state migration, or reload versioning exists today.

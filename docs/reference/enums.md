@@ -18,7 +18,7 @@ Message quit = Message.Quit;
 Message move = Message.Move(10, 20);
 ```
 
-Enum values copy by value. Their numeric tag and memory layout are compiler details: Aster does
+Enum values copy by value. Their numeric tag and memory layout are compiler details: ASTER does
 not implicitly convert an enum to or from an integer, and cases do not accept explicit numeric
 values in this version.
 

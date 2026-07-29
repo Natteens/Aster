@@ -33,9 +33,7 @@ import {
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 const { bundleTarget, binaryName } = detectBundleTarget();
 
@@ -60,21 +58,18 @@ function createFakeWorkspace(
         incompleteStdlib = false,
     } = {},
 ) {
-    // Fake release binary
     if (!skipBinary) {
         mkdirSync(join(root, "target", "release"), { recursive: true });
         writeFileSync(join(root, "target", "release", binaryName), "fake-binary");
     }
 
-    // LICENSE
     if (!skipLicense) {
         writeFileSync(join(root, "LICENSE"), "Apache-2.0 placeholder\n");
     }
 
-    // stdlib
     if (!skipStdlib) {
         const modules = incompleteStdlib
-            ? REQUIRED_STDLIB_MODULES.slice(0, 1) // only first module
+            ? REQUIRED_STDLIB_MODULES.slice(0, 1)
             : REQUIRED_STDLIB_MODULES;
         for (const rel of modules) {
             const full = join(root, "stdlib", rel.split("/").join(sep));
@@ -101,9 +96,7 @@ function runFakeBundle(workspaceRoot, distRoot, opts = {}) {
     });
 }
 
-// ---------------------------------------------------------------------------
 // Target / naming / version
-// ---------------------------------------------------------------------------
 
 test("detectBundleTarget returns supported target for this platform", () => {
     const { bundleTarget: t, binaryName: b } = detectBundleTarget();
@@ -124,9 +117,7 @@ test("readVersion extracts version from Cargo.toml", () => {
     assert.match(version, /^\d+\.\d+\.\d+/, "version must be semantic");
 });
 
-// ---------------------------------------------------------------------------
 // Path safety
-// ---------------------------------------------------------------------------
 
 test("assertSafeBundle accepts bundle directly inside dist", () => {
     const dist = join(tmpdir(), "dist");
@@ -162,9 +153,7 @@ test("assertSafeBundle rejects mismatched bundle name", () => {
     );
 });
 
-// ---------------------------------------------------------------------------
 // Error cases: missing sources
-// ---------------------------------------------------------------------------
 
 test("buildBundle fails with actionable message when binary is absent", () => {
     const root = tempDir("no-binary");
@@ -233,9 +222,7 @@ test("buildBundle fails when stdlib structure is incomplete", () => {
     }
 });
 
-// ---------------------------------------------------------------------------
 // Successful bundle: structure and manifest
-// ---------------------------------------------------------------------------
 
 test("buildBundle creates correct layout with valid manifest", () => {
     const root = tempDir("layout");
@@ -328,9 +315,7 @@ test("rebuild of existing bundle directory is idempotent", () => {
     }
 });
 
-// ---------------------------------------------------------------------------
 // Path with spaces and Unicode
-// ---------------------------------------------------------------------------
 
 test("buildBundle works when dist path contains spaces", () => {
     const root = tempDir("spaces");
@@ -372,9 +357,7 @@ test("buildBundle works when dist path contains Unicode characters", () => {
     }
 });
 
-// ---------------------------------------------------------------------------
 // Determinism
-// ---------------------------------------------------------------------------
 
 test("two consecutive bundles produce identical manifests and file list", () => {
     const root = tempDir("determinism");
@@ -415,9 +398,7 @@ test("two consecutive bundles produce identical manifests and file list", () => 
     }
 });
 
-// ---------------------------------------------------------------------------
 // Relocatable proof — requires the real release binary
-// ---------------------------------------------------------------------------
 
 const STDLIB_PROGRAM =
     "using aster.math; public class Program { public static int Main() { return Math.Max(0, 1); } }";
@@ -518,8 +499,7 @@ test(
                 "program output must be 1",
             );
 
-            // --- Proof that the EXE-RELATIVE stdlib is used, not the embedded fallback ---
-            // Remove a required stdlib file from the relocated bundle.
+            // Removing this file must fail instead of falling back to the embedded stdlib.
             const mathFile = join(relocDir, "stdlib", "aster", "math.aster");
             const mathBackup = mathFile + ".bak";
             renameSync(mathFile, mathBackup);
@@ -608,9 +588,7 @@ test(
     },
 );
 
-// ---------------------------------------------------------------------------
 // Determinism with real binary (bundle command invoked via CLI)
-// ---------------------------------------------------------------------------
 
 test(
     "npm run bundle is deterministic across two consecutive runs",

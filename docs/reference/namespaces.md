@@ -52,7 +52,7 @@ using aster.math;
 ```
 
 A project cannot declare an `aster.*` namespace. If an official source is missing, the compiler
-reports an incomplete Aster installation instead of searching the project.
+reports an incomplete ASTER installation instead of searching the project.
 
 Two usings that expose the same name produce an ambiguity error. Qualified source references and
 aliases are future work, so the declarations must currently be renamed or reorganized.
@@ -60,7 +60,7 @@ aliases are future work, so the declarations must currently be renamed or reorga
 ## Visibility
 
 - `private` is visible only inside its owning class or struct.
-- `internal` is visible throughout the same Aster project, including across namespaces when the
+- `internal` is visible throughout the same ASTER project, including across namespaces when the
   namespace is brought into scope with `using`.
 - `public` is the API intended for other projects or packages in the future.
 - `protected` remains rejected with an honest diagnostic until inheritance or another extension

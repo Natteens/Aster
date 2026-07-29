@@ -31,7 +31,7 @@ bool enabled = true;
 - `component`, `system`, `read`, `write`, and `query` are ordinary identifiers. An early ECS
   syntax experiment once reserved some of these words in the lexer; that reservation was
   removed, and no core-language keyword is proposed for them by this lexical chapter. See
-  `docs/future/ecs-package.md`.
+  `docs/research/ecs.md`.
 - `//` starts a comment that ends at the next line ending.
 - Implemented numeric literals use decimal digits, optionally followed by the suffixes
   `L`/`l`, `U`/`u`, `UL`/`LU` in either case, `F`/`f`, `D`/`d`, or `M`/`m`. Floating-point

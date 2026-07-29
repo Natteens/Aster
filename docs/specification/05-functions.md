@@ -3,7 +3,7 @@
 ## Objective
 
 Distinguish namespace-level functions, class methods, struct methods, and interface members while
-preserving Aster’s type-before-name convention. This chapter does not select a program entry point.
+preserving ASTER’s type-before-name convention. This chapter does not select a program entry point.
 
 ## Accepted syntax
 
@@ -55,7 +55,7 @@ Interface members are public by contract and omit a redundant visibility modifie
 
 ## Accepted rules
 
-- Aster supports namespace-level functions and methods simultaneously.
+- ASTER supports namespace-level functions and methods simultaneously.
 - A function declaration consists of return type, name, parameter list, and body.
 - Each parameter has a type before its name.
 - A namespace-level function belongs to its declaring namespace rather than to a type.
@@ -88,7 +88,7 @@ public class Greeter
 
 ```aster
 fn Add(int a, int b) -> int { return a + b; }
-// Invalid: Aster does not use `fn` or `->`.
+// Invalid: ASTER does not use `fn` or `->`.
 ```
 
 ```aster

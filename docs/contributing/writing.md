@@ -1,4 +1,4 @@
-# Writing Aster documentation
+# Writing ASTER documentation
 
 Write first for the person using the language. Explain why a concept matters, show a small example,
 then link to the complete reference or compiler detail.
@@ -18,7 +18,7 @@ Use this checklist when reviewing a page:
   generic specialization, monomorphization, runtime, JIT, and toolchain.
 - Preserve technical precision. Do not simplify away evaluation order, representation, allocation,
   dispatch, or other observable costs.
-- Do not explain universal syntax as an identity claim. Aster having `if` or arrays is less useful
+- Do not explain universal syntax as an identity claim. ASTER having `if` or arrays is less useful
   than explaining what its conditions, values, and arrays mean.
 - Label excerpts as excerpts. Anything presented as a complete runnable program must compile with
   the documented command.

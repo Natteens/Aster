@@ -44,7 +44,7 @@ An integer without a suffix is `int` when it fits and otherwise `long`. A value 
 | `M` or `m` | `decimal` |
 
 A decimal-point literal without a suffix is currently `float`. This differs from C# and is
-kept for compatibility with existing Aster source. Floating literals that parse as infinity
+kept for compatibility with existing ASTER source. Floating literals that parse as infinity
 because they exceed their type's finite range are rejected rather than rounded silently to
 infinity. Normal IEEE 754 rounding still applies to representable source literals.
 
@@ -102,7 +102,7 @@ conversions. It never changes sign or loses precision silently.
 
 Two equal small integer operands still promote to `int`: `byte + byte` has type `int`.
 Compound assignment is strict. It is accepted only when the promoted operation type is the
-target type; Aster does not insert a hidden narrowing cast. Write the cast explicitly:
+target type; ASTER does not insert a hidden narrowing cast. Write the cast explicitly:
 
 ```aster
 byte value = 255;
@@ -138,7 +138,7 @@ rejects any function or compilation unit requiring decimal with a specific diagn
 - Unsigned comparisons, division and remainder use unsigned semantics.
 - Integer division or remainder by zero is invalid. The current JIT still relies on the
   machine/Cranelift trap for dynamic zero divisors; converting that trap into a structured
-  Aster runtime diagnostic is required before the execution API is considered robust.
+  ASTER runtime diagnostic is required before the execution API is considered robust.
 - Floating arithmetic follows IEEE 754. `%` for `float` and `double` is not implemented and is
   rejected by the backend.
 
@@ -158,7 +158,8 @@ MIR decimal operations to those runtime calls.
 `float2`, `float3`, `float4`, `int2`, matrices and quaternions will be structs/value types in
 the future `aster.math` library. They are not compiler primitives. `nint` and `nuint` are
 future platform-dependent interop/low-level types. `half` is a possible future graphics/FFI
-type. Arrays, generics, `object`, `dynamic` and `null` are outside this phase.
+type. Arrays and monomorphized generics are current language features. Root `object`,
+`dynamic`, and `null` types are not part of ASTER.
 
 ## OPEN QUESTIONS
 
@@ -168,4 +169,4 @@ type. Arrays, generics, `object`, `dynamic` and `null` are outside this phase.
   wrapping?
 - **OPEN QUESTION:** What structured runtime failure mechanism will report integer division
   by zero and invalid dynamic `char` conversions?
-- **OPEN QUESTION:** Will unsuffixed decimal-point literals remain `float` before Aster 1.0?
+- **OPEN QUESTION:** Will unsuffixed decimal-point literals remain `float` before ASTER 1.0?

@@ -2,9 +2,7 @@ namespace aster.io;
 
 using aster.core;
 
-/// Portable, stable category of a filesystem error. Deliberately coarse:
-/// operations added in later milestones (M2C/M2D) classify into these
-/// cases; this milestone only declares the shape.
+/// Portable, stable categories reported by host-managed filesystem operations.
 public enum IOErrorKind
 {
     NotFound,
@@ -65,19 +63,10 @@ internal string NulText()
     return nul.ToString();
 }
 
-/// Lexically join `basePath` and `childPath` with `/`, never touching the
-/// filesystem: no existence check, no canonicalization, no symlink
-/// resolution, no absolutization, no `.`/`..` resolution, no separator
-/// conversion. `basePath`/`childPath` are plain `string`s, not a nominal
-/// `Path` type -- structs cannot yet declare methods the Cranelift backend
-/// can execute, and struct-literal construction requires every field to be
-/// `public` even from a function in this same file (confirmed empirically;
-/// no privileged same-namespace exception), so a nominal, truly immutable
-/// `Path` cannot preserve its own invariants with the language as it stands
-/// today (a `public string Value` field would let any caller read *and
-/// write* it directly). `Path` is deferred until ASTER has a way to build
-/// opaque, validated values without exposing a public field; each future
-/// filesystem operation (M2D) validates its own `string` argument instead.
+/// Lexically join `basePath` and a relative `childPath` with `/`. This does
+/// not access the filesystem, canonicalize, resolve symlinks or dot segments,
+/// or convert existing separators. Every filesystem operation validates its
+/// own plain-string path independently.
 public Result<string, IOError> CombinePath(string basePath, string childPath)
 {
     if (basePath.Length == 0 || childPath.Length == 0)

@@ -1,61 +1,78 @@
-# Command line
+# Command-line interface
 
-Install the `aster` binary from the repository root:
+The `aster` CLI creates projects, checks and runs source, watches files, diagnoses installations,
+and prints the compiler's typed intermediate representations.
+
+| Command | Purpose |
+| --- | --- |
+| `aster new <NAME>` | Create a project in a new child directory. |
+| `aster doctor` | Diagnose the local toolchain and current project without modifying them. |
+| `aster check [FILE]` | Validate a project or source file without executing it. |
+| `aster run [FILE]` | Compile and run an application. |
+| `aster watch <FILE>` | Recompile and rerun when a loaded project file changes. |
+| `aster dump-hir [FILE]` | Print typed HIR after successful validation. |
+| `aster dump-mir [FILE]` | Print control-flow MIR after successful validation. |
+| `aster --help` | Print the command summary. |
+| `aster --version` | Print the CLI version. |
+
+## Projects and source files
+
+Without `[FILE]`, `check`, `run`, `dump-hir`, and `dump-mir` use `Aster.toml` in the current
+directory and start from `app/main.aster`.
 
 ```console
-cargo install --path crates/aster-cli --locked --force
+aster check
+aster run
 ```
 
-The standard library is embedded in the executable, so the CLI can run source files from any
-working directory.
-
-| Command | What it does |
-| --- | --- |
-| `aster check FILE` | Validates a project without running it; no manifest means no required `Main`. |
-| `aster run FILE [--function NAME]` | Runs the app entry, or an explicitly named function. |
-| `aster watch FILE [--function NAME]` | Re-runs the selected entry after a save. |
-| `aster dump-hir FILE` | Prints typed HIR without requiring an entry. |
-| `aster dump-mir FILE` | Prints control-flow MIR without requiring an entry. |
-
-## Running an application
+Passing one source file selects it explicitly:
 
 ```console
+aster check examples/hello.aster
 aster run examples/hello.aster
 ```
 
-Without `--function`, `run` uses the nearest optional `Aster.toml` entry or finds one conventional
-public static `Main` in the root namespace. `Main` takes no parameters and returns `void` or `int`.
-See [application entry](application-entry.md) for the complete rules.
+The nearest `Aster.toml` establishes the project root and application entry. Without a manifest,
+`run` finds one conventional public static `Main` in the root namespace. `Main` is parameterless
+and returns `void` or `int`. See [application entry](application-entry.md) for the complete rules.
 
-## Running a function explicitly
+## Development options
 
-```powershell
-aster run examples\jit_basics.aster --function Calculate
-```
-
-The explicit function must be a public, parameterless namespace-level function in the root namespace. Its
-supported result is printed; a `void` function prints nothing beyond the program's logs. This mode
-takes precedence over `Aster.toml` and conventional `Main`; it is intended for targeted compiler
-development, tests, and debugging.
-
-## Watching a project
+`run` can select a public, parameterless namespace-level function:
 
 ```console
-aster watch examples/hello.aster
+aster run examples/expressions.aster --function Run
 ```
 
-`watch` keeps the terminal open and recompiles after changes to the root, a loaded project
-namespace file, or
-`Aster.toml`. Compile errors do not stop it. Every rebuild starts a fresh JIT session and execution
-context, so running state is not retained. Press `Ctrl+C` to stop. Add `--function NAME` to watch an
-explicit test function instead.
+The selected function takes precedence over the manifest and conventional `Main`. This option is
+intended for compiler development and focused examples. `--memory-stats` prints execution-context
+allocation metrics after a successful run.
 
-Unsupported runtime constructs are rejected with a controlled error rather than executed
-incorrectly. See [types](types.md), [namespaces](namespaces.md), and
-[application entry](application-entry.md) for the current boundaries.
+`watch` accepts the same `--function <NAME>` selection but always requires a source file:
 
-## Compiler development
+```console
+aster watch examples/watch_demo.aster
+```
 
-Contributors can run the binary from the checkout without installing it by replacing `aster` with
-`cargo run -p aster-cli --`. See [compiler development](../compiler/development.md) for the full
-workspace validation workflow.
+Every rebuild uses a fresh JIT session and execution context. A failed rebuild writes diagnostics
+to stderr and the watcher keeps observing for a later valid edit. Press `Ctrl+C` to stop.
+
+## Output and exit codes
+
+ASTER uses three process exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | The command completed successfully. |
+| `1` | Valid command arguments led to an operational, compilation, or runtime failure. |
+| `2` | The command or its arguments were invalid. |
+
+Normal output, including program output and HIR/MIR dumps, goes to stdout. Usage, filesystem,
+compiler, runtime, manifest, and standard-library errors go to stderr. A failed dump does not emit
+partial IR.
+
+## Compiler checkout
+
+Contributors can run the local binary by replacing `aster` with
+`cargo run -p aster-cli --`. See [compiler development](../compiler/development.md) for the Rust
+toolchain and workspace gates. Cargo is not required for a normal installed toolchain.

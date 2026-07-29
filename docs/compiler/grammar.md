@@ -15,7 +15,7 @@ namespace-declaration = "namespace" , namespace-name , ";" ;
 using-declaration   = "using" , namespace-name , ";" ;
 namespace-name      = identifier , { "." , identifier } ;
 declaration         = [ visibility ] ,
-                      ( type-declaration | function | namespace-variable ) ;
+                      ( type-declaration | [ "async" ] , function | namespace-variable ) ;
 
 visibility          = "public" | "internal" | "protected" | "private" ;
 
@@ -24,7 +24,8 @@ class               = "class" , identifier , [ type-parameters ] , [ interface-l
                       "{" , { class-member } , "}" ;
 static-class        = "static" , "class" , identifier ,
                       "{" , { static-class-member } , "}" ;
-static-class-member = [ visibility ] , "static" , type , identifier , function-tail ;
+static-class-member = [ visibility ] , "static" , [ "async" ] ,
+                      type , identifier , function-tail ;
 interface-list      = ":" , type , { "," , type } ;
 struct              = "struct" , identifier , [ type-parameters ] , "{" , { type-member } , "}" ;
 interface           = "interface" , identifier , [ type-parameters ] , "{" , { interface-member } , "}" ;
@@ -32,7 +33,7 @@ enum                = "enum" , identifier , [ type-parameters ] , "{" ,
                       enum-case , { "," , enum-case } , [ "," ] , "}" ;
 enum-case           = identifier , [ parameters ] ;
 
-type-member         = [ visibility ] , [ "static" ] , type , identifier ,
+type-member         = [ visibility ] , [ "static" ] , [ "async" ] , type , identifier ,
                       ( field-tail | property-tail | function-tail ) ;
 class-member        = type-member | constructor ;
 constructor         = [ visibility ] , identifier , parameters , block ;
@@ -60,6 +61,7 @@ statement           = variable-declaration
                     | if-statement
                     | while-statement
                     | for-statement
+                    | foreach-statement
                     | switch-statement
                     | "break" , ";"
                     | "continue" , ";"
@@ -74,6 +76,8 @@ for-initializer     = type , identifier , [ "=" , expression ]
                     | "var" , identifier , [ "=" , expression ]
                     | "const" , type , identifier , [ "=" , expression ]
                     | expression ;
+foreach-statement   = "foreach" , "(" , type , identifier , "in" ,
+                      expression , ")" , block ;
 switch-statement    = "switch" , "(" , expression , ")" , "{" ,
                       { switch-case } , [ default-case ] , "}" ;
 switch-case         = "case" , [ identifier , "." ] , identifier ,
@@ -89,7 +93,7 @@ equality            = comparison , { ( "==" | "!=" ) , comparison } ;
 comparison          = additive , { ( "<" | "<=" | ">" | ">=" ) , additive } ;
 additive            = multiplicative , { ( "+" | "-" ) , multiplicative } ;
 multiplicative      = unary , { ( "*" | "/" | "%" ) , unary } ;
-unary               = ( "!" | "-" | "++" | "--" ) , unary | cast | postfix ;
+unary               = ( "!" | "-" | "++" | "--" | "await" ) , unary | cast | postfix ;
 cast                = "(" , value-type , ")" , unary ;
 value-type          = "sbyte" | "byte" | "short" | "ushort" | "int" | "uint"
                     | "long" | "ulong" | "float" | "double" | "decimal" | "char" ;
@@ -164,7 +168,10 @@ rest of the file as invalid.
 - Named struct literals require every public field exactly once. Nested finite structs,
   field projections, value copies, parameters and internal aggregate returns are executable.
 - Homogeneous fixed-length arrays support literals, zeroed `new T[length]`, checked indexing,
-  element writes, reference assignment, parameters, internal returns, and read-only `Length`.
+  element writes, reference assignment, parameters, internal returns, read-only `Length`, and
+  compiler-known `foreach`.
+- `List<T>` supports construction, `Length`, `Add`, `Get`, `RemoveAt`, and fail-fast `foreach`.
+  `Dictionary<K, V>` supports its official key types, lookup/update/removal, and entry snapshots.
 - Classes support one constructor, arena allocation, reference identity, declaration-order field
   initializers, instance and static methods, explicit properties, implicit instance receivers, and
   explicit `this`. Static fields and auto-properties are not accepted.
@@ -172,8 +179,8 @@ rest of the file as invalid.
   conversions; ties are errors, and return types do not distinguish overloads.
 - Equality compares scalar and string values, comparable struct fields recursively, array/class
   reference identity, and the underlying object identity of interfaces.
-- Immutable strings support `string + string`, `+=`, and read-only `Length`. `Length` counts Unicode
-  scalar values. Other values are never converted to text implicitly.
+- Immutable strings support `string + string`, `+=`, Unicode-scalar indexing and `foreach`, and
+  read-only `Length`. Other values are never converted to text implicitly.
 - `var` requires and infers from an initializer. `const` requires an initializer and cannot
   be assigned again. Explicit variables are mutable.
 - Classes, structs, interfaces, nominal class interface lists, fields, namespace-level functions, methods,
@@ -182,8 +189,10 @@ rest of the file as invalid.
 - Value enums may carry typed payloads. Enum switches evaluate their input once, bind payloads in
   arm-local scopes, do not fall through, and require complete cases or `default`.
 - `Log`, `Log.Warning`, and `Log.Error` accept one `string`. Other logging members are rejected.
-- `if`, `while`, and present `for` conditions must be `bool`. Blocks and `for` initializers create
-  lexical scopes. `break` and `continue` are accepted only inside `while` and `for` loops.
+- `if`, `while`, and C-style `for` conditions must be `bool`. Blocks and loop initializers create
+  lexical scopes. `break` and `continue` are accepted only inside loops.
+- Async functions, `Task.Run`, `Task<T>.Wait`, `await`, and the official `Parallel` operations are
+  validated against restricted worker-transfer boundaries.
 - Non-`void` functions must return on every reachable path. Statements after `return`, `break`,
   or `continue` receive a warning for unreachable code; warnings do not invalidate compilation.
 
@@ -193,5 +202,5 @@ There is no class inheritance, interface inheritance, constructor/operator overl
 fields, auto-properties, named/default arguments, general pattern matching, switch guards or
 switch expressions, exceptions, `goto`,
 or engine lifecycle syntax. Application entry selection is a tooling rule rather than grammar:
-`aster run FILE` resolves one public static parameterless `Main` returning `void` or `int`, while
+`aster run [FILE]` resolves one public static parameterless `Main` returning `void` or `int`, while
 `--function NAME` remains the explicit development mode.

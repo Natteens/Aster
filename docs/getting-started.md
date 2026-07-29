@@ -1,93 +1,113 @@
 # Getting started
 
-Aster is currently distributed as source. You build its CLI once with Cargo, then use the `aster`
-command for normal work.
+The official ASTER installers download a release archive, verify its SHA-256 checksum, and install
+the CLI and standard library together. You do not need Rust, Cargo, or this repository to write
+ASTER programs.
 
-## Install the CLI
+## Install ASTER
 
-Install [stable Rust](https://rustup.rs) 1.85 or newer. From the root of a cloned Aster repository,
-run:
+ASTER currently supports Windows x64 and Linux x64.
 
-```console
-cargo install --path crates/aster-cli --locked --force
+### Windows x64
+
+Run in PowerShell:
+
+```powershell
+irm https://github.com/Natteens/Aster/releases/latest/download/install.ps1 | iex
 ```
 
-This compiles the Aster toolchain—the compiler, CLI, runtime, and embedded standard library—and
-installs an executable named `aster`, normally in
-`%USERPROFILE%\.cargo\bin` on Windows or `$HOME/.cargo/bin` on Unix. Make sure that directory is on
-`PATH`:
+### Linux x64
+
+Run in a POSIX shell:
+
+```sh
+curl -fsSL https://github.com/Natteens/Aster/releases/latest/download/install.sh | sh
+```
+
+Open a new terminal after installation, then verify the toolchain:
 
 ```console
 aster --version
-aster --help
+aster doctor
 ```
 
-The standard library is embedded in the executable, so the CLI does not need the repository as its
-working directory after installation.
+`aster doctor` checks the executable, platform, standard library, managed installation, current
+`PATH`, a real compilation probe, and the current project when one is present.
 
-## Run a program
+The installers can also repair a damaged managed installation or update an older one. The
+[release page](https://github.com/Natteens/Aster/releases/latest) contains the archives, checksums,
+and installer scripts used by these commands.
 
-The smallest application uses a public, static, parameterless `Main` method:
+## Create a project
+
+Create the initial project and enter it:
+
+```console
+aster new HelloAster
+cd HelloAster
+```
+
+The command writes this deterministic layout:
+
+```text
+HelloAster/
+├── Aster.toml
+└── app/
+    └── main.aster
+```
+
+`app/main.aster` contains:
 
 ```aster
+namespace app;
+
+using aster.io;
+
 public class Program
 {
     public static int Main()
     {
-        Log("Hello, Aster!");
-        return 42;
+        WriteLine("Hello from ASTER!");
+        return 0;
     }
 }
 ```
 
-Run the checked-in version:
+Check and run it from the project directory:
 
 ```console
-aster run examples/hello.aster
+aster check
+aster run
 ```
 
-The program logs `Hello, Aster!` and the CLI prints its return value, `42`.
+`check` validates the manifest, project sources, standard library, HIR, MIR, and executable
+boundary without running `Main`. `run` performs the same validation, executes the program, and
+prints its integer result after the program output.
 
-`Main` may also be declared `public static void Main()`: it executes without producing a value, so
-only the program's logs appear. See [`examples/void_main.aster`](../examples/void_main.aster).
+## Work with the project
 
-Copy the source into your own `hello.aster` file. You can check it without executing it, run it, or
-rerun it after each save:
+Use the inspection commands when you need to see the compiler's typed representations:
 
 ```console
-aster check hello.aster
-aster run hello.aster
-aster watch hello.aster
+aster dump-hir
+aster dump-mir
 ```
 
-`Main` may return `void` or `int`. A source file that represents a library can be checked without a
-`Main`; execution requires an [application entry](reference/application-entry.md).
-
-## Grow into a project
-
-Aster projects can spread a namespace across files. The introductory project has this shape:
-
-```text
-examples/hello_app/
-  Aster.toml
-  app/
-    main.aster
-    math.aster
-```
-
-Run it by passing the root source file:
+Watch mode currently requires an explicit source file:
 
 ```console
-aster run examples/hello_app/app/main.aster
+aster watch app/main.aster
 ```
 
-The nearest `Aster.toml` establishes the project root and selects `app.Program.Main`. Folder names
-provide default namespaces, while `using` brings another namespace into scope. See
-[Namespaces and usings](reference/namespaces.md) for the complete loading rules.
+Each successful rebuild starts a fresh JIT execution. Compile errors are reported without stopping
+the watcher.
 
 ## Continue learning
 
-- Follow the [runnable examples](../examples/README.md) from basics to generics and error values.
-- Read the [language tour](language-tour.md) for the ideas behind those programs.
-- Use the [CLI reference](reference/cli.md) for explicit function execution and IR inspection.
-- Contributors should use the separate [compiler development](compiler/development.md) workflow.
+- Follow the [runnable examples](../examples/README.md).
+- Read the [language tour](language-tour.md).
+- Use the [CLI reference](reference/cli.md) for every command and exit-code contract.
+- Browse the [language reference](README.md#language-reference).
+
+If you want to change the compiler itself, use the separate
+[compiler development guide](compiler/development.md).

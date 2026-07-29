@@ -29,7 +29,7 @@ as a value type.
 | `Math.Max(left, right)` | `int`, `long`, `float`, `double` | Larger operand |
 | `Math.Clamp(value, min, max)` | `int`, `long`, `float`, `double` | `value` limited to the inclusive range |
 
-Overloads use Aster's normal deterministic overload rules. Smaller types may use an existing safe
+Overloads use ASTER's normal deterministic overload rules. Smaller types may use an existing safe
 widening conversion; the return type is the type of the selected overload. The library does not add
 new implicit numeric conversions or dedicated unsigned, `char`, or `decimal` overloads.
 
@@ -37,8 +37,8 @@ new implicit numeric conversions or dedicated unsigned, `char`, or `decimal` ove
 
 `Abs` cannot represent the magnitude of the minimum `int` or `long`, because the positive value is
 outside the same signed type. The runtime records a controlled error and the CLI reports the
-invocation as failed after the entry function returns; the value is discarded. Aster has no
-exception/unwind mechanism yet, so later Aster instructions may run internally before the host sees
+invocation as failed after the entry function returns; the value is discarded. ASTER has no
+exception/unwind mechanism yet, so later ASTER instructions may run internally before the host sees
 the error. The operation does not wrap, saturate, panic Rust, or corrupt memory.
 
 `Clamp` requires `min <= max`. An invalid range produces a controlled runtime error. This first

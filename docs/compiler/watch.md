@@ -17,7 +17,7 @@ Behavior:
   observations of a changed file, so one editor save produces one rebuild (debounce).
 - Compile errors are printed and the watcher keeps running; when a later save compiles again
   it prints `[watch] compilation succeeded again`.
-- Each successful run prints the Aster frontend time and JIT+execution time separately
+- Each successful run prints the ASTER frontend time and JIT+execution time separately
   (Cargo build time is not part of either) plus the function result.
 - Every rebuild uses a fresh JIT session and ExecutionContext. The previous session is freed after
   its result is copied out — modules, code pages, arrays, objects, and dynamically concatenated
@@ -25,7 +25,8 @@ Behavior:
 - The terminal is never cleared. Stop with `Ctrl+C`.
 
 This is **recompile and restart**, not hot reload: no program state survives a rebuild. See
-`docs/compiler/hot-reload-foundation.md` for the future hot reload design.
+See the [hot-reload research note](../research/hot-reload.md) for the separate state-preserving
+design space.
 
 When developing the compiler without installing the binary, see [Development](development.md) for
 the equivalent Cargo workflow.

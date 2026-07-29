@@ -635,8 +635,8 @@ impl ExecutionContext {
     /// buffer yet) in the arena selected by `region`. Every failure is
     /// reported through `self.fail` and returns a null pointer â€” never a
     /// panic, never a trap, never a partially written header (nothing is
-    /// written to the header until every validation has passed). Capacity
-    /// is not reserved ahead of time: growth is a future operation.
+    /// written to the header until every validation has passed). The empty
+    /// list reserves no element capacity; the first `Add` grows it.
     pub(crate) fn allocate_list_in_region(
         &mut self,
         element_size: u32,

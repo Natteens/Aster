@@ -82,10 +82,10 @@ Build-profile filtering and its manifest schema remain `PROPOSED`; see `12-loggi
 
 ### ECS direction — ACCEPTED
 
-- ECS is not part of the Aster language or compiler. It is not required to use Aster.
-- A future ECS, if built, is a library/framework/engine package written using Aster —
+- ECS is not part of the ASTER language or compiler. It is not required to use ASTER.
+- A future ECS, if built, is a library/framework/engine package written using ASTER —
   not core-language syntax, semantics, or backend support.
-- No ECS keyword or compiler-known construct is promised. See `../future/ecs-package.md`.
+- No ECS keyword or compiler-known construct is promised. See `../research/ecs.md`.
 
 ## Valid decision record example
 

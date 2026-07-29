@@ -21,7 +21,7 @@ Structs may contain other finite structs and executable scalar types. A recursiv
 recursively when every field is comparable. This is value equality; it does not compare padding.
 
 Struct methods are checked by the frontend but are not executable yet. A struct may be returned
-between Aster functions; the function selected directly by `aster run` must still return a scalar,
+between ASTER functions; the function selected directly by `aster run` must still return a scalar,
 `string`, or `void`.
 
 Generic structs such as `Pair<T, U>` are specialized before layout calculation. `Pair<int, string>`

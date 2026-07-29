@@ -19,7 +19,7 @@ values[1] = 20;
 ```
 
 `new` currently requires an element type with a valid all-zero value. In particular,
-`new string[length]` and zeroed structs containing references are rejected because Aster does not
+`new string[length]` and zeroed structs containing references are rejected because ASTER does not
 have `null`; use an array literal that initializes every element instead.
 
 `values.Length` returns an `int` and cannot be assigned. Indices must be non-negative `int` values.
@@ -27,9 +27,15 @@ Every runtime access is bounds checked; an invalid index makes the CLI report a 
 error.
 
 Arrays may contain executable scalar types or finite structs and may be passed to or returned from
-Aster functions. Arrays returned to the selected CLI entry are not printable, so a public scalar
+ASTER functions. Arrays returned to the selected CLI entry are not printable, so a public scalar
 entry function should consume the result.
 
-There is no `null`, resizing, slicing, nested/multidimensional array, array `foreach`, or independent
-freeing. `==` and `!=` compare array reference identity; elements are not compared implicitly. All
-storage belongs to the current JIT execution context.
+`foreach (T value in values)` captures the array reference and length once, then reads each element
+from index zero upward. The iteration variable is a read-only copy. Array elements can still be
+changed through an explicit index, and later iterations observe those changes.
+
+There is no `null`, resizing, slicing, multidimensional array, or independent freeing. `==` and
+`!=` compare array reference identity; elements are not compared implicitly. All storage belongs
+to the current JIT execution context.
+
+See [Arrays and collections](collections.md) for `foreach`, `List<T>`, and `Dictionary<K, V>`.

@@ -2,7 +2,7 @@
 
 ## Objective
 
-State the safety guarantees Aster intends to provide while keeping ownership syntax,
+State the safety guarantees ASTER intends to provide while keeping ownership syntax,
 allocation strategy, and concurrency rules open until they can be designed together.
 
 ## Proposed syntax
@@ -24,7 +24,7 @@ void clear(Buffer write buffer)
 
 ## Proposed rules
 
-- Safe Aster must prevent use-after-free, double-free, dangling references, invalid
+- Safe ASTER must prevent use-after-free, double-free, dangling references, invalid
   aliasing, and data races at compile time or through a defined safe runtime mechanism.
 - Values have a single, deterministic lifetime even if most lifetimes are inferred.
 - Mutation requires exclusive writable access to the affected storage.
@@ -106,7 +106,7 @@ only after diagnostics prove inference alone insufficient.
 - **OPEN QUESTION:** Which types are implicitly copied, and can users define copy behavior?
 - **OPEN QUESTION:** Are lifetime annotations ever exposed to users?
 - **OPEN QUESTION:** How are heap allocation, smart pointers, shared ownership, and weak references expressed?
-- **OPEN QUESTION:** Does Aster have destructors, and can destruction fail or be asynchronous?
+- **OPEN QUESTION:** Does ASTER have destructors, and can destruction fail or be asynchronous?
 - **OPEN QUESTION:** What is the precise memory ordering and concurrency model?
 - **OPEN QUESTION:** How is `unsafe` entered, audited, and bounded?
 - **OPEN QUESTION:** What guarantees apply across foreign-function boundaries?

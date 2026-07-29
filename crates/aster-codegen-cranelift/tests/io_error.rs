@@ -482,19 +482,6 @@ fn structurally_identical_fake_types_stay_distinct_across_files() {
     );
 }
 
-// --- Section 19.24-30: internal Rust classification (aster-runtime) -----------
-// Covered directly in `aster-runtime/src/io_error.rs`'s own unit tests
-// (`classifies_not_found`, `classifies_permission_denied`,
-// `classifies_already_exists`, `classifies_unmapped_kinds_as_other`,
-// `preserves_the_raw_os_error_code_when_present`,
-// `absent_raw_os_error_classifies_as_zero`,
-// `classification_allocates_nothing_across_thousands_of_calls`); nothing in
-// this milestone's ASTER-level surface calls that classifier yet (no
-// filesystem operation exists), so there is nothing further to exercise
-// end-to-end here.
-
-// --- Section 19.31-34: memory --------------------------------------------------
-
 fn stats_for(source: &str) -> MemoryStats {
     let module = compile_mir(source);
     let (_, stats) = execute_with_stats(&module, "Main").expect("source should execute");

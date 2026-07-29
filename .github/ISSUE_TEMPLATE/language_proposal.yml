@@ -1,0 +1,55 @@
+name: Language proposal
+description: Propose a focused ASTER language or standard-library change
+title: "proposal: "
+labels:
+  - proposal
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ASTER favors a small, static, predictable surface without hidden allocation. Describe the problem before the syntax.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What concrete program is difficult or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: current
+    attributes:
+      label: Current workaround
+      description: Show how the problem is handled with the current language, if possible.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Include concise ASTER examples and the semantic contract.
+      render: aster
+    validations:
+      required: true
+  - type: textarea
+    id: costs
+    attributes:
+      label: Runtime and compiler costs
+      description: Address allocation, lifetime, control flow, diagnostics, workers, and compatibility as applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Explain why existing features or a smaller change are insufficient.
+    validations:
+      required: true
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: I reviewed the current documentation and roadmap.
+          required: true
+        - label: This proposal does not assume hidden allocation, exceptions, null, or a garbage collector.
+          required: true

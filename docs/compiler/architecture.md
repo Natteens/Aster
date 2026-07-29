@@ -1,6 +1,6 @@
 # Compiler architecture
 
-Aster is a Cargo workspace whose dependencies point inward:
+ASTER is a Cargo workspace whose dependencies point inward:
 
 ```text
 aster-cli -> aster-compiler -> aster-syntax -> aster-diagnostics
@@ -36,16 +36,17 @@ Statements include lexical blocks, `if`/`else if`/`else`, `while`, C-style `for`
 `break`, `continue`, and `return`.
 
 This crate describes syntax only. It does not resolve names, infer types, or
-depend on code-generation/runtime concerns. It has no ECS-specific syntax; an early ECS
-experiment (`component`/`system`/`foreach`/`read`/`write`) was removed — see
-`docs/future/ecs-package.md`.
+depend on code-generation/runtime concerns. `foreach`, `async`, and `await` are general
+language constructs. The removed `component`/`system`/`read`/`write` experiment remains
+research only; see [`ecs.md`](../research/ecs.md).
 
 ### `aster-compiler`
 
 Orchestrates project loading, lexing, parsing, linking, and validation. For a CLI root file,
 the project loader discovers local namespaces recursively from `using` declarations before final
-semantic analysis. Reserved `aster.*` namespaces come from embedded, checked-in standard-library
-sources and cannot be shadowed by the project. The loader creates
+semantic analysis. Standard-library discovery follows the shared environment,
+executable-relative, then embedded priority. Reserved `aster.*` namespaces cannot be shadowed
+by the project. The loader creates
 one deterministic compilation unit, gives linked declarations unique internal
 names, and retains source ownership so diagnostics still point at the correct file. See
 [`module-resolution.md`](module-resolution.md).
@@ -57,8 +58,9 @@ Cranelift; the backend has no generic ABI or type-erasure path. See
 [`monomorphization.md`](monomorphization.md).
 
 The semantic analyzer builds initial type/function/local symbol tables and checks visibility,
-declarations, types, calls, expressions, variables, constants, logging, lexical scopes,
-loop context, all-path returns, and unreachable-code warnings.
+declarations, types, calls, expressions, variables, constants, lexical scopes, loop context,
+all-path returns, worker-transfer boundaries, host-operation restrictions, and unreachable-code
+warnings.
 
 After validation succeeds, the compiler lowers general-language AST nodes to typed HIR and then lowers
 HIR to control-flow-explicit MIR.
@@ -82,7 +84,8 @@ the enclosing `Result`'s `Error` — so Cranelift sees only concrete branches an
 Owns the backend-independent high-level intermediate representation. HIR removes source-only syntax,
 normalizes visibility, assigns stable-in-compilation `SymbolId` values to declarations and references,
 and records checked types on expressions. It represents declarations, functions, blocks, control flow,
-calls, operators, assignments, literals, variables, and constants.
+calls, operators, assignments, literals, variables, constants, and typed compiler-known operations
+for collections, host I/O, tasks, and restricted parallel execution.
 
 HIR does not embed MIR, machine instructions, Cranelift integration, or execution.
 
@@ -102,26 +105,27 @@ feature boundaries without consulting HIR or source syntax.
 
 Executable structs use declaration-order natural layout. The JIT stores aggregates in stack slots,
 copies parameters into callee-owned storage and returns aggregates through a hidden destination
-pointer. This is an internal Aster ABI, not the platform C aggregate ABI.
+pointer. This is an internal ASTER ABI, not the platform C aggregate ABI.
 
 ### `aster-codegen-cranelift`
 
-Consumes validated `aster-mir` exclusively. It validates the supported JIT subset, declares all Aster
+Consumes validated `aster-mir` exclusively. It validates the supported JIT subset, declares all ASTER
 functions, translates MIR locals and basic blocks into Cranelift IR, finalizes native code in memory,
 and invokes a concrete function symbol already selected outside the backend.
 
 The current ABI maps 8/16/32/64-bit integers to matching Cranelift integer widths, `float` to
 f32, `double` to f64, `bool` to an 8-bit `0`/`1` value, `char` to an i32 Unicode scalar, and
 `string` to a pointer into the runtime
-string ABI. Direct calls between compiled Aster functions support all of these as parameters and
-returns. Runtime intrinsics (logging, string equality, concatenation, and Unicode length) are bound from the `aster-runtime`
-registry. The `unsafe` boundary converts Cranelift's finalized, untyped code pointer into the
+string ABI. Direct calls between compiled ASTER functions support all of these as parameters and
+returns. Runtime intrinsics for strings, arrays, official collections, host I/O, tasks, parallel
+workers, and memory scopes are bound from the `aster-runtime` registry. The `unsafe` boundary
+converts Cranelift's finalized, untyped code pointer into the
 exact signature already checked by the backend. Every function receives a hidden pointer to its
 host-owned ExecutionContext. Array allocation, `Length`, and indexing use the small checked runtime
 ABI. Class allocation uses the same context; method and constructor calls are ordinary resolved MIR
 calls with an explicit object receiver. An interface value is two pointer-sized words: the non-null
 object reference and a pointer to a read-only method table owned by the JIT module. Interface calls
-load the concrete function from that table and use the checked Aster calling convention. The backend
+load the concrete function from that table and use the checked ASTER calling convention. The backend
 frees each JIT session after
 its result is copied out. The JIT module remains alive during the call.
 
@@ -141,32 +145,32 @@ or standard-library paths.
 
 ### `aster-runtime`
 
-Owns the execution boundary between JIT-compiled Aster code and host services: the per-run
-ExecutionContext and fixed-array arena, the immutable
-UTF-8 string ABI (`docs/compiler/runtime-abi.md`), context-owned immutable string concatenation,
-Unicode-scalar length, the standard logging sink, and a central registry of
-exported runtime functions with backend-neutral signatures. It depends on no other Aster crate
-and exposes no Cranelift types; future runtime modules (files, time, windowing, audio,
-networking) add registry entries instead of backend special cases.
+Owns the execution boundary between JIT-compiled ASTER code and host services: the per-run
+`ExecutionContext`, temporary and persistent arenas, immutable UTF-8 strings, arrays, `List<T>`,
+`Dictionary<K,V>`, terminal and filesystem operations, and restricted task/parallel workers.
+It also owns the central registry of exported runtime functions with backend-neutral signatures.
+The crate depends on no other ASTER crate and exposes no Cranelift types.
 
 ### `aster-cli`
 
-Builds the `aster` executable. `aster check FILE` validates a source file. `aster dump-hir FILE` prints
-typed HIR, while `aster dump-mir FILE` prints control-flow MIR. Both inspection commands run the validated
-frontend pipeline and never execute the program. `aster run FILE` selects a validated application
-entry after namespace resolution and semantic analysis, then gives its `SymbolId` to the isolated
-backend. An optional `Aster.toml` is loaded outside Cranelift, which never sees paths or TOML.
-`--function NAME` preserves explicit root-namespace execution for development. All commands resolve
-the root file's transitive usings. `aster watch FILE [--function NAME]`
+Builds the `aster` executable. `aster new NAME` creates the canonical project scaffold, and
+`aster doctor` diagnoses the current executable, standard library, installation, `PATH`, and project.
+`check`, `run`, `dump-hir`, and `dump-mir` accept either an explicit file or the project in the
+current directory. Inspection commands never execute the program. `run` selects a validated
+application entry after namespace resolution and semantic analysis, then gives its `SymbolId` to
+the isolated backend. An optional `Aster.toml` is loaded outside Cranelift, which never sees paths
+or TOML. `--function NAME` preserves explicit root-namespace execution for development. All
+compilation commands resolve the root file's transitive usings. `aster watch FILE [--function NAME]`
 reruns the same pipeline when the root, manifest, or any loaded dependency changes
 (`docs/compiler/watch.md`).
 
 ## Deliberate boundaries
 
 Inheritance, interface inheritance/default methods, external packages, MIR optimization, AOT/object
-generation, executable linking, and concurrency remain outside this phase.
+generation, executable linking, and general shared-memory concurrency remain outside the current
+implementation. Task and parallel APIs deliberately use restricted worker boundaries.
 `Main` is only an application entry convention; it does not imply `Start`, `Update`, a loop, or any
-engine lifecycle. ECS is not part of the language or compiler — see `docs/future/ecs-package.md`.
+engine lifecycle. ECS is not part of the language or compiler — see `docs/research/ecs.md`.
 
 Arrays and classes use a per-invocation host-owned context. Objects are non-null references with
 identity and live until that invocation ends. Interface values borrow those object references and

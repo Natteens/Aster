@@ -1,6 +1,6 @@
 # `aster dump-mir`
 
-`dump-mir` is a development-only command that exposes Aster's initial mid-level representation:
+`dump-mir` is a development-only command that exposes ASTER's initial mid-level representation:
 
 ```powershell
 aster dump-mir path\to\file.aster

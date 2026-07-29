@@ -15,9 +15,7 @@ const ASTER_STDLIB_ENV: &str = "ASTER_STDLIB";
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 fn temp_dir(label: &str) -> PathBuf {
     let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
@@ -55,7 +53,6 @@ fn aster_with_env(
 ) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aster"));
     cmd.args(args).env(env_key, env_val);
-    // Unset ASTER_STDLIB on the child so we control it explicitly.
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
@@ -82,9 +79,7 @@ fn stdout(output: &Output) -> String {
 /// Minimal source that uses the stdlib (requires aster.math to be present).
 const STDLIB_PROGRAM: &str = "using aster.math; public class Program { public static int Main() { return Math.Max(0, 1); } }";
 
-// ---------------------------------------------------------------------------
 // ASTER_STDLIB tests (run against the subprocess, not the in-process env)
-// ---------------------------------------------------------------------------
 
 #[test]
 fn aster_stdlib_valid_path_compiles_and_runs() {
@@ -244,9 +239,7 @@ fn aster_stdlib_unicode_path_works() {
     assert!(output.status.success(), "stderr: {}", stderr(&output));
 }
 
-// ---------------------------------------------------------------------------
 // cwd independence: stdlib works when cwd is completely unrelated
-// ---------------------------------------------------------------------------
 
 #[test]
 fn embedded_stdlib_works_regardless_of_working_directory() {
@@ -265,9 +258,7 @@ fn embedded_stdlib_works_regardless_of_working_directory() {
     assert_eq!(stdout(&output).trim(), "1");
 }
 
-// ---------------------------------------------------------------------------
 // Priority: ASTER_STDLIB beats embedded fallback
-// ---------------------------------------------------------------------------
 
 #[test]
 fn aster_stdlib_invalid_takes_priority_over_embedded_fallback() {
@@ -294,9 +285,7 @@ fn aster_stdlib_invalid_takes_priority_over_embedded_fallback() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Error message content
-// ---------------------------------------------------------------------------
 
 #[test]
 fn aster_stdlib_error_message_mentions_env_var() {
@@ -322,33 +311,15 @@ fn aster_stdlib_error_message_mentions_env_var() {
     );
 }
 
-// ---------------------------------------------------------------------------
 // Relocatable proof: exe-relative stdlib discovery
-//
-// Layout:
-//   temp/
-//   ├── bin/
-//   │   └── aster[.exe]   ← copy of the real binary
-//   ├── stdlib/           ← copy of the real stdlib
-//   │   └── aster/
-//   └── project/
-//       └── main.aster
-//
-// The subprocess is launched with:
-//   - current_dir = temp/project/
-//   - ASTER_STDLIB is UNSET (env_remove)
-//   - executable = temp/bin/aster[.exe]
-//
-// Since ASTER_STDLIB is unset and exe-dir is temp/bin/, the discovery chain
-// must find temp/stdlib/ via <exe-dir>/../stdlib/ and succeed.
-// ---------------------------------------------------------------------------
+// The copied binary runs from an unrelated project directory without
+// ASTER_STDLIB, proving it resolves ../stdlib relative to its executable.
 
 #[test]
 #[allow(clippy::too_many_lines, clippy::similar_names)]
 fn exe_relative_stdlib_discovery_works_outside_repo() {
     let root = temp_dir("relocatable");
 
-    // 1. Create the layout directories.
     let bin_dir = root.join("bin");
     let stdlib_dir = root.join("stdlib");
     let project_dir = root.join("project");
@@ -356,22 +327,18 @@ fn exe_relative_stdlib_discovery_works_outside_repo() {
     fs::create_dir_all(&stdlib_dir).expect("create stdlib dir");
     fs::create_dir_all(&project_dir).expect("create project dir");
 
-    // 2. Copy the real aster binary into temp/bin/.
     let real_binary = PathBuf::from(env!("CARGO_BIN_EXE_aster"));
     let binary_filename = real_binary.file_name().expect("binary filename");
     let copied_binary = bin_dir.join(binary_filename);
     fs::copy(&real_binary, &copied_binary).unwrap_or_else(|e| panic!("copy binary: {e}"));
 
-    // 3. Copy the real stdlib into temp/stdlib/aster/.
     copy_real_stdlib(&stdlib_dir);
 
-    // 4. Write a project file that exercises the stdlib.
     let src = project_dir.join("main.aster");
     fs::write(&src, STDLIB_PROGRAM).expect("write source");
 
     let src_path = src.to_str().expect("UTF-8 source path");
 
-    // 5. Run each command, verifying exe-relative discovery works from project/.
     let check = Command::new(&copied_binary)
         .args(["check", src_path])
         .current_dir(&project_dir)

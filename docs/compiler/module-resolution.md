@@ -26,7 +26,7 @@ means project visibility, not file visibility. Standard-library internals are no
 Two usings that contribute the same unqualified name produce an ambiguity diagnostic. Before
 semantic validation, non-root declarations receive deterministic compiler-internal qualified
 names. References are rewritten against the source namespace and its direct usings. The combined
-AST then enters the existing semantic, HIR, and MIR pipeline. Internal names are not Aster syntax.
+AST then enters the existing semantic, HIR, and MIR pipeline. Internal names are not ASTER syntax.
 
 Source spans from different files occupy disjoint ranges, preserving the original file, line, and
 column in diagnostics.

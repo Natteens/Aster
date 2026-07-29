@@ -1,6 +1,6 @@
 # Logging
 
-Aster's standard library starts with one logging facade:
+ASTER's standard library starts with one logging facade:
 
 ```aster
 Log("normal message");

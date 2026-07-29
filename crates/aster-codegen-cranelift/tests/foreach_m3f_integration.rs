@@ -1,14 +1,9 @@
-//! M3F: end-to-end integration proof for the `foreach` M3 milestone.
-//!
-//! Every M3 sub-milestone (M3B arrays, M3C List<T>, M3D string) was validated
-//! in isolation and with cross-cutting consolidation (M3E). This file is the
-//! *closing* milestone: it runs one real ASTER program that exercises all three
-//! `foreach` paths together with the M2 filesystem APIs in a single execution.
+//! End-to-end integration coverage for all compiler-known `foreach` paths.
 //!
 //! The program:
-//! 1. `ListFiles` → `foreach` over `string[]`   (M3B array path)
-//! 2. `ReadAllText` per file, `foreach (char ...)` counts scalars  (M3D string path)
-//! 3. Stores counts in `List<int>`, `foreach` to sum  (M3C List path)
+//! 1. `ListFiles` → `foreach` over `string[]`
+//! 2. `ReadAllText` per file, `foreach (char ...)` counts scalars
+//! 3. Stores counts in `List<int>`, `foreach` to sum
 //! 4. `CombinePath` + `WriteAllText` to persist the summary
 //!
 //! `invalid.bin` contains invalid UTF-8 and is handled as a recoverable error

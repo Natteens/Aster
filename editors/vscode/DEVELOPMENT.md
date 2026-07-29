@@ -6,7 +6,7 @@ This file is for people changing the extension itself. To simply use it, read
 ## Try changes with F5
 
 1. Open this folder (`editors/vscode`) as the workspace in VS Code.
-2. Press `F5`. The `Run Aster Extension` launch configuration starts an
+2. Press `F5`. The `Run ASTER Extension` launch configuration starts an
    **Extension Development Host** — a second VS Code window with your local, uncommitted
    version of the extension loaded.
 3. In that window, open `test/syntax-sample.aster` to check highlighting and snippets.
@@ -21,7 +21,7 @@ VS Code extension packer, declared as the only dev dependency.
 
 ```sh
 cd editors/vscode
-npm install        # installs vsce locally
+npm ci             # installs the locked development dependency
 npm run validate   # lists exactly which files the package will contain
 npm run package    # writes aster-language-<version>.vsix into this folder
 ```

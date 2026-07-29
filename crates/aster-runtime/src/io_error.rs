@@ -1,16 +1,11 @@
-//! Portable, host-side classification of filesystem errors, ahead of any
-//! actual filesystem I/O (a later milestone). Mirrors the shape of
-//! `aster.io.IOErrorKind`/`IOError` (`stdlib/aster/io/io.aster`) without
-//! referencing them: this crate never depends on ASTER source or types, and
-//! no ASTER memory is constructed here. A future filesystem operation uses
-//! [`classify_io_error`] to decide which `IOErrorKind` case and `OsCode` to
-//! write into a real `Result<T, IOError>` value; this milestone only
-//! prepares that classification, since there is no filesystem call yet to
-//! classify.
+//! Portable host-side classification for ASTER filesystem operations.
+//! Mirrors `aster.io.IOErrorKind`/`IOError` without depending on ASTER source
+//! or compiler types. Filesystem entry points use [`classify_io_error`] to
+//! construct ordinary `Result<T, IOError>` values.
 //!
 //! Never stores a `std::io::Error` (no message, no allocation, no reference
 //! to the original error) and never touches [`crate::ExecutionContext`]:
-//! filesystem errors are ordinary values (a future `Result<T, IOError>`),
+//! filesystem errors are ordinary values,
 //! not the internal-corruption channel `ExecutionContext::fail` guards.
 
 use std::io;
@@ -39,11 +34,11 @@ pub struct PortableIoError {
     pub os_code: i32,
 }
 
-/// Classify a real `std::io::Error` into the portable category a future
-/// filesystem operation will report. Only the `ErrorKind`s Rust's stdlib
+/// Classify a real `std::io::Error` into the portable category a filesystem
+/// operation reports. Only the `ErrorKind`s Rust's standard library
 /// reliably distinguishes today are mapped explicitly; every other kind is
 /// `Other`. `InvalidPath`/`InvalidUtf8`/`NotFile`/`NotDirectory`/
-/// `LimitExceeded` are produced deliberately by future operations that know
+/// `LimitExceeded` are produced deliberately by operations that know
 /// their own context, never inferred from an arbitrary `std::io::Error` or
 /// its message text.
 #[must_use]
