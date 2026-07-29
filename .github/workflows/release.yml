@@ -374,7 +374,7 @@ jobs:
             "dist/release-assets/uninstall.sh"
             "dist/release-assets/release-manifest.json"
           )
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "ASTER $VERSION" --generate-notes
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$VERSION" --generate-notes
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "${assets[@]}"
           expected=$(printf '%s\n' "${assets[@]##*/}" | sort)
           actual=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | sort)

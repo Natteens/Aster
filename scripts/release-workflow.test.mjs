@@ -195,6 +195,8 @@ test("publish step names exactly the thirteen public assets", () => {
     }
     assert.equal((publish.match(/"dist\/release-assets\//g) ?? []).length, 13);
     assert.match(publish, /gh release create[\s\S]*--draft[\s\S]*gh release upload/);
+    assert.match(publish, /--title "\$VERSION"/);
+    assert.doesNotMatch(publish, /--title "ASTER \$VERSION"/);
     assert.match(publish, /gh release edit[\s\S]*--draft=false/);
 });
 
