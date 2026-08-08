@@ -381,6 +381,111 @@ test("installer scripts expose only the documented targets, aliases, and overrid
     assert.match(linux, /# <<< ASTER installer <<</);
 });
 
+function runPowerShellDefinitions(scriptPath, marker, probe) {
+    const source = readFileSync(scriptPath, "utf8");
+    const cut = source.lastIndexOf(marker);
+    assert.ok(cut > 0, `entrypoint marker not found in ${scriptPath}`);
+    const directory = temporaryDirectory("probe");
+    const probePath = join(directory, "probe.ps1");
+    writeFileSync(probePath, `${source.slice(0, cut)}\n${probe}\n`);
+    return new Promise((resolve, reject) => {
+        const child = spawn(
+            powerShellExecutable,
+            ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", probePath],
+            { cwd: tmpdir(), windowsHide: true },
+        );
+        let stdout = "";
+        let stderr = "";
+        child.stdout.setEncoding("utf8");
+        child.stderr.setEncoding("utf8");
+        child.stdout.on("data", (chunk) => {
+            stdout += chunk;
+        });
+        child.stderr.on("data", (chunk) => {
+            stderr += chunk;
+        });
+        child.on("error", (error) => {
+            rmSync(directory, { recursive: true, force: true });
+            reject(error);
+        });
+        child.on("close", (status) => {
+            rmSync(directory, { recursive: true, force: true });
+            resolve({ status, stdout, stderr });
+        });
+    });
+}
+
+test("PowerShell installers do not depend on RuntimeInformation.OSArchitecture", () => {
+    for (const path of [installPowerShellPath, uninstallPowerShellPath]) {
+        const source = readFileSync(path, "utf8");
+        assert.ok(
+            !source.includes("RuntimeInformation"),
+            `${basename(path)} must not use RuntimeInformation (missing on some Windows PowerShell 5.1 hosts)`,
+        );
+        assert.ok(!source.includes("OSArchitecture"), `${basename(path)} must not read OSArchitecture`);
+        assert.ok(!/\bpwsh\b/.test(source), `${basename(path)} must not require PowerShell 7`);
+        assert.match(source, /Set-StrictMode -Version Latest/);
+        assert.match(source, /GetNativeSystemInfo/);
+        assert.match(source, /IsWow64Process2/);
+        assert.ok(
+            !source.includes("PROCESSOR_ARCHITECTURE"),
+            `${basename(path)} must not trust the PROCESSOR_ARCHITECTURE environment variable`,
+        );
+    }
+});
+
+test("PowerShell installer detects the native architecture under Windows PowerShell", async () => {
+    if (!hostSupportsWindowsInstaller) return;
+    const result = await runPowerShellDefinitions(
+        installPowerShellPath,
+        "\ntry {\n    Invoke-AsterInstall",
+        `$architecture = Get-NativeWindowsArchitecture
+Write-Output "native=$architecture"
+Assert-WindowsX64
+Write-Output "assert=ok"
+foreach ($candidate in @('AMD64', 'ARM64', 'X86', 'ARM', 'IA64', 'UNKNOWN(0)', 'amd64', '')) {
+    Write-Output ("check=" + $candidate + "=" + [bool](Test-SupportedWindowsArchitecture $candidate))
+}`,
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(!result.stderr.includes("OSArchitecture"), result.stderr);
+    assert.match(result.stdout, /native=AMD64/);
+    assert.match(result.stdout, /assert=ok/);
+    assert.match(result.stdout, /check=AMD64=True/);
+    for (const rejected of ["ARM64", "X86", "ARM", "IA64", "UNKNOWN(0)", "amd64"]) {
+        assert.ok(
+            result.stdout.includes(`check=${rejected}=False`),
+            `${rejected} must be rejected:\n${result.stdout}`,
+        );
+    }
+    assert.match(result.stdout, /check==False/);
+});
+
+test("PowerShell uninstaller shares the same architecture contract", async () => {
+    if (!hostSupportsWindowsInstaller) return;
+    const result = await runPowerShellDefinitions(
+        uninstallPowerShellPath,
+        "\ntry {\n    Invoke-AsterUninstall",
+        `Write-Output "native=$(Get-NativeWindowsArchitecture)"
+Assert-WindowsX64
+Write-Output "assert=ok"
+foreach ($candidate in @('AMD64', 'ARM64', 'X86', 'UNKNOWN(0)')) {
+    Write-Output ("check=" + $candidate + "=" + [bool](Test-SupportedWindowsArchitecture $candidate))
+}`,
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(!result.stderr.includes("OSArchitecture"), result.stderr);
+    assert.match(result.stdout, /native=AMD64/);
+    assert.match(result.stdout, /assert=ok/);
+    assert.match(result.stdout, /check=AMD64=True/);
+    for (const rejected of ["ARM64", "X86", "UNKNOWN(0)"]) {
+        assert.ok(
+            result.stdout.includes(`check=${rejected}=False`),
+            `${rejected} must be rejected:\n${result.stdout}`,
+        );
+    }
+});
+
 test("PowerShell PATH helper is case-insensitive, idempotent, and preserves other entries", async () => {
     if (!hostSupportsWindowsInstaller) return;
     const source = readFileSync(installPowerShellPath, "utf8");

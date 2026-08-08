@@ -50,6 +50,112 @@ function Assert-SafeBaseUri {
     Throw-InstallerError "ASTER_INSTALL_BASE_URL must use HTTPS. Set ASTER_INSTALL_ALLOW_INSECURE=1 only for local tests."
 }
 
+function Get-NativeWindowsArchitecture {
+    # The .NET OS-architecture property is missing from the framework surface bound in some
+    # Windows PowerShell 5.1 sessions, so query Win32 for the native architecture instead.
+    try {
+        if (-not ([Management.Automation.PSTypeName]'Aster.Install.NativeArchitectureV1').Type) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace Aster.Install
+{
+    public static class NativeArchitectureV1
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SystemInfo
+        {
+            public ushort ProcessorArchitecture;
+            public ushort Reserved;
+            public uint PageSize;
+            public IntPtr MinimumApplicationAddress;
+            public IntPtr MaximumApplicationAddress;
+            public UIntPtr ActiveProcessorMask;
+            public uint NumberOfProcessors;
+            public uint ProcessorType;
+            public uint AllocationGranularity;
+            public ushort ProcessorLevel;
+            public ushort ProcessorRevision;
+        }
+
+        [DllImport("kernel32.dll")]
+        private static extern void GetNativeSystemInfo(out SystemInfo lpSystemInfo);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsWow64Process2(IntPtr hProcess, out ushort pProcessMachine, out ushort pNativeMachine);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetCurrentProcess();
+
+        public static string Resolve()
+        {
+            // GetNativeSystemInfo reports AMD64 for an x64 process emulated on ARM64, so prefer
+            // IsWow64Process2 (Windows 10 1709+) which always reports the real native machine.
+            try
+            {
+                ushort processMachine;
+                ushort nativeMachine;
+                if (IsWow64Process2(GetCurrentProcess(), out processMachine, out nativeMachine))
+                {
+                    return FromImageFileMachine(nativeMachine);
+                }
+            }
+            catch (EntryPointNotFoundException) { }
+            catch (DllNotFoundException) { }
+
+            SystemInfo info;
+            GetNativeSystemInfo(out info);
+            return FromProcessorArchitecture(info.ProcessorArchitecture);
+        }
+
+        private static string FromImageFileMachine(ushort machine)
+        {
+            switch (machine)
+            {
+                case 0x8664: return "AMD64";
+                case 0xAA64: return "ARM64";
+                case 0x014C: return "X86";
+                case 0x01C0:
+                case 0x01C4: return "ARM";
+                case 0x0200: return "IA64";
+                default: return "UNKNOWN(0x" + machine.ToString("X4") + ")";
+            }
+        }
+
+        private static string FromProcessorArchitecture(ushort architecture)
+        {
+            switch (architecture)
+            {
+                case 9: return "AMD64";
+                case 12: return "ARM64";
+                case 0: return "X86";
+                case 5: return "ARM";
+                case 6: return "IA64";
+                default: return "UNKNOWN(" + architecture.ToString() + ")";
+            }
+        }
+    }
+}
+'@
+        }
+        $architecture = [Aster.Install.NativeArchitectureV1]::Resolve()
+    }
+    catch {
+        Throw-InstallerError "Unable to determine the native Windows architecture: $($_.Exception.Message)"
+    }
+    if ([string]::IsNullOrWhiteSpace($architecture)) {
+        Throw-InstallerError "Unable to determine the native Windows architecture."
+    }
+    return $architecture
+}
+
+function Test-SupportedWindowsArchitecture {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Architecture)
+    return $Architecture -ceq "AMD64"
+}
+
 function Assert-WindowsX64 {
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
         Throw-InstallerError "This installer supports Windows x64 only."
@@ -57,8 +163,8 @@ function Assert-WindowsX64 {
     if (-not [Environment]::Is64BitOperatingSystem -or -not [Environment]::Is64BitProcess) {
         Throw-InstallerError "This installer requires a 64-bit Windows process on Windows x64."
     }
-    $architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
-    if ($architecture -ne "X64") {
+    $architecture = Get-NativeWindowsArchitecture
+    if (-not (Test-SupportedWindowsArchitecture $architecture)) {
         Throw-InstallerError "Unsupported Windows architecture: $architecture. Expected x64."
     }
 }
