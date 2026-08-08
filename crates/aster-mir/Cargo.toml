@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Typed mid-level intermediate representation for Aster"
 
 [dependencies]
-aster-hir = { path = "../aster-hir", version = "0.48.2" }
+aster-hir = { path = "../aster-hir", version = "0.48.3" }
 
 [lints]
 workspace = true
