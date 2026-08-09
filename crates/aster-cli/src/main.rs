@@ -5,6 +5,7 @@ mod watch;
 
 use std::{
     env, fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -312,6 +313,26 @@ fn validate_source_file(path: &Path) -> Result<(), ()> {
     Ok(())
 }
 
+fn write_stdout_line(
+    writer: &mut impl Write,
+    arguments: std::fmt::Arguments<'_>,
+) -> Result<(), ()> {
+    match writeln!(writer, "{arguments}") {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => {
+            eprintln!("error: could not write command output: {error}");
+            Err(())
+        }
+    }
+}
+
+fn print_stdout_line(arguments: std::fmt::Arguments<'_>) -> Result<(), ()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    write_stdout_line(&mut stdout, arguments)
+}
+
 fn process_file(
     command: &str,
     file_name: &str,
@@ -343,8 +364,8 @@ fn process_file(
                 return Err(());
             }
             match command {
-                "dump-hir" => println!("{}", compilation.hir),
-                "dump-mir" => println!("{}", compilation.mir),
+                "dump-hir" => print_stdout_line(format_args!("{}", compilation.hir))?,
+                "dump-mir" => print_stdout_line(format_args!("{}", compilation.mir))?,
                 _ => {
                     println!(
                         "checked `{file_name}`: {} declaration(s), {} token(s), {} file(s)",
@@ -517,17 +538,36 @@ fn print_command_help(command: &str) {
 mod tests {
     use std::{
         fs,
+        io::{self, Write},
         sync::atomic::{AtomicU64, Ordering},
     };
 
     use aster_compiler::StandardLibrary;
 
-    use super::{process_file, run, run_file};
+    use super::{process_file, run, run_file, write_stdout_line};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
     fn embedded() -> StandardLibrary {
         StandardLibrary::embedded()
+    }
+
+    struct BrokenPipeWriter;
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn command_output_treats_broken_pipe_as_success() {
+        let mut writer = BrokenPipeWriter;
+        assert!(write_stdout_line(&mut writer, format_args!("partial dump")).is_ok());
     }
 
     #[test]
