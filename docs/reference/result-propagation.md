@@ -1,106 +1,118 @@
-# Result propagation (`?`)
+# Propagation with `?`
 
-The postfix `?` operator propagates the `Error` case of an
-[`aster.core.Result<T, E>`](option-result.md) and continues with the `Ok`
-payload:
+The postfix `?` operator propagates absence or failure through the official
+[`aster.core.Option<T>` and `aster.core.Result<T, E>`](option-result.md) types.
+
+| Operand | Continue path | Early-return path | Required enclosing return |
+| --- | --- | --- | --- |
+| `Option<T>` | `Some(value)` → `value` | `None` | `Option<U>` |
+| `Result<T, E>` | `Ok(value)` → `value` | `Error(error)` | `Result<U, E>` |
+
+> [!IMPORTANT]
+> `?` is nominal and container-specific. It does not convert between `Option` and `Result`, and a
+> user-defined enum with the same case names does not participate automatically.
+
+## 🧩 Propagating `Option<T>`
 
 ```aster
-int value = Parse(text)?;
-```
-
-If `Parse(text)` produced `Ok(value)`, execution continues and `Parse(text)?`
-evaluates to that `value`. If it produced `Error(error)`, the enclosing function
-returns immediately with its own `Error(error)`.
-
-That single line is equivalent to writing the `switch` by hand:
-
-```aster
-Result<int, string> temporary = Parse(text);
-
-switch (temporary)
+public Option<int> ParsePort(string text)
 {
-    case Ok(value):
-        // continue with value
-    case Error(error):
-        return Result<int, string>.Error(error);
+    int value = text.TryParseInt()?;
+    return Option<int>.Some(value);
 }
 ```
 
-The equivalence is only explanatory: `?` lowers directly to typed control flow,
-it does not expand into source-level `switch`.
+If `TryParseInt()` produces `Some(value)`, execution continues and the `?` expression evaluates to
+that payload. If it produces `None`, the enclosing function returns `Option<int>.None` immediately.
 
-## Rules
+The enclosing payload type may differ from the operand payload type:
 
-- **`Ok` continues, `Error` returns early.** The success payload becomes the
-  value of the expression; the error path is a normal early `return`.
-- **The operand is evaluated exactly once.** `NextResult()?` calls `NextResult`
-  a single time and reuses that value to read the tag, extract the payload, and
-  continue or return.
-- **The error types must match exactly.** If the expression is
-  `Result<T, E>`, the enclosing function must return `Result<U, E>` with the
-  same `E`. There are no automatic error conversions — no `From`/`Into`, no
-  widening, no wrapping, no coercion to `string`. Convert with a `switch` when
-  the error types differ.
-- **The success type may differ.** The expression's success type `T` need not
-  equal the function's success type `U`:
+```aster
+public Option<string> Classify(string text)
+{
+    int value = text.TryParseInt()?;
 
-  ```aster
-  public Result<string, ParseError> Format(string text)
-  {
-      int number = Parse(text)?;          // Parse returns Result<int, ParseError>
-      return Result<string, ParseError>.Ok("valid");
-  }
-  ```
+    return value > 0
+        ? Option<string>.Some("positive")
+        : Option<string>.Some("non-positive");
+}
+```
 
-- **Only the official `aster.core.Result` supports `?`.** Recognition is
-  nominal: a user-defined enum named `Result` in another namespace is not the
-  official type and is rejected.
-- **`?` needs an enclosing function.** Used at namespace scope there is nowhere to
-  return, so it is rejected.
-- **There are no exceptions.** `?` is ordinary control flow; there is no
-  `throw`, `catch`, or unwinding.
+`None` from `TryParseInt()` still propagates as `Option<string>.None`.
 
-## Where `?` can appear
+## ⚠️ Propagating `Result<T, E>`
 
-`?` joins the existing postfix chain (calls, member access, indexing) and binds
-tighter than arithmetic, so `Parse(text)? + 1` means `(Parse(text)?) + 1`. It is
-valid anywhere the extracted value is valid: local initializers, call arguments,
-returned expressions, arithmetic, and `bool` conditions.
+```aster
+public Result<string, ParseError> Format(string text)
+{
+    int value = Parse(text)?;
+    return Result<string, ParseError>.Ok("valid");
+}
+```
+
+If `Parse(text)` produces `Ok(value)`, execution continues with `value`. If it produces
+`Error(error)`, the enclosing function returns its own `Result<string, ParseError>.Error(error)`.
+
+For `Result`, the success payload type may change, but the error type must match exactly. There is
+no automatic `From`/`Into`, widening, wrapping, or coercion to `string`.
+
+## 🔒 Shared rules
+
+- **The operand is evaluated exactly once.** A call such as `Next()?` runs `Next` once and reuses the
+  resulting enum value for the tag test and payload projection.
+- **The container family must match.** `Option<T>?` requires an enclosing `Option<U>` function;
+  `Result<T, E>?` requires an enclosing `Result<U, E>` function.
+- **Recognition is nominal.** Only the official `aster.core.Option` and `aster.core.Result` types
+  participate.
+- **`?` needs an enclosing function.** There is no return target at namespace scope.
+- **There are no exceptions.** Propagation is typed control flow; there is no `throw`, `catch`, or
+  unwinding behind the operator.
+- **No implicit unwrap exists.** Without `?`, `Option` and `Result` remain ordinary enum values and
+  must be handled explicitly.
+
+The compiler lowers propagation directly to typed control flow. It does not rewrite the source into
+a `switch` before compilation.
+
+## 📍 Where `?` can appear
+
+`?` joins the postfix expression chain and binds tighter than arithmetic. It can appear anywhere the
+extracted payload is valid:
 
 ```aster
 int value = Read()?;
 Use(Read()?);
 return Result<int, string>.Ok(Read()? + 1);
-if (Validate()? == true) { return Result<int, string>.Ok(42); }
+if (Validate()? == true)
+{
+    return Result<int, string>.Ok(42);
+}
 ```
 
-## Diagnostics
+The same rule applies to `Option` expressions inside functions that return `Option`.
 
-`?` reports, never panics:
+## 🩺 Diagnostics
 
-- operand is not a `Result` → *`?` requires an `aster.core.Result<T, E>` value*;
-- enclosing function does not return `Result` → *requires the enclosing function
-  to return `aster.core.Result<..., E>`*;
-- error types differ → *cannot propagate error type `A`; the enclosing function
-  returns `Result<..., B>`*;
-- operand is a user-defined `Result` → *works only with `aster.core.Result`*;
-- operand is an `Option` → *`?` does not support `aster.core.Option<T>` yet*;
-- used outside a function → *`?` cannot be used outside a function*.
+Invalid uses fail with controlled compiler diagnostics rather than panics. The compiler rejects, in
+particular:
 
-## Current limitations
+- operands that are neither the official `Option` nor `Result`;
+- `Option` propagation from a function that does not return `Option`;
+- `Result` propagation from a function that does not return `Result`;
+- mismatched `Result` error types;
+- user-defined lookalike enum types;
+- propagation outside a function.
 
-Current boundaries:
+Diagnostics should describe the container actually used and the enclosing return contract instead
+of suggesting an implicit conversion.
 
-- **`Option<T>` is not propagated yet.** Only `Result` participates in `?`.
-- **No automatic error conversion.** Mismatched error types must be converted
-  explicitly with `switch`.
-- **No operator customization.** `?` is not backed by a trait or interface.
-- **The ternary `?:`, `?.`, and `??` are separate constructs.** A lone trailing
-  `?` after an expression is always `Result` propagation; a `?` followed by
-  `?.`/`??` is reported as a syntax error for now.
+## 🚧 Current boundaries
 
-Generic functions may both propagate and construct a `Result` built from their
-own type parameters — `Result<T, E>.Ok(..)` and `input?` inside
-`Forward<T, E>(Result<T, E> input)` monomorphize and run like any other generic
-code. Every type parameter is substituted before concrete HIR, so no unresolved
-`T`/`U`/`E` reaches MIR or the backend.
+There is no automatic `Option` ↔ `Result` conversion, customizable propagation trait/interface,
+automatic error conversion, or implicit fallback value.
+
+The ternary `?:` is a separate expression. `?.` and `??` are not propagation forms and are not part
+of the current language.
+
+Generic functions may propagate official `Option` or `Result` values built from type parameters.
+Specialization substitutes those parameters before concrete HIR, MIR, layout, and backend execution,
+so unresolved generic parameters do not reach Cranelift.
