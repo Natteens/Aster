@@ -1,8 +1,19 @@
 # ASTER
 
-[![CI](https://github.com/Natteens/Aster/actions/workflows/ci.yml/badge.svg)](https://github.com/Natteens/Aster/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/Natteens/Aster?display_name=tag&sort=semver)](https://github.com/Natteens/Aster/releases/latest)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+<p align="center">
+  <a href="https://github.com/Natteens/Aster/actions/workflows/ci.yml">
+    <img alt="CI status" src="https://github.com/Natteens/Aster/actions/workflows/ci.yml/badge.svg">
+  </a>
+  <a href="https://github.com/Natteens/Aster/releases/latest">
+    <img alt="Latest release" src="https://img.shields.io/github/v/release/Natteens/Aster?display_name=tag&sort=semver&style=flat-square">
+  </a>
+  <a href="./LICENSE">
+    <img alt="Apache 2.0 license" src="https://img.shields.io/github/license/Natteens/Aster?style=flat-square">
+  </a>
+  <a href="https://github.com/Natteens/Aster/releases/latest">
+    <img alt="Windows x64 and Linux x64" src="https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20x64-informational?style=flat-square">
+  </a>
+</p>
 
 ASTER is an experimental native language with static nominal types, region-based memory, and a
 Cranelift JIT. The compiler and runtime are written in Rust.
@@ -17,13 +28,13 @@ Cranelift JIT. The compiler and runtime are written in Rust.
 
 Official installers are available for Windows x64 and Linux x64.
 
-**Windows PowerShell**
+**🪟 Windows PowerShell**
 
 ```powershell
 irm https://github.com/Natteens/Aster/releases/latest/download/install.ps1 | iex
 ```
 
-**Linux**
+**🐧 Linux**
 
 ```sh
 curl -fsSL https://github.com/Natteens/Aster/releases/latest/download/install.sh | sh
@@ -69,14 +80,14 @@ public class Program
 
 ## What works today
 
-- Static, strong, nominal types with non-null references by default.
-- Classes, structs, interfaces, enums, properties, overloads, and monomorphized generics.
-- Arrays, `List<T>`, `Dictionary<K, V>`, `Option<T>`, and `Result<T, E>`.
-- Immutable UTF-8 strings and `char` values that represent Unicode scalars.
-- Region-based memory backed by temporary and persistent arenas.
-- Multifile projects, filesystem and terminal APIs, and a Cranelift JIT.
-- Restricted worker-based task and parallel operations with explicit transfer boundaries.
-- A CLI for project creation, diagnostics, checking, running, watching, and HIR/MIR inspection.
+- 🧱 **Type system:** static, strong, nominal types with non-null references by default.
+- 🧩 **Language model:** classes, structs, interfaces, enums, properties, overloads, and monomorphized generics.
+- 📦 **Collections:** arrays, `List<T>`, `Dictionary<K, V>`, `Option<T>`, and `Result<T, E>`.
+- 🔤 **Text:** immutable UTF-8 strings and `char` values that represent Unicode scalars.
+- 🧠 **Memory:** region-based allocation backed by temporary and persistent arenas.
+- 🗂️ **Projects and I/O:** multifile projects plus filesystem and terminal APIs.
+- ⚙️ **Concurrency:** restricted worker-based task and parallel operations with explicit transfer boundaries.
+- 🛠️ **Tooling:** project creation, diagnostics, checking, running, watching, and HIR/MIR inspection.
 
 The [language tour](docs/language-tour.md) introduces these features through code. The
 [compiler documentation](docs/README.md#compiler-internals) covers the pipeline and memory model.
@@ -91,12 +102,12 @@ See the [roadmap](docs/roadmap.md) for planned work and research boundaries.
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md)
-- [Language tour](docs/language-tour.md)
-- [CLI reference](docs/reference/cli.md)
-- [Language and standard library reference](docs/README.md#language-reference)
-- [Compiler internals](docs/README.md#compiler-internals)
-- [Runnable examples](examples/README.md)
+- 🚀 [Getting started](docs/getting-started.md)
+- 🧭 [Language tour](docs/language-tour.md)
+- 🛠️ [CLI reference](docs/reference/cli.md)
+- 📚 [Language and standard library reference](docs/README.md#language-reference)
+- ⚙️ [Compiler internals](docs/README.md#compiler-internals)
+- 🧪 [Runnable examples](examples/README.md)
 
 ## Contributing
 

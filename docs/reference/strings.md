@@ -5,11 +5,11 @@ counts Unicode scalar values, `foreach` walks those scalars in order, and equali
 
 | Capability | Current behavior |
 | --- | --- |
-| Representation | Immutable UTF-8 |
-| Length | Unicode scalar count |
-| Scalar traversal | `foreach (char scalar in text)` |
-| Direct indexing | Not supported |
-| Equality | Content comparison with `==` / `!=` |
+| 🧬 **Representation** | Immutable UTF-8 |
+| 📏 **Length** | Unicode scalar count |
+| 🔁 **Scalar traversal** | `foreach (char scalar in text)` |
+| 🔒 **Direct indexing** | Not supported |
+| 🟰 **Equality** | Content comparison with `==` / `!=` |
 
 ```aster
 string name = "Natte";

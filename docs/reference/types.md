@@ -4,23 +4,25 @@ ASTER uses fixed-width primitive types and keeps their identities through HIR an
 surface below is executable today; `decimal` is deliberately different and remains outside the
 current backend-supported subset.
 
+**Status:** ✅ executable in the JIT · 🚧 recognized by the frontend but rejected by current public compiler commands
+
 | Type | Size | Sign | Typical use | Execution |
 | --- | ---: | --- | --- | --- |
-| `sbyte` | 8 bits | signed | compact signed binary data | JIT |
-| `byte` | 8 bits | unsigned | bytes, small counters and protocols | JIT |
-| `short` | 16 bits | signed | compact signed values | JIT |
-| `ushort` | 16 bits | unsigned | ports and compact unsigned values | JIT |
-| `int` | 32 bits | signed | default whole-number type | JIT |
-| `uint` | 32 bits | unsigned | bit fields and non-negative 32-bit data | JIT |
-| `long` | 64 bits | signed | large counters, timestamps and file sizes | JIT |
-| `ulong` | 64 bits | unsigned | full-width unsigned identifiers and masks | JIT |
-| `float` | 32 bits | n/a | graphics and approximate values | JIT |
-| `double` | 64 bits | n/a | higher-precision approximate calculations | JIT |
-| `decimal` | runtime layout pending | n/a | exact base-10 values such as money | recognized; public CLI rejects it |
-| `bool` | logical value | n/a | conditions | JIT |
-| `char` | Unicode scalar | n/a | one Unicode scalar value | JIT |
-| `string` | UTF-8 text | n/a | immutable text | JIT |
-| `void` | no value | n/a | function with no result | JIT |
+| `sbyte` | 8 bits | signed | compact signed binary data | ✅ JIT |
+| `byte` | 8 bits | unsigned | bytes, small counters and protocols | ✅ JIT |
+| `short` | 16 bits | signed | compact signed values | ✅ JIT |
+| `ushort` | 16 bits | unsigned | ports and compact unsigned values | ✅ JIT |
+| `int` | 32 bits | signed | default whole-number type | ✅ JIT |
+| `uint` | 32 bits | unsigned | bit fields and non-negative 32-bit data | ✅ JIT |
+| `long` | 64 bits | signed | large counters, timestamps and file sizes | ✅ JIT |
+| `ulong` | 64 bits | unsigned | full-width unsigned identifiers and masks | ✅ JIT |
+| `float` | 32 bits | n/a | graphics and approximate values | ✅ JIT |
+| `double` | 64 bits | n/a | higher-precision approximate calculations | ✅ JIT |
+| `decimal` | runtime layout pending | n/a | exact base-10 values such as money | 🚧 CLI rejects |
+| `bool` | logical value | n/a | conditions | ✅ JIT |
+| `char` | Unicode scalar | n/a | one Unicode scalar value | ✅ JIT |
+| `string` | UTF-8 text | n/a | immutable text | ✅ JIT |
+| `void` | no value | n/a | function with no result | ✅ JIT |
 
 ## 🧭 Choosing a numeric type
 
