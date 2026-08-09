@@ -35,10 +35,17 @@ permission needed for their work.
 | --- | --- |
 | `feat:` | Minor |
 | `fix:` or `perf:` | Patch |
-| `feat!:` or `BREAKING CHANGE:` | Major |
+| `feat!:` or `BREAKING CHANGE:` | Minor while ASTER is `0.x` |
 | `docs:`, `ci:`, `build:`, `test:`, `refactor:`, `chore:` | No release by themselves |
 
 No qualifying commits means no version, release commit, tag, or GitHub Release.
+
+ASTER's pre-1.0 compatibility policy allows deliberate incompatible changes only in minor releases,
+so the commit analyzer temporarily maps an accurate Conventional Commit breaking marker to
+`minor`. Before the deliberate 1.0 transition, that override must be removed so breaking commits
+again have normal major-version semantics. Do not remove the override merely to force a version.
+See the [compatibility policy](reference/compatibility.md) for the source, project, CLI, standard
+library, and runtime stability bands.
 
 ## Canonical version
 

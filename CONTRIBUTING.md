@@ -33,7 +33,10 @@ Update the canonical guide or reference page when behavior visible to users chan
 
 Commits follow [Conventional Commits](https://www.conventionalcommits.org/):
 `type(scope): description`. Common types include `feat`, `fix`, `docs`, `test`, `refactor`, `perf`,
-`build`, `ci`, and `chore`. Breaking changes use `!` or a `BREAKING CHANGE:` footer.
+`build`, `ci`, and `chore`. Incompatible changes still use `!` or a `BREAKING CHANGE:` footer. While
+ASTER is `0.x`, the release analyzer maps that marker to a minor release and the
+[compatibility policy](docs/reference/compatibility.md) requires migration documentation and
+regression coverage. Do not hide an incompatible change by omitting the marker.
 
 Do not edit released version numbers, changelog entries, or tags by hand. The automatic release
 flow calculates and synchronizes versions after validated changes reach `main`; see

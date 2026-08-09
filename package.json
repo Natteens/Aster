@@ -7,7 +7,7 @@
     "bundle": "node scripts/bundle.mjs",
     "package:release": "node scripts/package-release.mjs",
     "prepare:release-assets": "node scripts/prepare-release-assets.mjs",
-    "test:release-core": "node --test scripts/bundle.test.mjs scripts/package-release.test.mjs scripts/prepare-release-assets.test.mjs scripts/release-workflow.test.mjs scripts/semantic-release-result.test.mjs scripts/sync-release-version.test.mjs scripts/validate-release-ref.test.mjs",
+    "test:release-core": "node --test scripts/bundle.test.mjs scripts/package-release.test.mjs scripts/prepare-release-assets.test.mjs scripts/release-compatibility.test.mjs scripts/release-workflow.test.mjs scripts/semantic-release-result.test.mjs scripts/sync-release-version.test.mjs scripts/validate-release-ref.test.mjs",
     "test:installers": "node --test scripts/install.test.mjs scripts/install-linux.test.mjs",
     "release": "semantic-release",
     "release:dry-run": "semantic-release --dry-run",

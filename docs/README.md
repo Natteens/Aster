@@ -33,6 +33,7 @@ work that is not implemented.
 - 🧰 [Standard library](reference/standard-library.md), [filesystem and terminal I/O](reference/io.md),
   [`aster.math`](reference/math.md), and [logging](reference/logging.md)
 - ⚙️ [Tasks, parallel operations, and worker boundaries](reference/concurrency.md)
+- 🧭 [Compatibility before 1.0](reference/compatibility.md)
 - 📐 [Implemented grammar](compiler/grammar.md)
 
 These pages use the present tense only for behavior accepted by the current compiler and JIT.

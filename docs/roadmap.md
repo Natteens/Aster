@@ -28,8 +28,8 @@ The work before 1.0 is about closing explicit boundaries:
 - define long-lived ownership and any safe foreign-function or unsafe-code boundary;
 - improve diagnostics and reference coverage as the executable subset grows;
 - finish type-system decisions such as generic constraints and richer pattern handling;
-- specify compatibility expectations for source, projects, the runtime ABI, and the standard
-  library;
+- apply the documented [pre-1.0 compatibility policy](reference/compatibility.md) as source,
+  project, standard-library, CLI, and runtime contracts evolve;
 - measure representative programs before choosing compiler optimizations;
 - keep the worker model deterministic and explicit as concurrency support develops;
 - decide the minimum dependency and package model without hiding downloads or build steps.

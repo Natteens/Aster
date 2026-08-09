@@ -7,6 +7,10 @@ export default {
             "@semantic-release/commit-analyzer",
             {
                 preset: "conventionalcommits",
+                // ASTER is still 0.x: an explicitly marked incompatible change is
+                // a minor release until the deliberate 1.0 transition removes
+                // this override.
+                releaseRules: [{ breaking: true, release: "minor" }],
             },
         ],
         [
