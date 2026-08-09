@@ -266,13 +266,16 @@ fn resolve_source_argument(argument: Option<String>) -> Result<String, CliError>
         eprintln!("error: could not determine current directory: {error}");
         CliError::Failure
     })?;
-    let manifest = current_directory.join("Aster.toml");
-    let source = current_directory.join("app").join("main.aster");
-    if manifest.is_file() {
-        return path_to_utf8(source).map_err(|()| CliError::Failure);
-    }
-    eprintln!("error: no source file was provided and no Aster.toml was found");
-    Err(CliError::Failure)
+    let Some(manifest) = aster_compiler::find_manifest_path_from_directory(&current_directory)
+    else {
+        eprintln!("error: no source file was provided and no Aster.toml was found");
+        return Err(CliError::Failure);
+    };
+    let project_root = manifest.parent().ok_or_else(|| {
+        eprintln!("error: Aster.toml has no parent directory");
+        CliError::Failure
+    })?;
+    path_to_utf8(project_root.join("app").join("main.aster")).map_err(|()| CliError::Failure)
 }
 
 fn path_to_utf8(path: PathBuf) -> Result<String, ()> {

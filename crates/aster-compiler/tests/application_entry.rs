@@ -49,6 +49,16 @@ fn errors(root: &Path) -> Vec<String> {
     select(root).expect_err("entry selection should fail")
 }
 
+fn manifest_case(label: &str, manifest: &str) -> (Project, PathBuf) {
+    let project = Project::new(label);
+    project.write("Aster.toml", manifest);
+    let root = project.write(
+        "app/main.aster",
+        "namespace app; public class Program { public static int Main() { return 42; } }",
+    );
+    (project, root)
+}
+
 #[test]
 fn selects_conventional_void_and_int_main_methods() {
     for (label, return_type, body) in [("void", "void", ""), ("int", "int", "return 42;")] {
@@ -132,6 +142,104 @@ fn manifest_selects_a_resolved_root_method_and_sets_project_root() {
     assert_eq!(compilation.sources.len(), 2);
     let entry = select_application_entry(&compilation, &root).expect("manifest entry is valid");
     assert_eq!(entry.display_name, "app.Program.Main");
+}
+
+#[test]
+fn manifest_schema_one_and_legacy_missing_schema_are_accepted() {
+    for (label, manifest) in [
+        (
+            "legacy-schema",
+            "[application]\nentry = \"app.Program.Main\"\n",
+        ),
+        (
+            "schema-one",
+            "schema = 1\n\n[application]\nentry = \"app.Program.Main\"\n",
+        ),
+    ] {
+        let (_project, root) = manifest_case(label, manifest);
+        let entry = select(&root).expect("supported manifest schema");
+        assert_eq!(entry.display_name, "app.Program.Main");
+    }
+}
+
+#[test]
+fn manifest_rejects_unsupported_schema_and_unknown_fields() {
+    let cases = [
+        (
+            "future-schema",
+            "schema = 2\n\n[application]\nentry = \"app.Program.Main\"\n",
+            "unsupported Aster.toml schema `2`",
+        ),
+        (
+            "wrong-schema-type",
+            "schema = \"1\"\n\n[application]\nentry = \"app.Program.Main\"\n",
+            "`schema` must be an integer",
+        ),
+        (
+            "unknown-top-level",
+            "schema = 1\nname = \"demo\"\n\n[application]\nentry = \"app.Program.Main\"\n",
+            "unknown top-level Aster.toml field `name`",
+        ),
+        (
+            "unknown-application",
+            "schema = 1\n\n[application]\nentry = \"app.Program.Main\"\nmode = \"debug\"\n",
+            "unknown Aster.toml application field `mode`",
+        ),
+    ];
+    for (label, manifest, expected) in cases {
+        let (_project, root) = manifest_case(label, manifest);
+        assert!(
+            errors(&root)
+                .iter()
+                .any(|message| message.contains(expected)),
+            "missing `{expected}` diagnostic"
+        );
+    }
+}
+
+#[test]
+fn manifest_requires_a_typed_application_entry() {
+    let cases = [
+        (
+            "missing-application",
+            "schema = 1\n",
+            "does not define an `[application]` table",
+        ),
+        (
+            "wrong-application",
+            "schema = 1\napplication = \"app.Program.Main\"\n",
+            "`application` must be a table",
+        ),
+        (
+            "missing-entry",
+            "schema = 1\n\n[application]\n",
+            "does not define `application.entry`",
+        ),
+        (
+            "wrong-entry-type",
+            "schema = 1\n\n[application]\nentry = 1\n",
+            "`application.entry` must be a string",
+        ),
+        (
+            "empty-entry",
+            "schema = 1\n\n[application]\nentry = \"\"\n",
+            "invalid format",
+        ),
+        (
+            "wrong-method",
+            "schema = 1\n\n[application]\nentry = \"app.Program.Run\"\n",
+            "must end in `.Main`",
+        ),
+    ];
+    for (label, manifest, expected) in cases {
+        let (_project, root) = manifest_case(label, manifest);
+        assert!(
+            errors(&root)
+                .iter()
+                .any(|message| message.contains(expected)),
+            "missing `{expected}` diagnostic"
+        );
+    }
 }
 
 #[test]

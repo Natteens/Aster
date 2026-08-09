@@ -48,6 +48,8 @@ candidates. This keeps the root file in control of the application.
 A project can select its entry explicitly with an `Aster.toml` in the project root:
 
 ```toml
+schema = 1
+
 [application]
 entry = "app.Program.Main"
 ```
@@ -57,6 +59,11 @@ method follows the same static, parameter, and return rules as the convention. W
 is below the manifest, the manifest directory is also the project root. For example,
 `app/main.aster` belongs to namespace `app` and may use `using app.math;` for sources under
 `app/math/`.
+
+Schema `1` supports only the top-level `schema` field and the `[application]` table, which in turn
+supports only `entry`. Unknown fields and unsupported schema numbers are rejected with controlled
+manifest diagnostics instead of being ignored. Existing pre-schema manifests remain valid: omitting
+`schema` is treated as schema `1`, while `aster new` writes the explicit version for new projects.
 
 The manifest is intentionally small. It does not describe packages, dependencies, build profiles,
 an engine, or remote downloads.
@@ -72,4 +79,4 @@ aster run examples\expressions.aster --function Run
 An explicit function takes precedence over both `Main` and `Aster.toml`, even if the manifest is
 invalid. The named function must still be a public, parameterless namespace-level function in the
 root namespace. `check`, `dump-hir`, and `dump-mir` do not require an entry when no manifest exists. When a
-manifest is present, those commands validate its syntax and configured target without running it.
+manifest is present, those commands validate its schema, syntax, and configured target without running it.

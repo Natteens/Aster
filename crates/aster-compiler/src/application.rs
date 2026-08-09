@@ -1,17 +1,17 @@
-//! Application manifest loading and semantic entry-point selection.
+//! Application entry-point selection after typed manifest loading.
 //!
 //! This layer runs after project linking and semantic analysis. It selects a
 //! resolved HIR function symbol; neither MIR nor the backend knows about TOML,
 //! source paths, or the `Main` convention.
 
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use aster_hir::{self as hir, SymbolId, Type, Visibility};
 
-use crate::ProjectCompilation;
+use crate::{
+    ProjectCompilation,
+    manifest::{ManifestEntry, load_manifest},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApplicationEntry {
@@ -38,27 +38,6 @@ impl ApplicationDiagnostic {
     }
 }
 
-#[derive(Clone, Debug)]
-struct ManifestEntry {
-    path: PathBuf,
-    namespace: String,
-    class: String,
-    method: String,
-}
-
-/// Find the nearest `Aster.toml`, beginning at the root source directory.
-#[must_use]
-pub fn find_manifest_path(root_file: &Path) -> Option<PathBuf> {
-    let absolute = fs::canonicalize(root_file).ok()?;
-    for directory in absolute.parent()?.ancestors() {
-        let candidate = directory.join("Aster.toml");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 /// Select a manifest entry when present, otherwise select a conventional
 /// public static `Main` method from a root-namespace class.
 ///
@@ -71,74 +50,32 @@ pub fn select_application_entry(
     root_file: &Path,
 ) -> Result<ApplicationEntry, Vec<ApplicationDiagnostic>> {
     match load_manifest_entry(root_file)? {
-        Some(entry) => select_manifest_entry(project, &entry),
+        Some((path, entry)) => select_manifest_entry(project, &path, &entry),
         None => select_conventional_entry(project, root_file),
     }
 }
 
 fn load_manifest_entry(
     root_file: &Path,
-) -> Result<Option<ManifestEntry>, Vec<ApplicationDiagnostic>> {
-    let Some(path) = find_manifest_path(root_file) else {
+) -> Result<Option<(PathBuf, ManifestEntry)>, Vec<ApplicationDiagnostic>> {
+    let Some(manifest) = load_manifest(root_file) else {
         return Ok(None);
     };
-    let source = fs::read_to_string(&path).map_err(|error| {
-        vec![diagnostic(
-            &path,
-            format!("could not read application manifest: {error}"),
-            "make sure `Aster.toml` is readable UTF-8 text",
-        )]
-    })?;
-    let document = source.parse::<toml::Value>().map_err(|error| {
-        vec![diagnostic(
-            &path,
-            format!("invalid Aster.toml: {error}"),
-            "use `[application]` followed by `entry = \"namespace.Class.Main\"`",
-        )]
-    })?;
-    let entry = document
-        .get("application")
-        .and_then(toml::Value::as_table)
-        .and_then(|application| application.get("entry"))
-        .and_then(toml::Value::as_str)
-        .ok_or_else(|| {
-            vec![diagnostic(
-                &path,
-                "Aster.toml does not define a string `application.entry`",
-                "add `[application]` and `entry = \"app.Program.Main\"`",
-            )]
-        })?;
-    let parts = entry.split('.').collect::<Vec<_>>();
-    if parts.len() < 3 || parts.iter().any(|part| !valid_identifier(part)) {
-        return Err(vec![diagnostic(
-            &path,
-            format!("application entry `{entry}` has an invalid format"),
-            "use a dotted `namespace.Class.Main` name such as `app.Program.Main`",
-        )]);
-    }
-    let method = parts[parts.len() - 1].to_owned();
-    if method != "Main" {
-        return Err(vec![diagnostic(
-            &path,
-            format!("application entry must end in `.Main`, but found `.{method}`"),
-            "point `application.entry` at a public static `Main` method",
-        )]);
-    }
-    Ok(Some(ManifestEntry {
-        path,
-        namespace: parts[..parts.len() - 2].join("."),
-        class: parts[parts.len() - 2].to_owned(),
-        method,
-    }))
+    let path = manifest.path;
+    let manifest = manifest
+        .result
+        .map_err(|error| vec![diagnostic(&path, error.message, error.help)])?;
+    Ok(Some((path, manifest.application.entry)))
 }
 
 fn select_manifest_entry(
     project: &ProjectCompilation,
+    path: &Path,
     entry: &ManifestEntry,
 ) -> Result<ApplicationEntry, Vec<ApplicationDiagnostic>> {
     if crate::standard_library::is_official_name(&entry.namespace) {
         return Err(vec![diagnostic(
-            &entry.path,
+            path,
             format!(
                 "application entry cannot point into standard library namespace `{}`",
                 entry.namespace
@@ -154,7 +91,7 @@ fn select_manifest_entry(
     let Some(class) = classes(&project.compilation.hir).find(|class| class.name == linked_name)
     else {
         return Err(vec![diagnostic(
-            &entry.path,
+            path,
             format!(
                 "entry type `{}.{}` was not found in the root namespace or its using graph",
                 entry.namespace, entry.class
@@ -164,7 +101,7 @@ fn select_manifest_entry(
     };
     if class.visibility != Visibility::Public {
         return Err(vec![diagnostic(
-            &entry.path,
+            path,
             format!(
                 "entry class `{}.{}` is not public",
                 entry.namespace, entry.class
@@ -175,7 +112,7 @@ fn select_manifest_entry(
     select_named_methods(
         class,
         &entry.method,
-        &entry.path,
+        path,
         &format!("{}.{}.{}", entry.namespace, entry.class, entry.method),
     )
 }
@@ -318,12 +255,6 @@ fn classes(module: &hir::Module) -> impl Iterator<Item = &hir::TypeDeclaration> 
         };
         Some(class)
     })
-}
-
-fn valid_identifier(value: &str) -> bool {
-    let mut characters = value.chars();
-    matches!(characters.next(), Some('_' | 'a'..='z' | 'A'..='Z'))
-        && characters.all(|character| matches!(character, '_' | 'a'..='z' | 'A'..='Z' | '0'..='9'))
 }
 
 fn diagnostic(

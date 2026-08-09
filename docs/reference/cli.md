@@ -17,8 +17,9 @@ and prints the compiler's typed intermediate representations.
 
 ## Projects and source files
 
-Without `[FILE]`, `check`, `run`, `dump-hir`, and `dump-mir` use `Aster.toml` in the current
-directory and start from `app/main.aster`.
+Without `[FILE]`, `check`, `run`, `dump-hir`, and `dump-mir` find the nearest `Aster.toml` in the
+current directory or one of its ancestors, then start from `app/main.aster` below that manifest.
+This means the project commands keep working from nested directories inside the project.
 
 ```console
 aster check
@@ -32,9 +33,10 @@ aster check examples/hello.aster
 aster run examples/hello.aster
 ```
 
-The nearest `Aster.toml` establishes the project root and application entry. Without a manifest,
-`run` finds one conventional public static `Main` in the root namespace. `Main` is parameterless
-and returns `void` or `int`. See [application entry](application-entry.md) for the complete rules.
+For an explicit source, the nearest `Aster.toml` in that source file's ancestors establishes the
+project root and application entry. Without a manifest, `run` finds one conventional public static
+`Main` in the root namespace. `Main` is parameterless and returns `void` or `int`. See
+[application entry](application-entry.md) for the complete manifest and entry rules.
 
 ## Development options
 
@@ -44,9 +46,9 @@ and returns `void` or `int`. See [application entry](application-entry.md) for t
 aster run examples/expressions.aster --function Run
 ```
 
-The selected function takes precedence over the manifest and conventional `Main`. This option is
-intended for compiler development and focused examples. `--memory-stats` prints execution-context
-allocation metrics after a successful run.
+The selected function takes precedence over the manifest and conventional `Main`, including when
+the relevant manifest is invalid. This option is intended for compiler development and focused
+examples. `--memory-stats` prints execution-context allocation metrics after a successful run.
 
 `watch` accepts the same `--function <NAME>` selection but always requires a source file:
 

@@ -6,7 +6,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const MANIFEST: &str = "[application]\nentry = \"app.Program.Main\"\n";
 const MAIN_SOURCE: &str = r#"namespace app;
 
 using aster.io;
@@ -27,6 +26,13 @@ const RESERVED_WINDOWS_NAMES: [&str; 23] = [
 ];
 
 static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(0);
+
+fn manifest_source() -> String {
+    format!(
+        "schema = {}\n\n[application]\nentry = \"app.Program.Main\"\n",
+        aster_compiler::CURRENT_MANIFEST_SCHEMA
+    )
+}
 
 pub(crate) fn create(parent: &Path, name: &str) -> Result<PathBuf, String> {
     create_with_source(parent, name, MAIN_SOURCE)
@@ -74,9 +80,10 @@ pub(crate) fn create_with_source(
         let app = staging.join("app");
         fs::create_dir(&app)
             .map_err(|error| format!("could not create project source directory: {error}"))?;
-        write_new_file(&staging.join("Aster.toml"), MANIFEST)?;
+        let manifest = manifest_source();
+        write_new_file(&staging.join("Aster.toml"), &manifest)?;
         write_new_file(&app.join("main.aster"), source)?;
-        validate_staging(&staging, source)?;
+        validate_staging(&staging, &manifest, source)?;
 
         match fs::symlink_metadata(&destination) {
             Ok(_) => {
@@ -187,12 +194,16 @@ fn write_new_file(path: &Path, contents: &str) -> Result<(), String> {
         .map_err(|error| format!("could not finish `{}`: {error}", path.display()))
 }
 
-fn validate_staging(staging: &Path, expected_source: &str) -> Result<(), String> {
+fn validate_staging(
+    staging: &Path,
+    expected_manifest: &str,
+    expected_source: &str,
+) -> Result<(), String> {
     let manifest = fs::read_to_string(staging.join("Aster.toml"))
         .map_err(|error| format!("could not validate generated manifest: {error}"))?;
     let source = fs::read_to_string(staging.join("app/main.aster"))
         .map_err(|error| format!("could not validate generated source: {error}"))?;
-    if manifest != MANIFEST || source != expected_source {
+    if manifest != expected_manifest || source != expected_source {
         return Err("generated project content did not pass validation".into());
     }
     Ok(())
@@ -243,7 +254,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use super::{MAIN_SOURCE, MANIFEST, create, validate_name};
+    use super::{MAIN_SOURCE, create, manifest_source, validate_name};
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -291,7 +302,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(first.join("Aster.toml")).expect("read manifest"),
-            MANIFEST
+            manifest_source()
         );
         assert_eq!(
             fs::read_to_string(first.join("app/main.aster")).expect("read source"),
