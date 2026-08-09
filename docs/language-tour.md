@@ -125,7 +125,8 @@ replacement, removal, and insertion-order entry snapshots. `foreach` works over 
 strings without a public iterator or hidden iterator allocation.
 
 Strings are immutable UTF-8 values. Concatenation creates a new string, `==` compares content,
-indexing returns one Unicode scalar as `char`, and `Length` counts Unicode scalars. ASTER does not
+`foreach (char scalar in text)` walks Unicode scalars, and `Length` counts those scalars. Direct
+string indexing is not supported; `text[index]` is rejected with a type diagnostic. ASTER does not
 silently convert numbers or objects to text with `+`; use `$"Total: {quantity * price}"` instead.
 
 See [collections](reference/collections.md) and [strings](reference/strings.md) for their runtime

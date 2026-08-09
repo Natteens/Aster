@@ -86,8 +86,9 @@ can be used with ordinary array `foreach`.
 ## Strings
 
 `foreach (char scalar in text)` decodes immutable UTF-8 in Unicode-scalar order. Combining marks
-remain separate scalar values, and no grapheme-cluster allocation occurs. See [Strings](strings.md)
-for indexing, interpolation, equality, and allocation behavior.
+remain separate scalar values, and no grapheme-cluster allocation occurs. Direct string indexing is
+not supported. See [Strings](strings.md) for scalar iteration, interpolation, equality, and allocation
+behavior.
 
 Arrays, lists, dictionaries, and strings are not transferable across worker boundaries. They may
 still be created and used inside a worker when every operation in that body is otherwise allowed.

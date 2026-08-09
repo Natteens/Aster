@@ -20,7 +20,13 @@ casts and overflow behavior. User-defined types and memory management are separa
 | `ulong` | 64 | unsigned | 64-bit masks and identifiers | Cranelift JIT |
 | `float` | 32 | n/a | IEEE 754 binary32 approximation | Cranelift JIT |
 | `double` | 64 | n/a | IEEE 754 binary64 approximation | Cranelift JIT |
-| `decimal` | OPEN QUESTION | n/a | exact base-10 values | frontend only; JIT rejects it |
+| `decimal` | OPEN QUESTION | n/a | exact base-10 values | represented in frontend IR; public CLI rejects it |
+
+> [!IMPORTANT]
+> `decimal` has syntax and typed frontend/IR representation, but it is not part of the current
+> executable subset. Public commands validate backend support before success, so `aster check`,
+> `aster dump-hir`, `aster dump-mir`, and `aster run` reject a compilation unit that requires
+> `decimal` with a controlled diagnostic.
 
 `bool`, `char`, `string` and `void` remain primitive language types but are not numeric.
 `char` is one Unicode scalar value. `string` is an immutable UTF-8 reference: `+` and `+=`
@@ -126,28 +132,32 @@ Integer-to-`char` casts currently require a compile-time constant that is a vali
 scalar. This restriction avoids creating an invalid `char` until runtime validation exists.
 Direct casts between `char` and floating-point or decimal types are rejected.
 
-Casts involving `decimal` can be represented by the frontend, but cannot execute. The JIT
-rejects any function or compilation unit requiring decimal with a specific diagnostic.
+Casts involving `decimal` can be represented in the frontend and typed IR, but no current public
+compiler command accepts a compilation unit that requires decimal. Backend validation rejects it
+before a successful check, dump, or execution.
 
-## Overflow and division
+## ⚠️ Overflow and division
 
 - Runtime integer addition, subtraction, multiplication and explicit narrowing wrap at the
   operation or target width in both debug and release builds.
 - Constant integer arithmetic is checked; overflow is a compile-time error. This intentional
   difference prevents an overflowing value from becoming part of a constant declaration.
 - Unsigned comparisons, division and remainder use unsigned semantics.
-- Integer division or remainder by zero is invalid. The current JIT still relies on the
-  machine/Cranelift trap for dynamic zero divisors; converting that trap into a structured
-  ASTER runtime diagnostic is required before the execution API is considered robust.
+- Integer division or remainder by zero reports a controlled ASTER runtime error. It does not rely
+  on a raw machine or Cranelift trap.
+- The signed overflow case `MIN / -1` also reports a controlled ASTER runtime error rather than
+  terminating the process unexpectedly.
 - Floating arithmetic follows IEEE 754. `%` for `float` and `double` is not implemented and is
   rejected by the backend.
 
-## Decimal status
+## 🧪 Decimal status
 
 `decimal` is not a disguised `double`. Its keyword, `m` literal, type checking, HIR and MIR
-representation exist so designs can be validated. The Cranelift backend rejects execution
-instead of changing the value's meaning. Constant decimal arithmetic is also not implemented;
-a decimal constant may currently be initialized only by a supported exact literal/conversion.
+representation exist so the design can be preserved while the executable contract remains closed.
+Current public compiler commands reject decimal during backend validation instead of changing the
+value's meaning or exposing a partially supported execution path. Constant decimal arithmetic is
+also not implemented; a decimal constant may currently be initialized only by a supported exact
+literal/conversion inside the frontend representation.
 
 The next executable step is to choose a fixed decimal layout (precision, scale and overflow
 rules), implement arithmetic and conversions in `aster-runtime`, define its ABI, then lower
@@ -167,6 +177,6 @@ type. Arrays and monomorphized generics are current language features. Root `obj
   executable `decimal` use?
 - **OPEN QUESTION:** Should a future checked-arithmetic mode replace or supplement runtime
   wrapping?
-- **OPEN QUESTION:** What structured runtime failure mechanism will report integer division
-  by zero and invalid dynamic `char` conversions?
+- **OPEN QUESTION:** What runtime validation model should permit dynamic integer-to-`char`
+  conversions while guaranteeing a valid Unicode scalar?
 - **OPEN QUESTION:** Will unsuffixed decimal-point literals remain `float` before ASTER 1.0?

@@ -179,8 +179,8 @@ rest of the file as invalid.
   conversions; ties are errors, and return types do not distinguish overloads.
 - Equality compares scalar and string values, comparable struct fields recursively, array/class
   reference identity, and the underlying object identity of interfaces.
-- Immutable strings support `string + string`, `+=`, Unicode-scalar indexing and `foreach`, and
-  read-only `Length`. Other values are never converted to text implicitly.
+- Immutable strings support `string + string`, `+=`, Unicode-scalar `foreach`, and read-only
+  `Length`. Direct string indexing is rejected. Other values are never converted to text implicitly.
 - `var` requires and infers from an initializer. `const` requires an initializer and cannot
   be assigned again. Explicit variables are mutable.
 - Classes, structs, interfaces, nominal class interface lists, fields, namespace-level functions, methods,

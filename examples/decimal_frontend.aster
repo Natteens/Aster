@@ -1,6 +1,7 @@
-// Decimal values are checked and preserved exactly by the frontend.
-// `aster check` accepts this file; `aster run` rejects it until the dedicated
-// decimal runtime representation and ABI are implemented.
+// Decimal syntax and typed frontend/IR representation exist, but the current
+// public CLI validates backend support before success. `aster check`,
+// `aster dump-hir`, `aster dump-mir`, and `aster run` reject this fixture until
+// the decimal runtime representation and ABI are implemented.
 
 public decimal Price()
 {
