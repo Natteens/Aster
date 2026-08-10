@@ -12,8 +12,8 @@ name = "aster"
 path = "src/main.rs"
 
 [dependencies]
-aster-codegen-cranelift = { path = "../aster-codegen-cranelift", version = "0.49.1" }
-aster-compiler = { path = "../aster-compiler", version = "0.49.1" }
+aster-codegen-cranelift = { path = "../aster-codegen-cranelift", version = "0.50.0" }
+aster-compiler = { path = "../aster-compiler", version = "0.50.0" }
 
 [lints]
 workspace = true
