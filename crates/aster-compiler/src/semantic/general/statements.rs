@@ -1,7 +1,7 @@
 use super::{
-    Analyzer, Binding, Block, ConstError, ConstValue, Diagnostic, Expression, HashMap, HashSet,
-    ResolvedEnumCase, Span, Statement, Type, TypeRef, VariableDeclaration, VariableKind, evaluate,
-    resolve_type_readonly,
+    Analyzer, Binding, Block, ConstError, ConstValue, Diagnostic, EnumCaseInfo, Expression,
+    HashMap, HashSet, ResolvedEnumCase, Span, Statement, Type, TypeRef, VariableDeclaration,
+    VariableKind, evaluate, resolve_type_readonly,
 };
 
 #[derive(Clone, Copy)]
@@ -334,60 +334,18 @@ impl Analyzer<'_> {
         let mut covered = HashSet::new();
         let mut any_continues = false;
         for case in cases {
-            if let Some(owner) = &case.enum_name
-                && owner != &enum_name
-            {
-                self.diagnostics.push(Diagnostic::error(
-                    format!(
-                        "case `{}` belongs to `{owner}`, not `{enum_name}`",
-                        case.case_name
-                    ),
-                    case.span,
-                ));
-            }
-            let Some((case_index, info)) = enum_cases
-                .iter()
-                .enumerate()
-                .find(|(_, item)| item.name == case.case_name)
-            else {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        format!("enum `{enum_name}` has no case `{}`", case.case_name),
-                        case.span,
-                    )
-                    .with_help("use one of the cases declared by the selected enum"),
-                );
+            let Some(info) = self.resolve_switch_pattern(
+                &enum_name,
+                case.enum_name.as_deref(),
+                &case.case_name,
+                &case.bindings,
+                case.span,
+                &mut covered,
+            ) else {
                 self.block(&case.body, true);
                 any_continues = true;
                 continue;
             };
-            if !covered.insert(case_index) {
-                self.diagnostics.push(Diagnostic::error(
-                    format!("duplicate switch case `{}`", case.case_name),
-                    case.span,
-                ));
-            }
-            if case.bindings.len() != info.fields.len() {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        format!(
-                            "case `{}` expects {} binding(s), found {}",
-                            case.case_name,
-                            info.fields.len(),
-                            case.bindings.len()
-                        ),
-                        case.span,
-                    )
-                    .with_help("bind each payload value exactly once"),
-                );
-            }
-            self.model.switch_cases.insert(
-                self.model_key(case.span),
-                ResolvedEnumCase {
-                    enum_name: enum_name.clone(),
-                    case_index,
-                },
-            );
             self.scopes.push(HashMap::new());
             for (binding, (_, type_)) in case.bindings.iter().zip(&info.fields) {
                 self.declare(
@@ -407,33 +365,116 @@ impl Analyzer<'_> {
             any_continues |= flow.can_continue;
         }
         if let Some(default) = default {
-            if covered.len() == enum_cases.len() {
-                self.diagnostics.push(
-                    Diagnostic::warning("unreachable `default` case", default.span)
-                        .with_help("remove `default`; every enum case is already covered"),
-                );
-            }
+            self.validate_switch_coverage(&enum_cases, &covered, Some(default.span), span);
             any_continues |= self.block(default, true).can_continue;
-        } else if covered.len() != enum_cases.len() {
-            let missing = enum_cases
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| !covered.contains(index))
-                .map(|(_, case)| case.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            self.diagnostics.push(
-                Diagnostic::error(
-                    format!("non-exhaustive switch; missing case(s): {missing}"),
-                    span,
-                )
-                .with_help("handle every case or add a `default` arm"),
-            );
+        } else if !self.validate_switch_coverage(&enum_cases, &covered, None, span) {
             any_continues = true;
         }
         Flow {
             can_continue: any_continues,
         }
+    }
+
+    pub(super) fn resolve_switch_pattern(
+        &mut self,
+        enum_name: &str,
+        owner: Option<&str>,
+        case_name: &str,
+        bindings: &[String],
+        span: Span,
+        covered: &mut HashSet<usize>,
+    ) -> Option<EnumCaseInfo> {
+        let enum_cases = self
+            .context
+            .types
+            .get(enum_name)
+            .map(|info| info.enum_cases.clone())
+            .unwrap_or_default();
+        if let Some(owner) = owner
+            && owner != enum_name
+        {
+            self.diagnostics.push(Diagnostic::error(
+                format!("case `{case_name}` belongs to `{owner}`, not `{enum_name}`"),
+                span,
+            ));
+        }
+        let Some((case_index, info)) = enum_cases
+            .iter()
+            .enumerate()
+            .find(|(_, item)| item.name == case_name)
+        else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!("enum `{enum_name}` has no case `{case_name}`"),
+                    span,
+                )
+                .with_help("use one of the cases declared by the selected enum"),
+            );
+            return None;
+        };
+        if !covered.insert(case_index) {
+            self.diagnostics.push(Diagnostic::error(
+                format!("duplicate switch case `{case_name}`"),
+                span,
+            ));
+        }
+        if bindings.len() != info.fields.len() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "case `{case_name}` expects {} binding(s), found {}",
+                        info.fields.len(),
+                        bindings.len()
+                    ),
+                    span,
+                )
+                .with_help("bind each payload value exactly once"),
+            );
+        }
+        self.model.switch_cases.insert(
+            self.model_key(span),
+            ResolvedEnumCase {
+                enum_name: enum_name.to_owned(),
+                case_index,
+            },
+        );
+        Some(info.clone())
+    }
+
+    pub(super) fn validate_switch_coverage(
+        &mut self,
+        enum_cases: &[EnumCaseInfo],
+        covered: &HashSet<usize>,
+        default_span: Option<Span>,
+        span: Span,
+    ) -> bool {
+        if let Some(default_span) = default_span {
+            if covered.len() == enum_cases.len() {
+                self.diagnostics.push(
+                    Diagnostic::warning("unreachable `default` case", default_span)
+                        .with_help("remove `default`; every enum case is already covered"),
+                );
+            }
+            return true;
+        }
+        if covered.len() == enum_cases.len() {
+            return true;
+        }
+        let missing = enum_cases
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !covered.contains(index))
+            .map(|(_, case)| case.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.diagnostics.push(
+            Diagnostic::error(
+                format!("non-exhaustive switch; missing case(s): {missing}"),
+                span,
+            )
+            .with_help("handle every case or add a `default` arm"),
+        );
+        false
     }
 
     fn require_bool_condition(&mut self, construct: &str, actual: &Type, span: Span) {

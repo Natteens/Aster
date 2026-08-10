@@ -1,6 +1,6 @@
 use super::{
-    AstVisitorMut, Expression, ExpressionKind, HashMap, SwitchCase, TypeName, TypeRef,
-    walk_expression_mut, walk_switch_case_mut,
+    AstVisitorMut, Expression, ExpressionKind, HashMap, SwitchCase, SwitchExpressionCase, TypeName,
+    TypeRef, walk_expression_mut, walk_switch_case_mut, walk_switch_expression_case_mut,
 };
 
 pub(super) fn substitutions(parameters: &[String], concrete: &[String]) -> HashMap<String, String> {
@@ -66,6 +66,13 @@ impl AstVisitorMut for TypeSubstituter<'_> {
             *owner = substitute_name(owner, self.substitutions);
         }
         walk_switch_case_mut(self, case);
+    }
+
+    fn visit_switch_expression_case_mut(&mut self, case: &mut SwitchExpressionCase) {
+        if let Some(owner) = &mut case.enum_name {
+            *owner = substitute_name(owner, self.substitutions);
+        }
+        walk_switch_expression_case_mut(self, case);
     }
 
     fn visit_type_ref_mut(&mut self, type_ref: &mut TypeRef) {

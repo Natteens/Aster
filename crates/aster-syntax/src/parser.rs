@@ -6,8 +6,8 @@ use crate::{
     Accessor, AssignmentOperator, BinaryOperator, Block, EnumCase, EnumDeclaration, Expression,
     ExpressionKind, Field, FieldInitializer, FunctionDeclaration, IncrementOperator,
     InterpolatedPart, Item, Literal, Member, Module, Parameter, Property, Statement, SwitchCase,
-    Token, TokenKind, TypeDeclaration, TypeParameter, TypeRef, UnaryOperator, VariableDeclaration,
-    VariableKind, Visibility,
+    SwitchExpressionCase, Token, TokenKind, TypeDeclaration, TypeParameter, TypeRef, UnaryOperator,
+    VariableDeclaration, VariableKind, Visibility,
 };
 
 /// Build an AST from a positioned token stream.
@@ -971,7 +971,10 @@ impl Parser {
     /// `condition ? whenTrue : whenFalse`, right-associative, above assignment
     /// and below `||` in precedence.
     fn conditional(&mut self) -> Option<Expression> {
-        let condition = self.logical_or()?;
+        let mut condition = self.logical_or()?;
+        if self.at(&TokenKind::Switch) {
+            condition = self.switch_expression(condition)?;
+        }
         if self.take(&TokenKind::Question).is_none() {
             return Some(condition);
         }
@@ -986,6 +989,85 @@ impl Parser {
                 when_false: Box::new(when_false),
             },
             span,
+        })
+    }
+
+    fn switch_expression(&mut self, value: Expression) -> Option<Expression> {
+        let start = value.span.start;
+        self.expect(&TokenKind::Switch)?;
+        self.expect(&TokenKind::LeftBrace)?;
+        let mut cases = Vec::new();
+        let mut default = None;
+        while !self.at(&TokenKind::RightBrace) && !self.at(&TokenKind::Eof) {
+            if self.at(&TokenKind::Default) {
+                let default_span = self.advance().span;
+                self.expect(&TokenKind::FatArrow)?;
+                let arm = self.assignment_expression()?;
+                if default.replace(Box::new(arm)).is_some() {
+                    self.diagnostics.push(Diagnostic::error(
+                        "a switch expression can declare only one default arm",
+                        default_span,
+                    ));
+                }
+            } else {
+                if default.is_some() {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "switch expression arm after `default` is unreachable",
+                            self.current().span,
+                        )
+                        .with_help("move `default` to the final arm"),
+                    );
+                }
+                let case_start = self.current().span.start;
+                let (first, first_span) = self.identifier()?;
+                let (enum_name, case_name) = if self.take(&TokenKind::Dot).is_some() {
+                    (Some(first), self.identifier()?.0)
+                } else {
+                    (None, first)
+                };
+                let mut bindings = Vec::new();
+                if self.take(&TokenKind::LeftParen).is_some() {
+                    if !self.at(&TokenKind::RightParen) {
+                        loop {
+                            bindings.push(self.identifier()?.0);
+                            if self.take(&TokenKind::Comma).is_none() {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect(&TokenKind::RightParen)?;
+                }
+                self.expect(&TokenKind::FatArrow)?;
+                let arm = self.assignment_expression()?;
+                let end = arm.span.end.max(first_span.end);
+                cases.push(SwitchExpressionCase {
+                    enum_name,
+                    case_name,
+                    bindings,
+                    value: arm,
+                    span: Span::new(case_start, end),
+                });
+            }
+            if self.take(&TokenKind::Comma).is_none() && !self.at(&TokenKind::RightBrace) {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "expected `,` between switch expression arms",
+                        self.current().span,
+                    )
+                    .with_help("separate switch expression arms with commas"),
+                );
+                return None;
+            }
+        }
+        let end = self.expect(&TokenKind::RightBrace)?.span.end;
+        Some(Expression {
+            kind: ExpressionKind::Switch {
+                value: Box::new(value),
+                cases,
+                default,
+            },
+            span: Span::new(start, end),
         })
     }
 

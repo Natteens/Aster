@@ -10,8 +10,8 @@ pub use ast::{
     Accessor, AssignmentOperator, BinaryOperator, Block, EnumCase, EnumDeclaration, Expression,
     ExpressionKind, Field, FieldInitializer, FunctionDeclaration, IncrementOperator,
     InterpolatedPart, Item, Literal, Member, Module, NamespaceDeclaration, Parameter, Property,
-    Statement, SwitchCase, TypeDeclaration, TypeParameter, TypeRef, UnaryOperator,
-    UsingDeclaration, VariableDeclaration, VariableKind, Visibility,
+    Statement, SwitchCase, SwitchExpressionCase, TypeDeclaration, TypeParameter, TypeRef,
+    UnaryOperator, UsingDeclaration, VariableDeclaration, VariableKind, Visibility,
 };
 pub use lexer::lex;
 pub use parser::parse;

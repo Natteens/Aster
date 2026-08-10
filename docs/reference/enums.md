@@ -46,6 +46,24 @@ The switched expression is evaluated once. Payload names such as `x` and `text` 
 their arm. A switch must list every case or provide one `default` arm. Duplicate cases, the wrong
 number of payload names, and cases from another enum are errors.
 
+Use the restricted expression form when every arm produces a value:
+
+```aster
+public int Distance(Message message)
+{
+    return message switch
+    {
+        Move(x, y) => x + y,
+        Quit => 0,
+        Write(text) => text.Length,
+    };
+}
+```
+
+The input is evaluated once and only the selected arm is evaluated. Arms must produce compatible
+types and are comma-separated. The same exhaustiveness and payload rules apply; `default`, when
+used, must be the final arm.
+
 ```aster
 switch (message)
 {
@@ -56,6 +74,6 @@ switch (message)
 }
 ```
 
-This first `switch` works only with enums. It is a statement, not an expression. General pattern
-matching, guards, combined cases, numeric/string switches, explicit discriminants, enum methods,
+Both forms work only with enums. General pattern matching, guards, combined cases, numeric/string
+switches, explicit discriminants, enum methods,
 and recursive value layouts are not implemented.

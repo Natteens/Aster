@@ -139,6 +139,10 @@ pub(crate) struct Model {
     pub parallel_for_each: HashMap<ModelNodeKey, ResolvedParallelForEach>,
     pub parallel_reduce: HashMap<ModelNodeKey, ResolvedParallelReduce>,
     pub switch_cases: HashMap<ModelNodeKey, ResolvedEnumCase>,
+    /// Common result type selected by semantic analysis for a restricted enum
+    /// switch expression. HIR lowering materializes this decision instead of
+    /// independently repeating promotion or compatibility rules.
+    pub switch_expression_types: HashMap<ModelNodeKey, String>,
     pub propagations: HashMap<ModelNodeKey, ResolvedPropagation>,
     pub string_operations: HashMap<ModelNodeKey, StringOperation>,
     pub dictionary_operations: HashMap<ModelNodeKey, ResolvedDictionaryOperation>,

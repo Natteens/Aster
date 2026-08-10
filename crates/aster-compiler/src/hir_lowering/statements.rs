@@ -119,38 +119,14 @@ impl Lowerer<'_> {
                 let value = self.expression(value);
                 let mut lowered_cases = Vec::new();
                 for case in cases {
-                    let key = crate::semantic::ModelNodeKey {
-                        context: self.model_context.clone(),
-                        span: case.span,
-                    };
-                    let resolved = &self.model.switch_cases[&key];
-                    let (case_symbol, field_symbols) =
-                        self.enum_cases[&(resolved.enum_name.clone(), resolved.case_index)].clone();
                     self.scopes.push(HashMap::new());
-                    let bindings = case
-                        .bindings
-                        .iter()
-                        .zip(field_symbols)
-                        .map(|(name, field)| {
-                            let symbol = self.allocate();
-                            let type_ = self.symbol_types[&field].clone();
-                            self.symbol_types.insert(symbol, type_.clone());
-                            self.scopes
-                                .last_mut()
-                                .expect("switch case scope")
-                                .insert(name.clone(), symbol);
-                            hir::Parameter {
-                                symbol,
-                                name: name.clone(),
-                                type_,
-                            }
-                        })
-                        .collect();
+                    let (case_symbol, tag, bindings) =
+                        self.switch_pattern(case.span, &case.bindings);
                     let body = self.block(&case.body);
                     self.scopes.pop();
                     lowered_cases.push(hir::SwitchCase {
                         case: case_symbol,
-                        tag: u32::try_from(resolved.case_index).expect("validated enum tag"),
+                        tag,
                         bindings,
                         body,
                     });
@@ -164,6 +140,43 @@ impl Lowerer<'_> {
             ast::Statement::Break(_) => hir::Statement::Break,
             ast::Statement::Continue(_) => hir::Statement::Continue,
         })
+    }
+
+    pub(super) fn switch_pattern(
+        &mut self,
+        span: aster_diagnostics::Span,
+        names: &[String],
+    ) -> (hir::SymbolId, u32, Vec<hir::Parameter>) {
+        let key = crate::semantic::ModelNodeKey {
+            context: self.model_context.clone(),
+            span,
+        };
+        let resolved = &self.model.switch_cases[&key];
+        let (case_symbol, field_symbols) =
+            self.enum_cases[&(resolved.enum_name.clone(), resolved.case_index)].clone();
+        let bindings = names
+            .iter()
+            .zip(field_symbols)
+            .map(|(name, field)| {
+                let symbol = self.allocate();
+                let type_ = self.symbol_types[&field].clone();
+                self.symbol_types.insert(symbol, type_.clone());
+                self.scopes
+                    .last_mut()
+                    .expect("switch case scope")
+                    .insert(name.clone(), symbol);
+                hir::Parameter {
+                    symbol,
+                    name: name.clone(),
+                    type_,
+                }
+            })
+            .collect();
+        (
+            case_symbol,
+            u32::try_from(resolved.case_index).expect("validated enum tag"),
+            bindings,
+        )
     }
 
     pub(super) fn variable(

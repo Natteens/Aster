@@ -1206,6 +1206,19 @@ fn collect_expression_calls<'a>(expression: &'a Expression, out: &mut Vec<&'a Ex
             collect_expression_calls(when_true, out);
             collect_expression_calls(when_false, out);
         }
+        ExpressionKind::Switch {
+            value,
+            cases,
+            default,
+        } => {
+            collect_expression_calls(value, out);
+            for case in cases {
+                collect_expression_calls(&case.value, out);
+            }
+            if let Some(default) = default {
+                collect_expression_calls(default, out);
+            }
+        }
         ExpressionKind::Binary { left, right, .. } => {
             collect_expression_calls(left, out);
             collect_expression_calls(right, out);
@@ -1280,6 +1293,19 @@ fn collect_expression_awaits<'a>(expression: &'a Expression, out: &mut Vec<&'a E
             collect_expression_awaits(condition, out);
             collect_expression_awaits(when_true, out);
             collect_expression_awaits(when_false, out);
+        }
+        ExpressionKind::Switch {
+            value,
+            cases,
+            default,
+        } => {
+            collect_expression_awaits(value, out);
+            for case in cases {
+                collect_expression_awaits(&case.value, out);
+            }
+            if let Some(default) = default {
+                collect_expression_awaits(default, out);
+            }
         }
         ExpressionKind::Call {
             callee, arguments, ..

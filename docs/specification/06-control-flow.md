@@ -41,9 +41,10 @@ iteration yields Unicode scalars as `char`.
 ## Enum `switch`
 
 `switch` over an enum is exhaustive unless it has `default`. Cases do not fall through, and payload
-bindings are scoped to their direct arm. See [Enums](16-enums.md).
+bindings are scoped to their direct arm. A restricted expression form uses `=>` arms and produces
+one value. See [Enums](16-enums.md).
 
 ## Not implemented
 
 `if` is not an expression. There is no unconditional `loop`, iterator protocol, loop label,
-general `match`, nested pattern, guard, switch expression, or exception control flow.
+general `match`, nested pattern, guard, or exception control flow.

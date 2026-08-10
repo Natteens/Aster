@@ -270,16 +270,12 @@ impl Monomorphizer {
                 condition,
                 when_true,
                 when_false,
-            } => {
-                self.expression(condition, environment);
-                let first = self.expression(when_true, environment);
-                let second = self.expression(when_false, environment);
-                if first == second {
-                    first
-                } else {
-                    String::new()
-                }
-            }
+            } => self.conditional_expression(condition, when_true, when_false, environment),
+            ExpressionKind::Switch {
+                value,
+                cases,
+                default,
+            } => self.switch_expression(value, cases, default, environment),
             ExpressionKind::Cast { target, operand } => {
                 self.expression(operand, environment);
                 target.name.clone()
@@ -303,6 +299,51 @@ impl Monomorphizer {
                 "string".to_owned()
             }
         }
+    }
+
+    fn conditional_expression(
+        &mut self,
+        condition: &mut Expression,
+        when_true: &mut Expression,
+        when_false: &mut Expression,
+        environment: &HashMap<String, String>,
+    ) -> String {
+        self.expression(condition, environment);
+        let first = self.expression(when_true, environment);
+        let second = self.expression(when_false, environment);
+        if first == second {
+            first
+        } else {
+            String::new()
+        }
+    }
+
+    fn switch_expression(
+        &mut self,
+        value: &mut Expression,
+        cases: &mut [aster_syntax::SwitchExpressionCase],
+        default: &mut Option<Box<Expression>>,
+        environment: &HashMap<String, String>,
+    ) -> String {
+        self.expression(value, environment);
+        let mut result = String::new();
+        for case in cases {
+            let arm = self.expression(&mut case.value, environment);
+            if result.is_empty() {
+                result = arm;
+            } else if result != arm {
+                result.clear();
+            }
+        }
+        if let Some(default) = default {
+            let arm = self.expression(default, environment);
+            if result.is_empty() {
+                result = arm;
+            } else if result != arm {
+                result.clear();
+            }
+        }
+        result
     }
 
     fn binary_expression(

@@ -41,6 +41,20 @@ The selected value is evaluated once. Cases do not fall through, and `break` rem
 statement. Each arm has its own scope. Without `default`, every case must appear; duplicate or
 unknown cases and incorrect payload binding counts are errors.
 
+The restricted expression form selects one value:
+
+```aster
+return message switch
+{
+    Quit => 0,
+    Move(x, y) => x + y,
+};
+```
+
+It accepts the same enum cases and payload bindings, evaluates the selected value once, evaluates
+only the chosen arm, and requires compatible arm result types. Arms are comma-separated and
+`default`, when present, must be last.
+
 ## Representation
 
 A concrete enum is a value containing an internal tag and aligned storage for its largest payload.
@@ -67,6 +81,6 @@ Message message = Message.Move(10);
 
 ## Current limits
 
-Nested patterns, guards, switch expressions, numeric discriminants, flags, enum casts, enum methods,
+Nested patterns, guards, general pattern matching, numeric discriminants, flags, enum casts, enum methods,
 and implicit default values are not implemented. Nested structural patterns may be reconsidered
 after exhaustiveness diagnostics can remain equally precise.

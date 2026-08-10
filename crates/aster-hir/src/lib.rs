@@ -281,6 +281,14 @@ pub struct SwitchCase {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct SwitchExpressionCase {
+    pub case: SymbolId,
+    pub tag: u32,
+    pub bindings: Vec<Parameter>,
+    pub value: Expression,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Expression {
     pub type_: Type,
     pub kind: ExpressionKind,
@@ -486,6 +494,13 @@ pub enum ExpressionKind {
         condition: Box<Expression>,
         when_true: Box<Expression>,
         when_false: Box<Expression>,
+    },
+    /// Restricted exhaustive enum switch expression. Case symbols and payload
+    /// bindings are fully resolved; MIR lowering expands this into CFG.
+    Switch {
+        value: Box<Expression>,
+        cases: Vec<SwitchExpressionCase>,
+        default: Option<Box<Expression>>,
     },
     /// Postfix `?` on an `aster.core.Result<T, E>`: evaluate `operand` once, and
     /// either continue with the `Ok` payload (this expression's `type_`, `T`) or

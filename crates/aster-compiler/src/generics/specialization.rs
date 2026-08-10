@@ -1,7 +1,8 @@
 use super::{
     AstVisitorMut, Diagnostic, Expression, ExpressionKind, HashMap, Item, Member, Monomorphizer,
-    SwitchCase, TypeName, TypeRef, TypeSubstituter, Write, infer_type, substitute_name,
-    substitutions, walk_expression_mut, walk_switch_case_mut,
+    SwitchCase, SwitchExpressionCase, TypeName, TypeRef, TypeSubstituter, Write, infer_type,
+    substitute_name, substitutions, walk_expression_mut, walk_switch_case_mut,
+    walk_switch_expression_case_mut,
 };
 
 impl Monomorphizer {
@@ -395,6 +396,15 @@ impl AstVisitorMut for GenericTypeConcretizer<'_> {
             *owner = self.monomorphizer.concretize_type_name(owner, case.span);
         }
         walk_switch_case_mut(self, case);
+    }
+
+    fn visit_switch_expression_case_mut(&mut self, case: &mut SwitchExpressionCase) {
+        if let Some(owner) = &mut case.enum_name
+            && TypeName::parse(owner).is_some_and(|type_name| !type_name.arguments.is_empty())
+        {
+            *owner = self.monomorphizer.concretize_type_name(owner, case.span);
+        }
+        walk_switch_expression_case_mut(self, case);
     }
 
     fn visit_type_ref_mut(&mut self, type_ref: &mut TypeRef) {

@@ -1,8 +1,8 @@
 use super::{
     Analyzer, AssignmentOperator, BinaryOperator, Binding, Diagnostic, Expression, ExpressionKind,
-    HashSet, IncrementOperator, IntegerFit, InterpolatedPart, Literal, OptionCases, Primitive,
-    PropertyInfo, ResolvedPropagation, ResolvedPropertyAssignment, ResultCases, Span, Type,
-    TypeKind, TypeName, TypeRef, UnaryOperator, UnsignedFit, Visibility, classify_integer,
+    HashMap, HashSet, IncrementOperator, IntegerFit, InterpolatedPart, Literal, OptionCases,
+    Primitive, PropertyInfo, ResolvedPropagation, ResolvedPropertyAssignment, ResultCases, Span,
+    Type, TypeKind, TypeName, TypeRef, UnaryOperator, UnsignedFit, Visibility, classify_integer,
     classify_unsigned, compatible, constant_integer, evaluate, fits_long, fits_ulong,
     integer_value, promoted_numeric, resolve_type_readonly, zero_initializable,
 };
@@ -371,6 +371,11 @@ impl Analyzer<'_> {
                 when_true,
                 when_false,
             } => self.conditional(condition, when_true, when_false),
+            ExpressionKind::Switch {
+                value,
+                cases,
+                default,
+            } => self.switch_expression(value, cases, default.as_deref(), expression.span),
             ExpressionKind::Cast { target, operand } => self.cast(target, operand, expression.span),
             ExpressionKind::Binary {
                 left,
@@ -892,6 +897,133 @@ impl Analyzer<'_> {
                     when_false.span,
                 )
                 .with_help("give both branches a compatible type"),
+            );
+            Type::Unknown
+        }
+    }
+
+    fn switch_expression(
+        &mut self,
+        value: &Expression,
+        cases: &[aster_syntax::SwitchExpressionCase],
+        default: Option<&Expression>,
+        span: Span,
+    ) -> Type {
+        let selected = self.expression(value);
+        let Type::Enum(enum_name) = selected else {
+            if selected != Type::Unknown {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "`switch` expression requires an enum value, found `{}`",
+                            selected.display()
+                        ),
+                        value.span,
+                    )
+                    .with_help("select a declared enum value"),
+                );
+            }
+            for case in cases {
+                self.expression(&case.value);
+            }
+            if let Some(default) = default {
+                self.expression(default);
+            }
+            return Type::Unknown;
+        };
+        let enum_cases = self
+            .context
+            .types
+            .get(&enum_name)
+            .map(|info| info.enum_cases.clone())
+            .unwrap_or_default();
+        let mut covered = HashSet::new();
+        let mut result_type = None;
+        for case in cases {
+            let info = self.resolve_switch_pattern(
+                &enum_name,
+                case.enum_name.as_deref(),
+                &case.case_name,
+                &case.bindings,
+                case.span,
+                &mut covered,
+            );
+            self.scopes.push(HashMap::new());
+            if let Some(info) = info {
+                for (binding, (_, type_)) in case.bindings.iter().zip(&info.fields) {
+                    self.declare(
+                        binding,
+                        Binding {
+                            type_: type_.clone(),
+                            mutable: true,
+                            iteration_readonly: false,
+                            initialized: true,
+                            span: case.span,
+                            value: None,
+                        },
+                    );
+                }
+            }
+            let arm_type = self.expression(&case.value);
+            self.scopes.pop();
+            result_type = Some(self.switch_result_type(result_type, arm_type, case.value.span));
+        }
+        if let Some(default) = default {
+            self.validate_switch_coverage(&enum_cases, &covered, Some(default.span), span);
+            let arm_type = self.expression(default);
+            result_type = Some(self.switch_result_type(result_type, arm_type, default.span));
+        } else {
+            self.validate_switch_coverage(&enum_cases, &covered, None, span);
+        }
+        let result_type = result_type.unwrap_or_else(|| {
+            self.diagnostics.push(Diagnostic::error(
+                "a switch expression must contain at least one result arm",
+                span,
+            ));
+            Type::Unknown
+        });
+        if result_type != Type::Unknown {
+            self.model
+                .switch_expression_types
+                .insert(self.model_key(span), result_type.display());
+        }
+        result_type
+    }
+
+    fn switch_result_type(&mut self, current: Option<Type>, next: Type, span: Span) -> Type {
+        if next == Type::Unknown {
+            return Type::Unknown;
+        }
+        if next == Type::Void {
+            self.diagnostics.push(Diagnostic::error(
+                "switch expression arms must produce a value",
+                span,
+            ));
+            return Type::Unknown;
+        }
+        let Some(current) = current else {
+            return next;
+        };
+        if current == Type::Unknown {
+            return Type::Unknown;
+        }
+        if let Some(promoted) = promoted_numeric(&current, &next) {
+            promoted
+        } else if self.compatible(&current, &next) {
+            current
+        } else if self.compatible(&next, &current) {
+            next
+        } else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "switch expression arms have incompatible types `{}` and `{}`",
+                        current.display(),
+                        next.display()
+                    ),
+                    span,
+                )
+                .with_help("give every arm a compatible result type"),
             );
             Type::Unknown
         }

@@ -6,8 +6,8 @@
 use crate::{
     Accessor, Block, EnumCase, EnumDeclaration, Expression, ExpressionKind, Field,
     FieldInitializer, FunctionDeclaration, InterpolatedPart, Item, Member, Module,
-    NamespaceDeclaration, Parameter, Property, Statement, SwitchCase, TypeDeclaration,
-    TypeParameter, TypeRef, UsingDeclaration, VariableDeclaration, VariableKind,
+    NamespaceDeclaration, Parameter, Property, Statement, SwitchCase, SwitchExpressionCase,
+    TypeDeclaration, TypeParameter, TypeRef, UsingDeclaration, VariableDeclaration, VariableKind,
 };
 
 /// A mutable syntax-tree visitor with structural defaults.
@@ -76,6 +76,10 @@ pub trait AstVisitorMut {
 
     fn visit_switch_case_mut(&mut self, case: &mut SwitchCase) {
         walk_switch_case_mut(self, case);
+    }
+
+    fn visit_switch_expression_case_mut(&mut self, case: &mut SwitchExpressionCase) {
+        walk_switch_expression_case_mut(self, case);
     }
 
     fn visit_expression_mut(&mut self, expression: &mut Expression) {
@@ -292,6 +296,13 @@ pub fn walk_switch_case_mut<V: AstVisitorMut + ?Sized>(visitor: &mut V, case: &m
     visitor.visit_block_mut(&mut case.body);
 }
 
+pub fn walk_switch_expression_case_mut<V: AstVisitorMut + ?Sized>(
+    visitor: &mut V,
+    case: &mut SwitchExpressionCase,
+) {
+    visitor.visit_expression_mut(&mut case.value);
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn walk_expression_mut<V: AstVisitorMut + ?Sized>(
     visitor: &mut V,
@@ -350,6 +361,19 @@ pub fn walk_expression_mut<V: AstVisitorMut + ?Sized>(
             visitor.visit_expression_mut(condition);
             visitor.visit_expression_mut(when_true);
             visitor.visit_expression_mut(when_false);
+        }
+        ExpressionKind::Switch {
+            value,
+            cases,
+            default,
+        } => {
+            visitor.visit_expression_mut(value);
+            for case in cases {
+                visitor.visit_switch_expression_case_mut(case);
+            }
+            if let Some(default) = default {
+                visitor.visit_expression_mut(default);
+            }
         }
         ExpressionKind::Cast { target, operand } => {
             visitor.visit_type_ref_mut(target);

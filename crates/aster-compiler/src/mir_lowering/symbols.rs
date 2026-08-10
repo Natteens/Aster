@@ -325,6 +325,23 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
             collect_expression(when_true, max);
             collect_expression(when_false, max);
         }
+        hir::ExpressionKind::Switch {
+            value,
+            cases,
+            default,
+        } => {
+            collect_expression(value, max);
+            for case in cases {
+                note(max, case.case);
+                for binding in &case.bindings {
+                    note(max, binding.symbol);
+                }
+                collect_expression(&case.value, max);
+            }
+            if let Some(default) = default {
+                collect_expression(default, max);
+            }
+        }
         hir::ExpressionKind::PropagateResult {
             operand,
             ok_case,

@@ -725,23 +725,7 @@ impl FunctionLowerer {
         cases: &[hir::SwitchCase],
         default: Option<&hir::Block>,
     ) {
-        let value_operand = self
-            .lower_expression(value)
-            .expect("validated switch value produces a value");
-        let value_local = self.new_temporary(value.type_.clone());
-        self.assign(
-            mir::Place::Local(value_local),
-            mir::Rvalue {
-                type_: value.type_.clone(),
-                kind: mir::RvalueKind::Use(value_operand),
-            },
-        );
-        let enum_operand = mir::Operand {
-            type_: value.type_.clone(),
-            kind: mir::OperandKind::Copy(mir::Place::Local(value_local)),
-        };
-        let discriminant =
-            self.temporary(mir::Type::UInt, mir::RvalueKind::Discriminant(enum_operand));
+        let (value_local, discriminant) = self.lower_switch_value(value);
         let join = self.new_block();
         let mut continues = false;
         for case in cases {
@@ -766,36 +750,7 @@ impl FunctionLowerer {
                 else_block: next,
             });
             self.current = Some(arm);
-            let definition = self
-                .enums
-                .values()
-                .flat_map(|value| &value.cases)
-                .find(|value| value.symbol == case.case)
-                .expect("resolved switch case exists")
-                .clone();
-            for (binding, field) in case.bindings.iter().zip(&definition.fields) {
-                let local = self.source_local(
-                    binding.symbol,
-                    binding.name.clone(),
-                    binding.type_.clone(),
-                    true,
-                );
-                self.locals.push(local.clone());
-                self.assign(
-                    mir::Place::Local(local.id),
-                    mir::Rvalue {
-                        type_: field.type_.clone(),
-                        kind: mir::RvalueKind::Use(mir::Operand {
-                            type_: field.type_.clone(),
-                            kind: mir::OperandKind::Copy(mir::Place::EnumField {
-                                base: Box::new(mir::Place::Local(value_local)),
-                                case: case.case,
-                                field: field.symbol,
-                            }),
-                        }),
-                    },
-                );
-            }
+            self.bind_switch_case(value_local, case.case, &case.bindings);
             self.lower_block(&case.body);
             if let Some(block) = self.current.take() {
                 self.terminate(block, mir::Terminator::Goto(join));
@@ -819,6 +774,133 @@ impl FunctionLowerer {
         } else {
             self.terminate(join, mir::Terminator::Unreachable);
             self.current = None;
+        }
+    }
+
+    fn lower_switch_value(&mut self, value: &hir::Expression) -> (mir::LocalId, mir::Operand) {
+        let value_operand = self
+            .lower_expression(value)
+            .expect("validated switch value produces a value");
+        let value_local = self.new_temporary(value.type_.clone());
+        self.assign(
+            mir::Place::Local(value_local),
+            mir::Rvalue {
+                type_: value.type_.clone(),
+                kind: mir::RvalueKind::Use(value_operand),
+            },
+        );
+        let enum_operand = mir::Operand {
+            type_: value.type_.clone(),
+            kind: mir::OperandKind::Copy(mir::Place::Local(value_local)),
+        };
+        let discriminant =
+            self.temporary(mir::Type::UInt, mir::RvalueKind::Discriminant(enum_operand));
+        (value_local, discriminant)
+    }
+
+    fn bind_switch_case(
+        &mut self,
+        value_local: mir::LocalId,
+        case: hir::SymbolId,
+        bindings: &[hir::Parameter],
+    ) {
+        let definition = self
+            .enums
+            .values()
+            .flat_map(|value| &value.cases)
+            .find(|value| value.symbol == case)
+            .expect("resolved switch case exists")
+            .clone();
+        for (binding, field) in bindings.iter().zip(&definition.fields) {
+            let local = self.source_local(
+                binding.symbol,
+                binding.name.clone(),
+                binding.type_.clone(),
+                true,
+            );
+            self.locals.push(local.clone());
+            self.assign(
+                mir::Place::Local(local.id),
+                mir::Rvalue {
+                    type_: field.type_.clone(),
+                    kind: mir::RvalueKind::Use(mir::Operand {
+                        type_: field.type_.clone(),
+                        kind: mir::OperandKind::Copy(mir::Place::EnumField {
+                            base: Box::new(mir::Place::Local(value_local)),
+                            case,
+                            field: field.symbol,
+                        }),
+                    }),
+                },
+            );
+        }
+    }
+
+    pub(super) fn lower_switch_expression(
+        &mut self,
+        value: &hir::Expression,
+        cases: &[hir::SwitchExpressionCase],
+        default: Option<&hir::Expression>,
+        result_type: &hir::Type,
+    ) -> mir::Operand {
+        let (value_local, discriminant) = self.lower_switch_value(value);
+        let result_local = self.new_temporary(result_type.clone());
+        let join = self.new_block();
+        for case in cases {
+            let arm = self.new_block();
+            let next = self.new_block();
+            let condition = self.temporary(
+                mir::Type::Bool,
+                mir::RvalueKind::Binary {
+                    left: discriminant.clone(),
+                    operator: mir::BinaryOperator::Equal,
+                    right: mir::Operand {
+                        type_: mir::Type::UInt,
+                        kind: mir::OperandKind::Constant(mir::Constant::Integer(
+                            case.tag.to_string(),
+                        )),
+                    },
+                },
+            );
+            self.terminate_current(mir::Terminator::Branch {
+                condition,
+                then_block: arm,
+                else_block: next,
+            });
+            self.current = Some(arm);
+            self.bind_switch_case(value_local, case.case, &case.bindings);
+            let arm_value = self
+                .lower_expression(&case.value)
+                .expect("validated switch arm produces a value");
+            self.assign(
+                mir::Place::Local(result_local),
+                mir::Rvalue {
+                    type_: result_type.clone(),
+                    kind: mir::RvalueKind::Use(arm_value),
+                },
+            );
+            self.terminate_current(mir::Terminator::Goto(join));
+            self.current = Some(next);
+        }
+        if let Some(default) = default {
+            let arm_value = self
+                .lower_expression(default)
+                .expect("validated default arm produces a value");
+            self.assign(
+                mir::Place::Local(result_local),
+                mir::Rvalue {
+                    type_: result_type.clone(),
+                    kind: mir::RvalueKind::Use(arm_value),
+                },
+            );
+            self.terminate_current(mir::Terminator::Goto(join));
+        } else {
+            self.terminate_current(mir::Terminator::Unreachable);
+        }
+        self.current = Some(join);
+        mir::Operand {
+            type_: result_type.clone(),
+            kind: mir::OperandKind::Copy(mir::Place::Local(result_local)),
         }
     }
 

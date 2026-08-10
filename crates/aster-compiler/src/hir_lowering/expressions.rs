@@ -797,6 +797,43 @@ impl Lowerer<'_> {
                     },
                 }
             }
+            ast::ExpressionKind::Switch {
+                value,
+                cases,
+                default,
+            } => {
+                let value = self.expression(value);
+                let mut lowered_cases = Vec::new();
+                for case in cases {
+                    self.scopes.push(std::collections::HashMap::new());
+                    let (case_symbol, tag, bindings) =
+                        self.switch_pattern(case.span, &case.bindings);
+                    let arm = self.expression(&case.value);
+                    self.scopes.pop();
+                    lowered_cases.push(hir::SwitchExpressionCase {
+                        case: case_symbol,
+                        tag,
+                        bindings,
+                        value: arm,
+                    });
+                }
+                let mut lowered_default = default.as_ref().map(|arm| self.expression(arm));
+                let result_type_name = self.model.switch_expression_types[&model_key].clone();
+                let result_type =
+                    self.resolve_type(&ast::TypeRef::new(result_type_name, expression.span));
+                for case in &mut lowered_cases {
+                    case.value = convert(case.value.clone(), &result_type);
+                }
+                lowered_default = lowered_default.map(|arm| convert(arm, &result_type));
+                hir::Expression {
+                    type_: result_type,
+                    kind: hir::ExpressionKind::Switch {
+                        value: Box::new(value),
+                        cases: lowered_cases,
+                        default: lowered_default.map(Box::new),
+                    },
+                }
+            }
             ast::ExpressionKind::Binary {
                 left,
                 operator,

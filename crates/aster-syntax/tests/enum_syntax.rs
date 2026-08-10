@@ -12,6 +12,81 @@ fn lexes_enum_and_switch_keywords() {
 }
 
 #[test]
+fn parses_restricted_enum_switch_expression() {
+    let source = "public enum Message { Quit, Move(int x, int y), } public int Read(Message message) { return message switch { Quit => 0, Move(x, y) => x + y, }; }";
+    let module = parse(lex(source).expect("switch expression should lex"))
+        .expect("switch expression should parse");
+    let Item::Function(read) = &module.items[1] else {
+        panic!("expected Read function")
+    };
+    let Statement::Return {
+        value: Some(value), ..
+    } = &read.body.as_ref().expect("function body").statements[0]
+    else {
+        panic!("expected return")
+    };
+    let ExpressionKind::Switch {
+        value: selected,
+        cases,
+        default,
+    } = &value.kind
+    else {
+        panic!("expected switch expression")
+    };
+    assert!(matches!(&selected.kind, ExpressionKind::Name(name) if name == "message"));
+    assert_eq!(cases.len(), 2);
+    assert_eq!(cases[0].case_name, "Quit");
+    assert_eq!(cases[1].bindings, ["x", "y"]);
+    assert!(default.is_none());
+}
+
+#[test]
+fn switch_expression_requires_fat_arrows_and_commas() {
+    let missing_arrow = parse(
+        lex("public enum E { A } public int Read(E value) { return value switch { A: 1 }; }")
+            .expect("source lexes"),
+    )
+    .expect_err("colon is not an expression arm arrow");
+    assert!(
+        missing_arrow
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("expected `=>`"))
+    );
+
+    let missing_comma = parse(lex(
+        "public enum E { A, B } public int Read(E value) { return value switch { A => 1 B => 2 }; }",
+    ).expect("source lexes")).expect_err("arms require commas");
+    assert!(
+        missing_comma
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("expected `,`"))
+    );
+}
+
+#[test]
+fn parses_default_and_switch_expression_composition() {
+    let source = "public enum E { A, B } public int Take(int value) { return value; } public int Read(E value) { return Take(value switch { A => 42, default => 0, }); }";
+    let module = parse(lex(source).expect("composed switch expression lexes"))
+        .expect("default and function-argument composition parse");
+    let Item::Function(read) = &module.items[2] else {
+        panic!("expected Read function")
+    };
+    let Statement::Return {
+        value: Some(value), ..
+    } = &read.body.as_ref().expect("function body").statements[0]
+    else {
+        panic!("expected return")
+    };
+    let ExpressionKind::Call { arguments, .. } = &value.kind else {
+        panic!("expected composed function call")
+    };
+    let ExpressionKind::Switch { default, .. } = &arguments[0].kind else {
+        panic!("expected switch argument")
+    };
+    assert!(default.is_some());
+}
+
+#[test]
 fn parses_simple_and_generic_payload_enums() {
     let source =
         "public enum Direction { North, South } public enum Option<T> { None, Some(T value) }";
@@ -113,4 +188,14 @@ fn legacy_module_and_import_keep_their_migration_diagnostics() {
             diagnostic.message == message && diagnostic.help.as_deref() == Some(help)
         }));
     }
+}
+
+#[test]
+fn rejects_unreachable_switch_expression_arm_after_default() {
+    let source = "public enum E { A, B } public int Read(E value) { return value switch { default => 0, A => 1, }; }";
+    let diagnostics = parse(lex(source).expect("source should lex")).expect_err("unreachable arm");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.message == "switch expression arm after `default` is unreachable"
+            && diagnostic.help.as_deref() == Some("move `default` to the final arm")
+    }));
 }

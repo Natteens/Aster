@@ -95,6 +95,10 @@ impl Lexer<'_> {
             '/' => self.two_character(start, '=', TokenKind::SlashEqual, TokenKind::Slash),
             '%' => self.token(TokenKind::Percent, start),
             '!' => self.two_character(start, '=', TokenKind::BangEqual, TokenKind::Bang),
+            '=' if self.peek() == Some('>') => {
+                self.bump();
+                self.token(TokenKind::FatArrow, start);
+            }
             '=' => self.two_character(start, '=', TokenKind::EqualEqual, TokenKind::Equal),
             '<' => self.two_character(start, '=', TokenKind::LessEqual, TokenKind::Less),
             '>' => self.two_character(start, '=', TokenKind::GreaterEqual, TokenKind::Greater),

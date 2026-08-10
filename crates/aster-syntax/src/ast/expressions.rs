@@ -63,6 +63,11 @@ pub enum ExpressionKind {
         when_true: Box<Expression>,
         when_false: Box<Expression>,
     },
+    Switch {
+        value: Box<Expression>,
+        cases: Vec<SwitchExpressionCase>,
+        default: Option<Box<Expression>>,
+    },
     /// Explicit conversion: `(type)expression`.
     Cast {
         target: super::TypeRef,
@@ -82,6 +87,15 @@ pub enum ExpressionKind {
     InterpolatedString {
         parts: Vec<InterpolatedPart>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwitchExpressionCase {
+    pub enum_name: Option<String>,
+    pub case_name: String,
+    pub bindings: Vec<String>,
+    pub value: Expression,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq)]

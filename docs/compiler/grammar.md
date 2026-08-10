@@ -86,7 +86,14 @@ default-case        = "default" , ":" , { statement } ;
 
 expression          = assignment ;
 assignment          = conditional , [ assignment-op , assignment ] ;
-conditional         = logical-or , [ "?" , expression , ":" , assignment ] ;
+conditional         = switch-expression , [ "?" , expression , ":" , assignment ] ;
+switch-expression   = logical-or , [ "switch" , "{" , switch-expression-arms , "}" ] ;
+switch-expression-arms = ( switch-expression-case , { "," , switch-expression-case } ,
+                           [ "," , switch-expression-default ]
+                         | switch-expression-default ) , [ "," ] ;
+switch-expression-case = [ identifier , "." ] , identifier , [ "(" , identifiers , ")" ] ,
+                         "=>" , assignment ;
+switch-expression-default = "default" , "=>" , assignment ;
 logical-or          = logical-and , { "||" , logical-and } ;
 logical-and         = equality , { "&&" , equality } ;
 equality            = comparison , { ( "==" | "!=" ) , comparison } ;
@@ -186,8 +193,9 @@ rest of the file as invalid.
 - Classes, structs, interfaces, nominal class interface lists, fields, namespace-level functions, methods,
   and interface signatures
   are represented and validated. Interfaces cannot contain instance fields.
-- Value enums may carry typed payloads. Enum switches evaluate their input once, bind payloads in
-  arm-local scopes, do not fall through, and require complete cases or `default`.
+- Value enums may carry typed payloads. Enum switch statements and restricted switch expressions
+  evaluate their input once, bind payloads in arm-local scopes, and require complete cases or
+  `default`. Expression arms use `=>`, are comma-separated, and produce one compatible value type.
 - `Log`, `Log.Warning`, and `Log.Error` accept one `string`. Other logging members are rejected.
 - `if`, `while`, and C-style `for` conditions must be `bool`. Blocks and loop initializers create
   lexical scopes. `break` and `continue` are accepted only inside loops.
@@ -199,8 +207,8 @@ rest of the file as invalid.
 ## Unsupported language features
 
 There is no class inheritance, interface inheritance, constructor/operator overloads, static
-fields, auto-properties, named/default arguments, general pattern matching, switch guards or
-switch expressions, exceptions, `goto`,
+fields, auto-properties, named/default arguments, general pattern matching, switch guards,
+exceptions, `goto`,
 or engine lifecycle syntax. Application entry selection is a tooling rule rather than grammar:
 `aster run [FILE]` resolves one public static parameterless `Main` returning `void` or `int`, while
 `--function NAME` remains the explicit development mode.

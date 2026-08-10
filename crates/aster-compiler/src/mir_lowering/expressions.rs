@@ -393,6 +393,16 @@ impl FunctionLowerer {
                 when_true,
                 when_false,
             } => Some(self.lower_conditional(condition, when_true, when_false, &expression.type_)),
+            hir::ExpressionKind::Switch {
+                value,
+                cases,
+                default,
+            } => Some(self.lower_switch_expression(
+                value,
+                cases,
+                default.as_deref(),
+                &expression.type_,
+            )),
             hir::ExpressionKind::PropagateResult {
                 operand,
                 success_type,
