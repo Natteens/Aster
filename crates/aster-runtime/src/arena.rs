@@ -9,12 +9,12 @@
 //! capacity equals the request size.
 
 use std::{
-    alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error},
+    alloc::{Layout, alloc_zeroed, dealloc},
     sync::atomic::{AtomicU64, Ordering},
 };
 
 /// Default page capacity in bytes.
-const DEFAULT_PAGE_SIZE: usize = 64 * 1024;
+pub(crate) const DEFAULT_PAGE_SIZE: usize = 64 * 1024;
 
 /// Maximum alignment supported by arena allocations.
 pub(crate) const MAX_ALIGN: usize = 16;
@@ -35,22 +35,22 @@ struct Page {
 }
 
 impl Page {
-    fn new(capacity: usize) -> Self {
+    fn try_new(capacity: usize) -> Result<Self, ArenaAllocError> {
         debug_assert!(capacity > 0);
         let layout = Layout::from_size_align(capacity, MAX_ALIGN)
-            .expect("page layout exceeds platform limits");
+            .map_err(|_| ArenaAllocError::AddressSpace)?;
         // SAFETY: `layout` has non-zero size and valid alignment. The returned
         // pointer owns `capacity` zeroed bytes.
         #[allow(unsafe_code)]
         let base = unsafe { alloc_zeroed(layout) };
         if base.is_null() {
-            handle_alloc_error(layout);
+            return Err(ArenaAllocError::OutOfMemory);
         }
-        Page {
+        Ok(Page {
             base,
             layout,
             cursor: 0,
-        }
+        })
     }
 
     fn capacity(&self) -> usize {
@@ -125,6 +125,13 @@ pub(crate) struct ArenaMetrics {
     pub reserved_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArenaAllocError {
+    AddressSpace,
+    Limit,
+    OutOfMemory,
+}
+
 /// Paged bump allocator. Owns all pages and frees them on drop.
 pub(crate) struct PagedArena {
     pages: Vec<Page>,
@@ -149,16 +156,15 @@ impl PagedArena {
         }
     }
 
-    /// Allocate `size` bytes with the given alignment. The returned pointer is
-    /// stable while its region remains active and points to zeroed memory.
-    ///
-    /// # Panics
-    ///
-    /// - If `size` is zero.
-    /// - If `align` is not a non-zero power of two, or exceeds [`MAX_ALIGN`].
-    /// - Via [`handle_alloc_error`] if the system allocator cannot
-    ///   satisfy the underlying page allocation.
-    pub(crate) fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
+    /// Fallibly allocate zeroed arena storage without invoking Rust's global
+    /// allocation-error handler. `max_reserved_bytes` is the caller-owned
+    /// execution budget available to this arena.
+    pub(crate) fn try_alloc(
+        &mut self,
+        size: usize,
+        align: usize,
+        max_reserved_bytes: usize,
+    ) -> Result<*mut u8, ArenaAllocError> {
         assert!(size > 0, "zero-size allocation");
         assert!(
             align.is_power_of_two(),
@@ -172,8 +178,11 @@ impl PagedArena {
         if self.active_pages != 0 {
             let page = &mut self.pages[self.active_pages - 1];
             if let Some((ptr, consumed)) = page.try_alloc(size, align) {
-                self.used_bytes += consumed;
-                return ptr;
+                self.used_bytes = self
+                    .used_bytes
+                    .checked_add(consumed)
+                    .ok_or(ArenaAllocError::AddressSpace)?;
+                return Ok(ptr);
             }
         }
 
@@ -198,24 +207,46 @@ impl PagedArena {
                 .try_alloc(size, align)
                 .expect("reused page must satisfy the allocation");
             self.active_pages += 1;
-            self.used_bytes += consumed;
-            return ptr;
+            self.used_bytes = self
+                .used_bytes
+                .checked_add(consumed)
+                .ok_or(ArenaAllocError::AddressSpace)?;
+            return Ok(ptr);
         }
 
         // Fresh pages are MAX_ALIGN-aligned, so the first allocation needs no padding.
         let capacity = size.max(DEFAULT_PAGE_SIZE);
-        let mut page = Page::new(capacity);
+        let new_reserved = self
+            .reserved_bytes
+            .checked_add(capacity)
+            .ok_or(ArenaAllocError::AddressSpace)?;
+        if new_reserved > max_reserved_bytes {
+            return Err(ArenaAllocError::Limit);
+        }
+        self.pages
+            .try_reserve(1)
+            .map_err(|_| ArenaAllocError::OutOfMemory)?;
+        let mut page = Page::try_new(capacity)?;
         let (ptr, consumed) = page
             .try_alloc(size, align)
             .expect("fresh page must satisfy the allocation");
 
-        self.used_bytes += consumed;
-        self.reserved_bytes += page.capacity();
+        self.used_bytes = self
+            .used_bytes
+            .checked_add(consumed)
+            .ok_or(ArenaAllocError::AddressSpace)?;
+        self.reserved_bytes = new_reserved;
         self.pages.push(page);
         let new_page_index = self.pages.len() - 1;
         self.pages.swap(self.active_pages, new_page_index);
         self.active_pages += 1;
-        ptr
+        Ok(ptr)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
+        self.try_alloc(size, align, usize::MAX)
+            .expect("test arena allocation")
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -360,6 +391,17 @@ fn align_up(value: usize, align: usize) -> Option<usize> {
 #[allow(clippy::cast_ptr_alignment, clippy::ptr_as_ptr)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallible_allocation_rejects_the_budget_before_reserving_a_page() {
+        let mut arena = PagedArena::new();
+        assert_eq!(
+            arena.try_alloc(DEFAULT_PAGE_SIZE + 1, 8, DEFAULT_PAGE_SIZE),
+            Err(ArenaAllocError::Limit)
+        );
+        assert_eq!(arena.page_count(), 0);
+        assert_eq!(arena.metrics().reserved_bytes, 0);
+    }
 
     #[test]
     fn first_allocation_returns_aligned_non_null_pointer() {

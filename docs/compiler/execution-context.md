@@ -15,6 +15,13 @@ releases strings, arrays, `List<T>`, `Dictionary<K,V>`, class objects, and their
 together. There is no garbage collector, reference count, finalizer, process-global arena, or
 thread-local owner. No pointer from one execution can be supplied to another execution.
 
+One context may reserve at most 1 GiB across its persistent and temporary arenas. This keeps
+multi-gigabyte requests away from host overcommit and allocator-abort paths while preserving the
+validated 50,000,000-element `long` array workload (about 400 MB of payload). Allocation size
+arithmetic is checked and arena pages are obtained fallibly; an impossible size, an exceeded
+budget, or a host allocation failure records the first controlled ASTER runtime error. No partial
+collection header is published on failure. The limit applies equally to worker-owned contexts.
+
 This per-execution model keeps cleanup deterministic while ASTER has no general ownership syntax.
 Escape analysis selects a region for compiler-known dynamic allocations; see
 [memory management](memory-management.md). It is not a promise that a future long-lived or AOT

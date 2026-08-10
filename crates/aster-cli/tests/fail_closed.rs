@@ -82,6 +82,16 @@ fn all_frontend_cli_paths_reject_pathological_nesting() {
 }
 
 #[test]
+fn impossible_positive_allocation_is_a_controlled_cli_failure() {
+    let path = temporary_source(
+        "allocation",
+        "public class Program { public static int Main() { int[] values = new int[2147483647]; return values.Length; } }",
+    );
+    assert_controlled_failure(&aster("run", &path), "execution memory limit");
+    remove_source(&path);
+}
+
+#[test]
 fn excessive_recursion_is_a_controlled_cli_failure() {
     let path = temporary_source(
         "recursion",

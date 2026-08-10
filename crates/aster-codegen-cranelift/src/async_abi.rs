@@ -453,7 +453,10 @@ fn copy_scalar_array(
     length.checked_mul(expected_size).ok_or_else(|| {
         BackendError::new("Parallel.ForEach array byte length exceeds the addressable range")
     })?;
-    let mut values = Vec::with_capacity(length);
+    let mut values = Vec::new();
+    values.try_reserve_exact(length).map_err(|_| {
+        BackendError::new("Parallel.ForEach scalar copy exceeds available host memory")
+    })?;
     for index in 0..length {
         let element = aster_rt_array_element(
             context,

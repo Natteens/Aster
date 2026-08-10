@@ -336,7 +336,11 @@ fn string_join(
     // SAFETY: caller (generated code) provides `count` live pointers, as
     // documented above.
     let headers = unsafe { std::slice::from_raw_parts(parts, count) };
-    let mut views = Vec::with_capacity(count);
+    let mut views = Vec::new();
+    if views.try_reserve_exact(count).is_err() {
+        context.fail("string interpolation exceeds available host memory");
+        return ptr::null();
+    }
     for &header in headers {
         // SAFETY: each pointer is owned by the live context or JIT module.
         let Some(text) = (unsafe { view(header) }) else {

@@ -430,6 +430,55 @@ fn new_arrays_are_zeroed_and_support_writes() {
 }
 
 #[test]
+fn impossible_positive_array_allocation_fails_without_reaching_host_oom() {
+    let error = run(
+        "public int Run() { int[] values = new int[2147483647]; return 0; }",
+        "Run",
+    )
+    .expect_err("the execution allocation budget must reject the request");
+    assert!(error.contains("Aster runtime error"), "{error}");
+    assert!(error.contains("execution memory limit"), "{error}");
+    assert!(!error.contains("memory allocation of"), "{error}");
+}
+
+#[test]
+fn allocation_failure_propagates_through_direct_and_interface_calls() {
+    let direct = run(
+        "public int[] Make() { return new int[2147483647]; }
+         public int Run() { return Make().Length; }",
+        "Run",
+    )
+    .expect_err("a failing direct callee must not publish a null return");
+    assert!(direct.contains("execution memory limit"), "{direct}");
+
+    let interface = run(
+        "public interface IFactory { int[] Make(); }
+         public class Factory : IFactory {
+             public Factory() {}
+             public int[] Make() { return new int[2147483647]; }
+         }
+         public int Run() {
+             IFactory factory = new Factory();
+             return factory.Make().Length;
+         }",
+        "Run",
+    )
+    .expect_err("a failing interface callee must not publish a null return");
+    assert!(interface.contains("execution memory limit"), "{interface}");
+}
+
+#[test]
+fn moderate_large_array_still_executes() {
+    assert_eq!(
+        run(
+            "public int Run() { int[] values = new int[1000000]; values[999999] = 42; return values[999999]; }",
+            "Run",
+        ),
+        Ok(ExecutionValue::Int(42))
+    );
+}
+
+#[test]
 fn string_array_literals_are_fully_initialized() {
     let source =
         "public int Run() { string[] names = [\"Aster\", \"Natte\"]; return names.Length; }";

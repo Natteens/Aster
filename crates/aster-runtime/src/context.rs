@@ -6,13 +6,27 @@ use std::mem::{align_of, size_of};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::arena::{ArenaMark, MAX_ALIGN, PagedArena};
+#[cfg(test)]
+use crate::arena::DEFAULT_PAGE_SIZE;
+use crate::arena::{ArenaAllocError, ArenaMark, MAX_ALIGN, PagedArena};
 use crate::string::AsterStrHeader;
+
+/// Maximum arena capacity reserved by one execution context, shared by its
+/// persistent and temporary regions. One GiB preserves the externally
+/// validated 50,000,000-element `long` array (400,000,000 payload bytes plus
+/// arena overhead) with more than twice that workload's headroom, while still
+/// rejecting multi-gigabyte requests before host overcommit or an allocator
+/// abort can make failure process-wide.
+pub const EXECUTION_ALLOCATION_LIMIT_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Maximum number of simultaneously active ASTER function calls in one
 /// execution context. This is intentionally far below the native-stack depth
 /// where the smaller worker stacks have been observed to abort.
 pub const ASTER_CALL_DEPTH_LIMIT: u32 = 1024;
+
+fn checked_allocation_size(count: usize, element_size: usize) -> Option<usize> {
+    count.checked_mul(element_size)
+}
 
 /// Stable array header visible to generated code only through runtime calls.
 #[repr(C)]
@@ -329,6 +343,7 @@ pub struct ExecutionContext {
     arena: PagedArena,
     temporary_arena: PagedArena,
     temporary_scopes: Vec<TemporaryArenaMark>,
+    allocation_limit_bytes: usize,
     call_depth: u32,
     error: Option<String>,
     collect_stats: bool,
@@ -378,15 +393,20 @@ impl Default for ExecutionContext {
 impl ExecutionContext {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_options(false, EXECUTION_ALLOCATION_LIMIT_BYTES)
+    }
+
+    fn with_options(collect_stats: bool, allocation_limit_bytes: usize) -> Self {
         let (dictionary_hash_k0, dictionary_hash_k1, dictionary_owner_id) =
             dictionary_context_identity();
         Self {
             arena: PagedArena::new(),
             temporary_arena: PagedArena::new(),
             temporary_scopes: Vec::new(),
+            allocation_limit_bytes,
             call_depth: 0,
             error: None,
-            collect_stats: false,
+            collect_stats,
             stats: MemoryStats::default(),
             task_runtime: None,
             console: None,
@@ -399,23 +419,12 @@ impl ExecutionContext {
 
     #[must_use]
     pub fn with_stats() -> Self {
-        let (dictionary_hash_k0, dictionary_hash_k1, dictionary_owner_id) =
-            dictionary_context_identity();
-        Self {
-            arena: PagedArena::new(),
-            temporary_arena: PagedArena::new(),
-            temporary_scopes: Vec::new(),
-            call_depth: 0,
-            error: None,
-            collect_stats: true,
-            stats: MemoryStats::default(),
-            task_runtime: None,
-            console: None,
-            filesystem: None,
-            dictionary_hash_k0,
-            dictionary_hash_k1,
-            dictionary_owner_id,
-        }
+        Self::with_options(true, EXECUTION_ALLOCATION_LIMIT_BYTES)
+    }
+
+    #[cfg(test)]
+    fn with_allocation_limit(allocation_limit_bytes: usize) -> Self {
+        Self::with_options(false, allocation_limit_bytes)
     }
 
     pub fn take_error(&mut self) -> Option<String> {
@@ -556,11 +565,50 @@ impl ExecutionContext {
         TemporaryArenaMark(self.temporary_arena.mark())
     }
 
+    fn allocate_in_region(
+        &mut self,
+        size: usize,
+        align: usize,
+        temporary: bool,
+    ) -> Option<*mut u8> {
+        let other_reserved = if temporary {
+            self.arena.metrics().reserved_bytes
+        } else {
+            self.temporary_arena.metrics().reserved_bytes
+        };
+        let arena_limit = self.allocation_limit_bytes.saturating_sub(other_reserved);
+        let result = if temporary {
+            self.temporary_arena.try_alloc(size, align, arena_limit)
+        } else {
+            self.arena.try_alloc(size, align, arena_limit)
+        };
+        match result {
+            Ok(pointer) => {
+                self.refresh_memory_usage();
+                Some(pointer)
+            }
+            Err(ArenaAllocError::AddressSpace) => {
+                self.fail("allocation size exceeds the addressable range");
+                None
+            }
+            Err(ArenaAllocError::Limit) => {
+                self.fail(format!(
+                    "allocation exceeds the execution memory limit of {} bytes",
+                    self.allocation_limit_bytes
+                ));
+                None
+            }
+            Err(ArenaAllocError::OutOfMemory) => {
+                self.fail("the host could not satisfy an ASTER allocation request");
+                None
+            }
+        }
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn allocate_temporary(&mut self, size: usize, align: usize) -> *mut u8 {
-        let pointer = self.temporary_arena.alloc(size, align);
-        self.refresh_memory_usage();
-        pointer
+        self.allocate_in_region(size, align, true)
+            .unwrap_or(ptr::null_mut())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -588,7 +636,9 @@ impl ExecutionContext {
             return ptr::null_mut();
         }
         let bytes = usize::try_from(size.max(1)).unwrap_or(1);
-        let pointer = self.temporary_arena.alloc(bytes, 8);
+        let Some(pointer) = self.allocate_in_region(bytes, 8, true) else {
+            return ptr::null_mut();
+        };
         self.record_allocation(AllocationCategory::Object, bytes);
         pointer
     }
@@ -611,7 +661,7 @@ impl ExecutionContext {
         }
         let bytes = usize::try_from(valid_length)
             .ok()
-            .and_then(|length| length.checked_mul(valid_size as usize));
+            .and_then(|length| checked_allocation_size(length, valid_size as usize));
         let bytes = if let Some(bytes) = bytes {
             bytes.max(valid_size as usize)
         } else {
@@ -619,19 +669,16 @@ impl ExecutionContext {
             valid_size as usize
         };
 
-        let (data, header_ptr) = {
-            let arena = if temporary {
-                &mut self.temporary_arena
-            } else {
-                &mut self.arena
-            };
-            let data = arena.alloc(bytes, 8);
-            #[allow(clippy::cast_ptr_alignment)]
-            let header_ptr = arena
-                .alloc(size_of::<AsterArray>(), align_of::<AsterArray>())
-                .cast::<AsterArray>();
-            (data, header_ptr)
+        let Some(data) = self.allocate_in_region(bytes, 8, temporary) else {
+            return ptr::null_mut();
         };
+        let Some(header) =
+            self.allocate_in_region(size_of::<AsterArray>(), align_of::<AsterArray>(), temporary)
+        else {
+            return ptr::null_mut();
+        };
+        #[allow(clippy::cast_ptr_alignment)]
+        let header_ptr = header.cast::<AsterArray>();
 
         // SAFETY: `header_ptr` points to zeroed, correctly aligned memory for
         // `AsterArray`. Header and data belong to the same selected arena and
@@ -692,17 +739,15 @@ impl ExecutionContext {
             return ptr::null_mut();
         }
 
-        let header_ptr = {
-            let arena = if region == ListRegion::Temporary {
-                &mut self.temporary_arena
-            } else {
-                &mut self.arena
-            };
-            #[allow(clippy::cast_ptr_alignment)]
-            arena
-                .alloc(size_of::<AsterList>(), align_of::<AsterList>())
-                .cast::<AsterList>()
+        let Some(header) = self.allocate_in_region(
+            size_of::<AsterList>(),
+            align_of::<AsterList>(),
+            region == ListRegion::Temporary,
+        ) else {
+            return ptr::null_mut();
         };
+        #[allow(clippy::cast_ptr_alignment)]
+        let header_ptr = header.cast::<AsterList>();
 
         // SAFETY: `header_ptr` points to zeroed, correctly aligned memory for
         // `AsterList`, just allocated above and not yet observed anywhere
@@ -760,17 +805,15 @@ impl ExecutionContext {
             self.fail("temporary dictionary allocation requires an active temporary scope");
             return ptr::null_mut();
         }
-        let header = {
-            let arena = if region == ListRegion::Temporary {
-                &mut self.temporary_arena
-            } else {
-                &mut self.arena
-            };
-            #[allow(clippy::cast_ptr_alignment)]
-            arena
-                .alloc(size_of::<AsterDictionary>(), align_of::<AsterDictionary>())
-                .cast::<AsterDictionary>()
+        let Some(header) = self.allocate_in_region(
+            size_of::<AsterDictionary>(),
+            align_of::<AsterDictionary>(),
+            region == ListRegion::Temporary,
+        ) else {
+            return ptr::null_mut();
         };
+        #[allow(clippy::cast_ptr_alignment)]
+        let header = header.cast::<AsterDictionary>();
         // SAFETY: fresh, aligned arena memory is unpublished until every field is initialized.
         #[allow(unsafe_code)]
         unsafe {
@@ -1037,16 +1080,11 @@ impl ExecutionContext {
         // the permanent arena so they are not reclaimed when the helper exits.
         let use_temporary = region == ListRegion::Temporary
             && self.temporary_scopes.len() == birth_scope_depth as usize;
-        let (buckets, entries) = {
-            let arena = if use_temporary {
-                &mut self.temporary_arena
-            } else {
-                &mut self.arena
-            };
-            #[allow(clippy::cast_ptr_alignment)]
-            let buckets = arena.alloc(bucket_bytes, align_of::<u32>()).cast::<u32>();
-            (buckets, arena.alloc(entry_bytes, layout.align))
-        };
+        let bucket_storage =
+            self.allocate_in_region(bucket_bytes, align_of::<u32>(), use_temporary)?;
+        let entries = self.allocate_in_region(entry_bytes, layout.align, use_temporary)?;
+        #[allow(clippy::cast_ptr_alignment)]
+        let buckets = bucket_storage.cast::<u32>();
         for index in 0..bucket_capacity {
             #[allow(unsafe_code)]
             unsafe {
@@ -1816,9 +1854,10 @@ impl ExecutionContext {
             self.fail("list capacity overflow while growing");
             return None;
         };
-        let Some(byte_size) =
-            new_capacity_usize.checked_mul(usize::try_from(element_size).unwrap_or(0))
-        else {
+        let Some(byte_size) = checked_allocation_size(
+            new_capacity_usize,
+            usize::try_from(element_size).unwrap_or(0),
+        ) else {
             self.fail("list buffer size overflow while growing");
             return None;
         };
@@ -1842,15 +1881,8 @@ impl ExecutionContext {
         // the permanent arena so they are not reclaimed when the helper exits.
         let use_temporary = region == ListRegion::Temporary
             && self.temporary_scopes.len() == birth_scope_depth as usize;
-        let new_data = {
-            let align = usize::try_from(element_align).unwrap_or(1);
-            let arena = if use_temporary {
-                &mut self.temporary_arena
-            } else {
-                &mut self.arena
-            };
-            arena.alloc(byte_size, align)
-        };
+        let align = usize::try_from(element_align).unwrap_or(1);
+        let new_data = self.allocate_in_region(byte_size, align, use_temporary)?;
         let old_byte_len =
             usize::try_from(length).unwrap_or(0) * usize::try_from(element_size).unwrap_or(0);
         if !data.is_null() && old_byte_len > 0 {
@@ -2236,7 +2268,9 @@ impl ExecutionContext {
 
     pub(crate) fn allocate_object(&mut self, size: u32) -> *mut u8 {
         let bytes = usize::try_from(size.max(1)).unwrap_or(1);
-        let pointer = self.arena.alloc(bytes, 8);
+        let Some(pointer) = self.allocate_in_region(bytes, 8, false) else {
+            return ptr::null_mut();
+        };
         self.record_allocation(AllocationCategory::Object, bytes);
         pointer
     }
@@ -2263,13 +2297,10 @@ impl ExecutionContext {
             return ptr::null();
         };
 
-        let pointer = {
-            let arena = if temporary {
-                &mut self.temporary_arena
-            } else {
-                &mut self.arena
-            };
-            arena.alloc(total_bytes, align_of::<AsterStrHeader>())
+        let Some(pointer) =
+            self.allocate_in_region(total_bytes, align_of::<AsterStrHeader>(), temporary)
+        else {
+            return ptr::null();
         };
 
         // SAFETY: `pointer` points to `total_bytes` of zeroed, correctly aligned
@@ -3018,6 +3049,67 @@ mod tests {
     use crate::object::{aster_rt_object_new, aster_rt_object_new_temporary};
     use std::collections::BTreeMap;
     use std::time::Instant;
+
+    #[test]
+    fn execution_budget_rejects_large_requests_without_publishing_storage() {
+        let mut limited = ExecutionContext::with_allocation_limit(64 * 1024);
+        let array = limited.allocate_array(20_000, 4);
+        assert!(array.is_null());
+        assert_eq!(limited.arena.metrics().reserved_bytes, 0);
+        assert!(
+            limited
+                .take_error()
+                .is_some_and(|error| error.contains("execution memory limit"))
+        );
+
+        let mut independent = ExecutionContext::new();
+        let ordinary = independent.allocate_array(1_000_000, 4);
+        assert!(!ordinary.is_null());
+        assert!(independent.take_error().is_none());
+    }
+
+    #[test]
+    fn default_budget_preserves_the_verified_four_hundred_megabyte_array() {
+        let payload = 50_000_000_usize
+            .checked_mul(size_of::<i64>())
+            .expect("verified array payload is addressable");
+        // The dedicated data page is exactly `payload` bytes; the following
+        // array header requires one ordinary arena page because that data page
+        // has no remaining capacity.
+        let required_reservation = payload
+            .checked_add(DEFAULT_PAGE_SIZE)
+            .expect("verified array reservation is addressable");
+
+        assert!(required_reservation > 256 * 1024 * 1024);
+        assert!(required_reservation <= EXECUTION_ALLOCATION_LIMIT_BYTES);
+    }
+
+    #[test]
+    fn allocation_size_multiplication_is_checked() {
+        assert_eq!(checked_allocation_size(1024, 4), Some(4096));
+        assert_eq!(checked_allocation_size(usize::MAX, 2), None);
+    }
+
+    #[test]
+    fn list_growth_uses_the_same_execution_budget() {
+        let mut context = ExecutionContext::with_allocation_limit(64 * 1024);
+        let list = context.allocate_list_in_region(64 * 1024, 8, 0x1234, ListRegion::Persistent);
+        assert!(!list.is_null());
+        let source = [0_u8; 1];
+        context.list_add(list, 64 * 1024, 8, 0x1234, source.as_ptr());
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("execution memory limit"))
+        );
+        // SAFETY: `list` is a valid header and failed growth is atomic.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!((*list).length, 0);
+            assert_eq!((*list).capacity, 0);
+            assert!((*list).data.is_null());
+        }
+    }
 
     #[test]
     fn empty_list_header_satisfies_every_invariant() {

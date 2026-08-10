@@ -113,6 +113,23 @@ fn a_controlled_runtime_error_propagates_through_wait() {
 }
 
 #[test]
+fn worker_allocation_budget_failure_propagates_without_host_oom() {
+    let source = r"
+        public int Failing() {
+            int[] values = new int[2147483647];
+            return values.Length;
+        }
+        public int Main() {
+            return Task.Run(Failing).Wait();
+        }
+    ";
+    let error = run(source, "Main").expect_err("the worker allocation must fail closed");
+    assert!(error.contains("Aster runtime error:"), "{error}");
+    assert!(error.contains("execution memory limit"), "{error}");
+    assert!(!error.contains("memory allocation of"), "{error}");
+}
+
+#[test]
 fn a_function_with_parameters_is_rejected() {
     let errors = compile_errors(
         r"
