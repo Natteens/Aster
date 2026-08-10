@@ -19,18 +19,6 @@ fn temporary_source(label: &str, source: &str) -> PathBuf {
     path
 }
 
-fn temporary_source_bytes(label: &str, source: &[u8]) -> PathBuf {
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let directory = std::env::temp_dir().join(format!(
-        "aster-fail-closed-{label}-{}-{id}",
-        std::process::id()
-    ));
-    fs::create_dir(&directory).expect("create temporary source directory");
-    let path = directory.join("main.aster");
-    fs::write(&path, source).expect("write temporary Aster source bytes");
-    path
-}
-
 fn aster(command: &str, source: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_aster"))
         .arg(command)
