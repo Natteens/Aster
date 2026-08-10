@@ -172,6 +172,12 @@ After a syntax error the parser recovers at statement, member, and declaration b
 (`;`, `}`, and declaration/statement keywords), so one malformed statement does not report the
 rest of the file as invalid.
 
+The parser applies one machine-independent depth budget of 64 recursive source constructs across
+expressions, type references, and nested statement bodies. Source that exceeds the budget is
+rejected at the construct that crosses it with a positioned diagnostic. This compiler resource
+limit guarantees that a successfully parsed AST is shallow enough for the existing frontend
+visitors; it is not a general pattern-matching or expression-shape restriction.
+
 ## Implemented validation
 
 - Namespace-level declarations default to `internal`; class and struct members default to `private`;

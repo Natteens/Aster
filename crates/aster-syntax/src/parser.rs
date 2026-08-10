@@ -10,6 +10,11 @@ use crate::{
     VariableDeclaration, VariableKind, Visibility,
 };
 
+/// Maximum recursive source/AST nesting accepted by the frontend. This is a
+/// deterministic safety bound, deliberately well below the native stack depth
+/// at which recursive parser and visitor paths become unsafe.
+pub const MAX_SOURCE_NESTING: usize = 64;
+
 /// Build an AST from a positioned token stream.
 ///
 /// # Errors
@@ -20,6 +25,8 @@ pub fn parse(tokens: Vec<Token>) -> Result<Module, Vec<Diagnostic>> {
         tokens,
         cursor: 0,
         diagnostics: Vec::new(),
+        nesting_depth: 0,
+        nesting_reported: false,
     };
     let module = parser.module();
     if parser.diagnostics.is_empty() {
@@ -33,6 +40,8 @@ struct Parser {
     tokens: Vec<Token>,
     cursor: usize,
     diagnostics: Vec<Diagnostic>,
+    nesting_depth: usize,
+    nesting_reported: bool,
 }
 
 /// The declaration modifiers already parsed before a function's name, grouped
@@ -45,6 +54,116 @@ struct FunctionModifiers {
 }
 
 impl Parser {
+    fn with_nesting<T>(&mut self, parse: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        if self.nesting_depth >= MAX_SOURCE_NESTING {
+            self.report_excessive_nesting(self.current().span);
+            return None;
+        }
+        self.nesting_depth += 1;
+        let result = parse(self);
+        self.nesting_depth -= 1;
+        result
+    }
+
+    fn report_excessive_nesting(&mut self, span: Span) {
+        if self.nesting_reported {
+            return;
+        }
+        self.nesting_reported = true;
+        self.diagnostics.push(
+            Diagnostic::error(
+                format!("source nesting exceeds the compiler limit of {MAX_SOURCE_NESTING}"),
+                span,
+            )
+            .with_help("simplify or split the deeply nested expression, type, or statement"),
+        );
+    }
+
+    fn expression_within_limit(&mut self, expression: &Expression, span: Span) -> bool {
+        let mut pending = vec![(expression, 1_usize)];
+        while let Some((expression, depth)) = pending.pop() {
+            if depth > MAX_SOURCE_NESTING {
+                self.report_excessive_nesting(span);
+                return false;
+            }
+            let nested = depth + 1;
+            match &expression.kind {
+                ExpressionKind::StructLiteral { fields, .. } => {
+                    pending.extend(fields.iter().map(|field| (&field.value, nested)));
+                }
+                ExpressionKind::ArrayLiteral(elements) => {
+                    pending.extend(elements.iter().map(|element| (element, nested)));
+                }
+                ExpressionKind::NewArray { length, .. }
+                | ExpressionKind::Unary {
+                    operand: length, ..
+                }
+                | ExpressionKind::IncrementDecrement {
+                    operand: length, ..
+                }
+                | ExpressionKind::Try { operand: length }
+                | ExpressionKind::Await { operand: length }
+                | ExpressionKind::Cast {
+                    operand: length, ..
+                }
+                | ExpressionKind::Member { object: length, .. } => {
+                    pending.push((length, nested));
+                }
+                ExpressionKind::NewObject { arguments, .. } => {
+                    pending.extend(arguments.iter().map(|argument| (argument, nested)));
+                }
+                ExpressionKind::Index { array, index }
+                | ExpressionKind::Binary {
+                    left: array,
+                    right: index,
+                    ..
+                }
+                | ExpressionKind::Assignment {
+                    target: array,
+                    value: index,
+                    ..
+                } => {
+                    pending.push((array, nested));
+                    pending.push((index, nested));
+                }
+                ExpressionKind::Call {
+                    callee, arguments, ..
+                } => {
+                    pending.push((callee, nested));
+                    pending.extend(arguments.iter().map(|argument| (argument, nested)));
+                }
+                ExpressionKind::Conditional {
+                    condition,
+                    when_true,
+                    when_false,
+                } => {
+                    pending.push((condition, nested));
+                    pending.push((when_true, nested));
+                    pending.push((when_false, nested));
+                }
+                ExpressionKind::Switch {
+                    value,
+                    cases,
+                    default,
+                } => {
+                    pending.push((value, nested));
+                    pending.extend(cases.iter().map(|case| (&case.value, nested)));
+                    if let Some(default) = default {
+                        pending.push((default, nested));
+                    }
+                }
+                ExpressionKind::InterpolatedString { parts } => {
+                    pending.extend(parts.iter().filter_map(|part| match part {
+                        InterpolatedPart::Expression(expression) => Some((expression, nested)),
+                        InterpolatedPart::Text(_) => None,
+                    }));
+                }
+                ExpressionKind::Literal(_) | ExpressionKind::Name(_) | ExpressionKind::This => {}
+            }
+        }
+        true
+    }
+
     fn module(&mut self) -> Module {
         let namespace = if self.at(&TokenKind::Namespace) {
             self.namespace_declaration(&TokenKind::Namespace)
@@ -696,6 +815,10 @@ impl Parser {
     }
 
     fn block(&mut self) -> Option<Block> {
+        self.with_nesting(Self::block_inner)
+    }
+
+    fn block_inner(&mut self) -> Option<Block> {
         let start = self.expect(&TokenKind::LeftBrace)?.span.start;
         let mut statements = Vec::new();
         while !self.at(&TokenKind::RightBrace) && !self.at(&TokenKind::Eof) {
@@ -769,7 +892,7 @@ impl Parser {
         let then_block = self.block()?;
         let else_block = if self.take(&TokenKind::Else).is_some() {
             if self.at(&TokenKind::If) {
-                let nested = self.if_statement()?;
+                let nested = self.with_nesting(Self::if_statement)?;
                 let span = nested.span();
                 Some(Block {
                     statements: vec![nested],
@@ -870,7 +993,7 @@ impl Parser {
         let body = if self.at(&TokenKind::LeftBrace) {
             self.block()?
         } else {
-            let statement = self.statement()?;
+            let statement = self.with_nesting(Self::statement)?;
             let span = statement.span();
             Block {
                 statements: vec![statement],
@@ -1003,7 +1126,13 @@ impl Parser {
     }
 
     fn expression(&mut self) -> Option<Expression> {
-        self.assignment_expression()
+        self.with_nesting(|parser| {
+            let expression = parser.assignment_expression()?;
+            let span = expression.span;
+            parser
+                .expression_within_limit(&expression, span)
+                .then_some(expression)
+        })
     }
 
     fn assignment_expression(&mut self) -> Option<Expression> {
@@ -1020,7 +1149,7 @@ impl Parser {
             return Some(target);
         };
         self.advance();
-        let value = self.assignment_expression()?;
+        let value = self.with_nesting(Self::assignment_expression)?;
         let span = Span::new(target.span.start, value.span.end);
         Some(Expression {
             kind: ExpressionKind::Assignment {
@@ -1044,7 +1173,7 @@ impl Parser {
         }
         let when_true = self.expression()?;
         self.expect(&TokenKind::Colon)?;
-        let when_false = self.assignment_expression()?;
+        let when_false = self.with_nesting(Self::assignment_expression)?;
         let span = Span::new(condition.span.start, when_false.span.end);
         Some(Expression {
             kind: ExpressionKind::Conditional {
@@ -1066,7 +1195,7 @@ impl Parser {
             if self.at(&TokenKind::Default) {
                 let default_span = self.advance().span;
                 self.expect(&TokenKind::FatArrow)?;
-                let arm = self.assignment_expression()?;
+                let arm = self.with_nesting(Self::assignment_expression)?;
                 if default.replace(Box::new(arm)).is_some() {
                     self.diagnostics.push(Diagnostic::error(
                         "a switch expression can declare only one default arm",
@@ -1103,7 +1232,7 @@ impl Parser {
                     self.expect(&TokenKind::RightParen)?;
                 }
                 self.expect(&TokenKind::FatArrow)?;
-                let arm = self.assignment_expression()?;
+                let arm = self.with_nesting(Self::assignment_expression)?;
                 let end = arm.span.end.max(first_span.end);
                 cases.push(SwitchExpressionCase {
                     enum_name,
@@ -1200,7 +1329,7 @@ impl Parser {
         let mut expression = operand(self)?;
         while let Some((_, operator)) = operators.iter().find(|(token, _)| self.at(token)) {
             let operator = *operator;
-            self.advance();
+            let operator_span = self.advance().span;
             let right = operand(self)?;
             let span = Span::new(expression.span.start, right.span.end);
             expression = Expression {
@@ -1211,6 +1340,9 @@ impl Parser {
                 },
                 span,
             };
+            if !self.expression_within_limit(&expression, operator_span) {
+                return None;
+            }
         }
         Some(expression)
     }
@@ -1218,7 +1350,7 @@ impl Parser {
     fn unary(&mut self) -> Option<Expression> {
         if self.at(&TokenKind::Await) {
             let start = self.advance().span.start;
-            let operand = self.unary()?;
+            let operand = self.with_nesting(Self::unary)?;
             let span = Span::new(start, operand.span.end);
             return Some(Expression {
                 kind: ExpressionKind::Await {
@@ -1232,7 +1364,7 @@ impl Parser {
             let type_token = self.advance().clone();
             self.expect(&TokenKind::RightParen)?;
             let target = TypeRef::new(target, type_token.span);
-            let operand = self.unary()?;
+            let operand = self.with_nesting(Self::unary)?;
             let span = Span::new(start, operand.span.end);
             return Some(Expression {
                 kind: ExpressionKind::Cast {
@@ -1244,7 +1376,7 @@ impl Parser {
         }
         if let Some(operator) = self.increment_operator() {
             let start = self.advance().span.start;
-            let operand = self.unary()?;
+            let operand = self.with_nesting(Self::unary)?;
             let span = Span::new(start, operand.span.end);
             return Some(Expression {
                 kind: ExpressionKind::IncrementDecrement {
@@ -1262,7 +1394,7 @@ impl Parser {
         };
         if let Some(operator) = operator {
             let start = self.advance().span.start;
-            let operand = self.unary()?;
+            let operand = self.with_nesting(Self::unary)?;
             let span = Span::new(start, operand.span.end);
             return Some(Expression {
                 kind: ExpressionKind::Unary {
@@ -1288,6 +1420,9 @@ impl Parser {
                     },
                     span,
                 };
+                if !self.expression_within_limit(&expression, name_span) {
+                    return None;
+                }
             } else if self.take(&TokenKind::LeftBracket).is_some() {
                 let start = expression.span.start;
                 let index = self.expression()?;
@@ -1299,14 +1434,25 @@ impl Parser {
                     },
                     span: Span::new(start, end),
                 };
+                if !self.expression_within_limit(&expression, Span::new(end - 1, end)) {
+                    return None;
+                }
             } else if self.at(&TokenKind::Less) && self.generic_call_ahead() {
                 let type_arguments = self.type_arguments()?;
-                self.expect(&TokenKind::LeftParen)?;
+                let call_span = self.expect(&TokenKind::LeftParen)?.span;
                 expression = self.call_after_arguments(expression, type_arguments)?;
-            } else if self.take(&TokenKind::LeftParen).is_some() {
+                if !self.expression_within_limit(&expression, call_span) {
+                    return None;
+                }
+            } else if let Some(call) = self.take(&TokenKind::LeftParen) {
+                let call_span = call.span;
                 expression = self.call_after_arguments(expression, Vec::new())?;
+                if !self.expression_within_limit(&expression, call_span) {
+                    return None;
+                }
             } else if let Some(operator) = self.increment_operator() {
-                let end = self.advance().span.end;
+                let operator_span = self.advance().span;
+                let end = operator_span.end;
                 let span = Span::new(expression.span.start, end);
                 expression = Expression {
                     kind: ExpressionKind::IncrementDecrement {
@@ -1316,8 +1462,12 @@ impl Parser {
                     },
                     span,
                 };
+                if !self.expression_within_limit(&expression, operator_span) {
+                    return None;
+                }
             } else if self.at_try_propagation() {
-                let end = self.advance().span.end;
+                let operator_span = self.advance().span;
+                let end = operator_span.end;
                 let span = Span::new(expression.span.start, end);
                 expression = Expression {
                     kind: ExpressionKind::Try {
@@ -1325,6 +1475,9 @@ impl Parser {
                     },
                     span,
                 };
+                if !self.expression_within_limit(&expression, operator_span) {
+                    return None;
+                }
             } else {
                 break;
             }
@@ -1731,6 +1884,10 @@ impl Parser {
     }
 
     fn type_ref(&mut self) -> Option<TypeRef> {
+        self.with_nesting(Self::type_ref_inner)
+    }
+
+    fn type_ref_inner(&mut self) -> Option<TypeRef> {
         let mut type_ref = self.type_ref_base()?;
         if self.take(&TokenKind::LeftBracket).is_some() {
             let end = self.expect(&TokenKind::RightBracket)?.span.end;

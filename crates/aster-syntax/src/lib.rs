@@ -14,5 +14,5 @@ pub use ast::{
     UnaryOperator, UsingDeclaration, VariableDeclaration, VariableKind, Visibility,
 };
 pub use lexer::lex;
-pub use parser::parse;
+pub use parser::{MAX_SOURCE_NESTING, parse};
 pub use token::{Token, TokenKind};
