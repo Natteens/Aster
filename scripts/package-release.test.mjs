@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -51,9 +52,28 @@ const releaseBinary = join(
     currentTarget.binaryName,
 );
 
+function commandReportsVersion(command, expected) {
+    if (!existsSync(command)) return false;
+    const result = spawnSync(command, ["--version"], {
+        encoding: "utf8",
+        windowsHide: true,
+    });
+    return result.status === 0 && result.stdout.trim() === expected;
+}
+
+function hasCurrentReleaseBinary() {
+    return commandReportsVersion(releaseBinary, `aster ${canonicalVersion}`);
+}
+
 function temporaryDirectory(label) {
     return mkdtempSync(join(tmpdir(), `aster-package-${label}-`));
 }
+
+test("release binary gate requires the canonical reported version", () => {
+    assert.equal(commandReportsVersion(process.execPath, process.version), true);
+    assert.equal(commandReportsVersion(process.execPath, "v0.0.0-stale"), false);
+    assert.equal(commandReportsVersion(join(tmpdir(), "missing-aster"), canonicalVersion), false);
+});
 
 function createFakeWorkspace(root, binaryName) {
     mkdirSync(join(root, "target", "release"), { recursive: true });
@@ -509,9 +529,9 @@ test("packageBundle removes partial artifacts after invalid bundle manifest", ()
 test(
     "real extracted archive is relocatable and proves external stdlib use",
     {
-        skip: existsSync(releaseBinary)
+        skip: hasCurrentReleaseBinary()
             ? false
-            : "release binary is absent; npm run bundle builds it before package:release",
+            : "current release binary is absent; npm run bundle builds it before package:release",
     },
     () => {
         const workspaceRoot = temporaryDirectory("real relocation");
