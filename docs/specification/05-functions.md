@@ -119,6 +119,12 @@ matches win before safe implicit conversions; an equal best match is diagnosed, 
 alone never distinguishes an overload. Struct methods, default/named arguments, constructor
 overloads remain future work.
 
+Recursion is supported with a per-execution limit of 1,024 simultaneously active calls through a
+recursive call cycle. Exceeding it is a controlled runtime failure rather than a native stack
+overflow. The same limit applies to normal execution and worker-local execution such as
+`Task.Run`; independent execution contexts own independent counters. Acyclic calls are not counted
+against this recursion limit.
+
 ## Application entry
 
 ### ACCEPTED — Program entry point

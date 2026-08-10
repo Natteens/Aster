@@ -71,6 +71,11 @@ Rules:
   remain valid.
 - Temporary allocation is valid only while such a scope is active. The runtime reports a
   controlled error for unmatched scope exits or temporary allocation without a scope.
+- The backend identifies functions that can participate in direct, mutual, or interface-dispatched
+  call cycles. Those functions enter and leave a call-depth guard owned by their
+  `ExecutionContext`; acyclic calls pay no guard ABI cost. A failed guarded entry records a
+  controlled error and returns a neutral ABI value so native frames unwind normally; it does not
+  unwind through `extern "C"`. Worker contexts use the same guard independently.
 - Object storage follows the same ownership rule. Generated constructors and methods receive the
   object pointer directly; the runtime only allocates and owns the bytes.
 - Interface values do not allocate runtime memory. They copy a pair of pointers: the object owned

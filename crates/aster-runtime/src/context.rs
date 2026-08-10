@@ -9,6 +9,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::arena::{ArenaMark, MAX_ALIGN, PagedArena};
 use crate::string::AsterStrHeader;
 
+/// Maximum number of simultaneously active ASTER function calls in one
+/// execution context. This is intentionally far below the native-stack depth
+/// where the smaller worker stacks have been observed to abort.
+pub const ASTER_CALL_DEPTH_LIMIT: u32 = 1024;
+
 /// Stable array header visible to generated code only through runtime calls.
 #[repr(C)]
 pub struct AsterArray {
@@ -324,6 +329,7 @@ pub struct ExecutionContext {
     arena: PagedArena,
     temporary_arena: PagedArena,
     temporary_scopes: Vec<TemporaryArenaMark>,
+    call_depth: u32,
     error: Option<String>,
     collect_stats: bool,
     stats: MemoryStats,
@@ -378,6 +384,7 @@ impl ExecutionContext {
             arena: PagedArena::new(),
             temporary_arena: PagedArena::new(),
             temporary_scopes: Vec::new(),
+            call_depth: 0,
             error: None,
             collect_stats: false,
             stats: MemoryStats::default(),
@@ -398,6 +405,7 @@ impl ExecutionContext {
             arena: PagedArena::new(),
             temporary_arena: PagedArena::new(),
             temporary_scopes: Vec::new(),
+            call_depth: 0,
             error: None,
             collect_stats: true,
             stats: MemoryStats::default(),
@@ -428,6 +436,25 @@ impl ExecutionContext {
         if self.error.is_none() {
             self.error = Some(message.into());
         }
+    }
+
+    fn enter_call(&mut self) -> bool {
+        if self.call_depth >= ASTER_CALL_DEPTH_LIMIT {
+            self.fail(format!(
+                "ASTER call depth exceeds the supported limit of {ASTER_CALL_DEPTH_LIMIT}"
+            ));
+            return false;
+        }
+        self.call_depth += 1;
+        true
+    }
+
+    fn leave_call(&mut self) {
+        let Some(depth) = self.call_depth.checked_sub(1) else {
+            self.fail("ASTER call-depth guard is unbalanced");
+            return;
+        };
+        self.call_depth = depth;
     }
 
     /// Register the current top-level execution's opaque host extension
@@ -2298,6 +2325,43 @@ pub extern "C" fn aster_rt_temporary_scope_leave(context: *mut ExecutionContext)
     #[allow(unsafe_code)]
     let context = unsafe { &mut *context };
     context.leave_temporary_scope();
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_call_enter(context: *mut ExecutionContext) -> i8 {
+    if context.is_null() {
+        return 0;
+    }
+    // SAFETY: generated functions receive the live host-owned context as their
+    // hidden first parameter, and invocation cannot outlive that context.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    i8::from(context.enter_call())
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_call_leave(context: *mut ExecutionContext) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: generated functions receive the live host-owned context as their
+    // hidden first parameter, and invocation cannot outlive that context.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    context.leave_call();
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[must_use]
+pub extern "C" fn aster_rt_has_error(context: *const ExecutionContext) -> i8 {
+    if context.is_null() {
+        return 1;
+    }
+    // SAFETY: generated functions receive the live host-owned context as their
+    // hidden first parameter, and invocation cannot outlive that context.
+    #[allow(unsafe_code)]
+    let context = unsafe { &*context };
+    i8::from(context.error.is_some())
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -6043,6 +6107,58 @@ mod tests {
                 .take_error()
                 .is_some_and(|error| error.contains("no matching enter"))
         );
+    }
+
+    #[test]
+    fn call_depth_limit_is_controlled_and_balances_during_unwind() {
+        let mut context = ExecutionContext::new();
+        let pointer = &raw mut context;
+
+        for _ in 0..ASTER_CALL_DEPTH_LIMIT {
+            assert_eq!(aster_rt_call_enter(pointer), 1);
+        }
+        assert_eq!(aster_rt_call_enter(pointer), 0);
+        assert_eq!(
+            context.take_error().as_deref(),
+            Some("ASTER call depth exceeds the supported limit of 1024")
+        );
+
+        for _ in 0..ASTER_CALL_DEPTH_LIMIT {
+            aster_rt_call_leave(pointer);
+        }
+        assert_eq!(context.call_depth, 0);
+        assert_eq!(aster_rt_call_enter(pointer), 1);
+        aster_rt_call_leave(pointer);
+        assert_eq!(context.call_depth, 0);
+        assert_eq!(context.take_error(), None);
+    }
+
+    #[test]
+    fn call_depth_failure_is_first_error_wins_and_context_local() {
+        let mut first = ExecutionContext::new();
+        let first_pointer = &raw mut first;
+        for _ in 0..ASTER_CALL_DEPTH_LIMIT {
+            assert_eq!(aster_rt_call_enter(first_pointer), 1);
+        }
+        assert_eq!(aster_rt_call_enter(first_pointer), 0);
+        first.fail("later error");
+        assert_eq!(aster_rt_has_error(first_pointer), 1);
+
+        let mut second = ExecutionContext::new();
+        let second_pointer = &raw mut second;
+        assert_eq!(aster_rt_call_enter(second_pointer), 1);
+        aster_rt_call_leave(second_pointer);
+        assert_eq!(aster_rt_has_error(second_pointer), 0);
+        assert_eq!(second.take_error(), None);
+
+        assert_eq!(
+            first.take_error().as_deref(),
+            Some("ASTER call depth exceeds the supported limit of 1024")
+        );
+        for _ in 0..ASTER_CALL_DEPTH_LIMIT {
+            aster_rt_call_leave(first_pointer);
+        }
+        assert_eq!(first.call_depth, 0);
     }
 
     #[test]

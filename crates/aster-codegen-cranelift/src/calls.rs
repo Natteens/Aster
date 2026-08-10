@@ -51,6 +51,9 @@ impl Codegen {
             values.push(self.translate_operand(builder, argument, state)?);
         }
         let call = builder.ins().call(function_ref, &values);
+        if self.runtime_fallible_functions.contains(&function) {
+            self.continue_if_runtime_ok(builder, state)?;
+        }
         if let Some(destination) = destination
             && !is_aggregate(return_type)
         {
@@ -1306,6 +1309,7 @@ impl Codegen {
         let size = builder.ins().iconst(types::I32, size);
         let call = builder.ins().call(function_ref, &[context, length, size]);
         let array = builder.inst_results(call)[0];
+        self.continue_if_runtime_ok(builder, state)?;
         self.store_scalar(builder, destination, array, state)
     }
 
@@ -1335,6 +1339,7 @@ impl Codegen {
         let size = builder.ins().iconst(types::I32, i64::from(layout.size));
         let call = builder.ins().call(function_ref, &[context, size]);
         let object = builder.inst_results(call)[0];
+        self.continue_if_runtime_ok(builder, state)?;
         self.store_scalar(builder, destination, object, state)
     }
 
@@ -1371,6 +1376,7 @@ impl Codegen {
             .ins()
             .call(function_ref, &[context, size, align, type_key]);
         let list = builder.inst_results(call)[0];
+        self.continue_if_runtime_ok(builder, state)?;
         self.store_scalar(builder, destination, list, state)
     }
 
@@ -1427,7 +1433,9 @@ impl Codegen {
                 value_type_key,
             ],
         );
-        self.store_scalar(builder, destination, builder.inst_results(call)[0], state)
+        let dictionary = builder.inst_results(call)[0];
+        self.continue_if_runtime_ok(builder, state)?;
+        self.store_scalar(builder, destination, dictionary, state)
     }
 
     fn dictionary_operand_address(
@@ -1730,7 +1738,9 @@ impl Codegen {
             ),
         ]);
         let call = builder.ins().call(function_ref, &arguments);
-        self.store_scalar(builder, destination, builder.inst_results(call)[0], state)
+        let entries = builder.inst_results(call)[0];
+        self.continue_if_runtime_ok(builder, state)?;
+        self.store_scalar(builder, destination, entries, state)
     }
 
     /// `list.Add(value)`: materializes `value`'s full representation at a

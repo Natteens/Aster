@@ -7,10 +7,11 @@
 
 use crate::context::{
     aster_rt_array_element, aster_rt_array_length, aster_rt_array_new,
-    aster_rt_array_new_temporary, aster_rt_dictionary_add, aster_rt_dictionary_contains_key,
-    aster_rt_dictionary_entries, aster_rt_dictionary_length, aster_rt_dictionary_new,
-    aster_rt_dictionary_new_temporary, aster_rt_dictionary_remove, aster_rt_dictionary_set,
-    aster_rt_dictionary_try_get, aster_rt_list_add, aster_rt_list_get, aster_rt_list_length,
+    aster_rt_array_new_temporary, aster_rt_call_enter, aster_rt_call_leave,
+    aster_rt_dictionary_add, aster_rt_dictionary_contains_key, aster_rt_dictionary_entries,
+    aster_rt_dictionary_length, aster_rt_dictionary_new, aster_rt_dictionary_new_temporary,
+    aster_rt_dictionary_remove, aster_rt_dictionary_set, aster_rt_dictionary_try_get,
+    aster_rt_has_error, aster_rt_list_add, aster_rt_list_get, aster_rt_list_length,
     aster_rt_list_new, aster_rt_list_new_temporary, aster_rt_list_remove_at, aster_rt_list_version,
     aster_rt_list_version_mismatch, aster_rt_temporary_scope_enter, aster_rt_temporary_scope_leave,
 };
@@ -135,6 +136,30 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             signature: RuntimeSignature {
                 parameters: &[RuntimeType::Pointer],
                 result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_call_enter",
+            address: aster_rt_call_enter as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer],
+                result: Some(RuntimeType::I8),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_call_leave",
+            address: aster_rt_call_leave as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_has_error",
+            address: aster_rt_has_error as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer],
+                result: Some(RuntimeType::I8),
             },
         },
         RuntimeFunction {
@@ -1127,5 +1152,30 @@ mod tests {
             assert_eq!(function.signature.parameters, &[RuntimeType::Pointer]);
             assert_eq!(function.signature.result, None);
         }
+    }
+
+    #[test]
+    fn call_depth_signatures_match_the_abi() {
+        let functions = runtime_functions();
+        let enter = functions
+            .iter()
+            .find(|function| function.name == "aster_rt_call_enter")
+            .expect("missing call-depth enter function");
+        assert_eq!(enter.signature.parameters, &[RuntimeType::Pointer]);
+        assert_eq!(enter.signature.result, Some(RuntimeType::I8));
+
+        let leave = functions
+            .iter()
+            .find(|function| function.name == "aster_rt_call_leave")
+            .expect("missing call-depth leave function");
+        assert_eq!(leave.signature.parameters, &[RuntimeType::Pointer]);
+        assert_eq!(leave.signature.result, None);
+
+        let has_error = functions
+            .iter()
+            .find(|function| function.name == "aster_rt_has_error")
+            .expect("missing runtime error query");
+        assert_eq!(has_error.signature.parameters, &[RuntimeType::Pointer]);
+        assert_eq!(has_error.signature.result, Some(RuntimeType::I8));
     }
 }

@@ -34,7 +34,7 @@ impl Codegen {
                         BackendError::new("struct return is missing its hidden destination")
                     })?;
                     self.copy_value(builder, &value.type_, source, destination)?;
-                    self.leave_temporary_scope(builder, state)?;
+                    self.leave_function(builder, state)?;
                     builder.ins().return_(&[]);
                     return Ok(());
                 }
@@ -44,11 +44,11 @@ impl Codegen {
                     .transpose()?
                     .into_iter()
                     .collect::<Vec<_>>();
-                self.leave_temporary_scope(builder, state)?;
+                self.leave_function(builder, state)?;
                 builder.ins().return_(&values);
             }
             mir::Terminator::End => {
-                self.leave_temporary_scope(builder, state)?;
+                self.leave_function(builder, state)?;
                 builder.ins().return_(&[]);
             }
             mir::Terminator::Unreachable => {
@@ -58,22 +58,27 @@ impl Codegen {
         Ok(())
     }
 
-    fn leave_temporary_scope(
+    pub(super) fn leave_function(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
         state: &FunctionState,
     ) -> Result<(), BackendError> {
-        if !state.temporary_scope {
-            return Ok(());
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("Aster function is missing its ExecutionContext"))?;
+        if state.temporary_scope {
+            let function_ref = self.jit.declare_func_in_func(
+                self.runtime_ids["aster_rt_temporary_scope_leave"],
+                builder.func,
+            );
+            builder.ins().call(function_ref, &[context]);
         }
-        let context = state.execution_context.ok_or_else(|| {
-            BackendError::new("temporary allocation scope is missing its ExecutionContext")
-        })?;
-        let function_ref = self.jit.declare_func_in_func(
-            self.runtime_ids["aster_rt_temporary_scope_leave"],
-            builder.func,
-        );
-        builder.ins().call(function_ref, &[context]);
+        if state.call_depth_guarded {
+            let leave_ref = self
+                .jit
+                .declare_func_in_func(self.runtime_ids["aster_rt_call_leave"], builder.func);
+            builder.ins().call(leave_ref, &[context]);
+        }
         Ok(())
     }
 }

@@ -126,6 +126,9 @@ impl Codegen {
         let call = builder
             .ins()
             .call_indirect(signature, method_pointer, &values);
+        if self.runtime_fallible_interface_methods.contains(method) {
+            self.continue_if_runtime_ok(builder, state)?;
+        }
         if let Some(destination) = destination.as_ref()
             && !is_aggregate(return_type)
         {

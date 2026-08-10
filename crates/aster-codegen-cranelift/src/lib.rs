@@ -61,6 +61,9 @@ struct Codegen {
     interface_tables: HashMap<(mir::SymbolId, mir::SymbolId), DataId>,
     interface_methods:
         HashMap<mir::SymbolId, (mir::SymbolId, usize, mir::InterfaceMethodDefinition)>,
+    call_depth_guarded: HashSet<mir::SymbolId>,
+    runtime_fallible_functions: HashSet<mir::SymbolId>,
+    runtime_fallible_interface_methods: HashSet<mir::SymbolId>,
     layouts: Layouts,
 }
 
@@ -69,6 +72,8 @@ struct FunctionState {
     execution_context: Option<Value>,
     hidden_return: Option<Value>,
     temporary_scope: bool,
+    call_depth_guarded: bool,
+    runtime_failure: Block,
 }
 
 #[derive(Clone, Debug, PartialEq)]

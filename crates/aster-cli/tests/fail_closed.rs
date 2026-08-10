@@ -80,3 +80,23 @@ fn all_frontend_cli_paths_reject_pathological_nesting() {
     }
     remove_source(&path);
 }
+
+#[test]
+fn excessive_recursion_is_a_controlled_cli_failure() {
+    let path = temporary_source(
+        "recursion",
+        r"
+            public class Program {
+                public static int Recurse(int remaining) {
+                    return remaining == 0 ? 0 : Recurse(remaining - 1) + 1;
+                }
+                public static int Main() { return Recurse(2000); }
+            }
+        ",
+    );
+    assert_controlled_failure(
+        &aster("run", &path),
+        "call depth exceeds the supported limit",
+    );
+    remove_source(&path);
+}
