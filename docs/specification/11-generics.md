@@ -91,16 +91,53 @@ Box<int, long> value;   // Box accepts one type argument
 Box<long> other = new Box<int>(42); // closed types are incompatible
 ```
 
-## PROPOSED — Constraints
+## ACCEPTED — Interface constraints
 
-Alternatives:
+A type parameter may require one or more interfaces through a trailing `where` clause. This is an
+interface-only subset, not a general constraint or trait system.
 
-1. trailing `where T : IComparable<T>` clauses — explicit and scalable, but adds syntax and
-   constraint resolution;
-2. inline constraints — local, but noisy for nested signatures;
-3. structural operation inference — concise, but weakens contracts and diagnostics.
+```aster
+public T PickHigher<T>(T left, T right)
+    where T : IScored
+{
+    if (left.Score() >= right.Score()) { return left; }
+    return right;
+}
+```
 
-Recommendation: trailing interface-based `where` clauses. Constraints are not implemented.
+- One clause per type parameter; list several interfaces with commas: `where T : IFirst, ISecond`.
+- Constrain several parameters with several clauses: `where T : IFirst where U : ISecond`.
+- Every generic declaration kind accepts clauses: namespace functions, classes, structs,
+  interfaces, and enums. On a type declaration the clauses follow any interface list and precede
+  the body: `class Box<T> : IBox where T : IScored`.
+- `where` is contextual. It opens a clause only between a declaration header and its body, so it
+  remains usable as an ordinary identifier everywhere else.
+
+A concrete type argument satisfies a required interface when it *is* that interface, or when it is
+a class whose declaration nominally lists it. This mirrors the existing nominal compatibility rule
+for interface values. Whether such a class really implements the interface's members stays with
+ordinary semantic analysis, which rejects a class that lists an interface it does not implement.
+
+Constraints are proven when a specialization is requested, before the specialization cache is
+consulted and before any concrete declaration is generated. Every request path is covered: explicit
+arguments, inferred arguments, nested requests, and repeated request sites. An unsatisfied
+constraint is reported at the request span and names the parameter, the argument, and the
+interface.
+
+Constraints are a template contract only. They are erased with the rest of the type-parameter list
+during monomorphization, so no constraint reaches semantic analysis, HIR, MIR, backend validation,
+Cranelift, or the runtime, and adding one changes no generated instruction. There is no boxing, no
+erasure, and no new dispatch mechanism.
+
+Rejected in this subset, each with its own diagnostic: generic interface constraints
+(`where T : IBox<int>`, `where T : IComparable<T>`), primitives, classes, structs, enums, unknown
+types, duplicate constraints, a clause naming an unknown type parameter, and a duplicate clause for
+one parameter.
+
+Constraints are not required to call members on a type parameter. An unconstrained template that
+uses a member stays legal and is checked against each concrete specialization, exactly as before.
+Requiring constraints for member access needs open-template semantic validation, which ASTER does
+not have.
 
 ## PROPOSED — Variance
 
@@ -114,8 +151,9 @@ Recommendation: keep invariance until real library APIs demonstrate a need.
 
 ## Not implemented
 
-Generic methods with their own type parameters, generic constructors, constraints, variance,
-default arguments, partially applied types, generic class or interface inheritance, static members
-on generic types, reflection, boxing, runtime type erasure, and executable struct methods remain
+Generic methods with their own type parameters, generic constructors, generic interface
+constraints, non-interface constraints (`class`, `struct`, `new()`, numeric), variance, default
+arguments, partially applied types, generic class or interface inheritance, static members on
+generic types, reflection, boxing, runtime type erasure, and executable struct methods remain
 unimplemented. Official `List<T>`, `Dictionary<K,V>`, `Option<T>`, and `Result<T,E>`
 specializations use the existing monomorphization pipeline.

@@ -34,6 +34,19 @@ impl Monomorphizer {
     }
 
     pub(super) fn analyze_type_declaration(&mut self, declaration: &mut TypeDeclaration) {
+        // Generated class specializations reach this point too, which is how
+        // `Wrapper<int>` keeps the interface relation declared by `Wrapper<T>`
+        // when it is later used as a constrained type argument.
+        if !declaration.interfaces.is_empty() {
+            self.class_interfaces.insert(
+                declaration.name.clone(),
+                declaration
+                    .interfaces
+                    .iter()
+                    .map(|interface| interface.name.clone())
+                    .collect(),
+            );
+        }
         for member in &declaration.members {
             match member {
                 Member::Field(field) => {

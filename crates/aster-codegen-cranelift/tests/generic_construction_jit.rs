@@ -106,3 +106,92 @@ fn repeated_specialization_reuses_cache() {
         public int Run() { return First() + Second(); }";
     assert_eq!(int(source), ExecutionValue::Int(42));
 }
+
+const SCORED: &str = "public interface IScored { int Score(); }\n\
+    public class Small : IScored { private int value; public Small(int value) { this.value = value; } public int Score() { return value; } }\n\
+    public class Large : IScored { private int value; public Large(int value) { this.value = value; } public int Score() { return value; } }\n";
+
+#[test]
+fn constrained_generic_function_executes() {
+    let source = format!(
+        "{SCORED}public T PickHigher<T>(T left, T right) where T : IScored {{ if (left.Score() >= right.Score()) {{ return left; }} return right; }}\n\
+         public int Run() {{ return PickHigher(new Small(20), new Small(42)).Score(); }}"
+    );
+    assert_eq!(int(&source), ExecutionValue::Int(42));
+}
+
+#[test]
+fn two_satisfying_types_specialize_and_execute_independently() {
+    let source = format!(
+        "{SCORED}public int Read<T>(T value) where T : IScored {{ return value.Score(); }}\n\
+         public int Run() {{ return Read(new Small(2)) + Read(new Large(40)); }}"
+    );
+    assert_eq!(int(&source), ExecutionValue::Int(42));
+}
+
+#[test]
+fn constrained_generic_class_member_executes() {
+    let source = format!(
+        "{SCORED}public class Box<T> where T : IScored {{ private T item; public Box(T item) {{ this.item = item; }} public int Read() {{ return item.Score(); }} }}\n\
+         public int Run() {{ Box<Large> box = new Box<Large>(new Large(42)); return box.Read(); }}"
+    );
+    assert_eq!(int(&source), ExecutionValue::Int(42));
+}
+
+fn mir_of(source: &str, label: &str) -> aster_mir::Module {
+    let path = std::env::temp_dir().join(format!("aster-{label}-{}.aster", std::process::id()));
+    std::fs::write(&path, source).expect("write temporary project");
+    let compilation = compile_project(&path).expect("program compiles");
+    std::fs::remove_file(&path).ok();
+    compilation.compilation.mir
+}
+
+/// A constraint is a compile-time contract only. Adding it must not change one
+/// instruction of the generated program: same direct calls, no interface value
+/// materialized, no dispatch mechanism introduced.
+#[test]
+fn a_constraint_introduces_no_boxing_or_interface_dispatch() {
+    use aster_mir as mir;
+
+    let constrained = mir_of(
+        &format!(
+            "{SCORED}public int Read<T>(T value) where T : IScored {{ return value.Score(); }}\n\
+             public int Run() {{ return Read(new Small(42)); }}"
+        ),
+        "constraint-dispatch-with",
+    );
+    let unconstrained = mir_of(
+        &format!(
+            "{SCORED}public int Read<T>(T value) {{ return value.Score(); }}\n\
+             public int Run() {{ return Read(new Small(42)); }}"
+        ),
+        "constraint-dispatch-without",
+    );
+    assert_eq!(
+        format!("{constrained:#?}"),
+        format!("{unconstrained:#?}"),
+        "a constraint must not change generated MIR"
+    );
+
+    for function in &constrained.functions {
+        for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+            assert!(
+                !matches!(instruction, mir::Instruction::CallInterface { .. }),
+                "a constraint must not introduce interface dispatch"
+            );
+            assert!(
+                !matches!(
+                    instruction,
+                    mir::Instruction::Assign {
+                        value: mir::Rvalue {
+                            kind: mir::RvalueKind::MakeInterface { .. },
+                            ..
+                        },
+                        ..
+                    }
+                ),
+                "a constraint must not introduce an interface value"
+            );
+        }
+    }
+}

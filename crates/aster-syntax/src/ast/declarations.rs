@@ -106,6 +106,11 @@ pub struct FunctionDeclaration {
 pub struct TypeParameter {
     pub name: String,
     pub span: Span,
+    /// Interfaces this parameter is required to satisfy, from a trailing
+    /// `where` clause. Namespace linking rewrites these to linked nominal
+    /// names, and specialization clears them with the rest of the parameter
+    /// list, so no constraint outlives monomorphization.
+    pub constraints: Vec<TypeRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

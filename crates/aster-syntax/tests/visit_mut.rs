@@ -217,6 +217,7 @@ fn fixture() -> Module {
         type_parameters: vec![TypeParameter {
             name: "U".to_owned(),
             span: span(57),
+            constraints: vec![type_ref("IFunctionConstraint", 130)],
         }],
         visibility: Visibility::Public,
         return_type: type_ref("Return<T, U>[]", 58),
@@ -254,6 +255,10 @@ fn fixture() -> Module {
         type_parameters: vec![TypeParameter {
             name: "T".to_owned(),
             span: span(70),
+            constraints: vec![
+                type_ref("IClassConstraint", 131),
+                type_ref("ISecondClassConstraint", 132),
+            ],
         }],
         interfaces: vec![type_ref("Contract<T[]>", 71)],
         members: vec![
@@ -329,6 +334,7 @@ fn fixture() -> Module {
                 type_parameters: vec![TypeParameter {
                     name: "T".to_owned(),
                     span: span(86),
+                    constraints: vec![type_ref("IEnumConstraint", 133)],
                 }],
                 cases: vec![EnumCase {
                     name: "Some".to_owned(),
@@ -450,6 +456,12 @@ fn shared_traversal_reaches_every_current_child_shape() {
             "EnumPayload<T>",
             "Field<T>[]",
             "Global<T>",
+            "IClassConstraint",
+            "IEnumConstraint",
+            "IFunctionConstraint",
+            "IFunctionConstraint",
+            "IFunctionConstraint",
+            "ISecondClassConstraint",
             "Iterator<T>",
             "Iterator<T>",
             "Local<T>",

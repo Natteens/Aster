@@ -216,7 +216,7 @@ impl Parser {
             );
         }
         let (name, _) = self.identifier()?;
-        let type_parameters = self.type_parameters()?;
+        let mut type_parameters = self.type_parameters()?;
         let interfaces = if let Some(colon) = self.take(&TokenKind::Colon) {
             if kind != TypeKind::Class {
                 self.diagnostics.push(
@@ -238,6 +238,9 @@ impl Parser {
         } else {
             Vec::new()
         };
+        // After any interface list and before the body: the smallest position
+        // that stays unambiguous for `class Box<T> : IBox where T : IScored`.
+        self.where_clauses(&mut type_parameters)?;
         self.expect(&TokenKind::LeftBrace)?;
         let mut members = Vec::new();
         while !self.at(&TokenKind::RightBrace) && !self.at(&TokenKind::Eof) {
@@ -266,7 +269,8 @@ impl Parser {
     ) -> Option<EnumDeclaration> {
         self.advance();
         let (name, _) = self.identifier()?;
-        let type_parameters = self.type_parameters()?;
+        let mut type_parameters = self.type_parameters()?;
+        self.where_clauses(&mut type_parameters)?;
         self.expect(&TokenKind::LeftBrace)?;
         let mut cases = Vec::new();
         while !self.at(&TokenKind::RightBrace) && !self.at(&TokenKind::Eof) {
@@ -447,10 +451,12 @@ impl Parser {
             is_static,
             is_async,
         } = modifiers;
-        let type_parameters = self.type_parameters()?;
+        let mut type_parameters = self.type_parameters()?;
         self.expect(&TokenKind::LeftParen)?;
         let parameters = self.parameters()?;
         let right_paren = self.expect(&TokenKind::RightParen)?;
+        // Covers both bodied functions and signature-only interface members.
+        self.where_clauses(&mut type_parameters)?;
         if signature_only {
             let end = self.expect(&TokenKind::Semicolon)?.span.end;
             Some(FunctionDeclaration {
@@ -544,13 +550,71 @@ impl Parser {
         let mut parameters = Vec::new();
         loop {
             let (name, span) = self.identifier()?;
-            parameters.push(TypeParameter { name, span });
+            parameters.push(TypeParameter {
+                name,
+                span,
+                constraints: Vec::new(),
+            });
             if self.take(&TokenKind::Comma).is_none() {
                 break;
             }
         }
         self.expect(&TokenKind::Greater)?;
         Some(parameters)
+    }
+
+    /// Attach any trailing `where` clauses to the type parameters they name.
+    ///
+    /// `where` is contextual. It is recognized only here, in the gap between a
+    /// declaration header and its body, where the grammar previously admitted
+    /// nothing but `{` or `;`. An ordinary identifier spelled `where` therefore
+    /// keeps parsing everywhere else.
+    fn where_clauses(&mut self, parameters: &mut [TypeParameter]) -> Option<()> {
+        let mut clauses: Vec<String> = Vec::new();
+        while self.at_where_clause() {
+            self.advance();
+            let (name, name_span) = self.identifier()?;
+            self.expect(&TokenKind::Colon)?;
+            let mut constraints = Vec::new();
+            loop {
+                constraints.push(self.type_ref()?);
+                if self.take(&TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+            if clauses.contains(&name) {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!("duplicate `where` clause for type parameter `{name}`"),
+                        name_span,
+                    )
+                    .with_help(format!(
+                        "list every constraint for `{name}` in one `where` clause"
+                    )),
+                );
+                continue;
+            }
+            clauses.push(name.clone());
+            let Some(parameter) = parameters
+                .iter_mut()
+                .find(|parameter| parameter.name == name)
+            else {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!("unknown type parameter `{name}` in `where` clause"),
+                        name_span,
+                    )
+                    .with_help("constrain a type parameter declared by this declaration"),
+                );
+                continue;
+            };
+            parameter.constraints = constraints;
+        }
+        Some(())
+    }
+
+    fn at_where_clause(&self) -> bool {
+        matches!(&self.current().kind, TokenKind::Identifier(name) if name == "where")
     }
 
     fn parameters(&mut self) -> Option<Vec<Parameter>> {

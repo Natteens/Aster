@@ -4,7 +4,7 @@ use aster_diagnostics::Diagnostic;
 use aster_syntax::{
     BinaryOperator, Block, EnumDeclaration, Expression, ExpressionKind, FunctionDeclaration,
     InterpolatedPart, Item, Literal, Member, Module, Statement, SwitchCase, SwitchExpressionCase,
-    TypeDeclaration, TypeRef, VariableDeclaration, VariableKind,
+    TypeDeclaration, TypeParameter, TypeRef, VariableDeclaration, VariableKind,
     visit::{
         AstVisitorMut, walk_expression_mut, walk_switch_case_mut, walk_switch_expression_case_mut,
     },
@@ -23,6 +23,37 @@ use specialization::GenericTypeConcretizer;
 use substitution::{TypeSubstituter, substitute_name, substitutions};
 use templates::GenericTypeTemplate;
 
+/// What a linked type declaration is, as far as a `where` constraint needs to
+/// know.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeclarationKind {
+    Class,
+    Struct,
+    Interface,
+    Enum,
+}
+
+impl DeclarationKind {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Class => "a class",
+            Self::Struct => "a struct",
+            Self::Interface => "an interface",
+            Self::Enum => "an enum",
+        }
+    }
+}
+
+/// The minimum generic-layer facts about a linked declaration required to judge
+/// a constraint. This is deliberately not a second `semantic::TypeInfo`:
+/// semantic analysis remains the authority for whether a class actually
+/// implements the members of every interface it nominally lists.
+#[derive(Clone, Copy)]
+struct DeclarationFacts {
+    kind: DeclarationKind,
+    generic: bool,
+}
+
 pub(crate) fn monomorphize(module: &mut Module) -> Vec<Diagnostic> {
     Monomorphizer::new(module).run(module)
 }
@@ -40,10 +71,65 @@ struct Monomorphizer {
     type_cache: HashMap<(String, Vec<TypeName>), String>,
     type_active: Vec<(String, Vec<TypeName>)>,
     generated_types: Vec<Item>,
+    /// Kind and genericity of every linked type declaration, for constraint
+    /// well-formedness.
+    declarations: HashMap<String, DeclarationFacts>,
+    /// Linked class name to the interfaces it nominally lists, for constraint
+    /// satisfaction. Generated class specializations are added as they are
+    /// produced, so `Wrapper<int>` keeps `Wrapper<T>`'s interface relation.
+    class_interfaces: HashMap<String, Vec<String>>,
     diagnostics: Vec<Diagnostic>,
 }
 
 impl Monomorphizer {
+    /// The first-subset nominal satisfaction relation: a concrete argument
+    /// satisfies a required interface when it *is* that interface, or when it
+    /// is a class whose linked declaration nominally lists it. No structural
+    /// member scanning happens here; semantic analysis still rejects a class
+    /// that lists an interface it does not actually implement.
+    fn satisfies(&self, concrete: &str, interface: &str) -> bool {
+        concrete == interface
+            || self
+                .class_interfaces
+                .get(concrete)
+                .is_some_and(|implemented| implemented.iter().any(|listed| listed == interface))
+    }
+
+    /// Report every concrete argument that fails one of its parameter's
+    /// constraints. Called before cache lookup and before any clone is
+    /// generated, so no request path and no repeated request site can bypass
+    /// the contract.
+    fn check_constraints(
+        &mut self,
+        parameters: &[TypeParameter],
+        concrete: &[String],
+        span: aster_diagnostics::Span,
+    ) -> bool {
+        let mut satisfied = true;
+        for (parameter, argument) in parameters.iter().zip(concrete) {
+            for constraint in &parameter.constraints {
+                if self.satisfies(argument, &constraint.name) {
+                    continue;
+                }
+                satisfied = false;
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "type argument `{argument}` does not satisfy constraint `{}: {}`",
+                            parameter.name, constraint.name
+                        ),
+                        span,
+                    )
+                    .with_help(format!(
+                        "pass a class that implements `{}`, or the interface itself",
+                        constraint.name
+                    )),
+                );
+            }
+        }
+        satisfied
+    }
+
     fn run(mut self, module: &mut Module) -> Vec<Diagnostic> {
         self.validate_templates();
         self.reject_reserved_task_template(module);

@@ -56,7 +56,9 @@ pub trait AstVisitorMut {
         walk_function_declaration_mut(self, declaration);
     }
 
-    fn visit_type_parameter_mut(&mut self, _parameter: &mut TypeParameter) {}
+    fn visit_type_parameter_mut(&mut self, parameter: &mut TypeParameter) {
+        walk_type_parameter_mut(self, parameter);
+    }
 
     fn visit_parameter_mut(&mut self, parameter: &mut Parameter) {
         walk_parameter_mut(self, parameter);
@@ -196,6 +198,18 @@ pub fn walk_function_declaration_mut<V: AstVisitorMut + ?Sized>(
 
 pub fn walk_parameter_mut<V: AstVisitorMut + ?Sized>(visitor: &mut V, parameter: &mut Parameter) {
     visitor.visit_type_ref_mut(&mut parameter.type_ref);
+}
+
+/// Visiting a type parameter's constraints as ordinary type references is what
+/// lets namespace linking rewrite them to linked nominal names without a second
+/// resolver.
+pub fn walk_type_parameter_mut<V: AstVisitorMut + ?Sized>(
+    visitor: &mut V,
+    parameter: &mut TypeParameter,
+) {
+    for constraint in &mut parameter.constraints {
+        visitor.visit_type_ref_mut(constraint);
+    }
 }
 
 pub fn walk_variable_declaration_mut<V: AstVisitorMut + ?Sized>(

@@ -149,6 +149,44 @@ fn links_nested_generic_declarations_and_references_across_files() {
     assert!(hir.contains("app::Pair<app::Box<int>,app::Choice<app::Box<int>>>"));
 }
 
+/// A `where` constraint is an ordinary `TypeRef`, so the existing linker
+/// rewrites it to the linked nominal name with no second resolver.
+#[test]
+fn links_generic_constraints_declared_in_another_namespace() {
+    let project = Project::new("constraint-linking");
+    project.write(
+        "contracts/scored.aster",
+        "namespace contracts; public interface IScored { int Score(); }",
+    );
+    project.write(
+        "lib/helpers.aster",
+        "namespace lib; using contracts; public int Total<T>(T value) where T : IScored { return value.Score(); }",
+    );
+    let root = project.main(
+        "using contracts; using lib; public class Card : IScored { private int points; public Card(int points) { this.points = points; } public int Score() { return points; } } public int Run() { return Total(new Card(42)); }",
+    );
+    let compilation = compile_project(&root).expect("cross-namespace constraint");
+    let hir = format!("{:#?}", compilation.compilation.hir);
+    assert!(hir.contains("lib::Total#"));
+
+    let rejected = Project::new("constraint-linking-rejected");
+    rejected.write(
+        "contracts/scored.aster",
+        "namespace contracts; public interface IScored { int Score(); }",
+    );
+    rejected.write(
+        "lib/helpers.aster",
+        "namespace lib; using contracts; public T Keep<T>(T value) where T : IScored { return value; }",
+    );
+    let root = rejected.main(
+        "using contracts; using lib; public class Plain { public Plain() {} } public int Run() { Keep(new Plain()); return 0; }",
+    );
+    // The diagnostic names the linked identity, proving the constraint was
+    // qualified rather than compared as bare source text.
+    assert!(messages(&root).iter().any(|message| message
+        == "type argument `Plain` does not satisfy constraint `T: contracts::IScored`"));
+}
+
 #[test]
 fn reports_ambiguous_and_missing_namespaces() {
     let ambiguous = Project::new("ambiguous");

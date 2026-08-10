@@ -74,7 +74,14 @@ specializations. Struct layout, class fields, constructor signatures, properties
 tables are calculated from concrete types before HIR and MIR. Expanding recursive definitions that
 can never reach a finite specialization are rejected.
 
-Current limits: no constraints (`where`), variance, generic methods with additional parameters,
+Generic classes, structs, interfaces, and enums accept interface-only `where` constraints, written
+after any interface list and before the body: `class Box<T> : IBox where T : IScored`. The
+constraint is proven when the closed type is requested and erased before HIR. See
+[generics](generics.md).
+
+Current limits: no generic interface constraints (`where T : IBox<int>`), no
+`class`/`struct`/`new()`/numeric constraints, no variance, generic methods with additional
+parameters,
 constructors with their own type parameters, generic inheritance, static members on generic types, partial application,
 default type arguments, reflection, boxing, `object`, or generic standard collections. Struct
 methods are not executable yet; generic structs are currently data types with fields and literals.

@@ -21,15 +21,17 @@ visibility          = "public" | "internal" | "protected" | "private" ;
 
 type-declaration    = class | static-class | struct | interface | enum ;
 class               = "class" , identifier , [ type-parameters ] , [ interface-list ] ,
-                      "{" , { class-member } , "}" ;
+                      { where-clause } , "{" , { class-member } , "}" ;
 static-class        = "static" , "class" , identifier ,
                       "{" , { static-class-member } , "}" ;
 static-class-member = [ visibility ] , "static" , [ "async" ] ,
                       type , identifier , function-tail ;
 interface-list      = ":" , type , { "," , type } ;
-struct              = "struct" , identifier , [ type-parameters ] , "{" , { type-member } , "}" ;
-interface           = "interface" , identifier , [ type-parameters ] , "{" , { interface-member } , "}" ;
-enum                = "enum" , identifier , [ type-parameters ] , "{" ,
+struct              = "struct" , identifier , [ type-parameters ] , { where-clause } ,
+                      "{" , { type-member } , "}" ;
+interface           = "interface" , identifier , [ type-parameters ] , { where-clause } ,
+                      "{" , { interface-member } , "}" ;
+enum                = "enum" , identifier , [ type-parameters ] , { where-clause } , "{" ,
                       enum-case , { "," , enum-case } , [ "," ] , "}" ;
 enum-case           = identifier , [ parameters ] ;
 
@@ -44,7 +46,13 @@ accessor            = [ visibility ] , ( "get" | "set" ) , block ;
 
 function            = type , identifier , [ type-parameters ] , function-tail ;
 type-parameters     = "<" , identifier , { "," , identifier } , ">" ;
-function-tail       = parameters , block ;
+(* `where` is contextual: it is a clause opener only between a declaration
+   header and its body, so it remains usable as an ordinary identifier. The
+   identifier must name a type parameter of the same declaration, each
+   parameter accepts at most one clause, and every listed type must be a
+   non-generic interface. *)
+where-clause        = "where" , identifier , ":" , type , { "," , type } ;
+function-tail       = parameters , { where-clause } , block ;
 parameters          = "(" , [ parameter , { "," , parameter } ] , ")" ;
 parameter           = type , identifier ;
 type-arguments      = "<" , type , { "," , type } , ">" ;

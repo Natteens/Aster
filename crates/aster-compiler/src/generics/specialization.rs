@@ -164,6 +164,33 @@ impl Monomorphizer {
         concrete: &[TypeName],
         span: aster_diagnostics::Span,
     ) -> String {
+        // Constraints are proven before the cache is consulted, so a satisfied
+        // request cannot install an entry that silences a later bad one, and
+        // every request path reaching this function is covered.
+        let parameters = self
+            .type_templates
+            .get(name)
+            .map(|template| template.declaration().type_parameters.clone())
+            .or_else(|| {
+                self.enum_templates
+                    .get(name)
+                    .map(|template| template.type_parameters.clone())
+            })
+            .unwrap_or_default();
+        if parameters
+            .iter()
+            .any(|parameter| !parameter.constraints.is_empty())
+        {
+            let arguments = concrete.iter().map(ToString::to_string).collect::<Vec<_>>();
+            if !self.check_constraints(&parameters, &arguments, span) {
+                return TypeName {
+                    base: name.to_owned(),
+                    arguments: concrete.to_vec(),
+                    array: false,
+                }
+                .to_string();
+            }
+        }
         let key = (name.to_owned(), concrete.to_vec());
         if let Some(specialized) = self.type_cache.get(&key) {
             return specialized.clone();
@@ -247,6 +274,7 @@ impl Monomorphizer {
         specialized
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) fn instantiate(
         &mut self,
         name: &str,
@@ -310,6 +338,11 @@ impl Monomorphizer {
                 format!("cannot infer concrete types for generic function `{name}`"),
                 span,
             ));
+            return None;
+        }
+        // Proven before the cache lookup, so explicit, inferred and repeated
+        // request sites are all held to the same contract.
+        if !self.check_constraints(&template.type_parameters, &concrete, span) {
             return None;
         }
         let key = (name.to_owned(), concrete.clone());
