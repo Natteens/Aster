@@ -1,10 +1,10 @@
 # Packages and dependencies
 
 An ASTER package is a directory with an `Aster.toml`. A package declares a name, may declare an
-application entry, and may depend on other packages by local path.
+application entry, and may depend on other packages by local path or public HTTPS Git source.
 
-Everything on this page is local. `aster check`, `run`, `dump-hir`, `dump-mir`, and `watch` never
-download anything and never contact the network. There is no registry, lockfile, or Git source yet.
+`aster check`, `run`, `dump-hir`, `dump-mir`, and `watch` never download anything and never contact
+the network. Only `aster fetch` resolves or downloads Git sources.
 
 ## Declaring a package
 
@@ -48,6 +48,46 @@ which package you depend on.
 `path` is resolved relative to **the manifest that declares it**, not the shell's working
 directory, and is then canonicalized. The same checkout produces the same graph no matter where
 `aster` is invoked from.
+
+For a public Git repository, declare both its HTTPS URL and a required revision:
+
+```toml
+[dependencies]
+math = { git = "https://github.com/example/math.git", rev = "main" }
+```
+
+`rev` may name a branch, a tag, or a full commit SHA. A branch and tag with the same name is
+ambiguous and rejected. SSH, private authentication, local/file transports, submodules, repository
+subdirectories, and implicit default branches are not supported.
+
+Run `aster fetch` after adding or changing a Git dependency. It resolves each revision to an exact
+commit, materializes the source in ASTER's user cache, resolves transitive dependencies, and writes
+the root project's `Aster.lock`. Git dependencies require a usable `git` executable for fetching
+and local cache validation. Commit the lockfile to source control. A lock entry records only the
+package name, declared Git URL and revision, and resolved full commit:
+
+```toml
+[[package]]
+name = "math"
+git = "https://github.com/example/math.git"
+rev = "main"
+commit = "0123456789abcdef0123456789abcdef01234567"
+```
+
+The lockfile contains Git packages only, including transitives, in package-name order. Dependency
+edges remain owned by each package's `Aster.toml`; dependency lockfiles are ignored. A moving
+branch or tag does not change a locked build. To re-resolve one declared Git dependency, run
+`aster fetch --update math`; unrelated packages remain pinned unless the updated graph requires a
+different resolution.
+
+With a valid lockfile and cache, all compilation commands work offline. A missing or stale lockfile,
+or a missing or modified cache entry, fails with a diagnostic directing you to `aster fetch` rather
+than repairing state or contacting a remote. A relative path dependency declared inside a Git
+package must remain inside that immutable materialized source tree.
+
+The shared Git cache lives under `%LOCALAPPDATA%\Aster\cache\git` on Windows and
+`${XDG_CACHE_HOME:-$HOME/.cache}/aster/git` on Linux. Its directory names are SHA-256 keys derived
+from the exact URL and locked commit; cache paths never participate in package identity.
 
 A layout for the example above:
 
@@ -174,13 +214,13 @@ Each of these is an ordinary compiler diagnostic, never a panic:
 
 ## Watching
 
-`aster watch` observes every source in the root package and its path dependencies, plus every
-manifest in the resolved graph. Editing a dependency's source or its `Aster.toml` rebuilds the
-graph.
+`aster watch` observes every source and manifest in the resolved local graph, plus the root
+`Aster.lock` when present. It never polls Git remotes. Cached Git sources are immutable; change a
+declared revision through `aster fetch`, then restart the watcher.
 
 ## Not implemented yet
 
-Git source dependencies, a lockfile, a registry or package service, semantic-version ranges and
-solving, build scripts, and native package hooks are all deliberately absent. Dependencies are
-local paths only. Any future extension must be deliberate and follow the
-[compatibility policy](compatibility.md).
+A registry or package service, package publishing/search, semantic-version ranges and solving,
+`aster add`/`remove`, private or SSH Git sources, Git subdirectory packages, build scripts, and
+native package hooks are deliberately absent. Any future extension must be deliberate and follow
+the [compatibility policy](compatibility.md).

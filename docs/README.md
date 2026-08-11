@@ -22,7 +22,7 @@ work that is not implemented.
 
 - 🚪 [Application entry points](reference/application-entry.md)
 - 🗂️ [Namespaces and `using`](reference/namespaces.md)
-- 📦 [Packages and path dependencies](reference/packages.md)
+- 📦 [Packages and path/Git dependencies](reference/packages.md)
 - 🔤 [Primitive types](reference/types.md), [strings](reference/strings.md), and
   [arrays](reference/arrays.md)
 - 📦 [`List<T>` and `Dictionary<K,V>`](reference/collections.md)

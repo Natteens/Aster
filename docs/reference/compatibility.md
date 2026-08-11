@@ -49,8 +49,8 @@ intentional, documented, and produce controlled migration diagnostics where prac
 in-file schema, edition, or format-version mechanism. An obsolete `schema` field is rejected; it
 never selects alternate parser or identity behavior. See [packages and dependencies](packages.md).
 
-Git source dependencies and a lockfile, when they arrive, must extend the package model without
-making filesystem paths part of nominal identity.
+Git source dependencies extend this model through `Aster.lock`: the declared package name still
+owns nominal identity, while the lockfile records only the exact immutable Git resolution.
 
 ## Incompatible changes during 0.x
 

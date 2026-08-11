@@ -74,8 +74,8 @@ pub struct ProjectCompilation {
 
 impl ProjectCompilation {
     /// Every local input whose change can affect this compilation: project
-    /// sources from the root package and its path dependencies, plus every
-    /// manifest in the resolved graph. Standard-library sources are excluded.
+    /// sources from the resolved package graph, plus every participating
+    /// manifest and the root lockfile. Standard-library sources are excluded.
     #[must_use]
     pub fn dependency_paths(&self) -> Vec<PathBuf> {
         let mut paths = self
@@ -157,7 +157,7 @@ const ROOT_PACKAGE: PackageId = 0;
 #[derive(Clone, Debug)]
 struct Package {
     /// Declared `[package] name`. Empty only for a manifest-less root or the
-    /// standard library, neither of which can declare path dependencies.
+    /// standard library, neither of which can declare dependencies.
     name: String,
     /// Canonical directory containing this package's `Aster.toml`, or the root
     /// source directory when no manifest exists.
@@ -165,6 +165,9 @@ struct Package {
     /// Direct dependencies, ordered by declared name.
     dependencies: Vec<PackageId>,
     standard_library: bool,
+    /// Root of an immutable materialized Git source. Relative path
+    /// dependencies declared by this package may not escape it.
+    immutable_source_root: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -185,6 +188,82 @@ struct Unit {
 /// semantic failures in any participating compilation unit.
 pub fn compile_project(path: &Path) -> Result<ProjectCompilation, Vec<ProjectDiagnostic>> {
     compile_project_with_standard_library(path, StandardLibrary::embedded())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchSummary {
+    pub package_count: usize,
+    pub lockfile_path: Option<PathBuf>,
+    pub lockfile_changed: bool,
+}
+
+/// Resolve and materialize the Git dependencies reachable from one root
+/// manifest. This is the only compiler operation allowed to contact remotes.
+///
+/// # Errors
+///
+/// Returns sourced diagnostics for an invalid graph, lockfile, cache, or Git
+/// source. Existing valid cache entries and lockfiles remain usable on failure.
+pub fn fetch_dependencies(
+    manifest_path: &Path,
+    update: Option<&str>,
+) -> Result<FetchSummary, Vec<ProjectDiagnostic>> {
+    let manifest_path = fs::canonicalize(manifest_path).map_err(|error| {
+        vec![plain_error(
+            manifest_path,
+            format!("could not read Aster.toml: {error}"),
+        )]
+    })?;
+    if manifest_path.file_name().and_then(|name| name.to_str()) != Some("Aster.toml") {
+        return Err(vec![plain_error(
+            &manifest_path,
+            "fetch requires the root Aster.toml",
+        )]);
+    }
+    let Some(project_root) = manifest_path.parent() else {
+        return Err(vec![plain_error(
+            &manifest_path,
+            "Aster.toml has no parent directory",
+        )]);
+    };
+    if let Err(error) = crate::manifest::read_manifest(&manifest_path) {
+        return Err(vec![plain_error(&manifest_path, error.message)]);
+    }
+    let resolved = resolve_packages(
+        Some(&manifest_path),
+        project_root,
+        ResolutionMode::Fetch { update },
+    )
+    .map_err(|errors| {
+        errors
+            .into_iter()
+            .map(|error| plain_error(&error.path, error.message))
+            .collect::<Vec<_>>()
+    })?;
+    let ResolutionState::Fetch {
+        packages, previous, ..
+    } = resolved.state
+    else {
+        unreachable!("fetch resolution returns fetch state")
+    };
+    let lockfile_path = project_root.join("Aster.lock");
+    if packages.is_empty() {
+        let changed = crate::lockfile::remove_atomic(&lockfile_path, previous.as_ref())
+            .map_err(|message| vec![plain_error(&lockfile_path, message)])?;
+        return Ok(FetchSummary {
+            package_count: 0,
+            lockfile_path: None,
+            lockfile_changed: changed,
+        });
+    }
+    let lockfile = crate::lockfile::Lockfile { packages };
+    let changed = crate::lockfile::write_atomic(&lockfile_path, &lockfile, previous.as_ref())
+        .map_err(|message| vec![plain_error(&lockfile_path, message)])?;
+    Ok(FetchSummary {
+        package_count: lockfile.packages.len(),
+        lockfile_path: Some(lockfile_path),
+        lockfile_changed: changed,
+    })
 }
 
 pub(crate) fn compile_project_with_standard_library(
@@ -212,8 +291,9 @@ pub(crate) fn compile_project_with_standard_library(
 
     // The package graph is resolved from manifests before any source is read,
     // so namespace discovery can never wander outside the declared graph.
-    let graph = match resolve_packages(manifest.as_deref(), &project_root) {
-        Ok(graph) => graph,
+    let graph = match resolve_packages(manifest.as_deref(), &project_root, ResolutionMode::Offline)
+    {
+        Ok(resolved) => resolved.graph,
         Err(errors) => {
             return Err(errors
                 .into_iter()
@@ -301,29 +381,39 @@ struct PackageGraph {
     requires_application_entry: bool,
 }
 
-/// Resolve the package graph from manifests alone.
+struct ResolvedPackages {
+    graph: PackageGraph,
+    state: ResolutionState,
+}
+
+/// Resolve the package graph from manifests and locally materialized sources.
 ///
-/// Every dependency path is interpreted relative to the manifest that declares
-/// it and canonicalized, so the same checkout resolves identically regardless
-/// of the working directory. Nothing here touches the network.
+/// Every path is interpreted relative to its declaring manifest. Offline mode
+/// accepts only exact locked cache entries; fetch mode is the sole caller that
+/// may resolve or materialize a remote Git source.
 fn resolve_packages(
     root_manifest: Option<&Path>,
     project_root: &Path,
-) -> Result<PackageGraph, Vec<GraphError>> {
+    mode: ResolutionMode<'_>,
+) -> Result<ResolvedPackages, Vec<GraphError>> {
     let mut packages = vec![Package {
         name: String::new(),
         root: project_root.to_path_buf(),
         dependencies: Vec::new(),
         standard_library: false,
+        immutable_source_root: None,
     }];
     let mut manifest_paths = Vec::new();
 
     let Some(root_manifest) = root_manifest else {
         packages.push(standard_library_package());
-        return Ok(PackageGraph {
-            packages,
-            manifest_paths,
-            requires_application_entry: false,
+        return Ok(ResolvedPackages {
+            graph: PackageGraph {
+                packages,
+                manifest_paths,
+                requires_application_entry: false,
+            },
+            state: ResolutionState::new(mode, None),
         });
     };
     manifest_paths.push(root_manifest.to_path_buf());
@@ -333,10 +423,13 @@ fn resolve_packages(
     // Dependency manifests have no such history and fail closed below.
     let Ok(manifest) = crate::manifest::read_manifest(root_manifest) else {
         packages.push(standard_library_package());
-        return Ok(PackageGraph {
-            packages,
-            manifest_paths,
-            requires_application_entry: true,
+        return Ok(ResolvedPackages {
+            graph: PackageGraph {
+                packages,
+                manifest_paths,
+                requires_application_entry: true,
+            },
+            state: ResolutionState::new(mode, None),
         });
     };
     let requires_application_entry = manifest.application.is_some();
@@ -353,6 +446,19 @@ fn resolve_packages(
             project_root.to_path_buf(),
         );
     }
+    let lock_path = project_root.join("Aster.lock");
+    let lockfile = match crate::lockfile::read(&lock_path) {
+        Ok(lockfile) => lockfile,
+        Err(message) => {
+            return Err(vec![GraphError {
+                path: lock_path,
+                message,
+            }]);
+        }
+    };
+    if lockfile.is_some() {
+        manifest_paths.push(lock_path.clone());
+    }
     let mut builder = GraphBuilder {
         packages,
         by_root,
@@ -360,8 +466,13 @@ fn resolve_packages(
         manifest_paths,
         stack: Vec::new(),
         errors: Vec::new(),
+        mode: ResolutionState::new(mode, lockfile),
     };
     builder.resolve(ROOT_PACKAGE, root_manifest, &manifest.dependencies);
+    if !builder.errors.is_empty() {
+        return Err(builder.errors);
+    }
+    builder.finish_resolution(root_manifest);
     if !builder.errors.is_empty() {
         return Err(builder.errors);
     }
@@ -370,10 +481,13 @@ fn resolve_packages(
     let mut manifest_paths = builder.manifest_paths;
     manifest_paths.sort();
     manifest_paths.dedup();
-    Ok(PackageGraph {
-        packages,
-        manifest_paths,
-        requires_application_entry,
+    Ok(ResolvedPackages {
+        graph: PackageGraph {
+            packages,
+            manifest_paths,
+            requires_application_entry,
+        },
+        state: builder.mode,
     })
 }
 
@@ -383,6 +497,7 @@ fn standard_library_package() -> Package {
         root: PathBuf::new(),
         dependencies: Vec::new(),
         standard_library: true,
+        immutable_source_root: None,
     }
 }
 
@@ -397,6 +512,7 @@ struct GraphBuilder {
     /// Manifests currently being resolved, for cycle detection.
     stack: Vec<PathBuf>,
     errors: Vec<GraphError>,
+    mode: ResolutionState,
 }
 
 /// A dependency that passed path, manifest, and identity validation.
@@ -404,6 +520,43 @@ struct ResolvedDependency {
     root: PathBuf,
     manifest_path: PathBuf,
     manifest: crate::manifest::ProjectManifest,
+    immutable_source_root: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+enum ResolutionMode<'a> {
+    Offline,
+    Fetch { update: Option<&'a str> },
+}
+
+enum ResolutionState {
+    Offline {
+        lockfile: Option<crate::lockfile::Lockfile>,
+        used: HashSet<String>,
+    },
+    Fetch {
+        previous: Option<crate::lockfile::Lockfile>,
+        update: Option<String>,
+        update_seen: bool,
+        packages: Vec<crate::lockfile::LockedPackage>,
+    },
+}
+
+impl ResolutionState {
+    fn new(mode: ResolutionMode<'_>, lockfile: Option<crate::lockfile::Lockfile>) -> Self {
+        match mode {
+            ResolutionMode::Offline => Self::Offline {
+                lockfile,
+                used: HashSet::new(),
+            },
+            ResolutionMode::Fetch { update } => Self::Fetch {
+                previous: lockfile,
+                update: update.map(str::to_owned),
+                update_seen: false,
+                packages: Vec::new(),
+            },
+        }
+    }
 }
 
 impl GraphBuilder {
@@ -448,6 +601,7 @@ impl GraphBuilder {
                 root: resolved.root.clone(),
                 dependencies: Vec::new(),
                 standard_library: false,
+                immutable_source_root: resolved.immutable_source_root,
             });
             self.by_root.insert(resolved.root, id);
             self.packages[owner].dependencies.push(id);
@@ -468,27 +622,12 @@ impl GraphBuilder {
         dependency: &crate::manifest::DependencyManifest,
     ) -> Option<ResolvedDependency> {
         let name = &dependency.name;
-        // Resolved against the declaring manifest, never the process working
-        // directory, so the graph is location-independent.
-        let declared = owner_directory.join(&dependency.path);
-        let Ok(root) = fs::canonicalize(&declared) else {
-            self.fail(
-                owner_manifest,
-                format!(
-                    "dependency `{name}` path `{}` does not exist (resolved to `{}`)",
-                    dependency.path,
-                    declared.display()
-                ),
-            );
-            return None;
-        };
+        let (root, immutable_source_root) =
+            self.resolve_dependency_source(owner, owner_manifest, owner_directory, dependency)?;
         if !root.is_dir() {
             self.fail(
                 owner_manifest,
-                format!(
-                    "dependency `{name}` path `{}` is not a directory",
-                    dependency.path
-                ),
+                format!("dependency `{name}` source is not a directory"),
             );
             return None;
         }
@@ -517,14 +656,6 @@ impl GraphBuilder {
             );
             return None;
         }
-        if let Some(&existing) = self.by_root.get(&root) {
-            // The same package reached twice is loaded once.
-            if !self.packages[owner].dependencies.contains(&existing) {
-                self.packages[owner].dependencies.push(existing);
-            }
-            return None;
-        }
-
         let manifest = match crate::manifest::read_manifest(&manifest_path) {
             Ok(manifest) => manifest,
             Err(error) => {
@@ -541,6 +672,13 @@ impl GraphBuilder {
                     declared_package.name
                 ),
             );
+            return None;
+        }
+        if let Some(&existing) = self.by_root.get(&root) {
+            // The same correctly named package reached twice is loaded once.
+            if !self.packages[owner].dependencies.contains(&existing) {
+                self.packages[owner].dependencies.push(existing);
+            }
             return None;
         }
         if let Some(previous) = self.by_name.get(name)
@@ -560,7 +698,207 @@ impl GraphBuilder {
             root,
             manifest_path,
             manifest,
+            immutable_source_root,
         })
+    }
+
+    fn resolve_dependency_source(
+        &mut self,
+        owner: PackageId,
+        owner_manifest: &Path,
+        owner_directory: &Path,
+        dependency: &crate::manifest::DependencyManifest,
+    ) -> Option<(PathBuf, Option<PathBuf>)> {
+        let name = &dependency.name;
+        match &dependency.source {
+            crate::manifest::DependencySource::Path { path } => {
+                let requested_update = if let ResolutionState::Fetch {
+                    update: Some(update),
+                    update_seen,
+                    ..
+                } = &mut self.mode
+                {
+                    if update == name {
+                        *update_seen = true;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if requested_update {
+                    self.fail(
+                        owner_manifest,
+                        format!(
+                            "dependency `{name}` is not a Git dependency and cannot be updated"
+                        ),
+                    );
+                    return None;
+                }
+                // Resolved against the declaring manifest, never the process working
+                // directory, so the graph is location-independent.
+                let declared = owner_directory.join(path);
+                let Ok(root) = fs::canonicalize(&declared) else {
+                    self.fail(
+                        owner_manifest,
+                        format!(
+                            "dependency `{name}` path `{path}` does not exist (resolved to `{}`)",
+                            declared.display()
+                        ),
+                    );
+                    return None;
+                };
+                if let Some(immutable_root) = &self.packages[owner].immutable_source_root
+                    && !root.starts_with(immutable_root)
+                {
+                    self.fail(
+                        owner_manifest,
+                        format!(
+                            "path dependency `{name}` escapes the immutable Git package source"
+                        ),
+                    );
+                    return None;
+                }
+                Some((root, self.packages[owner].immutable_source_root.clone()))
+            }
+            crate::manifest::DependencySource::Git { git, rev } => {
+                let root = self.resolve_git(owner_manifest, name, git, rev)?;
+                Some((root.clone(), Some(root)))
+            }
+        }
+    }
+
+    fn resolve_git(
+        &mut self,
+        owner_manifest: &Path,
+        name: &str,
+        git: &str,
+        rev: &str,
+    ) -> Option<PathBuf> {
+        let result = match &mut self.mode {
+            ResolutionState::Offline { lockfile, used } => {
+                let Some(lockfile) = lockfile else {
+                    self.fail(
+                        owner_manifest,
+                        format!("Git dependency `{name}` is not locked; run `aster fetch`"),
+                    );
+                    return None;
+                };
+                let Some(package) = lockfile
+                    .packages
+                    .iter()
+                    .find(|package| package.name == name)
+                else {
+                    self.fail(
+                        owner_manifest,
+                        format!("Aster.lock is stale: Git dependency `{name}` is missing; run `aster fetch`"),
+                    );
+                    return None;
+                };
+                if package.git != git || package.rev != rev {
+                    self.fail(
+                        owner_manifest,
+                        format!(
+                            "Aster.lock is stale for Git dependency `{name}`; run `aster fetch`"
+                        ),
+                    );
+                    return None;
+                }
+                used.insert(name.to_owned());
+                crate::git_source::cached_source(git, &package.commit)
+            }
+            ResolutionState::Fetch {
+                previous,
+                update,
+                update_seen,
+                packages,
+            } => {
+                if let Some(package) = packages.iter().find(|package| package.name == name)
+                    && (package.git != git || package.rev != rev)
+                {
+                    self.errors.push(GraphError {
+                        path: owner_manifest.to_path_buf(),
+                        message: format!(
+                            "Git dependency `{name}` is declared with conflicting sources"
+                        ),
+                    });
+                    return None;
+                }
+                let explicitly_updated = update.as_deref() == Some(name);
+                if explicitly_updated {
+                    *update_seen = true;
+                }
+                let previous = previous.as_ref().and_then(|lockfile| {
+                    lockfile.packages.iter().find(|package| {
+                        package.name == name && package.git == git && package.rev == rev
+                    })
+                });
+                let commit = if explicitly_updated {
+                    crate::git_source::resolve_revision(git, rev)
+                } else if let Some(previous) = previous {
+                    Ok(previous.commit.clone())
+                } else {
+                    crate::git_source::resolve_revision(git, rev)
+                };
+                let commit = match commit {
+                    Ok(commit) => commit,
+                    Err(message) => {
+                        self.errors.push(GraphError {
+                            path: owner_manifest.to_path_buf(),
+                            message,
+                        });
+                        return None;
+                    }
+                };
+                if !packages.iter().any(|package| package.name == name) {
+                    packages.push(crate::lockfile::LockedPackage {
+                        name: name.to_owned(),
+                        git: git.to_owned(),
+                        rev: rev.to_owned(),
+                        commit: commit.clone(),
+                    });
+                }
+                crate::git_source::materialize(git, &commit)
+            }
+        };
+        match result {
+            Ok(path) => Some(path),
+            Err(message) => {
+                self.fail(owner_manifest, message);
+                None
+            }
+        }
+    }
+
+    fn finish_resolution(&mut self, root_manifest: &Path) {
+        match &self.mode {
+            ResolutionState::Offline { lockfile, used } => {
+                if let Some(extra) = lockfile.as_ref().and_then(|lockfile| {
+                    lockfile
+                        .packages
+                        .iter()
+                        .find(|package| !used.contains(&package.name))
+                }) {
+                    self.fail(
+                        root_manifest,
+                        format!(
+                            "Aster.lock is stale: package `{}` is no longer in the Git dependency graph; run `aster fetch`",
+                            extra.name
+                        ),
+                    );
+                }
+            }
+            ResolutionState::Fetch {
+                update: Some(update),
+                update_seen: false,
+                ..
+            } => self.fail(
+                root_manifest,
+                format!("Git dependency `{update}` was not found"),
+            ),
+            ResolutionState::Fetch { .. } => {}
+        }
     }
 }
 

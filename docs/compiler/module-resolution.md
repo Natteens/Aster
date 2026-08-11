@@ -14,8 +14,8 @@ root produce source diagnostics.
 
 ## The package graph
 
-A package declares `[package] name` and may declare local path dependencies. The whole graph is
-resolved from manifests **before any source is read**, so
+A package declares `[package] name` and may declare path or locked Git dependencies. The whole
+graph is resolved from manifests **before any source is read**, so
 namespace discovery can never wander outside the declared graph — a `using` reaches only the
 current package and its direct dependencies.
 
@@ -24,10 +24,17 @@ the graph does not depend on the working directory. Dependencies are visited in 
 order, and directory enumeration is sorted, so discovery, linking, and diagnostics are
 deterministic. Manifest tables are sorted rather than trusted to preserve TOML order.
 
+Git resolution is a separate source-materialization step owned by `aster fetch`. Normal compilation
+reads the root `Aster.lock`, validates the exact cached commit, and gives its canonical local source
+directory to this same graph builder; it never resolves a remote revision. Dependency lockfiles are
+ignored. A path dependency originating inside a materialized Git source must remain within that
+source root.
+
 The same canonical directory reached through several graph paths becomes one package and is loaded
 once. Two directories claiming the same package name, a name that disagrees with the key it is
 declared under, a cycle, a missing path, a non-package directory, and an unsupported or malformed
-dependency manifest are all controlled errors. Nothing in this path performs network access.
+dependency manifest are all controlled errors. Nothing in the compiler graph path performs network
+access.
 
 A malformed *root* manifest stays non-fatal during loading, because application-entry selection
 reports it and `--function` deliberately bypasses that. Dependency manifests fail closed.
@@ -77,7 +84,7 @@ package supplies it, and a dependency declaring its own `[application]` does not
 never discovers packages, files, or TOML. Imported functions and types use the same MIR and the
 same per-run ExecutionContext.
 
-Watch snapshots every loaded source from the root package and its path dependencies, plus every
-manifest in the resolved graph, through one owning abstraction
+Watch snapshots every loaded source, every manifest in the resolved graph, and the root lockfile
+when present, through one owning abstraction
 (`ProjectCompilation::dependency_paths`). A stable change rebuilds the graph and replaces both the
 JIT session and ExecutionContext. Standard-library sources are read-only and are not watched.

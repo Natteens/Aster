@@ -63,6 +63,6 @@ import geometry; // use using geometry;
 - **OPEN QUESTION:** Will `partial` allow one type to span files?
 - **OPEN QUESTION:** What syntax will qualify a namespace provided by more than one package?
 
-Namespace cycles are rejected in the current discovery graph. Packages declare identity and local
-path dependencies in `Aster.toml`; see `../reference/packages.md`. Remote dependencies, a lockfile,
-and a registry are not part of the implemented system.
+Namespace cycles are rejected in the current discovery graph. Packages declare identity and path
+or public HTTPS Git dependencies in `Aster.toml`; exact Git commits are recorded in `Aster.lock`.
+See `../reference/packages.md`. A registry is not part of the implemented system.

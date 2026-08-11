@@ -16,6 +16,7 @@ The current toolchain includes:
 - region-based temporary and persistent allocation with conservative escape analysis;
 - terminal and host-managed filesystem operations;
 - multifile projects with `Aster.toml` and conventional `Main`;
+- deterministic path dependencies and public HTTPS Git dependencies pinned by `Aster.lock`;
 - restricted `Task<T>`, `await`, and `Parallel` operations with checked worker boundaries;
 - checking, JIT execution, watch mode, installation diagnostics, and HIR/MIR inspection;
 - official Windows x64 and Linux x64 release archives, installers, repair/update/rollback, and
@@ -32,7 +33,7 @@ The work before 1.0 is about closing explicit boundaries:
   project, standard-library, CLI, and runtime contracts evolve;
 - measure representative programs before choosing compiler optimizations;
 - keep the worker model deterministic and explicit as concurrency support develops;
-- decide the minimum dependency and package model without hiding downloads or build steps.
+- keep package resolution explicit and reproducible as future sources are evaluated.
 
 No item is complete merely because it parses. Unsupported layouts and operations must continue to
 fail before unsafe execution.

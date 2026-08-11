@@ -4,7 +4,9 @@ mod application;
 mod constexpr;
 mod escape_analysis;
 mod generics;
+mod git_source;
 mod hir_lowering;
+mod lockfile;
 mod manifest;
 mod mir_lowering;
 mod primitives;
@@ -23,7 +25,8 @@ pub use aster_hir as hir;
 pub use aster_mir as mir;
 pub use manifest::{find_manifest_path, find_manifest_path_from_directory};
 pub use project::{
-    ProjectCompilation, ProjectDiagnostic, ProjectSource, ProjectSourceOrigin, compile_project,
+    FetchSummary, ProjectCompilation, ProjectDiagnostic, ProjectSource, ProjectSourceOrigin,
+    compile_project, fetch_dependencies,
 };
 pub use standard_library::StandardLibrary;
 

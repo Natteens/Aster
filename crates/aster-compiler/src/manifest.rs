@@ -6,6 +6,7 @@
 
 use std::{
     fs,
+    net::IpAddr,
     path::{Path, PathBuf},
 };
 
@@ -16,7 +17,7 @@ pub(crate) struct ProjectManifest {
     /// Present when the package can be executed. A package without one is a
     /// reusable source package.
     pub application: Option<ApplicationManifest>,
-    /// Direct path dependencies, sorted by declared name.
+    /// Direct dependencies, sorted by declared name.
     pub dependencies: Vec<DependencyManifest>,
 }
 
@@ -30,8 +31,15 @@ pub(crate) struct DependencyManifest {
     /// The name the dependency is declared under. It must equal the declared
     /// `[package] name` of the manifest it resolves to.
     pub name: String,
+    pub source: DependencySource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DependencySource {
     /// Raw path text, interpreted relative to the declaring manifest.
-    pub path: String,
+    Path { path: String },
+    /// Public HTTPS Git repository and the exact user-declared revision.
+    Git { git: String, rev: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -214,38 +222,148 @@ fn parse_dependencies(value: &toml::Value) -> Result<Vec<DependencyManifest>, Ma
                 format!("write `{name} = {{ path = \"../{name}\" }}`"),
             )
         })?;
-        if let Some(key) = entry.keys().find(|key| key.as_str() != "path") {
+        if let Some(key) = entry
+            .keys()
+            .find(|key| !matches!(key.as_str(), "path" | "git" | "rev"))
+        {
             return Err(manifest_error(
                 format!("unknown field `{key}` in dependency `{name}`"),
-                "only `path` dependencies are implemented; Git and registry sources are not available",
+                "dependencies support only `path`, or `git` together with `rev`",
             ));
         }
-        let path = entry.get("path").ok_or_else(|| {
-            manifest_error(
-                format!("dependency `{name}` does not define `path`"),
-                format!("write `{name} = {{ path = \"../{name}\" }}`"),
-            )
-        })?;
-        let path = path.as_str().ok_or_else(|| {
-            manifest_error(
-                format!("dependency `{name}` path must be a string"),
-                format!("write `{name} = {{ path = \"../{name}\" }}`"),
-            )
-        })?;
-        if path.is_empty() {
-            return Err(manifest_error(
-                format!("dependency `{name}` has an empty path"),
-                format!("write `{name} = {{ path = \"../{name}\" }}`"),
-            ));
-        }
+        let source = match (entry.get("path"), entry.get("git"), entry.get("rev")) {
+            (Some(_), Some(_), _) => {
+                return Err(manifest_error(
+                    format!("dependency `{name}` cannot define both `path` and `git`"),
+                    "choose one dependency source",
+                ));
+            }
+            (Some(path), None, None) => {
+                let path = dependency_string(path, name, "path")?;
+                if path.is_empty() {
+                    return Err(manifest_error(
+                        format!("dependency `{name}` has an empty path"),
+                        format!("write `{name} = {{ path = \"../{name}\" }}`"),
+                    ));
+                }
+                DependencySource::Path { path }
+            }
+            (Some(_), None, Some(_)) => {
+                return Err(manifest_error(
+                    format!("path dependency `{name}` cannot define `rev`"),
+                    "remove `rev` from the path dependency",
+                ));
+            }
+            (None, Some(git), Some(rev)) => {
+                let git = dependency_string(git, name, "git")?;
+                let rev = dependency_string(rev, name, "rev")?;
+                validate_git_url(&git).map_err(|message| {
+                    manifest_error(
+                        format!("dependency `{name}` {message}"),
+                        "use a public HTTPS repository URL",
+                    )
+                })?;
+                validate_git_rev(&rev).map_err(|message| {
+                    manifest_error(
+                        format!("dependency `{name}` {message}"),
+                        "use a branch, tag, or full commit SHA",
+                    )
+                })?;
+                DependencySource::Git { git, rev }
+            }
+            (None, Some(_), None) => {
+                return Err(manifest_error(
+                    format!("Git dependency `{name}` does not define `rev`"),
+                    format!("write `{name} = {{ git = \"https://...\", rev = \"main\" }}"),
+                ));
+            }
+            (None, None, Some(_)) => {
+                return Err(manifest_error(
+                    format!("dependency `{name}` defines `rev` without `git`"),
+                    "add `git` or remove `rev`",
+                ));
+            }
+            (None, None, None) => {
+                return Err(manifest_error(
+                    format!("dependency `{name}` does not define a source"),
+                    "define either `path`, or `git` together with `rev`",
+                ));
+            }
+        };
         dependencies.push(DependencyManifest {
             name: name.clone(),
-            path: path.to_owned(),
+            source,
         });
     }
     // TOML table order is not a public contract, so the graph is ordered here.
     dependencies.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(dependencies)
+}
+
+fn dependency_string(
+    value: &toml::Value,
+    name: &str,
+    field: &str,
+) -> Result<String, ManifestDiagnostic> {
+    value.as_str().map(str::to_owned).ok_or_else(|| {
+        manifest_error(
+            format!("dependency `{name}` {field} must be a string"),
+            format!("write `{field} = \"...\"`"),
+        )
+    })
+}
+
+pub(crate) fn validate_git_url(url: &str) -> Result<(), &'static str> {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return Err("Git URL must use `https://`");
+    };
+    if rest.is_empty() || rest.chars().any(char::is_control) || rest.contains(['\\', '?', '#', '@'])
+    {
+        return Err("has an invalid Git URL");
+    }
+    let Some((host, path)) = rest.split_once('/') else {
+        return Err("Git URL must include a repository path");
+    };
+    if host.is_empty()
+        || path.is_empty()
+        || host.contains(':')
+        || host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().is_ok()
+        || !host.contains('.')
+        || !host.is_ascii()
+        || host.split('.').any(str::is_empty)
+        || path
+            .split('/')
+            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        return Err("has an invalid public HTTPS Git URL");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_git_rev(rev: &str) -> Result<(), &'static str> {
+    if rev.is_empty()
+        || rev.chars().any(char::is_control)
+        || rev.starts_with('-')
+        || rev.contains([' ', '~', '^', ':', '?', '*', '[', '\\'])
+        || rev.contains("..")
+        || rev.contains("//")
+        || rev.starts_with('/')
+        || rev.ends_with(['.', '/'])
+        || rev.contains("@{")
+        || rev.split('/').any(|component| {
+            component.starts_with('.')
+                || Path::new(component)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("lock"))
+        })
+    {
+        return Err("has an invalid Git revision");
+    }
+    if rev.chars().all(|character| character.is_ascii_hexdigit()) && !matches!(rev.len(), 40 | 64) {
+        return Err("uses a short commit SHA; use the full SHA");
+    }
+    Ok(())
 }
 
 fn parse_application(value: &toml::Value) -> Result<ApplicationManifest, ManifestDiagnostic> {
@@ -299,7 +417,7 @@ fn parse_application(value: &toml::Value) -> Result<ApplicationManifest, Manifes
     })
 }
 
-fn valid_identifier(value: &str) -> bool {
+pub(crate) fn valid_identifier(value: &str) -> bool {
     let mut characters = value.chars();
     matches!(characters.next(), Some('_' | 'a'..='z' | 'A'..='Z'))
         && characters.all(|character| matches!(character, '_' | 'a'..='z' | 'A'..='Z' | '0'..='9'))
@@ -377,15 +495,30 @@ mod tests {
     }
 
     #[test]
-    fn git_and_registry_dependency_sources_are_rejected() {
-        let error = parse_manifest(
-            "[package]\nname = \"app\"\n\n[dependencies]\nmath = { git = \"https://example.invalid/math\" }\n",
+    fn git_dependencies_require_a_public_https_url_and_revision() {
+        let manifest = parse_manifest(
+            "[package]\nname = \"app\"\n\n[dependencies]\nmath = { git = \"https://example.invalid/math.git\", rev = \"main\" }\n",
         )
-        .expect_err("only path dependencies exist");
-        assert!(
-            error.message.contains("unknown field `git`"),
-            "{}",
-            error.message
-        );
+        .expect("Git dependency");
+        assert!(matches!(
+            &manifest.dependencies[0].source,
+            super::DependencySource::Git { git, rev }
+                if git == "https://example.invalid/math.git" && rev == "main"
+        ));
+
+        for entry in [
+            "math = { git = \"https://example.invalid/math.git\" }",
+            "math = { git = \"ssh://example.invalid/math.git\", rev = \"main\" }",
+            "math = { git = \"https://user@example.invalid/math.git\", rev = \"main\" }",
+            "math = { git = \"https://example.invalid/math.git\", rev = \"abc123\" }",
+            "math = { path = \"../math\", git = \"https://example.invalid/math.git\", rev = \"main\" }",
+            "math = { git = \"https://example.invalid/math.git\", rev = \"main\", branch = \"main\" }",
+        ] {
+            let error = parse_manifest(&format!(
+                "[package]\nname = \"app\"\n\n[dependencies]\n{entry}\n"
+            ))
+            .expect_err("invalid Git dependency");
+            assert!(!error.message.is_empty());
+        }
     }
 }

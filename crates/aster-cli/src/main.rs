@@ -38,6 +38,7 @@ fn main() -> ExitCode {
 fn run(mut arguments: impl Iterator<Item = String>) -> CliResult {
     match arguments.next().as_deref() {
         Some("new") => run_new_command(&mut arguments),
+        Some("fetch") => run_fetch_command(&mut arguments),
         Some("doctor") => {
             reject_extra_argument(&mut arguments, "aster doctor")?;
             if doctor::run() {
@@ -78,6 +79,72 @@ fn run(mut arguments: impl Iterator<Item = String>) -> CliResult {
         Some(command) => {
             eprintln!("error: unknown command `{command}`\n\nRun `aster --help` for usage.");
             Err(CliError::Usage)
+        }
+    }
+}
+
+fn run_fetch_command(arguments: &mut impl Iterator<Item = String>) -> CliResult {
+    const USAGE: &str = "aster fetch [--update <PACKAGE>]";
+    let first = arguments.next();
+    if matches!(first.as_deref(), Some("--help" | "-h")) {
+        reject_extra_argument(arguments, USAGE)?;
+        print_command_help("fetch");
+        return Ok(());
+    }
+    let update = match first.as_deref() {
+        None => None,
+        Some("--update") => Some(
+            arguments
+                .next()
+                .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                .ok_or_else(|| usage_error("missing package name after `--update`", USAGE))?,
+        ),
+        Some(argument) if argument.starts_with('-') => {
+            return Err(usage_error(format!("unknown flag `{argument}`"), USAGE));
+        }
+        Some(argument) => {
+            return Err(usage_error(
+                format!("unexpected argument `{argument}`"),
+                USAGE,
+            ));
+        }
+    };
+    reject_extra_argument(arguments, USAGE)?;
+    let current_directory = env::current_dir().map_err(|error| {
+        eprintln!("error: could not determine current directory: {error}");
+        CliError::Failure
+    })?;
+    let Some(manifest) = aster_compiler::find_manifest_path_from_directory(&current_directory)
+    else {
+        eprintln!("error: no Aster.toml was found");
+        return Err(CliError::Failure);
+    };
+    match aster_compiler::fetch_dependencies(&manifest, update.as_deref()) {
+        Ok(summary) if summary.package_count == 0 => {
+            println!("No Git dependencies to fetch.");
+            Ok(())
+        }
+        Ok(summary) => {
+            let action = if summary.lockfile_changed {
+                "resolved"
+            } else {
+                "verified"
+            };
+            println!(
+                "ASTER dependencies {action}\n\nGit packages: {}\nLockfile: {}",
+                summary.package_count,
+                summary
+                    .lockfile_path
+                    .as_deref()
+                    .map_or_else(|| "none".to_owned(), |path| path.display().to_string())
+            );
+            Ok(())
+        }
+        Err(diagnostics) => {
+            for diagnostic in diagnostics {
+                eprintln!("{}", diagnostic.render());
+            }
+            Err(CliError::Failure)
         }
     }
 }
@@ -501,7 +568,7 @@ fn print_memory_stats(stats: &aster_codegen_cranelift::MemoryStats) {
 
 fn print_help() {
     println!(
-        "Aster compiler\n\nUsage:\n  aster <command> [arguments]\n\nCommands:\n  new <NAME>       Create a new ASTER project\n  doctor           Diagnose the ASTER installation and environment\n  check [FILE]     Check a project or source file\n  run [FILE]       Run a project or source file\n  watch <FILE>     Watch and rerun a source file\n  dump-hir [FILE]  Print HIR\n  dump-mir [FILE]  Print MIR\n\nOptions:\n  -h, --help\n  -V, --version"
+        "Aster compiler\n\nUsage:\n  aster <command> [arguments]\n\nCommands:\n  new <NAME>       Create a new ASTER project\n  fetch            Fetch and lock Git dependencies\n  doctor           Diagnose the ASTER installation and environment\n  check [FILE]     Check a project or source file\n  run [FILE]       Run a project or source file\n  watch <FILE>     Watch and rerun a source file\n  dump-hir [FILE]  Print HIR\n  dump-mir [FILE]  Print MIR\n\nOptions:\n  -h, --help\n  -V, --version"
     );
 }
 
@@ -510,6 +577,10 @@ fn print_command_help(command: &str) {
         "new" => (
             "aster new <NAME>",
             "Create a new ASTER project in a child of the current directory.",
+        ),
+        "fetch" => (
+            "aster fetch [--update <PACKAGE>]",
+            "Fetch public HTTPS Git dependencies and write Aster.lock.",
         ),
         "check" => (
             "aster check [FILE]",
