@@ -120,3 +120,32 @@ typed HIR/MIR metadata; the backend never performs source-name or duck-typing lo
 
 New privileged behavior still requires a concrete representation, diagnostics, and runtime
 contract. Future ECS research does not gain compiler integration merely by being a library idea.
+
+### ACCEPTED — Initial foreign-function boundary
+
+No user-facing FFI syntax is accepted or implemented yet. When ASTER first
+exposes foreign calls, they must be explicitly unsafe and target only
+host-registered C-ABI functions. The initial source-level signature surface is
+`void` plus fixed-width scalars: `bool`/`sbyte`/`byte` (8-bit),
+`short`/`ushort` (16-bit), `char`/`int`/`uint` (32-bit, with `char` a validated
+Unicode scalar), `long`/`ulong` (64-bit), `float` (binary32), and `double`
+(binary64). `decimal` is excluded until it has an executable representation.
+
+The C mapping is exact: `bool` is `uint8_t` (`0` or `1`); signed and unsigned
+integer widths map to their matching fixed-width C integer; `char` maps to a
+validated `uint32_t`; and floating values map to `float`/`double`. A registered
+binding uses a separate C status result (`0` for success, non-zero for a
+controlled ASTER runtime error); any scalar result is written only on success
+by the host wrapper. This wrapper detail is not an ASTER pointer surface.
+
+There is no initial ABI for strings, arrays or buffers, objects, interfaces,
+collections, `Option`, `Result`, pointers, callbacks, retained ASTER
+references, worker/context transfer, dynamic-library loading, or symbol lookup.
+Nullability is therefore not applicable. Host wrappers own their storage; an
+ASTER caller receives only scalar values or `void` and never frees foreign
+memory. A non-zero native status must become a controlled ASTER runtime error;
+native panics or unwinds must not cross `extern "C"`.
+
+The exact `unsafe` and foreign-declaration syntax remains deliberately
+undefined. It requires a separate language decision; no backend may infer this
+boundary from textual type names.

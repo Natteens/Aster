@@ -66,6 +66,19 @@ Buffer write second = borrowWrite(data); // overlapping writable access
 
 These snippets use placeholder design syntax and are not claims about compiler support.
 
+## Current execution model
+
+The implemented JIT model uses temporary and persistent `ExecutionContext`
+arenas. A proven local dynamic allocation rewinds with its function scope;
+escaping or uncertain values remain retained until context teardown. This is an
+intentional conservative model, not a claim of per-value reclamation.
+
+Reference counting and non-moving tracing are deferred. RC needs correct
+accounting for copied structs/enums, collections, interfaces, calls, and
+returns, and does not reclaim cycles alone. Tracing needs stable allocation
+descriptors, JIT roots, and safe points. A future model must preserve stable
+references, worker-context isolation, and the typed HIR/MIR boundary.
+
 ## OPEN QUESTIONS
 
 ### PROPOSED — Class memory management
@@ -80,6 +93,10 @@ These snippets use placeholder design syntax and are not claims about compiler s
 **Recommendation:** PROPOSED — start from ownership and borrowing for deterministic native
 execution, then evaluate an explicit shared-ownership library type. Do not accept this until
 class ergonomics and cyclic object graphs have representative examples.
+
+This historical proposal is superseded for the current JIT. No long-lived
+reclamation model is accepted until allocation metadata, JIT roots, safe
+points, and representative cyclic graphs have stronger evidence.
 
 ### PROPOSED — Class allocation location
 

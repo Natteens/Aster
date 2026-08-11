@@ -96,6 +96,7 @@ Question: How are class instances reclaimed?
 Alternatives: ownership/borrowing; tracing GC; reference counting.
 Current JIT subset: a host-owned per-execution arena releases all instances together.
 Long-lived/AOT recommendation: investigate ownership/borrowing before accepting a final model.
+Current status: defer RC and non-moving tracing until allocation metadata, JIT roots, and safe-point evidence exists.
 Implementation authorized beyond the JIT arena: no.
 ```
 

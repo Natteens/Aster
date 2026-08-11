@@ -90,6 +90,11 @@ The crate lints with `unsafe_code = "deny"` and each use carries an explicit `SA
 Runtime entry points are panic-free: malformed input yields controlled diagnostics because a
 panic across the `extern "C"` boundary would abort the process.
 
+This private JIT/runtime ABI is not a user FFI surface. The constrained future
+foreign-call contract, including scalar-only values and the requirement for an
+explicit unsafe context, is specified in
+[platform boundaries](../specification/14-platform-boundaries.md).
+
 `aster.math` itself is ordinary ASTER source. Its private domain-error declarations carry trusted
 provider metadata and lower to a typed MIR intrinsic, which the backend binds through this registry. The intrinsic provides a
 panic-free host boundary without introducing exception or unwind behavior; backend code never

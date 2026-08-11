@@ -119,3 +119,22 @@ provide long-lived ownership, individual deallocation, reference counting, or
 a garbage collector. Pages are released when the `ExecutionContext` is
 dropped. Future ownership work must preserve the explicit MIR region contract
 and controlled runtime boundary.
+
+An escaping or uncertain allocation can therefore remain reserved after it is
+no longer reachable by source code. This is intentional conservative retention
+for the current execution, not an automatic leak classification. Cycles are
+safe for the same reason: they remain context-owned until teardown.
+
+Reference counting and non-moving tracing are both deferred. RC would need
+correct accounting for every copied aggregate, collection entry, interface,
+call, and return; tracing would need allocation descriptors plus reliable JIT
+root maps and safe points. Worker executions keep separate contexts and never
+share arena references, so either future model must preserve that isolation.
+
+| Candidate | Missing evidence before a prototype can change production ownership |
+| --- | --- |
+| Non-atomic RC | Retain/release placement for aggregate copies, collection mutation, interface aliases, calls, returns, and a cycle policy. |
+| Non-moving tracing | Allocation descriptors, reference-field maps, JIT stack/root discovery, safe points, and traversal of collections and interface pairs. |
+
+These are runtime/JIT contracts, not backend heuristics. No production RC or
+tracing abstraction exists until the required evidence is demonstrated.

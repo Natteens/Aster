@@ -55,3 +55,12 @@ Expected filesystem failures do not throw exceptions. Paths and messages are not
 `IOError`, and no operation exposes a native handle.
 
 Filesystem I/O is also rejected inside worker bodies. These checks happen before JIT execution.
+
+## Resource lifetime
+
+Current I/O remains operation-scoped: ASTER has no public file, socket, or
+terminal handle. If a future API exposes a long-lived host resource, it must
+have explicit deterministic `Close`/`Dispose`-style authority; repeated close
+must be idempotent. Context teardown may clean up a forgotten handle as a
+safety backstop, but finalization or future memory reclamation must never be
+required for resource correctness.
