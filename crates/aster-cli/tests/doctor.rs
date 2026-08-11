@@ -183,7 +183,7 @@ fn current_project_is_checked_without_execution_or_parent_search() {
     fs::create_dir(&child).expect("create child");
     fs::write(
         parent.join("Aster.toml"),
-        "[application]\nentry = \"app.Program.Main\"\n",
+        "[package]\nname = \"parent\"\n\n[application]\nentry = \"app.Program.Main\"\n",
     )
     .expect("write parent manifest");
     let no_parent_search = doctor(binary(), &child, None, true);

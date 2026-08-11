@@ -380,11 +380,8 @@ fn a_combined_path_built_and_used_across_two_files_preserves_its_text() {
     let root =
         std::env::temp_dir().join(format!("aster-path-multifile-{}-{id}", std::process::id()));
     std::fs::create_dir_all(&root).expect("create project root");
-    std::fs::write(
-        root.join("Aster.toml"),
-        "[application]\nentry = \"app.Main\"\n",
-    )
-    .expect("write manifest");
+    std::fs::write(root.join("Aster.toml"), "[package]\nname = \"path_test\"\n")
+        .expect("write manifest");
     let app_dir = root.join("app");
     std::fs::create_dir_all(&app_dir).expect("create app dir");
     std::fs::write(
@@ -416,7 +413,7 @@ fn a_combined_path_built_and_used_across_two_files_preserves_its_text() {
     std::fs::remove_dir_all(&root).ok();
     let compilation = compilation.expect("multifile project using CombinePath should compile");
     assert_eq!(
-        execute(&compilation.compilation.mir, "Main"),
+        execute(&compilation.compilation.mir, "path_test::app::Main"),
         Ok(ExecutionValue::Int(19))
     );
 }

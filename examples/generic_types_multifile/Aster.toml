@@ -1,2 +1,5 @@
+[package]
+name = "generic_types_multifile"
+
 [application]
 entry = "app.Program.Main"

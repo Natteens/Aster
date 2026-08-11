@@ -1,4 +1,2 @@
-schema = 2
-
 [package]
 name = "math"

@@ -21,9 +21,7 @@ use aster_syntax::{Module, Token, lex, parse};
 pub use application::{ApplicationDiagnostic, ApplicationEntry, select_application_entry};
 pub use aster_hir as hir;
 pub use aster_mir as mir;
-pub use manifest::{
-    CURRENT_MANIFEST_SCHEMA, find_manifest_path, find_manifest_path_from_directory,
-};
+pub use manifest::{find_manifest_path, find_manifest_path_from_directory};
 pub use project::{
     ProjectCompilation, ProjectDiagnostic, ProjectSource, ProjectSourceOrigin, compile_project,
 };

@@ -9,7 +9,7 @@ contract for documented, implemented behavior.
 | Surface | Patch release | Minor release before 1.0 |
 | --- | --- | --- |
 | Source language | Preserve documented valid programs. Correctness or safety fixes may reject behavior that was invalid, unsafe, or accepted by mistake. | May deliberately change documented syntax or semantics when the language needs it. The migration must be documented and covered by diagnostics where practical. |
-| `Aster.toml` | Preserve the current manifest schema and its documented interpretation. | May introduce a new explicit schema or project contract. Unsupported newer schemas must fail with a controlled diagnostic. |
+| `Aster.toml` | Preserve the current documented manifest contract. | May deliberately change the manifest when the migration is documented and diagnosed where practical. |
 | Standard library | Preserve documented names and behavior except for correctness or safety fixes. Additive APIs are allowed. | May rename, replace, or remove APIs when the replacement is documented and the migration is clear. |
 | CLI | Preserve documented commands, flags, exit-code meanings, and stdout/stderr roles. | May reshape a command contract when the migration is documented. Human diagnostic wording is not a byte-for-byte compatibility surface unless a specific diagnostic contract says otherwise. |
 | Release and install artifacts | Preserve supported platform targets and the validated install, repair, update, rollback, and uninstall contract. | Packaging may evolve when the supported replacement and migration are documented and validated on every affected platform. |
@@ -30,27 +30,10 @@ supported. Unsupported execution must continue to fail before unsafe code genera
 
 ## Project manifests
 
-`Aster.toml` has an explicit schema authority. Each schema number keeps exactly one documented
-meaning, and an unsupported schema is rejected rather than guessed.
-
-Schema `1` accepts only `schema` and a required `[application]` table containing only `entry`:
+`Aster.toml` has one current format. Every manifest-backed package declares its identity with
+`[package] name`; `[application]` is optional, and local path dependencies use `[dependencies]`:
 
 ```toml
-schema = 1
-
-[application]
-entry = "app.Program.Main"
-```
-
-Manifests that omit `schema` are interpreted as schema `1`. Schema `1` is unchanged and keeps
-working; it simply has no package identity and therefore cannot declare dependencies.
-
-Schema `2` adds package identity and local path dependencies, and makes `[application]` optional so
-a package can be a library:
-
-```toml
-schema = 2
-
 [package]
 name = "app"
 
@@ -61,14 +44,13 @@ entry = "app.Program.Main"
 math = { path = "../math" }
 ```
 
-Schema `2` was introduced additively rather than by reinterpreting schema `1`, because schema `1`
-deliberately rejects unknown fields. `aster new` writes the newest schema. See
-[packages and dependencies](packages.md).
+ASTER is pre-1.0, so this syntax may still evolve before 1.0. Incompatible manifest changes must be
+intentional, documented, and produce controlled migration diagnostics where practical. There is no
+in-file schema, edition, or format-version mechanism. An obsolete `schema` field is rejected; it
+never selects alternate parser or identity behavior. See [packages and dependencies](packages.md).
 
-Future schema changes must keep the same rule: one documented schema meaning per number,
-deterministic discovery, and a controlled migration diagnostic instead of silently reinterpreting a
-project. Git source dependencies and a lockfile, when they arrive, will extend the dependency
-surface under this same contract.
+Git source dependencies and a lockfile, when they arrive, must extend the package model without
+making filesystem paths part of nominal identity.
 
 ## Incompatible changes during 0.x
 

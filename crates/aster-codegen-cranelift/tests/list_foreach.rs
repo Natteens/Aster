@@ -252,7 +252,7 @@ fn list_foreach_works_across_a_multifile_project() {
     std::fs::create_dir_all(&root).expect("create project root");
     std::fs::write(
         root.join("Aster.toml"),
-        "[application]\nentry = \"app.Main\"\n",
+        "[package]\nname = \"list_foreach_test\"\n",
     )
     .expect("write manifest");
     let app_dir = root.join("app");
@@ -289,7 +289,10 @@ fn list_foreach_works_across_a_multifile_project() {
         .expect("multifile project using list foreach should compile")
         .compilation
         .mir;
-    assert_eq!(execute(&module, "Main"), Ok(ExecutionValue::Int(10)));
+    assert_eq!(
+        execute(&module, "list_foreach_test::app::Main"),
+        Ok(ExecutionValue::Int(10))
+    );
 }
 
 // --- Section 18.14-20: control flow -----------------------------------------------

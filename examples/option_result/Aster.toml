@@ -1,2 +1,5 @@
+[package]
+name = "option_result"
+
 [application]
 entry = "app.Program.Main"

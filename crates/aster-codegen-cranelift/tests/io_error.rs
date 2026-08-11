@@ -444,7 +444,7 @@ fn structurally_identical_fake_types_stay_distinct_across_files() {
     std::fs::create_dir_all(&root).expect("create project root");
     std::fs::write(
         root.join("Aster.toml"),
-        "[application]\nentry = \"app.Main\"\n",
+        "[package]\nname = \"io_error_test\"\n",
     )
     .expect("write manifest");
     let app_dir = root.join("app");
@@ -477,7 +477,7 @@ fn structurally_identical_fake_types_stay_distinct_across_files() {
     std::fs::remove_dir_all(&root).ok();
     let compilation = compilation.expect("project with two distinct error types should compile");
     assert_eq!(
-        execute(&compilation.compilation.mir, "Main"),
+        execute(&compilation.compilation.mir, "io_error_test::app::Main"),
         Ok(ExecutionValue::Int(3))
     );
 }

@@ -268,7 +268,7 @@ fn project_cannot_declare_or_shadow_aster_namespaces() {
     let project = Project::new("reserved");
     project.write(
         "Aster.toml",
-        "[application]\nentry = \"app.Program.Main\"\n",
+        "[package]\nname = \"reserved\"\n\n[application]\nentry = \"app.Program.Main\"\n",
     );
     let reserved = project.write(
         "aster/math/replacement.aster",
@@ -291,7 +291,7 @@ fn project_cannot_declare_or_shadow_aster_namespaces() {
     let text = Project::new("reserved-text");
     text.write(
         "Aster.toml",
-        "[application]\nentry = \"app.Program.Main\"\n",
+        "[package]\nname = \"reserved_text\"\n\n[application]\nentry = \"app.Program.Main\"\n",
     );
     let replacement = text.write(
         "aster/text/text.aster",

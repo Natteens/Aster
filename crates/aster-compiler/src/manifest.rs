@@ -1,7 +1,7 @@
 //! Typed `Aster.toml` loading and project-root discovery.
 //!
-//! This module is the compiler-side authority for every supported manifest
-//! schema. Downstream semantic, HIR, MIR, backend, and runtime layers never
+//! This module is the compiler-side authority for the current manifest
+//! format. Downstream semantic, HIR, MIR, backend, and runtime layers never
 //! depend on TOML or source paths.
 
 use std::{
@@ -9,22 +9,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// The schema written by `aster new`. Older supported schemas keep their own
-/// documented interpretation; see `docs/reference/compatibility.md`.
-pub const CURRENT_MANIFEST_SCHEMA: i64 = 2;
-
-/// Every schema this build understands. A manifest outside this set is
-/// rejected rather than guessed.
-const SUPPORTED_SCHEMAS: [i64; 2] = [1, 2];
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProjectManifest {
-    pub schema: i64,
-    /// Declared package identity. Always present from schema 2; `None` for
-    /// schema 1, which predates package identity.
-    pub package: Option<PackageManifest>,
-    /// Present when the package can be executed. Optional from schema 2, so a
-    /// package can be a pure library.
+    /// Declared package identity for every manifest-backed package.
+    pub package: PackageManifest,
+    /// Present when the package can be executed. A package without one is a
+    /// reusable source package.
     pub application: Option<ApplicationManifest>,
     /// Direct path dependencies, sorted by declared name.
     pub dependencies: Vec<DependencyManifest>,
@@ -117,88 +107,29 @@ fn parse_manifest(source: &str) -> Result<ProjectManifest, ManifestDiagnostic> {
     let document = source.parse::<toml::Value>().map_err(|error| {
         manifest_error(
             format!("invalid Aster.toml: {error}"),
-            "use `schema = 2` followed by `[package]` and, for an application, `[application]`",
+            "use `[package]` and, for an application, `[application]`",
         )
     })?;
     let table = document.as_table().ok_or_else(|| {
         manifest_error(
             "Aster.toml must contain a TOML table",
-            "use `schema = 2` followed by a `[package]` table",
+            "use a `[package]` table",
         )
     })?;
 
-    // A manifest without `schema` predates the field and keeps schema 1's
-    // documented meaning.
-    let schema = match table.get("schema") {
-        None => 1,
-        Some(toml::Value::Integer(value)) if SUPPORTED_SCHEMAS.contains(value) => *value,
-        Some(toml::Value::Integer(value)) => {
-            return Err(manifest_error(
-                format!("unsupported Aster.toml schema `{value}`"),
-                format!(
-                    "this ASTER build supports schema {}; update the toolchain or migrate the manifest",
-                    supported_schema_list()
-                ),
-            ));
-        }
-        Some(_) => {
-            return Err(manifest_error(
-                "Aster.toml `schema` must be an integer",
-                format!("write `schema = {CURRENT_MANIFEST_SCHEMA}`"),
-            ));
-        }
-    };
-
-    if schema == 1 {
-        parse_schema_1(table)
-    } else {
-        parse_schema_2(table)
+    if table.contains_key("schema") {
+        return Err(manifest_error(
+            "Aster.toml no longer uses a `schema` field; remove it",
+            "start the manifest with a `[package]` table",
+        ));
     }
-}
-
-/// Schema 1 keeps its original closed meaning: only `schema` and a required
-/// `[application]` table carrying only `entry`.
-fn parse_schema_1(table: &toml::Table) -> Result<ProjectManifest, ManifestDiagnostic> {
     if let Some(key) = table
         .keys()
-        .find(|key| !matches!(key.as_str(), "schema" | "application"))
+        .find(|key| !matches!(key.as_str(), "package" | "application" | "dependencies"))
     {
         return Err(manifest_error(
             format!("unknown top-level Aster.toml field `{key}`"),
-            format!(
-                "schema 1 supports only `schema` and `[application]`; write `schema = {CURRENT_MANIFEST_SCHEMA}` to use `[package]` and `[dependencies]`"
-            ),
-        ));
-    }
-
-    let application = table.get("application").ok_or_else(|| {
-        manifest_error(
-            "Aster.toml does not define an `[application]` table",
-            "add `[application]` and `entry = \"app.Program.Main\"`",
-        )
-    })?;
-    let application = parse_application(application)?;
-
-    Ok(ProjectManifest {
-        schema: 1,
-        package: None,
-        application: Some(application),
-        dependencies: Vec::new(),
-    })
-}
-
-/// Schema 2 adds package identity and local path dependencies, and makes
-/// `[application]` optional so a package can be a pure library.
-fn parse_schema_2(table: &toml::Table) -> Result<ProjectManifest, ManifestDiagnostic> {
-    if let Some(key) = table.keys().find(|key| {
-        !matches!(
-            key.as_str(),
-            "schema" | "package" | "application" | "dependencies"
-        )
-    }) {
-        return Err(manifest_error(
-            format!("unknown top-level Aster.toml field `{key}`"),
-            "schema 2 supports only `schema`, `[package]`, `[application]`, and `[dependencies]`",
+            "Aster.toml supports only `[package]`, `[application]`, and `[dependencies]`",
         ));
     }
 
@@ -220,8 +151,7 @@ fn parse_schema_2(table: &toml::Table) -> Result<ProjectManifest, ManifestDiagno
     };
 
     Ok(ProjectManifest {
-        schema: 2,
-        package: Some(package),
+        package,
         application,
         dependencies,
     })
@@ -237,7 +167,7 @@ fn parse_package(value: &toml::Value) -> Result<PackageManifest, ManifestDiagnos
     if let Some(key) = table.keys().find(|key| key.as_str() != "name") {
         return Err(manifest_error(
             format!("unknown Aster.toml package field `{key}`"),
-            "schema 2 supports only `package.name`",
+            "a `[package]` table supports only `name`",
         ));
     }
     let name = table.get("name").ok_or_else(|| {
@@ -287,7 +217,7 @@ fn parse_dependencies(value: &toml::Value) -> Result<Vec<DependencyManifest>, Ma
         if let Some(key) = entry.keys().find(|key| key.as_str() != "path") {
             return Err(manifest_error(
                 format!("unknown field `{key}` in dependency `{name}`"),
-                "schema 2 supports only `path` dependencies; Git and registry sources are not implemented",
+                "only `path` dependencies are implemented; Git and registry sources are not available",
             ));
         }
         let path = entry.get("path").ok_or_else(|| {
@@ -369,14 +299,6 @@ fn parse_application(value: &toml::Value) -> Result<ApplicationManifest, Manifes
     })
 }
 
-fn supported_schema_list() -> String {
-    SUPPORTED_SCHEMAS
-        .iter()
-        .map(|schema| format!("`{schema}`"))
-        .collect::<Vec<_>>()
-        .join(" and ")
-}
-
 fn valid_identifier(value: &str) -> bool {
     let mut characters = value.chars();
     matches!(characters.next(), Some('_' | 'a'..='z' | 'A'..='Z'))
@@ -392,15 +314,15 @@ fn manifest_error(message: impl Into<String>, help: impl Into<String>) -> Manife
 
 #[cfg(test)]
 mod tests {
-    use super::{CURRENT_MANIFEST_SCHEMA, parse_manifest};
+    use super::parse_manifest;
 
     #[test]
-    fn schema_one_keeps_its_closed_meaning() {
-        let manifest =
-            parse_manifest("schema = 1\n\n[application]\nentry = \"app.Program.Main\"\n")
-                .expect("schema 1 manifest");
-        assert_eq!(manifest.schema, 1);
-        assert!(manifest.package.is_none());
+    fn an_application_manifest_uses_the_current_package_format() {
+        let manifest = parse_manifest(
+            "[package]\nname = \"app\"\n\n[application]\nentry = \"app.Program.Main\"\n",
+        )
+        .expect("application manifest");
+        assert_eq!(manifest.package.name, "app");
         assert!(manifest.dependencies.is_empty());
         assert_eq!(
             manifest.application.expect("application").entry.namespace,
@@ -409,31 +331,9 @@ mod tests {
     }
 
     #[test]
-    fn a_manifest_without_schema_is_schema_one() {
-        let manifest = parse_manifest("[application]\nentry = \"app.Program.Main\"\n")
-            .expect("implicit schema 1");
-        assert_eq!(manifest.schema, 1);
-    }
-
-    #[test]
-    fn schema_one_still_rejects_package_and_dependencies() {
-        for source in [
-            "schema = 1\n\n[package]\nname = \"app\"\n\n[application]\nentry = \"app.Program.Main\"\n",
-            "schema = 1\n\n[application]\nentry = \"app.Program.Main\"\n\n[dependencies]\nmath = { path = \"../math\" }\n",
-        ] {
-            let error = parse_manifest(source).expect_err("schema 1 is closed");
-            assert!(
-                error.message.contains("unknown top-level Aster.toml field"),
-                "{}",
-                error.message
-            );
-        }
-    }
-
-    #[test]
-    fn schema_two_requires_package_identity() {
-        let error = parse_manifest("schema = 2\n\n[application]\nentry = \"app.Program.Main\"\n")
-            .expect_err("schema 2 requires a package name");
+    fn every_manifest_requires_package_identity() {
+        let error = parse_manifest("[application]\nentry = \"app.Program.Main\"\n")
+            .expect_err("a manifest requires a package name");
         assert!(
             error.message.contains("`[package]` table"),
             "{}",
@@ -442,17 +342,16 @@ mod tests {
     }
 
     #[test]
-    fn schema_two_allows_a_library_without_an_application() {
-        let manifest =
-            parse_manifest("schema = 2\n\n[package]\nname = \"math\"\n").expect("library package");
-        assert_eq!(manifest.package.expect("package").name, "math");
+    fn a_library_needs_no_application_table() {
+        let manifest = parse_manifest("[package]\nname = \"math\"\n").expect("library package");
+        assert_eq!(manifest.package.name, "math");
         assert!(manifest.application.is_none());
     }
 
     #[test]
     fn dependencies_are_sorted_by_declared_name() {
         let manifest = parse_manifest(
-            "schema = 2\n\n[package]\nname = \"app\"\n\n[dependencies]\nzeta = { path = \"../zeta\" }\nalpha = { path = \"../alpha\" }\n",
+            "[package]\nname = \"app\"\n\n[dependencies]\nzeta = { path = \"../zeta\" }\nalpha = { path = \"../alpha\" }\n",
         )
         .expect("dependency table");
         let names = manifest
@@ -464,21 +363,23 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_schema_is_rejected_rather_than_guessed() {
-        let error = parse_manifest("schema = 999\n").expect_err("unsupported schema");
-        assert!(
-            error
-                .message
-                .contains("unsupported Aster.toml schema `999`")
-        );
-        assert!(error.help.contains("`1`"));
-        assert!(error.help.contains("`2`"));
+    fn schema_fields_are_rejected_without_activating_old_semantics() {
+        for schema in ["1", "2", "999", "\"future\""] {
+            let source = format!(
+                "schema = {schema}\n\n[package]\nname = \"app\"\n\n[application]\nentry = \"app.Program.Main\"\n"
+            );
+            let error = parse_manifest(&source).expect_err("schema fields are not supported");
+            assert_eq!(
+                error.message,
+                "Aster.toml no longer uses a `schema` field; remove it"
+            );
+        }
     }
 
     #[test]
     fn git_and_registry_dependency_sources_are_rejected() {
         let error = parse_manifest(
-            "schema = 2\n\n[package]\nname = \"app\"\n\n[dependencies]\nmath = { git = \"https://example.invalid/math\" }\n",
+            "[package]\nname = \"app\"\n\n[dependencies]\nmath = { git = \"https://example.invalid/math\" }\n",
         )
         .expect_err("only path dependencies exist");
         assert!(
@@ -486,10 +387,5 @@ mod tests {
             "{}",
             error.message
         );
-    }
-
-    #[test]
-    fn current_schema_is_the_newest_supported_schema() {
-        assert_eq!(CURRENT_MANIFEST_SCHEMA, 2);
     }
 }

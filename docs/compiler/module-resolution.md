@@ -14,8 +14,8 @@ root produce source diagnostics.
 
 ## The package graph
 
-From manifest schema 2, a package declares `[package] name` and may declare local path
-dependencies. The whole graph is resolved from manifests **before any source is read**, so
+A package declares `[package] name` and may declare local path dependencies. The whole graph is
+resolved from manifests **before any source is read**, so
 namespace discovery can never wander outside the declared graph — a `using` reaches only the
 current package and its direct dependencies.
 
@@ -53,14 +53,13 @@ name. A package's declared `[package] name` prefixes its declarations independen
 package is the graph root, a direct dependency, or a transitive one: the same declaration gets the
 same identity regardless of graph position. This is why two packages that spell the same namespace
 and type can never collapse into one declaration, and cross-package identity collisions are
-reported rather than merged. A schema-1 or manifest-less package has no declared name and keeps the
-historical namespace-only scheme, so existing single-package projects are byte-for-byte unchanged.
-Package *names* participate in this identity; filesystem paths never do.
+reported rather than merged. A manifest-less direct-file compilation uses an implicit empty root
+identity and keeps its bare/namespace-only naming. Package *names* participate in manifest-backed
+identity; filesystem paths never do.
 
-Schema-2 declarations follow that rule even in the literal file passed to `compile_project`.
-Source-facing entry selectors such as `--function NAME` resolve their spelling to the linked symbol
-before execution; they do not define nominal identity. Schema-1 declarations in the literal root
-file retain their historical unqualified spelling.
+Manifest-backed declarations follow that rule even in the literal file passed to
+`compile_project`. Source-facing entry selectors such as `--function NAME` resolve their spelling
+to the linked symbol before execution; they do not define nominal identity.
 
 References are rewritten against the source namespace and its direct usings. The combined AST then
 enters the existing semantic, HIR, and MIR pipeline. Internal names are not ASTER syntax.

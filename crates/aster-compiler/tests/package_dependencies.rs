@@ -39,7 +39,7 @@ impl Workspace {
     /// A package with an application entry, plus its `[dependencies]` table.
     fn application(&self, name: &str, dependencies: &[(&str, &str)]) {
         let mut manifest = format!(
-            "schema = 2\n\n[package]\nname = \"{name}\"\n\n[application]\nentry = \"app.Program.Main\"\n"
+            "[package]\nname = \"{name}\"\n\n[application]\nentry = \"app.Program.Main\"\n"
         );
         if !dependencies.is_empty() {
             manifest.push_str("\n[dependencies]\n");
@@ -53,7 +53,7 @@ impl Workspace {
 
     /// A library package: package identity, no application entry.
     fn library(&self, name: &str, dependencies: &[(&str, &str)]) {
-        let mut manifest = format!("schema = 2\n\n[package]\nname = \"{name}\"\n");
+        let mut manifest = format!("[package]\nname = \"{name}\"\n");
         if !dependencies.is_empty() {
             manifest.push_str("\n[dependencies]\n");
             for (dependency, path) in dependencies {
@@ -368,7 +368,7 @@ fn a_dependency_without_a_manifest_is_a_controlled_error() {
 fn a_malformed_dependency_manifest_is_a_controlled_error() {
     let workspace = Workspace::new("malformed-dependency");
     workspace.application("app", &[("math", "../math")]);
-    workspace.write("math/Aster.toml", "schema = 2\n\n[package\nname = ");
+    workspace.write("math/Aster.toml", "[package\nname = ");
     let root = workspace.write(
         "app/app/main.aster",
         "namespace app; public class Program { public static int Main() { return 0; } }",
@@ -377,30 +377,23 @@ fn a_malformed_dependency_manifest_is_a_controlled_error() {
 }
 
 #[test]
-fn an_incompatible_dependency_schema_is_a_controlled_error() {
-    let workspace = Workspace::new("dependency-schema");
-    workspace.application("app", &[("math", "../math")]);
-    workspace.write("math/Aster.toml", "schema = 999\n");
-    let root = workspace.write(
-        "app/app/main.aster",
-        "namespace app; public class Program { public static int Main() { return 0; } }",
-    );
-    assert_reports(&root, "unsupported Aster.toml schema `999`");
-}
-
-#[test]
-fn a_schema_one_dependency_has_no_package_identity() {
-    let workspace = Workspace::new("schema-one-dependency");
-    workspace.application("app", &[("math", "../math")]);
-    workspace.write(
-        "math/Aster.toml",
-        "schema = 1\n\n[application]\nentry = \"math.Program.Main\"\n",
-    );
-    let root = workspace.write(
-        "app/app/main.aster",
-        "namespace app; public class Program { public static int Main() { return 0; } }",
-    );
-    assert_reports(&root, "schema 1, which has no package identity");
+fn a_dependency_manifest_with_a_removed_schema_field_is_rejected() {
+    for value in ["1", "2"] {
+        let workspace = Workspace::new(&format!("removed-schema-{value}"));
+        workspace.application("app", &[("math", "../math")]);
+        workspace.write(
+            "math/Aster.toml",
+            &format!("schema = {value}\n\n[package]\nname = \"math\"\n"),
+        );
+        let root = workspace.write(
+            "app/app/main.aster",
+            "namespace app; public class Program { public static int Main() { return 0; } }",
+        );
+        assert_reports(
+            &root,
+            "Aster.toml no longer uses a `schema` field; remove it",
+        );
+    }
 }
 
 #[test]
@@ -435,20 +428,14 @@ fn two_packages_cannot_claim_the_same_identity() {
     // Both dependencies declare the same package name from different roots.
     workspace.write(
         "left/Aster.toml",
-        "schema = 2\n\n[package]\nname = \"left\"\n\n[dependencies]\nshared = { path = \"../shared_one\" }\n",
+        "[package]\nname = \"left\"\n\n[dependencies]\nshared = { path = \"../shared_one\" }\n",
     );
     workspace.write(
         "right/Aster.toml",
-        "schema = 2\n\n[package]\nname = \"right\"\n\n[dependencies]\nshared = { path = \"../shared_two\" }\n",
+        "[package]\nname = \"right\"\n\n[dependencies]\nshared = { path = \"../shared_two\" }\n",
     );
-    workspace.write(
-        "shared_one/Aster.toml",
-        "schema = 2\n\n[package]\nname = \"shared\"\n",
-    );
-    workspace.write(
-        "shared_two/Aster.toml",
-        "schema = 2\n\n[package]\nname = \"shared\"\n",
-    );
+    workspace.write("shared_one/Aster.toml", "[package]\nname = \"shared\"\n");
+    workspace.write("shared_two/Aster.toml", "[package]\nname = \"shared\"\n");
     let root = workspace.write(
         "app/app/main.aster",
         "namespace app; public class Program { public static int Main() { return 0; } }",
@@ -564,7 +551,7 @@ fn only_the_root_application_supplies_the_entry_point() {
     workspace.application("app", &[("tool", "../tool")]);
     workspace.write(
         "tool/Aster.toml",
-        "schema = 2\n\n[package]\nname = \"tool\"\n\n[application]\nentry = \"tool.Program.Main\"\n",
+        "[package]\nname = \"tool\"\n\n[application]\nentry = \"tool.Program.Main\"\n",
     );
     workspace.write(
         "tool/tool/main.aster",
@@ -577,14 +564,14 @@ fn only_the_root_application_supplies_the_entry_point() {
     links(&root);
 }
 
-/// A schema 2 package's declared name is its nominal identity independent of
+/// A package's declared name is its nominal identity independent of
 /// graph position: `math::math::Answer` names the exact same declaration
 /// whether `math` is compiled as the root project or pulled in as a
 /// dependency. The declaration lives in a file other than the literal CLI
 /// entry file in both fixtures, so this isolates the package-identity rule
 /// from the separate, unrelated `--function`/entry-file bare-name contract.
 #[test]
-fn a_schema_two_package_keeps_the_same_identity_as_root_or_as_a_dependency() {
+fn a_package_keeps_the_same_identity_as_root_or_as_a_dependency() {
     let as_dependency = Workspace::new("identity-as-dependency");
     as_dependency.application("app", &[("math", "../math")]);
     as_dependency.library("math", &[]);
@@ -671,30 +658,4 @@ fn a_generic_specialization_keeps_the_same_identity_as_root_or_as_a_dependency()
         standalone_hir.contains("\"math::math::Box<int>\""),
         "{standalone_hir}"
     );
-}
-
-/// Schema 1 has no package identity, so its non-root-file declarations keep
-/// their exact pre-M7D `namespace::name` spelling. This is the compatibility
-/// boundary the package-identity fix must not cross.
-#[test]
-fn schema_one_keeps_its_legacy_namespace_only_identity() {
-    let workspace = Workspace::new("schema-one-identity");
-    workspace.write(
-        "Aster.toml",
-        "schema = 1\n\n[application]\nentry = \"app.Program.Main\"\n",
-    );
-    workspace.write(
-        "app/helpers.aster",
-        "namespace app; public class Helper { public Helper() {} public int Get() { return 42; } }",
-    );
-    let root = workspace.write(
-        "app/main.aster",
-        "namespace app; public class Program { public static int Main() { return new Helper().Get(); } }",
-    );
-    let project = compile_project(&root).expect("schema 1 project compiles");
-    let hir = format!("{:#?}", project.compilation.hir);
-    assert!(hir.contains("\"app::Helper\""), "{hir}");
-    assert!(!hir.contains("app::app::Helper"), "{hir}");
-    assert!(hir.contains("name: \"Program\""), "{hir}");
-    assert!(!hir.contains("name: \"app::Program\""), "{hir}");
 }

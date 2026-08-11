@@ -417,7 +417,7 @@ fn try_parse_double_works_across_namespaces() {
     std::fs::create_dir_all(&directory).expect("create namespace directory");
     std::fs::write(
         project_root.join("Aster.toml"),
-        "[application]\nentry = \"app.Main\"\n",
+        "[package]\nname = \"string_try_parse_float_test\"\n",
     )
     .expect("write manifest");
     let path = directory.join("main.aster");
@@ -432,7 +432,10 @@ fn try_parse_double_works_across_namespaces() {
     std::fs::remove_dir_all(&project_root).ok();
     let compilation = compilation.expect("namespaced source should compile");
     assert_eq!(
-        execute(&compilation.compilation.mir, "Main"),
+        execute(
+            &compilation.compilation.mir,
+            "string_try_parse_float_test::app::Main",
+        ),
         Ok(ExecutionValue::Double(7.25))
     );
 }

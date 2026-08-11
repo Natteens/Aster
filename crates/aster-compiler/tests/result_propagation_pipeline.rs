@@ -236,7 +236,7 @@ fn generic_specialization_across_namespaces() {
         ),
         (
             "Aster.toml",
-            "[application]\nentry = \"app.Program.Main\"\n",
+            "[package]\nname = \"result_propagation\"\n\n[application]\nentry = \"app.Program.Main\"\n",
         ),
     ]);
     if let Err(messages) = compilation {
@@ -331,7 +331,7 @@ fn rejects_result_in_nested_user_namespace() {
             ),
             (
                 "Aster.toml",
-                "[application]\nentry = \"app.Program.Main\"\n",
+                "[package]\nname = \"result_propagation\"\n\n[application]\nentry = \"app.Program.Main\"\n",
             ),
         ],
         "`?` works only with the official `aster.core.Result",

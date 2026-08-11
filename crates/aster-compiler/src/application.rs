@@ -50,26 +50,38 @@ pub fn select_application_entry(
     root_file: &Path,
 ) -> Result<ApplicationEntry, Vec<ApplicationDiagnostic>> {
     match load_manifest_entry(root_file)? {
-        Some((path, entry)) => select_manifest_entry(project, &path, &entry),
-        None => select_conventional_entry(project, root_file),
+        ManifestApplication::Configured(path, entry) => {
+            select_manifest_entry(project, &path, &entry)
+        }
+        ManifestApplication::Library(path) => Err(vec![diagnostic(
+            &path,
+            "this package does not define an `[application]` entry",
+            "add `[application]` with `entry = \"app.Program.Main\"`, or use `aster check` for a library package",
+        )]),
+        ManifestApplication::Manifestless => select_conventional_entry(project, root_file),
     }
+}
+
+enum ManifestApplication {
+    Configured(PathBuf, ManifestEntry),
+    Library(PathBuf),
+    Manifestless,
 }
 
 fn load_manifest_entry(
     root_file: &Path,
-) -> Result<Option<(PathBuf, ManifestEntry)>, Vec<ApplicationDiagnostic>> {
+) -> Result<ManifestApplication, Vec<ApplicationDiagnostic>> {
     let Some(manifest) = load_manifest(root_file) else {
-        return Ok(None);
+        return Ok(ManifestApplication::Manifestless);
     };
     let path = manifest.path;
     let manifest = manifest
         .result
         .map_err(|error| vec![diagnostic(&path, error.message, error.help)])?;
-    // A library package declares no `[application]`. Selecting an entry for it
-    // falls back to the conventional rule, exactly like a manifest-less file.
-    Ok(manifest
-        .application
-        .map(|application| (path, application.entry)))
+    Ok(match manifest.application {
+        Some(application) => ManifestApplication::Configured(path, application.entry),
+        None => ManifestApplication::Library(path),
+    })
 }
 
 fn select_manifest_entry(
@@ -119,9 +131,9 @@ fn select_manifest_entry(
 }
 
 /// Every compiler-internal identity the entry class could resolve to.
-/// Schema 1 preserves the historical bare root-file candidate; schema 2 has
-/// one package-qualified identity regardless of which package file was the
-/// literal compilation root.
+/// Manifest-backed packages have one package-qualified identity regardless of
+/// which package file was the literal compilation root. The empty-package
+/// branch is reserved for the direct-file workflow without `Aster.toml`.
 fn entry_identity_candidates(project: &ProjectCompilation, entry: &ManifestEntry) -> Vec<String> {
     let mut candidates = Vec::new();
     let namespace_scoped = format!("{}::{}", entry.namespace, entry.class);

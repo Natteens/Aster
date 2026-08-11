@@ -1,7 +1,7 @@
 # Packages and dependencies
 
-An ASTER package is a directory with an `Aster.toml`. From manifest schema `2`, a package declares
-a name, may declare an application entry, and may depend on other packages by local path.
+An ASTER package is a directory with an `Aster.toml`. A package declares a name, may declare an
+application entry, and may depend on other packages by local path.
 
 Everything on this page is local. `aster check`, `run`, `dump-hir`, `dump-mir`, and `watch` never
 download anything and never contact the network. There is no registry, lockfile, or Git source yet.
@@ -9,8 +9,6 @@ download anything and never contact the network. There is no registry, lockfile,
 ## Declaring a package
 
 ```toml
-schema = 2
-
 [package]
 name = "app"
 
@@ -26,8 +24,6 @@ any character of the project name that cannot appear in an identifier with `_`.
 without providing `Main`.
 
 ```toml
-schema = 2
-
 [package]
 name = "math"
 ```
@@ -35,8 +31,6 @@ name = "math"
 ## Depending on another package
 
 ```toml
-schema = 2
-
 [package]
 name = "app"
 
@@ -169,8 +163,8 @@ Each of these is an ordinary compiler diagnostic, never a panic:
 
 - a dependency path that does not exist, or is not a directory;
 - a dependency directory with no `Aster.toml`;
-- a malformed or unsupported-schema dependency manifest;
-- a schema-1 dependency, which has no package identity;
+- a malformed dependency manifest;
+- a dependency manifest without `[package] name`;
 - a dependency whose declared name differs from the key it is declared under;
 - two packages claiming the same identity;
 - a dependency cycle;
@@ -188,5 +182,5 @@ graph.
 
 Git source dependencies, a lockfile, a registry or package service, semantic-version ranges and
 solving, build scripts, and native package hooks are all deliberately absent. Dependencies are
-local paths only. See [compatibility](compatibility.md) for how a future schema would introduce
-them.
+local paths only. Any future extension must be deliberate and follow the
+[compatibility policy](compatibility.md).

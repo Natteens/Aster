@@ -694,7 +694,7 @@ mod tests {
         fs::create_dir_all(directory.join("app")).expect("create test project");
         fs::write(
             directory.join("Aster.toml"),
-            "[application]\nentry = \"app.Program.Main\"\n",
+            "[package]\nname = \"manifest_run\"\n\n[application]\nentry = \"app.Program.Main\"\n",
         )
         .expect("write manifest");
         fs::write(

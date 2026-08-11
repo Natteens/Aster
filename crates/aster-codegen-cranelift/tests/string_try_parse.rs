@@ -458,7 +458,7 @@ fn try_parse_works_across_namespaces() {
     // global namespace instead.
     std::fs::write(
         project_root.join("Aster.toml"),
-        "[application]\nentry = \"app.Main\"\n",
+        "[package]\nname = \"string_try_parse_test\"\n",
     )
     .expect("write manifest");
     let path = directory.join("main.aster");
@@ -478,7 +478,10 @@ fn try_parse_works_across_namespaces() {
     .ok();
     let compilation = compilation.expect("namespaced source should compile");
     assert_eq!(
-        execute(&compilation.compilation.mir, "Main"),
+        execute(
+            &compilation.compilation.mir,
+            "string_try_parse_test::app::Main",
+        ),
         Ok(ExecutionValue::Int(777))
     );
 }

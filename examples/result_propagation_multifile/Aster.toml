@@ -1,2 +1,5 @@
+[package]
+name = "result_propagation_multifile"
+
 [application]
 entry = "app.Program.Main"

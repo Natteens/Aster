@@ -41,7 +41,7 @@ impl Workspace {
 
     fn application(&self, name: &str, dependencies: &[(&str, &str)]) {
         let mut manifest = format!(
-            "schema = 2\n\n[package]\nname = \"{name}\"\n\n[application]\nentry = \"app.Program.Main\"\n"
+            "[package]\nname = \"{name}\"\n\n[application]\nentry = \"app.Program.Main\"\n"
         );
         if !dependencies.is_empty() {
             manifest.push_str("\n[dependencies]\n");
@@ -54,7 +54,7 @@ impl Workspace {
     }
 
     fn library(&self, name: &str, dependencies: &[(&str, &str)]) {
-        let mut manifest = format!("schema = 2\n\n[package]\nname = \"{name}\"\n");
+        let mut manifest = format!("[package]\nname = \"{name}\"\n");
         if !dependencies.is_empty() {
             manifest.push_str("\n[dependencies]\n");
             for (dependency, path) in dependencies {

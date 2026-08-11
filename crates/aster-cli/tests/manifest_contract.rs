@@ -16,7 +16,7 @@ fn no_file_commands_find_the_nearest_manifest_from_nested_directories() {
     fs::create_dir_all(&nested).expect("create nested directory");
     fs::write(
         project.join("Aster.toml"),
-        "schema = 1\n\n[application]\nentry = \"app.Program.Main\"\n",
+        "[package]\nname = \"app\"\n\n[application]\nentry = \"app.Program.Main\"\n",
     )
     .expect("write manifest");
     fs::write(
@@ -60,7 +60,7 @@ fn the_nearest_manifest_wins_when_ancestors_have_manifests() {
     fs::create_dir_all(&nested).expect("create nested directory");
     fs::write(
         project.join("Aster.toml"),
-        "schema = 1\n\n[application]\nentry = \"app.Program.Main\"\n",
+        "[package]\nname = \"app\"\n\n[application]\nentry = \"app.Program.Main\"\n",
     )
     .expect("write inner manifest");
     fs::write(
@@ -101,13 +101,10 @@ fn explicit_function_ignores_an_invalid_relevant_manifest() {
 }
 
 #[test]
-fn explicit_function_resolves_a_schema_two_root_symbol() {
-    let project = temporary_directory("schema-two-function");
-    fs::write(
-        project.join("Aster.toml"),
-        "schema = 2\n\n[package]\nname = \"tool\"\n",
-    )
-    .expect("write schema 2 manifest");
+fn explicit_function_resolves_a_package_qualified_root_symbol() {
+    let project = temporary_directory("package-function");
+    fs::write(project.join("Aster.toml"), "[package]\nname = \"tool\"\n")
+        .expect("write package manifest");
     let source = project.join("main.aster");
     fs::write(&source, "public int Calculate() { return 42; }").expect("write source");
 
@@ -124,7 +121,73 @@ fn explicit_function_resolves_a_schema_two_root_symbol() {
     assert_eq!(stdout(&output).trim(), "42");
     assert!(stderr(&output).is_empty());
 
-    fs::remove_dir_all(project).expect("remove schema 2 function project");
+    fs::remove_dir_all(project).expect("remove package function project");
+}
+
+#[test]
+fn a_library_manifest_needs_no_application_table() {
+    let project = temporary_directory("library-package");
+    fs::create_dir_all(project.join("math")).expect("create library namespace");
+    fs::write(project.join("Aster.toml"), "[package]\nname = \"math\"\n")
+        .expect("write library manifest");
+    let source = project.join("math/answer.aster");
+    fs::write(
+        &source,
+        "namespace math; public int Answer() { return 42; }",
+    )
+    .expect("write library source");
+
+    let output = aster(
+        &project,
+        ["check", source.to_str().expect("UTF-8 source path")],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stderr(&output).is_empty());
+
+    let output = aster(
+        &project,
+        ["run", source.to_str().expect("UTF-8 source path")],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("does not define an `[application]` entry"));
+    fs::remove_dir_all(project).expect("remove library project");
+}
+
+#[test]
+fn removed_schema_fields_are_rejected_by_public_commands() {
+    for schema in ["1", "2"] {
+        let project = temporary_directory(&format!("removed-schema-{schema}"));
+        fs::create_dir_all(project.join("app")).expect("create app directory");
+        fs::write(
+            project.join("Aster.toml"),
+            format!(
+                "schema = {schema}\n\n[package]\nname = \"app\"\n\n[application]\nentry = \"app.Program.Main\"\n"
+            ),
+        )
+        .expect("write removed schema manifest");
+        fs::write(
+            project.join("app/main.aster"),
+            "namespace app; public class Program { public static int Main() { return 42; } }",
+        )
+        .expect("write application source");
+
+        for command in ["check", "run", "dump-hir", "dump-mir"] {
+            let output = aster(&project, [command]);
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{command}: {}",
+                stderr(&output)
+            );
+            let error = stderr(&output);
+            assert!(
+                error.contains("Aster.toml no longer uses a `schema` field; remove it"),
+                "{command}: {error}"
+            );
+            assert!(!error.contains("panicked"), "{command}: {error}");
+        }
+        fs::remove_dir_all(project).expect("remove removed-schema project");
+    }
 }
 
 fn aster<const N: usize>(current_directory: &Path, arguments: [&str; N]) -> Output {

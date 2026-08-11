@@ -1,2 +1,5 @@
+[package]
+name = "standard_library"
+
 [application]
 entry = "app.Program.Main"

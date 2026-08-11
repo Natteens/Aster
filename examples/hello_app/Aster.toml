@@ -1,2 +1,5 @@
+[package]
+name = "hello_app"
+
 [application]
 entry = "app.Program.Main"

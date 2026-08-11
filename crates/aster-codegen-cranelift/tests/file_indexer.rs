@@ -2,7 +2,8 @@
 //!
 //! The permanent example at `examples/file-indexer/` is compiled from disk and
 //! executed against a `MemoryFileSystemBackend` fixture. The free function
-//! `Main()` in `app/main.aster` is the test entry point; the CLI uses
+//! `file_indexer::app::Main()` in `app/main.aster` is the internal test entry;
+//! the CLI uses
 //! `Program.Main()` via `Aster.toml`.
 //!
 //! Fixture (5 direct files, 1 skipped subdirectory):
@@ -43,7 +44,8 @@ fn run_fs(
     module: &mir::Module,
     backend: impl FileSystemBackend + 'static,
 ) -> Result<ExecutionValue, String> {
-    execute_with_filesystem(module, "Main", Box::new(backend)).map_err(|error| error.to_string())
+    execute_with_filesystem(module, "file_indexer::app::Main", Box::new(backend))
+        .map_err(|error| error.to_string())
 }
 
 fn canonical_backend() -> MemoryFileSystemBackend {

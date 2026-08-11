@@ -29,8 +29,7 @@ static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(0);
 
 fn manifest_source(name: &str) -> String {
     format!(
-        "schema = {}\n\n[package]\nname = \"{}\"\n\n[application]\nentry = \"app.Program.Main\"\n",
-        aster_compiler::CURRENT_MANIFEST_SCHEMA,
+        "[package]\nname = \"{}\"\n\n[application]\nentry = \"app.Program.Main\"\n",
         package_name(name)
     )
 }

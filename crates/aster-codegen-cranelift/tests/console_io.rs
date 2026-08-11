@@ -319,7 +319,7 @@ fn write_and_read_line_work_across_namespaces_and_files() {
     std::fs::create_dir_all(&directory).expect("create namespace directory");
     std::fs::write(
         project_root.join("Aster.toml"),
-        "[application]\nentry = \"app.Main\"\n",
+        "[package]\nname = \"console_io_test\"\n",
     )
     .expect("write manifest");
     let path = directory.join("main.aster");
@@ -336,7 +336,11 @@ fn write_and_read_line_work_across_namespaces_and_files() {
     let compilation = compilation.expect("namespaced source should compile");
     let backend = MemoryConsoleBackend::new("world\n".as_bytes());
     let output_handle = backend.clone();
-    let result = execute_with_console(&compilation.compilation.mir, "Main", Box::new(backend));
+    let result = execute_with_console(
+        &compilation.compilation.mir,
+        "console_io_test::app::Main",
+        Box::new(backend),
+    );
     assert_eq!(result, Ok(ExecutionValue::String("world".to_owned())));
     assert_eq!(output_handle.output(), b"hello\n");
 }

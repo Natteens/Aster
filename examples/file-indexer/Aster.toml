@@ -1,2 +1,5 @@
+[package]
+name = "file_indexer"
+
 [application]
 entry = "app.Program.Main"

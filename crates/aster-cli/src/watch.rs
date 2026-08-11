@@ -319,8 +319,11 @@ mod tests {
             std::env::temp_dir().join(format!("aster-watch-main-{}-{id}", std::process::id()));
         fs::create_dir_all(&directory).expect("create test directory");
         let manifest = directory.join("Aster.toml");
-        fs::write(&manifest, "[application]\nentry = \"app.Program.Main\"\n")
-            .expect("write manifest");
+        fs::write(
+            &manifest,
+            "[package]\nname = \"watch_test\"\n\n[application]\nentry = \"app.Program.Main\"\n",
+        )
+        .expect("write manifest");
         let root = directory.join("app/main.aster");
         fs::create_dir_all(root.parent().expect("root parent")).expect("create namespace");
         fs::write(

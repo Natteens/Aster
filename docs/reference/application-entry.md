@@ -43,12 +43,13 @@ public class Program
 Namespaces reached through `using` are compiled and callable, but their `Main` methods are not conventional entry
 candidates. This keeps the root file in control of the application.
 
-## Optional `Aster.toml`
+## `Aster.toml`
 
 A project can select its entry explicitly with an `Aster.toml` in the project root:
 
 ```toml
-schema = 1
+[package]
+name = "app"
 
 [application]
 entry = "app.Program.Main"
@@ -60,15 +61,13 @@ is below the manifest, the manifest directory is also the project root. For exam
 `app/main.aster` belongs to namespace `app` and may use `using app.math;` for sources under
 `app/math/`.
 
-Schema `1` supports only the top-level `schema` field and the `[application]` table, which in turn
-supports only `entry`. Unknown fields and unsupported schema numbers are rejected with controlled
-manifest diagnostics instead of being ignored. Existing pre-schema manifests remain valid: omitting
-`schema` is treated as schema `1`, while `aster new` writes the newest schema for new projects.
-
-Schema `2` adds `[package]` identity and `[dependencies]`, and makes `[application]` optional so a
-package can be a library with no entry point. Only the root package supplies the application entry;
-a dependency that declares its own `[application]` does not compete for it. See
+Every manifest declares `[package] name`. `[application]` is optional; omitting it makes the package
+a reusable source package with no executable entry. Only the root package supplies the application
+entry, and a dependency that declares its own `[application]` does not compete for it. See
 [packages and dependencies](packages.md).
+
+ASTER does not put a schema, edition, or format-version field in `Aster.toml`. A `schema` field is
+rejected with a controlled migration diagnostic rather than activating alternate semantics.
 
 The manifest stays small. It does not describe build profiles, an engine, remote downloads, or any
 dependency source other than a local path.
@@ -84,4 +83,4 @@ aster run examples\expressions.aster --function Run
 An explicit function takes precedence over both `Main` and `Aster.toml`, even if the manifest is
 invalid. The named function must still be a public, parameterless namespace-level function in the
 root namespace. `check`, `dump-hir`, and `dump-mir` do not require an entry when no manifest exists. When a
-manifest is present, those commands validate its schema, syntax, and configured target without running it.
+manifest is present, those commands validate its syntax and configured target without running it.

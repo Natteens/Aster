@@ -1,2 +1,5 @@
+[package]
+name = "standard_text"
+
 [application]
 entry = "app.Program.Main"

@@ -502,7 +502,7 @@ fn to_string_works_across_namespaces() {
     std::fs::create_dir_all(&directory).expect("create namespace directory");
     std::fs::write(
         project_root.join("Aster.toml"),
-        "[application]\nentry = \"app.Main\"\n",
+        "[package]\nname = \"to_string_test\"\n",
     )
     .expect("write manifest");
     let path = directory.join("main.aster");
@@ -513,7 +513,7 @@ fn to_string_works_across_namespaces() {
     std::fs::remove_dir_all(&project_root).ok();
     let compilation = compilation.expect("namespaced source should compile");
     assert_eq!(
-        execute(&compilation.compilation.mir, "Main"),
+        execute(&compilation.compilation.mir, "to_string_test::app::Main"),
         Ok(ExecutionValue::String("314".to_owned()))
     );
 }

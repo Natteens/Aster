@@ -66,8 +66,8 @@ pub struct ProjectCompilation {
     /// Editing one of these can change compilation, so watch mode observes them.
     manifest_paths: Vec<PathBuf>,
     requires_application_entry: bool,
-    /// The root package's declared `[package] name`, or empty for schema 1 or
-    /// a manifest-less root. See [`linked_name`] for how this participates in
+    /// The root package's declared `[package] name`, or empty for a
+    /// manifest-less root. See [`linked_name`] for how this participates in
     /// compiler-internal nominal identity.
     root_package_name: String,
 }
@@ -139,9 +139,9 @@ impl ProjectCompilation {
         self.requires_application_entry
     }
 
-    /// The root package's declared name, or `""` when it has none (schema 1,
-    /// or no manifest). Crate-internal: this is a compiler identity detail,
-    /// not ASTER source syntax.
+    /// The root package's declared name, or `""` when there is no manifest.
+    /// Crate-internal: this is a compiler identity detail, not ASTER source
+    /// syntax.
     #[must_use]
     pub(crate) fn root_package_name(&self) -> &str {
         &self.root_package_name
@@ -156,8 +156,8 @@ const ROOT_PACKAGE: PackageId = 0;
 /// One resolved package in the dependency graph.
 #[derive(Clone, Debug)]
 struct Package {
-    /// Declared `[package] name`. Empty for a schema-1 or manifest-less root,
-    /// which has no package identity and therefore no dependencies.
+    /// Declared `[package] name`. Empty only for a manifest-less root or the
+    /// standard library, neither of which can declare path dependencies.
     name: String,
     /// Canonical directory containing this package's `Aster.toml`, or the root
     /// source directory when no manifest exists.
@@ -340,9 +340,9 @@ fn resolve_packages(
         });
     };
     let requires_application_entry = manifest.application.is_some();
-    if let Some(package) = &manifest.package {
-        packages[ROOT_PACKAGE].name.clone_from(&package.name);
-    }
+    packages[ROOT_PACKAGE]
+        .name
+        .clone_from(&manifest.package.name);
 
     let mut by_root = HashMap::new();
     by_root.insert(project_root.to_path_buf(), ROOT_PACKAGE);
@@ -532,15 +532,7 @@ impl GraphBuilder {
                 return None;
             }
         };
-        let Some(declared_package) = manifest.package.as_ref() else {
-            self.fail(
-                &manifest_path,
-                format!(
-                    "dependency `{name}` uses manifest schema 1, which has no package identity"
-                ),
-            );
-            return None;
-        };
+        let declared_package = &manifest.package;
         if &declared_package.name != name {
             self.fail(
                 owner_manifest,
@@ -1041,10 +1033,9 @@ fn valid_namespace_segment(segment: &str) -> bool {
 /// A package's identity is its declared `[package] name`, independent of
 /// whether that package is the graph root, a direct dependency, or a
 /// transitive one: any unit whose package has a name gets that name prefixed
-/// ahead of its namespace. A schema-1 or manifest-less package has no
-/// declared name and keeps the historical bare/namespace-only scheme, so
-/// existing single-package projects are unchanged. Package *names*
-/// participate here; filesystem paths never do.
+/// ahead of its namespace. A manifest-less root has an implicit empty package
+/// identity and keeps the direct-file bare/namespace-only scheme. Package
+/// *names* participate here; filesystem paths never do.
 ///
 fn linked_name(unit: &Unit, packages: &[Package], name: &str) -> String {
     let package = &packages[unit.package];

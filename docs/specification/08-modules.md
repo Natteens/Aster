@@ -64,5 +64,5 @@ import geometry; // use using geometry;
 - **OPEN QUESTION:** What syntax will qualify a namespace provided by more than one package?
 
 Namespace cycles are rejected in the current discovery graph. Packages declare identity and local
-path dependencies from manifest schema 2; see `../reference/packages.md`. Remote dependencies, a
-lockfile, and a registry are not part of the implemented system.
+path dependencies in `Aster.toml`; see `../reference/packages.md`. Remote dependencies, a lockfile,
+and a registry are not part of the implemented system.

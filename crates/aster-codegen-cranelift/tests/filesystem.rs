@@ -601,7 +601,7 @@ fn read_all_text_and_write_all_text_work_across_two_files_in_a_namespace() {
     std::fs::create_dir_all(&root).expect("create project root");
     std::fs::write(
         root.join("Aster.toml"),
-        "[application]\nentry = \"app.Main\"\n",
+        "[package]\nname = \"filesystem_test\"\n",
     )
     .expect("write manifest");
     let app_dir = root.join("app");
@@ -639,7 +639,7 @@ fn read_all_text_and_write_all_text_work_across_two_files_in_a_namespace() {
         .mir;
     let backend = MemoryFileSystemBackend::new().with_file("a.txt", "cross-file-nine");
     assert_eq!(
-        execute_with_filesystem(&module, "Main", Box::new(backend)),
+        execute_with_filesystem(&module, "filesystem_test::app::Main", Box::new(backend)),
         Ok(ExecutionValue::Int(15))
     );
 }

@@ -7,7 +7,8 @@ use std::{
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
-const MANIFEST: &str = "schema = 2\n\n[package]\nname = \"HelloAster\"\n\n[application]\nentry = \"app.Program.Main\"\n";
+const MANIFEST: &str =
+    "[package]\nname = \"HelloAster\"\n\n[application]\nentry = \"app.Program.Main\"\n";
 const SOURCE: &str = r#"namespace app;
 
 using aster.io;
@@ -39,6 +40,7 @@ fn new_project_is_functional_outside_the_checkout() {
         fs::read_to_string(project.join("Aster.toml")).expect("read manifest"),
         MANIFEST
     );
+    assert!(!MANIFEST.contains("schema"));
     assert_eq!(
         fs::read_to_string(project.join("app/main.aster")).expect("read source"),
         SOURCE

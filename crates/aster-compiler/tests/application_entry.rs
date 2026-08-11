@@ -127,7 +127,7 @@ fn manifest_selects_a_resolved_root_method_and_sets_project_root() {
     let project = Project::new("manifest");
     project.write(
         "Aster.toml",
-        "[application]\nentry = \"app.Program.Main\"\n",
+        "[package]\nname = \"app\"\n\n[application]\nentry = \"app.Program.Main\"\n",
     );
     project.write(
         "app/math.aster",
@@ -145,98 +145,73 @@ fn manifest_selects_a_resolved_root_method_and_sets_project_root() {
 }
 
 /// The entry class does not have to live in the literal file passed to
-/// `compile_project`. It must resolve whether the root package has a
-/// declared schema 2 name (package-qualified sibling identity) or none
-/// (schema 1's legacy namespace-only identity).
+/// `compile_project`. Every manifest-backed root uses the same
+/// package-qualified identity.
 #[test]
 fn manifest_entry_resolves_from_a_sibling_file_of_the_root_package() {
-    for (label, manifest) in [
-        (
-            "schema-one",
-            "schema = 1\n\n[application]\nentry = \"app.Program.Main\"\n".to_owned(),
-        ),
-        (
-            "schema-two-named",
-            "schema = 2\n\n[package]\nname = \"greeter\"\n\n[application]\nentry = \"app.Program.Main\"\n"
-                .to_owned(),
-        ),
-    ] {
-        let project = Project::new(label);
-        project.write("Aster.toml", &manifest);
-        // `Program` lives in a sibling file, never the literal root file.
-        project.write(
-            "app/program.aster",
-            "namespace app; public class Program { public static int Main() { return 42; } }",
-        );
-        let root = project.write("app/main.aster", "namespace app;");
-        let compilation =
-            compile_project(&root).expect("manifest root resolves sibling namespace file");
-        let entry =
-            select_application_entry(&compilation, &root).expect("sibling entry class resolves");
-        assert_eq!(entry.display_name, "app.Program.Main", "{label}");
-    }
+    let project = Project::new("sibling-entry");
+    project.write(
+        "Aster.toml",
+        "[package]\nname = \"greeter\"\n\n[application]\nentry = \"app.Program.Main\"\n",
+    );
+    // `Program` lives in a sibling file, never the literal root file.
+    project.write(
+        "app/program.aster",
+        "namespace app; public class Program { public static int Main() { return 42; } }",
+    );
+    let root = project.write("app/main.aster", "namespace app;");
+    let compilation =
+        compile_project(&root).expect("manifest root resolves sibling namespace file");
+    let entry =
+        select_application_entry(&compilation, &root).expect("sibling entry class resolves");
+    assert_eq!(entry.display_name, "app.Program.Main");
 }
 
 #[test]
-fn schema_two_manifest_entry_resolves_from_the_literal_root_file() {
-    let project = Project::new("schema-two-root-entry");
+fn manifest_entry_resolves_from_the_literal_root_file() {
+    let project = Project::new("root-entry");
     project.write(
         "Aster.toml",
-        "schema = 2\n\n[package]\nname = \"greeter\"\n\n[application]\nentry = \"app.Program.Main\"\n",
+        "[package]\nname = \"greeter\"\n\n[application]\nentry = \"app.Program.Main\"\n",
     );
     let root = project.write(
         "app/main.aster",
         "namespace app; public class Program { public static int Main() { return 42; } }",
     );
-    let compilation = compile_project(&root).expect("schema 2 root entry compiles");
+    let compilation = compile_project(&root).expect("root entry compiles");
     let entry = select_application_entry(&compilation, &root).expect("root entry resolves");
     assert_eq!(entry.display_name, "app.Program.Main");
 }
 
 #[test]
-fn manifest_schema_one_and_legacy_missing_schema_are_accepted() {
+fn removed_manifest_schema_fields_are_rejected() {
     for (label, manifest) in [
-        (
-            "legacy-schema",
-            "[application]\nentry = \"app.Program.Main\"\n",
-        ),
-        (
-            "schema-one",
-            "schema = 1\n\n[application]\nentry = \"app.Program.Main\"\n",
-        ),
+        ("schema-one", "schema = 1\n\n[package]\nname = \"app\"\n"),
+        ("schema-two", "schema = 2\n\n[package]\nname = \"app\"\n"),
     ] {
         let (_project, root) = manifest_case(label, manifest);
-        let entry = select(&root).expect("supported manifest schema");
-        assert_eq!(entry.display_name, "app.Program.Main");
+        assert!(errors(&root).iter().any(|message| {
+            message.contains("Aster.toml no longer uses a `schema` field; remove it")
+        }));
     }
 }
 
 #[test]
-fn manifest_rejects_unsupported_schema_and_unknown_fields() {
+fn manifest_requires_package_identity_and_rejects_unknown_fields() {
     let cases = [
         (
-            "future-schema",
-            "schema = 999\n\n[application]\nentry = \"app.Program.Main\"\n",
-            "unsupported Aster.toml schema `999`",
-        ),
-        (
-            "schema-two-without-package",
-            "schema = 2\n\n[application]\nentry = \"app.Program.Main\"\n",
+            "without-package",
+            "[application]\nentry = \"app.Program.Main\"\n",
             "does not define a `[package]` table",
         ),
         (
-            "wrong-schema-type",
-            "schema = \"1\"\n\n[application]\nentry = \"app.Program.Main\"\n",
-            "`schema` must be an integer",
-        ),
-        (
             "unknown-top-level",
-            "schema = 1\nname = \"demo\"\n\n[application]\nentry = \"app.Program.Main\"\n",
+            "name = \"demo\"\n\n[package]\nname = \"app\"\n\n[application]\nentry = \"app.Program.Main\"\n",
             "unknown top-level Aster.toml field `name`",
         ),
         (
             "unknown-application",
-            "schema = 1\n\n[application]\nentry = \"app.Program.Main\"\nmode = \"debug\"\n",
+            "[package]\nname = \"app\"\n\n[application]\nentry = \"app.Program.Main\"\nmode = \"debug\"\n",
             "unknown Aster.toml application field `mode`",
         ),
     ];
@@ -256,32 +231,32 @@ fn manifest_requires_a_typed_application_entry() {
     let cases = [
         (
             "missing-application",
-            "schema = 1\n",
-            "does not define an `[application]` table",
+            "[package]\nname = \"app\"\n",
+            "does not define an `[application]` entry",
         ),
         (
             "wrong-application",
-            "schema = 1\napplication = \"app.Program.Main\"\n",
+            "application = \"app.Program.Main\"\n\n[package]\nname = \"app\"\n",
             "`application` must be a table",
         ),
         (
             "missing-entry",
-            "schema = 1\n\n[application]\n",
+            "[package]\nname = \"app\"\n\n[application]\n",
             "does not define `application.entry`",
         ),
         (
             "wrong-entry-type",
-            "schema = 1\n\n[application]\nentry = 1\n",
+            "[package]\nname = \"app\"\n\n[application]\nentry = 1\n",
             "`application.entry` must be a string",
         ),
         (
             "empty-entry",
-            "schema = 1\n\n[application]\nentry = \"\"\n",
+            "[package]\nname = \"app\"\n\n[application]\nentry = \"\"\n",
             "invalid format",
         ),
         (
             "wrong-method",
-            "schema = 1\n\n[application]\nentry = \"app.Program.Run\"\n",
+            "[package]\nname = \"app\"\n\n[application]\nentry = \"app.Program.Run\"\n",
             "must end in `.Main`",
         ),
     ];
@@ -301,7 +276,7 @@ fn manifest_selects_a_void_main_entry() {
     let project = Project::new("manifest-void");
     project.write(
         "Aster.toml",
-        "[application]\nentry = \"app.Program.Main\"\n",
+        "[package]\nname = \"app\"\n\n[application]\nentry = \"app.Program.Main\"\n",
     );
     let root = project.write(
         "app/main.aster",
@@ -322,7 +297,10 @@ fn manifest_reports_invalid_toml_and_entry_format() {
     assert!(errors(&root)[0].contains("invalid Aster.toml"));
 
     let invalid_entry = Project::new("invalid-entry");
-    invalid_entry.write("Aster.toml", "[application]\nentry = \"Program.Run\"\n");
+    invalid_entry.write(
+        "Aster.toml",
+        "[package]\nname = \"app\"\n\n[application]\nentry = \"Program.Run\"\n",
+    );
     let root = invalid_entry.write(
         "main.aster",
         "public class Program { public static void Main() {} }",
@@ -335,7 +313,7 @@ fn manifest_reports_missing_inaccessible_and_invalid_targets() {
     let missing = Project::new("manifest-missing");
     missing.write(
         "Aster.toml",
-        "[application]\nentry = \"app.Missing.Main\"\n",
+        "[package]\nname = \"app\"\n\n[application]\nentry = \"app.Missing.Main\"\n",
     );
     let root = missing.write(
         "app/main.aster",
@@ -346,7 +324,7 @@ fn manifest_reports_missing_inaccessible_and_invalid_targets() {
     let inaccessible = Project::new("manifest-internal");
     inaccessible.write(
         "Aster.toml",
-        "[application]\nentry = \"app.Program.Main\"\n",
+        "[package]\nname = \"app\"\n\n[application]\nentry = \"app.Program.Main\"\n",
     );
     let root = inaccessible.write(
         "app/main.aster",
@@ -357,7 +335,7 @@ fn manifest_reports_missing_inaccessible_and_invalid_targets() {
     let imported_internal = Project::new("manifest-imported-internal");
     imported_internal.write(
         "Aster.toml",
-        "[application]\nentry = \"app.hidden.Program.Main\"\n",
+        "[package]\nname = \"app\"\n\n[application]\nentry = \"app.hidden.Program.Main\"\n",
     );
     imported_internal.write(
         "app/hidden/program.aster",
@@ -372,7 +350,7 @@ fn manifest_reports_missing_inaccessible_and_invalid_targets() {
     let invalid = Project::new("manifest-invalid-method");
     invalid.write(
         "Aster.toml",
-        "[application]\nentry = \"app.Program.Main\"\n",
+        "[package]\nname = \"app\"\n\n[application]\nentry = \"app.Program.Main\"\n",
     );
     let root = invalid.write(
         "app/main.aster",
@@ -386,7 +364,7 @@ fn manifest_cannot_select_an_official_standard_library_module() {
     let project = Project::new("manifest-stdlib");
     project.write(
         "Aster.toml",
-        "[application]\nentry = \"aster.math.Math.Main\"\n",
+        "[package]\nname = \"app\"\n\n[application]\nentry = \"aster.math.Math.Main\"\n",
     );
     let root = project.write(
         "app/main.aster",
