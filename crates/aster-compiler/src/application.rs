@@ -65,7 +65,11 @@ fn load_manifest_entry(
     let manifest = manifest
         .result
         .map_err(|error| vec![diagnostic(&path, error.message, error.help)])?;
-    Ok(Some((path, manifest.application.entry)))
+    // A library package declares no `[application]`. Selecting an entry for it
+    // falls back to the conventional rule, exactly like a manifest-less file.
+    Ok(manifest
+        .application
+        .map(|application| (path, application.entry)))
 }
 
 fn select_manifest_entry(
@@ -83,12 +87,9 @@ fn select_manifest_entry(
             "declare the application entry in a project namespace",
         )]);
     }
-    let linked_name = if project.root_namespace == entry.namespace {
-        entry.class.clone()
-    } else {
-        format!("{}::{}", entry.namespace, entry.class)
-    };
-    let Some(class) = classes(&project.compilation.hir).find(|class| class.name == linked_name)
+    let candidates = entry_identity_candidates(project, entry);
+    let Some(class) = classes(&project.compilation.hir)
+        .find(|class| candidates.iter().any(|candidate| candidate == &class.name))
     else {
         return Err(vec![diagnostic(
             path,
@@ -117,12 +118,31 @@ fn select_manifest_entry(
     )
 }
 
+/// Every compiler-internal identity the entry class could resolve to.
+/// Schema 1 preserves the historical bare root-file candidate; schema 2 has
+/// one package-qualified identity regardless of which package file was the
+/// literal compilation root.
+fn entry_identity_candidates(project: &ProjectCompilation, entry: &ManifestEntry) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let namespace_scoped = format!("{}::{}", entry.namespace, entry.class);
+    match project.root_package_name() {
+        "" => {
+            if project.root_namespace == entry.namespace {
+                candidates.push(entry.class.clone());
+            }
+            candidates.push(namespace_scoped);
+        }
+        package => candidates.push(format!("{package}::{namespace_scoped}")),
+    }
+    candidates
+}
+
 fn select_conventional_entry(
     project: &ProjectCompilation,
     root_file: &Path,
 ) -> Result<ApplicationEntry, Vec<ApplicationDiagnostic>> {
     let root_classes = classes(&project.compilation.hir)
-        .filter(|class| !class.name.contains("::"))
+        .filter(|class| project.is_root_type(&class.name))
         .collect::<Vec<_>>();
     let candidates = root_classes
         .iter()

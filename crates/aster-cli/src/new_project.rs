@@ -27,11 +27,36 @@ const RESERVED_WINDOWS_NAMES: [&str; 23] = [
 
 static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(0);
 
-fn manifest_source() -> String {
+fn manifest_source(name: &str) -> String {
     format!(
-        "schema = {}\n\n[application]\nentry = \"app.Program.Main\"\n",
-        aster_compiler::CURRENT_MANIFEST_SCHEMA
+        "schema = {}\n\n[package]\nname = \"{}\"\n\n[application]\nentry = \"app.Program.Main\"\n",
+        aster_compiler::CURRENT_MANIFEST_SCHEMA,
+        package_name(name)
     )
+}
+
+/// A package identity derived from the project directory name.
+///
+/// `validate_name` deliberately accepts more than ASTER identifiers (dots,
+/// spaces, accents), so characters that cannot appear in a package name become
+/// underscores and a leading digit is prefixed.
+fn package_name(name: &str) -> String {
+    let mut identifier = String::new();
+    for character in name.chars() {
+        if character == '_' || character.is_ascii_alphanumeric() {
+            identifier.push(character);
+        } else {
+            identifier.push('_');
+        }
+    }
+    if !identifier
+        .chars()
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+    {
+        identifier.insert(0, '_');
+    }
+    identifier
 }
 
 pub(crate) fn create(parent: &Path, name: &str) -> Result<PathBuf, String> {
@@ -80,7 +105,7 @@ pub(crate) fn create_with_source(
         let app = staging.join("app");
         fs::create_dir(&app)
             .map_err(|error| format!("could not create project source directory: {error}"))?;
-        let manifest = manifest_source();
+        let manifest = manifest_source(name);
         write_new_file(&staging.join("Aster.toml"), &manifest)?;
         write_new_file(&app.join("main.aster"), source)?;
         validate_staging(&staging, &manifest, source)?;
@@ -302,7 +327,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(first.join("Aster.toml")).expect("read manifest"),
-            manifest_source()
+            manifest_source("HelloAster")
         );
         assert_eq!(
             fs::read_to_string(first.join("app/main.aster")).expect("read source"),

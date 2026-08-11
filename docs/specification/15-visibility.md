@@ -21,8 +21,9 @@ Exactly one simple visibility modifier may appear on a declaration. Compound for
 
 ### `public`
 
-Accessible from any project that can access the declaration. It may be applied to classes,
-structs, interfaces, methods, fields, properties, constructors, and exported namespace declarations.
+Accessible from any package that can access the declaration, including packages that depend on this
+one by path. It may be applied to classes, structs, interfaces, methods, fields, properties,
+constructors, and exported namespace declarations.
 
 ```aster
 public class Player
@@ -35,10 +36,14 @@ public class Player
 
 ### `internal`
 
-Accessible within the same ASTER project, including across different namespaces. A file must still
-use the other namespace to bring its names into scope. The project root is the nearest `Aster.toml`
+Accessible within the same ASTER package, including across different namespaces. A file must still
+use the other namespace to bring its names into scope. A package is the nearest `Aster.toml`
 directory, or the root source directory when no manifest exists. It may be used for namespace-level
 declarations and type members.
+
+`internal` never crosses a package dependency boundary. Only `public` declarations are accessible
+from a package that depends on yours, and there is no `friend` or workspace-wide visibility. See
+[packages and dependencies](../reference/packages.md).
 
 ```aster
 internal class CompilerCache

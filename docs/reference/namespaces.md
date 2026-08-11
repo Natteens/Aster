@@ -60,9 +60,9 @@ aliases are future work, so the declarations must currently be renamed or reorga
 ## Visibility
 
 - `private` is visible only inside its owning class or struct.
-- `internal` is visible throughout the same ASTER project, including across namespaces when the
-  namespace is brought into scope with `using`.
-- `public` is the API intended for other projects or packages in the future.
+- `internal` is visible throughout the same ASTER package, including across namespaces when the
+  namespace is brought into scope with `using`. It never crosses a package dependency boundary.
+- `public` is the API other packages can use, including packages that depend on yours by path.
 - `protected` remains rejected with an honest diagnostic until inheritance or another extension
   model exists.
 

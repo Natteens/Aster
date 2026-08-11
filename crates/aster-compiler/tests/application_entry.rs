@@ -144,6 +144,55 @@ fn manifest_selects_a_resolved_root_method_and_sets_project_root() {
     assert_eq!(entry.display_name, "app.Program.Main");
 }
 
+/// The entry class does not have to live in the literal file passed to
+/// `compile_project`. It must resolve whether the root package has a
+/// declared schema 2 name (package-qualified sibling identity) or none
+/// (schema 1's legacy namespace-only identity).
+#[test]
+fn manifest_entry_resolves_from_a_sibling_file_of_the_root_package() {
+    for (label, manifest) in [
+        (
+            "schema-one",
+            "schema = 1\n\n[application]\nentry = \"app.Program.Main\"\n".to_owned(),
+        ),
+        (
+            "schema-two-named",
+            "schema = 2\n\n[package]\nname = \"greeter\"\n\n[application]\nentry = \"app.Program.Main\"\n"
+                .to_owned(),
+        ),
+    ] {
+        let project = Project::new(label);
+        project.write("Aster.toml", &manifest);
+        // `Program` lives in a sibling file, never the literal root file.
+        project.write(
+            "app/program.aster",
+            "namespace app; public class Program { public static int Main() { return 42; } }",
+        );
+        let root = project.write("app/main.aster", "namespace app;");
+        let compilation =
+            compile_project(&root).expect("manifest root resolves sibling namespace file");
+        let entry =
+            select_application_entry(&compilation, &root).expect("sibling entry class resolves");
+        assert_eq!(entry.display_name, "app.Program.Main", "{label}");
+    }
+}
+
+#[test]
+fn schema_two_manifest_entry_resolves_from_the_literal_root_file() {
+    let project = Project::new("schema-two-root-entry");
+    project.write(
+        "Aster.toml",
+        "schema = 2\n\n[package]\nname = \"greeter\"\n\n[application]\nentry = \"app.Program.Main\"\n",
+    );
+    let root = project.write(
+        "app/main.aster",
+        "namespace app; public class Program { public static int Main() { return 42; } }",
+    );
+    let compilation = compile_project(&root).expect("schema 2 root entry compiles");
+    let entry = select_application_entry(&compilation, &root).expect("root entry resolves");
+    assert_eq!(entry.display_name, "app.Program.Main");
+}
+
 #[test]
 fn manifest_schema_one_and_legacy_missing_schema_are_accepted() {
     for (label, manifest) in [
@@ -167,8 +216,13 @@ fn manifest_rejects_unsupported_schema_and_unknown_fields() {
     let cases = [
         (
             "future-schema",
+            "schema = 999\n\n[application]\nentry = \"app.Program.Main\"\n",
+            "unsupported Aster.toml schema `999`",
+        ),
+        (
+            "schema-two-without-package",
             "schema = 2\n\n[application]\nentry = \"app.Program.Main\"\n",
-            "unsupported Aster.toml schema `2`",
+            "does not define a `[package]` table",
         ),
         (
             "wrong-schema-type",

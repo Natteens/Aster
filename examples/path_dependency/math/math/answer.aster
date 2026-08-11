@@ -1,0 +1,12 @@
+namespace math;
+
+public int Answer()
+{
+    return 42;
+}
+
+// `internal` stays inside this package: `app` cannot reach it.
+internal int Seed()
+{
+    return 7;
+}

@@ -61,7 +61,8 @@ import geometry; // use using geometry;
 - **OPEN QUESTION:** What syntax will qualify an ambiguous name directly?
 - **OPEN QUESTION:** Will aliases, selective usings, or reexports be added?
 - **OPEN QUESTION:** Will `partial` allow one type to span files?
-- **OPEN QUESTION:** What package and dependency manifest will follow the local project model?
+- **OPEN QUESTION:** What syntax will qualify a namespace provided by more than one package?
 
-Namespace cycles are rejected in the current discovery graph. Package management and remote
-dependencies are not part of the implemented system.
+Namespace cycles are rejected in the current discovery graph. Packages declare identity and local
+path dependencies from manifest schema 2; see `../reference/packages.md`. Remote dependencies, a
+lockfile, and a registry are not part of the implemented system.

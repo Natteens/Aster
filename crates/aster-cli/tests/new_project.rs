@@ -7,7 +7,7 @@ use std::{
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
-const MANIFEST: &str = "schema = 1\n\n[application]\nentry = \"app.Program.Main\"\n";
+const MANIFEST: &str = "schema = 2\n\n[package]\nname = \"HelloAster\"\n\n[application]\nentry = \"app.Program.Main\"\n";
 const SOURCE: &str = r#"namespace app;
 
 using aster.io;

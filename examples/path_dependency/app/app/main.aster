@@ -1,0 +1,11 @@
+namespace app;
+
+using math;
+
+public class Program
+{
+    public static int Main()
+    {
+        return Answer();
+    }
+}

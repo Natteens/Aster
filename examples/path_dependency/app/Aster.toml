@@ -1,0 +1,10 @@
+schema = 2
+
+[package]
+name = "app"
+
+[application]
+entry = "app.Program.Main"
+
+[dependencies]
+math = { path = "../math" }

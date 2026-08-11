@@ -69,6 +69,7 @@ Other project examples include:
 - `namespaces` for folder namespaces, `namespace`, and `using`;
 - `option_result` and `result_propagation_multifile` for errors across files;
 - `generic_types_multifile` for concrete generic specialization;
+- `path_dependency` for two local packages linked by a `[dependencies]` path;
 - `file-indexer` for filesystem, collections, and reporting.
 
 ## Focused compiler examples

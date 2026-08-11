@@ -100,6 +100,33 @@ fn explicit_function_ignores_an_invalid_relevant_manifest() {
     fs::remove_dir_all(project).expect("remove function override project");
 }
 
+#[test]
+fn explicit_function_resolves_a_schema_two_root_symbol() {
+    let project = temporary_directory("schema-two-function");
+    fs::write(
+        project.join("Aster.toml"),
+        "schema = 2\n\n[package]\nname = \"tool\"\n",
+    )
+    .expect("write schema 2 manifest");
+    let source = project.join("main.aster");
+    fs::write(&source, "public int Calculate() { return 42; }").expect("write source");
+
+    let output = aster(
+        &project,
+        [
+            "run",
+            source.to_str().expect("UTF-8 source path"),
+            "--function",
+            "Calculate",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "42");
+    assert!(stderr(&output).is_empty());
+
+    fs::remove_dir_all(project).expect("remove schema 2 function project");
+}
+
 fn aster<const N: usize>(current_directory: &Path, arguments: [&str; N]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_aster"))
         .args(arguments)

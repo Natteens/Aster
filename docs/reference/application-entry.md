@@ -63,10 +63,15 @@ is below the manifest, the manifest directory is also the project root. For exam
 Schema `1` supports only the top-level `schema` field and the `[application]` table, which in turn
 supports only `entry`. Unknown fields and unsupported schema numbers are rejected with controlled
 manifest diagnostics instead of being ignored. Existing pre-schema manifests remain valid: omitting
-`schema` is treated as schema `1`, while `aster new` writes the explicit version for new projects.
+`schema` is treated as schema `1`, while `aster new` writes the newest schema for new projects.
 
-The manifest is intentionally small. It does not describe packages, dependencies, build profiles,
-an engine, or remote downloads.
+Schema `2` adds `[package]` identity and `[dependencies]`, and makes `[application]` optional so a
+package can be a library with no entry point. Only the root package supplies the application entry;
+a dependency that declares its own `[application]` does not compete for it. See
+[packages and dependencies](packages.md).
+
+The manifest stays small. It does not describe build profiles, an engine, remote downloads, or any
+dependency source other than a local path.
 
 ## Explicit development entry
 

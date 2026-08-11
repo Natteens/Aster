@@ -345,7 +345,9 @@ fn process_file(
             for diagnostic in project_diagnostics(&project) {
                 eprintln!("{}", diagnostic.render());
             }
-            if aster_compiler::find_manifest_path(Path::new(file_name)).is_some()
+            // A library package declares no `[application]`, so `check` must
+            // not demand an entry point from it.
+            if project.requires_application_entry()
                 && let Err(diagnostics) =
                     aster_compiler::select_application_entry(&project, Path::new(file_name))
             {
@@ -433,15 +435,15 @@ pub(crate) fn execute_project(
     (),
 > {
     if let Some(function_name) = function_name {
-        if !project.is_root_public_function(function_name) {
+        let Some(symbol) = project.root_public_function_symbol(function_name) else {
             eprintln!(
                 "error: entry function `{function_name}` must be declared `public` in the root namespace"
             );
             return Err(());
-        }
-        return aster_codegen_cranelift::execute_with_stats(
+        };
+        return aster_codegen_cranelift::execute_symbol_with_stats(
             &project.compilation.mir,
-            function_name,
+            symbol,
         )
         .map(|(value, stats)| (value, function_name.to_owned(), stats))
         .map_err(|error| eprintln!("error: {error}"));

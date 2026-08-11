@@ -30,7 +30,10 @@ supported. Unsupported execution must continue to fail before unsafe code genera
 
 ## Project manifests
 
-`Aster.toml` has an explicit schema authority. Schema `1` accepts:
+`Aster.toml` has an explicit schema authority. Each schema number keeps exactly one documented
+meaning, and an unsupported schema is rejected rather than guessed.
+
+Schema `1` accepts only `schema` and a required `[application]` table containing only `entry`:
 
 ```toml
 schema = 1
@@ -39,10 +42,33 @@ schema = 1
 entry = "app.Program.Main"
 ```
 
-Legacy manifests that omit `schema` are interpreted as schema `1`. An explicitly newer schema is
-rejected rather than guessed. Future schema changes must keep that rule: one documented schema
-meaning per number, deterministic discovery, and a controlled migration diagnostic instead of
-silently reinterpreting a project.
+Manifests that omit `schema` are interpreted as schema `1`. Schema `1` is unchanged and keeps
+working; it simply has no package identity and therefore cannot declare dependencies.
+
+Schema `2` adds package identity and local path dependencies, and makes `[application]` optional so
+a package can be a library:
+
+```toml
+schema = 2
+
+[package]
+name = "app"
+
+[application]
+entry = "app.Program.Main"
+
+[dependencies]
+math = { path = "../math" }
+```
+
+Schema `2` was introduced additively rather than by reinterpreting schema `1`, because schema `1`
+deliberately rejects unknown fields. `aster new` writes the newest schema. See
+[packages and dependencies](packages.md).
+
+Future schema changes must keep the same rule: one documented schema meaning per number,
+deterministic discovery, and a controlled migration diagnostic instead of silently reinterpreting a
+project. Git source dependencies and a lockfile, when they arrive, will extend the dependency
+surface under this same contract.
 
 ## Incompatible changes during 0.x
 

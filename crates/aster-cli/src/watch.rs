@@ -150,7 +150,7 @@ fn build_and_run(
         eprintln!("{}", diagnostic.render());
     }
     let execution_started = Instant::now();
-    let dependencies = Some(watched_paths(&project, Path::new(file_name)));
+    let dependencies = Some(watched_paths(&project));
     if let Ok((value, entry_name, _stats)) =
         crate::execute_project(&project, Path::new(file_name), function_name)
     {
@@ -178,14 +178,11 @@ fn build_and_run(
     }
 }
 
-fn watched_paths(project: &aster_compiler::ProjectCompilation, root_file: &Path) -> Vec<PathBuf> {
-    let mut paths = project.dependency_paths();
-    if let Some(manifest) = aster_compiler::find_manifest_path(root_file) {
-        paths.push(manifest);
-    }
-    paths.sort();
-    paths.dedup();
-    paths
+/// The watch set is whatever the resolved package graph says can affect this
+/// compilation: root-package and path-dependency sources plus every manifest in
+/// the graph. Watch mode owns no second dependency scanner.
+fn watched_paths(project: &aster_compiler::ProjectCompilation) -> Vec<PathBuf> {
+    project.dependency_paths()
 }
 
 type DependencySnapshot = BTreeMap<PathBuf, Option<Snapshot>>;
@@ -335,7 +332,7 @@ mod tests {
         assert!(outcome.succeeded);
         let project = aster_compiler::compile_project(&root).expect("compile test project");
         assert!(
-            watched_paths(&project, &root)
+            watched_paths(&project)
                 .contains(&fs::canonicalize(&manifest).expect("canonical manifest path"))
         );
         fs::remove_dir_all(directory).expect("remove test directory");
@@ -347,7 +344,7 @@ mod tests {
             .join("../..")
             .join("examples/math_basics.aster");
         let project = aster_compiler::compile_project(&root).expect("compile math example");
-        let paths = watched_paths(&project, &root);
+        let paths = watched_paths(&project);
         assert_eq!(paths, vec![fs::canonicalize(root).expect("canonical root")]);
     }
 
