@@ -281,6 +281,12 @@ impl Lowerer<'_> {
             ast::ExpressionKind::Call {
                 callee, arguments, ..
             } => {
+                // Semantic analysis records ordinary calls. The collection
+                // intrinsics below deliberately have no call record, so this
+                // lets a user-defined `Get`/`Add`/`RemoveAt` go directly to
+                // the resolved-call path without lowering its receiver once
+                // just to discover that it is not a List.
+                let has_resolved_call = self.model.calls.contains_key(&model_key);
                 if let Some(level) = log_level(callee) {
                     let argument = arguments
                         .first()
@@ -375,7 +381,8 @@ impl Lowerer<'_> {
                         },
                     };
                 }
-                if let ast::ExpressionKind::Member { object, name } = &callee.kind
+                if !has_resolved_call
+                    && let ast::ExpressionKind::Member { object, name } = &callee.kind
                     && name == "Add"
                 {
                     let object = self.expression(object);
@@ -390,7 +397,8 @@ impl Lowerer<'_> {
                         };
                     }
                 }
-                if let ast::ExpressionKind::Member { object, name } = &callee.kind
+                if !has_resolved_call
+                    && let ast::ExpressionKind::Member { object, name } = &callee.kind
                     && name == "Get"
                 {
                     let object = self.expression(object);
@@ -406,7 +414,8 @@ impl Lowerer<'_> {
                         };
                     }
                 }
-                if let ast::ExpressionKind::Member { object, name } = &callee.kind
+                if !has_resolved_call
+                    && let ast::ExpressionKind::Member { object, name } = &callee.kind
                     && name == "RemoveAt"
                 {
                     let object = self.expression(object);

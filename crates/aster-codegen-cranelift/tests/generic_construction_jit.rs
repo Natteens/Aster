@@ -107,6 +107,24 @@ fn repeated_specialization_reuses_cache() {
     assert_eq!(int(source), ExecutionValue::Int(42));
 }
 
+#[test]
+fn nested_generic_member_get_chain_executes() {
+    let depth = 12;
+    let mut type_name = "int".to_owned();
+    let mut value = "42".to_owned();
+    for _ in 0..depth {
+        type_name = format!("Box<{type_name}>");
+        value = format!("new {type_name}({value})");
+    }
+    let calls = std::iter::repeat_n("Get()", depth)
+        .collect::<Vec<_>>()
+        .join(".");
+    let source = format!(
+        "public class Box<T> {{ private T value; public Box(T value) {{ this.value = value; }} public T Get() {{ return value; }} }} public int Run() {{ {type_name} value = {value}; return value.{calls}; }}"
+    );
+    assert_eq!(int(&source), ExecutionValue::Int(42));
+}
+
 const SCORED: &str = "public interface IScored { int Score(); }\n\
     public class Small : IScored { private int value; public Small(int value) { this.value = value; } public int Score() { return value; } }\n\
     public class Large : IScored { private int value; public Large(int value) { this.value = value; } public int Score() { return value; } }\n";
