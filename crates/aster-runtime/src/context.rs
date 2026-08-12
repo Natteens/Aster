@@ -4,7 +4,10 @@ use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::mem::{align_of, size_of};
 use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use crate::arena::{
     ArenaAllocError, ArenaEventMetrics, ArenaMark, ArenaRewindMetrics, ArenaTelemetrySnapshot,
@@ -12,6 +15,7 @@ use crate::arena::{
 };
 #[cfg(test)]
 use crate::arena::{DEFAULT_PAGE_SIZE, MIN_PAGE_SIZE};
+use crate::memory_governor::{MemoryGovernor, MemoryGovernorTelemetry};
 use crate::string::AsterStrHeader;
 
 /// Maximum arena capacity reserved by one execution context, shared by its
@@ -429,6 +433,7 @@ pub struct AarmMemoryTelemetry {
     pub temporary: AarmRegionTelemetry,
     pub persistent: AarmRegionTelemetry,
     pub total: AarmRegionTelemetry,
+    pub governor: Option<MemoryGovernorTelemetry>,
 }
 
 impl From<ArenaEventMetrics> for AarmAllocatorEvents {
@@ -574,11 +579,28 @@ impl ExecutionContext {
     }
 
     fn with_options(collect_stats: bool, allocation_limit_bytes: usize) -> Self {
+        Self::with_options_and_governor(collect_stats, allocation_limit_bytes, None)
+    }
+
+    fn with_options_and_governor(
+        collect_stats: bool,
+        allocation_limit_bytes: usize,
+        governor: Option<Arc<MemoryGovernor>>,
+    ) -> Self {
         let (dictionary_hash_k0, dictionary_hash_k1, dictionary_owner_id) =
             dictionary_context_identity();
+        let (arena, temporary_arena) = governor.map_or_else(
+            || (PagedArena::new(), PagedArena::new()),
+            |governor| {
+                (
+                    PagedArena::with_memory_governor(Arc::clone(&governor)),
+                    PagedArena::with_memory_governor(governor),
+                )
+            },
+        );
         Self {
-            arena: PagedArena::new(),
-            temporary_arena: PagedArena::new(),
+            arena,
+            temporary_arena,
             temporary_scopes: Vec::new(),
             allocation_limit_bytes,
             call_depth: 0,
@@ -597,6 +619,14 @@ impl ExecutionContext {
     #[must_use]
     pub fn with_stats() -> Self {
         Self::with_options(true, EXECUTION_ALLOCATION_LIMIT_BYTES)
+    }
+
+    /// Create an experimental statistics-enabled context governed by one
+    /// explicit shared hard budget.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_memory_governor(governor: Arc<MemoryGovernor>) -> Self {
+        Self::with_options_and_governor(true, EXECUTION_ALLOCATION_LIMIT_BYTES, Some(governor))
     }
 
     #[cfg(test)]
@@ -643,6 +673,7 @@ impl ExecutionContext {
             temporary,
             persistent,
             total,
+            governor: self.arena.governor_telemetry(),
         })
     }
 
@@ -813,6 +844,11 @@ impl ExecutionContext {
                 self.fail(format!(
                     "allocation exceeds the execution memory limit of {} bytes",
                     self.allocation_limit_bytes
+                ));
+            }
+            ArenaAllocError::SharedLimit { hard_limit_bytes } => {
+                self.fail(format!(
+                    "allocation exceeds the shared execution memory budget of {hard_limit_bytes} bytes"
                 ));
             }
             ArenaAllocError::OutOfMemory => {
@@ -6732,6 +6768,7 @@ mod tests {
             .aarm_memory_telemetry()
             .expect("statistics mode enables telemetry");
         assert_eq!(telemetry.requested_bytes, 32);
+        assert_eq!(telemetry.governor, None);
         assert_eq!(telemetry.persistent.live_used_bytes, 32);
         assert_eq!(telemetry.temporary.live_used_bytes, 64);
         assert_eq!(telemetry.total.live_used_bytes, 96);
@@ -6816,6 +6853,194 @@ mod tests {
         assert_eq!(telemetry.total.peak_arena_capacity_bytes, 0);
         assert_eq!(telemetry.total.events.allocation_limit_denials, 1);
         assert_eq!(context.memory_stats(), &MemoryStats::default());
+    }
+
+    #[test]
+    #[cfg(feature = "aarm-telemetry")]
+    fn governed_context_charges_only_fresh_page_capacity() {
+        let governor = Arc::new(MemoryGovernor::new(MIN_PAGE_SIZE));
+        let mut context = ExecutionContext::with_memory_governor(Arc::clone(&governor));
+
+        assert!(!aster_rt_object_new(&raw mut context, 16).is_null());
+        let after_fresh = governor.telemetry();
+        assert_eq!(after_fresh.current_capacity_bytes, MIN_PAGE_SIZE as u64);
+        assert_eq!(after_fresh.grant_events, 1);
+
+        assert!(!aster_rt_object_new(&raw mut context, 16).is_null());
+        let after_fast = governor.telemetry();
+        assert_eq!(after_fast.current_capacity_bytes, MIN_PAGE_SIZE as u64);
+        assert_eq!(after_fast.grant_events, 1);
+        let telemetry = context
+            .aarm_memory_telemetry()
+            .expect("governed contexts collect AARM telemetry");
+        assert_eq!(telemetry.total.events.slow_path_allocations, 1);
+        assert_eq!(telemetry.total.events.active_page_fast_path_allocations, 1);
+        assert_eq!(telemetry.governor, Some(after_fast));
+
+        drop(context);
+        let after_drop = governor.telemetry();
+        assert_eq!(after_drop.current_capacity_bytes, 0);
+        assert_eq!(after_drop.release_events, 1);
+    }
+
+    #[test]
+    #[cfg(feature = "aarm-telemetry")]
+    fn temporary_rewind_and_reuse_keep_retained_capacity_charged() {
+        let governor = Arc::new(MemoryGovernor::new(MIN_PAGE_SIZE));
+        let mut context = ExecutionContext::with_memory_governor(Arc::clone(&governor));
+
+        let first_mark = context.mark_temporary();
+        assert!(!context.allocate_temporary(64, 8).is_null());
+        context.rewind_temporary(first_mark);
+        let after_rewind = governor.telemetry();
+        assert_eq!(after_rewind.current_capacity_bytes, MIN_PAGE_SIZE as u64);
+        assert_eq!(after_rewind.grant_events, 1);
+        assert_eq!(after_rewind.release_events, 0);
+
+        let second_mark = context.mark_temporary();
+        assert!(!context.allocate_temporary(64, 8).is_null());
+        context.rewind_temporary(second_mark);
+        let after_reuse = governor.telemetry();
+        assert_eq!(after_reuse.current_capacity_bytes, MIN_PAGE_SIZE as u64);
+        assert_eq!(after_reuse.grant_events, 1);
+        let telemetry = context
+            .aarm_memory_telemetry()
+            .expect("governed contexts collect AARM telemetry");
+        assert_eq!(telemetry.temporary.events.inactive_page_reuse_events, 1);
+        assert_eq!(
+            telemetry.temporary.inactive_page_capacity_bytes,
+            MIN_PAGE_SIZE as u64
+        );
+
+        drop(context);
+        assert_eq!(governor.telemetry().current_capacity_bytes, 0);
+    }
+
+    #[test]
+    #[cfg(feature = "aarm-telemetry")]
+    fn persistent_and_temporary_arenas_share_one_governor() {
+        let governor = Arc::new(MemoryGovernor::new(MIN_PAGE_SIZE * 2));
+        let mut context = ExecutionContext::with_memory_governor(Arc::clone(&governor));
+        assert!(!aster_rt_object_new(&raw mut context, 64).is_null());
+        let mark = context.mark_temporary();
+        assert!(!context.allocate_temporary(64, 8).is_null());
+
+        let telemetry = context
+            .aarm_memory_telemetry()
+            .expect("governed contexts collect AARM telemetry");
+        assert_eq!(
+            telemetry.persistent.arena_capacity_bytes,
+            MIN_PAGE_SIZE as u64
+        );
+        assert_eq!(
+            telemetry.temporary.arena_capacity_bytes,
+            MIN_PAGE_SIZE as u64
+        );
+        assert_eq!(
+            telemetry.total.arena_capacity_bytes,
+            (MIN_PAGE_SIZE * 2) as u64
+        );
+        assert_eq!(
+            telemetry
+                .governor
+                .expect("governor telemetry is present")
+                .current_capacity_bytes,
+            telemetry.total.arena_capacity_bytes
+        );
+
+        context.rewind_temporary(mark);
+        assert_eq!(
+            governor.telemetry().current_capacity_bytes,
+            (MIN_PAGE_SIZE * 2) as u64
+        );
+        drop(context);
+        assert_eq!(governor.telemetry().current_capacity_bytes, 0);
+    }
+
+    #[test]
+    #[cfg(feature = "aarm-telemetry")]
+    fn shared_denial_is_controlled_and_teardown_makes_capacity_available() {
+        let governor = Arc::new(MemoryGovernor::new(MIN_PAGE_SIZE));
+        let mut first = ExecutionContext::with_memory_governor(Arc::clone(&governor));
+        let mut second = ExecutionContext::with_memory_governor(Arc::clone(&governor));
+        assert!(!aster_rt_object_new(&raw mut first, 1).is_null());
+
+        assert!(aster_rt_object_new(&raw mut second, 1).is_null());
+        assert_eq!(
+            second.take_error().as_deref(),
+            Some("allocation exceeds the shared execution memory budget of 4096 bytes")
+        );
+        let denied = governor.telemetry();
+        assert_eq!(denied.current_capacity_bytes, MIN_PAGE_SIZE as u64);
+        assert_eq!(denied.denial_events, 1);
+        assert!(denied.current_capacity_bytes <= denied.hard_limit_bytes);
+        let second_telemetry = second
+            .aarm_memory_telemetry()
+            .expect("governed contexts collect AARM telemetry");
+        assert_eq!(second_telemetry.total.arena_capacity_bytes, 0);
+        assert_eq!(
+            second_telemetry.total.events.fresh_regular_page_allocations,
+            0
+        );
+
+        drop(first);
+        assert_eq!(governor.telemetry().current_capacity_bytes, 0);
+        assert!(!aster_rt_object_new(&raw mut second, 1).is_null());
+        let reused_budget = governor.telemetry();
+        assert_eq!(reused_budget.current_capacity_bytes, MIN_PAGE_SIZE as u64);
+        assert_eq!(reused_budget.grant_events, 2);
+        assert_eq!(reused_budget.release_events, 1);
+        assert_eq!(
+            reused_budget.granted_bytes_cumulative - reused_budget.released_bytes_cumulative,
+            reused_budget.current_capacity_bytes
+        );
+
+        drop(second);
+        assert_eq!(governor.telemetry().current_capacity_bytes, 0);
+    }
+
+    #[test]
+    fn local_limit_is_checked_before_the_shared_governor() {
+        let governor = Arc::new(MemoryGovernor::new(MIN_PAGE_SIZE * 4));
+        let mut context = ExecutionContext::with_options_and_governor(
+            true,
+            MIN_PAGE_SIZE,
+            Some(Arc::clone(&governor)),
+        );
+        assert!(
+            aster_rt_object_new(
+                &raw mut context,
+                i32::try_from(MIN_PAGE_SIZE + 1).expect("test size fits i32")
+            )
+            .is_null()
+        );
+        assert_eq!(
+            context.take_error().as_deref(),
+            Some("allocation exceeds the execution memory limit of 4096 bytes")
+        );
+        let telemetry = governor.telemetry();
+        assert_eq!(telemetry.current_capacity_bytes, 0);
+        assert_eq!(telemetry.grant_events, 0);
+        assert_eq!(telemetry.denial_events, 0);
+    }
+
+    #[test]
+    fn shared_governor_enforcement_does_not_depend_on_telemetry_feature() {
+        let governor = Arc::new(MemoryGovernor::new(MIN_PAGE_SIZE));
+        let mut first = ExecutionContext::with_memory_governor(Arc::clone(&governor));
+        let mut second = ExecutionContext::with_memory_governor(Arc::clone(&governor));
+        assert!(!aster_rt_object_new(&raw mut first, 1).is_null());
+        assert!(aster_rt_object_new(&raw mut second, 1).is_null());
+        assert_eq!(
+            second.take_error().as_deref(),
+            Some("allocation exceeds the shared execution memory budget of 4096 bytes")
+        );
+        assert_eq!(
+            governor.telemetry().current_capacity_bytes,
+            MIN_PAGE_SIZE as u64
+        );
+        drop((first, second));
+        assert_eq!(governor.telemetry().current_capacity_bytes, 0);
     }
 
     #[test]

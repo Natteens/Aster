@@ -16,7 +16,7 @@ fn small_results() -> &'static [CaseResult] {
 #[test]
 fn small_matrix_covers_required_workload_shapes() {
     let results = small_results();
-    assert_eq!(results.len(), 9);
+    assert_eq!(results.len(), 18);
     for workload in [
         "tiny_allocations",
         "long_scope_temporary",
@@ -24,6 +24,15 @@ fn small_matrix_covers_required_workload_shapes() {
         "temporary_burst_rewind",
         "temporary_burst_rewind_reuse",
         "persistent_control",
+        "direct_tiny_allocations_control",
+        "governed_tiny_allocations",
+        "page_growth_control",
+        "governed_page_growth",
+        "governed_contexts_1",
+        "governed_contexts_4",
+        "governed_contexts_16",
+        "shared_governor_denial",
+        "governor_teardown_reuse",
     ] {
         assert!(results.iter().any(|result| result.workload == workload));
     }
@@ -60,7 +69,59 @@ fn every_region_and_total_obey_allocator_invariants() {
             telemetry.total.arena_capacity_bytes,
             telemetry.temporary.arena_capacity_bytes + telemetry.persistent.arena_capacity_bytes
         );
+        if let Some(governor) = telemetry.governor {
+            assert!(governor.current_capacity_bytes <= governor.hard_limit_bytes);
+            assert!(governor.peak_capacity_bytes >= governor.current_capacity_bytes);
+            assert_eq!(
+                governor.granted_bytes_cumulative - governor.released_bytes_cumulative,
+                governor.current_capacity_bytes
+            );
+        }
     }
+}
+
+#[test]
+fn governed_cases_report_shared_admission_denial_and_release() {
+    let results = small_results();
+    for context_count in [1_u64, 4, 16] {
+        let workload = format!("governed_contexts_{context_count}");
+        let result = results
+            .iter()
+            .find(|result| result.workload == workload)
+            .expect("governed context result exists");
+        let governor = result
+            .telemetry
+            .governor
+            .expect("governed result has governor telemetry");
+        assert_eq!(governor.grant_events, context_count);
+        assert_eq!(governor.denial_events, 0);
+        assert_eq!(
+            governor.current_capacity_bytes,
+            result.telemetry.total.arena_capacity_bytes
+        );
+    }
+
+    let denial = results
+        .iter()
+        .find(|result| result.workload == "shared_governor_denial")
+        .expect("shared denial result exists")
+        .telemetry
+        .governor
+        .expect("shared denial has governor telemetry");
+    assert_eq!(denial.grant_events, 1);
+    assert_eq!(denial.denial_events, 1);
+    assert_eq!(denial.current_capacity_bytes, denial.hard_limit_bytes);
+
+    let teardown = results
+        .iter()
+        .find(|result| result.workload == "governor_teardown_reuse")
+        .expect("teardown result exists")
+        .telemetry
+        .governor
+        .expect("teardown result has governor telemetry");
+    assert_eq!(teardown.grant_events, 2);
+    assert_eq!(teardown.release_events, 1);
+    assert_eq!(teardown.current_capacity_bytes, teardown.hard_limit_bytes);
 }
 
 #[test]
@@ -100,15 +161,19 @@ fn rewind_reuse_and_persistence_are_visible_without_policy_changes() {
 #[test]
 fn structured_output_contains_no_future_aarm_claims() {
     let json = serialize_results(small_results());
-    assert!(json.starts_with("{\"schema_version\":1,"));
+    assert!(json.starts_with("{\"schema_version\":2,"));
     assert!(json.contains("\"requested_bytes\""));
     assert!(json.contains("\"arena_capacity_bytes\""));
     assert!(json.contains("\"last_rewind\""));
     assert!(json.contains("\"process_rss_bytes\""));
+    assert!(json.contains("\"current_capacity_bytes\""));
+    assert!(json.contains("\"grant_events\""));
+    assert!(json.contains("\"denial_events\""));
+    assert!(json.contains("\"release_events\""));
     assert!(!json.contains("virtual_reserved_bytes"));
     assert!(!json.contains("committed_backing_bytes"));
     assert!(!json.contains("purge_events"));
-    assert_eq!(json.matches("\"workload\":").count(), 9);
+    assert_eq!(json.matches("\"workload\":").count(), 18);
 }
 
 #[test]

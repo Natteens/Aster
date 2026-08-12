@@ -11,8 +11,13 @@
 
 use std::{
     alloc::{Layout, alloc_zeroed, dealloc},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
+
+use crate::memory_governor::{GovernorReservation, MemoryGovernor, MemoryGovernorTelemetry};
 
 /// Default page capacity in bytes.
 pub(crate) const DEFAULT_PAGE_SIZE: usize = 64 * 1024;
@@ -37,17 +42,32 @@ struct Page {
     base: *mut u8,
     layout: Layout,
     cursor: usize,
+    _governor_reservation: Option<GovernorReservation>,
 }
 
 impl Page {
-    fn try_new(capacity: usize) -> Result<Self, ArenaAllocError> {
+    fn try_new(
+        capacity: usize,
+        governor_reservation: Option<GovernorReservation>,
+    ) -> Result<Self, ArenaAllocError> {
+        Self::try_new_with_allocator(capacity, governor_reservation, |layout| {
+            // SAFETY: `layout` has non-zero size and valid alignment.
+            #[allow(unsafe_code)]
+            unsafe {
+                alloc_zeroed(layout)
+            }
+        })
+    }
+
+    fn try_new_with_allocator(
+        capacity: usize,
+        governor_reservation: Option<GovernorReservation>,
+        allocate: impl FnOnce(Layout) -> *mut u8,
+    ) -> Result<Self, ArenaAllocError> {
         debug_assert!(capacity > 0);
         let layout = Layout::from_size_align(capacity, MAX_ALIGN)
             .map_err(|_| ArenaAllocError::AddressSpace)?;
-        // SAFETY: `layout` has non-zero size and valid alignment. The returned
-        // pointer owns `capacity` zeroed bytes.
-        #[allow(unsafe_code)]
-        let base = unsafe { alloc_zeroed(layout) };
+        let base = allocate(layout);
         if base.is_null() {
             return Err(ArenaAllocError::OutOfMemory);
         }
@@ -55,6 +75,7 @@ impl Page {
             base,
             layout,
             cursor: 0,
+            _governor_reservation: governor_reservation,
         })
     }
 
@@ -183,12 +204,14 @@ struct ArenaTelemetryState {
 pub(crate) enum ArenaAllocError {
     AddressSpace,
     Limit,
+    SharedLimit { hard_limit_bytes: u64 },
     OutOfMemory,
 }
 
 /// Paged bump allocator. Owns all pages and frees them on drop.
 pub(crate) struct PagedArena {
     pages: Vec<Page>,
+    governor: Option<Arc<MemoryGovernor>>,
     active_pages: usize,
     used_bytes: usize,
     reserved_bytes: usize,
@@ -203,6 +226,7 @@ impl PagedArena {
     pub(crate) fn new() -> Self {
         PagedArena {
             pages: Vec::new(),
+            governor: None,
             active_pages: 0,
             used_bytes: 0,
             reserved_bytes: 0,
@@ -212,6 +236,17 @@ impl PagedArena {
             #[cfg(feature = "aarm-telemetry")]
             telemetry: ArenaTelemetryState::default(),
         }
+    }
+
+    pub(crate) fn with_memory_governor(governor: Arc<MemoryGovernor>) -> Self {
+        Self {
+            governor: Some(governor),
+            ..Self::new()
+        }
+    }
+
+    pub(crate) fn governor_telemetry(&self) -> Option<MemoryGovernorTelemetry> {
+        self.governor.as_ref().map(|governor| governor.telemetry())
     }
 
     /// Fallibly allocate zeroed arena storage without invoking Rust's global
@@ -296,7 +331,18 @@ impl PagedArena {
         self.pages
             .try_reserve(1)
             .map_err(|_| ArenaAllocError::OutOfMemory)?;
-        let mut page = Page::try_new(capacity)?;
+        let governor_reservation = if let Some(governor) = &self.governor {
+            Some(
+                governor
+                    .try_acquire(capacity)
+                    .ok_or(ArenaAllocError::SharedLimit {
+                        hard_limit_bytes: governor.hard_limit_bytes(),
+                    })?,
+            )
+        } else {
+            None
+        };
+        let mut page = Page::try_new(capacity, governor_reservation)?;
         let (ptr, consumed) = page
             .try_alloc(size, align)
             .expect("fresh page must satisfy the allocation");
@@ -566,6 +612,7 @@ fn align_up(value: usize, align: usize) -> Option<usize> {
 #[allow(clippy::cast_ptr_alignment, clippy::ptr_as_ptr)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn fallible_allocation_rejects_the_budget_before_reserving_a_page() {
@@ -576,6 +623,27 @@ mod tests {
         );
         assert_eq!(arena.page_count(), 0);
         assert_eq!(arena.metrics().reserved_bytes, 0);
+    }
+
+    #[test]
+    fn failed_host_page_allocation_releases_its_governor_grant() {
+        let governor = Arc::new(MemoryGovernor::new(MIN_PAGE_SIZE));
+        let reservation = governor
+            .try_acquire(MIN_PAGE_SIZE)
+            .expect("one page fits the governor");
+        let result = Page::try_new_with_allocator(MIN_PAGE_SIZE, Some(reservation), |_| {
+            std::ptr::null_mut()
+        });
+        assert!(matches!(result, Err(ArenaAllocError::OutOfMemory)));
+
+        let telemetry = governor.telemetry();
+        assert_eq!(telemetry.current_capacity_bytes, 0);
+        assert_eq!(telemetry.grant_events, 1);
+        assert_eq!(telemetry.release_events, 1);
+        assert_eq!(
+            telemetry.granted_bytes_cumulative - telemetry.released_bytes_cumulative,
+            telemetry.current_capacity_bytes
+        );
     }
 
     #[test]

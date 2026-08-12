@@ -82,6 +82,65 @@ allocation counts.
 
 No allocator event is called a commit. The current allocator is not an OS page backend.
 
+## AARM-2A shared MemoryGovernor
+
+AARM-2A adds an opt-in, runtime-owned `MemoryGovernor` for research executions. Production and
+default ASTER execution remain unchanged: `ExecutionContext::new()` and
+`ExecutionContext::with_stats()` still use only the existing 1 GiB per-context safety limit. A
+governed context is created explicitly with a shared `Arc<MemoryGovernor>` and continues to use the
+current `PagedArena` and `std::alloc` page backing.
+
+The governor limits retained arena page capacity across every participating Temporary and
+Persistent arena. It does not limit logical requested bytes, live used bytes, process RSS, virtual
+address space, or OS committed backing. Both authorities apply to a governed context:
+
+```text
+existing 1 GiB local context safety ceiling
+AND
+explicit shared governor hard ceiling
+```
+
+An arena consults the governor only when it has calculated the exact capacity of a fresh page and
+has already established that its local context limit permits that page. Admission atomically
+reserves the page capacity before the host allocation. Allocation from the active page and reuse of
+an inactive retained page perform no governor lookup, atomic reservation, or shared-counter update.
+
+Every successful admission creates one reservation owned by the resulting page. If host allocation
+fails, the unpublished page construction drops the reservation and restores the budget. Rewind does
+not release a reservation because the current allocator retains the page. Destroying the page,
+normally through context teardown, releases its reservation exactly once.
+
+The governor atomics use relaxed ordering because they protect numeric resource accounting only.
+Page publication and memory ownership stay within the exclusively borrowed arena and do not rely on
+the counters for cross-thread synchronization. The compare/exchange admission loop prevents budget
+overshoot. After a completed operation, cumulative granted bytes minus cumulative released bytes
+equals current governed capacity; a snapshot taken during a concurrent in-flight admission or
+release may observe the independently loaded counters at adjacent instants. Governor snapshots are
+therefore observational, not transactional: cross-field equalities are guaranteed after quiescence,
+not during concurrent mutation. In particular, an admission updates current capacity before its
+peak and grant counters, so a racing snapshot may transiently observe current capacity above the
+sampled peak or before the matching cumulative grant.
+
+Experimental governor telemetry records:
+
+- `hard_limit_bytes`: fixed shared retained-capacity ceiling;
+- `current_capacity_bytes`: page capacity currently owned by all participating arenas;
+- `peak_capacity_bytes`: largest successfully admitted current capacity;
+- `grant_events`: successful fresh-page capacity admissions;
+- `denial_events`: admissions rejected before host page allocation;
+- `release_events`: page reservations returned at permanent page destruction;
+- `granted_bytes_cumulative`: total capacity admitted over the governor lifetime;
+- `released_bytes_cumulative`: total capacity returned over the governor lifetime.
+
+These fields describe governed allocator capacity. They are not committed memory, virtual
+reservation, or RSS, and they are absent from stable `--memory-stats` output.
+
+Public Task/Parallel execution is intentionally not governed in AARM-2A. With a naive shared
+first-come admission race, host scheduling could decide which worker receives the final grant and
+therefore which logical worker first encounters memory exhaustion. ASTER's deterministic worker
+failure ordering requires an explicit admission or quota design before integration. AARM-2B owns
+that design; AARM-2A does not change worker-pool behavior.
+
 ## Measurement invariants
 
 Every snapshot must satisfy:
@@ -127,7 +186,9 @@ and worker payloads are live when the platform supports it.
 `aarm_memory_matrix` is release-only and supports `small`, `medium`, and manual `large` scales. Its
 workloads cover tiny allocations, long-scope temporary retention, helper-scoped control, temporary
 burst and rewind, repeated burst/reuse, persistent retention, and isolated 1/4/16-context worker
-shapes. Default burst sizes are measured in tens of MiB or less; `large` must be selected explicitly.
+shapes. AARM-2A extends it with paired governed/control tiny-allocation and page-growth cases,
+manually governed 1/4/16-context aggregates, shared-limit denial, and teardown/reuse. Default burst
+sizes are measured in tens of MiB or less; `large` must be selected explicitly.
 
 ```console
 cargo run --release -p aster-codegen-cranelift --features aarm-telemetry --example aarm_memory_matrix -- --scale small
@@ -140,12 +201,12 @@ not committed.
 
 ## Metrics that do not exist yet
 
-AARM-1 does not expose or infer:
+AARM-2A does not expose or infer:
 
 - `virtual_reserved_bytes`;
 - `committed_backing_bytes`;
 - purge or decommit events and bytes;
-- governor borrows or denials;
+- adaptive governor quotas, borrows, or host-memory policy;
 - decay, hysteresis, or pressure state.
 
 These fields remain absent until an architecture exists that can measure them accurately.
@@ -154,7 +215,9 @@ These fields remain absent until an architecture exists that can measure them ac
 
 ```text
 AARM-1 observability
--> AARM-2 MemoryGovernor on current allocator
+-> AARM-2A shared MemoryGovernor foundation on current allocator
+-> AARM-2B deterministic worker admission/quota design
+-> AARM-2C host-adaptive policy research
 -> AARM-3 OS PageBackend
 -> AARM-4 delayed purge/hysteresis
 -> AARM-5 MIR lifetime refinement

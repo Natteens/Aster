@@ -17,6 +17,7 @@ pub mod io;
 pub mod io_error;
 pub mod log;
 mod math;
+mod memory_governor;
 mod object;
 pub mod registry;
 pub mod string;
@@ -48,5 +49,6 @@ pub use io::{
 };
 pub use io_error::{PortableIoError, PortableIoErrorKind, classify_io_error};
 pub use log::LogLevel;
+pub use memory_governor::{MemoryGovernor, MemoryGovernorTelemetry};
 pub use registry::{RuntimeFunction, RuntimeSignature, RuntimeType, runtime_functions};
 pub use string::{AsterStrHeader, decode_str, encode_str};

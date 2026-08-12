@@ -5,6 +5,7 @@
 
 use std::{
     fmt::Write as _,
+    mem::size_of,
     sync::{Arc, Barrier, mpsc},
     thread,
     time::Instant,
@@ -13,12 +14,16 @@ use std::{
 use aster_codegen_cranelift::{AarmMemoryTelemetry, ExecutionValue, execute_with_aarm_telemetry};
 use aster_compiler::compile;
 use aster_runtime::{
-    AarmAllocatorEvents, AarmRegionTelemetry, ExecutionContext,
+    AarmAllocatorEvents, AarmRegionTelemetry, ExecutionContext, MemoryGovernor,
+    MemoryGovernorTelemetry,
     context::{
-        aster_rt_array_element, aster_rt_array_new_temporary, aster_rt_temporary_scope_enter,
-        aster_rt_temporary_scope_leave,
+        aster_rt_array_element, aster_rt_array_new, aster_rt_array_new_temporary,
+        aster_rt_temporary_scope_enter, aster_rt_temporary_scope_leave,
     },
 };
+
+const GOVERNOR_PAGE_BYTES: usize = 4 * 1024;
+const PAGE_GROWTH_ALLOCATION_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scale {
@@ -122,6 +127,15 @@ pub fn run_matrix(scales: &[Scale]) -> Vec<CaseResult> {
         for workers in [1, 4, 16] {
             results.push(worker_context_case(scale, workers));
         }
+        results.push(direct_tiny_allocation_case(scale, false));
+        results.push(direct_tiny_allocation_case(scale, true));
+        results.push(page_growth_case(scale, false));
+        results.push(page_growth_case(scale, true));
+        for contexts in [1, 4, 16] {
+            results.push(governed_contexts_case(scale, contexts));
+        }
+        results.push(shared_governor_denial_case(scale));
+        results.push(governor_teardown_reuse_case(scale));
     }
     results
 }
@@ -330,6 +344,221 @@ fn worker_context_case(scale: Scale, workers: usize) -> CaseResult {
     }
 }
 
+fn direct_tiny_allocation_case(scale: Scale, governed: bool) -> CaseResult {
+    let iterations = scale.tiny_iterations();
+    let governor = governed.then(|| Arc::new(MemoryGovernor::new(scale.burst_bytes())));
+    let mut context = governor
+        .as_ref()
+        .map_or_else(ExecutionContext::with_stats, |governor| {
+            ExecutionContext::with_memory_governor(Arc::clone(governor))
+        });
+    let before = process_memory();
+    let started = Instant::now();
+    let mut checksum = 0_i64;
+    for _ in 0..iterations {
+        let array = aster_rt_array_new(&raw mut context, 1, 1);
+        assert!(!array.is_null());
+        checksum += 1;
+    }
+    let elapsed_micros = started.elapsed().as_micros();
+    assert!(context.take_error().is_none());
+    let telemetry = context
+        .aarm_memory_telemetry()
+        .expect("statistics mode enables telemetry");
+    let after = process_memory();
+    CaseResult {
+        workload: if governed {
+            "governed_tiny_allocations"
+        } else {
+            "direct_tiny_allocations_control"
+        },
+        scale,
+        iterations: u64::try_from(iterations).expect("iterations fit u64"),
+        workers: None,
+        checksum,
+        elapsed_micros,
+        telemetry,
+        rss_before_bytes: before.rss_bytes,
+        rss_at_peak_bytes: after.rss_bytes,
+        rss_after_bytes: after.rss_bytes,
+        process_peak_rss_bytes: after.peak_rss_bytes,
+    }
+}
+
+fn page_growth_case(scale: Scale, governed: bool) -> CaseResult {
+    let pages = scale.burst_bytes() / PAGE_GROWTH_ALLOCATION_BYTES;
+    let payload_bytes = PAGE_GROWTH_ALLOCATION_BYTES - size_of::<aster_runtime::AsterArray>();
+    let governor = governed.then(|| Arc::new(MemoryGovernor::new(scale.burst_bytes())));
+    let mut context = governor
+        .as_ref()
+        .map_or_else(ExecutionContext::with_stats, |governor| {
+            ExecutionContext::with_memory_governor(Arc::clone(governor))
+        });
+    let before = process_memory();
+    let started = Instant::now();
+    for _ in 0..pages {
+        let array = aster_rt_array_new(
+            &raw mut context,
+            i32::try_from(payload_bytes).expect("page-growth payload fits i32"),
+            1,
+        );
+        assert!(!array.is_null());
+    }
+    let elapsed_micros = started.elapsed().as_micros();
+    assert!(context.take_error().is_none());
+    let telemetry = context
+        .aarm_memory_telemetry()
+        .expect("statistics mode enables telemetry");
+    let at_peak = process_memory();
+    CaseResult {
+        workload: if governed {
+            "governed_page_growth"
+        } else {
+            "page_growth_control"
+        },
+        scale,
+        iterations: u64::try_from(pages).expect("page count fits u64"),
+        workers: None,
+        checksum: i64::try_from(pages).expect("page count fits i64"),
+        elapsed_micros,
+        telemetry,
+        rss_before_bytes: before.rss_bytes,
+        rss_at_peak_bytes: at_peak.rss_bytes,
+        rss_after_bytes: at_peak.rss_bytes,
+        process_peak_rss_bytes: at_peak.peak_rss_bytes,
+    }
+}
+
+fn governed_contexts_case(scale: Scale, context_count: usize) -> CaseResult {
+    let payload = scale.worker_payload_bytes();
+    let retained_page_capacity = payload + size_of::<aster_runtime::AsterArray>();
+    let governor = Arc::new(MemoryGovernor::new(
+        retained_page_capacity
+            .checked_mul(context_count)
+            .expect("governor matrix budget is addressable"),
+    ));
+    let before = process_memory();
+    let started = Instant::now();
+    let mut contexts = Vec::with_capacity(context_count);
+    let mut checksum = 0_i64;
+    for _ in 0..context_count {
+        let mut context = ExecutionContext::with_memory_governor(Arc::clone(&governor));
+        let context_pointer = &raw mut context;
+        let array = aster_rt_array_new(
+            context_pointer,
+            i32::try_from(payload).expect("context payload fits i32"),
+            1,
+        );
+        assert!(!array.is_null());
+        checksum += touch_array(context_pointer, array, payload);
+        assert!(context.take_error().is_none());
+        contexts.push(context);
+    }
+    let elapsed_micros = started.elapsed().as_micros();
+    let at_peak = process_memory();
+    let snapshots = contexts
+        .iter()
+        .map(|context| {
+            context
+                .aarm_memory_telemetry()
+                .expect("governed contexts collect telemetry")
+        })
+        .collect::<Vec<_>>();
+    let telemetry = sum_telemetry(&snapshots);
+    drop(contexts);
+    let after = process_memory();
+    CaseResult {
+        workload: match context_count {
+            1 => "governed_contexts_1",
+            4 => "governed_contexts_4",
+            16 => "governed_contexts_16",
+            _ => unreachable!("matrix uses fixed context counts"),
+        },
+        scale,
+        iterations: u64::try_from(payload).expect("payload fits u64"),
+        workers: None,
+        checksum,
+        elapsed_micros,
+        telemetry,
+        rss_before_bytes: before.rss_bytes,
+        rss_at_peak_bytes: at_peak.rss_bytes,
+        rss_after_bytes: after.rss_bytes,
+        process_peak_rss_bytes: after.peak_rss_bytes,
+    }
+}
+
+fn shared_governor_denial_case(scale: Scale) -> CaseResult {
+    let governor = Arc::new(MemoryGovernor::new(GOVERNOR_PAGE_BYTES));
+    let mut first = ExecutionContext::with_memory_governor(Arc::clone(&governor));
+    let mut second = ExecutionContext::with_memory_governor(Arc::clone(&governor));
+    let before = process_memory();
+    let started = Instant::now();
+    assert!(!aster_rt_array_new(&raw mut first, 1, 1).is_null());
+    assert!(aster_rt_array_new(&raw mut second, 1, 1).is_null());
+    assert_eq!(
+        second.take_error().as_deref(),
+        Some("allocation exceeds the shared execution memory budget of 4096 bytes")
+    );
+    let elapsed_micros = started.elapsed().as_micros();
+    let at_peak = process_memory();
+    let mut telemetry = sum_telemetry(&[
+        first
+            .aarm_memory_telemetry()
+            .expect("governed contexts collect telemetry"),
+        second
+            .aarm_memory_telemetry()
+            .expect("governed contexts collect telemetry"),
+    ]);
+    telemetry.governor = Some(governor.telemetry());
+    drop((first, second));
+    let after = process_memory();
+    CaseResult {
+        workload: "shared_governor_denial",
+        scale,
+        iterations: 2,
+        workers: None,
+        checksum: 1,
+        elapsed_micros,
+        telemetry,
+        rss_before_bytes: before.rss_bytes,
+        rss_at_peak_bytes: at_peak.rss_bytes,
+        rss_after_bytes: after.rss_bytes,
+        process_peak_rss_bytes: after.peak_rss_bytes,
+    }
+}
+
+fn governor_teardown_reuse_case(scale: Scale) -> CaseResult {
+    let governor = Arc::new(MemoryGovernor::new(GOVERNOR_PAGE_BYTES));
+    let before = process_memory();
+    let started = Instant::now();
+    let mut first = ExecutionContext::with_memory_governor(Arc::clone(&governor));
+    assert!(!aster_rt_array_new(&raw mut first, 1, 1).is_null());
+    drop(first);
+    let mut second = ExecutionContext::with_memory_governor(Arc::clone(&governor));
+    assert!(!aster_rt_array_new(&raw mut second, 1, 1).is_null());
+    assert!(second.take_error().is_none());
+    let elapsed_micros = started.elapsed().as_micros();
+    let at_peak = process_memory();
+    let telemetry = second
+        .aarm_memory_telemetry()
+        .expect("governed contexts collect telemetry");
+    drop(second);
+    let after = process_memory();
+    CaseResult {
+        workload: "governor_teardown_reuse",
+        scale,
+        iterations: 2,
+        workers: None,
+        checksum: 2,
+        elapsed_micros,
+        telemetry,
+        rss_before_bytes: before.rss_bytes,
+        rss_at_peak_bytes: at_peak.rss_bytes,
+        rss_after_bytes: after.rss_bytes,
+        process_peak_rss_bytes: after.peak_rss_bytes,
+    }
+}
+
 fn touch_array(
     context: *mut ExecutionContext,
     array: *mut aster_runtime::AsterArray,
@@ -377,6 +606,10 @@ fn sum_telemetry(snapshots: &[AarmMemoryTelemetry]) -> AarmMemoryTelemetry {
         add_region(&mut result.persistent, snapshot.persistent);
         add_region(&mut result.total, snapshot.total);
     }
+    result.governor = snapshots
+        .iter()
+        .rev()
+        .find_map(|snapshot| snapshot.governor);
     result
 }
 
@@ -524,6 +757,28 @@ fn json_region(region: AarmRegionTelemetry) -> String {
     )
 }
 
+fn json_governor(governor: Option<MemoryGovernorTelemetry>) -> String {
+    governor.map_or_else(
+        || "null".to_string(),
+        |governor| {
+            format!(
+                "{{\"hard_limit_bytes\":{},\"current_capacity_bytes\":{},\
+                 \"peak_capacity_bytes\":{},\"grant_events\":{},\"denial_events\":{},\
+                 \"release_events\":{},\"granted_bytes_cumulative\":{},\
+                 \"released_bytes_cumulative\":{}}}",
+                governor.hard_limit_bytes,
+                governor.current_capacity_bytes,
+                governor.peak_capacity_bytes,
+                governor.grant_events,
+                governor.denial_events,
+                governor.release_events,
+                governor.granted_bytes_cumulative,
+                governor.released_bytes_cumulative,
+            )
+        },
+    )
+}
+
 fn json_case(result: &CaseResult) -> String {
     let workers = result
         .workers
@@ -531,7 +786,7 @@ fn json_case(result: &CaseResult) -> String {
     format!(
         "{{\"workload\":\"{}\",\"scale\":\"{}\",\"iterations\":{},\"workers\":{},\
          \"checksum\":{},\"elapsed_micros\":{},\"requested_bytes\":{},\
-         \"temporary\":{},\"persistent\":{},\"total\":{},\
+         \"temporary\":{},\"persistent\":{},\"total\":{},\"governor\":{},\
          \"process_rss_bytes\":{{\"before\":{},\"at_peak\":{},\"after\":{},\
          \"process_peak\":{}}}}}",
         result.workload,
@@ -544,6 +799,7 @@ fn json_case(result: &CaseResult) -> String {
         json_region(result.telemetry.temporary),
         json_region(result.telemetry.persistent),
         json_region(result.telemetry.total),
+        json_governor(result.telemetry.governor),
         json_option(result.rss_before_bytes),
         json_option(result.rss_at_peak_bytes),
         json_option(result.rss_after_bytes),
@@ -553,7 +809,7 @@ fn json_case(result: &CaseResult) -> String {
 
 #[must_use]
 pub fn serialize_results(results: &[CaseResult]) -> String {
-    let mut output = String::from("{\"schema_version\":1,\"results\":[");
+    let mut output = String::from("{\"schema_version\":2,\"results\":[");
     for (index, result) in results.iter().enumerate() {
         if index != 0 {
             output.push(',');
@@ -606,10 +862,23 @@ fn main() {
         if let Some(workers) = result.workers {
             write!(label, "_{workers}").expect("writing a String cannot fail");
         }
+        let governor = result.telemetry.governor.map_or_else(
+            || "none".to_string(),
+            |governor| {
+                format!(
+                    "{}/{} grants={} denials={} releases={}",
+                    governor.current_capacity_bytes,
+                    governor.hard_limit_bytes,
+                    governor.grant_events,
+                    governor.denial_events,
+                    governor.release_events
+                )
+            },
+        );
         println!(
             "workload={label:<36} scale={:<6} elapsed_ms={:>5}.{:03} requested={:>10} \
              final_used={:>10} peak_used={:>10} capacity={:>10} fast={:>8} slow={:>8} \
-             reuse={:>5} rewinds={:>5} rss_peak={}",
+             reuse={:>5} rewinds={:>5} governor={governor} rss_peak={}",
             result.scale.as_str(),
             result.elapsed_micros / 1000,
             result.elapsed_micros % 1000,
