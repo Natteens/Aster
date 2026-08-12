@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "Execution runtime boundary and ABI for JIT-compiled Aster programs"
 
+[features]
+aarm-telemetry = []
+
 [lints.rust]
 unsafe_code = "deny"
 

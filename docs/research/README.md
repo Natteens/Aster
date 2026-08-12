@@ -4,6 +4,7 @@ These documents explore possible directions. They are not implementation plans a
 features available in the current compiler.
 
 - [Hot reload](hot-reload.md)
+- [Adaptive Region Memory (AARM)](aarm.md)
 - [GPU targets and an optional engine](gpu-and-engine.md)
 - [ECS as an optional library or framework](ecs.md)
 

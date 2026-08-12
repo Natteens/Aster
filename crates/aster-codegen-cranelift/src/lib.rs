@@ -30,7 +30,7 @@ use std::{
 };
 
 use aster_mir as mir;
-pub use aster_runtime::MemoryStats;
+pub use aster_runtime::{AarmMemoryTelemetry, MemoryStats};
 use aster_runtime::{RuntimeType, runtime_functions};
 use aster_types::Primitive;
 use cranelift_codegen::ir::{
@@ -46,6 +46,8 @@ use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, default
 use backend::module_error;
 use declarations::runtime_type;
 use execution::execute_resolved;
+#[cfg(feature = "aarm-telemetry")]
+use execution::execute_resolved_with_aarm_telemetry;
 use layouts::Layouts;
 use validation::{select_entry, validate_invocable_entry, validate_module};
 use values::{
@@ -188,6 +190,24 @@ pub fn execute_with_stats(
     validate_module(module)?;
     let entry = select_entry(module, function_name)?;
     execute_resolved(module, entry, true, None, None)
+}
+
+/// Execute one entry with the opt-in experimental AARM allocator telemetry.
+/// Stable CLI memory-statistics output remains unchanged.
+///
+/// # Errors
+///
+/// Returns the same controlled validation, preparation, and runtime errors as
+/// [`execute_with_stats`].
+#[doc(hidden)]
+#[cfg(feature = "aarm-telemetry")]
+pub fn execute_with_aarm_telemetry(
+    module: &mir::Module,
+    function_name: &str,
+) -> Result<(ExecutionValue, AarmMemoryTelemetry), BackendError> {
+    validate_module(module)?;
+    let entry = select_entry(module, function_name)?;
+    execute_resolved_with_aarm_telemetry(module, entry)
 }
 
 /// Like [`execute`], but injects `console_backend` for `aster.io.Write`/

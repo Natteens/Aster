@@ -120,6 +120,8 @@ pub(crate) struct ArenaMark {
     active_pages: usize,
     cursor: usize,
     used_bytes: usize,
+    #[cfg(feature = "aarm-telemetry")]
+    active_page_capacity_bytes: usize,
 }
 
 /// Current allocation statistics from the arena.
@@ -128,6 +130,53 @@ pub(crate) struct ArenaMetrics {
     pub used_bytes: usize,
     /// Total capacity of all pages held by the arena.
     pub reserved_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ArenaEventMetrics {
+    pub active_page_fast_path_allocations: u64,
+    pub slow_path_allocations: u64,
+    pub inactive_page_reuse_events: u64,
+    pub fresh_regular_page_allocations: u64,
+    pub fresh_oversized_page_allocations: u64,
+    pub rewind_events: u64,
+    pub rewound_bytes: u64,
+    pub allocation_limit_denials: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ArenaRewindMetrics {
+    pub used_bytes_before: usize,
+    pub used_bytes_after: usize,
+    pub capacity_bytes_before: usize,
+    pub capacity_bytes_after: usize,
+    pub active_page_capacity_bytes_after: usize,
+    pub inactive_page_capacity_bytes_after: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ArenaTelemetrySnapshot {
+    pub used_bytes: usize,
+    pub capacity_bytes: usize,
+    pub active_page_capacity_bytes: usize,
+    pub inactive_page_capacity_bytes: usize,
+    pub page_count: usize,
+    pub active_page_count: usize,
+    pub inactive_page_count: usize,
+    pub peak_used_bytes: usize,
+    pub peak_capacity_bytes: usize,
+    pub events: ArenaEventMetrics,
+    pub last_rewind: Option<ArenaRewindMetrics>,
+}
+
+#[cfg(feature = "aarm-telemetry")]
+#[derive(Default)]
+struct ArenaTelemetryState {
+    active_page_capacity_bytes: usize,
+    peak_used_bytes: usize,
+    peak_capacity_bytes: usize,
+    events: ArenaEventMetrics,
+    last_rewind: Option<ArenaRewindMetrics>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,6 +195,8 @@ pub(crate) struct PagedArena {
     arena_id: u64,
     next_mark_id: u64,
     mark_stack: Vec<u64>,
+    #[cfg(feature = "aarm-telemetry")]
+    telemetry: ArenaTelemetryState,
 }
 
 impl PagedArena {
@@ -158,6 +209,8 @@ impl PagedArena {
             arena_id: next_arena_id(),
             next_mark_id: 1,
             mark_stack: Vec::new(),
+            #[cfg(feature = "aarm-telemetry")]
+            telemetry: ArenaTelemetryState::default(),
         }
     }
 
@@ -172,6 +225,11 @@ impl PagedArena {
     ) -> Result<*mut u8, ArenaAllocError> {
         if let Some(pointer) = self.try_alloc_existing(size, align)? {
             return Ok(pointer);
+        }
+
+        #[cfg(feature = "aarm-telemetry")]
+        {
+            self.telemetry.events.slow_path_allocations += 1;
         }
 
         assert!(
@@ -191,6 +249,8 @@ impl PagedArena {
         if let Some(index) = reusable_index {
             self.pages.swap(self.active_pages, index);
             let page = &mut self.pages[self.active_pages];
+            #[cfg(feature = "aarm-telemetry")]
+            let activated_capacity = page.capacity();
             let (ptr, consumed) = page
                 .try_alloc(size, align)
                 .expect("reused page must satisfy the allocation");
@@ -199,6 +259,13 @@ impl PagedArena {
                 .used_bytes
                 .checked_add(consumed)
                 .ok_or(ArenaAllocError::AddressSpace)?;
+            #[cfg(feature = "aarm-telemetry")]
+            {
+                self.telemetry.events.inactive_page_reuse_events += 1;
+                self.telemetry.active_page_capacity_bytes += activated_capacity;
+            }
+            #[cfg(feature = "aarm-telemetry")]
+            self.refresh_telemetry_peaks();
             return Ok(ptr);
         }
 
@@ -220,6 +287,10 @@ impl PagedArena {
             .checked_add(capacity)
             .ok_or(ArenaAllocError::AddressSpace)?;
         if new_reserved > max_reserved_bytes {
+            #[cfg(feature = "aarm-telemetry")]
+            {
+                self.telemetry.events.allocation_limit_denials += 1;
+            }
             return Err(ArenaAllocError::Limit);
         }
         self.pages
@@ -239,6 +310,17 @@ impl PagedArena {
         let new_page_index = self.pages.len() - 1;
         self.pages.swap(self.active_pages, new_page_index);
         self.active_pages += 1;
+        #[cfg(feature = "aarm-telemetry")]
+        {
+            self.telemetry.active_page_capacity_bytes += capacity;
+            if size > DEFAULT_PAGE_SIZE {
+                self.telemetry.events.fresh_oversized_page_allocations += 1;
+            } else {
+                self.telemetry.events.fresh_regular_page_allocations += 1;
+            }
+        }
+        #[cfg(feature = "aarm-telemetry")]
+        self.refresh_telemetry_peaks();
         Ok(ptr)
     }
 
@@ -268,6 +350,12 @@ impl PagedArena {
                     .used_bytes
                     .checked_add(consumed)
                     .ok_or(ArenaAllocError::AddressSpace)?;
+                #[cfg(feature = "aarm-telemetry")]
+                {
+                    self.telemetry.events.active_page_fast_path_allocations += 1;
+                }
+                #[cfg(feature = "aarm-telemetry")]
+                self.refresh_telemetry_peaks();
                 return Ok(Some(ptr));
             }
         }
@@ -301,18 +389,26 @@ impl PagedArena {
             active_pages: self.active_pages,
             cursor,
             used_bytes: self.used_bytes,
+            #[cfg(feature = "aarm-telemetry")]
+            active_page_capacity_bytes: self.telemetry.active_page_capacity_bytes,
         }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn rewind(&mut self, mark: ArenaMark) {
+        #[cfg(feature = "aarm-telemetry")]
+        let used_bytes_before = self.used_bytes;
+        #[cfg(feature = "aarm-telemetry")]
+        let capacity_bytes_before = self.reserved_bytes;
         let ArenaMark {
             arena_id,
             mark_id,
             active_pages,
             cursor,
             used_bytes,
+            #[cfg(feature = "aarm-telemetry")]
+            active_page_capacity_bytes,
         } = mark;
 
         assert_eq!(
@@ -376,6 +472,24 @@ impl PagedArena {
             Some(mark_id),
             "arena mark stack changed during rewind"
         );
+
+        #[cfg(feature = "aarm-telemetry")]
+        {
+            self.telemetry.active_page_capacity_bytes = active_page_capacity_bytes;
+            let active_page_capacity_bytes_after = active_page_capacity_bytes;
+            let inactive_page_capacity_bytes_after =
+                self.reserved_bytes - active_page_capacity_bytes_after;
+            self.telemetry.events.rewind_events += 1;
+            self.telemetry.events.rewound_bytes += (used_bytes_before - used_bytes) as u64;
+            self.telemetry.last_rewind = Some(ArenaRewindMetrics {
+                used_bytes_before,
+                used_bytes_after: used_bytes,
+                capacity_bytes_before,
+                capacity_bytes_after: self.reserved_bytes,
+                active_page_capacity_bytes_after,
+                inactive_page_capacity_bytes_after,
+            });
+        }
     }
 
     pub(crate) fn metrics(&self) -> ArenaMetrics {
@@ -383,6 +497,36 @@ impl PagedArena {
             used_bytes: self.used_bytes,
             reserved_bytes: self.reserved_bytes,
         }
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn telemetry_snapshot(&self) -> Option<ArenaTelemetrySnapshot> {
+        #[cfg(not(feature = "aarm-telemetry"))]
+        return None;
+
+        #[cfg(feature = "aarm-telemetry")]
+        let active_page_capacity_bytes = self.telemetry.active_page_capacity_bytes;
+        #[cfg(feature = "aarm-telemetry")]
+        Some(ArenaTelemetrySnapshot {
+            used_bytes: self.used_bytes,
+            capacity_bytes: self.reserved_bytes,
+            active_page_capacity_bytes,
+            inactive_page_capacity_bytes: self.reserved_bytes - active_page_capacity_bytes,
+            page_count: self.pages.len(),
+            active_page_count: self.active_pages,
+            inactive_page_count: self.pages.len() - self.active_pages,
+            peak_used_bytes: self.telemetry.peak_used_bytes,
+            peak_capacity_bytes: self.telemetry.peak_capacity_bytes,
+            events: self.telemetry.events,
+            last_rewind: self.telemetry.last_rewind,
+        })
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    fn refresh_telemetry_peaks(&mut self) {
+        self.telemetry.peak_used_bytes = self.telemetry.peak_used_bytes.max(self.used_bytes);
+        self.telemetry.peak_capacity_bytes =
+            self.telemetry.peak_capacity_bytes.max(self.reserved_bytes);
     }
 
     /// Number of pages currently held. Exposed for internal assertions only.
@@ -644,6 +788,88 @@ mod tests {
         assert_eq!(m.used_bytes, 0);
         assert_eq!(m.reserved_bytes, 0);
         assert_eq!(arena.page_count(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "aarm-telemetry")]
+    fn telemetry_classifies_fast_and_fresh_slow_paths() {
+        let mut arena = PagedArena::new();
+        arena.alloc(32, 8);
+        arena.alloc(32, 8);
+
+        let telemetry = arena.telemetry_snapshot().expect("telemetry enabled");
+        assert_eq!(telemetry.used_bytes, 64);
+        assert_eq!(telemetry.capacity_bytes, MIN_PAGE_SIZE);
+        assert_eq!(telemetry.active_page_capacity_bytes, MIN_PAGE_SIZE);
+        assert_eq!(telemetry.inactive_page_capacity_bytes, 0);
+        assert_eq!(telemetry.page_count, 1);
+        assert_eq!(telemetry.active_page_count, 1);
+        assert_eq!(telemetry.inactive_page_count, 0);
+        assert_eq!(telemetry.peak_used_bytes, 64);
+        assert_eq!(telemetry.peak_capacity_bytes, MIN_PAGE_SIZE);
+        assert_eq!(telemetry.events.slow_path_allocations, 1);
+        assert_eq!(telemetry.events.active_page_fast_path_allocations, 1);
+        assert_eq!(telemetry.events.fresh_regular_page_allocations, 1);
+        assert_eq!(telemetry.events.fresh_oversized_page_allocations, 0);
+    }
+
+    #[test]
+    #[cfg(feature = "aarm-telemetry")]
+    fn telemetry_records_rewind_and_inactive_page_reuse_without_new_capacity() {
+        let mut arena = PagedArena::new();
+        let mark = arena.mark();
+        arena.alloc(DEFAULT_PAGE_SIZE, 8);
+        arena.alloc(DEFAULT_PAGE_SIZE, 8);
+        let capacity = arena.metrics().reserved_bytes;
+
+        arena.rewind(mark);
+        let rewound = arena.telemetry_snapshot().expect("telemetry enabled");
+        assert_eq!(rewound.used_bytes, 0);
+        assert_eq!(rewound.capacity_bytes, capacity);
+        assert_eq!(rewound.active_page_capacity_bytes, 0);
+        assert_eq!(rewound.inactive_page_capacity_bytes, capacity);
+        assert_eq!(rewound.events.rewind_events, 1);
+        assert_eq!(rewound.events.rewound_bytes, (2 * DEFAULT_PAGE_SIZE) as u64);
+        assert_eq!(
+            rewound.last_rewind,
+            Some(ArenaRewindMetrics {
+                used_bytes_before: 2 * DEFAULT_PAGE_SIZE,
+                used_bytes_after: 0,
+                capacity_bytes_before: capacity,
+                capacity_bytes_after: capacity,
+                active_page_capacity_bytes_after: 0,
+                inactive_page_capacity_bytes_after: capacity,
+            })
+        );
+
+        arena.alloc(8, 8);
+        let reused = arena.telemetry_snapshot().expect("telemetry enabled");
+        assert_eq!(reused.capacity_bytes, capacity);
+        assert_eq!(reused.events.inactive_page_reuse_events, 1);
+        assert_eq!(reused.events.fresh_regular_page_allocations, 2);
+    }
+
+    #[test]
+    #[cfg(feature = "aarm-telemetry")]
+    fn telemetry_distinguishes_oversized_pages_and_limit_denials() {
+        let mut oversized = PagedArena::new();
+        oversized.alloc(DEFAULT_PAGE_SIZE + 1, 8);
+        let metrics = oversized.telemetry_snapshot().expect("telemetry enabled");
+        assert_eq!(metrics.events.fresh_oversized_page_allocations, 1);
+        assert_eq!(metrics.events.fresh_regular_page_allocations, 0);
+
+        let mut denied = PagedArena::new();
+        assert_eq!(
+            denied.try_alloc(DEFAULT_PAGE_SIZE + 1, 8, DEFAULT_PAGE_SIZE),
+            Err(ArenaAllocError::Limit)
+        );
+        let metrics = denied.telemetry_snapshot().expect("telemetry enabled");
+        assert_eq!(metrics.used_bytes, 0);
+        assert_eq!(metrics.capacity_bytes, 0);
+        assert_eq!(metrics.peak_used_bytes, 0);
+        assert_eq!(metrics.peak_capacity_bytes, 0);
+        assert_eq!(metrics.events.slow_path_allocations, 1);
+        assert_eq!(metrics.events.allocation_limit_denials, 1);
     }
 
     #[test]

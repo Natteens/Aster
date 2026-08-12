@@ -6,7 +6,10 @@ use std::mem::{align_of, size_of};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::arena::{ArenaAllocError, ArenaMark, MAX_ALIGN, PagedArena};
+use crate::arena::{
+    ArenaAllocError, ArenaEventMetrics, ArenaMark, ArenaRewindMetrics, ArenaTelemetrySnapshot,
+    MAX_ALIGN, PagedArena,
+};
 #[cfg(test)]
 use crate::arena::{DEFAULT_PAGE_SIZE, MIN_PAGE_SIZE};
 use crate::string::AsterStrHeader;
@@ -372,6 +375,128 @@ pub struct MemoryStats {
     pub peak_reserved_bytes: u64,
 }
 
+/// Experimental allocator event counters used by the AARM research matrix.
+///
+/// This surface is intentionally separate from [`MemoryStats`] and is not
+/// printed by the stable `--memory-stats` CLI output.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AarmAllocatorEvents {
+    pub active_page_fast_path_allocations: u64,
+    pub slow_path_allocations: u64,
+    pub inactive_page_reuse_events: u64,
+    pub fresh_regular_page_allocations: u64,
+    pub fresh_oversized_page_allocations: u64,
+    pub rewind_events: u64,
+    pub rewound_bytes: u64,
+    pub allocation_limit_denials: u64,
+}
+
+/// State transition recorded for the most recent rewind of one arena.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AarmRewindTelemetry {
+    pub live_used_bytes_before: u64,
+    pub live_used_bytes_after: u64,
+    pub arena_capacity_bytes_before: u64,
+    pub arena_capacity_bytes_after: u64,
+    pub active_page_capacity_bytes_after: u64,
+    pub inactive_page_capacity_bytes_after: u64,
+}
+
+/// Experimental point-in-time and peak measurements for one arena region.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AarmRegionTelemetry {
+    pub live_used_bytes: u64,
+    pub arena_capacity_bytes: u64,
+    pub active_page_capacity_bytes: u64,
+    pub inactive_page_capacity_bytes: u64,
+    pub page_count: u64,
+    pub active_page_count: u64,
+    pub inactive_page_count: u64,
+    pub peak_live_used_bytes: u64,
+    pub peak_arena_capacity_bytes: u64,
+    pub events: AarmAllocatorEvents,
+    pub last_rewind: Option<AarmRewindTelemetry>,
+}
+
+/// Opt-in AARM measurement snapshot for one execution context.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AarmMemoryTelemetry {
+    pub requested_bytes: u64,
+    pub temporary: AarmRegionTelemetry,
+    pub persistent: AarmRegionTelemetry,
+    pub total: AarmRegionTelemetry,
+}
+
+impl From<ArenaEventMetrics> for AarmAllocatorEvents {
+    fn from(events: ArenaEventMetrics) -> Self {
+        Self {
+            active_page_fast_path_allocations: events.active_page_fast_path_allocations,
+            slow_path_allocations: events.slow_path_allocations,
+            inactive_page_reuse_events: events.inactive_page_reuse_events,
+            fresh_regular_page_allocations: events.fresh_regular_page_allocations,
+            fresh_oversized_page_allocations: events.fresh_oversized_page_allocations,
+            rewind_events: events.rewind_events,
+            rewound_bytes: events.rewound_bytes,
+            allocation_limit_denials: events.allocation_limit_denials,
+        }
+    }
+}
+
+impl From<ArenaRewindMetrics> for AarmRewindTelemetry {
+    fn from(rewind: ArenaRewindMetrics) -> Self {
+        Self {
+            live_used_bytes_before: rewind.used_bytes_before as u64,
+            live_used_bytes_after: rewind.used_bytes_after as u64,
+            arena_capacity_bytes_before: rewind.capacity_bytes_before as u64,
+            arena_capacity_bytes_after: rewind.capacity_bytes_after as u64,
+            active_page_capacity_bytes_after: rewind.active_page_capacity_bytes_after as u64,
+            inactive_page_capacity_bytes_after: rewind.inactive_page_capacity_bytes_after as u64,
+        }
+    }
+}
+
+impl From<ArenaTelemetrySnapshot> for AarmRegionTelemetry {
+    fn from(snapshot: ArenaTelemetrySnapshot) -> Self {
+        Self {
+            live_used_bytes: snapshot.used_bytes as u64,
+            arena_capacity_bytes: snapshot.capacity_bytes as u64,
+            active_page_capacity_bytes: snapshot.active_page_capacity_bytes as u64,
+            inactive_page_capacity_bytes: snapshot.inactive_page_capacity_bytes as u64,
+            page_count: snapshot.page_count as u64,
+            active_page_count: snapshot.active_page_count as u64,
+            inactive_page_count: snapshot.inactive_page_count as u64,
+            peak_live_used_bytes: snapshot.peak_used_bytes as u64,
+            peak_arena_capacity_bytes: snapshot.peak_capacity_bytes as u64,
+            events: snapshot.events.into(),
+            last_rewind: snapshot.last_rewind.map(Into::into),
+        }
+    }
+}
+
+impl AarmAllocatorEvents {
+    fn sum(left: Self, right: Self) -> Self {
+        Self {
+            active_page_fast_path_allocations: left.active_page_fast_path_allocations
+                + right.active_page_fast_path_allocations,
+            slow_path_allocations: left.slow_path_allocations + right.slow_path_allocations,
+            inactive_page_reuse_events: left.inactive_page_reuse_events
+                + right.inactive_page_reuse_events,
+            fresh_regular_page_allocations: left.fresh_regular_page_allocations
+                + right.fresh_regular_page_allocations,
+            fresh_oversized_page_allocations: left.fresh_oversized_page_allocations
+                + right.fresh_oversized_page_allocations,
+            rewind_events: left.rewind_events + right.rewind_events,
+            rewound_bytes: left.rewound_bytes + right.rewound_bytes,
+            allocation_limit_denials: left.allocation_limit_denials
+                + right.allocation_limit_denials,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum AllocationCategory {
     Object,
@@ -486,6 +611,36 @@ impl ExecutionContext {
     #[must_use]
     pub fn memory_stats(&self) -> &MemoryStats {
         &self.stats
+    }
+
+    /// Return the experimental AARM allocator snapshot when this context was
+    /// created in statistics mode.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn aarm_memory_telemetry(&self) -> Option<AarmMemoryTelemetry> {
+        let persistent: AarmRegionTelemetry = self.arena.telemetry_snapshot()?.into();
+        let temporary: AarmRegionTelemetry = self.temporary_arena.telemetry_snapshot()?.into();
+        let total = AarmRegionTelemetry {
+            live_used_bytes: temporary.live_used_bytes + persistent.live_used_bytes,
+            arena_capacity_bytes: temporary.arena_capacity_bytes + persistent.arena_capacity_bytes,
+            active_page_capacity_bytes: temporary.active_page_capacity_bytes
+                + persistent.active_page_capacity_bytes,
+            inactive_page_capacity_bytes: temporary.inactive_page_capacity_bytes
+                + persistent.inactive_page_capacity_bytes,
+            page_count: temporary.page_count + persistent.page_count,
+            active_page_count: temporary.active_page_count + persistent.active_page_count,
+            inactive_page_count: temporary.inactive_page_count + persistent.inactive_page_count,
+            peak_live_used_bytes: self.stats.peak_used_bytes,
+            peak_arena_capacity_bytes: self.stats.peak_reserved_bytes,
+            events: AarmAllocatorEvents::sum(temporary.events, persistent.events),
+            last_rewind: temporary.last_rewind.or(persistent.last_rewind),
+        };
+        Some(AarmMemoryTelemetry {
+            requested_bytes: self.stats.requested_bytes,
+            temporary,
+            persistent,
+            total,
+        })
     }
 
     /// Record a controlled runtime error. First-error-wins: later calls are
@@ -6560,6 +6715,89 @@ mod tests {
         assert_eq!(stats.reserved_bytes, MIN_PAGE_SIZE as u64);
         assert_eq!(stats.peak_used_bytes, stats.used_bytes);
         assert_eq!(stats.peak_reserved_bytes, stats.reserved_bytes);
+    }
+
+    #[test]
+    #[cfg(feature = "aarm-telemetry")]
+    fn aarm_telemetry_totals_are_derived_from_both_regions() {
+        let mut context = ExecutionContext::with_stats();
+        aster_rt_object_new(&raw mut context, 32);
+        let mark = context.mark_temporary();
+        context.allocate_temporary(64, 8);
+
+        let telemetry = context
+            .aarm_memory_telemetry()
+            .expect("statistics mode enables telemetry");
+        assert_eq!(telemetry.requested_bytes, 32);
+        assert_eq!(telemetry.persistent.live_used_bytes, 32);
+        assert_eq!(telemetry.temporary.live_used_bytes, 64);
+        assert_eq!(telemetry.total.live_used_bytes, 96);
+        assert_eq!(
+            telemetry.total.arena_capacity_bytes,
+            telemetry.temporary.arena_capacity_bytes + telemetry.persistent.arena_capacity_bytes
+        );
+        assert_eq!(
+            telemetry.total.active_page_capacity_bytes,
+            telemetry.temporary.active_page_capacity_bytes
+                + telemetry.persistent.active_page_capacity_bytes
+        );
+        assert_eq!(
+            telemetry.total.inactive_page_capacity_bytes,
+            telemetry.temporary.inactive_page_capacity_bytes
+                + telemetry.persistent.inactive_page_capacity_bytes
+        );
+        assert_eq!(
+            telemetry.total.page_count,
+            telemetry.temporary.page_count + telemetry.persistent.page_count
+        );
+        assert_eq!(telemetry.total.peak_live_used_bytes, 96);
+
+        context.rewind_temporary(mark);
+        let telemetry = context
+            .aarm_memory_telemetry()
+            .expect("statistics mode enables telemetry");
+        assert_eq!(telemetry.temporary.live_used_bytes, 0);
+        assert_eq!(telemetry.persistent.live_used_bytes, 32);
+        assert_eq!(telemetry.total.live_used_bytes, 32);
+        assert_eq!(telemetry.temporary.events.rewind_events, 1);
+        assert_eq!(telemetry.temporary.events.rewound_bytes, 64);
+        assert_eq!(
+            telemetry.temporary.last_rewind,
+            Some(AarmRewindTelemetry {
+                live_used_bytes_before: 64,
+                live_used_bytes_after: 0,
+                arena_capacity_bytes_before: MIN_PAGE_SIZE as u64,
+                arena_capacity_bytes_after: MIN_PAGE_SIZE as u64,
+                active_page_capacity_bytes_after: 0,
+                inactive_page_capacity_bytes_after: MIN_PAGE_SIZE as u64,
+            })
+        );
+        assert_eq!(telemetry.total.peak_live_used_bytes, 96);
+    }
+
+    #[test]
+    #[cfg(feature = "aarm-telemetry")]
+    fn aarm_feature_exposes_an_empty_snapshot_for_a_fresh_context() {
+        assert!(ExecutionContext::new().aarm_memory_telemetry().is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "aarm-telemetry")]
+    fn aarm_limit_denial_does_not_increase_live_or_capacity_metrics() {
+        let mut context = ExecutionContext::with_options(true, MIN_PAGE_SIZE);
+        let request = i32::try_from(MIN_PAGE_SIZE + 1).expect("test request fits i32");
+        let pointer = aster_rt_object_new(&raw mut context, request);
+        assert!(pointer.is_null());
+
+        let telemetry = context
+            .aarm_memory_telemetry()
+            .expect("statistics mode enables telemetry");
+        assert_eq!(telemetry.total.live_used_bytes, 0);
+        assert_eq!(telemetry.total.arena_capacity_bytes, 0);
+        assert_eq!(telemetry.total.peak_live_used_bytes, 0);
+        assert_eq!(telemetry.total.peak_arena_capacity_bytes, 0);
+        assert_eq!(telemetry.total.events.allocation_limit_denials, 1);
+        assert_eq!(context.memory_stats(), &MemoryStats::default());
     }
 
     #[test]

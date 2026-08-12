@@ -136,6 +136,10 @@ cargo run --release -p aster-codegen-cranelift --example memory_regions
 Use these benchmarks as a same-machine regression check, not as a cross-machine
 performance claim.
 
+The experimental [Adaptive Region Memory research program](../research/aarm.md) adds an opt-in,
+release-only matrix with per-region page and allocator-event telemetry. It does not change arena
+behavior or the stable `--memory-stats` output.
+
 ## Current boundary
 
 This model is designed for one bounded JIT execution. ASTER does not yet

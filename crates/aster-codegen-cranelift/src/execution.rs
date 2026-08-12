@@ -83,6 +83,46 @@ impl PreparedProgram {
         console_backend: Option<Box<dyn aster_runtime::ConsoleBackend>>,
         filesystem_backend: Option<Box<dyn aster_runtime::FileSystemBackend>>,
     ) -> Result<(ExecutionValue, super::MemoryStats), BackendError> {
+        self.invoke_observed(
+            symbol,
+            collect_stats,
+            task_runtime,
+            console_backend,
+            filesystem_backend,
+        )
+        .map(|(value, stats, _)| (value, stats))
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    pub(super) fn invoke_with_aarm_telemetry(
+        &self,
+        symbol: mir::SymbolId,
+        task_runtime: Option<*mut ()>,
+    ) -> Result<(ExecutionValue, aster_runtime::AarmMemoryTelemetry), BackendError> {
+        self.invoke_observed(symbol, true, task_runtime, None, None)
+            .map(|(value, _, telemetry)| {
+                (
+                    value,
+                    telemetry.expect("statistics mode enables AARM telemetry"),
+                )
+            })
+    }
+
+    fn invoke_observed(
+        &self,
+        symbol: mir::SymbolId,
+        collect_stats: bool,
+        task_runtime: Option<*mut ()>,
+        console_backend: Option<Box<dyn aster_runtime::ConsoleBackend>>,
+        filesystem_backend: Option<Box<dyn aster_runtime::FileSystemBackend>>,
+    ) -> Result<
+        (
+            ExecutionValue,
+            super::MemoryStats,
+            Option<aster_runtime::AarmMemoryTelemetry>,
+        ),
+        BackendError,
+    > {
         let (pointer, return_type) = self
             .entries
             .get(&symbol)
@@ -104,10 +144,11 @@ impl PreparedProgram {
         let value = invoke_finalized(*pointer, return_type, &mut execution_context);
         let runtime_error = execution_context.take_error();
         let stats = execution_context.memory_stats().clone();
+        let telemetry = execution_context.aarm_memory_telemetry();
         if let Some(error) = runtime_error {
             Err(BackendError::new(format!("Aster runtime error: {error}")))
         } else {
-            value.map(|v| (v, stats))
+            value.map(|v| (v, stats, telemetry))
         }
     }
 
@@ -572,6 +613,21 @@ pub(super) fn execute_resolved(
         console_backend,
         filesystem_backend,
     )
+}
+
+#[cfg(feature = "aarm-telemetry")]
+pub(super) fn execute_resolved_with_aarm_telemetry(
+    module: &mir::Module,
+    entry: &mir::Function,
+) -> Result<(ExecutionValue, aster_runtime::AarmMemoryTelemetry), BackendError> {
+    let prepared = PreparedProgram::prepare(module)?;
+    if !module_uses_tasks(module) {
+        return prepared.invoke_with_aarm_telemetry(entry.symbol, None);
+    }
+    let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let mut runtime = TaskRuntime::new(&Arc::new(module.clone()), worker_count)?;
+    let pointer = std::ptr::from_mut(&mut runtime).cast::<()>();
+    prepared.invoke_with_aarm_telemetry(entry.symbol, Some(pointer))
 }
 
 /// This is the only unsafe boundary in the backend. Cranelift returns an untyped

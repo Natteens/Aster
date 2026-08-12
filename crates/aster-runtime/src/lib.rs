@@ -22,7 +22,8 @@ pub mod registry;
 pub mod string;
 
 pub use context::{
-    ASTER_ARRAY_DATA_OFFSET, ASTER_ARRAY_LENGTH_OFFSET, ASTER_CALL_DEPTH_LIMIT, AsterArray,
+    ASTER_ARRAY_DATA_OFFSET, ASTER_ARRAY_LENGTH_OFFSET, ASTER_CALL_DEPTH_LIMIT,
+    AarmAllocatorEvents, AarmMemoryTelemetry, AarmRegionTelemetry, AarmRewindTelemetry, AsterArray,
     AsterDictionary, AsterList, AsterStringBuilder, DictionaryKeyKind, ExecutionContext,
     ListRegion, MemoryStats, aster_rt_array_element, aster_rt_array_length, aster_rt_call_enter,
     aster_rt_call_leave, aster_rt_dictionary_add, aster_rt_dictionary_contains_key,
