@@ -22,7 +22,7 @@ checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
 name = "aster-cli"
-version = "0.54.4"
+version = "0.54.5"
 dependencies = [
  "aster-codegen-cranelift",
  "aster-compiler",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "aster-codegen-cranelift"
-version = "0.54.4"
+version = "0.54.5"
 dependencies = [
  "aster-compiler",
  "aster-mir",
@@ -44,7 +44,7 @@ dependencies = [
 
 [[package]]
 name = "aster-compiler"
-version = "0.54.4"
+version = "0.54.5"
 dependencies = [
  "aster-diagnostics",
  "aster-hir",
@@ -56,33 +56,33 @@ dependencies = [
 
 [[package]]
 name = "aster-diagnostics"
-version = "0.54.4"
+version = "0.54.5"
 
 [[package]]
 name = "aster-hir"
-version = "0.54.4"
+version = "0.54.5"
 
 [[package]]
 name = "aster-mir"
-version = "0.54.4"
+version = "0.54.5"
 dependencies = [
  "aster-hir",
 ]
 
 [[package]]
 name = "aster-runtime"
-version = "0.54.4"
+version = "0.54.5"
 
 [[package]]
 name = "aster-syntax"
-version = "0.54.4"
+version = "0.54.5"
 dependencies = [
  "aster-diagnostics",
 ]
 
 [[package]]
 name = "aster-types"
-version = "0.54.4"
+version = "0.54.5"
 
 [[package]]
 name = "bitflags"
