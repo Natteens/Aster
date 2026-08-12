@@ -118,6 +118,34 @@ fn using_loads_all_direct_files_in_stable_order() {
 }
 
 #[test]
+fn diagnostics_keep_their_file_local_span_without_padded_sources() {
+    let project = Project::new("diagnostic-offset");
+    project.write(
+        "app/alpha.aster",
+        "namespace app; public int Alpha() { return 1; }",
+    );
+    project.write(
+        "app/zeta.aster",
+        "namespace app; public int Broken() { return @; }",
+    );
+    let root = project.main("using app; public int Run() { return Alpha(); }");
+
+    let diagnostics = compile_project(&root).expect_err("invalid second namespace file");
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.path.ends_with("app/zeta.aster"))
+        .expect("diagnostic belongs to the invalid file");
+    assert_eq!(
+        diagnostic.source,
+        "namespace app; public int Broken() { return @; }"
+    );
+    assert_eq!(
+        &diagnostic.source[diagnostic.diagnostic.span.start..diagnostic.diagnostic.span.end],
+        "@"
+    );
+}
+
+#[test]
 fn an_empty_namespace_file_links_without_creating_a_symbol_table_clone() {
     let project = Project::new("empty-namespace");
     project.write("app/empty.aster", "namespace app;");

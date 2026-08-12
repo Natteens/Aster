@@ -170,25 +170,8 @@ impl PagedArena {
         align: usize,
         max_reserved_bytes: usize,
     ) -> Result<*mut u8, ArenaAllocError> {
-        assert!(size > 0, "zero-size allocation");
-        assert!(
-            align.is_power_of_two(),
-            "alignment must be a non-zero power of two"
-        );
-        assert!(
-            align <= MAX_ALIGN,
-            "alignment {align} exceeds MAX_ALIGN ({MAX_ALIGN})"
-        );
-
-        if self.active_pages != 0 {
-            let page = &mut self.pages[self.active_pages - 1];
-            if let Some((ptr, consumed)) = page.try_alloc(size, align) {
-                self.used_bytes = self
-                    .used_bytes
-                    .checked_add(consumed)
-                    .ok_or(ArenaAllocError::AddressSpace)?;
-                return Ok(ptr);
-            }
+        if let Some(pointer) = self.try_alloc_existing(size, align)? {
+            return Ok(pointer);
         }
 
         assert!(
@@ -257,6 +240,38 @@ impl PagedArena {
         self.pages.swap(self.active_pages, new_page_index);
         self.active_pages += 1;
         Ok(ptr)
+    }
+
+    /// Allocate only when the current active page already has capacity.
+    /// No page is reserved here, so callers may use this as a budget-free hot
+    /// path before consulting the execution-wide reservation limit.
+    #[inline]
+    pub(crate) fn try_alloc_existing(
+        &mut self,
+        size: usize,
+        align: usize,
+    ) -> Result<Option<*mut u8>, ArenaAllocError> {
+        assert!(size > 0, "zero-size allocation");
+        assert!(
+            align.is_power_of_two(),
+            "alignment must be a non-zero power of two"
+        );
+        assert!(
+            align <= MAX_ALIGN,
+            "alignment {align} exceeds MAX_ALIGN ({MAX_ALIGN})"
+        );
+
+        if self.active_pages != 0 {
+            let page = &mut self.pages[self.active_pages - 1];
+            if let Some((ptr, consumed)) = page.try_alloc(size, align) {
+                self.used_bytes = self
+                    .used_bytes
+                    .checked_add(consumed)
+                    .ok_or(ArenaAllocError::AddressSpace)?;
+                return Ok(Some(ptr));
+            }
+        }
+        Ok(None)
     }
 
     #[cfg(test)]
@@ -426,6 +441,26 @@ mod tests {
         assert!(!ptr.is_null());
         assert_eq!(ptr as usize % 8, 0);
         assert_eq!(arena.page_count(), 1);
+    }
+
+    #[test]
+    fn existing_page_fast_path_never_reserves_or_reuses_a_page() {
+        let mut arena = PagedArena::new();
+        assert_eq!(arena.try_alloc_existing(8, 8), Ok(None));
+        let first = arena.alloc(8, 8);
+        let reserved = arena.metrics().reserved_bytes;
+        let second = arena
+            .try_alloc_existing(8, 8)
+            .expect("existing allocation is addressable")
+            .expect("active page has capacity");
+        assert_ne!(first, second);
+        assert_eq!(arena.metrics().reserved_bytes, reserved);
+        assert_eq!(
+            arena.try_alloc_existing(MIN_PAGE_SIZE, 8),
+            Ok(None),
+            "a full active page must fall back to the budgeted slow path"
+        );
+        assert_eq!(arena.metrics().reserved_bytes, reserved);
     }
 
     #[test]

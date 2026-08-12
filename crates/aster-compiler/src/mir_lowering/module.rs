@@ -1,5 +1,5 @@
 use super::symbols::SymbolAllocator;
-use super::{FunctionLowerer, HashMap, async_machine, hir, mir};
+use super::{Arc, FunctionLowerer, HashMap, async_machine, hir, mir};
 
 #[allow(clippy::too_many_lines)]
 pub(super) fn lower(module: &hir::Module) -> mir::Module {
@@ -96,10 +96,13 @@ pub(super) fn lower(module: &hir::Module) -> mir::Module {
             })
         })
         .collect::<Vec<_>>();
-    let enum_map = enums
-        .iter()
-        .map(|value| (value.symbol, value.clone()))
-        .collect::<HashMap<_, _>>();
+    let enum_cases = Arc::new(
+        enums
+            .iter()
+            .flat_map(|value| value.cases.iter())
+            .map(|case| (case.symbol, case.clone()))
+            .collect::<HashMap<_, _>>(),
+    );
     let mut functions = Vec::new();
     for item in &module.items {
         match item {
@@ -109,7 +112,7 @@ pub(super) fn lower(module: &hir::Module) -> mir::Module {
                     function,
                     None,
                     &intrinsics,
-                    &enum_map,
+                    &enum_cases,
                     &mut symbols,
                 );
             }
@@ -120,7 +123,7 @@ pub(super) fn lower(module: &hir::Module) -> mir::Module {
                         method,
                         Some(declaration.symbol),
                         &intrinsics,
-                        &enum_map,
+                        &enum_cases,
                         &mut symbols,
                     );
                 }
@@ -216,7 +219,7 @@ fn push_function(
     function: &hir::Function,
     owner: Option<hir::SymbolId>,
     intrinsics: &HashMap<hir::SymbolId, hir::Intrinsic>,
-    enums: &HashMap<hir::SymbolId, mir::EnumDefinition>,
+    enum_cases: &Arc<HashMap<hir::SymbolId, mir::EnumCaseDefinition>>,
     symbols: &mut SymbolAllocator,
 ) {
     if function.body.is_none() || function.intrinsic.is_some() {
@@ -228,12 +231,12 @@ fn push_function(
         // identity — never by name.
         let move_next_symbol = symbols.fresh();
         let (wrapper, move_next) =
-            async_machine::lower(function, owner, intrinsics, enums, move_next_symbol);
+            async_machine::lower(function, owner, intrinsics, enum_cases, move_next_symbol);
         functions.push(wrapper);
         functions.push(move_next);
     } else {
         functions.push(
-            FunctionLowerer::new(function, intrinsics.clone(), enums.clone())
+            FunctionLowerer::new(function, intrinsics.clone(), Arc::clone(enum_cases))
                 .lower(function, owner),
         );
     }

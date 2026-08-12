@@ -6,7 +6,7 @@ mod module;
 mod places;
 mod symbols;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use aster_hir as hir;
 use aster_mir as mir;
@@ -37,7 +37,7 @@ struct FunctionLowerer {
     next_local: u32,
     next_temporary: u32,
     intrinsics: HashMap<hir::SymbolId, hir::Intrinsic>,
-    enums: HashMap<hir::SymbolId, mir::EnumDefinition>,
+    enum_cases: Arc<HashMap<hir::SymbolId, mir::EnumCaseDefinition>>,
     /// Set while lowering an async `MoveNext` state machine. When present,
     /// `await` lowers to a use of this pre-materialized result operand and
     /// `return` stores the value as the async task's candidate result before
@@ -52,7 +52,7 @@ impl FunctionLowerer {
     /// [`Self::new`] for ordinary ones.
     fn new_bare(
         intrinsics: HashMap<hir::SymbolId, hir::Intrinsic>,
-        enums: HashMap<hir::SymbolId, mir::EnumDefinition>,
+        enum_cases: Arc<HashMap<hir::SymbolId, mir::EnumCaseDefinition>>,
     ) -> Self {
         let mut lowerer = Self {
             blocks: Vec::new(),
@@ -64,7 +64,7 @@ impl FunctionLowerer {
             next_local: 0,
             next_temporary: 0,
             intrinsics,
-            enums,
+            enum_cases,
             async_await_result: None,
             async_handle: None,
         };
@@ -76,9 +76,9 @@ impl FunctionLowerer {
     fn new(
         function: &hir::Function,
         intrinsics: HashMap<hir::SymbolId, hir::Intrinsic>,
-        enums: HashMap<hir::SymbolId, mir::EnumDefinition>,
+        enum_cases: Arc<HashMap<hir::SymbolId, mir::EnumCaseDefinition>>,
     ) -> Self {
-        let mut lowerer = Self::new_bare(intrinsics, enums);
+        let mut lowerer = Self::new_bare(intrinsics, enum_cases);
         for parameter in &function.parameters {
             let local = lowerer.source_local(
                 parameter.symbol,

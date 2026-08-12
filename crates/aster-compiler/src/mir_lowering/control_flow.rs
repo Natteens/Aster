@@ -805,10 +805,8 @@ impl FunctionLowerer {
         bindings: &[hir::Parameter],
     ) {
         let definition = self
-            .enums
-            .values()
-            .flat_map(|value| &value.cases)
-            .find(|value| value.symbol == case)
+            .enum_cases
+            .get(&case)
             .expect("resolved switch case exists")
             .clone();
         for (binding, field) in bindings.iter().zip(&definition.fields) {

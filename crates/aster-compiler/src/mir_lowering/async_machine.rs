@@ -17,7 +17,7 @@
 //! the `await`, publishes the final value as the task's candidate result, and
 //! returns `Completed`.
 
-use super::{FunctionLowerer, HashMap, hir, mir};
+use super::{Arc, FunctionLowerer, HashMap, hir, mir};
 
 /// `MoveNext` status returned to the host pump. Never a `Task<T>` value.
 const PENDING: i64 = 0;
@@ -49,7 +49,7 @@ pub(super) fn lower(
     function: &hir::Function,
     owner: Option<hir::SymbolId>,
     intrinsics: &HashMap<hir::SymbolId, hir::Intrinsic>,
-    enums: &HashMap<hir::SymbolId, mir::EnumDefinition>,
+    enum_cases: &Arc<HashMap<hir::SymbolId, mir::EnumCaseDefinition>>,
     move_next_symbol: hir::SymbolId,
 ) -> (mir::Function, mir::Function) {
     let body = function
@@ -58,7 +58,7 @@ pub(super) fn lower(
         .expect("a validated async function has a body");
     let plan = AsyncPlan::new(body);
 
-    let move_next = lower_move_next(function, &plan, intrinsics, enums, move_next_symbol);
+    let move_next = lower_move_next(function, &plan, intrinsics, enum_cases, move_next_symbol);
     let wrapper = lower_wrapper(function, owner, move_next_symbol, plan.slots.len());
     (wrapper, move_next)
 }
@@ -110,7 +110,7 @@ fn lower_wrapper(
     move_next_symbol: hir::SymbolId,
     slot_count: usize,
 ) -> mir::Function {
-    let mut lowerer = FunctionLowerer::new_bare(HashMap::new(), HashMap::new());
+    let mut lowerer = FunctionLowerer::new_bare(HashMap::new(), Arc::new(HashMap::new()));
     let handle = mir::Place::Local(lowerer.new_temporary(function.return_type.clone()));
     lowerer.instruction(mir::Instruction::CallIntrinsic {
         destination: Some(handle.clone()),
@@ -142,10 +142,10 @@ fn lower_move_next(
     function: &hir::Function,
     plan: &AsyncPlan<'_>,
     intrinsics: &HashMap<hir::SymbolId, hir::Intrinsic>,
-    enums: &HashMap<hir::SymbolId, mir::EnumDefinition>,
+    enum_cases: &Arc<HashMap<hir::SymbolId, mir::EnumCaseDefinition>>,
     move_next_symbol: hir::SymbolId,
 ) -> mir::Function {
-    let mut lowerer = FunctionLowerer::new_bare(intrinsics.clone(), enums.clone());
+    let mut lowerer = FunctionLowerer::new_bare(intrinsics.clone(), Arc::clone(enum_cases));
 
     // Hidden scalar parameter carrying the outer async task's handle. It has
     // no source symbol, participates in no overload, and is validated

@@ -997,10 +997,19 @@ impl Loader {
                 ProjectSourceOrigin::Project
             },
         });
-        let padded = format!("{}{}", " ".repeat(offset), source);
-        let tokens = match lex(&padded) {
-            Ok(tokens) => tokens,
+        let tokens = match lex(&source) {
+            Ok(mut tokens) => {
+                for token in &mut tokens {
+                    token.span.start = token.span.start.saturating_add(offset);
+                    token.span.end = token.span.end.saturating_add(offset);
+                }
+                tokens
+            }
             Err(mut diagnostics) => {
+                for diagnostic in &mut diagnostics {
+                    diagnostic.span.start = diagnostic.span.start.saturating_add(offset);
+                    diagnostic.span.end = diagnostic.span.end.saturating_add(offset);
+                }
                 self.diagnostics.append(&mut diagnostics);
                 return None;
             }

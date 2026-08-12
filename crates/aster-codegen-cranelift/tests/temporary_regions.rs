@@ -85,6 +85,49 @@ fn compiler_marks_local_object_temporary_and_rewinds_at_return() {
 }
 
 #[test]
+fn direct_and_helper_object_loops_match_and_rewind_at_their_existing_boundaries() {
+    let source = r"
+        public class Box { public int value; }
+        internal int Build() {
+            Box box = new Box();
+            box.value = 1;
+            return box.value;
+        }
+        public int Direct() {
+            int total = 0;
+            for (int index = 0; index < 1000; index++) {
+                Box box = new Box();
+                box.value = 1;
+                total += box.value;
+            }
+            return total;
+        }
+        public int Helper() {
+            int total = 0;
+            for (int index = 0; index < 1000; index++) {
+                total += Build();
+            }
+            return total;
+        }
+    ";
+    let compilation = compile(source).expect("valid direct/helper temporary-object program");
+    let (direct_value, direct) =
+        execute_with_stats(&compilation.mir, "Direct").expect("direct loop executes");
+    let (helper_value, helper) =
+        execute_with_stats(&compilation.mir, "Helper").expect("helper loop executes");
+
+    assert_eq!(direct_value, ExecutionValue::Int(1_000));
+    assert_eq!(helper_value, direct_value);
+    assert_eq!(direct.object_allocations, 1_000);
+    assert_eq!(helper.object_allocations, direct.object_allocations);
+    assert_eq!(direct.requested_bytes, helper.requested_bytes);
+    assert_eq!(direct.used_bytes, 0);
+    assert_eq!(helper.used_bytes, 0);
+    assert!(direct.peak_used_bytes > helper.peak_used_bytes);
+    assert!(direct.reserved_bytes >= helper.reserved_bytes);
+}
+
+#[test]
 fn nested_function_scopes_preserve_the_callers_temporary_object() {
     let source = r"
         public class Box { public int value; }

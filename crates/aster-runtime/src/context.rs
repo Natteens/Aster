@@ -44,6 +44,13 @@ pub struct AsterArray {
 pub const ASTER_ARRAY_DATA_OFFSET: usize = std::mem::offset_of!(AsterArray, data);
 pub const ASTER_ARRAY_LENGTH_OFFSET: usize = std::mem::offset_of!(AsterArray, length);
 
+fn array_allocation_layout(length: usize, element_size: usize) -> Option<(usize, usize, usize)> {
+    let payload_bytes = checked_allocation_size(length, element_size)?.max(element_size);
+    let data_offset = checked_align_up(size_of::<AsterArray>(), 8)?;
+    let allocation_bytes = data_offset.checked_add(payload_bytes)?;
+    Some((payload_bytes, data_offset, allocation_bytes))
+}
+
 impl AsterArray {
     /// Element stride recorded when this runtime-owned header was allocated.
     /// Host ABI adapters use it to validate scalar transport before reading.
@@ -229,6 +236,23 @@ fn dictionary_entry_layout(
         stride,
         align,
     })
+}
+
+fn dictionary_storage_fits(
+    bucket_capacity: i32,
+    entry_capacity: i32,
+    layout: DictionaryEntryLayout,
+) -> bool {
+    usize::try_from(bucket_capacity)
+        .ok()
+        .and_then(|capacity| capacity.checked_mul(size_of::<u32>()))
+        .zip(
+            usize::try_from(entry_capacity)
+                .ok()
+                .and_then(|capacity| capacity.checked_mul(layout.stride)),
+        )
+        .and_then(|(buckets, entries)| buckets.checked_add(entries))
+        .is_some_and(|bytes| bytes <= DICTIONARY_MAX_ACTIVE_BYTES)
 }
 
 #[inline]
@@ -595,20 +619,26 @@ impl ExecutionContext {
                 self.refresh_memory_usage();
                 Some(pointer)
             }
-            Err(ArenaAllocError::AddressSpace) => {
-                self.fail("allocation size exceeds the addressable range");
+            Err(error) => {
+                self.fail_allocation(error);
                 None
             }
-            Err(ArenaAllocError::Limit) => {
+        }
+    }
+
+    fn fail_allocation(&mut self, error: ArenaAllocError) {
+        match error {
+            ArenaAllocError::AddressSpace => {
+                self.fail("allocation size exceeds the addressable range");
+            }
+            ArenaAllocError::Limit => {
                 self.fail(format!(
                     "allocation exceeds the execution memory limit of {} bytes",
                     self.allocation_limit_bytes
                 ));
-                None
             }
-            Err(ArenaAllocError::OutOfMemory) => {
+            ArenaAllocError::OutOfMemory => {
                 self.fail("the host could not satisfy an ASTER allocation request");
-                None
             }
         }
     }
@@ -644,6 +674,18 @@ impl ExecutionContext {
             return ptr::null_mut();
         }
         let bytes = usize::try_from(size.max(1)).unwrap_or(1);
+        match self.temporary_arena.try_alloc_existing(bytes, 8) {
+            Ok(Some(pointer)) => {
+                self.refresh_memory_usage();
+                self.record_allocation(AllocationCategory::Object, bytes);
+                return pointer;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.fail_allocation(error);
+                return ptr::null_mut();
+            }
+        }
         let Some(pointer) = self.allocate_in_region(bytes, 8, true) else {
             return ptr::null_mut();
         };
@@ -667,30 +709,26 @@ impl ExecutionContext {
         if length < 0 {
             self.fail(format!("array length cannot be negative: {length}"));
         }
-        let bytes = usize::try_from(valid_length)
+        let layout = usize::try_from(valid_length)
             .ok()
-            .and_then(|length| checked_allocation_size(length, valid_size as usize));
-        let bytes = if let Some(bytes) = bytes {
-            bytes.max(valid_size as usize)
-        } else {
+            .and_then(|length| array_allocation_layout(length, valid_size as usize));
+        let Some((bytes, data_offset, allocation_bytes)) = layout else {
             self.fail("array allocation size exceeds the addressable range");
-            valid_size as usize
-        };
-
-        let Some(data) = self.allocate_in_region(bytes, 8, temporary) else {
             return ptr::null_mut();
         };
-        let Some(header) =
-            self.allocate_in_region(size_of::<AsterArray>(), align_of::<AsterArray>(), temporary)
+
+        let allocation_align = align_of::<AsterArray>().max(8);
+        let Some(header) = self.allocate_in_region(allocation_bytes, allocation_align, temporary)
         else {
             return ptr::null_mut();
         };
+        let data = header.wrapping_add(data_offset);
         #[allow(clippy::cast_ptr_alignment)]
         let header_ptr = header.cast::<AsterArray>();
 
         // SAFETY: `header_ptr` points to zeroed, correctly aligned memory for
-        // `AsterArray`. Header and data belong to the same selected arena and
-        // therefore have exactly the same lifetime.
+        // `AsterArray`. Header and data are one arena allocation and therefore
+        // have exactly the same lifetime.
         #[allow(unsafe_code)]
         unsafe {
             (*header_ptr).data = data;
@@ -1353,16 +1391,6 @@ impl ExecutionContext {
         if !needs_bucket_growth && !needs_entry_growth {
             return true;
         }
-        let tombstones = count - length;
-        let new_entry_capacity = if needs_entry_growth && tombstones == 0 {
-            let Some(capacity) = entry_capacity.checked_mul(2) else {
-                self.fail("Dictionary entry capacity overflow");
-                return false;
-            };
-            capacity
-        } else {
-            entry_capacity
-        };
         let new_bucket_capacity = if needs_bucket_growth {
             let Some(capacity) = bucket_capacity.checked_mul(2) else {
                 self.fail("Dictionary bucket capacity overflow");
@@ -1371,6 +1399,35 @@ impl ExecutionContext {
             capacity
         } else {
             bucket_capacity
+        };
+        let tombstones = count - length;
+        let new_entry_capacity = if needs_entry_growth {
+            let doubled = entry_capacity.checked_mul(2);
+            let sparse_tombstones = tombstones.saturating_mul(2) < length;
+            #[allow(unsafe_code)]
+            let layout = unsafe {
+                dictionary_entry_layout(
+                    (*dictionary).key_size,
+                    (*dictionary).key_align,
+                    (*dictionary).value_size,
+                    (*dictionary).value_align,
+                )
+                .expect("validated dictionary layout")
+            };
+            if let Some(capacity) = doubled
+                && (tombstones == 0
+                    || sparse_tombstones
+                        && dictionary_storage_fits(new_bucket_capacity, capacity, layout))
+            {
+                capacity
+            } else if tombstones > 0 {
+                entry_capacity
+            } else {
+                self.fail("Dictionary entry capacity overflow");
+                return false;
+            }
+        } else {
+            entry_capacity
         };
         self.dictionary_rebuild(dictionary, new_bucket_capacity, new_entry_capacity)
     }
@@ -3691,6 +3748,80 @@ mod tests {
     }
 
     #[test]
+    fn sparse_tombstone_churn_grows_once_instead_of_rebuilding_repeatedly() {
+        let mut context = ExecutionContext::with_stats();
+        let dictionary = context.allocate_dictionary_in_region(
+            DictionaryKeyKind::Int,
+            4,
+            4,
+            1,
+            4,
+            4,
+            2,
+            ListRegion::Persistent,
+        );
+        for key in 0_i32..1_000 {
+            assert_eq!(
+                context.dictionary_add_or_set(
+                    dictionary,
+                    DictionaryKeyKind::Int,
+                    4,
+                    4,
+                    1,
+                    4,
+                    4,
+                    2,
+                    (&raw const key).cast(),
+                    (&raw const key).cast(),
+                    false,
+                ),
+                1
+            );
+        }
+        let before = context.memory_stats().total_allocations;
+        for key in 0_i32..1_000 {
+            assert_eq!(
+                context.dictionary_contains_or_remove(
+                    dictionary,
+                    DictionaryKeyKind::Int,
+                    4,
+                    4,
+                    1,
+                    4,
+                    4,
+                    2,
+                    (&raw const key).cast(),
+                    true,
+                ),
+                1
+            );
+            assert_eq!(
+                context.dictionary_add_or_set(
+                    dictionary,
+                    DictionaryKeyKind::Int,
+                    4,
+                    4,
+                    1,
+                    4,
+                    4,
+                    2,
+                    (&raw const key).cast(),
+                    (&raw const key).cast(),
+                    false,
+                ),
+                1
+            );
+        }
+
+        assert_eq!(context.memory_stats().total_allocations - before, 2);
+        assert_eq!(
+            live_int_entries(dictionary),
+            (0_i32..1_000).map(|key| (key, key)).collect::<Vec<_>>()
+        );
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
     fn dictionary_read_operations_and_duplicates_do_not_allocate() {
         let mut context = ExecutionContext::with_stats();
         let dictionary = context.allocate_dictionary_in_region(
@@ -5775,6 +5906,60 @@ mod tests {
         assert!(stats.requested_bytes >= 16);
         assert!(stats.used_bytes >= stats.requested_bytes);
         assert!(stats.reserved_bytes >= stats.used_bytes);
+    }
+
+    #[test]
+    fn array_allocation_preflights_the_complete_header_and_payload() {
+        let data_offset = checked_align_up(size_of::<AsterArray>(), 8).expect("array data offset");
+        let maximum_payload = MIN_PAGE_SIZE - data_offset;
+        let maximum_length = i32::try_from(maximum_payload / 4).expect("test length");
+
+        let mut valid = ExecutionContext::with_options(true, MIN_PAGE_SIZE);
+        let array = valid.allocate_array(maximum_length, 4);
+        assert!(!array.is_null());
+        assert!(valid.take_error().is_none());
+        assert_eq!(valid.memory_stats().array_allocations, 1);
+        assert_eq!(valid.memory_stats().requested_bytes, maximum_payload as u64);
+        assert_eq!(valid.memory_stats().used_bytes, MIN_PAGE_SIZE as u64);
+        assert_eq!(valid.memory_stats().reserved_bytes, MIN_PAGE_SIZE as u64);
+
+        for length in [maximum_length + 4, maximum_length + 5] {
+            let mut rejected = ExecutionContext::with_options(true, MIN_PAGE_SIZE);
+            assert!(rejected.allocate_array(length, 4).is_null());
+            assert_eq!(rejected.memory_stats(), &MemoryStats::default());
+            assert_eq!(
+                rejected.take_error().as_deref(),
+                Some("allocation exceeds the execution memory limit of 4096 bytes")
+            );
+        }
+    }
+
+    #[test]
+    fn zero_length_and_ordinary_arrays_keep_their_allocation_contract() {
+        let mut context = ExecutionContext::with_stats();
+        let empty = context.allocate_array(0, 4);
+        let ordinary = context.allocate_array(3, 4);
+        assert!(!empty.is_null());
+        assert!(!ordinary.is_null());
+        assert_eq!(context.memory_stats().array_allocations, 2);
+        assert_eq!(context.memory_stats().requested_bytes, 16);
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    fn array_layout_overflow_and_preflight_errors_are_fail_closed_and_first_wins() {
+        assert!(array_allocation_layout(usize::MAX, 2).is_none());
+        assert!(array_allocation_layout(usize::MAX, 1).is_none());
+
+        let mut first = ExecutionContext::with_options(true, MIN_PAGE_SIZE);
+        first.fail("earlier failure");
+        assert!(
+            first
+                .allocate_array(i32::try_from(MIN_PAGE_SIZE).unwrap(), 1)
+                .is_null()
+        );
+        assert_eq!(first.take_error().as_deref(), Some("earlier failure"));
+        assert_eq!(first.memory_stats(), &MemoryStats::default());
     }
 
     #[test]
