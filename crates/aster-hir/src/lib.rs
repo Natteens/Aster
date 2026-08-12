@@ -372,6 +372,11 @@ pub enum ExpressionKind {
         key_type: Type,
         value_type: Type,
     },
+    /// `new aster.core.StringBuilder()`: allocates the native mutable builder
+    /// header selected by the resolved official core class identity.
+    NewStringBuilder {
+        class_symbol: SymbolId,
+    },
     Index {
         array: Box<Expression>,
         index: Box<Expression>,
@@ -429,6 +434,17 @@ pub enum ExpressionKind {
         value_type: Type,
         entry_type: Type,
         entry_layout: DictionaryEntryLayout,
+    },
+    /// Explicit mutation of one official `aster.core.StringBuilder`.
+    StringBuilderAppend {
+        builder: Box<Expression>,
+        value: Box<Expression>,
+        class_symbol: SymbolId,
+    },
+    /// Produces an independent immutable `string` snapshot.
+    StringBuilderToString {
+        builder: Box<Expression>,
+        class_symbol: SymbolId,
     },
     /// `list.Add(value)`: appends `value`, growing the buffer if needed.
     /// Always typed `void`. `value`'s type is exactly the list's element

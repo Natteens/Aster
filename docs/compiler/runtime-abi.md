@@ -20,6 +20,7 @@ Representative export groups:
 | `aster_rt_array_*` | Fixed-array allocation, checked element access, and length |
 | `aster_rt_list_*` | `List<T>` allocation, length, mutation, indexed access, and structural version checks |
 | `aster_rt_dictionary_*` | `Dictionary<K,V>` allocation, key operations, length, and entry snapshots |
+| `aster_rt_string_builder_*` | Explicit mutable UTF-8 construction and immutable snapshots |
 | `aster_rt_object_*` | Class-object storage |
 | `aster_rt_io_*` | Terminal and host-managed filesystem operations |
 | `aster_rt_temporary_scope_*` | Temporary-arena checkpoints |
@@ -49,6 +50,12 @@ Rules:
 - The header stores bytes for ABI traversal. Source-level `Length` separately validates UTF-8 and
   counts Unicode scalar values.
 
+`StringBuilder` uses a separate private native header containing its active buffer pointer, byte
+length, capacity, allocation region, and temporary-scope birth depth. Capacity starts at zero and
+grows to a checked power of two only when an append does not fit. Input strings are borrowed for one
+append call. `ToString()` allocates and copies an exact-size ordinary string, so immutable strings
+never alias builder storage.
+
 ## Ownership and lifetime
 
 - String literals live in the data section of the JIT module that compiled them. Dynamic
@@ -65,7 +72,7 @@ Rules:
   the host-created `ExecutionContext` and are released together after the invocation. Internal
   ASTER calls forward the same hidden context pointer.
 - An array header and its data buffer always use the same arena, so neither can outlive the other.
-- Generated functions that contain temporary objects, arrays, lists, dictionaries, or strings
+- Generated functions that contain temporary objects, arrays, lists, dictionaries, string builders, or strings
   enter a nested temporary scope on function entry and leave it on every normal `Return` or `End`.
   Leaving rewinds only the innermost checkpoint; allocations made by callers before a nested call
   remain valid.

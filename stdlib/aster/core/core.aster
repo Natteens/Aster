@@ -11,3 +11,16 @@ public enum Result<T, E>
     Ok(T value),
     Error(E error),
 }
+
+/// Mutable UTF-8 construction buffer. Ordinary `string` values remain immutable;
+/// each `ToString()` call returns an independent immutable snapshot.
+public class StringBuilder
+{
+    public StringBuilder() {}
+
+    /// Appends `value` without constructing an intermediate ASTER string.
+    public void Append(string value) {}
+
+    /// Returns an immutable snapshot of the current content.
+    public string ToString() { return ""; }
+}

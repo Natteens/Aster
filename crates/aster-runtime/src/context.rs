@@ -152,6 +152,26 @@ pub struct AsterList {
     birth_scope_depth: u32,
 }
 
+/// Native mutable UTF-8 construction header. The header and every backing
+/// buffer are owned by one execution context; immutable strings never alias
+/// `data` and are produced as independent snapshots.
+#[repr(C)]
+pub struct AsterStringBuilder {
+    data: *mut u8,
+    length: usize,
+    capacity: usize,
+    region: ListRegion,
+    birth_scope_depth: u32,
+}
+
+const STRING_BUILDER_INITIAL_CAPACITY: usize = 16;
+
+fn string_builder_growth_capacity(required: usize) -> Option<usize> {
+    required
+        .max(STRING_BUILDER_INITIAL_CAPACITY)
+        .checked_next_power_of_two()
+}
+
 /// Native header for one concrete insertion-ordered `Dictionary<K, V>`.
 /// Buckets and entries are allocated lazily in the same arena as this header.
 /// Hash seeds remain per-context; snapshots need no iterator/version state.
@@ -816,6 +836,166 @@ impl ExecutionContext {
         }
         self.record_allocation(AllocationCategory::Object, size_of::<AsterList>());
         header_ptr
+    }
+
+    pub(crate) fn allocate_string_builder_in_region(
+        &mut self,
+        region: ListRegion,
+    ) -> *mut AsterStringBuilder {
+        if region == ListRegion::Temporary && self.temporary_scopes.is_empty() {
+            self.fail("temporary StringBuilder allocation requires an active temporary scope");
+            return ptr::null_mut();
+        }
+        let Some(header) = self.allocate_in_region(
+            size_of::<AsterStringBuilder>(),
+            align_of::<AsterStringBuilder>(),
+            region == ListRegion::Temporary,
+        ) else {
+            return ptr::null_mut();
+        };
+        #[allow(clippy::cast_ptr_alignment)]
+        let header = header.cast::<AsterStringBuilder>();
+        // SAFETY: fresh, aligned arena memory is unpublished until every
+        // field has been initialized.
+        #[allow(unsafe_code)]
+        unsafe {
+            *header = AsterStringBuilder {
+                data: ptr::null_mut(),
+                length: 0,
+                capacity: 0,
+                region,
+                birth_scope_depth: if region == ListRegion::Temporary {
+                    u32::try_from(self.temporary_scopes.len()).unwrap_or(u32::MAX)
+                } else {
+                    0
+                },
+            };
+        }
+        self.record_allocation(AllocationCategory::Object, size_of::<AsterStringBuilder>());
+        header
+    }
+
+    fn validate_string_builder(&mut self, builder: *const AsterStringBuilder) -> bool {
+        if builder.is_null() {
+            self.fail("StringBuilder received a null builder");
+            return false;
+        }
+        // SAFETY: generated code can obtain this pointer only from the
+        // allocation functions below and keeps its execution context alive.
+        #[allow(unsafe_code)]
+        let (data, length, capacity) =
+            unsafe { ((*builder).data, (*builder).length, (*builder).capacity) };
+        if length > capacity || (capacity == 0) != data.is_null() {
+            self.fail("StringBuilder header is invalid");
+            return false;
+        }
+        true
+    }
+
+    fn string_builder_append(
+        &mut self,
+        builder: *mut AsterStringBuilder,
+        value: *const AsterStrHeader,
+    ) {
+        if self.error.is_some() || !self.validate_string_builder(builder) {
+            return;
+        }
+        // SAFETY: `value` is an immutable ASTER string owned by this context
+        // or the live JIT module and is borrowed only for this call.
+        #[allow(unsafe_code)]
+        let Some(value) = (unsafe { crate::string::view(value) }) else {
+            self.fail("StringBuilder.Append received an invalid UTF-8 string reference");
+            return;
+        };
+        // SAFETY: validated above.
+        #[allow(unsafe_code)]
+        let (old_data, old_length, old_capacity, region, birth_scope_depth) = unsafe {
+            (
+                (*builder).data,
+                (*builder).length,
+                (*builder).capacity,
+                (*builder).region,
+                (*builder).birth_scope_depth,
+            )
+        };
+        let Some(required) = old_length.checked_add(value.len()) else {
+            self.fail("StringBuilder length overflow while appending");
+            return;
+        };
+        if required <= old_capacity {
+            if !value.is_empty() {
+                // SAFETY: `required <= old_capacity`; input is immutable and
+                // cannot alias the builder's unpublished mutable storage.
+                #[allow(unsafe_code)]
+                unsafe {
+                    ptr::copy_nonoverlapping(value.as_ptr(), old_data.add(old_length), value.len());
+                    (*builder).length = required;
+                }
+            }
+            return;
+        }
+        let Some(new_capacity) = string_builder_growth_capacity(required) else {
+            self.fail("StringBuilder capacity overflow while growing");
+            return;
+        };
+        if region == ListRegion::Temporary && self.temporary_scopes.is_empty() {
+            self.fail("temporary StringBuilder growth requires an active temporary scope");
+            return;
+        }
+        let use_temporary = region == ListRegion::Temporary
+            && self.temporary_scopes.len() == birth_scope_depth as usize;
+        let Some(new_data) = self.allocate_in_region(new_capacity, 1, use_temporary) else {
+            return;
+        };
+        // SAFETY: the fresh buffer has `new_capacity >= required` bytes.
+        // Nothing is published until both copies complete.
+        #[allow(unsafe_code)]
+        unsafe {
+            if old_length != 0 {
+                ptr::copy_nonoverlapping(old_data, new_data, old_length);
+            }
+            if !value.is_empty() {
+                ptr::copy_nonoverlapping(value.as_ptr(), new_data.add(old_length), value.len());
+            }
+        }
+        self.record_allocation(AllocationCategory::Object, new_capacity);
+        // SAFETY: allocation and copying succeeded; publishing all three
+        // fields together leaves no partially grown observable header.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*builder).data = new_data;
+            (*builder).length = required;
+            (*builder).capacity = new_capacity;
+        }
+    }
+
+    fn string_builder_to_string(
+        &mut self,
+        builder: *const AsterStringBuilder,
+        temporary: bool,
+    ) -> *const AsterStrHeader {
+        if self.error.is_some() || !self.validate_string_builder(builder) {
+            return ptr::null();
+        }
+        // SAFETY: the validated header owns `length <= capacity` initialized
+        // UTF-8 bytes, formed only by appending validated ASTER strings.
+        #[allow(unsafe_code)]
+        let bytes = unsafe {
+            if (*builder).length == 0 {
+                &[]
+            } else {
+                std::slice::from_raw_parts((*builder).data, (*builder).length)
+            }
+        };
+        let Ok(value) = std::str::from_utf8(bytes) else {
+            self.fail("StringBuilder contains invalid UTF-8");
+            return ptr::null();
+        };
+        if temporary {
+            self.allocate_temporary_string_parts(&[value])
+        } else {
+            self.allocate_string_parts(&[value])
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2588,6 +2768,70 @@ pub extern "C" fn aster_rt_list_new_temporary(
     #[allow(clippy::cast_sign_loss)]
     let type_key = element_type_key as u64;
     context.allocate_list_in_region(size, align, type_key, ListRegion::Temporary)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_builder_new(
+    context: *mut ExecutionContext,
+) -> *mut AsterStringBuilder {
+    if context.is_null() {
+        return ptr::null_mut();
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    context.allocate_string_builder_in_region(ListRegion::Persistent)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_builder_new_temporary(
+    context: *mut ExecutionContext,
+) -> *mut AsterStringBuilder {
+    if context.is_null() {
+        return ptr::null_mut();
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    context.allocate_string_builder_in_region(ListRegion::Temporary)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_builder_append(
+    context: *mut ExecutionContext,
+    builder: *mut AsterStringBuilder,
+    value: *const AsterStrHeader,
+) {
+    if context.is_null() {
+        return;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    context.string_builder_append(builder, value);
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_builder_to_string(
+    context: *mut ExecutionContext,
+    builder: *const AsterStringBuilder,
+) -> *const AsterStrHeader {
+    if context.is_null() {
+        return ptr::null();
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    context.string_builder_to_string(builder, false)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_builder_to_string_temporary(
+    context: *mut ExecutionContext,
+    builder: *const AsterStringBuilder,
+) -> *const AsterStrHeader {
+    if context.is_null() {
+        return ptr::null();
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    context.string_builder_to_string(builder, true)
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -6001,6 +6245,154 @@ mod tests {
         assert_eq!(stats.string_allocations, 1);
         assert_eq!(stats.object_allocations, 0);
         assert!(stats.requested_bytes > 0);
+    }
+
+    #[test]
+    fn string_builder_grows_geometrically_and_snapshots_are_immutable() {
+        let mut context = ExecutionContext::with_stats();
+        let a = context.allocate_string_parts(&["a"]);
+        let b = context.allocate_string_parts(&["b"]);
+        let builder = context.allocate_string_builder_in_region(ListRegion::Persistent);
+
+        context.string_builder_append(builder, a);
+        let first = context.string_builder_to_string(builder, false);
+        context.string_builder_append(builder, b);
+        let second = context.string_builder_to_string(builder, false);
+
+        // SAFETY: all pointers remain owned by the live persistent arena.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!(crate::string::view(first), Some("a"));
+            assert_eq!(crate::string::view(second), Some("ab"));
+        }
+        assert_eq!(context.memory_stats().string_allocations, 4);
+        assert_eq!(context.memory_stats().object_allocations, 2);
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    fn string_builder_preserves_utf8_and_empty_appends() {
+        let mut context = ExecutionContext::new();
+        let builder = context.allocate_string_builder_in_region(ListRegion::Persistent);
+        for part in ["", "A", "á", "😀", "e\u{301}"] {
+            let value = context.allocate_string_parts(&[part]);
+            context.string_builder_append(builder, value);
+        }
+        let result = context.string_builder_to_string(builder, false);
+        // SAFETY: the result is a live immutable arena string.
+        #[allow(unsafe_code)]
+        let result = unsafe { crate::string::view(result) };
+        assert_eq!(result, Some("Aá😀e\u{301}"));
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    fn string_builder_growth_failure_is_atomic_and_first_error_wins() {
+        assert!(string_builder_growth_capacity(usize::MAX / 2 + 2).is_none());
+
+        let mut source = ExecutionContext::new();
+        let large = source.allocate_string_parts(&[&"x".repeat(MIN_PAGE_SIZE + 1)]);
+        let mut limited = ExecutionContext::with_allocation_limit(MIN_PAGE_SIZE);
+        let builder = limited.allocate_string_builder_in_region(ListRegion::Persistent);
+        assert!(!builder.is_null());
+
+        limited.string_builder_append(builder, large);
+        assert!(
+            limited
+                .take_error()
+                .is_some_and(|error| error.contains("execution memory limit"))
+        );
+        let empty = limited.string_builder_to_string(builder, false);
+        // SAFETY: failed growth did not publish pointer/length/capacity.
+        #[allow(unsafe_code)]
+        let empty = unsafe { crate::string::view(empty) };
+        assert_eq!(empty, Some(""));
+
+        limited.fail("earlier builder failure");
+        limited.string_builder_append(builder, large);
+        assert_eq!(
+            limited.take_error().as_deref(),
+            Some("earlier builder failure")
+        );
+    }
+
+    #[test]
+    fn string_builder_length_overflow_fails_before_touching_storage() {
+        let mut context = ExecutionContext::new();
+        let value = context.allocate_string_parts(&["x"]);
+        let builder = context.allocate_string_builder_in_region(ListRegion::Persistent);
+        // This impossible internal state models the arithmetic boundary
+        // directly without allocating anywhere near the context limit. The
+        // append must reject `length + input.len()` before dereferencing data.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*builder).data = std::ptr::NonNull::<u8>::dangling().as_ptr();
+            (*builder).length = usize::MAX;
+            (*builder).capacity = usize::MAX;
+        }
+        context.string_builder_append(builder, value);
+        assert_eq!(
+            context.take_error().as_deref(),
+            Some("StringBuilder length overflow while appending")
+        );
+    }
+
+    #[test]
+    fn string_builder_snapshot_failure_preserves_builder_content() {
+        let mut source = ExecutionContext::new();
+        let value = source.allocate_string_parts(&[&"x".repeat(2_010)]);
+        let mut limited = ExecutionContext::with_allocation_limit(MIN_PAGE_SIZE);
+        let builder = limited.allocate_string_builder_in_region(ListRegion::Persistent);
+        assert!(!builder.is_null());
+        limited.string_builder_append(builder, value);
+        assert!(limited.take_error().is_none());
+
+        assert!(limited.string_builder_to_string(builder, false).is_null());
+        assert!(
+            limited
+                .take_error()
+                .is_some_and(|error| error.contains("execution memory limit"))
+        );
+        // SAFETY: ToString never mutates the builder header, including when
+        // its exact-size immutable allocation fails.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!((*builder).length, 2_010);
+            assert_eq!(
+                std::slice::from_raw_parts((*builder).data, (*builder).length),
+                "x".repeat(2_010).as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn temporary_string_builder_rewinds_and_nested_growth_stays_live() {
+        let mut context = ExecutionContext::with_stats();
+        let value = context.allocate_string_parts(&["nested"]);
+        aster_rt_temporary_scope_enter(&raw mut context);
+        let builder = context.allocate_string_builder_in_region(ListRegion::Temporary);
+        aster_rt_temporary_scope_enter(&raw mut context);
+        context.string_builder_append(builder, value);
+        aster_rt_temporary_scope_leave(&raw mut context);
+
+        let snapshot = context.string_builder_to_string(builder, true);
+        // SAFETY: nested growth was promoted and the outer temporary header
+        // remains live until the outer scope leaves below.
+        #[allow(unsafe_code)]
+        let snapshot = unsafe { crate::string::view(snapshot) };
+        assert_eq!(snapshot, Some("nested"));
+        aster_rt_temporary_scope_leave(&raw mut context);
+        assert!(context.memory_stats().used_bytes > 0);
+        assert!(context.take_error().is_none());
+
+        let mut local = ExecutionContext::with_stats();
+        let value = local.allocate_string_parts(&["local"]);
+        aster_rt_temporary_scope_enter(&raw mut local);
+        let builder = local.allocate_string_builder_in_region(ListRegion::Temporary);
+        local.string_builder_append(builder, value);
+        assert!(!local.string_builder_to_string(builder, true).is_null());
+        aster_rt_temporary_scope_leave(&raw mut local);
+        assert_eq!(local.memory_stats().used_bytes, 13);
     }
 
     #[test]

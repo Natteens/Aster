@@ -166,6 +166,7 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
         hir::ExpressionKind::Literal(_)
         | hir::ExpressionKind::NewList { .. }
         | hir::ExpressionKind::NewDictionary { .. } => {}
+        hir::ExpressionKind::NewStringBuilder { class_symbol } => note(max, *class_symbol),
         hir::ExpressionKind::Symbol(symbol) => note(max, *symbol),
         hir::ExpressionKind::StructLiteral {
             struct_symbol,
@@ -210,6 +211,22 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
         hir::ExpressionKind::ListAdd { list, value } => {
             collect_expression(list, max);
             collect_expression(value, max);
+        }
+        hir::ExpressionKind::StringBuilderAppend {
+            builder,
+            value,
+            class_symbol,
+        } => {
+            note(max, *class_symbol);
+            collect_expression(builder, max);
+            collect_expression(value, max);
+        }
+        hir::ExpressionKind::StringBuilderToString {
+            builder,
+            class_symbol,
+        } => {
+            note(max, *class_symbol);
+            collect_expression(builder, max);
         }
         hir::ExpressionKind::DictionaryAdd {
             dictionary,

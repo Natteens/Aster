@@ -10,7 +10,8 @@ intrinsics still resolve through official `aster.*` symbols rather than text or 
 
 ## Namespaces
 
-- `aster.core` defines [`Option<T>` and `Result<T, E>`](option-result.md).
+- `aster.core` defines [`Option<T>`, `Result<T, E>`](option-result.md), and the explicit
+  incremental [`StringBuilder`](strings.md#incremental-construction).
 - `aster.io` provides [terminal and host-managed filesystem operations](io.md).
 - `aster.math` provides scalar [`Abs`, `Min`, `Max`, and `Clamp`](math.md) overloads.
 - `aster.text` provides immutable-text helpers documented with [strings](strings.md).

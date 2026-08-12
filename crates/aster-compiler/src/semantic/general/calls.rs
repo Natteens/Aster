@@ -1,8 +1,8 @@
 use super::{
     Analyzer, Callable, Diagnostic, Dispatch, Expression, ExpressionKind, Primitive, ResolvedCall,
     ResolvedDictionaryOperation, ResolvedEnumCase, ResolvedParallelFor, ResolvedParallelForEach,
-    ResolvedParallelReduce, ResolvedTaskRun, Signature, Span, Type, TypeKind, TypeRef, Visibility,
-    resolve_type_readonly,
+    ResolvedParallelReduce, ResolvedStringBuilderOperation, ResolvedTaskRun, Signature, Span, Type,
+    TypeKind, TypeRef, Visibility, resolve_type_readonly,
 };
 use aster_hir::StringOperation;
 
@@ -108,6 +108,11 @@ impl Analyzer<'_> {
         self.model
             .constructors
             .insert(self.model_key(span), signature.key);
+        if type_name == crate::standard_library::STRING_BUILDER_NAME {
+            self.model
+                .string_builder_constructions
+                .insert(self.model_key(span));
+        }
         Type::Class(type_name.to_owned())
     }
 
@@ -768,10 +773,24 @@ impl Analyzer<'_> {
             );
             return Type::Unknown;
         };
+        let model_key = self.model_key(span);
+        let callable_key = callable.key.clone();
+        if callable_key.owner.as_deref() == Some(crate::standard_library::STRING_BUILDER_NAME) {
+            let operation = match callable_key.name.as_str() {
+                "Append" => Some(ResolvedStringBuilderOperation::Append),
+                "ToString" => Some(ResolvedStringBuilderOperation::ToString),
+                _ => None,
+            };
+            if let Some(operation) = operation {
+                self.model
+                    .string_builder_operations
+                    .insert(model_key.clone(), operation);
+            }
+        }
         self.model.calls.insert(
-            self.model_key(span),
+            model_key,
             ResolvedCall {
-                callable: callable.key,
+                callable: callable_key,
                 dispatch,
             },
         );

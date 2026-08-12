@@ -17,7 +17,8 @@ use aster_syntax::{
 use super::{
     AccessorKind, CallableKey, Dispatch, Model, ResolvedCall, ResolvedDictionaryOperation,
     ResolvedEnumCase, ResolvedParallelFor, ResolvedParallelForEach, ResolvedParallelReduce,
-    ResolvedPropagation, ResolvedPropertyAssignment, ResolvedTaskRun, callable_key,
+    ResolvedPropagation, ResolvedPropertyAssignment, ResolvedStringBuilderOperation,
+    ResolvedTaskRun, callable_key,
 };
 use crate::type_names::TypeName;
 

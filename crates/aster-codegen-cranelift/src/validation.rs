@@ -750,6 +750,27 @@ fn validate_instruction(
             enums,
             locals,
         ),
+        mir::Instruction::AllocateStringBuilder {
+            destination, class, ..
+        } => validate_allocate_string_builder(destination, *class, function_name, classes, locals),
+        mir::Instruction::StringBuilderAppend {
+            builder,
+            value,
+            class,
+        } => validate_string_builder_append(builder, value, *class, function_name, classes, locals),
+        mir::Instruction::StringBuilderToString {
+            destination,
+            builder,
+            class,
+            ..
+        } => validate_string_builder_to_string(
+            destination,
+            builder,
+            *class,
+            function_name,
+            classes,
+            locals,
+        ),
         mir::Instruction::DictionaryAdd {
             destination,
             dictionary,
@@ -1442,6 +1463,104 @@ fn validate_allocate_dictionary(
                 "function `{function_name}` has an `AllocateDictionary` whose destination type does not match its concrete specialization"
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_allocate_string_builder(
+    destination: &mir::Place,
+    class: mir::SymbolId,
+    function_name: &str,
+    classes: &HashSet<mir::SymbolId>,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    validate_place(destination, function_name)?;
+    if !classes.contains(&class) {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` allocates a StringBuilder with an unknown class identity"
+        )));
+    }
+    let mir::Place::Local(local) = destination else {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` allocates a StringBuilder into a non-local destination"
+        )));
+    };
+    if locals.get(local) != Some(&mir::Type::Class(class)) {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` allocates a StringBuilder into an incompatible destination"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_string_builder_append(
+    builder: &mir::Operand,
+    value: &mir::Operand,
+    class: mir::SymbolId,
+    function_name: &str,
+    classes: &HashSet<mir::SymbolId>,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    if !classes.contains(&class)
+        || builder.type_ != mir::Type::Class(class)
+        || value.type_ != mir::Type::String
+        || !matches!(builder.kind, mir::OperandKind::Copy(_))
+        || matches!(value.kind, mir::OperandKind::Constant(ref constant) if !matches!(constant, mir::Constant::String(_)))
+    {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has an invalid StringBuilder.Append operation"
+        )));
+    }
+    validate_operand(builder, function_name)?;
+    validate_operand(value, function_name)?;
+    validate_builder_operand_local(builder, function_name, locals)?;
+    validate_builder_operand_local(value, function_name, locals)
+}
+
+fn validate_string_builder_to_string(
+    destination: &mir::Place,
+    builder: &mir::Operand,
+    class: mir::SymbolId,
+    function_name: &str,
+    classes: &HashSet<mir::SymbolId>,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    validate_place(destination, function_name)?;
+    validate_operand(builder, function_name)?;
+    if !classes.contains(&class)
+        || builder.type_ != mir::Type::Class(class)
+        || !matches!(builder.kind, mir::OperandKind::Copy(_))
+    {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has an invalid StringBuilder.ToString receiver"
+        )));
+    }
+    validate_builder_operand_local(builder, function_name, locals)?;
+    let mir::Place::Local(local) = destination else {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` writes StringBuilder.ToString into a non-local destination"
+        )));
+    };
+    if locals.get(local) != Some(&mir::Type::String) {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` writes StringBuilder.ToString into a non-string destination"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_builder_operand_local(
+    operand: &mir::Operand,
+    function_name: &str,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    let mir::OperandKind::Copy(mir::Place::Local(local)) = &operand.kind else {
+        return Ok(());
+    };
+    if locals.get(local) != Some(&operand.type_) {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a StringBuilder operation whose operand type does not match its local"
+        )));
     }
     Ok(())
 }
@@ -2408,6 +2527,124 @@ fn unsupported(function_name: &str, feature: &str) -> BackendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_STRING_BUILDER_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn string_builder_module() -> mir::Module {
+        let id = NEXT_STRING_BUILDER_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "aster-invalid-string-builder-{}-{id}.aster",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "using aster.core; public string Main() { StringBuilder builder = new StringBuilder(); builder.Append(\"x\"); return builder.ToString(); }",
+        )
+        .expect("write StringBuilder validation source");
+        let result = aster_compiler::compile_project(&path)
+            .expect("StringBuilder validation source compiles")
+            .compilation
+            .mir;
+        std::fs::remove_file(path).expect("remove StringBuilder validation source");
+        result
+    }
+
+    #[test]
+    fn malformed_string_builder_operations_are_rejected_before_codegen() {
+        let valid = string_builder_module();
+        validate_module(&valid).expect("compiler-produced builder MIR is valid");
+
+        let mut unknown_class = valid.clone();
+        let class = unknown_class
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|instruction| match instruction {
+                mir::Instruction::AllocateStringBuilder { class, .. } => Some(class),
+                _ => None,
+            })
+            .expect("builder allocation instruction");
+        *class = mir::SymbolId(u32::MAX);
+        assert!(
+            validate_module(&unknown_class)
+                .expect_err("unknown builder class must fail")
+                .message()
+                .contains("unknown class identity")
+        );
+
+        let mut wrong_append = valid.clone();
+        let append = wrong_append
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Main")
+            .into_iter()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|instruction| match instruction {
+                mir::Instruction::StringBuilderAppend { value, .. } => Some(value),
+                _ => None,
+            })
+            .expect("append instruction");
+        append.type_ = mir::Type::Int;
+        assert!(
+            validate_module(&wrong_append)
+                .expect_err("non-string append must fail")
+                .message()
+                .contains("StringBuilder.Append")
+        );
+
+        let mut constant_receiver = valid.clone();
+        let builder = constant_receiver
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Main")
+            .into_iter()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|instruction| match instruction {
+                mir::Instruction::StringBuilderAppend { builder, .. } => Some(builder),
+                _ => None,
+            })
+            .expect("append receiver");
+        builder.kind = mir::OperandKind::Constant(mir::Constant::String("invalid".to_owned()));
+        assert!(
+            validate_module(&constant_receiver)
+                .expect_err("constant builder receiver must fail")
+                .message()
+                .contains("StringBuilder.Append")
+        );
+
+        let mut wrong_result = valid;
+        let function = wrong_result
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Main")
+            .expect("Main exists");
+        let builder_local = function
+            .locals
+            .iter()
+            .find(|local| matches!(local.type_, mir::Type::Class(_)))
+            .expect("builder local exists")
+            .id;
+        let destination = function
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|instruction| match instruction {
+                mir::Instruction::StringBuilderToString { destination, .. } => Some(destination),
+                _ => None,
+            })
+            .expect("ToString instruction");
+        *destination = mir::Place::Local(builder_local);
+        assert!(
+            validate_module(&wrong_result)
+                .expect_err("non-string destination must fail")
+                .message()
+                .contains("non-string destination")
+        );
+    }
 
     #[test]
     fn duplicate_function_symbols_are_rejected_before_codegen() {

@@ -36,6 +36,7 @@ const STDLIB_MODULES: &[(&str, &str)] = &[
 /// bootstrap and then compare resolved identities, never raw type spellings.
 pub(crate) const CORE_NAMESPACE: &str = "aster.core";
 pub(crate) const COLLECTIONS_NAMESPACE: &str = "aster.collections";
+pub(crate) const STRING_BUILDER_NAME: &str = "aster.core::StringBuilder";
 
 fn canonical_generic_argument(value: &str) -> String {
     value

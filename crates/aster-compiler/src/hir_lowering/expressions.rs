@@ -193,6 +193,18 @@ impl Lowerer<'_> {
                     },
                 }
             }
+            ast::ExpressionKind::NewObject { .. }
+                if self.model.string_builder_constructions.contains(&model_key) =>
+            {
+                let class_symbol = self
+                    .string_builder
+                    .expect("official StringBuilder symbols were predeclared")
+                    .class;
+                hir::Expression {
+                    type_: hir::Type::Class(class_symbol),
+                    kind: hir::ExpressionKind::NewStringBuilder { class_symbol },
+                }
+            }
             ast::ExpressionKind::NewObject {
                 type_name,
                 arguments,
@@ -608,6 +620,38 @@ impl Lowerer<'_> {
                             combine,
                         },
                     };
+                }
+                if let (Some(builder), Some(operation)) = (
+                    self.string_builder,
+                    self.model.string_builder_operations.get(&model_key),
+                ) {
+                    match operation {
+                        crate::semantic::ResolvedStringBuilderOperation::Append => {
+                            let ast::ExpressionKind::Member { object, .. } = &callee.kind else {
+                                unreachable!("StringBuilder.Append is an instance method")
+                            };
+                            return hir::Expression {
+                                type_: hir::Type::Void,
+                                kind: hir::ExpressionKind::StringBuilderAppend {
+                                    builder: Box::new(self.expression(object)),
+                                    value: Box::new(self.expression(&arguments[0])),
+                                    class_symbol: builder.class,
+                                },
+                            };
+                        }
+                        crate::semantic::ResolvedStringBuilderOperation::ToString => {
+                            let ast::ExpressionKind::Member { object, .. } = &callee.kind else {
+                                unreachable!("StringBuilder.ToString is an instance method")
+                            };
+                            return hir::Expression {
+                                type_: hir::Type::String,
+                                kind: hir::ExpressionKind::StringBuilderToString {
+                                    builder: Box::new(self.expression(object)),
+                                    class_symbol: builder.class,
+                                },
+                            };
+                        }
+                    }
                 }
                 let resolved = &self.model.calls[&model_key];
                 let symbol = self.callable_symbols[&resolved.callable];

@@ -1380,6 +1380,76 @@ impl Codegen {
         self.store_scalar(builder, destination, list, state)
     }
 
+    pub(super) fn translate_string_builder_allocation(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: &mir::Place,
+        region: mir::AllocationRegion,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let symbol = match region {
+            mir::AllocationRegion::Persistent => "aster_rt_string_builder_new",
+            mir::AllocationRegion::Temporary => "aster_rt_string_builder_new_temporary",
+        };
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids[symbol], builder.func);
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new("StringBuilder allocation is missing its ExecutionContext")
+        })?;
+        let call = builder.ins().call(function_ref, &[context]);
+        let value = builder.inst_results(call)[0];
+        self.continue_if_runtime_ok(builder, state)?;
+        self.store_scalar(builder, destination, value, state)
+    }
+
+    pub(super) fn translate_string_builder_append(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        receiver: &mir::Operand,
+        value: &mir::Operand,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let function_ref = self.jit.declare_func_in_func(
+            self.runtime_ids["aster_rt_string_builder_append"],
+            builder.func,
+        );
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new("StringBuilder.Append is missing its ExecutionContext")
+        })?;
+        let receiver = self.translate_operand(builder, receiver, state)?;
+        let value = self.translate_operand(builder, value, state)?;
+        builder
+            .ins()
+            .call(function_ref, &[context, receiver, value]);
+        self.continue_if_runtime_ok(builder, state)
+    }
+
+    pub(super) fn translate_string_builder_to_string(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: &mir::Place,
+        receiver: &mir::Operand,
+        region: mir::AllocationRegion,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let symbol = match region {
+            mir::AllocationRegion::Persistent => "aster_rt_string_builder_to_string",
+            mir::AllocationRegion::Temporary => "aster_rt_string_builder_to_string_temporary",
+        };
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids[symbol], builder.func);
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new("StringBuilder.ToString is missing its ExecutionContext")
+        })?;
+        let receiver = self.translate_operand(builder, receiver, state)?;
+        let call = builder.ins().call(function_ref, &[context, receiver]);
+        let value = builder.inst_results(call)[0];
+        self.continue_if_runtime_ok(builder, state)?;
+        self.store_scalar(builder, destination, value, state)
+    }
+
     pub(super) fn translate_dictionary_allocation(
         &mut self,
         builder: &mut FunctionBuilder<'_>,

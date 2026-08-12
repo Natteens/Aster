@@ -92,8 +92,38 @@ dynamic concatenations allocate exactly one result for each binary `+` operation
 
 `==` and `!=` compare string content, including dynamically concatenated strings.
 
+## Incremental construction
+
+Use `aster.core.StringBuilder` when text grows across a loop or another incremental process. It is
+an explicitly mutable construction object; ordinary `string` values and the behavior of `+` remain
+unchanged.
+
+```aster
+using aster.core;
+
+StringBuilder builder = new StringBuilder();
+for (int i = 0; i < 20000; i++)
+{
+    builder.Append("x");
+}
+
+string value = builder.ToString();
+```
+
+The initial API is deliberately small: `StringBuilder()`, `Append(string)`, and `ToString()`.
+Backing storage grows geometrically, so repeated append has amortized linear copy work rather than
+copying the accumulated prefix on every iteration. `ToString()` copies the active content into a
+normal immutable string. A later append cannot mutate a snapshot returned earlier.
+
+Builder headers and backing buffers belong to the current `ExecutionContext` and follow the same
+temporary/persistent region decisions as other reference allocations. A builder is mutable local
+state, not a shared concurrency primitive, and cannot cross `Task` or `Parallel` worker boundaries.
+Static safe `+` chains can still use the compiler's one-allocation join path; effectful and ordinary
+binary concatenation retain their existing evaluation and allocation behavior.
+
 ## 🚧 Current limits
 
-There is no general implicit `ToString`, split, replace, regex, mutable buffer, nullable string, or
-direct string indexing. ASTER exposes neither UTF-8 bytes nor raw string pointers. Interpolation has
-no format specifiers, alignment, culture, or raw/verbatim form.
+There is no general implicit `ToString`, split, replace, regex, nullable string, or direct string
+indexing. `StringBuilder` does not expose capacity, insertion, replacement, formatting, or implicit
+conversion. ASTER exposes neither UTF-8 bytes nor raw string pointers. Interpolation has no format
+specifiers, alignment, culture, or raw/verbatim form.

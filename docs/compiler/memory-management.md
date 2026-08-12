@@ -15,8 +15,8 @@ function that created them returns. Typical reasons are:
 - passing it to a call whose summary cannot prove a non-escaping use;
 - any unsupported or uncertain aliasing pattern.
 
-The temporary arena holds objects, arrays, lists, dictionaries, and dynamic strings that the
-compiler proves do not escape their containing function.
+The temporary arena holds objects, arrays, lists, dictionaries, string builders, and dynamic
+strings that the compiler proves do not escape their containing function.
 
 A generated function with at least one temporary allocation enters a temporary
 scope on entry. Every normal `Return` and `End` leaves that scope. Leaving a
@@ -47,6 +47,12 @@ cannot leave a live header pointing at reclaimed element storage.
 region. Growth can retain older arena buffers until the containing temporary scope rewinds or the
 execution context is dropped; there is no individual deallocation.
 
+`StringBuilder` follows the same rule. Its header records the selected region, and its UTF-8 backing
+capacity grows geometrically. Growth inside a deeper helper scope is promoted when necessary so a
+live caller-owned header never points into storage that the helper is about to rewind. `ToString()`
+allocates an exact-size immutable snapshot in the result's independently selected region; it never
+exposes or aliases mutable builder capacity.
+
 String literals are not arena allocations; they live in the JIT module data
 section. Concatenation, interpolation, and scalar formatting create dynamic
 strings in either the persistent or temporary arena. These operations always
@@ -58,7 +64,8 @@ region determines the lifetime.
 `aster run <FILE> --memory-stats` prints one snapshot after execution.
 
 - `allocations`, `objects`, `arrays`, and `strings` are cumulative logical allocation counts.
-  Collection headers and backing buffers use the existing object/array accounting categories.
+  Collection and `StringBuilder` headers/backing buffers use the existing object category;
+  immutable snapshots use the string category.
 - `requested` is cumulative logical requested storage. It excludes arena
   alignment padding and excludes the separate array header.
 - `used` is the current consumed storage across both arenas.
@@ -76,10 +83,11 @@ order while allocating and sizing the final immutable string once. Chains contai
 interpolation, or other effectful expressions retain pairwise concatenation so allocation failure
 and side-effect ordering do not change.
 
-Loop-carried append still allocates one immutable result per iteration and copies its accumulated
-prefix repeatedly. Eliminating that amplification needs an explicit builder or ownership contract
-and is therefore not optimized implicitly. The release-only `string_construction_matrix` example
-records both curves without asserting machine-dependent timing thresholds.
+Loop-carried `value = value + part` still allocates one immutable result per iteration and copies its
+accumulated prefix repeatedly. ASTER does not rewrite that expression because aliases, intermediate
+reads, effects, exits, and allocation-failure ordering are observable. Programs can opt into
+amortized O(n) construction with `aster.core.StringBuilder`; the release-only
+`string_construction_matrix` example records both curves without machine-dependent thresholds.
 
 A successful temporary-only workload can therefore report many allocations,
 non-zero requested and peak values, `used: 0 bytes`, and non-zero reserved

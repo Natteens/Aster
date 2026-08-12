@@ -62,6 +62,9 @@ impl FunctionLowerer {
                 key_type,
                 value_type,
             } => Some(self.lower_new_dictionary(&expression.type_, key_type, value_type)),
+            hir::ExpressionKind::NewStringBuilder { class_symbol } => {
+                Some(self.lower_new_string_builder(&expression.type_, *class_symbol))
+            }
             hir::ExpressionKind::Index { .. } | hir::ExpressionKind::Member { .. } => {
                 Some(self.place_operand(expression))
             }
@@ -88,6 +91,44 @@ impl FunctionLowerer {
                     expression.type_.clone(),
                     mir::RvalueKind::DictionaryLength(dictionary),
                 ))
+            }
+            hir::ExpressionKind::StringBuilderAppend {
+                builder,
+                value,
+                class_symbol,
+            } => {
+                let builder = self
+                    .lower_expression(builder)
+                    .expect("validated StringBuilder receiver produces a value");
+                let value = self
+                    .lower_expression(value)
+                    .expect("validated string append value produces a value");
+                self.instruction(mir::Instruction::StringBuilderAppend {
+                    builder,
+                    value,
+                    class: *class_symbol,
+                });
+                None
+            }
+            hir::ExpressionKind::StringBuilderToString {
+                builder,
+                class_symbol,
+            } => {
+                let builder = self
+                    .lower_expression(builder)
+                    .expect("validated StringBuilder receiver produces a value");
+                let destination = self.new_temporary(hir::Type::String);
+                let place = mir::Place::Local(destination);
+                self.instruction(mir::Instruction::StringBuilderToString {
+                    destination: place.clone(),
+                    builder,
+                    class: *class_symbol,
+                    region: mir::AllocationRegion::Persistent,
+                });
+                Some(mir::Operand {
+                    type_: mir::Type::String,
+                    kind: mir::OperandKind::Copy(place),
+                })
             }
             hir::ExpressionKind::DictionaryAdd {
                 dictionary,
@@ -947,6 +988,23 @@ impl FunctionLowerer {
             destination: mir::Place::Local(destination),
             key_type: key_type.clone(),
             value_type: value_type.clone(),
+            region: mir::AllocationRegion::Persistent,
+        });
+        mir::Operand {
+            type_: type_.clone(),
+            kind: mir::OperandKind::Copy(mir::Place::Local(destination)),
+        }
+    }
+
+    fn lower_new_string_builder(
+        &mut self,
+        type_: &hir::Type,
+        class: hir::SymbolId,
+    ) -> mir::Operand {
+        let destination = self.new_temporary(type_.clone());
+        self.instruction(mir::Instruction::AllocateStringBuilder {
+            destination: mir::Place::Local(destination),
+            class,
             region: mir::AllocationRegion::Persistent,
         });
         mir::Operand {

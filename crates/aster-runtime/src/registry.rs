@@ -13,7 +13,10 @@ use crate::context::{
     aster_rt_dictionary_remove, aster_rt_dictionary_set, aster_rt_dictionary_try_get,
     aster_rt_has_error, aster_rt_list_add, aster_rt_list_get, aster_rt_list_length,
     aster_rt_list_new, aster_rt_list_new_temporary, aster_rt_list_remove_at, aster_rt_list_version,
-    aster_rt_list_version_mismatch, aster_rt_temporary_scope_enter, aster_rt_temporary_scope_leave,
+    aster_rt_list_version_mismatch, aster_rt_string_builder_append, aster_rt_string_builder_new,
+    aster_rt_string_builder_new_temporary, aster_rt_string_builder_to_string,
+    aster_rt_string_builder_to_string_temporary, aster_rt_temporary_scope_enter,
+    aster_rt_temporary_scope_leave,
 };
 use crate::filesystem::{
     aster_rt_io_list_files, aster_rt_io_list_files_temporary, aster_rt_io_read_all_text,
@@ -376,6 +379,50 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             signature: RuntimeSignature {
                 parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
                 result: Some(RuntimeType::I32),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_builder_new",
+            address: aster_rt_string_builder_new as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_builder_new_temporary",
+            address: aster_rt_string_builder_new_temporary as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_builder_append",
+            address: aster_rt_string_builder_append as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_builder_to_string",
+            address: aster_rt_string_builder_to_string as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_builder_to_string_temporary",
+            address: aster_rt_string_builder_to_string_temporary as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::Pointer),
             },
         },
         RuntimeFunction {

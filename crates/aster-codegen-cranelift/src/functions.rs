@@ -240,6 +240,28 @@ impl Codegen {
                 *region,
                 state,
             ),
+            mir::Instruction::AllocateStringBuilder {
+                destination,
+                region,
+                ..
+            } => self.translate_string_builder_allocation(builder, destination, *region, state),
+            mir::Instruction::StringBuilderAppend {
+                builder: receiver,
+                value,
+                ..
+            } => self.translate_string_builder_append(builder, receiver, value, state),
+            mir::Instruction::StringBuilderToString {
+                destination,
+                builder: receiver,
+                region,
+                ..
+            } => self.translate_string_builder_to_string(
+                builder,
+                destination,
+                receiver,
+                *region,
+                state,
+            ),
             mir::Instruction::DictionaryAdd {
                 destination,
                 dictionary,
@@ -376,6 +398,14 @@ fn function_uses_temporary_allocations(function: &mir::Function) -> bool {
                 ..
             }
             | mir::Instruction::AllocateDictionary {
+                region: mir::AllocationRegion::Temporary,
+                ..
+            }
+            | mir::Instruction::AllocateStringBuilder {
+                region: mir::AllocationRegion::Temporary,
+                ..
+            }
+            | mir::Instruction::StringBuilderToString {
                 region: mir::AllocationRegion::Temporary,
                 ..
             }

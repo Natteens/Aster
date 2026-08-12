@@ -299,6 +299,8 @@ fn is_dynamic_allocation(instruction: &mir::Instruction) -> bool {
             | mir::Instruction::AllocateArray { .. }
             | mir::Instruction::AllocateList { .. }
             | mir::Instruction::AllocateDictionary { .. }
+            | mir::Instruction::AllocateStringBuilder { .. }
+            | mir::Instruction::StringBuilderToString { .. }
             | mir::Instruction::DictionaryEntries { .. }
     ) || matches!(
         instruction,
@@ -313,6 +315,8 @@ fn allocation_destination(instruction: &mir::Instruction) -> Option<&mir::Place>
         | mir::Instruction::AllocateArray { destination, .. }
         | mir::Instruction::AllocateList { destination, .. }
         | mir::Instruction::AllocateDictionary { destination, .. }
+        | mir::Instruction::AllocateStringBuilder { destination, .. }
+        | mir::Instruction::StringBuilderToString { destination, .. }
         | mir::Instruction::DictionaryEntries { destination, .. } => Some(destination),
         mir::Instruction::CallIntrinsic {
             destination,
@@ -335,6 +339,12 @@ fn set_allocation_region(instruction: &mut mir::Instruction, region: mir::Alloca
             region: current, ..
         }
         | mir::Instruction::AllocateDictionary {
+            region: current, ..
+        }
+        | mir::Instruction::AllocateStringBuilder {
+            region: current, ..
+        }
+        | mir::Instruction::StringBuilderToString {
             region: current, ..
         }
         | mir::Instruction::DictionaryEntries {
@@ -617,6 +627,9 @@ fn instruction_escape(
         | mir::Instruction::AllocateObject { .. }
         | mir::Instruction::AllocateList { .. }
         | mir::Instruction::AllocateDictionary { .. }
+        | mir::Instruction::AllocateStringBuilder { .. }
+        | mir::Instruction::StringBuilderAppend { .. }
+        | mir::Instruction::StringBuilderToString { .. }
         | mir::Instruction::DictionaryTryGet { .. }
         | mir::Instruction::DictionaryContainsKey { .. }
         | mir::Instruction::DictionaryRemove { .. }

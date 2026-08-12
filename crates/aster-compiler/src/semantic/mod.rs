@@ -103,6 +103,12 @@ pub(crate) enum ResolvedDictionaryOperation {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResolvedStringBuilderOperation {
+    Append,
+    ToString,
+}
+
 /// A resolved postfix `?` operator. Records the concrete official-`Result`
 /// or official-`Option` enum and case positions so HIR lowering can attach
 /// symbols and tags without re-resolving any type or inspecting names. The
@@ -146,6 +152,12 @@ pub(crate) struct Model {
     pub propagations: HashMap<ModelNodeKey, ResolvedPropagation>,
     pub string_operations: HashMap<ModelNodeKey, StringOperation>,
     pub dictionary_operations: HashMap<ModelNodeKey, ResolvedDictionaryOperation>,
+    /// Intrinsic operations on the official `aster.core.StringBuilder`,
+    /// selected after ordinary nominal method resolution. HIR lowering
+    /// consumes this semantic decision instead of recognizing method names.
+    pub string_builder_operations: HashMap<ModelNodeKey, ResolvedStringBuilderOperation>,
+    /// Successful construction sites for the official `StringBuilder` class.
+    pub string_builder_constructions: HashSet<ModelNodeKey>,
     /// Validated `value.ToString()` call sites on one of the eight
     /// fundamental primitives. Membership alone is enough for HIR lowering:
     /// the receiver's own lowered type supplies the exact primitive.

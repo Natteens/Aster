@@ -49,6 +49,12 @@ struct Lowerer<'a> {
     /// references into literals during lowering.
     constant_values: HashMap<hir::SymbolId, ConstValue>,
     model_context: String,
+    string_builder: Option<StringBuilderSymbols>,
+}
+
+#[derive(Clone, Copy)]
+struct StringBuilderSymbols {
+    class: hir::SymbolId,
 }
 
 impl<'a> Lowerer<'a> {
@@ -81,8 +87,13 @@ impl<'a> Lowerer<'a> {
             callable_symbols: HashMap::new(),
             constant_values: HashMap::new(),
             model_context: String::new(),
+            string_builder: None,
         };
         lowerer.predeclare(module);
+        lowerer.string_builder = lowerer
+            .types
+            .get(crate::standard_library::STRING_BUILDER_NAME)
+            .map(|class| StringBuilderSymbols { class: *class });
         lowerer
     }
 

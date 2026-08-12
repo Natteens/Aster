@@ -183,6 +183,26 @@ pub enum Instruction {
         value_type: Type,
         region: AllocationRegion,
     },
+    /// Allocate the native header for the resolved official `StringBuilder`
+    /// class. Backing storage is allocated lazily by the runtime.
+    AllocateStringBuilder {
+        destination: Place,
+        class: SymbolId,
+        region: AllocationRegion,
+    },
+    /// Append immutable UTF-8 bytes to a builder without producing a string.
+    StringBuilderAppend {
+        builder: Operand,
+        value: Operand,
+        class: SymbolId,
+    },
+    /// Copy the active builder bytes into one immutable string allocation.
+    StringBuilderToString {
+        destination: Place,
+        builder: Operand,
+        class: SymbolId,
+        region: AllocationRegion,
+    },
     DictionaryAdd {
         destination: Place,
         dictionary: Operand,
