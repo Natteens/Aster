@@ -32,8 +32,8 @@ use std::sync::Arc;
 use super::completion_queue::{CompletionQueue, CompletionToken};
 use super::execution::PreparedProgram;
 use super::worker_pool::{
-    AsyncMemoryDomain, ChunkOutcome, ExecutionPool, JobKind, ParallelMemoryBudget,
-    ReduceChunkOutcome, TaskHandle, TaskMemoryDomain, TaskOutcome,
+    AsyncInnerPhaseGate, AsyncMemoryDomain, ChunkOutcome, ExecutionPool, JobKind,
+    ParallelMemoryBudget, ReduceChunkOutcome, TaskHandle, TaskMemoryDomain, TaskOutcome,
 };
 use super::{BackendError, ExecutionValue, MemoryStats, mir, scalar};
 
@@ -80,6 +80,8 @@ pub struct AarmAsyncMemoryDomainTelemetry {
     pub main_local_capacity_ceiling_bytes: u64,
     pub move_next_context_ceiling_bytes: u64,
     pub awaited_inner_context_ceiling_bytes: u64,
+    pub temporal_borrowing_enabled: bool,
+    pub phase_context_ceiling_bytes: u64,
     pub async_handles_created: u64,
     pub move_next_contexts_started: u64,
     pub move_next_contexts_completed: u64,
@@ -91,6 +93,8 @@ pub struct AarmAsyncMemoryDomainTelemetry {
     pub move_next_fresh_page_allocations: u64,
     pub inner_fast_path_allocations: u64,
     pub inner_fresh_page_allocations: u64,
+    pub phase_wait_events: u64,
+    pub phase_borrowed_contexts: u64,
     pub peak_simultaneous_governed_async_contexts: usize,
 }
 
@@ -104,8 +108,9 @@ struct TaskMemoryDomainPlan {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AsyncMemoryDomainPlan {
     main_future_growth: u64,
-    move_next_ceiling: u64,
-    awaited_inner_ceiling: u64,
+    fixed_move_next_ceiling: u64,
+    fixed_inner_ceiling: u64,
+    phase_context_ceiling: u64,
 }
 
 /// Opaque, stable identity for one task within its owning [`TaskRuntime`].
@@ -145,6 +150,9 @@ struct AsyncTask {
     /// while suspended at the `await`.
     inner: Option<TaskHandle>,
     inner_token: Option<CompletionToken>,
+    /// Closed while its submitting `MoveNext` context is live. The worker waits
+    /// before it creates a governed context or acquires any real capacity.
+    inner_phase_gate: Option<Arc<AsyncInnerPhaseGate>>,
     /// The completed inner result, cached once its token is signalled.
     inner_result: Option<ExecutionValue>,
     /// The value published by `MoveNext` via `AsyncSetResult`, promoted to the
@@ -324,6 +332,8 @@ impl TaskRuntime {
         telemetry.move_next_fresh_page_allocations = counters.move_next_fresh_page_allocations;
         telemetry.inner_fast_path_allocations = counters.inner_fast_path_allocations;
         telemetry.inner_fresh_page_allocations = counters.inner_fresh_page_allocations;
+        telemetry.phase_wait_events = counters.phase_wait_events;
+        telemetry.phase_borrowed_contexts = counters.phase_borrowed_contexts;
         telemetry.peak_simultaneous_governed_async_contexts = counters.peak_live_contexts;
         Some(telemetry)
     }
@@ -496,15 +506,18 @@ impl TaskRuntime {
             .ok_or_else(|| BackendError::new("main async entitlement exceeds host limits"))?;
         #[cfg(not(feature = "aarm-telemetry"))]
         let _ = main_local_capacity_ceiling;
-        let move_next_limit = usize::try_from(plan.move_next_ceiling)
+        let phase_limit = usize::try_from(plan.phase_context_ceiling)
+            .map_err(|_| BackendError::new("async phase entitlement exceeds host limits"))?;
+        let fixed_move_next_limit = usize::try_from(plan.fixed_move_next_ceiling)
             .map_err(|_| BackendError::new("async MoveNext entitlement exceeds host limits"))?;
-        let inner_limit = usize::try_from(plan.awaited_inner_ceiling).map_err(|_| {
+        let fixed_inner_limit = usize::try_from(plan.fixed_inner_ceiling).map_err(|_| {
             BackendError::new("async awaited-inner entitlement exceeds host limits")
         })?;
         let domain = Arc::new(AsyncMemoryDomain::new(
             governor,
-            move_next_limit,
-            inner_limit,
+            phase_limit,
+            fixed_move_next_limit,
+            fixed_inner_limit,
         ));
         #[cfg(feature = "aarm-telemetry")]
         {
@@ -515,8 +528,12 @@ impl TaskRuntime {
                 main_future_growth_bytes: plan.main_future_growth,
                 main_local_capacity_ceiling_bytes: u64::try_from(main_local_capacity_ceiling)
                     .expect("execution capacity ceilings fit governor telemetry"),
-                move_next_context_ceiling_bytes: plan.move_next_ceiling,
-                awaited_inner_context_ceiling_bytes: plan.awaited_inner_ceiling,
+                move_next_context_ceiling_bytes: plan.phase_context_ceiling,
+                awaited_inner_context_ceiling_bytes: plan.phase_context_ceiling,
+                temporal_borrowing_enabled: plan.phase_context_ceiling
+                    > plan.fixed_move_next_ceiling
+                    || plan.phase_context_ceiling > plan.fixed_inner_ceiling,
+                phase_context_ceiling_bytes: plan.phase_context_ceiling,
                 ..AarmAsyncMemoryDomainTelemetry::default()
             });
         }
@@ -560,6 +577,7 @@ impl TaskRuntime {
                 frame: vec![None; slot_count],
                 inner: None,
                 inner_token: None,
+                inner_phase_gate: None,
                 inner_result: None,
                 candidate: None,
                 resolved: None,
@@ -679,11 +697,18 @@ impl TaskRuntime {
         let token = self.fresh_token()?;
         self.pool.ensure_workers(self.pending_worker_demand())?;
         let completion = (Arc::clone(&self.completion), token);
-        let handle = match self.async_memory_domain.as_ref().map(Arc::clone) {
-            Some(domain) => self
-                .pool
-                .submit_governed_async_inner(inner, domain, completion)?,
-            None => self.pool.submit(inner, false, Some(completion))?,
+        let (handle, phase_gate) = match self.async_memory_domain.as_ref().map(Arc::clone) {
+            Some(domain) => {
+                let phase_gate = AsyncMemoryDomain::new_inner_phase_gate();
+                let handle = self.pool.submit_governed_async_inner(
+                    inner,
+                    domain,
+                    Arc::clone(&phase_gate),
+                    completion,
+                )?;
+                (handle, Some(phase_gate))
+            }
+            None => (self.pool.submit(inner, false, Some(completion))?, None),
         };
         let task = self
             .async_tasks
@@ -691,6 +716,7 @@ impl TaskRuntime {
             .ok_or_else(|| BackendError::new("async task disappeared during inner spawn"))?;
         task.inner = Some(handle);
         task.inner_token = Some(token);
+        task.inner_phase_gate = phase_gate;
         self.token_to_async.insert(token, id);
         Ok(())
     }
@@ -835,6 +861,8 @@ impl TaskRuntime {
         loop {
             // SAFETY: short reborrow, immediately dropped.
             if let Some(outcome) = unsafe { (*runtime).resolved_outcome(target) } {
+                // SAFETY: short reborrow, immediately dropped.
+                unsafe { (*runtime).settle_governed_inner(target) };
                 return outcome;
             }
             // SAFETY: each reborrow inside the loop body is short-lived and
@@ -858,30 +886,37 @@ impl TaskRuntime {
                     domain.record_move_next_outcome(&step, telemetry.as_ref());
                 }
                 drop(permit);
+                // `invoke_move_next` owns and drops its fresh context before
+                // returning. Only now may the queued inner construct its own
+                // governed context and reuse the phase entitlement.
+                unsafe { (*runtime).open_async_inner_phase(handle) };
                 // SAFETY: short reborrow, immediately dropped.
                 unsafe { (*runtime).apply_move_next(handle, step) };
             }
             // SAFETY: short reborrow, immediately dropped.
             if let Some(outcome) = unsafe { (*runtime).resolved_outcome(target) } {
+                // SAFETY: short reborrow, immediately dropped.
+                unsafe { (*runtime).settle_governed_inner(target) };
                 return outcome;
             }
-            match completion.pop() {
-                Some(token) => {
+            if let Some(token) = completion.pop() {
+                // SAFETY: short reborrow, immediately dropped.
+                let completion = unsafe { (*runtime).on_completion(token) };
+                if let Err(error) = completion {
+                    // SAFETY: short reborrow, immediately dropped. Cache
+                    // the failure so a repeated Wait cannot block after the
+                    // bad token has already been consumed.
+                    unsafe { (*runtime).resolve_error(target, error.clone()) };
                     // SAFETY: short reborrow, immediately dropped.
-                    let completion = unsafe { (*runtime).on_completion(token) };
-                    if let Err(error) = completion {
-                        // SAFETY: short reborrow, immediately dropped. Cache
-                        // the failure so a repeated Wait cannot block after the
-                        // bad token has already been consumed.
-                        unsafe { (*runtime).resolve_error(target, error.clone()) };
-                        return Err(error);
-                    }
+                    unsafe { (*runtime).settle_governed_inner(target) };
+                    return Err(error);
                 }
-                None => {
-                    return Err(BackendError::new(
-                        "the async completion queue closed while a task was still pending",
-                    ));
-                }
+            } else {
+                // SAFETY: short reborrow, immediately dropped.
+                unsafe { (*runtime).settle_governed_inner(target) };
+                return Err(BackendError::new(
+                    "the async completion queue closed while a task was still pending",
+                ));
             }
         }
     }
@@ -917,6 +952,36 @@ impl TaskRuntime {
     fn resolve_error(&mut self, target: TaskHandleId, error: BackendError) {
         if let Some(task) = self.async_tasks.get_mut(&target) {
             task.resolved = Some(Err(error));
+        }
+    }
+
+    fn open_async_inner_phase(&self, handle: TaskHandleId) {
+        if self.async_memory_domain.is_none() {
+            return;
+        }
+        let Some(gate) = self
+            .async_tasks
+            .get(&handle)
+            .and_then(|task| task.inner_phase_gate.as_ref())
+        else {
+            return;
+        };
+        AsyncMemoryDomain::open_inner_phase(gate);
+    }
+
+    /// On a governed failure after an inner was accepted, wait for the inner
+    /// context to finish before returning to Main. Its token remains mapped so
+    /// a late completion notification is harmless during a later serial pump.
+    fn settle_governed_inner(&mut self, target: TaskHandleId) {
+        if self.async_memory_domain.is_none() {
+            return;
+        }
+        let inner = self
+            .async_tasks
+            .get_mut(&target)
+            .and_then(|task| task.inner.take());
+        if let Some(inner) = inner {
+            let _ = inner.join();
         }
     }
 
@@ -985,6 +1050,10 @@ impl TaskRuntime {
             ));
         }
         task.inner_token = None;
+        task.inner_phase_gate = None;
+        if task.resolved.is_some() {
+            return Ok(());
+        }
         let outcome = match task.inner.take() {
             Some(inner) => inner.join(),
             None => Err(BackendError::new(
@@ -1315,10 +1384,9 @@ fn plan_task_memory_domain(
     })
 }
 
-/// Split frozen async future headroom across `MoveNext`, awaited inner, and
-/// Main in that canonical role order. The base planner gives useful whole
-/// minimum pages before any role receives a fragment; local context caps are
-/// then enforced and any excess is deterministically reassigned in role order.
+/// Freeze Main's post-Wait entitlement using the prior page-aware role split,
+/// then permit each mutually-exclusive async phase to use the full captured
+/// headroom up to the existing per-context safety ceiling.
 fn plan_async_memory_domain(
     available_headroom_bytes: u64,
     main_retained_capacity_bytes: u64,
@@ -1343,9 +1411,10 @@ fn plan_async_memory_domain(
         excess -= additional;
     }
     Ok(AsyncMemoryDomainPlan {
-        move_next_ceiling: budgets[0],
-        awaited_inner_ceiling: budgets[1],
+        fixed_move_next_ceiling: budgets[0],
+        fixed_inner_ceiling: budgets[1],
         main_future_growth: budgets[2],
+        phase_context_ceiling: available_headroom_bytes.min(local_limit),
     })
 }
 
@@ -1967,17 +2036,20 @@ mod tests {
     }
 
     #[test]
-    fn async_memory_domain_planning_is_page_aware_ordered_and_exact() {
+    fn async_memory_domain_planning_preserves_main_share_and_borrows_phase_headroom() {
         let page = u64::try_from(aster_runtime::ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES)
             .expect("minimum page capacity fits u64");
         let cases = [
-            (0, [0, 0, 0]),
-            (page - 1, [page - 1, 0, 0]),
-            (page, [page, 0, 0]),
-            (2 * page, [page, page, 0]),
-            (3 * page, [page, page, page]),
-            (3 * page + 2, [page + 1, page + 1, page]),
-            (6 * page + 2, [2 * page + 1, 2 * page + 1, 2 * page]),
+            (0, [0, 0, 0, 0]),
+            (page - 1, [page - 1, page - 1, 0, 0]),
+            (page, [page, page, 0, 0]),
+            (2 * page, [2 * page, page, page, 0]),
+            (3 * page, [3 * page, page, page, page]),
+            (3 * page + 2, [3 * page + 2, page + 1, page + 1, page]),
+            (
+                6 * page + 2,
+                [6 * page + 2, 2 * page + 1, 2 * page + 1, 2 * page],
+            ),
         ];
         for (headroom, expected) in cases {
             let first = plan_async_memory_domain(headroom, 0).expect("plan succeeds");
@@ -1985,14 +2057,17 @@ mod tests {
             assert_eq!(first, second);
             assert_eq!(
                 [
-                    first.move_next_ceiling,
-                    first.awaited_inner_ceiling,
+                    first.phase_context_ceiling,
+                    first.fixed_move_next_ceiling,
+                    first.fixed_inner_ceiling,
                     first.main_future_growth,
                 ],
                 expected
             );
             assert_eq!(
-                first.move_next_ceiling + first.awaited_inner_ceiling + first.main_future_growth,
+                first.fixed_move_next_ceiling
+                    + first.fixed_inner_ceiling
+                    + first.main_future_growth,
                 headroom
             );
         }
@@ -2003,12 +2078,13 @@ mod tests {
         let local = u64::try_from(aster_runtime::ExecutionContext::AARM_MAX_CONTEXT_CAPACITY_BYTES)
             .expect("local limit fits u64");
         let plan = plan_async_memory_domain(u64::MAX, local - 7).expect("large plan succeeds");
-        assert_eq!(plan.move_next_ceiling, local);
-        assert_eq!(plan.awaited_inner_ceiling, local);
+        assert_eq!(plan.phase_context_ceiling, local);
+        assert_eq!(plan.fixed_move_next_ceiling, local);
+        assert_eq!(plan.fixed_inner_ceiling, local);
         assert_eq!(plan.main_future_growth, 7);
         assert!(
-            u128::from(plan.move_next_ceiling)
-                + u128::from(plan.awaited_inner_ceiling)
+            u128::from(plan.fixed_move_next_ceiling)
+                + u128::from(plan.fixed_inner_ceiling)
                 + u128::from(plan.main_future_growth)
                 <= u128::from(u64::MAX)
         );

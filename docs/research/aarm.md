@@ -325,6 +325,40 @@ governed async contexts. Governor telemetry remains the authority for real retai
 Relaxed event-counter snapshots are observational during mutation and are asserted only after
 workers quiesce.
 
+## AARM-2B3 deterministic temporal borrowing
+
+AARM-2B3 keeps **live concurrent quota borrowing intentionally unsupported**. Pointer-stable arena
+pages cannot be revoked while their context is live. A first-come enlargement for concurrently
+running Parallel chunks or plain `Task.Run` contexts would therefore make scarce-memory success
+depend on scheduler order. Parallel keeps fixed logical-chunk ceilings (with its existing
+sequential Reduce-combine reuse), and plain Task.Run keeps fixed slot entitlements: completed tasks
+release real pages, but no live task receives a larger quota.
+
+The opt-in governed async path now permits **deterministic temporal borrowing** across proven
+non-overlapping phases only:
+
+```text
+MoveNext -> context drop -> awaited inner -> context drop
+         -> resumed MoveNext -> context drop -> Main resumes
+```
+
+At capture, Main's post-Wait entitlement remains the same page-aware deterministic share used by
+AARM-2B2B. While Main is blocked inside `Wait`, each async phase receives the full captured
+headroom up to the unchanged 1 GiB local ceiling. This is an entitlement ceiling, not a governor
+grant. Its real pages are released before another phase or Main can allocate.
+
+An execution-owned phase gate travels with each awaited-inner job. A worker may dequeue that job
+while the submitting MoveNext runs, but waits before constructing its governed `ExecutionContext`
+or obtaining a governor reservation. The host pump opens the gate only after `invoke_move_next`
+returns, which means that fresh MoveNext context has dropped. Failure paths settle any accepted
+governed inner before `Wait` returns; late completion tokens are harmlessly consumed by a later
+serial pump. There is no scheduler-selected borrower, no allocation-path arbitration, no quota
+pre-charge, and no borrowing into Main's frozen post-Wait guarantee.
+
+Telemetry adds `temporal_borrowing_enabled`, `phase_context_ceiling_bytes`,
+`phase_wait_events`, and `phase_borrowed_contexts`. These describe planning and gate behavior,
+not committed backing, virtual reservation, RSS, or governor grants.
+
 ## Measurement invariants
 
 Every snapshot must satisfy:
@@ -383,6 +417,8 @@ deterministic task-local denial.
 AARM-2B2B adds ordinary/governed trivial async, allocation before and after suspension, awaited
 inner allocation, Main post-Wait growth, page-tight domain plans, repeated Wait, and multiple
 serial async-handle cases.
+AARM-2B3 adds phase-serialized temporal borrowing controls for before-await, awaited-inner, and
+resumed-MoveNext allocations under the same tight governor hard limit.
 
 ```console
 cargo run --release -p aster-codegen-cranelift --features aarm-telemetry --example aarm_memory_matrix -- --scale small
@@ -395,7 +431,7 @@ Generated reports and machine-local baselines are not committed.
 
 ## Metrics that do not exist yet
 
-AARM-2B2B does not expose or infer:
+AARM-2B3 does not expose or infer:
 
 - `virtual_reserved_bytes`;
 - `committed_backing_bytes`;
@@ -413,7 +449,7 @@ AARM-1 observability
 -> AARM-2B1 deterministic Parallel chunk partitions
 -> AARM-2B2A deterministic plain Task.Run memory domains
 -> AARM-2B2B async task memory domains
--> AARM-2B3 deterministic quota borrowing research
+-> AARM-2B3 deterministic temporal borrowing
 -> AARM-2C host-adaptive policy research
 -> AARM-3 OS PageBackend
 -> AARM-4 delayed purge/hysteresis

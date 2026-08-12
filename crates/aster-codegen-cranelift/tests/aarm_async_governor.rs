@@ -55,6 +55,8 @@ fn governed_async_covers_before_inner_after_and_main_growth() {
             assert_eq!(domain.inner_contexts_completed, 1);
             assert_eq!(domain.move_next_memory_failures, 0);
             assert_eq!(domain.inner_memory_failures, 0);
+            assert!(domain.temporal_borrowing_enabled);
+            assert_eq!(domain.peak_simultaneous_governed_async_contexts, 1);
             assert!(governor.peak_capacity_bytes <= governor.hard_limit_bytes);
             assert_eq!(governor.current_capacity_bytes, 0);
             assert_eq!(governor.grant_events, governor.release_events);
@@ -74,10 +76,10 @@ fn async_domain_plan_is_page_aware_for_zero_through_three_pages() {
     let page = ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES;
     let cases = [
         (0, [0, 0, 0]),
-        (page, [page, 0, 0]),
-        (2 * page, [page, page, 0]),
-        (3 * page, [page, page, page]),
-        (3 * page + 2, [page + 1, page + 1, page]),
+        (page, [page, page, 0]),
+        (2 * page, [2 * page, 2 * page, 0]),
+        (3 * page, [3 * page, 3 * page, page]),
+        (3 * page + 2, [3 * page + 2, 3 * page + 2, page]),
     ];
     for (headroom, expected) in cases {
         let (value, _, domain, governor) =
@@ -97,8 +99,7 @@ fn async_domain_plan_is_page_aware_for_zero_through_three_pages() {
 }
 
 #[test]
-fn move_next_and_inner_entitlement_failures_are_controlled_and_repeatable() {
-    let page = ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES;
+fn zero_phase_entitlement_failures_are_controlled_and_repeatable() {
     let move_failure = "public int Scratch() { int[] values = new int[1]; return values.Length; } \
          public int Inner() { return 1; } \
          public async Task<int> Calculate() { int before = Scratch(); int value = await Task.Run(Inner); return before + value; } \
@@ -113,7 +114,7 @@ fn move_next_and_inner_entitlement_failures_are_controlled_and_repeatable() {
             move_error.contains("deterministic async MoveNext memory entitlement"),
             "unexpected error: {move_error}"
         );
-        let inner_error = run(inner_failure, 4, page).expect_err("zero inner quota rejects a page");
+        let inner_error = run(inner_failure, 4, 0).expect_err("zero inner quota rejects a page");
         assert!(
             inner_error.contains("deterministic async awaited-inner memory entitlement"),
             "unexpected error: {inner_error}"
@@ -122,25 +123,26 @@ fn move_next_and_inner_entitlement_failures_are_controlled_and_repeatable() {
 }
 
 #[test]
-fn oversized_inner_page_uses_its_actual_byte_capacity() {
+fn temporal_borrowing_preserves_oversized_page_accounting() {
     let source = "public int Inner() { int[] values = new int[20000]; return values.Length; } \
          public async Task<int> Calculate() { int value = await Task.Run(Inner); return value; } \
          public int Main() { return Calculate().Wait(); }";
     let regular = ExecutionContext::AARM_DEFAULT_PAGE_CAPACITY_BYTES;
-    let denied = run(source, 4, 3 * regular)
-        .expect_err("a request-sized oversized page exceeds the fixed inner byte ceiling");
+    let denied = run(source, 4, regular)
+        .expect_err("a request-sized oversized page exceeds the phase ceiling");
     assert!(denied.contains("deterministic async awaited-inner memory entitlement"));
 
-    let (value, _, domain, governor) =
-        run(source, 4, 9 * regular).expect("the actual oversized capacity fits a larger ceiling");
+    let (value, _, domain, governor) = run(source, 4, 3 * regular).expect(
+        "the same limit that stranded the old fixed share now fits the actual oversized page",
+    );
     assert_eq!(value, ExecutionValue::Int(20_000));
-    assert!(domain.awaited_inner_context_ceiling_bytes > regular as u64);
+    assert_eq!(domain.phase_context_ceiling_bytes, (3 * regular) as u64);
     assert_eq!(governor.grant_events, 1);
     assert_eq!(governor.grant_events, governor.release_events);
 }
 
 #[test]
-fn resumed_move_next_and_main_post_wait_keep_their_frozen_limits() {
+fn temporal_borrowing_expands_resumed_move_next_but_not_main() {
     let page = ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES;
     let resumed_failure = "public int Inner() { return 1; } \
          public async Task<int> Calculate() { int value = await Task.Run(Inner); int[] values = new int[2000]; return value + values.Length; } \
@@ -149,12 +151,49 @@ fn resumed_move_next_and_main_post_wait_keep_their_frozen_limits() {
          public async Task<int> Calculate() { int value = await Task.Run(Inner); return value; } \
          public int Main() { int value = Calculate().Wait(); int[] values = new int[2000]; return value + values.Length; }";
 
-    let resumed =
-        run(resumed_failure, 4, 3 * page).expect_err("resumed MoveNext keeps its one-page ceiling");
-    assert!(resumed.contains("deterministic async MoveNext memory entitlement"));
+    let resumed = run(resumed_failure, 4, 3 * page)
+        .expect("resumed MoveNext borrows the full quiescent phase entitlement");
+    assert_eq!(resumed.0, ExecutionValue::Int(2_001));
     let main = run(main_failure, 4, 3 * page)
         .expect_err("post-Wait Main keeps its one-page future entitlement");
     assert!(main.contains("deterministic async Main memory entitlement"));
+}
+
+#[test]
+fn temporal_borrowing_makes_each_serial_async_phase_useful_under_one_tight_limit() {
+    let page = ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES;
+    let cases = [
+        (
+            "before",
+            "public int Scratch() { int[] values = new int[2000]; return values.Length; } public int Inner() { return 1; } public async Task<int> Later() { int before = Scratch(); int value = await Task.Run(Inner); return before + value; } public int Main() { return Later().Wait(); }",
+            2_001,
+        ),
+        (
+            "inner",
+            "public int Inner() { int[] values = new int[2000]; return values.Length; } public async Task<int> Later() { int value = await Task.Run(Inner); return value; } public int Main() { return Later().Wait(); }",
+            2_000,
+        ),
+        (
+            "after",
+            "public int Inner() { return 1; } public async Task<int> Later() { int value = await Task.Run(Inner); int[] after = new int[2000]; return value + after.Length; } public int Main() { return Later().Wait(); }",
+            2_001,
+        ),
+    ];
+    for workers in [1, 4, 16] {
+        for (name, source, expected) in cases {
+            for _ in 0..8 {
+                let (value, _, domain, governor) = run(source, workers, 3 * page)
+                    .unwrap_or_else(|error| panic!("{name} must be deterministic: {error}"));
+                assert_eq!(value, ExecutionValue::Int(expected));
+                assert_eq!(domain.phase_context_ceiling_bytes, (3 * page) as u64);
+                assert_eq!(domain.peak_simultaneous_governed_async_contexts, 1);
+                assert!(domain.phase_borrowed_contexts > 0);
+                assert!(governor.peak_capacity_bytes <= governor.hard_limit_bytes);
+                assert_eq!(governor.current_capacity_bytes, 0);
+                assert_eq!(governor.grant_events, governor.release_events);
+            }
+        }
+    }
 }
 
 #[test]

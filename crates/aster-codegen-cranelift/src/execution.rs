@@ -252,7 +252,7 @@ impl PreparedProgram {
             memory_domain.map_or_else(aster_runtime::ExecutionContext::new, |domain| {
                 aster_runtime::ExecutionContext::with_async_move_next_memory_budget(
                     Arc::clone(domain.governor()),
-                    domain.move_next_limit_bytes(),
+                    domain.phase_context_limit_bytes(),
                 )
             });
         context.set_task_runtime(task_runtime);

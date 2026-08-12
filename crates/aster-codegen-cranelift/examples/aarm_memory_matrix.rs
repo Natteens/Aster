@@ -189,6 +189,9 @@ pub fn run_matrix(scales: &[Scale]) -> Vec<CaseResult> {
         results.push(async_inner_denial_case(scale));
         results.push(async_move_next_denial_case(scale));
         results.push(async_repeated_wait_case(scale));
+        results.push(async_temporal_before_await_case(scale));
+        results.push(async_temporal_inner_case(scale));
+        results.push(async_temporal_after_await_case(scale));
     }
     results
 }
@@ -1290,6 +1293,36 @@ fn async_repeated_wait_case(scale: Scale) -> CaseResult {
     )
 }
 
+fn async_temporal_before_await_case(scale: Scale) -> CaseResult {
+    governed_async_shape_case(
+        "governed_async_temporal_before_await",
+        scale,
+        "public int Scratch() { int[] values = new int[2000]; return values.Length; } public int Inner() { return 1; } public async Task<int> Later() { int before = Scratch(); int value = await Task.Run(Inner); return before + value; } public int Main() { return Later().Wait(); }",
+        2_001,
+        3 * ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES,
+    )
+}
+
+fn async_temporal_inner_case(scale: Scale) -> CaseResult {
+    governed_async_shape_case(
+        "governed_async_temporal_inner",
+        scale,
+        "public int Inner() { int[] values = new int[2000]; return values.Length; } public async Task<int> Later() { int value = await Task.Run(Inner); return value; } public int Main() { return Later().Wait(); }",
+        2_000,
+        3 * ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES,
+    )
+}
+
+fn async_temporal_after_await_case(scale: Scale) -> CaseResult {
+    governed_async_shape_case(
+        "governed_async_temporal_after_await",
+        scale,
+        "public int Inner() { return 1; } public async Task<int> Later() { int value = await Task.Run(Inner); int[] after = new int[2000]; return value + after.Length; } public int Main() { return Later().Wait(); }",
+        2_001,
+        3 * ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES,
+    )
+}
+
 fn async_denial_case(
     workload: &'static str,
     scale: Scale,
@@ -1338,7 +1371,7 @@ fn async_inner_denial_case(scale: Scale) -> CaseResult {
         "governed_async_inner_denial",
         scale,
         "public int Inner() { int[] values = new int[1]; return values.Length; } public async Task<int> Later() { int value = await Task.Run(Inner); return value; } public int Main() { return Later().Wait(); }",
-        ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES,
+        0,
         "deterministic async awaited-inner memory entitlement",
     )
 }
@@ -1645,12 +1678,14 @@ fn json_async_domain(domain: Option<AarmAsyncMemoryDomainTelemetry>) -> String {
                  \"main_future_growth_bytes\":{},\"main_local_capacity_ceiling_bytes\":{},\
                  \"move_next_context_ceiling_bytes\":{},\
                  \"awaited_inner_context_ceiling_bytes\":{},\
+                 \"temporal_borrowing_enabled\":{},\"phase_context_ceiling_bytes\":{},\
                  \"async_handles_created\":{},\"move_next_contexts_started\":{},\
                  \"move_next_contexts_completed\":{},\"inner_contexts_started\":{},\
                  \"inner_contexts_completed\":{},\"move_next_memory_failures\":{},\
                  \"inner_memory_failures\":{},\"move_next_fast_path_allocations\":{},\
                  \"move_next_fresh_page_allocations\":{},\
                  \"inner_fast_path_allocations\":{},\"inner_fresh_page_allocations\":{},\
+                 \"phase_wait_events\":{},\"phase_borrowed_contexts\":{},\
                  \"peak_simultaneous_governed_async_contexts\":{}}}",
                 domain.initial_governor_capacity_bytes,
                 domain.available_headroom_bytes,
@@ -1659,6 +1694,8 @@ fn json_async_domain(domain: Option<AarmAsyncMemoryDomainTelemetry>) -> String {
                 domain.main_local_capacity_ceiling_bytes,
                 domain.move_next_context_ceiling_bytes,
                 domain.awaited_inner_context_ceiling_bytes,
+                domain.temporal_borrowing_enabled,
+                domain.phase_context_ceiling_bytes,
                 domain.async_handles_created,
                 domain.move_next_contexts_started,
                 domain.move_next_contexts_completed,
@@ -1670,6 +1707,8 @@ fn json_async_domain(domain: Option<AarmAsyncMemoryDomainTelemetry>) -> String {
                 domain.move_next_fresh_page_allocations,
                 domain.inner_fast_path_allocations,
                 domain.inner_fresh_page_allocations,
+                domain.phase_wait_events,
+                domain.phase_borrowed_contexts,
                 domain.peak_simultaneous_governed_async_contexts,
             )
         },
@@ -1710,7 +1749,7 @@ fn json_case(result: &CaseResult) -> String {
 
 #[must_use]
 pub fn serialize_results(results: &[CaseResult]) -> String {
-    let mut output = String::from("{\"schema_version\":5,\"results\":[");
+    let mut output = String::from("{\"schema_version\":6,\"results\":[");
     for (index, result) in results.iter().enumerate() {
         if index != 0 {
             output.push(',');
@@ -1831,7 +1870,7 @@ mod tests {
     fn structured_output_advertises_the_async_domain_schema() {
         assert_eq!(
             serialize_results(&[]),
-            "{\"schema_version\":5,\"results\":[]}"
+            "{\"schema_version\":6,\"results\":[]}"
         );
     }
 }

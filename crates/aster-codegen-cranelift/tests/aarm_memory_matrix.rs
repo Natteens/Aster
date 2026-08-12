@@ -17,7 +17,7 @@ fn small_results() -> &'static [CaseResult] {
 #[test]
 fn small_matrix_covers_required_workload_shapes() {
     let results = small_results();
-    assert_eq!(results.len(), 110);
+    assert_eq!(results.len(), 113);
     for workload in [
         "tiny_allocations",
         "long_scope_temporary",
@@ -70,6 +70,9 @@ fn small_matrix_covers_required_workload_shapes() {
         "governed_async_inner_denial",
         "governed_async_move_next_denial",
         "governed_async_repeated_wait",
+        "governed_async_temporal_before_await",
+        "governed_async_temporal_inner",
+        "governed_async_temporal_after_await",
     ] {
         assert!(results.iter().any(|result| result.workload == workload));
     }
@@ -89,12 +92,16 @@ fn governed_async_domains_are_frozen_page_aware_and_quiescent() {
         .filter(|result| result.async_domain.is_some())
     {
         let domain = result.async_domain.expect("async domain exists");
-        assert!(
-            u128::from(domain.main_future_growth_bytes)
-                + u128::from(domain.move_next_context_ceiling_bytes)
-                + u128::from(domain.awaited_inner_context_ceiling_bytes)
-                <= u128::from(domain.available_headroom_bytes)
+        assert!(domain.temporal_borrowing_enabled);
+        assert_eq!(
+            domain.move_next_context_ceiling_bytes,
+            domain.phase_context_ceiling_bytes
         );
+        assert_eq!(
+            domain.awaited_inner_context_ceiling_bytes,
+            domain.phase_context_ceiling_bytes
+        );
+        assert!(domain.phase_context_ceiling_bytes <= domain.available_headroom_bytes);
         assert_eq!(
             domain.move_next_contexts_started,
             domain.move_next_contexts_completed
@@ -123,8 +130,9 @@ fn governed_async_domains_are_frozen_page_aware_and_quiescent() {
         .expect("tight async case exists")
         .async_domain
         .expect("tight async case reports its plan");
-    assert_eq!(tight.move_next_context_ceiling_bytes, page);
-    assert_eq!(tight.awaited_inner_context_ceiling_bytes, page);
+    assert_eq!(tight.move_next_context_ceiling_bytes, 3 * page);
+    assert_eq!(tight.awaited_inner_context_ceiling_bytes, 3 * page);
+    assert_eq!(tight.phase_context_ceiling_bytes, 3 * page);
     assert_eq!(tight.main_future_growth_bytes, page);
 
     let repeated = results
@@ -361,7 +369,7 @@ fn rewind_reuse_and_persistence_are_visible_without_policy_changes() {
 #[test]
 fn structured_output_contains_no_future_aarm_claims() {
     let json = serialize_results(small_results());
-    assert!(json.starts_with("{\"schema_version\":5,"));
+    assert!(json.starts_with("{\"schema_version\":6,"));
     assert!(json.contains("\"requested_bytes\""));
     assert!(json.contains("\"arena_capacity_bytes\""));
     assert!(json.contains("\"last_rewind\""));
@@ -378,10 +386,12 @@ fn structured_output_contains_no_future_aarm_claims() {
     assert!(json.contains("\"async_memory_domain\""));
     assert!(json.contains("\"move_next_context_ceiling_bytes\""));
     assert!(json.contains("\"awaited_inner_context_ceiling_bytes\""));
+    assert!(json.contains("\"temporal_borrowing_enabled\""));
+    assert!(json.contains("\"phase_context_ceiling_bytes\""));
     assert!(!json.contains("virtual_reserved_bytes"));
     assert!(!json.contains("committed_backing_bytes"));
     assert!(!json.contains("purge_events"));
-    assert_eq!(json.matches("\"workload\":").count(), 110);
+    assert_eq!(json.matches("\"workload\":").count(), 113);
 }
 
 #[test]
