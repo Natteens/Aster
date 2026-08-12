@@ -32,8 +32,8 @@ use std::sync::Arc;
 use super::completion_queue::{CompletionQueue, CompletionToken};
 use super::execution::PreparedProgram;
 use super::worker_pool::{
-    ChunkOutcome, ExecutionPool, JobKind, ParallelMemoryBudget, ReduceChunkOutcome, TaskHandle,
-    TaskMemoryDomain, TaskOutcome,
+    AsyncMemoryDomain, ChunkOutcome, ExecutionPool, JobKind, ParallelMemoryBudget,
+    ReduceChunkOutcome, TaskHandle, TaskMemoryDomain, TaskOutcome,
 };
 use super::{BackendError, ExecutionValue, MemoryStats, mir, scalar};
 
@@ -68,11 +68,44 @@ pub struct AarmTaskMemoryDomainTelemetry {
     pub fresh_page_allocations: u64,
 }
 
+/// Frozen plan and observational counters for one governed async domain.
+#[cfg(feature = "aarm-telemetry")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AarmAsyncMemoryDomainTelemetry {
+    pub initial_governor_capacity_bytes: u64,
+    pub available_headroom_bytes: u64,
+    pub main_retained_capacity_bytes: u64,
+    pub main_future_growth_bytes: u64,
+    pub main_local_capacity_ceiling_bytes: u64,
+    pub move_next_context_ceiling_bytes: u64,
+    pub awaited_inner_context_ceiling_bytes: u64,
+    pub async_handles_created: u64,
+    pub move_next_contexts_started: u64,
+    pub move_next_contexts_completed: u64,
+    pub inner_contexts_started: u64,
+    pub inner_contexts_completed: u64,
+    pub move_next_memory_failures: u64,
+    pub inner_memory_failures: u64,
+    pub move_next_fast_path_allocations: u64,
+    pub move_next_fresh_page_allocations: u64,
+    pub inner_fast_path_allocations: u64,
+    pub inner_fresh_page_allocations: u64,
+    pub peak_simultaneous_governed_async_contexts: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TaskMemoryDomainPlan {
     main_future_growth_bytes: u64,
     task_context_ceiling_bytes: u64,
     task_memory_concurrency_limit: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AsyncMemoryDomainPlan {
+    main_future_growth: u64,
+    move_next_ceiling: u64,
+    awaited_inner_ceiling: u64,
 }
 
 /// Opaque, stable identity for one task within its owning [`TaskRuntime`].
@@ -139,8 +172,13 @@ pub(super) struct TaskRuntime {
     parallel_governor: Option<Arc<aster_runtime::MemoryGovernor>>,
     task_governor: Option<Arc<aster_runtime::MemoryGovernor>>,
     task_memory_domain: Option<Arc<TaskMemoryDomain>>,
+    async_governor: Option<Arc<aster_runtime::MemoryGovernor>>,
+    async_memory_domain: Option<Arc<AsyncMemoryDomain>>,
+    async_handles_created: u64,
     #[cfg(feature = "aarm-telemetry")]
     task_domain_telemetry: Option<AarmTaskMemoryDomainTelemetry>,
+    #[cfg(feature = "aarm-telemetry")]
+    async_domain_telemetry: Option<AarmAsyncMemoryDomainTelemetry>,
     #[cfg(feature = "aarm-telemetry")]
     parallel_plans: Vec<AarmParallelPlanningTelemetry>,
     #[cfg(feature = "aarm-telemetry")]
@@ -177,7 +215,7 @@ impl TaskRuntime {
         module: &Arc<mir::Module>,
         worker_count: usize,
     ) -> Result<Self, BackendError> {
-        Self::with_governors(module, worker_count, None, None)
+        Self::with_governors(module, worker_count, None, None, None)
     }
 
     fn with_governors(
@@ -185,6 +223,7 @@ impl TaskRuntime {
         worker_count: usize,
         parallel_governor: Option<Arc<aster_runtime::MemoryGovernor>>,
         task_governor: Option<Arc<aster_runtime::MemoryGovernor>>,
+        async_governor: Option<Arc<aster_runtime::MemoryGovernor>>,
     ) -> Result<Self, BackendError> {
         let pool = ExecutionPool::new(Arc::clone(module), worker_count)?;
         let driver = module_uses_async(module)
@@ -204,8 +243,13 @@ impl TaskRuntime {
             parallel_governor,
             task_governor,
             task_memory_domain: None,
+            async_governor,
+            async_memory_domain: None,
+            async_handles_created: 0,
             #[cfg(feature = "aarm-telemetry")]
             task_domain_telemetry: None,
+            #[cfg(feature = "aarm-telemetry")]
+            async_domain_telemetry: None,
             #[cfg(feature = "aarm-telemetry")]
             parallel_plans: Vec::new(),
             #[cfg(feature = "aarm-telemetry")]
@@ -221,7 +265,7 @@ impl TaskRuntime {
         worker_count: usize,
         governor: Arc<aster_runtime::MemoryGovernor>,
     ) -> Result<Self, BackendError> {
-        Self::with_governors(module, worker_count, Some(governor), None)
+        Self::with_governors(module, worker_count, Some(governor), None, None)
     }
 
     #[cfg(feature = "aarm-telemetry")]
@@ -230,7 +274,16 @@ impl TaskRuntime {
         worker_count: usize,
         governor: Arc<aster_runtime::MemoryGovernor>,
     ) -> Result<Self, BackendError> {
-        Self::with_governors(module, worker_count, None, Some(governor))
+        Self::with_governors(module, worker_count, None, Some(governor), None)
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    pub(super) fn with_async_memory_governor(
+        module: &Arc<mir::Module>,
+        worker_count: usize,
+        governor: Arc<aster_runtime::MemoryGovernor>,
+    ) -> Result<Self, BackendError> {
+        Self::with_governors(module, worker_count, None, None, Some(governor))
     }
 
     #[cfg(feature = "aarm-telemetry")]
@@ -253,6 +306,25 @@ impl TaskRuntime {
         telemetry.task_context_memory_failures = counters.memory_failures;
         telemetry.active_page_fast_path_allocations = counters.active_page_fast_path_allocations;
         telemetry.fresh_page_allocations = counters.fresh_page_allocations;
+        Some(telemetry)
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    pub(super) fn async_domain_telemetry(&self) -> Option<AarmAsyncMemoryDomainTelemetry> {
+        let mut telemetry = self.async_domain_telemetry?;
+        let counters = self.async_memory_domain.as_ref()?.counters();
+        telemetry.async_handles_created = self.async_handles_created;
+        telemetry.move_next_contexts_started = counters.move_next_contexts_started;
+        telemetry.move_next_contexts_completed = counters.move_next_contexts_completed;
+        telemetry.inner_contexts_started = counters.inner_contexts_started;
+        telemetry.inner_contexts_completed = counters.inner_contexts_completed;
+        telemetry.move_next_memory_failures = counters.move_next_memory_failures;
+        telemetry.inner_memory_failures = counters.inner_memory_failures;
+        telemetry.move_next_fast_path_allocations = counters.move_next_fast_path_allocations;
+        telemetry.move_next_fresh_page_allocations = counters.move_next_fresh_page_allocations;
+        telemetry.inner_fast_path_allocations = counters.inner_fast_path_allocations;
+        telemetry.inner_fresh_page_allocations = counters.inner_fresh_page_allocations;
+        telemetry.peak_simultaneous_governed_async_contexts = counters.peak_live_contexts;
         Some(telemetry)
     }
 
@@ -384,6 +456,74 @@ impl TaskRuntime {
         Ok(domain)
     }
 
+    fn activate_async_memory_domain(
+        &mut self,
+        main_context: &mut aster_runtime::ExecutionContext,
+    ) -> Result<Arc<AsyncMemoryDomain>, BackendError> {
+        if let Some(domain) = &self.async_memory_domain {
+            return Ok(Arc::clone(domain));
+        }
+        let governor = self
+            .async_governor
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| BackendError::new("async memory governor is unavailable"))?;
+        if !main_context.is_governed_by(&governor) {
+            return Err(BackendError::new(
+                "main context does not use the async memory governor",
+            ));
+        }
+        let snapshot = governor.telemetry();
+        let main_retained = main_context
+            .retained_arena_capacity_bytes()
+            .ok_or_else(|| BackendError::new("main retained arena capacity overflow"))?;
+        let main_retained_u64 = u64::try_from(main_retained)
+            .map_err(|_| BackendError::new("main retained arena capacity exceeds telemetry"))?;
+        if snapshot.current_capacity_bytes < main_retained_u64 {
+            return Err(BackendError::new(
+                "governed main capacity is not owned by the async memory governor",
+            ));
+        }
+        let available_headroom_bytes = snapshot
+            .hard_limit_bytes
+            .checked_sub(snapshot.current_capacity_bytes)
+            .ok_or_else(|| BackendError::new("memory governor capacity exceeds its hard limit"))?;
+        let plan = plan_async_memory_domain(available_headroom_bytes, main_retained_u64)?;
+        let main_future_growth = usize::try_from(plan.main_future_growth)
+            .map_err(|_| BackendError::new("main async entitlement exceeds host limits"))?;
+        let main_local_capacity_ceiling = main_context
+            .freeze_async_domain_main_limit(main_future_growth)
+            .ok_or_else(|| BackendError::new("main async entitlement exceeds host limits"))?;
+        #[cfg(not(feature = "aarm-telemetry"))]
+        let _ = main_local_capacity_ceiling;
+        let move_next_limit = usize::try_from(plan.move_next_ceiling)
+            .map_err(|_| BackendError::new("async MoveNext entitlement exceeds host limits"))?;
+        let inner_limit = usize::try_from(plan.awaited_inner_ceiling).map_err(|_| {
+            BackendError::new("async awaited-inner entitlement exceeds host limits")
+        })?;
+        let domain = Arc::new(AsyncMemoryDomain::new(
+            governor,
+            move_next_limit,
+            inner_limit,
+        ));
+        #[cfg(feature = "aarm-telemetry")]
+        {
+            self.async_domain_telemetry = Some(AarmAsyncMemoryDomainTelemetry {
+                initial_governor_capacity_bytes: snapshot.current_capacity_bytes,
+                available_headroom_bytes,
+                main_retained_capacity_bytes: main_retained_u64,
+                main_future_growth_bytes: plan.main_future_growth,
+                main_local_capacity_ceiling_bytes: u64::try_from(main_local_capacity_ceiling)
+                    .expect("execution capacity ceilings fit governor telemetry"),
+                move_next_context_ceiling_bytes: plan.move_next_ceiling,
+                awaited_inner_context_ceiling_bytes: plan.awaited_inner_ceiling,
+                ..AarmAsyncMemoryDomainTelemetry::default()
+            });
+        }
+        self.async_memory_domain = Some(Arc::clone(&domain));
+        Ok(domain)
+    }
+
     pub(super) fn is_async_handle(&self, id: TaskHandleId) -> bool {
         self.async_tasks.contains_key(&id)
     }
@@ -425,6 +565,10 @@ impl TaskRuntime {
                 resolved: None,
             },
         );
+        self.async_handles_created = self
+            .async_handles_created
+            .checked_add(1)
+            .ok_or_else(|| BackendError::new("async handle telemetry overflow"))?;
         Ok(id)
     }
 
@@ -534,9 +678,13 @@ impl TaskRuntime {
         }
         let token = self.fresh_token()?;
         self.pool.ensure_workers(self.pending_worker_demand())?;
-        let handle = self
-            .pool
-            .submit(inner, false, Some((Arc::clone(&self.completion), token)))?;
+        let completion = (Arc::clone(&self.completion), token);
+        let handle = match self.async_memory_domain.as_ref().map(Arc::clone) {
+            Some(domain) => self
+                .pool
+                .submit_governed_async_inner(inner, domain, completion)?,
+            None => self.pool.submit(inner, false, Some(completion))?,
+        };
         let task = self
             .async_tasks
             .get_mut(&id)
@@ -646,6 +794,30 @@ impl TaskRuntime {
         outcome
     }
 
+    /// Freeze the governed async domain, if configured, before the first
+    /// unresolved async step executes. The Main borrow ends before `pump`
+    /// invokes JIT code.
+    #[allow(unsafe_code)]
+    pub(super) unsafe fn pump_from_context(
+        runtime: *mut Self,
+        target: TaskHandleId,
+        main_context: &mut aster_runtime::ExecutionContext,
+    ) -> Result<TaskOutcome, BackendError> {
+        // SAFETY: the caller provides the same exclusive runtime pointer as
+        // `pump`; this short reborrow ends before any MoveNext invocation.
+        let already_resolved = unsafe { (*runtime).resolved_outcome(target) };
+        if let Some(outcome) = already_resolved {
+            return outcome;
+        }
+        // SAFETY: same short-reborrow contract.
+        if unsafe { (*runtime).async_governor.is_some() } {
+            // SAFETY: no runtime borrow spans the later pump.
+            unsafe { (*runtime).activate_async_memory_domain(main_context) }?;
+        }
+        // SAFETY: forwarded caller contract; the Main borrow is no longer used.
+        unsafe { Self::pump(runtime, target) }
+    }
+
     /// # Safety
     /// See [`Self::pump`]. Every `(*runtime)` reborrow below is a single
     /// statement and is dropped before `driver.invoke_move_next` runs, so no
@@ -668,10 +840,24 @@ impl TaskRuntime {
             // SAFETY: each reborrow inside the loop body is short-lived and
             // never spans `invoke_move_next`.
             while let Some((move_next, handle)) = unsafe { (*runtime).pop_ready() } {
+                // SAFETY: short reborrow ending before the JIT invocation.
+                let memory_domain =
+                    unsafe { (*runtime).async_memory_domain.as_ref().map(Arc::clone) };
+                let permit = memory_domain
+                    .as_ref()
+                    .map(AsyncMemoryDomain::acquire_move_next);
                 // No runtime borrow is held here: the step's ABI callbacks
                 // reborrow `runtime` freshly through the context pointer.
-                let step =
-                    driver.invoke_move_next(move_next, handle.to_bits(), runtime.cast::<()>());
+                let (step, telemetry) = driver.invoke_move_next(
+                    move_next,
+                    handle.to_bits(),
+                    runtime.cast::<()>(),
+                    memory_domain.as_deref(),
+                );
+                if let Some(domain) = &memory_domain {
+                    domain.record_move_next_outcome(&step, telemetry.as_ref());
+                }
+                drop(permit);
                 // SAFETY: short reborrow, immediately dropped.
                 unsafe { (*runtime).apply_move_next(handle, step) };
             }
@@ -1129,6 +1315,40 @@ fn plan_task_memory_domain(
     })
 }
 
+/// Split frozen async future headroom across `MoveNext`, awaited inner, and
+/// Main in that canonical role order. The base planner gives useful whole
+/// minimum pages before any role receives a fragment; local context caps are
+/// then enforced and any excess is deterministically reassigned in role order.
+fn plan_async_memory_domain(
+    available_headroom_bytes: u64,
+    main_retained_capacity_bytes: u64,
+) -> Result<AsyncMemoryDomainPlan, BackendError> {
+    let local_limit =
+        u64::try_from(aster_runtime::ExecutionContext::AARM_MAX_CONTEXT_CAPACITY_BYTES)
+            .expect("execution allocation limit fits governor telemetry");
+    let main_limit = local_limit.saturating_sub(main_retained_capacity_bytes);
+    let caps = [local_limit, local_limit, main_limit];
+    let raw = parallel_chunk_budgets(available_headroom_bytes, caps.len())?;
+    let mut budgets = [0_u64; 3];
+    let mut excess = 0_u64;
+    for (index, share) in raw.into_iter().enumerate() {
+        budgets[index] = share.min(caps[index]);
+        excess = excess
+            .checked_add(share - budgets[index])
+            .ok_or_else(|| BackendError::new("async memory plan overflow"))?;
+    }
+    for (budget, cap) in budgets.iter_mut().zip(caps) {
+        let additional = excess.min(cap - *budget);
+        *budget += additional;
+        excess -= additional;
+    }
+    Ok(AsyncMemoryDomainPlan {
+        move_next_ceiling: budgets[0],
+        awaited_inner_ceiling: budgets[1],
+        main_future_growth: budgets[2],
+    })
+}
+
 /// Split fixed available governed headroom by logical chunk index. When not
 /// every chunk can receive one minimum arena page, earlier chunks receive
 /// whole-page entitlement first and the next chunk receives the sub-page
@@ -1335,6 +1555,23 @@ pub(super) fn module_uses_async(module: &mir::Module) -> bool {
                     instruction,
                     mir::Instruction::CallIntrinsic {
                         intrinsic: mir::Intrinsic::AsyncSpawn | mir::Intrinsic::AsyncSpawnInner,
+                        ..
+                    }
+                )
+            })
+        })
+    })
+}
+
+#[cfg(feature = "aarm-telemetry")]
+pub(super) fn module_uses_plain_task_run(module: &mir::Module) -> bool {
+    module.functions.iter().any(|function| {
+        function.blocks.iter().any(|block| {
+            block.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    mir::Instruction::CallIntrinsic {
+                        intrinsic: mir::Intrinsic::TaskRun,
                         ..
                     }
                 )
@@ -1727,6 +1964,54 @@ mod tests {
         assert_eq!(bounded.main_future_growth_bytes, 100);
         assert_eq!(bounded.task_context_ceiling_bytes, local_limit);
         assert_eq!(bounded.task_memory_concurrency_limit, 16);
+    }
+
+    #[test]
+    fn async_memory_domain_planning_is_page_aware_ordered_and_exact() {
+        let page = u64::try_from(aster_runtime::ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES)
+            .expect("minimum page capacity fits u64");
+        let cases = [
+            (0, [0, 0, 0]),
+            (page - 1, [page - 1, 0, 0]),
+            (page, [page, 0, 0]),
+            (2 * page, [page, page, 0]),
+            (3 * page, [page, page, page]),
+            (3 * page + 2, [page + 1, page + 1, page]),
+            (6 * page + 2, [2 * page + 1, 2 * page + 1, 2 * page]),
+        ];
+        for (headroom, expected) in cases {
+            let first = plan_async_memory_domain(headroom, 0).expect("plan succeeds");
+            let second = plan_async_memory_domain(headroom, 0).expect("plan is stable");
+            assert_eq!(first, second);
+            assert_eq!(
+                [
+                    first.move_next_ceiling,
+                    first.awaited_inner_ceiling,
+                    first.main_future_growth,
+                ],
+                expected
+            );
+            assert_eq!(
+                first.move_next_ceiling + first.awaited_inner_ceiling + first.main_future_growth,
+                headroom
+            );
+        }
+    }
+
+    #[test]
+    fn async_memory_domain_planning_respects_main_and_context_caps() {
+        let local = u64::try_from(aster_runtime::ExecutionContext::AARM_MAX_CONTEXT_CAPACITY_BYTES)
+            .expect("local limit fits u64");
+        let plan = plan_async_memory_domain(u64::MAX, local - 7).expect("large plan succeeds");
+        assert_eq!(plan.move_next_ceiling, local);
+        assert_eq!(plan.awaited_inner_ceiling, local);
+        assert_eq!(plan.main_future_growth, 7);
+        assert!(
+            u128::from(plan.move_next_ceiling)
+                + u128::from(plan.awaited_inner_ceiling)
+                + u128::from(plan.main_future_growth)
+                <= u128::from(u64::MAX)
+        );
     }
 
     #[test]

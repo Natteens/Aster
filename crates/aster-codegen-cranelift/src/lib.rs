@@ -47,6 +47,8 @@ use backend::module_error;
 use declarations::runtime_type;
 use execution::execute_resolved;
 #[cfg(feature = "aarm-telemetry")]
+use execution::execute_resolved_with_aarm_async_governor;
+#[cfg(feature = "aarm-telemetry")]
 use execution::execute_resolved_with_aarm_parallel_governor;
 #[cfg(feature = "aarm-telemetry")]
 use execution::execute_resolved_with_aarm_parallel_workers;
@@ -58,7 +60,8 @@ use layouts::Layouts;
 #[cfg(feature = "aarm-telemetry")]
 #[doc(hidden)]
 pub use task_runtime::{
-    AarmParallelPlanningTelemetry, AarmTaskMemoryDomainTelemetry, parallel_chunk_budgets,
+    AarmAsyncMemoryDomainTelemetry, AarmParallelPlanningTelemetry, AarmTaskMemoryDomainTelemetry,
+    parallel_chunk_budgets,
 };
 use validation::{select_entry, validate_invocable_entry, validate_module};
 use values::{
@@ -298,6 +301,34 @@ pub fn execute_with_aarm_task_governor(
     validate_module(module)?;
     let entry = select_entry(module, function_name)?;
     execute_resolved_with_aarm_task_governor(module, entry, worker_count, governor)
+}
+
+/// Execute with one experimental governor shared by Main, async `MoveNext`
+/// contexts, and awaited-inner worker contexts through a frozen async domain.
+/// Independent plain `Task.Run` and Parallel operations are rejected.
+///
+/// # Errors
+///
+/// Returns controlled validation, unsupported-domain, preparation, and
+/// runtime errors.
+#[doc(hidden)]
+#[cfg(feature = "aarm-telemetry")]
+pub fn execute_with_aarm_async_governor(
+    module: &mir::Module,
+    function_name: &str,
+    worker_count: usize,
+    governor: std::sync::Arc<aster_runtime::MemoryGovernor>,
+) -> Result<
+    (
+        ExecutionValue,
+        AarmMemoryTelemetry,
+        Option<AarmAsyncMemoryDomainTelemetry>,
+    ),
+    BackendError,
+> {
+    validate_module(module)?;
+    let entry = select_entry(module, function_name)?;
+    execute_resolved_with_aarm_async_governor(module, entry, worker_count, governor)
 }
 
 /// Like [`execute`], but injects `console_backend` for `aster.io.Write`/

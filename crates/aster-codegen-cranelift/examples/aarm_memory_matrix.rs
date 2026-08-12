@@ -12,8 +12,9 @@ use std::{
 };
 
 use aster_codegen_cranelift::{
-    AarmMemoryTelemetry, AarmParallelPlanningTelemetry, AarmTaskMemoryDomainTelemetry,
-    ExecutionValue, execute_with_aarm_parallel_governor, execute_with_aarm_parallel_workers,
+    AarmAsyncMemoryDomainTelemetry, AarmMemoryTelemetry, AarmParallelPlanningTelemetry,
+    AarmTaskMemoryDomainTelemetry, ExecutionValue, execute_with_aarm_async_governor,
+    execute_with_aarm_parallel_governor, execute_with_aarm_parallel_workers,
     execute_with_aarm_task_governor, execute_with_aarm_telemetry, parallel_chunk_budgets,
 };
 use aster_compiler::compile;
@@ -104,6 +105,7 @@ pub struct CaseResult {
     pub telemetry: AarmMemoryTelemetry,
     pub parallel_plans: Vec<AarmParallelPlanningTelemetry>,
     pub task_domain: Option<AarmTaskMemoryDomainTelemetry>,
+    pub async_domain: Option<AarmAsyncMemoryDomainTelemetry>,
     pub rss_before_bytes: Option<u64>,
     pub rss_at_peak_bytes: Option<u64>,
     pub rss_after_bytes: Option<u64>,
@@ -171,6 +173,22 @@ pub fn run_matrix(scales: &[Scale]) -> Vec<CaseResult> {
         results.push(task_teardown_reuse_case(scale));
         results.push(task_tight_page_domain_case(scale));
         results.push(task_deterministic_denial_case(scale));
+        for workers in [1, 4, 16] {
+            for kind in [
+                AsyncWorkload::Trivial,
+                AsyncWorkload::BeforeAwait,
+                AsyncWorkload::Inner,
+                AsyncWorkload::AfterAwait,
+                AsyncWorkload::MultipleHandles,
+            ] {
+                results.push(async_case(scale, workers, kind, false));
+                results.push(async_case(scale, workers, kind, true));
+            }
+        }
+        results.push(async_tight_domain_case(scale));
+        results.push(async_inner_denial_case(scale));
+        results.push(async_move_next_denial_case(scale));
+        results.push(async_repeated_wait_case(scale));
     }
     results
 }
@@ -242,6 +260,7 @@ fn execute_compiled_case(
         telemetry,
         parallel_plans: Vec::new(),
         task_domain: None,
+        async_domain: None,
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: None,
         rss_after_bytes: after.rss_bytes,
@@ -289,6 +308,7 @@ fn direct_burst_case(scale: Scale, repeats: usize) -> CaseResult {
         telemetry,
         parallel_plans: Vec::new(),
         task_domain: None,
+        async_domain: None,
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: rss_at_peak,
         rss_after_bytes: after.rss_bytes,
@@ -378,6 +398,7 @@ fn worker_context_case(scale: Scale, workers: usize) -> CaseResult {
         telemetry,
         parallel_plans: Vec::new(),
         task_domain: None,
+        async_domain: None,
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: rss_at_peak,
         rss_after_bytes: after.rss_bytes,
@@ -421,6 +442,7 @@ fn direct_tiny_allocation_case(scale: Scale, governed: bool) -> CaseResult {
         telemetry,
         parallel_plans: Vec::new(),
         task_domain: None,
+        async_domain: None,
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: after.rss_bytes,
         rss_after_bytes: after.rss_bytes,
@@ -467,6 +489,7 @@ fn page_growth_case(scale: Scale, governed: bool) -> CaseResult {
         telemetry,
         parallel_plans: Vec::new(),
         task_domain: None,
+        async_domain: None,
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: at_peak.rss_bytes,
         rss_after_bytes: at_peak.rss_bytes,
@@ -527,6 +550,7 @@ fn governed_contexts_case(scale: Scale, context_count: usize) -> CaseResult {
         telemetry,
         parallel_plans: Vec::new(),
         task_domain: None,
+        async_domain: None,
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: at_peak.rss_bytes,
         rss_after_bytes: after.rss_bytes,
@@ -569,6 +593,7 @@ fn shared_governor_denial_case(scale: Scale) -> CaseResult {
         telemetry,
         parallel_plans: Vec::new(),
         task_domain: None,
+        async_domain: None,
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: at_peak.rss_bytes,
         rss_after_bytes: after.rss_bytes,
@@ -603,6 +628,7 @@ fn governor_teardown_reuse_case(scale: Scale) -> CaseResult {
         telemetry,
         parallel_plans: Vec::new(),
         task_domain: None,
+        async_domain: None,
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: at_peak.rss_bytes,
         rss_after_bytes: after.rss_bytes,
@@ -701,6 +727,7 @@ fn parallel_case(scale: Scale, workers: usize, kind: ParallelKind, governed: boo
         telemetry,
         parallel_plans,
         task_domain: None,
+        async_domain: None,
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: after.rss_bytes,
         rss_after_bytes: after.rss_bytes,
@@ -769,6 +796,7 @@ fn governed_parallel_shape_case(
         telemetry,
         parallel_plans,
         task_domain: None,
+        async_domain: None,
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: after.rss_bytes,
         rss_after_bytes: after.rss_bytes,
@@ -831,6 +859,7 @@ fn deterministic_parallel_denial_case(scale: Scale) -> CaseResult {
             chunk_budgets_bytes: budgets,
         }],
         task_domain: None,
+        async_domain: None,
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: after.rss_bytes,
         rss_after_bytes: after.rss_bytes,
@@ -941,6 +970,7 @@ fn task_run_case(scale: Scale, workers: usize, kind: TaskWorkload, governed: boo
         telemetry,
         parallel_plans: Vec::new(),
         task_domain,
+        async_domain: None,
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: after.rss_bytes,
         rss_after_bytes: after.rss_bytes,
@@ -979,6 +1009,7 @@ fn governed_task_shape_case(
         telemetry,
         parallel_plans: Vec::new(),
         task_domain,
+        async_domain: None,
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: after.rss_bytes,
         rss_after_bytes: after.rss_bytes,
@@ -1082,6 +1113,7 @@ fn task_deterministic_denial_case(scale: Scale) -> CaseResult {
         },
         parallel_plans: Vec::new(),
         task_domain,
+        async_domain: None,
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: after.rss_bytes,
         rss_after_bytes: after.rss_bytes,
@@ -1111,6 +1143,214 @@ fn merge_task_domain(
     } else {
         *aggregate = Some(observed);
     }
+}
+
+#[derive(Clone, Copy)]
+enum AsyncWorkload {
+    Trivial,
+    BeforeAwait,
+    Inner,
+    AfterAwait,
+    MultipleHandles,
+}
+
+impl AsyncWorkload {
+    fn source(self) -> (&'static str, i32) {
+        match self {
+            Self::Trivial => (
+                "public int Inner() { return 7; } public async Task<int> Later() { int value = await Task.Run(Inner); return value; } public int Main() { return Later().Wait(); }",
+                7,
+            ),
+            Self::BeforeAwait => (
+                "public int Scratch() { int[] values = new int[1000]; return values.Length; } public int Inner() { return 7; } public async Task<int> Later() { int before = Scratch(); int value = await Task.Run(Inner); return before + value; } public int Main() { return Later().Wait(); }",
+                1007,
+            ),
+            Self::Inner => (
+                "public int Inner() { int[] values = new int[4000]; return values.Length; } public async Task<int> Later() { int value = await Task.Run(Inner); return value; } public int Main() { return Later().Wait(); }",
+                4000,
+            ),
+            Self::AfterAwait => (
+                "public int Inner() { return 7; } public async Task<int> Later() { int value = await Task.Run(Inner); int[] after = new int[1000]; return value + after.Length; } public int Main() { return Later().Wait(); }",
+                1007,
+            ),
+            Self::MultipleHandles => (
+                "public int A() { return 10; } public int B() { return 20; } public async Task<int> LaterA() { int value = await Task.Run(A); return value; } public async Task<int> LaterB() { int value = await Task.Run(B); return value; } public int Main() { Task<int> a = LaterA(); Task<int> b = LaterB(); return b.Wait() + a.Wait(); }",
+                30,
+            ),
+        }
+    }
+
+    fn workload(self, governed: bool) -> &'static str {
+        match (self, governed) {
+            (Self::Trivial, false) => "async_trivial_control",
+            (Self::Trivial, true) => "governed_async_trivial",
+            (Self::BeforeAwait, false) => "async_before_await_control",
+            (Self::BeforeAwait, true) => "governed_async_before_await",
+            (Self::Inner, false) => "async_inner_control",
+            (Self::Inner, true) => "governed_async_inner",
+            (Self::AfterAwait, false) => "async_after_await_control",
+            (Self::AfterAwait, true) => "governed_async_after_await",
+            (Self::MultipleHandles, false) => "async_multiple_handles_control",
+            (Self::MultipleHandles, true) => "governed_async_multiple_handles",
+        }
+    }
+}
+
+fn async_case(scale: Scale, workers: usize, kind: AsyncWorkload, governed: bool) -> CaseResult {
+    let (source, expected) = kind.source();
+    let module = compile(source).expect("async matrix source compiles").mir;
+    let before = process_memory();
+    let started = Instant::now();
+    let (value, telemetry, async_domain) = if governed {
+        let governor = Arc::new(MemoryGovernor::new(scale.burst_bytes()));
+        let (value, mut telemetry, domain) =
+            execute_with_aarm_async_governor(&module, "Main", workers, Arc::clone(&governor))
+                .expect("governed async matrix control executes");
+        telemetry.governor = Some(governor.telemetry());
+        (value, telemetry, domain)
+    } else {
+        let (value, telemetry) = execute_with_aarm_parallel_workers(&module, "Main", workers)
+            .expect("ordinary async matrix control executes");
+        (value, telemetry, None)
+    };
+    let elapsed_micros = started.elapsed().as_micros();
+    assert_eq!(value, ExecutionValue::Int(expected));
+    let after = process_memory();
+    CaseResult {
+        workload: kind.workload(governed),
+        scale,
+        iterations: async_domain.map_or(1, |domain| domain.move_next_contexts_started),
+        workers: Some(u64::try_from(workers).expect("workers fit u64")),
+        checksum: i64::from(expected),
+        elapsed_micros,
+        telemetry,
+        parallel_plans: Vec::new(),
+        task_domain: None,
+        async_domain,
+        rss_before_bytes: before.rss_bytes,
+        rss_at_peak_bytes: after.rss_bytes,
+        rss_after_bytes: after.rss_bytes,
+        process_peak_rss_bytes: after.peak_rss_bytes,
+    }
+}
+
+fn governed_async_shape_case(
+    workload: &'static str,
+    scale: Scale,
+    source: &str,
+    expected: i32,
+    hard_limit_bytes: usize,
+) -> CaseResult {
+    let module = compile(source).expect("async shape source compiles").mir;
+    let governor = Arc::new(MemoryGovernor::new(hard_limit_bytes));
+    let before = process_memory();
+    let started = Instant::now();
+    let (value, mut telemetry, async_domain) =
+        execute_with_aarm_async_governor(&module, "Main", 4, Arc::clone(&governor))
+            .expect("governed async shape executes");
+    let elapsed_micros = started.elapsed().as_micros();
+    assert_eq!(value, ExecutionValue::Int(expected));
+    telemetry.governor = Some(governor.telemetry());
+    let after = process_memory();
+    CaseResult {
+        workload,
+        scale,
+        iterations: async_domain.map_or(0, |domain| domain.move_next_contexts_started),
+        workers: Some(4),
+        checksum: i64::from(expected),
+        elapsed_micros,
+        telemetry,
+        parallel_plans: Vec::new(),
+        task_domain: None,
+        async_domain,
+        rss_before_bytes: before.rss_bytes,
+        rss_at_peak_bytes: after.rss_bytes,
+        rss_after_bytes: after.rss_bytes,
+        process_peak_rss_bytes: after.peak_rss_bytes,
+    }
+}
+
+fn async_tight_domain_case(scale: Scale) -> CaseResult {
+    governed_async_shape_case(
+        "governed_async_tight_three_page_domain",
+        scale,
+        AsyncWorkload::Trivial.source().0,
+        7,
+        3 * ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES,
+    )
+}
+
+fn async_repeated_wait_case(scale: Scale) -> CaseResult {
+    governed_async_shape_case(
+        "governed_async_repeated_wait",
+        scale,
+        "public int Inner() { int[] values = new int[1]; return values.Length; } public async Task<int> Later() { int value = await Task.Run(Inner); return value; } public int Main() { Task<int> task = Later(); return task.Wait() + task.Wait(); }",
+        2,
+        256 * 1024,
+    )
+}
+
+fn async_denial_case(
+    workload: &'static str,
+    scale: Scale,
+    source: &str,
+    hard_limit_bytes: usize,
+    expected: &str,
+) -> CaseResult {
+    const REPETITIONS: usize = 20;
+    let module = compile(source).expect("async denial source compiles").mir;
+    let governor = Arc::new(MemoryGovernor::new(hard_limit_bytes));
+    let before = process_memory();
+    let started = Instant::now();
+    let mut error_checksum = 0_i64;
+    for _ in 0..REPETITIONS {
+        let error = execute_with_aarm_async_governor(&module, "Main", 4, Arc::clone(&governor))
+            .expect_err("fixed async entitlement rejects the allocation");
+        assert!(error.message().contains(expected));
+        error_checksum = i64::try_from(error.message().len()).expect("error length fits i64");
+        assert_eq!(governor.telemetry().current_capacity_bytes, 0);
+    }
+    let elapsed_micros = started.elapsed().as_micros();
+    let after = process_memory();
+    CaseResult {
+        workload,
+        scale,
+        iterations: REPETITIONS as u64,
+        workers: Some(4),
+        checksum: error_checksum,
+        elapsed_micros,
+        telemetry: AarmMemoryTelemetry {
+            governor: Some(governor.telemetry()),
+            ..AarmMemoryTelemetry::default()
+        },
+        parallel_plans: Vec::new(),
+        task_domain: None,
+        async_domain: None,
+        rss_before_bytes: before.rss_bytes,
+        rss_at_peak_bytes: after.rss_bytes,
+        rss_after_bytes: after.rss_bytes,
+        process_peak_rss_bytes: after.peak_rss_bytes,
+    }
+}
+
+fn async_inner_denial_case(scale: Scale) -> CaseResult {
+    async_denial_case(
+        "governed_async_inner_denial",
+        scale,
+        "public int Inner() { int[] values = new int[1]; return values.Length; } public async Task<int> Later() { int value = await Task.Run(Inner); return value; } public int Main() { return Later().Wait(); }",
+        ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES,
+        "deterministic async awaited-inner memory entitlement",
+    )
+}
+
+fn async_move_next_denial_case(scale: Scale) -> CaseResult {
+    async_denial_case(
+        "governed_async_move_next_denial",
+        scale,
+        "public int Scratch() { int[] values = new int[1]; return values.Length; } public int Inner() { return 1; } public async Task<int> Later() { int before = Scratch(); int value = await Task.Run(Inner); return value + before; } public int Main() { return Later().Wait(); }",
+        0,
+        "deterministic async MoveNext memory entitlement",
+    )
 }
 
 fn touch_array(
@@ -1395,6 +1635,47 @@ fn json_task_domain(domain: Option<AarmTaskMemoryDomainTelemetry>) -> String {
     )
 }
 
+fn json_async_domain(domain: Option<AarmAsyncMemoryDomainTelemetry>) -> String {
+    domain.map_or_else(
+        || "null".to_string(),
+        |domain| {
+            format!(
+                "{{\"initial_governor_capacity_bytes\":{},\
+                 \"available_headroom_bytes\":{},\"main_retained_capacity_bytes\":{},\
+                 \"main_future_growth_bytes\":{},\"main_local_capacity_ceiling_bytes\":{},\
+                 \"move_next_context_ceiling_bytes\":{},\
+                 \"awaited_inner_context_ceiling_bytes\":{},\
+                 \"async_handles_created\":{},\"move_next_contexts_started\":{},\
+                 \"move_next_contexts_completed\":{},\"inner_contexts_started\":{},\
+                 \"inner_contexts_completed\":{},\"move_next_memory_failures\":{},\
+                 \"inner_memory_failures\":{},\"move_next_fast_path_allocations\":{},\
+                 \"move_next_fresh_page_allocations\":{},\
+                 \"inner_fast_path_allocations\":{},\"inner_fresh_page_allocations\":{},\
+                 \"peak_simultaneous_governed_async_contexts\":{}}}",
+                domain.initial_governor_capacity_bytes,
+                domain.available_headroom_bytes,
+                domain.main_retained_capacity_bytes,
+                domain.main_future_growth_bytes,
+                domain.main_local_capacity_ceiling_bytes,
+                domain.move_next_context_ceiling_bytes,
+                domain.awaited_inner_context_ceiling_bytes,
+                domain.async_handles_created,
+                domain.move_next_contexts_started,
+                domain.move_next_contexts_completed,
+                domain.inner_contexts_started,
+                domain.inner_contexts_completed,
+                domain.move_next_memory_failures,
+                domain.inner_memory_failures,
+                domain.move_next_fast_path_allocations,
+                domain.move_next_fresh_page_allocations,
+                domain.inner_fast_path_allocations,
+                domain.inner_fresh_page_allocations,
+                domain.peak_simultaneous_governed_async_contexts,
+            )
+        },
+    )
+}
+
 fn json_case(result: &CaseResult) -> String {
     let workers = result
         .workers
@@ -1403,7 +1684,7 @@ fn json_case(result: &CaseResult) -> String {
         "{{\"workload\":\"{}\",\"scale\":\"{}\",\"iterations\":{},\"workers\":{},\
          \"checksum\":{},\"elapsed_micros\":{},\"requested_bytes\":{},\
          \"temporary\":{},\"persistent\":{},\"total\":{},\"governor\":{},\
-         \"parallel_plans\":{},\"task_memory_domain\":{},\
+         \"parallel_plans\":{},\"task_memory_domain\":{},\"async_memory_domain\":{},\
          \"process_rss_bytes\":{{\"before\":{},\"at_peak\":{},\"after\":{},\
          \"process_peak\":{}}}}}",
         result.workload,
@@ -1419,6 +1700,7 @@ fn json_case(result: &CaseResult) -> String {
         json_governor(result.telemetry.governor),
         json_parallel_plans(&result.parallel_plans),
         json_task_domain(result.task_domain),
+        json_async_domain(result.async_domain),
         json_option(result.rss_before_bytes),
         json_option(result.rss_at_peak_bytes),
         json_option(result.rss_after_bytes),
@@ -1428,7 +1710,7 @@ fn json_case(result: &CaseResult) -> String {
 
 #[must_use]
 pub fn serialize_results(results: &[CaseResult]) -> String {
-    let mut output = String::from("{\"schema_version\":4,\"results\":[");
+    let mut output = String::from("{\"schema_version\":5,\"results\":[");
     for (index, result) in results.iter().enumerate() {
         if index != 0 {
             output.push(',');
@@ -1533,14 +1815,23 @@ fn main() {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn linux_status_parser_keeps_current_and_peak_rss_distinct() {
         let memory = parse_linux_status("Name:\ttest\nVmHWM:\t2048 kB\nVmRSS:\t1024 kB\n");
         assert_eq!(memory.rss_bytes, Some(1024 * 1024));
         assert_eq!(memory.peak_rss_bytes, Some(2048 * 1024));
+    }
+
+    #[test]
+    fn structured_output_advertises_the_async_domain_schema() {
+        assert_eq!(
+            serialize_results(&[]),
+            "{\"schema_version\":5,\"results\":[]}"
+        );
     }
 }

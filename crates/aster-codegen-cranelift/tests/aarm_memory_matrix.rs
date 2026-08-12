@@ -6,6 +6,7 @@ mod matrix;
 
 use std::sync::OnceLock;
 
+use aster_runtime::ExecutionContext;
 use matrix::{CaseResult, Scale, run_matrix, serialize_results};
 
 fn small_results() -> &'static [CaseResult] {
@@ -16,7 +17,7 @@ fn small_results() -> &'static [CaseResult] {
 #[test]
 fn small_matrix_covers_required_workload_shapes() {
     let results = small_results();
-    assert_eq!(results.len(), 76);
+    assert_eq!(results.len(), 110);
     for workload in [
         "tiny_allocations",
         "long_scope_temporary",
@@ -55,6 +56,20 @@ fn small_matrix_covers_required_workload_shapes() {
         "governed_task_teardown_reuse",
         "governed_task_tight_page_domain",
         "governed_task_deterministic_denial",
+        "async_trivial_control",
+        "governed_async_trivial",
+        "async_before_await_control",
+        "governed_async_before_await",
+        "async_inner_control",
+        "governed_async_inner",
+        "async_after_await_control",
+        "governed_async_after_await",
+        "async_multiple_handles_control",
+        "governed_async_multiple_handles",
+        "governed_async_tight_three_page_domain",
+        "governed_async_inner_denial",
+        "governed_async_move_next_denial",
+        "governed_async_repeated_wait",
     ] {
         assert!(results.iter().any(|result| result.workload == workload));
     }
@@ -64,6 +79,78 @@ fn small_matrix_covers_required_workload_shapes() {
         .map(|result| result.workers.expect("worker result has a count"))
         .collect::<Vec<_>>();
     assert_eq!(worker_counts, [1, 4, 16]);
+}
+
+#[test]
+fn governed_async_domains_are_frozen_page_aware_and_quiescent() {
+    let results = small_results();
+    for result in results
+        .iter()
+        .filter(|result| result.async_domain.is_some())
+    {
+        let domain = result.async_domain.expect("async domain exists");
+        assert!(
+            u128::from(domain.main_future_growth_bytes)
+                + u128::from(domain.move_next_context_ceiling_bytes)
+                + u128::from(domain.awaited_inner_context_ceiling_bytes)
+                <= u128::from(domain.available_headroom_bytes)
+        );
+        assert_eq!(
+            domain.move_next_contexts_started,
+            domain.move_next_contexts_completed
+        );
+        assert_eq!(
+            domain.inner_contexts_started,
+            domain.inner_contexts_completed
+        );
+        let governor = result
+            .telemetry
+            .governor
+            .expect("governed async reports governor telemetry");
+        assert_eq!(governor.current_capacity_bytes, 0);
+        assert!(governor.peak_capacity_bytes <= governor.hard_limit_bytes);
+        assert_eq!(governor.grant_events, governor.release_events);
+        assert_eq!(
+            governor.granted_bytes_cumulative,
+            governor.released_bytes_cumulative
+        );
+    }
+
+    let page = ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES as u64;
+    let tight = results
+        .iter()
+        .find(|result| result.workload == "governed_async_tight_three_page_domain")
+        .expect("tight async case exists")
+        .async_domain
+        .expect("tight async case reports its plan");
+    assert_eq!(tight.move_next_context_ceiling_bytes, page);
+    assert_eq!(tight.awaited_inner_context_ceiling_bytes, page);
+    assert_eq!(tight.main_future_growth_bytes, page);
+
+    let repeated = results
+        .iter()
+        .find(|result| result.workload == "governed_async_repeated_wait")
+        .expect("repeated Wait case exists")
+        .async_domain
+        .expect("repeated Wait reports its domain");
+    assert_eq!(repeated.async_handles_created, 1);
+    assert_eq!(repeated.move_next_contexts_started, 2);
+    assert_eq!(repeated.inner_contexts_started, 1);
+
+    for workload in [
+        "governed_async_inner_denial",
+        "governed_async_move_next_denial",
+    ] {
+        let governor = results
+            .iter()
+            .find(|result| result.workload == workload)
+            .expect("async denial case exists")
+            .telemetry
+            .governor
+            .expect("async denial reports governor telemetry");
+        assert_eq!(governor.current_capacity_bytes, 0);
+        assert!(governor.peak_capacity_bytes <= governor.hard_limit_bytes);
+    }
 }
 
 #[test]
@@ -274,7 +361,7 @@ fn rewind_reuse_and_persistence_are_visible_without_policy_changes() {
 #[test]
 fn structured_output_contains_no_future_aarm_claims() {
     let json = serialize_results(small_results());
-    assert!(json.starts_with("{\"schema_version\":4,"));
+    assert!(json.starts_with("{\"schema_version\":5,"));
     assert!(json.contains("\"requested_bytes\""));
     assert!(json.contains("\"arena_capacity_bytes\""));
     assert!(json.contains("\"last_rewind\""));
@@ -288,10 +375,13 @@ fn structured_output_contains_no_future_aarm_claims() {
     assert!(json.contains("\"chunk_budgets_bytes\""));
     assert!(json.contains("\"task_memory_domain\""));
     assert!(json.contains("\"task_context_ceiling_bytes\""));
+    assert!(json.contains("\"async_memory_domain\""));
+    assert!(json.contains("\"move_next_context_ceiling_bytes\""));
+    assert!(json.contains("\"awaited_inner_context_ceiling_bytes\""));
     assert!(!json.contains("virtual_reserved_bytes"));
     assert!(!json.contains("committed_backing_bytes"));
     assert!(!json.contains("purge_events"));
-    assert_eq!(json.matches("\"workload\":").count(), 76);
+    assert_eq!(json.matches("\"workload\":").count(), 110);
 }
 
 #[test]

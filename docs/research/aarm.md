@@ -273,6 +273,58 @@ mutation; equality assertions are made after worker quiescence.
 There is no task quota borrowing or dynamic enlargement in AARM-2B2A. Async governance and a safe
 unified Task/Parallel entitlement plan are explicitly deferred.
 
+## AARM-2B2B deterministic async memory domain
+
+AARM-2B2B adds a separate opt-in research entry point for async execution. Default ASTER execution
+is unchanged. The entry point rejects independent plain `Task.Run` and Parallel operations before
+execution; only the `AsyncSpawnInner` job produced by the validated single-`await Task.Run(...)`
+state machine participates in this domain.
+
+The Async Memory Domain freezes at the first unresolved governed `Task<T>.Wait()`, immediately
+before the pump's first `MoveNext` step. `AsyncSpawn` remains lazy, so Main may allocate between
+creating the handle and waiting. Capture records Main's real retained capacity and the governor's
+remaining headroom, then releases the Main borrow before JIT execution. Main keeps every retained
+page and receives a fixed future-growth entitlement for execution after `Wait` returns.
+
+Future headroom is assigned in canonical role order:
+
+```text
+MoveNext -> awaited inner -> Main future growth
+```
+
+The page-aware planner first assigns whole allocator minimum pages in that order. If the remaining
+headroom is smaller than a minimum page, the next role receives the byte tail rather than
+fragmenting it across every role. Once all three roles have a page, surplus is split evenly with
+earlier roles receiving the deterministic remainder. The local 1 GiB context ceiling still caps
+each role; representable headroom beyond role caps remains enforced by the governor rather than
+being reported as an entitlement. A zero-byte context can execute allocation-free code and fails
+with a controlled role-specific error on its first fresh allocation.
+
+MoveNext and awaited-inner entitlements are simultaneously included in the frozen plan. This is
+required because a worker can begin `AsyncSpawnInner` while the submitting MoveNext context is
+still alive. Every MoveNext invocation nevertheless receives a fresh context, just as before;
+dropping the step releases its real pages, and a resumed step receives the same fixed entitlement.
+The awaited-inner policy travels with its logical job, never worker identity, and its fresh worker
+context releases real page reservations before the scalar `TaskOutcome` is cached.
+
+Entitlements are not pre-charged governor capacity. Only actual fresh pages pass the unchanged
+sequence of local limit check, shared governor admission, and host allocation. Active-page bumps
+and inactive-page reuse perform no async-domain or governor shared-state operation. Released pages
+may be reused by a later step or serial async handle with the same fixed limit; they never enlarge
+another live entitlement, so async quota borrowing is not implemented.
+
+The host `AsyncTask.frame` is Rust-owned scalar storage, not arena capacity, OS commitment, virtual
+reservation, or RSS-controlled memory. Compiler semantic validation rejects reference-typed locals
+before suspension; MIR validation independently requires every async frame slot to be worker
+transferable. Awaited inner results and published async results use the same fixed-width scalar
+transport, so neither an arena pointer nor worker arena ownership can survive context teardown.
+
+Async-domain telemetry records the frozen Main/MoveNext/inner plan, handle and context lifecycle
+counters, role-specific memory failures, allocator fast/fresh page events, and peak simultaneous
+governed async contexts. Governor telemetry remains the authority for real retained capacity.
+Relaxed event-counter snapshots are observational during mutation and are asserted only after
+workers quiesce.
+
 ## Measurement invariants
 
 Every snapshot must satisfy:
@@ -328,19 +380,22 @@ AARM-2B2A adds ordinary/governed empty-task, fast-path-heavy small-allocation, m
 and task-swarm controls at 1/2/4/16 worker shapes. It also covers more-task-than-worker queueing,
 concurrent Main/task growth, teardown and sequential reuse, a tight page-aware domain, and repeated
 deterministic task-local denial.
+AARM-2B2B adds ordinary/governed trivial async, allocation before and after suspension, awaited
+inner allocation, Main post-Wait growth, page-tight domain plans, repeated Wait, and multiple
+serial async-handle cases.
 
 ```console
 cargo run --release -p aster-codegen-cranelift --features aarm-telemetry --example aarm_memory_matrix -- --scale small
 cargo run --release -p aster-codegen-cranelift --features aarm-telemetry --example aarm_memory_matrix -- --scale small --json
 ```
 
-Structured output separates allocator telemetry, Parallel planning, Task Memory Domain planning,
+Structured output separates allocator telemetry, Parallel planning, Task/Async Memory Domain planning,
 process RSS, checksum, scale, and informational elapsed time. Timing is never a correctness gate.
 Generated reports and machine-local baselines are not committed.
 
 ## Metrics that do not exist yet
 
-AARM-2B2A does not expose or infer:
+AARM-2B2B does not expose or infer:
 
 - `virtual_reserved_bytes`;
 - `committed_backing_bytes`;

@@ -164,8 +164,10 @@ fn wait(context: *mut ExecutionContext, handle: i64) -> Option<ExecutionValue> {
     let is_async = unsafe { (*runtime).is_async_handle(id) };
     #[allow(unsafe_code)]
     let outcome = if is_async {
-        // SAFETY: `pump`'s own contract; no runtime borrow is live across it.
-        unsafe { TaskRuntime::pump(runtime, id) }
+        // SAFETY: `pump_from_context`'s own contract; no runtime borrow is
+        // live across it. The Main context borrow is used only to freeze the
+        // async domain before any MoveNext step begins.
+        unsafe { TaskRuntime::pump_from_context(runtime, id, context) }
     } else {
         // SAFETY: short-lived exclusive borrow for a single plain join.
         unsafe { (*runtime).wait(id) }

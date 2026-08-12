@@ -514,6 +514,9 @@ enum AllocationLimitKind {
     Execution,
     TaskDomainMain,
     TaskEntitlement,
+    AsyncDomainMain,
+    AsyncMoveNextEntitlement,
+    AsyncInnerEntitlement,
 }
 
 /// Opaque checkpoint for the temporary arena owned by one execution context.
@@ -679,6 +682,30 @@ impl ExecutionContext {
         context
     }
 
+    /// Create one experimental governed async `MoveNext` context.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_async_move_next_memory_budget(
+        governor: Arc<MemoryGovernor>,
+        allocation_limit_bytes: usize,
+    ) -> Self {
+        let mut context = Self::with_memory_budget(governor, allocation_limit_bytes);
+        context.allocation_limit_kind = AllocationLimitKind::AsyncMoveNextEntitlement;
+        context
+    }
+
+    /// Create one experimental governed awaited-inner context.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_async_inner_memory_budget(
+        governor: Arc<MemoryGovernor>,
+        allocation_limit_bytes: usize,
+    ) -> Self {
+        let mut context = Self::with_memory_budget(governor, allocation_limit_bytes);
+        context.allocation_limit_kind = AllocationLimitKind::AsyncInnerEntitlement;
+        context
+    }
+
     /// Freeze the governed main context at its already-retained capacity plus
     /// a deterministic future-growth entitlement. Returns the effective local
     /// ceiling, or `None` if the arithmetic is not addressable.
@@ -688,6 +715,17 @@ impl ExecutionContext {
         let requested = retained.checked_add(future_growth_bytes)?;
         self.allocation_limit_bytes = self.allocation_limit_bytes.min(requested).max(retained);
         self.allocation_limit_kind = AllocationLimitKind::TaskDomainMain;
+        Some(self.allocation_limit_bytes)
+    }
+
+    /// Freeze Main at retained capacity plus its async-domain future-growth
+    /// entitlement without invalidating pages it already owns.
+    #[doc(hidden)]
+    pub fn freeze_async_domain_main_limit(&mut self, future_growth_bytes: usize) -> Option<usize> {
+        let retained = self.retained_arena_capacity_bytes()?;
+        let requested = retained.checked_add(future_growth_bytes)?;
+        self.allocation_limit_bytes = self.allocation_limit_bytes.min(requested).max(retained);
+        self.allocation_limit_kind = AllocationLimitKind::AsyncDomainMain;
         Some(self.allocation_limit_bytes)
     }
 
@@ -928,6 +966,15 @@ impl ExecutionContext {
                     }
                     AllocationLimitKind::TaskEntitlement => {
                         "deterministic Task.Run memory entitlement"
+                    }
+                    AllocationLimitKind::AsyncDomainMain => {
+                        "deterministic async Main memory entitlement"
+                    }
+                    AllocationLimitKind::AsyncMoveNextEntitlement => {
+                        "deterministic async MoveNext memory entitlement"
+                    }
+                    AllocationLimitKind::AsyncInnerEntitlement => {
+                        "deterministic async awaited-inner memory entitlement"
                     }
                 };
                 self.fail(format!(
@@ -3709,6 +3756,63 @@ mod tests {
                 .take_error()
                 .is_some_and(|error| error.contains("deterministic Task.Run memory entitlement"))
         );
+    }
+
+    #[test]
+    fn async_entitlement_denials_precede_shared_governor_admission() {
+        let page = ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES;
+        let governor = Arc::new(MemoryGovernor::new(2 * page));
+        let mut move_next =
+            ExecutionContext::with_async_move_next_memory_budget(Arc::clone(&governor), page - 1);
+        assert!(move_next.allocate_array(1, 1).is_null());
+        assert!(move_next.take_error().is_some_and(|error| {
+            error.contains("deterministic async MoveNext memory entitlement")
+        }));
+
+        let mut inner =
+            ExecutionContext::with_async_inner_memory_budget(Arc::clone(&governor), page - 1);
+        assert!(inner.allocate_array(1, 1).is_null());
+        assert!(inner.take_error().is_some_and(|error| {
+            error.contains("deterministic async awaited-inner memory entitlement")
+        }));
+        assert_eq!(governor.telemetry().grant_events, 0);
+    }
+
+    #[test]
+    fn async_main_limit_preserves_retained_capacity() {
+        let governor = Arc::new(MemoryGovernor::new(64 * 1024));
+        let mut context = ExecutionContext::with_memory_governor(Arc::clone(&governor));
+        assert!(!context.allocate_array(1, 1).is_null());
+        let retained = context.retained_arena_capacity_bytes().unwrap();
+        assert_eq!(context.freeze_async_domain_main_limit(0), Some(retained));
+        assert!(context.allocate_array(2_000, 4).is_null());
+        assert_eq!(context.retained_arena_capacity_bytes(), Some(retained));
+        assert!(context.take_error().is_some_and(|error| {
+            error.contains("deterministic async Main memory entitlement")
+        }));
+    }
+
+    #[test]
+    fn shared_governor_remains_final_authority_for_async_contexts() {
+        let page = ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES;
+        let governor = Arc::new(MemoryGovernor::new(page));
+        let mut move_next =
+            ExecutionContext::with_async_move_next_memory_budget(Arc::clone(&governor), 2 * page);
+        let mut inner =
+            ExecutionContext::with_async_inner_memory_budget(Arc::clone(&governor), 2 * page);
+        assert!(!move_next.allocate_array(1, 1).is_null());
+        assert!(inner.allocate_array(1, 1).is_null());
+        assert!(
+            inner
+                .take_error()
+                .is_some_and(|error| error.contains("shared execution memory budget"))
+        );
+        let telemetry = governor.telemetry();
+        assert_eq!(telemetry.current_capacity_bytes, page as u64);
+        assert_eq!(telemetry.denial_events, 1);
+        drop(inner);
+        drop(move_next);
+        assert_eq!(governor.telemetry().current_capacity_bytes, 0);
     }
 
     #[test]

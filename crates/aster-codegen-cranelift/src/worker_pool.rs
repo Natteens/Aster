@@ -8,7 +8,7 @@
 //! No `JITModule` is ever shared between workers or moved after creation.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
@@ -193,6 +193,229 @@ struct TaskMemoryPermit {
     domain: Arc<TaskMemoryDomain>,
 }
 
+/// One frozen execution-owned memory domain shared by host `MoveNext` steps
+/// and their awaited worker jobs. Entitlements are fixed byte ceilings; only
+/// real arena pages are charged to the shared governor.
+pub(super) struct AsyncMemoryDomain {
+    governor: Arc<aster_runtime::MemoryGovernor>,
+    move_next_limit_bytes: usize,
+    inner_limit_bytes: usize,
+    move_next_contexts_started: AtomicU64,
+    move_next_contexts_completed: AtomicU64,
+    inner_contexts_started: AtomicU64,
+    inner_contexts_completed: AtomicU64,
+    move_next_memory_failures: AtomicU64,
+    inner_memory_failures: AtomicU64,
+    move_next_fast_path_allocations: AtomicU64,
+    move_next_fresh_page_allocations: AtomicU64,
+    inner_fast_path_allocations: AtomicU64,
+    inner_fresh_page_allocations: AtomicU64,
+    live_contexts: AtomicUsize,
+    peak_live_contexts: AtomicUsize,
+}
+
+#[derive(Clone, Copy)]
+enum AsyncContextRole {
+    MoveNext,
+    Inner,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(feature = "aarm-telemetry")]
+pub(super) struct AsyncMemoryDomainCounters {
+    pub(super) move_next_contexts_started: u64,
+    pub(super) move_next_contexts_completed: u64,
+    pub(super) inner_contexts_started: u64,
+    pub(super) inner_contexts_completed: u64,
+    pub(super) move_next_memory_failures: u64,
+    pub(super) inner_memory_failures: u64,
+    pub(super) move_next_fast_path_allocations: u64,
+    pub(super) move_next_fresh_page_allocations: u64,
+    pub(super) inner_fast_path_allocations: u64,
+    pub(super) inner_fresh_page_allocations: u64,
+    pub(super) peak_live_contexts: usize,
+}
+
+impl AsyncMemoryDomain {
+    pub(super) fn new(
+        governor: Arc<aster_runtime::MemoryGovernor>,
+        move_next_limit_bytes: usize,
+        inner_limit_bytes: usize,
+    ) -> Self {
+        Self {
+            governor,
+            move_next_limit_bytes,
+            inner_limit_bytes,
+            move_next_contexts_started: AtomicU64::new(0),
+            move_next_contexts_completed: AtomicU64::new(0),
+            inner_contexts_started: AtomicU64::new(0),
+            inner_contexts_completed: AtomicU64::new(0),
+            move_next_memory_failures: AtomicU64::new(0),
+            inner_memory_failures: AtomicU64::new(0),
+            move_next_fast_path_allocations: AtomicU64::new(0),
+            move_next_fresh_page_allocations: AtomicU64::new(0),
+            inner_fast_path_allocations: AtomicU64::new(0),
+            inner_fresh_page_allocations: AtomicU64::new(0),
+            live_contexts: AtomicUsize::new(0),
+            peak_live_contexts: AtomicUsize::new(0),
+        }
+    }
+
+    pub(super) fn governor(&self) -> &Arc<aster_runtime::MemoryGovernor> {
+        &self.governor
+    }
+
+    pub(super) fn move_next_limit_bytes(&self) -> usize {
+        self.move_next_limit_bytes
+    }
+
+    pub(super) fn inner_limit_bytes(&self) -> usize {
+        self.inner_limit_bytes
+    }
+
+    pub(super) fn acquire_move_next(self: &Arc<Self>) -> AsyncMemoryPermit {
+        self.acquire(AsyncContextRole::MoveNext)
+    }
+
+    fn acquire_inner(self: &Arc<Self>) -> AsyncMemoryPermit {
+        self.acquire(AsyncContextRole::Inner)
+    }
+
+    fn acquire(self: &Arc<Self>, role: AsyncContextRole) -> AsyncMemoryPermit {
+        match role {
+            AsyncContextRole::MoveNext => {
+                self.move_next_contexts_started
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            AsyncContextRole::Inner => {
+                self.inner_contexts_started.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let live = self.live_contexts.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak_live_contexts.fetch_max(live, Ordering::Relaxed);
+        AsyncMemoryPermit {
+            domain: Arc::clone(self),
+            role,
+        }
+    }
+
+    pub(super) fn record_move_next_outcome(
+        &self,
+        outcome: &Result<(ExecutionValue, super::MemoryStats), BackendError>,
+        telemetry: Option<&aster_runtime::AarmMemoryTelemetry>,
+    ) {
+        if matches!(outcome, Err(error) if error.message().contains("deterministic async MoveNext memory entitlement"))
+        {
+            self.move_next_memory_failures
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.record_allocator_events(AsyncContextRole::MoveNext, telemetry);
+    }
+
+    fn record_inner_outcome(
+        &self,
+        outcome: &TaskOutcome,
+        telemetry: Option<&aster_runtime::AarmMemoryTelemetry>,
+    ) {
+        if matches!(outcome, TaskOutcome::Failed(error) if error.message().contains("deterministic async awaited-inner memory entitlement"))
+        {
+            self.inner_memory_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        self.record_allocator_events(AsyncContextRole::Inner, telemetry);
+    }
+
+    fn record_allocator_events(
+        &self,
+        role: AsyncContextRole,
+        telemetry: Option<&aster_runtime::AarmMemoryTelemetry>,
+    ) {
+        let Some(telemetry) = telemetry else { return };
+        let fast = telemetry.total.events.active_page_fast_path_allocations;
+        let fresh = telemetry.total.events.fresh_regular_page_allocations
+            + telemetry.total.events.fresh_oversized_page_allocations;
+        match role {
+            AsyncContextRole::MoveNext => {
+                self.move_next_fast_path_allocations
+                    .fetch_add(fast, Ordering::Relaxed);
+                self.move_next_fresh_page_allocations
+                    .fetch_add(fresh, Ordering::Relaxed);
+            }
+            AsyncContextRole::Inner => {
+                self.inner_fast_path_allocations
+                    .fetch_add(fast, Ordering::Relaxed);
+                self.inner_fresh_page_allocations
+                    .fetch_add(fresh, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    pub(super) fn counters(&self) -> AsyncMemoryDomainCounters {
+        AsyncMemoryDomainCounters {
+            move_next_contexts_started: self.move_next_contexts_started.load(Ordering::Relaxed),
+            move_next_contexts_completed: self.move_next_contexts_completed.load(Ordering::Relaxed),
+            inner_contexts_started: self.inner_contexts_started.load(Ordering::Relaxed),
+            inner_contexts_completed: self.inner_contexts_completed.load(Ordering::Relaxed),
+            move_next_memory_failures: self.move_next_memory_failures.load(Ordering::Relaxed),
+            inner_memory_failures: self.inner_memory_failures.load(Ordering::Relaxed),
+            move_next_fast_path_allocations: self
+                .move_next_fast_path_allocations
+                .load(Ordering::Relaxed),
+            move_next_fresh_page_allocations: self
+                .move_next_fresh_page_allocations
+                .load(Ordering::Relaxed),
+            inner_fast_path_allocations: self.inner_fast_path_allocations.load(Ordering::Relaxed),
+            inner_fresh_page_allocations: self.inner_fresh_page_allocations.load(Ordering::Relaxed),
+            peak_live_contexts: self.peak_live_contexts.load(Ordering::Relaxed),
+        }
+    }
+}
+
+pub(super) struct AsyncMemoryPermit {
+    domain: Arc<AsyncMemoryDomain>,
+    role: AsyncContextRole,
+}
+
+impl Drop for AsyncMemoryPermit {
+    fn drop(&mut self) {
+        self.domain.live_contexts.fetch_sub(1, Ordering::Relaxed);
+        match self.role {
+            AsyncContextRole::MoveNext => {
+                self.domain
+                    .move_next_contexts_completed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            AsyncContextRole::Inner => {
+                self.domain
+                    .inner_contexts_completed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+pub(super) enum TaskMemoryPolicy {
+    Plain(Arc<TaskMemoryDomain>),
+    AsyncInner(Arc<AsyncMemoryDomain>),
+}
+
+impl TaskMemoryPolicy {
+    pub(super) fn context(&self) -> aster_runtime::ExecutionContext {
+        match self {
+            Self::Plain(domain) => aster_runtime::ExecutionContext::with_task_memory_budget(
+                Arc::clone(domain.governor()),
+                domain.local_limit_bytes(),
+            ),
+            Self::AsyncInner(domain) => {
+                aster_runtime::ExecutionContext::with_async_inner_memory_budget(
+                    Arc::clone(domain.governor()),
+                    domain.inner_limit_bytes(),
+                )
+            }
+        }
+    }
+}
+
 impl Drop for TaskMemoryPermit {
     fn drop(&mut self) {
         let mut active = self
@@ -218,7 +441,7 @@ pub(super) enum JobKind {
     Task {
         symbol: mir::SymbolId,
         collect_stats: bool,
-        memory_domain: Option<Arc<TaskMemoryDomain>>,
+        memory_policy: Option<TaskMemoryPolicy>,
     },
     /// `Body(int)` over a contiguous half-open range `[start, end)`.
     ForChunk {
@@ -369,17 +592,32 @@ fn run_job(program: &PreparedProgram, kind: JobKind, respond: Respond) {
             JobKind::Task {
                 symbol,
                 collect_stats,
-                memory_domain,
+                memory_policy,
             },
             Respond::Task(reply),
         ) => {
-            let permit = memory_domain.as_ref().map(TaskMemoryDomain::acquire);
+            let plain_permit = match &memory_policy {
+                Some(TaskMemoryPolicy::Plain(domain)) => Some(domain.acquire()),
+                _ => None,
+            };
+            let async_permit = match &memory_policy {
+                Some(TaskMemoryPolicy::AsyncInner(domain)) => Some(domain.acquire_inner()),
+                _ => None,
+            };
             let (outcome, telemetry) =
-                program.run_task(symbol, collect_stats, memory_domain.as_deref());
-            if let Some(domain) = &memory_domain {
-                domain.record_outcome(&outcome, telemetry.as_ref());
+                program.run_task(symbol, collect_stats, memory_policy.as_ref());
+            if let Some(policy) = &memory_policy {
+                match policy {
+                    TaskMemoryPolicy::Plain(domain) => {
+                        domain.record_outcome(&outcome, telemetry.as_ref());
+                    }
+                    TaskMemoryPolicy::AsyncInner(domain) => {
+                        domain.record_inner_outcome(&outcome, telemetry.as_ref());
+                    }
+                }
             }
-            drop(permit);
+            drop(async_permit);
+            drop(plain_permit);
             let _ = reply.send(outcome);
         }
         (
@@ -690,25 +928,42 @@ impl ExecutionPool {
         symbol: mir::SymbolId,
         domain: Arc<TaskMemoryDomain>,
     ) -> Result<TaskHandle, BackendError> {
-        self.submit_task(symbol, true, Some(domain), None)
+        self.submit_task(symbol, true, Some(TaskMemoryPolicy::Plain(domain)), None)
+    }
+
+    pub(super) fn submit_governed_async_inner(
+        &self,
+        symbol: mir::SymbolId,
+        domain: Arc<AsyncMemoryDomain>,
+        completion: (Arc<CompletionQueue>, CompletionToken),
+    ) -> Result<TaskHandle, BackendError> {
+        self.submit_task(
+            symbol,
+            true,
+            Some(TaskMemoryPolicy::AsyncInner(domain)),
+            Some(completion),
+        )
     }
 
     fn submit_task(
         &self,
         symbol: mir::SymbolId,
         collect_stats: bool,
-        memory_domain: Option<Arc<TaskMemoryDomain>>,
+        memory_policy: Option<TaskMemoryPolicy>,
         completion: Option<(Arc<CompletionQueue>, CompletionToken)>,
     ) -> Result<TaskHandle, BackendError> {
         self.ensure_workers(1)?;
         let id = TaskId(self.next_task_id.fetch_add(1, Ordering::Relaxed));
         let (reply, receiver) = mpsc::channel();
-        let submitted_domain = memory_domain.as_ref().map(Arc::clone);
+        let submitted_domain = match &memory_policy {
+            Some(TaskMemoryPolicy::Plain(domain)) => Some(Arc::clone(domain)),
+            _ => None,
+        };
         self.queue.push(Job {
             kind: JobKind::Task {
                 symbol,
                 collect_stats,
-                memory_domain,
+                memory_policy,
             },
             respond: Respond::Task(reply),
             completion,
@@ -854,6 +1109,67 @@ mod tests {
         // guarantee: only owned scalars, never a pointer or `ExecutionContext`.
         assert_send::<ReduceChunkOutcome>();
         assert_send::<CombineOutcome>();
+        assert_send::<TaskMemoryPolicy>();
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    #[test]
+    fn async_domain_counts_move_next_and_inner_overlap_without_precharging() {
+        let page = aster_runtime::ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES;
+        let governor = Arc::new(aster_runtime::MemoryGovernor::new(2 * page));
+        let domain = Arc::new(AsyncMemoryDomain::new(Arc::clone(&governor), page, page));
+        let move_permit = domain.acquire_move_next();
+        let move_context = aster_runtime::ExecutionContext::with_async_move_next_memory_budget(
+            Arc::clone(domain.governor()),
+            domain.move_next_limit_bytes(),
+        );
+        assert_eq!(governor.telemetry().current_capacity_bytes, 0);
+        let inner_domain = Arc::clone(&domain);
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let inner_entered = Arc::clone(&entered);
+        let inner_release = Arc::clone(&release);
+        let inner = thread::spawn(move || {
+            let _permit = inner_domain.acquire_inner();
+            let context = aster_runtime::ExecutionContext::with_async_inner_memory_budget(
+                Arc::clone(inner_domain.governor()),
+                inner_domain.inner_limit_bytes(),
+            );
+            inner_entered.wait();
+            inner_release.wait();
+            drop(context);
+        });
+        entered.wait();
+        let counters = domain.counters();
+        assert_eq!(counters.peak_live_contexts, 2);
+        release.wait();
+        drop(move_context);
+        drop(move_permit);
+        inner.join().expect("inner context completes");
+        let counters = domain.counters();
+        assert_eq!(counters.move_next_contexts_started, 1);
+        assert_eq!(counters.move_next_contexts_completed, 1);
+        assert_eq!(counters.inner_contexts_started, 1);
+        assert_eq!(counters.inner_contexts_completed, 1);
+        assert_eq!(governor.telemetry().current_capacity_bytes, 0);
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    #[test]
+    fn async_domain_counts_role_specific_memory_failures() {
+        let governor = Arc::new(aster_runtime::MemoryGovernor::new(0));
+        let domain = AsyncMemoryDomain::new(governor, 0, 0);
+        let move_error = Err(BackendError::new(
+            "Aster runtime error: allocation exceeds the deterministic async MoveNext memory entitlement of 0 bytes",
+        ));
+        domain.record_move_next_outcome(&move_error, None);
+        let inner_error = TaskOutcome::Failed(BackendError::new(
+            "Aster runtime error: allocation exceeds the deterministic async awaited-inner memory entitlement of 0 bytes",
+        ));
+        domain.record_inner_outcome(&inner_error, None);
+        let counters = domain.counters();
+        assert_eq!(counters.move_next_memory_failures, 1);
+        assert_eq!(counters.inner_memory_failures, 1);
     }
 
     #[cfg(feature = "aarm-telemetry")]

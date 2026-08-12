@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::task_runtime::{TaskRuntime, module_uses_tasks};
 #[cfg(feature = "aarm-telemetry")]
-use super::task_runtime::{module_uses_async, module_uses_parallel};
+use super::task_runtime::{module_uses_async, module_uses_parallel, module_uses_plain_task_run};
 use super::{
     BackendError, Codegen, ExecutionValue, HashMap, JITBuilder, JITModule, default_libcall_names,
     mir, module_error, runtime_functions,
@@ -184,7 +184,7 @@ impl PreparedProgram {
         &self,
         symbol: mir::SymbolId,
         collect_stats: bool,
-        memory_domain: Option<&super::worker_pool::TaskMemoryDomain>,
+        memory_policy: Option<&super::worker_pool::TaskMemoryPolicy>,
     ) -> (
         super::worker_pool::TaskOutcome,
         Option<aster_runtime::AarmMemoryTelemetry>,
@@ -199,7 +199,7 @@ impl PreparedProgram {
                 None,
             );
         };
-        let mut context = memory_domain.map_or_else(
+        let mut context = memory_policy.map_or_else(
             || {
                 if collect_stats {
                     aster_runtime::ExecutionContext::with_stats()
@@ -207,12 +207,7 @@ impl PreparedProgram {
                     aster_runtime::ExecutionContext::new()
                 }
             },
-            |domain| {
-                aster_runtime::ExecutionContext::with_task_memory_budget(
-                    Arc::clone(domain.governor()),
-                    domain.local_limit_bytes(),
-                )
-            },
+            super::worker_pool::TaskMemoryPolicy::context,
         );
         let value = invoke_finalized(*pointer, return_type, &mut context);
         let runtime_error = context.take_error();
@@ -240,11 +235,26 @@ impl PreparedProgram {
         symbol: mir::SymbolId,
         handle: i64,
         task_runtime: *mut (),
-    ) -> Result<(ExecutionValue, super::MemoryStats), BackendError> {
-        let (pointer, _return_type) = self.entries.get(&symbol).ok_or_else(|| {
-            BackendError::new(format!("MoveNext symbol {symbol:?} was not prepared"))
-        })?;
-        let mut context = aster_runtime::ExecutionContext::new();
+        memory_domain: Option<&super::worker_pool::AsyncMemoryDomain>,
+    ) -> (
+        Result<(ExecutionValue, super::MemoryStats), BackendError>,
+        Option<aster_runtime::AarmMemoryTelemetry>,
+    ) {
+        let Some((pointer, _return_type)) = self.entries.get(&symbol) else {
+            return (
+                Err(BackendError::new(format!(
+                    "MoveNext symbol {symbol:?} was not prepared"
+                ))),
+                None,
+            );
+        };
+        let mut context =
+            memory_domain.map_or_else(aster_runtime::ExecutionContext::new, |domain| {
+                aster_runtime::ExecutionContext::with_async_move_next_memory_budget(
+                    Arc::clone(domain.governor()),
+                    domain.move_next_limit_bytes(),
+                )
+            });
         context.set_task_runtime(task_runtime);
         // SAFETY: this symbol was declared and finalized as
         // `(ExecutionContext*, i64) -> i32` (see `mir_lowering::async_machine`
@@ -254,10 +264,12 @@ impl PreparedProgram {
             unsafe { std::mem::transmute(*pointer) };
         let move_next_status = function(&raw mut context, handle);
         let stats = context.memory_stats().clone();
-        match context.take_error() {
+        let result = match context.take_error() {
             Some(error) => Err(BackendError::new(format!("Aster runtime error: {error}"))),
             None => Ok((ExecutionValue::Int(move_next_status), stats)),
-        }
+        };
+        let telemetry = context.aarm_memory_telemetry();
+        (result, telemetry)
     }
 
     /// Run `Parallel.For`'s `Body(int)` over `[start, end)` on this worker with
@@ -880,6 +892,48 @@ pub(super) fn execute_resolved_with_aarm_task_governor(
     runtime.quiesce_workers();
     let task_domain = runtime.task_domain_telemetry();
     outcome.map(|(value, telemetry)| (value, telemetry, task_domain))
+}
+
+#[cfg(feature = "aarm-telemetry")]
+pub(super) fn execute_resolved_with_aarm_async_governor(
+    module: &mir::Module,
+    entry: &mir::Function,
+    worker_count: usize,
+    governor: Arc<aster_runtime::MemoryGovernor>,
+) -> Result<
+    (
+        ExecutionValue,
+        aster_runtime::AarmMemoryTelemetry,
+        Option<super::AarmAsyncMemoryDomainTelemetry>,
+    ),
+    BackendError,
+> {
+    if module_uses_plain_task_run(module) {
+        return Err(BackendError::new(
+            "experimental governed async does not support independent plain Task.Run execution",
+        ));
+    }
+    if module_uses_parallel(module) {
+        return Err(BackendError::new(
+            "experimental governed async does not support mixed Parallel execution",
+        ));
+    }
+    let prepared = PreparedProgram::prepare(module)?;
+    if !module_uses_async(module) {
+        return prepared
+            .invoke_with_memory_governor(entry.symbol, None, governor)
+            .map(|(value, telemetry)| (value, telemetry, None));
+    }
+    let mut runtime = TaskRuntime::with_async_memory_governor(
+        &Arc::new(module.clone()),
+        worker_count,
+        Arc::clone(&governor),
+    )?;
+    let pointer = std::ptr::from_mut(&mut runtime).cast::<()>();
+    let outcome = prepared.invoke_with_memory_governor(entry.symbol, Some(pointer), governor);
+    runtime.quiesce_workers();
+    let async_domain = runtime.async_domain_telemetry();
+    outcome.map(|(value, telemetry)| (value, telemetry, async_domain))
 }
 
 /// This is the only unsafe boundary in the backend. Cranelift returns an untyped
