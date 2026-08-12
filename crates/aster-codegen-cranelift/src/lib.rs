@@ -61,7 +61,9 @@ use execution::execute_resolved_with_aarm_telemetry;
 #[cfg(feature = "aarm-telemetry")]
 #[doc(hidden)]
 pub use host_memory::{
-    AarmHostMemoryCapacity, AarmHostMemoryCapacitySource, discover_aarm_host_memory_capacity,
+    AarmAutoBudgetError, AarmAutoBudgetTelemetry, AarmAutoGovernor, AarmHostMemoryCapacity,
+    AarmHostMemoryCapacitySource, aarm_auto_governor_from_capacity, discover_aarm_auto_governor,
+    discover_aarm_host_memory_capacity, resolve_aarm_auto_budget,
 };
 use layouts::Layouts;
 #[cfg(feature = "aarm-telemetry")]
@@ -336,6 +338,82 @@ pub fn execute_with_aarm_async_governor(
     validate_module(module)?;
     let entry = select_entry(module, function_name)?;
     execute_resolved_with_aarm_async_governor(module, entry, worker_count, governor)
+}
+
+/// Resolve one frozen experimental Auto budget and apply its one shared
+/// governor to deterministic Parallel execution.
+#[doc(hidden)]
+#[cfg(feature = "aarm-telemetry")]
+pub type AarmAutoParallelExecution = (
+    ExecutionValue,
+    AarmMemoryTelemetry,
+    Vec<AarmParallelPlanningTelemetry>,
+    Vec<AarmMemoryTelemetry>,
+    AarmAutoBudgetTelemetry,
+);
+
+/// Resolve one frozen experimental Auto budget and apply its one shared
+/// governor to deterministic Parallel execution.
+#[doc(hidden)]
+#[cfg(feature = "aarm-telemetry")]
+pub fn execute_with_aarm_auto_parallel_governor(
+    module: &mir::Module,
+    function_name: &str,
+    worker_count: usize,
+) -> Result<AarmAutoParallelExecution, BackendError> {
+    let auto =
+        discover_aarm_auto_governor().map_err(|error| BackendError::new(error.to_string()))?;
+    let telemetry = auto.telemetry();
+    execute_with_aarm_parallel_governor(module, function_name, worker_count, auto.governor())
+        .map(|(value, main, plans, workers)| (value, main, plans, workers, telemetry))
+}
+
+/// Resolve one frozen experimental Auto budget and apply its one shared
+/// governor to deterministic plain `Task.Run` execution.
+#[doc(hidden)]
+#[cfg(feature = "aarm-telemetry")]
+pub fn execute_with_aarm_auto_task_governor(
+    module: &mir::Module,
+    function_name: &str,
+    worker_count: usize,
+) -> Result<
+    (
+        ExecutionValue,
+        AarmMemoryTelemetry,
+        Option<AarmTaskMemoryDomainTelemetry>,
+        AarmAutoBudgetTelemetry,
+    ),
+    BackendError,
+> {
+    let auto =
+        discover_aarm_auto_governor().map_err(|error| BackendError::new(error.to_string()))?;
+    let telemetry = auto.telemetry();
+    execute_with_aarm_task_governor(module, function_name, worker_count, auto.governor())
+        .map(|(value, main, domain)| (value, main, domain, telemetry))
+}
+
+/// Resolve one frozen experimental Auto budget and apply its one shared
+/// governor to deterministic governed async execution.
+#[doc(hidden)]
+#[cfg(feature = "aarm-telemetry")]
+pub fn execute_with_aarm_auto_async_governor(
+    module: &mir::Module,
+    function_name: &str,
+    worker_count: usize,
+) -> Result<
+    (
+        ExecutionValue,
+        AarmMemoryTelemetry,
+        Option<AarmAsyncMemoryDomainTelemetry>,
+        AarmAutoBudgetTelemetry,
+    ),
+    BackendError,
+> {
+    let auto =
+        discover_aarm_auto_governor().map_err(|error| BackendError::new(error.to_string()))?;
+    let telemetry = auto.telemetry();
+    execute_with_aarm_async_governor(module, function_name, worker_count, auto.governor())
+        .map(|(value, main, domain)| (value, main, domain, telemetry))
 }
 
 /// Like [`execute`], but injects `console_backend` for `aster.io.Write`/

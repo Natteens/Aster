@@ -4,6 +4,9 @@
 //! startup. It deliberately does not observe free memory, RSS, current cgroup
 //! usage, or allocator state, and it has no allocation-path callers.
 
+#[cfg(feature = "aarm-telemetry")]
+use std::{fmt, sync::Arc};
+
 /// The stable source or sources used to resolve an effective host capacity.
 #[cfg(feature = "aarm-telemetry")]
 #[doc(hidden)]
@@ -43,6 +46,76 @@ pub struct AarmHostMemoryCapacity {
     pub source: Option<AarmHostMemoryCapacitySource>,
 }
 
+/// Frozen experimental Auto-budget resolution for one top-level execution.
+///
+/// The resolved limit governs retained ASTER arena capacity. It is not process
+/// RSS, committed backing, or a guarantee that the OS will admit every later
+/// host allocation.
+#[cfg(feature = "aarm-telemetry")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AarmAutoBudgetTelemetry {
+    pub effective_capacity_bytes: u64,
+    pub resolved_hard_limit_bytes: u64,
+    pub address_width_clamped: bool,
+    pub capacity_source: AarmHostMemoryCapacitySource,
+}
+
+/// Controlled failure to resolve an experimental Auto memory budget.
+#[cfg(feature = "aarm-telemetry")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AarmAutoBudgetError {
+    StableCapacityUnavailable,
+    StableCapacityZero,
+}
+
+#[cfg(feature = "aarm-telemetry")]
+impl fmt::Display for AarmAutoBudgetError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StableCapacityUnavailable => formatter.write_str(
+                "AARM Auto memory budget is unavailable because no stable host memory capacity could be discovered",
+            ),
+            Self::StableCapacityZero => formatter.write_str(
+                "AARM Auto memory budget is unavailable because stable host memory capacity was zero",
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "aarm-telemetry")]
+impl std::error::Error for AarmAutoBudgetError {}
+
+/// Execution-owned frozen Auto governor. Each participating context receives
+/// clones of this one explicit governor authority.
+#[cfg(feature = "aarm-telemetry")]
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct AarmAutoGovernor {
+    host_capacity: AarmHostMemoryCapacity,
+    telemetry: AarmAutoBudgetTelemetry,
+    governor: Arc<aster_runtime::MemoryGovernor>,
+}
+
+#[cfg(feature = "aarm-telemetry")]
+impl AarmAutoGovernor {
+    #[must_use]
+    pub const fn host_capacity(&self) -> AarmHostMemoryCapacity {
+        self.host_capacity
+    }
+
+    #[must_use]
+    pub const fn telemetry(&self) -> AarmAutoBudgetTelemetry {
+        self.telemetry
+    }
+
+    #[must_use]
+    pub fn governor(&self) -> Arc<aster_runtime::MemoryGovernor> {
+        Arc::clone(&self.governor)
+    }
+}
+
 #[cfg(feature = "aarm-telemetry")]
 impl AarmHostMemoryCapacity {
     fn from_candidates(
@@ -76,12 +149,76 @@ impl AarmHostMemoryCapacity {
     }
 }
 
+/// Resolves one exact Auto hard limit from an already-frozen capacity snapshot.
+/// No page alignment or percentage policy is applied.
+#[cfg(feature = "aarm-telemetry")]
+#[doc(hidden)]
+pub fn resolve_aarm_auto_budget(
+    capacity: AarmHostMemoryCapacity,
+) -> Result<AarmAutoBudgetTelemetry, AarmAutoBudgetError> {
+    resolve_aarm_auto_budget_for_usize_max(capacity, usize::MAX as u64)
+}
+
+#[cfg(feature = "aarm-telemetry")]
+fn resolve_aarm_auto_budget_for_usize_max(
+    capacity: AarmHostMemoryCapacity,
+    usize_max: u64,
+) -> Result<AarmAutoBudgetTelemetry, AarmAutoBudgetError> {
+    let effective_capacity_bytes = capacity
+        .effective_capacity_bytes
+        .ok_or(AarmAutoBudgetError::StableCapacityUnavailable)?;
+    if effective_capacity_bytes == 0 {
+        return Err(AarmAutoBudgetError::StableCapacityZero);
+    }
+    let capacity_source = capacity
+        .source
+        .ok_or(AarmAutoBudgetError::StableCapacityUnavailable)?;
+    let resolved_hard_limit_bytes = effective_capacity_bytes.min(usize_max);
+    Ok(AarmAutoBudgetTelemetry {
+        effective_capacity_bytes,
+        resolved_hard_limit_bytes,
+        address_width_clamped: resolved_hard_limit_bytes != effective_capacity_bytes,
+        capacity_source,
+    })
+}
+
+/// Creates one frozen Auto governor from a supplied immutable snapshot.
+#[cfg(feature = "aarm-telemetry")]
+#[doc(hidden)]
+pub fn aarm_auto_governor_from_capacity(
+    host_capacity: AarmHostMemoryCapacity,
+) -> Result<AarmAutoGovernor, AarmAutoBudgetError> {
+    let telemetry = resolve_aarm_auto_budget(host_capacity)?;
+    let hard_limit = usize::try_from(telemetry.resolved_hard_limit_bytes)
+        .expect("Auto budget was clamped to usize::MAX");
+    Ok(AarmAutoGovernor {
+        host_capacity,
+        telemetry,
+        governor: Arc::new(aster_runtime::MemoryGovernor::new(hard_limit)),
+    })
+}
+
 /// Captures stable host capacity facts once for an experimental AARM execution.
 #[cfg(feature = "aarm-telemetry")]
 #[doc(hidden)]
 #[must_use]
 pub fn discover_aarm_host_memory_capacity() -> AarmHostMemoryCapacity {
     platform_capacity()
+}
+
+/// Discovers once, resolves once, and freezes one Auto governor for a single
+/// experimental top-level execution.
+#[cfg(feature = "aarm-telemetry")]
+#[doc(hidden)]
+pub fn discover_aarm_auto_governor() -> Result<AarmAutoGovernor, AarmAutoBudgetError> {
+    discover_aarm_auto_governor_with(discover_aarm_host_memory_capacity)
+}
+
+#[cfg(feature = "aarm-telemetry")]
+fn discover_aarm_auto_governor_with(
+    discover: impl FnOnce() -> AarmHostMemoryCapacity,
+) -> Result<AarmAutoGovernor, AarmAutoBudgetError> {
+    aarm_auto_governor_from_capacity(discover())
 }
 
 #[cfg(feature = "aarm-telemetry")]
@@ -394,6 +531,16 @@ fn parse_cgroup_v1_memory_limit(contents: &str) -> Option<u64> {
 #[cfg(all(test, feature = "aarm-telemetry"))]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    fn physical_capacity(bytes: Option<u64>) -> AarmHostMemoryCapacity {
+        AarmHostMemoryCapacity {
+            physical_total_bytes: bytes,
+            environment_limit_bytes: None,
+            effective_capacity_bytes: bytes,
+            source: bytes.map(|_| AarmHostMemoryCapacitySource::PhysicalTotal),
+        }
+    }
 
     #[test]
     fn effective_capacity_uses_only_stable_nonzero_candidates() {
@@ -438,6 +585,73 @@ mod tests {
         }
         let max = AarmHostMemoryCapacity::from_candidates(Some(u64::MAX), Some(u64::MAX - 1));
         assert_eq!(max.effective_capacity_bytes, Some(u64::MAX - 1));
+    }
+
+    #[test]
+    fn auto_budget_is_exact_for_representable_capacities_and_fails_closed_when_unknown() {
+        for bytes in [
+            1,
+            4095,
+            4096,
+            4097,
+            1024_u64.pow(3),
+            4 * 1024_u64.pow(3),
+            16 * 1024_u64.pow(3),
+        ] {
+            let resolved = resolve_aarm_auto_budget(physical_capacity(Some(bytes)))
+                .expect("capacity resolves");
+            assert_eq!(resolved.effective_capacity_bytes, bytes);
+            assert_eq!(
+                resolved.resolved_hard_limit_bytes,
+                bytes.min(usize::MAX as u64)
+            );
+            assert_eq!(resolved.address_width_clamped, bytes > usize::MAX as u64);
+        }
+        assert_eq!(
+            resolve_aarm_auto_budget(physical_capacity(None)),
+            Err(AarmAutoBudgetError::StableCapacityUnavailable)
+        );
+        assert_eq!(
+            resolve_aarm_auto_budget(AarmHostMemoryCapacity {
+                effective_capacity_bytes: Some(0),
+                source: Some(AarmHostMemoryCapacitySource::PhysicalTotal),
+                ..AarmHostMemoryCapacity::default()
+            }),
+            Err(AarmAutoBudgetError::StableCapacityZero)
+        );
+    }
+
+    #[test]
+    fn auto_budget_clamps_only_at_the_supplied_address_width_boundary() {
+        let capacity = physical_capacity(Some(u64::MAX));
+        let synthetic_32_bit =
+            resolve_aarm_auto_budget_for_usize_max(capacity, u64::from(u32::MAX))
+                .expect("u64 capacity clamps");
+        assert_eq!(
+            synthetic_32_bit.resolved_hard_limit_bytes,
+            u64::from(u32::MAX)
+        );
+        assert!(synthetic_32_bit.address_width_clamped);
+
+        let native = resolve_aarm_auto_budget_for_usize_max(capacity, u64::MAX).expect("u64 fits");
+        assert_eq!(native.resolved_hard_limit_bytes, u64::MAX);
+        assert!(!native.address_width_clamped);
+    }
+
+    #[test]
+    fn auto_governor_discovers_once_and_shares_one_explicit_authority() {
+        let discoveries = Cell::new(0);
+        let auto = discover_aarm_auto_governor_with(|| {
+            discoveries.set(discoveries.get() + 1);
+            physical_capacity(Some(8193))
+        })
+        .expect("first discovery resolves");
+        assert_eq!(discoveries.get(), 1);
+        assert_eq!(auto.telemetry().resolved_hard_limit_bytes, 8193);
+        let first = auto.governor();
+        let second = auto.governor();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.telemetry().hard_limit_bytes, 8193);
     }
 
     #[test]

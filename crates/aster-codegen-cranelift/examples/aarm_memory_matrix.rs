@@ -12,11 +12,12 @@ use std::{
 };
 
 use aster_codegen_cranelift::{
-    AarmAsyncMemoryDomainTelemetry, AarmHostMemoryCapacity, AarmMemoryTelemetry,
-    AarmParallelPlanningTelemetry, AarmTaskMemoryDomainTelemetry, ExecutionValue,
-    discover_aarm_host_memory_capacity, execute_with_aarm_async_governor,
-    execute_with_aarm_parallel_governor, execute_with_aarm_parallel_workers,
-    execute_with_aarm_task_governor, execute_with_aarm_telemetry, parallel_chunk_budgets,
+    AarmAsyncMemoryDomainTelemetry, AarmAutoBudgetTelemetry, AarmHostMemoryCapacity,
+    AarmMemoryTelemetry, AarmParallelPlanningTelemetry, AarmTaskMemoryDomainTelemetry,
+    ExecutionValue, aarm_auto_governor_from_capacity, discover_aarm_host_memory_capacity,
+    execute_with_aarm_async_governor, execute_with_aarm_parallel_governor,
+    execute_with_aarm_parallel_workers, execute_with_aarm_task_governor,
+    execute_with_aarm_telemetry, parallel_chunk_budgets, resolve_aarm_auto_budget,
 };
 use aster_compiler::compile;
 use aster_runtime::{
@@ -115,6 +116,13 @@ pub struct CaseResult {
 
 #[must_use]
 pub fn run_matrix(scales: &[Scale]) -> Vec<CaseResult> {
+    run_matrix_with_host_capacity(scales, discover_aarm_host_memory_capacity())
+}
+
+fn run_matrix_with_host_capacity(
+    scales: &[Scale],
+    host_capacity: AarmHostMemoryCapacity,
+) -> Vec<CaseResult> {
     let mut results = Vec::new();
     for &scale in scales {
         results.push(compiled_object_case("tiny_allocations", scale, false, true));
@@ -193,8 +201,100 @@ pub fn run_matrix(scales: &[Scale]) -> Vec<CaseResult> {
         results.push(async_temporal_before_await_case(scale));
         results.push(async_temporal_inner_case(scale));
         results.push(async_temporal_after_await_case(scale));
+        for kind in [
+            AutoWorkload::Plain,
+            AutoWorkload::Parallel,
+            AutoWorkload::Task,
+            AutoWorkload::Async,
+        ] {
+            results.push(auto_governor_case(scale, kind, host_capacity));
+        }
     }
     results
+}
+
+#[derive(Clone, Copy)]
+enum AutoWorkload {
+    Plain,
+    Parallel,
+    Task,
+    Async,
+}
+
+fn auto_governor_case(
+    scale: Scale,
+    kind: AutoWorkload,
+    host_capacity: AarmHostMemoryCapacity,
+) -> CaseResult {
+    let auto = aarm_auto_governor_from_capacity(host_capacity).expect("Auto capacity resolves");
+    let (workload, source, workers) = match kind {
+        AutoWorkload::Plain => (
+            "auto_governed_plain",
+            "public int Main() { int[] values = new int[1]; return values.Length; }",
+            1,
+        ),
+        AutoWorkload::Parallel => (
+            "auto_governed_parallel",
+            "public void Body(int index) { int[] values = new int[1]; } public int Main() { Parallel.For(0, 4, Body); return 4; }",
+            4,
+        ),
+        AutoWorkload::Task => (
+            "auto_governed_task",
+            "public int Work() { int[] values = new int[1]; return values.Length; } public int Main() { return Task.Run(Work).Wait(); }",
+            4,
+        ),
+        AutoWorkload::Async => (
+            "auto_governed_async",
+            "public int Work() { int[] values = new int[1]; return values.Length; } public async Task<int> Later() { return await Task.Run(Work); } public int Main() { return Later().Wait(); }",
+            4,
+        ),
+    };
+    let module = compile(source).expect("Auto matrix source compiles").mir;
+    let before = process_memory();
+    let started = Instant::now();
+    let (value, mut telemetry, parallel_plans, task_domain, async_domain) = match kind {
+        AutoWorkload::Plain | AutoWorkload::Parallel => {
+            let (value, telemetry, plans, _) =
+                execute_with_aarm_parallel_governor(&module, "Main", workers, auto.governor())
+                    .expect("Auto Parallel path executes");
+            (value, telemetry, plans, None, None)
+        }
+        AutoWorkload::Task => {
+            let (value, telemetry, domain) =
+                execute_with_aarm_task_governor(&module, "Main", workers, auto.governor())
+                    .expect("Auto Task path executes");
+            (value, telemetry, Vec::new(), domain, None)
+        }
+        AutoWorkload::Async => {
+            let (value, telemetry, domain) =
+                execute_with_aarm_async_governor(&module, "Main", workers, auto.governor())
+                    .expect("Auto async path executes");
+            (value, telemetry, Vec::new(), None, domain)
+        }
+    };
+    telemetry.governor = Some(auto.governor().telemetry());
+    let elapsed_micros = started.elapsed().as_micros();
+    let after = process_memory();
+    let checksum = match value {
+        ExecutionValue::Int(value) => i64::from(value),
+        _ => 0,
+    };
+    CaseResult {
+        workload,
+        scale,
+        iterations: 1,
+        workers: Some(workers as u64),
+        checksum,
+        elapsed_micros,
+        telemetry,
+        parallel_plans,
+        task_domain,
+        async_domain,
+        rss_before_bytes: before.rss_bytes,
+        rss_at_peak_bytes: after.rss_bytes,
+        rss_after_bytes: after.rss_bytes,
+        process_peak_rss_bytes: after.peak_rss_bytes,
+    }
 }
 
 fn compiled_object_case(
@@ -1762,6 +1862,22 @@ fn json_host_memory_capacity(capacity: AarmHostMemoryCapacity) -> String {
     )
 }
 
+fn json_auto_memory_budget(budget: Option<AarmAutoBudgetTelemetry>) -> String {
+    budget.map_or_else(
+        || "null".to_string(),
+        |budget| {
+            format!(
+                "{{\"effective_capacity_bytes\":{},\"resolved_hard_limit_bytes\":{},\
+             \"address_width_clamped\":{},\"capacity_source\":\"{}\"}}",
+                budget.effective_capacity_bytes,
+                budget.resolved_hard_limit_bytes,
+                budget.address_width_clamped,
+                budget.capacity_source.as_str(),
+            )
+        },
+    )
+}
+
 #[must_use]
 pub fn serialize_results(results: &[CaseResult]) -> String {
     serialize_results_with_host_capacity(results, discover_aarm_host_memory_capacity())
@@ -1773,8 +1889,9 @@ pub fn serialize_results_with_host_capacity(
     host_capacity: AarmHostMemoryCapacity,
 ) -> String {
     let mut output = format!(
-        "{{\"schema_version\":7,\"host_memory_capacity\":{},\"results\":[",
-        json_host_memory_capacity(host_capacity)
+        "{{\"schema_version\":8,\"host_memory_capacity\":{},\"auto_memory_budget\":{},\"results\":[",
+        json_host_memory_capacity(host_capacity),
+        json_auto_memory_budget(resolve_aarm_auto_budget(host_capacity).ok())
     );
     for (index, result) in results.iter().enumerate() {
         if index != 0 {
@@ -1819,7 +1936,7 @@ fn selected_scales() -> Vec<Scale> {
 
 fn main() {
     let host_capacity = discover_aarm_host_memory_capacity();
-    let results = run_matrix(&selected_scales());
+    let results = run_matrix_with_host_capacity(&selected_scales(), host_capacity);
     if std::env::args().any(|argument| argument == "--json") {
         println!(
             "{}",
@@ -1899,8 +2016,9 @@ mod tests {
     #[test]
     fn structured_output_advertises_the_research_schema() {
         let json = serialize_results(&[]);
-        assert!(json.starts_with("{\"schema_version\":7,"));
+        assert!(json.starts_with("{\"schema_version\":8,"));
         assert!(json.contains("\"host_memory_capacity\""));
+        assert!(json.contains("\"auto_memory_budget\""));
         assert!(json.ends_with("\"results\":[]}"));
     }
 }

@@ -17,7 +17,7 @@ fn small_results() -> &'static [CaseResult] {
 #[test]
 fn small_matrix_covers_required_workload_shapes() {
     let results = small_results();
-    assert_eq!(results.len(), 113);
+    assert_eq!(results.len(), 117);
     for workload in [
         "tiny_allocations",
         "long_scope_temporary",
@@ -73,6 +73,10 @@ fn small_matrix_covers_required_workload_shapes() {
         "governed_async_temporal_before_await",
         "governed_async_temporal_inner",
         "governed_async_temporal_after_await",
+        "auto_governed_plain",
+        "auto_governed_parallel",
+        "auto_governed_task",
+        "auto_governed_async",
     ] {
         assert!(results.iter().any(|result| result.workload == workload));
     }
@@ -89,7 +93,7 @@ fn governed_async_domains_are_frozen_page_aware_and_quiescent() {
     let results = small_results();
     for result in results
         .iter()
-        .filter(|result| result.async_domain.is_some())
+        .filter(|result| result.async_domain.is_some() && !result.workload.starts_with("auto_"))
     {
         let domain = result.async_domain.expect("async domain exists");
         assert!(domain.temporal_borrowing_enabled);
@@ -377,8 +381,9 @@ fn structured_output_contains_no_future_aarm_claims() {
         ),
     };
     let json = serialize_results_with_host_capacity(small_results(), capacity);
-    assert!(json.starts_with("{\"schema_version\":7,"));
+    assert!(json.starts_with("{\"schema_version\":8,"));
     assert!(json.contains("\"host_memory_capacity\""));
+    assert!(json.contains("\"auto_memory_budget\""));
     assert!(json.contains("\"physical_total_bytes\":16384"));
     assert!(json.contains("\"environment_limit_bytes\":4096"));
     assert!(json.contains("\"effective_capacity_bytes\":4096"));
@@ -404,7 +409,7 @@ fn structured_output_contains_no_future_aarm_claims() {
     assert!(!json.contains("virtual_reserved_bytes"));
     assert!(!json.contains("committed_backing_bytes"));
     assert!(!json.contains("purge_events"));
-    assert_eq!(json.matches("\"workload\":").count(), 113);
+    assert_eq!(json.matches("\"workload\":").count(), 117);
 }
 
 #[test]

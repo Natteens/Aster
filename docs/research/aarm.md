@@ -391,8 +391,34 @@ reject a later host allocation independently of a future AARM logical budget.
   unavailable rather than invented.
 
 `aarm_memory_matrix` captures this snapshot once before running its cases and emits it once at the
-top level of schema version 7 JSON. This remains separate from its process RSS samples. AARM-2C2,
-not AARM-2C1, will decide whether and how an Auto governor budget uses the snapshot.
+top level of its research JSON. This remains separate from its process RSS samples. AARM-2C2, not
+AARM-2C1, decides whether and how an Auto governor budget uses the snapshot.
+
+## AARM-2C2 frozen Auto governor budget
+
+AARM-2C2 adds an opt-in research resolver: **Auto hard limit = stable effective host capacity**,
+clamped only when the current process cannot represent that `u64` value as `usize`. It applies no
+percentage, host reserve, page-size rounding, worker multiplier, free-memory input, RSS input, or
+dynamic retuning. Unknown or zero effective capacity is a controlled pre-execution failure rather
+than a fallback budget.
+
+One Auto execution discovers capacity once, resolves once, and creates one explicit shared
+`MemoryGovernor`. Main and the existing supported Parallel, plain Task.Run, or async domain paths
+receive clones of that one authority. Existing unsupported mixed-domain shapes remain rejected.
+The resolved limit is frozen for the top-level execution; a later cgroup change may affect OS
+allocation outcomes but does not rewrite that logical hard limit.
+
+The Auto limit is a retained ASTER `PagedArena` capacity ceiling, not a target and not a process RSS
+guarantee. JIT code/data, Rust host allocations, worker stacks, libraries, async host frames,
+compiler/backend allocations, and other process overhead remain outside the governor. Future
+pressure/purge work may reduce physical backing, but must not silently change this frozen logical
+limit. The current per-`ExecutionContext` 1 GiB local safety ceiling remains in force.
+
+Matrix schema version 8 emits the stable `host_memory_capacity` snapshot and the independently
+named `auto_memory_budget` resolution. It includes small integration cases for plain, Parallel,
+Task.Run, and async governed execution without consuming the machine-sized Auto ceiling.
+
+**Explicit reproducible override: deferred to AARM-2C3.**
 
 ## Measurement invariants
 
