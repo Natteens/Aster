@@ -7,7 +7,7 @@ mod matrix;
 use std::sync::OnceLock;
 
 use aster_runtime::ExecutionContext;
-use matrix::{CaseResult, Scale, run_matrix, serialize_results};
+use matrix::{CaseResult, Scale, run_matrix, serialize_results_with_host_capacity};
 
 fn small_results() -> &'static [CaseResult] {
     static RESULTS: OnceLock<Vec<CaseResult>> = OnceLock::new();
@@ -368,8 +368,21 @@ fn rewind_reuse_and_persistence_are_visible_without_policy_changes() {
 
 #[test]
 fn structured_output_contains_no_future_aarm_claims() {
-    let json = serialize_results(small_results());
-    assert!(json.starts_with("{\"schema_version\":6,"));
+    let capacity = aster_codegen_cranelift::AarmHostMemoryCapacity {
+        physical_total_bytes: Some(16 * 1024),
+        environment_limit_bytes: Some(4 * 1024),
+        effective_capacity_bytes: Some(4 * 1024),
+        source: Some(
+            aster_codegen_cranelift::AarmHostMemoryCapacitySource::PhysicalTotalAndEnvironmentLimit,
+        ),
+    };
+    let json = serialize_results_with_host_capacity(small_results(), capacity);
+    assert!(json.starts_with("{\"schema_version\":7,"));
+    assert!(json.contains("\"host_memory_capacity\""));
+    assert!(json.contains("\"physical_total_bytes\":16384"));
+    assert!(json.contains("\"environment_limit_bytes\":4096"));
+    assert!(json.contains("\"effective_capacity_bytes\":4096"));
+    assert!(json.contains("\"capacity_source\":\"physical_total_and_environment_limit\""));
     assert!(json.contains("\"requested_bytes\""));
     assert!(json.contains("\"arena_capacity_bytes\""));
     assert!(json.contains("\"last_rewind\""));

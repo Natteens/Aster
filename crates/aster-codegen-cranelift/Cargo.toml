@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Cranelift JIT backend for Aster MIR"
 
 [features]
-aarm-telemetry = ["aster-runtime/aarm-telemetry"]
+aarm-telemetry = ["aster-runtime/aarm-telemetry", "dep:windows-sys"]
 
 [[example]]
 name = "aarm_memory_matrix"
@@ -27,11 +27,12 @@ cranelift-module = "=0.121.2"
 [dev-dependencies]
 aster-compiler = { path = "../aster-compiler", version = "0.55.0" }
 
-[target.'cfg(windows)'.dev-dependencies]
+[target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59.0", features = [
     "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
-] }
+], optional = true }
 
 [lints.rust]
 unsafe_code = "deny"

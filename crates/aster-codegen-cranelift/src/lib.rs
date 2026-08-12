@@ -12,6 +12,8 @@ mod control_flow;
 mod declarations;
 mod execution;
 mod functions;
+#[cfg(feature = "aarm-telemetry")]
+mod host_memory;
 mod interfaces;
 mod layouts;
 mod places;
@@ -56,6 +58,11 @@ use execution::execute_resolved_with_aarm_parallel_workers;
 use execution::execute_resolved_with_aarm_task_governor;
 #[cfg(feature = "aarm-telemetry")]
 use execution::execute_resolved_with_aarm_telemetry;
+#[cfg(feature = "aarm-telemetry")]
+#[doc(hidden)]
+pub use host_memory::{
+    AarmHostMemoryCapacity, AarmHostMemoryCapacitySource, discover_aarm_host_memory_capacity,
+};
 use layouts::Layouts;
 #[cfg(feature = "aarm-telemetry")]
 #[doc(hidden)]

@@ -12,8 +12,9 @@ use std::{
 };
 
 use aster_codegen_cranelift::{
-    AarmAsyncMemoryDomainTelemetry, AarmMemoryTelemetry, AarmParallelPlanningTelemetry,
-    AarmTaskMemoryDomainTelemetry, ExecutionValue, execute_with_aarm_async_governor,
+    AarmAsyncMemoryDomainTelemetry, AarmHostMemoryCapacity, AarmMemoryTelemetry,
+    AarmParallelPlanningTelemetry, AarmTaskMemoryDomainTelemetry, ExecutionValue,
+    discover_aarm_host_memory_capacity, execute_with_aarm_async_governor,
     execute_with_aarm_parallel_governor, execute_with_aarm_parallel_workers,
     execute_with_aarm_task_governor, execute_with_aarm_telemetry, parallel_chunk_budgets,
 };
@@ -1747,9 +1748,34 @@ fn json_case(result: &CaseResult) -> String {
     )
 }
 
+fn json_host_memory_capacity(capacity: AarmHostMemoryCapacity) -> String {
+    let source = capacity.source.map_or_else(
+        || "null".to_string(),
+        |source| format!("\"{}\"", source.as_str()),
+    );
+    format!(
+        "{{\"physical_total_bytes\":{},\"environment_limit_bytes\":{},\
+         \"effective_capacity_bytes\":{},\"capacity_source\":{source}}}",
+        json_option(capacity.physical_total_bytes),
+        json_option(capacity.environment_limit_bytes),
+        json_option(capacity.effective_capacity_bytes),
+    )
+}
+
 #[must_use]
 pub fn serialize_results(results: &[CaseResult]) -> String {
-    let mut output = String::from("{\"schema_version\":6,\"results\":[");
+    serialize_results_with_host_capacity(results, discover_aarm_host_memory_capacity())
+}
+
+#[must_use]
+pub fn serialize_results_with_host_capacity(
+    results: &[CaseResult],
+    host_capacity: AarmHostMemoryCapacity,
+) -> String {
+    let mut output = format!(
+        "{{\"schema_version\":7,\"host_memory_capacity\":{},\"results\":[",
+        json_host_memory_capacity(host_capacity)
+    );
     for (index, result) in results.iter().enumerate() {
         if index != 0 {
             output.push(',');
@@ -1792,9 +1818,13 @@ fn selected_scales() -> Vec<Scale> {
 }
 
 fn main() {
+    let host_capacity = discover_aarm_host_memory_capacity();
     let results = run_matrix(&selected_scales());
     if std::env::args().any(|argument| argument == "--json") {
-        println!("{}", serialize_results(&results));
+        println!(
+            "{}",
+            serialize_results_with_host_capacity(&results, host_capacity)
+        );
         return;
     }
     for result in &results {
@@ -1867,10 +1897,10 @@ mod tests {
     }
 
     #[test]
-    fn structured_output_advertises_the_async_domain_schema() {
-        assert_eq!(
-            serialize_results(&[]),
-            "{\"schema_version\":6,\"results\":[]}"
-        );
+    fn structured_output_advertises_the_research_schema() {
+        let json = serialize_results(&[]);
+        assert!(json.starts_with("{\"schema_version\":7,"));
+        assert!(json.contains("\"host_memory_capacity\""));
+        assert!(json.ends_with("\"results\":[]}"));
     }
 }

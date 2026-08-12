@@ -359,6 +359,41 @@ Telemetry adds `temporal_borrowing_enabled`, `phase_context_ceiling_bytes`,
 `phase_wait_events`, and `phase_borrowed_contexts`. These describe planning and gate behavior,
 not committed backing, virtual reservation, RSS, or governor grants.
 
+## AARM-2C1 stable host capacity discovery
+
+AARM-2C1 adds an experimental, immutable `HostMemoryCapacity` snapshot for a future Auto-budget
+resolver. It observes stable host/environment ceilings at execution or matrix startup only. It does
+not create a governor, choose a percentage, modify the existing 1 GiB local context ceiling, or
+query the operating system from allocation or page-growth paths.
+
+The snapshot records optional `physical_total_bytes`, optional `environment_limit_bytes`, optional
+`effective_capacity_bytes`, and its source. A nonzero effective capacity is the conservative
+minimum of physical total and a finite environment hard limit when both are known; when only one
+reliable ceiling is known it is used directly; when neither is known it remains unavailable. Zero
+is never used as an unknown-capacity sentinel.
+
+Stable capacity is **not** currently free/available memory, current RSS, arena capacity, or a
+governor budget. The snapshot is a value: it does not change when other processes allocate, RSS or
+cgroup usage changes, or a host administrator changes a cgroup after capture. The OS may still
+reject a later host allocation independently of a future AARM logical budget.
+
+- Windows x64 uses `GlobalMemoryStatusEx` with `MEMORYSTATUSEX::ullTotalPhys` for physical total.
+  A Job Object/container hard limit is intentionally unavailable in this slice: working-set limits
+  are not treated as process memory capacity, and robust Job Object limit discovery is deferred.
+- Linux x64 parses `MemTotal` from `/proc/meminfo`; it never uses `MemAvailable` or `MemFree`.
+  It resolves the current process's cgroup path from `/proc/self/cgroup` against the matching
+  `cgroup2` or memory-controller `cgroup` mount in `/proc/self/mountinfo`, including the mount
+  root. It reads finite cgroup v2 `memory.max` or v1 `memory.limit_in_bytes` from the resolved
+  current cgroup through every ancestor up to that mount root; the smallest finite applicable hard
+  limit wins. v2 `max`, v1's page-counter-max unlimited range, malformed input, unreadable files,
+  overflow, and zero are unavailable for that individual level. A readable finite ancestor remains
+  usable when another level is unavailable; if no finite level is found the environment limit is
+  unavailable rather than invented.
+
+`aarm_memory_matrix` captures this snapshot once before running its cases and emits it once at the
+top level of schema version 7 JSON. This remains separate from its process RSS samples. AARM-2C2,
+not AARM-2C1, will decide whether and how an Auto governor budget uses the snapshot.
+
 ## Measurement invariants
 
 Every snapshot must satisfy:
@@ -450,7 +485,8 @@ AARM-1 observability
 -> AARM-2B2A deterministic plain Task.Run memory domains
 -> AARM-2B2B async task memory domains
 -> AARM-2B3 deterministic temporal borrowing
--> AARM-2C host-adaptive policy research
+-> AARM-2C1 stable host capacity discovery
+-> AARM-2C2 Auto governor budget policy
 -> AARM-3 OS PageBackend
 -> AARM-4 delayed purge/hysteresis
 -> AARM-5 MIR lifetime refinement
