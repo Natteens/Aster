@@ -2,6 +2,7 @@ use super::{
     BackendError, Codegen, FunctionBuilder, FunctionState, InstBuilder, IntCC, MemFlags, Module,
     Value, is_aggregate, mir, types,
 };
+use aster_runtime::{ASTER_ARRAY_DATA_OFFSET, ASTER_ARRAY_LENGTH_OFFSET};
 
 impl Codegen {
     pub(super) fn assign_rvalue(
@@ -242,18 +243,11 @@ impl Codegen {
                     .ok_or_else(|| BackendError::new("MIR references an unknown enum field"))?;
                 Ok(builder.ins().iadd_imm(base, i64::from(field.offset)))
             }
-            mir::Place::Index { array, index, .. } => {
-                let function_ref = self
-                    .jit
-                    .declare_func_in_func(self.runtime_ids["aster_rt_array_element"], builder.func);
-                let context = state.execution_context.ok_or_else(|| {
-                    BackendError::new("array access is missing its ExecutionContext")
-                })?;
-                let array = self.translate_operand(builder, array, state)?;
-                let index = self.translate_operand(builder, index, state)?;
-                let call = builder.ins().call(function_ref, &[context, array, index]);
-                Ok(builder.inst_results(call)[0])
-            }
+            mir::Place::Index {
+                array,
+                index,
+                element_type,
+            } => self.array_element_address(builder, array, index, element_type, state),
             mir::Place::ObjectField { object, field } => {
                 let object = self.translate_operand(builder, object, state)?;
                 let field =
@@ -270,6 +264,66 @@ impl Codegen {
                 "module storage is not executable in the current JIT",
             )),
         }
+    }
+
+    fn array_element_address(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        array: &mir::Operand,
+        index: &mir::Operand,
+        element_type: &mir::Type,
+        state: &FunctionState,
+    ) -> Result<Value, BackendError> {
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("array access is missing its ExecutionContext"))?;
+        let array_length_offset = i32::try_from(ASTER_ARRAY_LENGTH_OFFSET)
+            .map_err(|_| BackendError::new("array header length offset is too large"))?;
+        let array_data_offset = i32::try_from(ASTER_ARRAY_DATA_OFFSET)
+            .map_err(|_| BackendError::new("array header data offset is too large"))?;
+        let array = self.translate_operand(builder, array, state)?;
+        let index = self.translate_operand(builder, index, state)?;
+        let in_bounds = builder.create_block();
+        let out_of_bounds = builder.create_block();
+        let join = builder.create_block();
+        builder.append_block_param(join, self.pointer_type);
+
+        let non_negative = builder
+            .ins()
+            .icmp_imm(IntCC::SignedGreaterThanOrEqual, index, 0);
+        let length = builder
+            .ins()
+            .load(types::I32, MemFlags::new(), array, array_length_offset);
+        let before_end = builder.ins().icmp(IntCC::SignedLessThan, index, length);
+        let valid = builder.ins().band(non_negative, before_end);
+        builder
+            .ins()
+            .brif(valid, in_bounds, &[], out_of_bounds, &[]);
+
+        builder.switch_to_block(out_of_bounds);
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids["aster_rt_array_element"], builder.func);
+        let call = builder.ins().call(function_ref, &[context, array, index]);
+        let address = builder.inst_results(call)[0];
+        builder.ins().jump(join, &[address.into()]);
+
+        builder.switch_to_block(in_bounds);
+        let data = builder
+            .ins()
+            .load(self.pointer_type, MemFlags::new(), array, array_data_offset);
+        let index = builder.ins().uextend(self.pointer_type, index);
+        let stride = i64::from(self.layouts.type_layout(element_type)?.size);
+        let offset = if stride == 1 {
+            index
+        } else {
+            builder.ins().imul_imm(index, stride)
+        };
+        let address = builder.ins().iadd(data, offset);
+        builder.ins().jump(join, &[address.into()]);
+
+        builder.switch_to_block(join);
+        Ok(builder.block_params(join)[0])
     }
 
     pub(super) fn store_scalar(

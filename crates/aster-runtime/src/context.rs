@@ -36,6 +36,14 @@ pub struct AsterArray {
     element_size: u32,
 }
 
+/// Offsets in the private array header ABI shared with generated code.
+///
+/// These are target-local constants derived from the `repr(C)` header rather
+/// than duplicated layout assumptions in a backend. They are not a public
+/// foreign-function interface.
+pub const ASTER_ARRAY_DATA_OFFSET: usize = std::mem::offset_of!(AsterArray, data);
+pub const ASTER_ARRAY_LENGTH_OFFSET: usize = std::mem::offset_of!(AsterArray, length);
+
 impl AsterArray {
     /// Element stride recorded when this runtime-owned header was allocated.
     /// Host ABI adapters use it to validate scalar transport before reading.
@@ -5707,6 +5715,18 @@ mod tests {
         assert_eq!(value, 0);
         assert!(!aster_rt_array_element(context_pointer, array, 2).is_null());
         assert!(context.take_error().unwrap().contains("outside"));
+    }
+
+    #[test]
+    fn array_header_offsets_follow_the_repr_c_layout() {
+        assert_eq!(
+            ASTER_ARRAY_DATA_OFFSET,
+            std::mem::offset_of!(AsterArray, data)
+        );
+        assert_eq!(
+            ASTER_ARRAY_LENGTH_OFFSET,
+            std::mem::offset_of!(AsterArray, length)
+        );
     }
 
     #[test]

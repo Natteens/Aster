@@ -88,7 +88,10 @@ All `unsafe` in `aster-runtime` is confined to ABI pointer views, context-owned 
 aligned buffer projection across string, collection, I/O, logging, math, and object entry points.
 The crate lints with `unsafe_code = "deny"` and each use carries an explicit `SAFETY` comment.
 Runtime entry points are panic-free: malformed input yields controlled diagnostics because a
-panic across the `extern "C"` boundary would abort the process.
+panic across the `extern "C"` boundary would abort the process. The JIT may directly load the
+runtime-owned `repr(C)` array header's data pointer and length on the proven in-bounds path; the
+runtime exports target-local offsets for that private ABI, while out-of-bounds access still uses
+the same controlled runtime diagnostic path. This is not a public FFI layout contract.
 
 This private JIT/runtime ABI is not a user FFI surface. The constrained future
 foreign-call contract, including scalar-only values and the requirement for an

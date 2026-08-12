@@ -512,6 +512,23 @@ fn out_of_bounds_is_a_controlled_runtime_error() {
 }
 
 #[test]
+fn indexed_array_reads_and_writes_keep_bounds_failures_controlled() {
+    assert_eq!(
+        run(
+            "public int Run() { int[] values = new int[3]; for (int i = 0; i < values.Length; i++) { values[i] = i + 13; } return values[0] + values[1] + values[2]; }",
+            "Run",
+        ),
+        Ok(ExecutionValue::Int(42))
+    );
+    let error = run(
+        "public int Run() { int[] values = [42]; int index = -1; int ignored = values[index]; return values[0]; }",
+        "Run",
+    )
+    .expect_err("negative index remains a controlled runtime error");
+    assert!(error.contains("array index -1"));
+}
+
+#[test]
 fn each_execution_gets_a_fresh_context() {
     let invalid = "public int Run() { int[] a = [1]; int i = 1; return a[i]; }";
     assert!(run(invalid, "Run").is_err());
