@@ -359,10 +359,14 @@ impl ExecutionPool {
             ));
         }
         validate_module(&module)?;
+        let mut workers = Vec::new();
+        workers
+            .try_reserve(worker_count)
+            .map_err(|_| BackendError::new("execution pool worker capacity exceeds host limits"))?;
         Ok(Self {
             module,
             queue: Arc::new(JobQueue::new()),
-            workers: Mutex::new(Vec::with_capacity(worker_count)),
+            workers: Mutex::new(workers),
             max_workers: worker_count,
             next_task_id: AtomicU64::new(0),
         })
@@ -407,7 +411,11 @@ impl ExecutionPool {
         if workers.len() >= target {
             return Ok(());
         }
-        let mut ready_receivers = Vec::with_capacity(worker_count);
+        let additional_workers = target - workers.len();
+        let mut ready_receivers = Vec::new();
+        ready_receivers
+            .try_reserve(additional_workers)
+            .map_err(|_| BackendError::new("worker preparation capacity exceeds host limits"))?;
         for index in workers.len()..target {
             let worker_module = Arc::clone(&self.module);
             let worker_queue = Arc::clone(&self.queue);
@@ -631,6 +639,13 @@ mod tests {
     }
 
     #[test]
+    fn impossible_worker_capacity_is_a_controlled_error() {
+        let module = Arc::new(compile("public int Run() { return 42; }"));
+        let result = ExecutionPool::new(module, usize::MAX);
+        assert!(result.is_err_and(|error| error.message().contains("worker capacity")));
+    }
+
+    #[test]
     fn single_worker_pool_runs_a_task() {
         let module = Arc::new(compile("public int Run() { return 40 + 2; }"));
         let pool = ExecutionPool::new(module, 1).expect("pool starts");
@@ -643,6 +658,18 @@ mod tests {
             TaskOutcome::Completed(value, _) => assert_eq!(value, ExecutionValue::Int(42)),
             TaskOutcome::Failed(error) => panic!("unexpected failure: {error}"),
         }
+
+        pool.shutdown();
+    }
+
+    #[test]
+    fn worker_demand_is_capped_before_allocating_preparation_state() {
+        let module = Arc::new(compile("public int Run() { return 42; }"));
+        let pool = ExecutionPool::new(module, 1).expect("pool starts");
+
+        pool.ensure_workers(usize::MAX)
+            .expect("demand is capped by the configured worker limit");
+        assert_eq!(pool.prepared_worker_count(), 1);
 
         pool.shutdown();
     }

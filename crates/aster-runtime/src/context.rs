@@ -1126,11 +1126,21 @@ impl ExecutionContext {
         // the permanent arena so they are not reclaimed when the helper exits.
         let use_temporary = region == ListRegion::Temporary
             && self.temporary_scopes.len() == birth_scope_depth as usize;
-        let bucket_storage =
-            self.allocate_in_region(bucket_bytes, align_of::<u32>(), use_temporary)?;
-        let entries = self.allocate_in_region(entry_bytes, layout.align, use_temporary)?;
+        // One aligned reservation keeps budget failure atomic: a rejected
+        // entries buffer cannot leave a large buckets allocation behind.
+        let Some(entries_offset) = checked_align_up(bucket_bytes, layout.align) else {
+            self.fail("Dictionary buffer size overflow");
+            return None;
+        };
+        let Some(allocation_bytes) = entries_offset.checked_add(entry_bytes) else {
+            self.fail("Dictionary buffer size overflow");
+            return None;
+        };
+        let allocation_align = align_of::<u32>().max(layout.align);
+        let storage = self.allocate_in_region(allocation_bytes, allocation_align, use_temporary)?;
+        let entries = storage.wrapping_add(entries_offset);
         #[allow(clippy::cast_ptr_alignment)]
-        let buckets = bucket_storage.cast::<u32>();
+        let buckets = storage.cast::<u32>();
         for index in 0..bucket_capacity {
             #[allow(unsafe_code)]
             unsafe {
@@ -4474,6 +4484,26 @@ mod tests {
         assert!(
             over.take_error()
                 .is_some_and(|error| error.contains("64 MiB"))
+        );
+    }
+
+    #[test]
+    fn dictionary_buffers_fail_atomically_before_reserving_partial_storage() {
+        let mut context = ExecutionContext::with_allocation_limit(8 * 1024 * 1024);
+        let before = context.memory_stats().clone();
+        let layout = dictionary_entry_layout(4, 4, 128, 8).expect("large value entry layout");
+
+        assert!(
+            context
+                .dictionary_allocate_buffers(131_072, 65_536, layout, ListRegion::Persistent, 0,)
+                .is_none()
+        );
+        assert_eq!(context.memory_stats(), &before);
+        assert_eq!(context.arena.metrics().reserved_bytes, 0);
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("execution memory limit"))
         );
     }
 

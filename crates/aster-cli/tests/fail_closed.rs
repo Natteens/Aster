@@ -7,7 +7,7 @@ use std::{
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
-fn temporary_source(label: &str, source: &str) -> PathBuf {
+fn temporary_source(label: &str, source: impl AsRef<[u8]>) -> PathBuf {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let directory = std::env::temp_dir().join(format!(
         "aster-fail-closed-{label}-{}-{id}",
@@ -96,5 +96,12 @@ fn excessive_recursion_is_a_controlled_cli_failure() {
         &aster("run", &path),
         "call depth exceeds the supported limit",
     );
+    remove_source(&path);
+}
+
+#[test]
+fn invalid_utf8_is_a_controlled_cli_failure() {
+    let path = temporary_source("invalid-utf8", [0xff, 0xfe, 0xfd]);
+    assert_controlled_failure(&aster("check", &path), "valid UTF-8");
     remove_source(&path);
 }
