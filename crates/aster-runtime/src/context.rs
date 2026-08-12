@@ -618,6 +618,9 @@ impl ExecutionContext {
     #[doc(hidden)]
     #[must_use]
     pub fn aarm_memory_telemetry(&self) -> Option<AarmMemoryTelemetry> {
+        if !self.collect_stats {
+            return None;
+        }
         let persistent: AarmRegionTelemetry = self.arena.telemetry_snapshot()?.into();
         let temporary: AarmRegionTelemetry = self.temporary_arena.telemetry_snapshot()?.into();
         let total = AarmRegionTelemetry {
@@ -6777,8 +6780,23 @@ mod tests {
 
     #[test]
     #[cfg(feature = "aarm-telemetry")]
-    fn aarm_feature_exposes_an_empty_snapshot_for_a_fresh_context() {
-        assert!(ExecutionContext::new().aarm_memory_telemetry().is_some());
+    fn aarm_telemetry_requires_statistics_mode() {
+        assert!(ExecutionContext::new().aarm_memory_telemetry().is_none());
+
+        let mut context = ExecutionContext::with_stats();
+        aster_rt_object_new(&raw mut context, 32);
+        let telemetry = context
+            .aarm_memory_telemetry()
+            .expect("statistics mode enables telemetry");
+        assert_eq!(telemetry.requested_bytes, 32);
+        assert_eq!(
+            telemetry.total.live_used_bytes,
+            telemetry.temporary.live_used_bytes + telemetry.persistent.live_used_bytes
+        );
+        assert_eq!(
+            telemetry.total.arena_capacity_bytes,
+            telemetry.temporary.arena_capacity_bytes + telemetry.persistent.arena_capacity_bytes
+        );
     }
 
     #[test]
