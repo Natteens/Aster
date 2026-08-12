@@ -1736,6 +1736,25 @@ fn stats_local_dynamic_string_is_rewound() {
 }
 
 #[test]
+fn static_string_concat_chain_allocates_once() {
+    let source = r#"
+        public string Run() {
+            string a = "a";
+            string b = "b";
+            string c = "c";
+            string d = "d";
+            string e = "e";
+            return a + b + c + d + e;
+        }
+    "#;
+    let (value, stats) = run_with_stats(source, "Run").expect("chain should run");
+    assert_eq!(value, ExecutionValue::String("abcde".into()));
+    assert_eq!(stats.string_allocations, 1);
+    assert_eq!(stats.total_allocations, 1);
+    assert_eq!(stats.requested_bytes, 13);
+}
+
+#[test]
 fn stats_multiple_allocation_types() {
     let source = r#"
         public class Box { public int value; }

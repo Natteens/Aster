@@ -463,6 +463,20 @@ impl FunctionLowerer {
                     return Some(self.lower_short_circuit(*operator, left, right));
                 }
                 if left.type_ == hir::Type::String && *operator == hir::BinaryOperator::Add {
+                    let mut parts = Vec::new();
+                    if (is_string_concat(left) || is_string_concat(right))
+                        && collect_static_string_concat(expression, &mut parts)
+                        && parts.len() >= 3
+                    {
+                        let segments = parts
+                            .into_iter()
+                            .map(|part| {
+                                self.lower_expression(part)
+                                    .expect("validated string operand produces a value")
+                            })
+                            .collect();
+                        return Some(self.emit_string_join(segments));
+                    }
                     let left = self
                         .lower_expression(left)
                         .expect("validated string operand produces a value");
@@ -743,6 +757,10 @@ impl FunctionLowerer {
                 kind: mir::OperandKind::Constant(mir::Constant::String(String::new())),
             };
         }
+        self.emit_string_join(segments)
+    }
+
+    fn emit_string_join(&mut self, segments: Vec<mir::Operand>) -> mir::Operand {
         let destination = self.new_temporary(hir::Type::String);
         let place = mir::Place::Local(destination);
         self.instruction(mir::Instruction::CallIntrinsic {
@@ -1159,6 +1177,50 @@ pub(super) fn boolean_operand(value: bool) -> mir::Operand {
         type_: mir::Type::Bool,
         kind: mir::OperandKind::Constant(mir::Constant::Boolean(value)),
     }
+}
+
+/// Collect a string-add tree only when every leaf is already a stable string
+/// value. Calls and other expressions retain pairwise concatenation so a
+/// failing intermediate allocation cannot move past a later side effect or
+/// controlled error.
+fn collect_static_string_concat<'a>(
+    expression: &'a hir::Expression,
+    parts: &mut Vec<&'a hir::Expression>,
+) -> bool {
+    let mut pending = vec![expression];
+    while let Some(expression) = pending.pop() {
+        match &expression.kind {
+            hir::ExpressionKind::Binary {
+                left,
+                operator: hir::BinaryOperator::Add,
+                right,
+            } if expression.type_ == hir::Type::String => {
+                pending.push(right);
+                pending.push(left);
+            }
+            hir::ExpressionKind::Literal(hir::Literal::String(_))
+            | hir::ExpressionKind::Symbol(_)
+                if expression.type_ == hir::Type::String =>
+            {
+                parts.push(expression);
+            }
+            _ => {
+                parts.clear();
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn is_string_concat(expression: &hir::Expression) -> bool {
+    matches!(
+        &expression.kind,
+        hir::ExpressionKind::Binary {
+            operator: hir::BinaryOperator::Add,
+            ..
+        }
+    ) && expression.type_ == hir::Type::String
 }
 
 fn int_operand(value: usize) -> mir::Operand {

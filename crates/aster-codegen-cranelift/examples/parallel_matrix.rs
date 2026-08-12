@@ -50,8 +50,10 @@
 
 use std::{fmt::Write as _, time::Instant};
 
-use aster_codegen_cranelift::{ExecutionValue, execute_with_stats};
+use aster_codegen_cranelift::{ExecutionValue, MemoryStats, execute_with_stats};
 use aster_compiler::compile;
+
+const SAMPLES: usize = 5;
 
 struct Timing {
     frontend_compile_ms: f64,
@@ -69,25 +71,50 @@ fn timed_compile(source: &str) -> (aster_compiler::mir::Module, f64) {
 /// Times only `execute_with_stats` itself: `frontend_compile_ms` is filled in
 /// by the caller from the earlier, separately timed `compile` call, so it is
 /// never double-counted here.
-fn timed_execute(module: &aster_compiler::mir::Module, entry: &str) -> (ExecutionValue, f64, u64) {
-    let start = Instant::now();
-    let (value, stats) = execute_with_stats(module, entry)
-        .unwrap_or_else(|error| panic!("benchmark entry {entry} must run: {error}"));
-    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    (value, elapsed_ms, stats.used_bytes + stats.reserved_bytes)
+fn timed_execute(
+    module: &aster_compiler::mir::Module,
+    entry: &str,
+) -> (ExecutionValue, f64, MemoryStats) {
+    let mut samples = Vec::with_capacity(SAMPLES);
+    let mut result = None;
+    for _ in 0..SAMPLES {
+        let start = Instant::now();
+        let (value, stats) = execute_with_stats(module, entry)
+            .unwrap_or_else(|error| panic!("benchmark entry {entry} must run: {error}"));
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        if let Some((previous_value, previous_stats)) = &result {
+            assert_eq!(
+                &value, previous_value,
+                "benchmark result changed between samples"
+            );
+            assert_eq!(
+                &stats, previous_stats,
+                "memory metrics changed between samples"
+            );
+        } else {
+            result = Some((value, stats));
+        }
+    }
+    samples.sort_by(f64::total_cmp);
+    let (value, stats) = result.expect("at least one timing sample");
+    (value, samples[SAMPLES / 2], stats)
 }
 
 fn report_case(case: &str, source: &str, entry: &str, expected: &ExecutionValue) {
     let (module, frontend_compile_ms) = timed_compile(source);
-    let (value, jit_and_execute_ms, memory_bytes) = timed_execute(&module, entry);
+    let (value, jit_and_execute_ms, memory) = timed_execute(&module, entry);
     let timing = Timing {
         frontend_compile_ms,
         jit_and_execute_ms,
     };
     let status = if value == *expected { "ok" } else { "MISMATCH" };
     println!(
-        "{case:<28} status={status:<8} frontend_compile_ms={:>8.3} jit_and_execute_ms={:>9.3} memory_bytes={memory_bytes:>10} value={value}",
-        timing.frontend_compile_ms, timing.jit_and_execute_ms,
+        "{case:<28} status={status:<8} frontend_compile_ms={:>8.3} jit_and_execute_ms={:>9.3} requested_bytes={:>10} used_bytes={:>10} reserved_bytes={:>10} value={value}",
+        timing.frontend_compile_ms,
+        timing.jit_and_execute_ms,
+        memory.requested_bytes,
+        memory.used_bytes,
+        memory.reserved_bytes,
     );
 }
 
@@ -126,6 +153,66 @@ fn sequential_task_source(tasks: usize, iterations: i64) -> String {
     }
     source.push_str("return total; }");
     source
+}
+
+fn repeated_task_source(tasks: usize, iterations: i64, parallel: bool) -> String {
+    let call = if parallel {
+        "Task.Run(Work).Wait()"
+    } else {
+        "Work()"
+    };
+    format!(
+        "public long Work() {{ long total = 0; for (long i = 0; i < {iterations}; i++) {{ total += i; }} return total; }} \
+         public long Main() {{ long total = 0; int task = 0; while (task < {tasks}) {{ total += {call}; task += 1; }} return total; }}"
+    )
+}
+
+fn task_cases() {
+    for &(tasks, iterations) in &[
+        (1_usize, 0_i64),
+        (2, 0),
+        (4, 0),
+        (8, 0),
+        (16, 0),
+        (1, 100_000),
+        (16, 100_000),
+        (1, 1_000_000),
+        (16, 1_000_000),
+        (1, 10_000_000),
+        (16, 10_000_000),
+    ] {
+        let task_count = i64::try_from(tasks).expect("benchmark task count fits in long");
+        let expected = task_count * iterations * (iterations - 1) / 2;
+        report_case(
+            &format!("sequential_{tasks}x{iterations}"),
+            &sequential_task_source(tasks, iterations),
+            "Main",
+            &ExecutionValue::Long(expected),
+        );
+        report_case(
+            &format!("task_run_{tasks}x{iterations}"),
+            &task_run_source(tasks, iterations),
+            "Main",
+            &ExecutionValue::Long(expected),
+        );
+    }
+
+    for &(tasks, iterations) in &[(100_usize, 0_i64), (1_000, 0), (100, 100_000)] {
+        let task_count = i64::try_from(tasks).expect("benchmark task count fits in long");
+        let expected = task_count * iterations * (iterations - 1) / 2;
+        report_case(
+            &format!("sequential_reused_{tasks}x{iterations}"),
+            &repeated_task_source(tasks, iterations, false),
+            "Main",
+            &ExecutionValue::Long(expected),
+        );
+        report_case(
+            &format!("task_reused_{tasks}x{iterations}"),
+            &repeated_task_source(tasks, iterations, true),
+            "Main",
+            &ExecutionValue::Long(expected),
+        );
+    }
 }
 
 fn main() {
@@ -198,31 +285,7 @@ fn main() {
         println!();
     }
 
-    for &(tasks, iterations) in &[
-        (1_usize, 0_i64),
-        (16, 0),
-        (1, 100_000),
-        (16, 100_000),
-        (1, 1_000_000),
-        (16, 1_000_000),
-        (1, 10_000_000),
-        (16, 10_000_000),
-    ] {
-        let task_count = i64::try_from(tasks).expect("benchmark task count fits in long");
-        let expected = task_count * iterations * (iterations - 1) / 2;
-        report_case(
-            &format!("sequential_{tasks}x{iterations}"),
-            &sequential_task_source(tasks, iterations),
-            "Main",
-            &ExecutionValue::Long(expected),
-        );
-        report_case(
-            &format!("task_run_{tasks}x{iterations}"),
-            &task_run_source(tasks, iterations),
-            "Main",
-            &ExecutionValue::Long(expected),
-        );
-    }
+    task_cases();
 
     println!(
         "Limitation: copy cost (ForEach/Reduce host-side array copy) and coordination cost \

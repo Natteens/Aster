@@ -97,6 +97,7 @@ pub(super) struct TaskRuntime {
     token_to_async: HashMap<CompletionToken, TaskHandleId>,
     ready: VecDeque<TaskHandleId>,
     worker_count: usize,
+    task_worker_count: usize,
     next_id: u64,
     next_token: CompletionToken,
 }
@@ -133,6 +134,7 @@ impl TaskRuntime {
         let driver = module_uses_async(module)
             .then(|| PreparedProgram::prepare(module))
             .transpose()?;
+        let task_worker_count = module_task_call_sites(module).min(worker_count).max(1);
         Ok(Self {
             pool,
             driver,
@@ -142,6 +144,7 @@ impl TaskRuntime {
             token_to_async: HashMap::new(),
             ready: VecDeque::new(),
             worker_count,
+            task_worker_count,
             next_id: 0,
             next_token: 0,
         })
@@ -169,6 +172,7 @@ impl TaskRuntime {
 
     /// `Task.Run(function)`: submit one plain task and return its handle.
     pub(super) fn run(&mut self, symbol: mir::SymbolId) -> Result<TaskHandleId, BackendError> {
+        self.pool.ensure_workers(self.pending_worker_demand())?;
         let id = self.fresh_id()?;
         let handle = self.pool.submit(symbol, false, None)?;
         self.entries.insert(id, TaskEntry::Pending(handle));
@@ -324,6 +328,7 @@ impl TaskRuntime {
             ));
         }
         let token = self.fresh_token()?;
+        self.pool.ensure_workers(self.pending_worker_demand())?;
         let handle = self
             .pool
             .submit(inner, false, Some((Arc::clone(&self.completion), token)))?;
@@ -335,6 +340,25 @@ impl TaskRuntime {
         task.inner_token = Some(token);
         self.token_to_async.insert(token, id);
         Ok(())
+    }
+
+    fn pending_worker_demand(&self) -> usize {
+        let plain = self
+            .entries
+            .values()
+            .filter(|entry| matches!(entry, TaskEntry::Pending(_)))
+            .count();
+        let async_inners = self
+            .async_tasks
+            .values()
+            .filter(|task| task.inner.is_some())
+            .count();
+        self.task_worker_count.max(
+            plain
+                .saturating_add(async_inners)
+                .saturating_add(1)
+                .min(self.worker_count),
+        )
     }
 
     pub(super) fn async_await_result(&self, id: TaskHandleId) -> Result<i64, BackendError> {
@@ -609,6 +633,7 @@ impl TaskRuntime {
             return Ok(());
         }
         let boundaries = chunk_boundaries(total, self.worker_count);
+        self.pool.ensure_workers(boundaries.len())?;
         let mut receivers = Vec::with_capacity(boundaries.len());
         let mut cursor = i64::from(start);
         for length in boundaries {
@@ -649,16 +674,17 @@ impl TaskRuntime {
             return Ok(());
         }
         let boundaries = chunk_boundaries(values.len(), self.worker_count);
+        self.pool.ensure_workers(boundaries.len())?;
         let mut receivers = Vec::with_capacity(boundaries.len());
-        let mut values = values;
+        let values = Arc::new(values);
         let mut base = 0;
         for length in boundaries {
-            let rest = values.split_off(length);
-            let chunk_values = std::mem::replace(&mut values, rest);
+            let range = base..base + length;
             let submission = self.pool.submit_parallel(JobKind::ForEachChunk {
                 symbol: body,
                 base,
-                values: chunk_values,
+                values: Arc::clone(&values),
+                range,
             });
             match submission {
                 Ok(receiver) => receivers.push(receiver),
@@ -689,17 +715,18 @@ impl TaskRuntime {
             return Ok(identity);
         }
         let boundaries = chunk_boundaries(values.len(), self.worker_count);
+        self.pool.ensure_workers(boundaries.len())?;
         let mut receivers = Vec::with_capacity(boundaries.len());
-        let mut values = values;
+        let values = Arc::new(values);
         let mut base = 0;
         for length in boundaries {
-            let rest = values.split_off(length);
-            let chunk_values = std::mem::replace(&mut values, rest);
+            let range = base..base + length;
             let submission = self.pool.submit_reduce_chunk(JobKind::ReduceChunk {
                 symbol: accumulate,
                 base,
                 identity: identity.clone(),
-                values: chunk_values,
+                values: Arc::clone(&values),
+                range,
             });
             match submission {
                 Ok(receiver) => receivers.push(receiver),
@@ -878,6 +905,24 @@ fn module_uses_async(module: &mir::Module) -> bool {
     })
 }
 
+fn module_task_call_sites(module: &mir::Module) -> usize {
+    module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            matches!(
+                instruction,
+                mir::Instruction::CallIntrinsic {
+                    intrinsic: mir::Intrinsic::TaskRun | mir::Intrinsic::AsyncSpawnInner,
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
@@ -912,6 +957,41 @@ mod tests {
             "public int Compute() { return 1; } public int Main() { return Task.Run(Compute).Wait(); }",
         );
         assert!(module_uses_tasks(&module));
+    }
+
+    #[test]
+    fn task_worker_demand_tracks_live_submissions_not_static_call_sites() {
+        let module = Arc::new(compile(
+            "public int Work() { return 1; } public Task<int> Start() { return Task.Run(Work); } public int Main() { Task<int> a = Start(); Task<int> b = Start(); return a.Wait() + b.Wait(); }",
+        ));
+        let work = module
+            .functions
+            .iter()
+            .find(|function| function.name == "Work")
+            .expect("Work exists")
+            .symbol;
+        let mut runtime = TaskRuntime::new(&module, 4).expect("runtime starts");
+
+        assert_eq!(runtime.pending_worker_demand(), 1);
+        let first = runtime.run(work).expect("first task starts");
+        assert_eq!(runtime.pending_worker_demand(), 2);
+        let second = runtime.run(work).expect("second task starts");
+        assert_eq!(runtime.pending_worker_demand(), 3);
+
+        runtime.wait(first).expect("first task completes");
+        assert_eq!(runtime.pending_worker_demand(), 2);
+        runtime.wait(second).expect("second task completes");
+        assert_eq!(runtime.pending_worker_demand(), 1);
+    }
+
+    #[test]
+    fn independent_static_task_submissions_prepare_together() {
+        let module = Arc::new(compile(
+            "public int Work() { return 1; } public int Main() { Task<int> a = Task.Run(Work); Task<int> b = Task.Run(Work); return a.Wait() + b.Wait(); }",
+        ));
+        let runtime = TaskRuntime::new(&module, 4).expect("runtime starts");
+        assert_eq!(runtime.task_worker_count, 2);
+        assert_eq!(runtime.pending_worker_demand(), 2);
     }
 
     #[test]

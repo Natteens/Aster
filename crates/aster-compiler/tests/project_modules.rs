@@ -118,6 +118,15 @@ fn using_loads_all_direct_files_in_stable_order() {
 }
 
 #[test]
+fn an_empty_namespace_file_links_without_creating_a_symbol_table_clone() {
+    let project = Project::new("empty-namespace");
+    project.write("app/empty.aster", "namespace app;");
+    let root = project.main("using app; public int Run() { return 42; }");
+
+    compile_project(&root).expect("empty namespace links without panicking");
+}
+
+#[test]
 fn resolves_transitive_usings_and_project_internal_symbols() {
     let project = Project::new("transitive-internal");
     project.write(

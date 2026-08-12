@@ -70,7 +70,8 @@ pub(super) enum JobKind {
     ForEachChunk {
         symbol: mir::SymbolId,
         base: usize,
-        values: Vec<ExecutionValue>,
+        values: Arc<Vec<ExecutionValue>>,
+        range: std::ops::Range<usize>,
     },
     /// `Accumulate(identity, values[i])` folded sequentially over one
     /// `Parallel.Reduce` chunk of host-owned scalar copies, whose first
@@ -80,7 +81,8 @@ pub(super) enum JobKind {
         symbol: mir::SymbolId,
         base: usize,
         identity: ExecutionValue,
-        values: Vec<ExecutionValue>,
+        values: Arc<Vec<ExecutionValue>>,
+        range: std::ops::Range<usize>,
     },
     /// One `Combine(left, right)` call submitted to the pool during a
     /// `Parallel.Reduce`'s sequential combination phase, so the host thread
@@ -177,6 +179,13 @@ impl JobQueue {
         self.not_empty.notify_all();
     }
 
+    fn is_closed(&self) -> bool {
+        self.state
+            .lock()
+            .expect("job queue mutex is not poisoned")
+            .closed
+    }
+
     /// Fail the queue after a worker panic. Dropping queued jobs disconnects
     /// their reply channels, so every already-issued handle unblocks with a
     /// controlled error instead of waiting forever for a worker that died.
@@ -243,10 +252,11 @@ fn worker_loop(
                     symbol,
                     base,
                     values,
+                    range,
                 },
                 Respond::Chunk(reply),
             ) => {
-                let _ = reply.send(program.run_for_each_chunk(symbol, base, &values));
+                let _ = reply.send(program.run_for_each_chunk(symbol, base, &values[range]));
             }
             (
                 JobKind::ReduceChunk {
@@ -254,10 +264,12 @@ fn worker_loop(
                     base,
                     identity,
                     values,
+                    range,
                 },
                 Respond::Reduce(reply),
             ) => {
-                let _ = reply.send(program.run_reduce_chunk(symbol, base, &identity, &values));
+                let _ =
+                    reply.send(program.run_reduce_chunk(symbol, base, &identity, &values[range]));
             }
             (
                 JobKind::CombineStep {
@@ -332,16 +344,28 @@ pub(super) struct ExecutionPool {
     // rejecting a post-shutdown `submit` on the same value is part of the
     // contract.
     workers: Mutex<Vec<JoinHandle<()>>>,
+    max_workers: usize,
     next_task_id: AtomicU64,
 }
 
 impl ExecutionPool {
-    /// Validate `module` once, then start `worker_count` threads, each of
-    /// which builds its own `PreparedProgram` before accepting tasks.
-    /// Returns only once every worker has confirmed it is ready; if any
-    /// worker fails to prepare, no `Self` is ever returned.
+    /// Validate `module` once. Workers are prepared lazily as concurrency is
+    /// actually requested, so one tiny task does not compile the module once
+    /// per available CPU before doing useful work.
     pub(super) fn new(module: Arc<mir::Module>, worker_count: usize) -> Result<Self, BackendError> {
-        Self::new_internal(module, worker_count, None)
+        if worker_count == 0 {
+            return Err(BackendError::new(
+                "execution pool requires at least one worker",
+            ));
+        }
+        validate_module(&module)?;
+        Ok(Self {
+            module,
+            queue: Arc::new(JobQueue::new()),
+            workers: Mutex::new(Vec::with_capacity(worker_count)),
+            max_workers: worker_count,
+            next_task_id: AtomicU64::new(0),
+        })
     }
 
     /// Test-only injection point: forces the worker at `failing_index` to
@@ -353,28 +377,41 @@ impl ExecutionPool {
         worker_count: usize,
         failing_index: usize,
     ) -> Result<Self, BackendError> {
-        Self::new_internal(module, worker_count, Some(failing_index))
+        let pool = Self::new(module, worker_count)?;
+        pool.ensure_workers_internal(worker_count, Some(failing_index))?;
+        Ok(pool)
     }
 
-    fn new_internal(
-        module: Arc<mir::Module>,
+    pub(super) fn ensure_workers(&self, worker_count: usize) -> Result<(), BackendError> {
+        self.ensure_workers_internal(worker_count, None)
+    }
+
+    #[cfg(test)]
+    fn prepared_worker_count(&self) -> usize {
+        self.workers
+            .lock()
+            .expect("workers mutex is not poisoned")
+            .len()
+    }
+
+    fn ensure_workers_internal(
+        &self,
         worker_count: usize,
         failing_index: Option<usize>,
-    ) -> Result<Self, BackendError> {
-        if worker_count == 0 {
-            return Err(BackendError::new(
-                "execution pool requires at least one worker",
-            ));
+    ) -> Result<(), BackendError> {
+        if self.queue.is_closed() {
+            return Err(BackendError::new("execution pool is shut down"));
         }
-        validate_module(&module)?;
-
-        let queue = Arc::new(JobQueue::new());
-        let mut workers = Vec::with_capacity(worker_count);
+        let target = worker_count.max(1).min(self.max_workers);
+        let mut workers = self.workers.lock().expect("workers mutex is not poisoned");
+        if workers.len() >= target {
+            return Ok(());
+        }
         let mut ready_receivers = Vec::with_capacity(worker_count);
-        for index in 0..worker_count {
-            let worker_module = Arc::clone(&module);
-            let worker_queue = Arc::clone(&queue);
-            let panic_queue = Arc::clone(&queue);
+        for index in workers.len()..target {
+            let worker_module = Arc::clone(&self.module);
+            let worker_queue = Arc::clone(&self.queue);
+            let panic_queue = Arc::clone(&self.queue);
             let (ready_tx, ready_rx) = mpsc::channel();
             let simulate_this_worker_failing = failing_index == Some(index);
             workers.push(thread::spawn(move || {
@@ -412,19 +449,15 @@ impl ExecutionPool {
         }
 
         if let Some(error) = failure {
-            queue.close();
-            for worker in workers {
+            self.queue.abort();
+            let failed_workers = workers.drain(..).collect::<Vec<_>>();
+            drop(workers);
+            for worker in failed_workers {
                 let _ = worker.join();
             }
             return Err(error);
         }
-
-        Ok(Self {
-            module,
-            queue,
-            workers: Mutex::new(workers),
-            next_task_id: AtomicU64::new(0),
-        })
+        Ok(())
     }
 
     /// Resolve a public, zero-parameter, scalar-returning function by name
@@ -449,6 +482,7 @@ impl ExecutionPool {
         collect_stats: bool,
         completion: Option<(Arc<CompletionQueue>, CompletionToken)>,
     ) -> Result<TaskHandle, BackendError> {
+        self.ensure_workers(1)?;
         let id = TaskId(self.next_task_id.fetch_add(1, Ordering::Relaxed));
         let (reply, receiver) = mpsc::channel();
         self.queue.push(Job {
@@ -589,7 +623,7 @@ mod tests {
         assert_send::<JobKind>();
         assert_send::<ChunkOutcome>();
         assert_send::<TaskOutcome>();
-        assert_send::<Vec<ExecutionValue>>();
+        assert_send::<Arc<Vec<ExecutionValue>>>();
         // `Parallel.Reduce`'s job/outcome types must hold to the same
         // guarantee: only owned scalars, never a pointer or `ExecutionContext`.
         assert_send::<ReduceChunkOutcome>();
@@ -600,9 +634,11 @@ mod tests {
     fn single_worker_pool_runs_a_task() {
         let module = Arc::new(compile("public int Run() { return 40 + 2; }"));
         let pool = ExecutionPool::new(module, 1).expect("pool starts");
+        assert_eq!(pool.prepared_worker_count(), 0);
         let run = pool.resolve("Run").expect("Run resolves");
 
         let handle = pool.submit(run, false, None).expect("task is accepted");
+        assert_eq!(pool.prepared_worker_count(), 1);
         match join_with_timeout(handle) {
             TaskOutcome::Completed(value, _) => assert_eq!(value, ExecutionValue::Int(42)),
             TaskOutcome::Failed(error) => panic!("unexpected failure: {error}"),
@@ -615,6 +651,8 @@ mod tests {
     fn multiple_workers_run_many_tasks_of_the_same_function() {
         let module = Arc::new(compile("public int Run() { return 40 + 2; }"));
         let pool = ExecutionPool::new(module, 4).expect("pool starts");
+        pool.ensure_workers(4).expect("four workers prepare");
+        assert_eq!(pool.prepared_worker_count(), 4);
         let run = pool.resolve("Run").expect("Run resolves");
 
         let handles: Vec<_> = (0..20)
@@ -1009,21 +1047,26 @@ mod tests {
     }
 
     #[test]
-    fn for_each_chunk_owns_its_scalar_values_not_a_pointer() {
+    fn for_each_chunks_share_only_immutable_host_owned_scalars() {
+        let values = Arc::new(vec![
+            crate::ExecutionValue::Int(1),
+            crate::ExecutionValue::Int(2),
+        ]);
         let chunk = JobKind::ForEachChunk {
             symbol: mir::SymbolId(0),
             base: 0,
-            values: vec![crate::ExecutionValue::Int(1), crate::ExecutionValue::Int(2)],
+            values: Arc::clone(&values),
+            range: 0..1,
         };
-        let JobKind::ForEachChunk { values, .. } = chunk else {
+        let JobKind::ForEachChunk {
+            values: shared,
+            range,
+            ..
+        } = chunk
+        else {
             unreachable!()
         };
-        // `values` is a plain, independently owned `Vec`: moving the whole
-        // `JobKind` (as every job is, into the worker's queue) moves this
-        // storage with it, never a reference into the submitting thread's data.
-        assert_eq!(
-            values,
-            vec![crate::ExecutionValue::Int(1), crate::ExecutionValue::Int(2)]
-        );
+        assert!(Arc::ptr_eq(&values, &shared));
+        assert_eq!(&shared[range], [crate::ExecutionValue::Int(1)]);
     }
 }

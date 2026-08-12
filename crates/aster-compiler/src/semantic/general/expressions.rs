@@ -1,3 +1,4 @@
+use super::statements::ResolvedSwitch;
 use super::{
     Analyzer, AssignmentOperator, BinaryOperator, Binding, Diagnostic, Expression, ExpressionKind,
     HashMap, HashSet, IncrementOperator, IntegerFit, InterpolatedPart, Literal, OptionCases,
@@ -937,15 +938,25 @@ impl Analyzer<'_> {
             .get(&enum_name)
             .map(|info| info.enum_cases.clone())
             .unwrap_or_default();
+        let case_indices = enum_cases
+            .iter()
+            .enumerate()
+            .map(|(index, case)| (case.name.as_str(), index))
+            .collect::<HashMap<_, _>>();
+        let resolved = ResolvedSwitch {
+            enum_name: &enum_name,
+            cases: &enum_cases,
+            indices: &case_indices,
+        };
         let mut covered = HashSet::new();
         let mut result_type = None;
         for case in cases {
             let info = self.resolve_switch_pattern(
-                &enum_name,
                 case.enum_name.as_deref(),
                 &case.case_name,
                 &case.bindings,
                 case.span,
+                &resolved,
                 &mut covered,
             );
             self.scopes.push(HashMap::new());

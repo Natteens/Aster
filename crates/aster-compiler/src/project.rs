@@ -1473,12 +1473,12 @@ fn link(
         );
     }
     for unit in units {
-        let mut visible = namespace_symbols
+        let empty_visible = HashMap::new();
+        let local_visible = namespace_symbols
             .get(&(unit.package, unit.name.clone()))
-            .cloned()
-            .unwrap_or_default();
+            .unwrap_or(&empty_visible);
+        let mut imported_visible = HashMap::new();
         let mut inaccessible = HashMap::new();
-        let local_names: HashSet<_> = visible.keys().cloned().collect();
         let mut imported_from: HashMap<String, String> = HashMap::new();
         for using in &unit.module.usings {
             let owner = if is_official_name(&using.name) {
@@ -1527,7 +1527,7 @@ fn link(
                 importable.extend(internal_symbols.get(&key).cloned().unwrap_or_default());
             }
             for (name, linked) in &importable {
-                if local_names.contains(name) {
+                if local_visible.contains_key(name) {
                     if units
                         .iter()
                         .any(|unit| unit.name == using.name && unit.standard_library)
@@ -1561,12 +1561,13 @@ fn link(
                         );
                     }
                 } else {
-                    visible.insert(name.clone(), linked.clone());
+                    imported_visible.insert(name.clone(), linked.clone());
                 }
             }
         }
         let mut rewriter = Rewriter {
-            visible,
+            local_visible,
+            imported_visible,
             inaccessible,
             diagnostics: Vec::new(),
             type_parameters: HashSet::new(),
@@ -1644,8 +1645,9 @@ impl InaccessibleOrigin {
     }
 }
 
-struct Rewriter {
-    visible: HashMap<String, String>,
+struct Rewriter<'a> {
+    local_visible: &'a HashMap<String, String>,
+    imported_visible: HashMap<String, String>,
     inaccessible: HashMap<String, InaccessibleOrigin>,
     diagnostics: Vec<Diagnostic>,
     type_parameters: HashSet<String>,
@@ -1653,7 +1655,13 @@ struct Rewriter {
     members: HashSet<String>,
 }
 
-impl Rewriter {
+impl Rewriter<'_> {
+    fn visible(&self, name: &str) -> Option<&String> {
+        self.local_visible
+            .get(name)
+            .or_else(|| self.imported_visible.get(name))
+    }
+
     fn current_locals(&self) -> Option<&HashSet<String>> {
         self.locals.last()
     }
@@ -1666,7 +1674,7 @@ impl Rewriter {
             if self.type_parameters.contains(base) {
                 return base.to_owned();
             }
-            if let Some(linked) = self.visible.get(base) {
+            if let Some(linked) = self.visible(base) {
                 linked.clone()
             } else if let Some(origin) = self.inaccessible.get(base) {
                 let (message, help) = origin.describe(base);
@@ -1681,7 +1689,7 @@ impl Rewriter {
     }
 }
 
-impl AstVisitorMut for Rewriter {
+impl AstVisitorMut for Rewriter<'_> {
     fn visit_item_mut(&mut self, item: &mut Item) {
         match item {
             Item::Class(value) | Item::Struct(value) | Item::Interface(value) => {
@@ -1710,11 +1718,15 @@ impl AstVisitorMut for Rewriter {
                     if let Member::Method(method) = member
                         && method.constructor
                     {
-                        method.name.clone_from(&self.visible[&original]);
+                        method
+                            .name
+                            .clone_from(self.visible(&original).expect("declared type is visible"));
                     }
                 }
                 walk_type_declaration_mut(self, value);
-                value.name.clone_from(&self.visible[&original]);
+                value
+                    .name
+                    .clone_from(self.visible(&original).expect("declared type is visible"));
                 self.members = previous_members;
                 self.type_parameters = previous_parameters;
             }
@@ -1729,18 +1741,26 @@ impl AstVisitorMut for Rewriter {
                 );
                 let original = value.name.clone();
                 self.visit_enum_declaration_mut(value);
-                value.name.clone_from(&self.visible[&original]);
+                value
+                    .name
+                    .clone_from(self.visible(&original).expect("declared enum is visible"));
                 self.type_parameters = previous_parameters;
             }
             Item::Function(value) => {
                 let original = value.name.clone();
                 self.visit_function_declaration_mut(value);
-                value.name.clone_from(&self.visible[&original]);
+                value.name.clone_from(
+                    self.visible(&original)
+                        .expect("declared function is visible"),
+                );
             }
             Item::Variable(value) => {
                 let original = value.name.clone();
                 self.visit_variable_declaration_mut(value);
-                value.name.clone_from(&self.visible[&original]);
+                value.name.clone_from(
+                    self.visible(&original)
+                        .expect("declared variable is visible"),
+                );
             }
         }
     }
@@ -1808,7 +1828,7 @@ impl AstVisitorMut for Rewriter {
 
     fn visit_switch_case_mut(&mut self, case: &mut SwitchCase) {
         if let Some(owner) = &mut case.enum_name
-            && let Some(name) = self.visible.get(owner)
+            && let Some(name) = self.visible(owner)
         {
             owner.clone_from(name);
         }
@@ -1839,7 +1859,7 @@ impl AstVisitorMut for Rewriter {
                     *name = self.rewrite_type_name(name, expression.span);
                 } else if !local
                     && !self.members.contains(name)
-                    && let Some(linked) = self.visible.get(name)
+                    && let Some(linked) = self.visible(name)
                 {
                     *name = linked.clone();
                 } else if !local

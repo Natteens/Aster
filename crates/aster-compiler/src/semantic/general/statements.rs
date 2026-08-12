@@ -4,6 +4,12 @@ use super::{
     VariableKind, evaluate, resolve_type_readonly,
 };
 
+pub(super) struct ResolvedSwitch<'a> {
+    pub(super) enum_name: &'a str,
+    pub(super) cases: &'a [EnumCaseInfo],
+    pub(super) indices: &'a HashMap<&'a str, usize>,
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct Flow {
     pub(super) can_continue: bool,
@@ -331,15 +337,25 @@ impl Analyzer<'_> {
             .get(&enum_name)
             .map(|info| info.enum_cases.clone())
             .unwrap_or_default();
+        let case_indices = enum_cases
+            .iter()
+            .enumerate()
+            .map(|(index, case)| (case.name.as_str(), index))
+            .collect::<HashMap<_, _>>();
+        let resolved = ResolvedSwitch {
+            enum_name: &enum_name,
+            cases: &enum_cases,
+            indices: &case_indices,
+        };
         let mut covered = HashSet::new();
         let mut any_continues = false;
         for case in cases {
             let Some(info) = self.resolve_switch_pattern(
-                &enum_name,
                 case.enum_name.as_deref(),
                 &case.case_name,
                 &case.bindings,
                 case.span,
+                &resolved,
                 &mut covered,
             ) else {
                 self.block(&case.body, true);
@@ -377,41 +393,35 @@ impl Analyzer<'_> {
 
     pub(super) fn resolve_switch_pattern(
         &mut self,
-        enum_name: &str,
         owner: Option<&str>,
         case_name: &str,
         bindings: &[String],
         span: Span,
+        resolved: &ResolvedSwitch<'_>,
         covered: &mut HashSet<usize>,
     ) -> Option<EnumCaseInfo> {
-        let enum_cases = self
-            .context
-            .types
-            .get(enum_name)
-            .map(|info| info.enum_cases.clone())
-            .unwrap_or_default();
         if let Some(owner) = owner
-            && owner != enum_name
+            && owner != resolved.enum_name
         {
             self.diagnostics.push(Diagnostic::error(
-                format!("case `{case_name}` belongs to `{owner}`, not `{enum_name}`"),
+                format!(
+                    "case `{case_name}` belongs to `{owner}`, not `{}`",
+                    resolved.enum_name
+                ),
                 span,
             ));
         }
-        let Some((case_index, info)) = enum_cases
-            .iter()
-            .enumerate()
-            .find(|(_, item)| item.name == case_name)
-        else {
+        let Some(&case_index) = resolved.indices.get(case_name) else {
             self.diagnostics.push(
                 Diagnostic::error(
-                    format!("enum `{enum_name}` has no case `{case_name}`"),
+                    format!("enum `{}` has no case `{case_name}`", resolved.enum_name),
                     span,
                 )
                 .with_help("use one of the cases declared by the selected enum"),
             );
             return None;
         };
+        let info = &resolved.cases[case_index];
         if !covered.insert(case_index) {
             self.diagnostics.push(Diagnostic::error(
                 format!("duplicate switch case `{case_name}`"),
@@ -434,7 +444,7 @@ impl Analyzer<'_> {
         self.model.switch_cases.insert(
             self.model_key(span),
             ResolvedEnumCase {
-                enum_name: enum_name.to_owned(),
+                enum_name: resolved.enum_name.to_owned(),
                 case_index,
             },
         );

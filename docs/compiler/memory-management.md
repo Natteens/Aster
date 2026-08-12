@@ -70,11 +70,16 @@ steady-state page size. Larger requests use dedicated non-moving pages. This
 keeps small executions dense without trading away sustained-allocation
 throughput or pointer stability.
 
-Repeated binary string concatenation still allocates one immutable result per `+`, so an append
-loop copies its accumulated prefix repeatedly. The existing multi-part string-join intrinsic used
-by interpolation shows the safe direction for future work: lower a statically known concatenation
-chain to one sized allocation without adding mutable strings or changing ownership. A loop-carried
-append needs an explicit builder or ownership contract and is therefore not optimized implicitly.
+The compiler lowers a statically visible string-concatenation tree whose leaves are literals or
+stable string values through the existing multi-part join intrinsic. This keeps left-to-right value
+order while allocating and sizing the final immutable string once. Chains containing calls,
+interpolation, or other effectful expressions retain pairwise concatenation so allocation failure
+and side-effect ordering do not change.
+
+Loop-carried append still allocates one immutable result per iteration and copies its accumulated
+prefix repeatedly. Eliminating that amplification needs an explicit builder or ownership contract
+and is therefore not optimized implicitly. The release-only `string_construction_matrix` example
+records both curves without asserting machine-dependent timing thresholds.
 
 A successful temporary-only workload can therefore report many allocations,
 non-zero requested and peak values, `used: 0 bytes`, and non-zero reserved
