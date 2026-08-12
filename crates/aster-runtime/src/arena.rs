@@ -5,7 +5,8 @@
 //! active page. Rewound pages remain reserved and can be reused without moving
 //! their backing memory. All pages are released when the arena is dropped.
 //!
-//! Requests larger than [`DEFAULT_PAGE_SIZE`] get a dedicated page whose
+//! Regular pages grow geometrically from [`MIN_PAGE_SIZE`] through
+//! [`DEFAULT_PAGE_SIZE`]. Requests larger than [`DEFAULT_PAGE_SIZE`] get a dedicated page whose
 //! capacity equals the request size.
 
 use std::{
@@ -15,6 +16,10 @@ use std::{
 
 /// Default page capacity in bytes.
 pub(crate) const DEFAULT_PAGE_SIZE: usize = 64 * 1024;
+
+/// Initial page capacity. Small executions should not reserve a full 64 KiB
+/// page before their live payload proves that capacity useful.
+pub(crate) const MIN_PAGE_SIZE: usize = 4 * 1024;
 
 /// Maximum alignment supported by arena allocations.
 pub(crate) const MAX_ALIGN: usize = 16;
@@ -214,8 +219,19 @@ impl PagedArena {
             return Ok(ptr);
         }
 
+        // Regular pages grow geometrically to keep tiny contexts dense without
+        // turning sustained allocation into a long list of 4 KiB pages.
+        // Dedicated oversized pages do not influence later regular growth.
+        let regular_capacity = self.pages[..self.active_pages]
+            .iter()
+            .map(Page::capacity)
+            .filter(|capacity| *capacity <= DEFAULT_PAGE_SIZE)
+            .max()
+            .map_or(MIN_PAGE_SIZE, |capacity| {
+                capacity.saturating_mul(2).min(DEFAULT_PAGE_SIZE)
+            });
         // Fresh pages are MAX_ALIGN-aligned, so the first allocation needs no padding.
-        let capacity = size.max(DEFAULT_PAGE_SIZE);
+        let capacity = size.max(regular_capacity);
         let new_reserved = self
             .reserved_bytes
             .checked_add(capacity)
@@ -413,10 +429,11 @@ mod tests {
     }
 
     #[test]
-    fn multiple_small_allocations_share_one_page() {
+    fn multiple_small_allocations_share_growing_pages() {
         let mut arena = PagedArena::new();
         let ptrs: Vec<*mut u8> = (0..100).map(|_| arena.alloc(64, 8)).collect();
-        assert_eq!(arena.page_count(), 1);
+        assert_eq!(arena.page_count(), 2);
+        assert_eq!(arena.metrics().reserved_bytes, MIN_PAGE_SIZE * 3);
         for (i, &p) in ptrs.iter().enumerate() {
             for &q in &ptrs[i + 1..] {
                 assert_ne!(p, q);
@@ -489,7 +506,7 @@ mod tests {
         let mut arena = PagedArena::new();
         arena.alloc(8, 8);
         let r1 = arena.metrics().reserved_bytes;
-        assert_eq!(r1, DEFAULT_PAGE_SIZE);
+        assert_eq!(r1, MIN_PAGE_SIZE);
         arena.alloc(DEFAULT_PAGE_SIZE, 8);
         let r2 = arena.metrics().reserved_bytes;
         assert!(r2 > r1);
@@ -550,7 +567,7 @@ mod tests {
         assert!(!ptr.is_null());
         assert_eq!(ptr as usize % 8, 0);
         let m = arena.metrics();
-        assert!(m.reserved_bytes >= DEFAULT_PAGE_SIZE + big_size);
+        assert!(m.reserved_bytes >= MIN_PAGE_SIZE + big_size);
         // SAFETY: verify zeroed.
         #[allow(unsafe_code)]
         let last_byte = unsafe { *ptr.add(big_size - 1) };

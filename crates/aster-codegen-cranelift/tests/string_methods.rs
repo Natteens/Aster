@@ -239,7 +239,7 @@ fn searches_do_not_allocate_and_local_substrings_are_reclaimed() {
     assert_eq!(stats.string_allocations, 10_000);
     assert_eq!(stats.requested_bytes, 160_000);
     assert_eq!(stats.used_bytes, 0);
-    assert_eq!(stats.reserved_bytes, 64 * 1024);
+    assert_eq!(stats.reserved_bytes, 4 * 1024);
     assert_eq!(stats.peak_used_bytes, 16);
 
     let persistent = compile(
@@ -253,5 +253,5 @@ fn searches_do_not_allocate_and_local_substrings_are_reclaimed() {
     assert_eq!(stats.string_allocations, 1);
     assert_eq!(stats.requested_bytes, 13);
     assert_eq!(stats.used_bytes, 13);
-    assert_eq!(stats.reserved_bytes, 64 * 1024);
+    assert_eq!(stats.reserved_bytes, 4 * 1024);
 }

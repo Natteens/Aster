@@ -65,6 +65,17 @@ region determines the lifetime.
 - `reserved` is the total page capacity retained by both arenas.
 - `peak used` and `peak reserved` are maximum simultaneous values.
 
+Regular arena pages start at 4 KiB and grow geometrically to the 64 KiB
+steady-state page size. Larger requests use dedicated non-moving pages. This
+keeps small executions dense without trading away sustained-allocation
+throughput or pointer stability.
+
+Repeated binary string concatenation still allocates one immutable result per `+`, so an append
+loop copies its accumulated prefix repeatedly. The existing multi-part string-join intrinsic used
+by interpolation shows the safe direction for future work: lower a statically known concatenation
+chain to one sized allocation without adding mutable strings or changing ownership. A loop-carried
+append needs an explicit builder or ownership contract and is therefore not optimized implicitly.
+
 A successful temporary-only workload can therefore report many allocations,
 non-zero requested and peak values, `used: 0 bytes`, and non-zero reserved
 capacity. That means memory was reclaimed and its pages were retained for

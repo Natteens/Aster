@@ -48,7 +48,7 @@
 //! on this machine: the public API has no override, and adding one would be
 //! a new public surface this batch does not introduce.
 
-use std::time::Instant;
+use std::{fmt::Write as _, time::Instant};
 
 use aster_codegen_cranelift::{ExecutionValue, execute_with_stats};
 use aster_compiler::compile;
@@ -91,13 +91,50 @@ fn report_case(case: &str, source: &str, entry: &str, expected: &ExecutionValue)
     );
 }
 
+fn task_run_source(tasks: usize, iterations: i64) -> String {
+    let mut source = format!(
+        "public long Work() {{ \
+             long total = 0; \
+             for (long i = 0; i < {iterations}; i++) {{ total += i; }} \
+             return total; \
+         }} \
+         public long Main() {{ "
+    );
+    for task in 0..tasks {
+        write!(source, "Task<long> task{task} = Task.Run(Work); ")
+            .expect("writing into a String cannot fail");
+    }
+    source.push_str("long total = 0; ");
+    for task in 0..tasks {
+        write!(source, "total += task{task}.Wait(); ").expect("writing into a String cannot fail");
+    }
+    source.push_str("return total; }");
+    source
+}
+
+fn sequential_task_source(tasks: usize, iterations: i64) -> String {
+    let mut source = format!(
+        "public long Work() {{ \
+             long total = 0; \
+             for (long i = 0; i < {iterations}; i++) {{ total += i; }} \
+             return total; \
+         }} \
+         public long Main() {{ long total = 0; "
+    );
+    for _ in 0..tasks {
+        source.push_str("total += Work(); ");
+    }
+    source.push_str("return total; }");
+    source
+}
+
 fn main() {
     let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     println!("Lote 6 Parallel.* manual timing snapshot (informative only, not a benchmark)");
     println!("worker_count (available_parallelism) = {worker_count}");
     println!();
 
-    for &elements in &[1_000_i64, 100_000] {
+    for &elements in &[1_i64, 32, 1_000, 100_000, 1_000_000] {
         println!("--- elements = {elements} ---");
         let expected_sum = ExecutionValue::Long(elements * (elements + 1) / 2);
 
@@ -159,6 +196,32 @@ fn main() {
         );
 
         println!();
+    }
+
+    for &(tasks, iterations) in &[
+        (1_usize, 0_i64),
+        (16, 0),
+        (1, 100_000),
+        (16, 100_000),
+        (1, 1_000_000),
+        (16, 1_000_000),
+        (1, 10_000_000),
+        (16, 10_000_000),
+    ] {
+        let task_count = i64::try_from(tasks).expect("benchmark task count fits in long");
+        let expected = task_count * iterations * (iterations - 1) / 2;
+        report_case(
+            &format!("sequential_{tasks}x{iterations}"),
+            &sequential_task_source(tasks, iterations),
+            "Main",
+            &ExecutionValue::Long(expected),
+        );
+        report_case(
+            &format!("task_run_{tasks}x{iterations}"),
+            &task_run_source(tasks, iterations),
+            "Main",
+            &ExecutionValue::Long(expected),
+        );
     }
 
     println!(

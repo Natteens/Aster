@@ -130,10 +130,12 @@ impl TaskRuntime {
         worker_count: usize,
     ) -> Result<Self, BackendError> {
         let pool = ExecutionPool::new(Arc::clone(module), worker_count)?;
-        let driver = PreparedProgram::prepare(module)?;
+        let driver = module_uses_async(module)
+            .then(|| PreparedProgram::prepare(module))
+            .transpose()?;
         Ok(Self {
             pool,
-            driver: Some(driver),
+            driver,
             completion: Arc::new(CompletionQueue::new()),
             entries: HashMap::new(),
             async_tasks: HashMap::new(),
@@ -860,6 +862,22 @@ pub(super) fn module_uses_tasks(module: &mir::Module) -> bool {
     })
 }
 
+fn module_uses_async(module: &mir::Module) -> bool {
+    module.functions.iter().any(|function| {
+        function.blocks.iter().any(|block| {
+            block.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    mir::Instruction::CallIntrinsic {
+                        intrinsic: mir::Intrinsic::AsyncSpawn | mir::Intrinsic::AsyncSpawnInner,
+                        ..
+                    }
+                )
+            })
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
@@ -894,6 +912,19 @@ mod tests {
             "public int Compute() { return 1; } public int Main() { return Task.Run(Compute).Wait(); }",
         );
         assert!(module_uses_tasks(&module));
+    }
+
+    #[test]
+    fn async_driver_is_only_required_by_async_modules() {
+        let task = compile(
+            "public int Work() { return 42; } public int Run() { Task<int> task = Task.Run(Work); return task.Wait(); }",
+        );
+        assert!(!module_uses_async(&task));
+
+        let async_module = compile(
+            "public int Work() { return 42; } public async Task<int> Run() { int value = await Task.Run(Work); return value; }",
+        );
+        assert!(module_uses_async(&async_module));
     }
 
     #[test]
@@ -1164,7 +1195,9 @@ mod tests {
 
     #[test]
     fn driver_guard_restores_the_driver_during_unwind() {
-        let module = compile("public int Compute() { return 1; }");
+        let module = compile(
+            "public int Compute() { return 1; } public async Task<int> Run() { return await Task.Run(Compute); }",
+        );
         let mut runtime = TaskRuntime::new(&Arc::new(module), 1).expect("runtime starts");
         let runtime_pointer = std::ptr::from_mut(&mut runtime);
         let driver = runtime.driver.take().expect("driver is present");

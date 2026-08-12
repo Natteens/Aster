@@ -74,7 +74,7 @@ fn temporary_object_array_and_string_stress_stays_bounded() {
     assert_eq!(stats.array_allocations, 10_000);
     assert_eq!(stats.string_allocations, 10_000);
     assert_eq!(stats.used_bytes, 0);
-    assert_eq!(stats.reserved_bytes, 64 * 1024);
+    assert_eq!(stats.reserved_bytes, 4 * 1024);
     assert!(stats.peak_used_bytes > 0);
     assert!(stats.peak_used_bytes < 1024);
 }
@@ -190,7 +190,7 @@ fn temporary_list_stress_stays_bounded() {
 
     assert_eq!(value, ExecutionValue::Int((0..8).sum::<i32>() * 10_000));
     assert_eq!(stats.used_bytes, 0);
-    assert_eq!(stats.reserved_bytes, 64 * 1024);
+    assert_eq!(stats.reserved_bytes, 4 * 1024);
     assert!(stats.peak_used_bytes > 0);
     assert!(
         stats.peak_used_bytes < 1024,
@@ -245,7 +245,7 @@ fn a_long_lived_list_workload_peaks_then_shrinks_without_unbounded_growth() {
     assert_eq!(stats.used_bytes, 0, "the final call's scope was reclaimed");
     assert_eq!(
         stats.reserved_bytes,
-        64 * 1024,
+        4 * 1024,
         "one temporary page is reused across every call, never growing per iteration"
     );
     // Every generation of the buffer this list ever had (0->4->8->16->32->64)

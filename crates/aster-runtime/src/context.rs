@@ -6,9 +6,9 @@ use std::mem::{align_of, size_of};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(test)]
-use crate::arena::DEFAULT_PAGE_SIZE;
 use crate::arena::{ArenaAllocError, ArenaMark, MAX_ALIGN, PagedArena};
+#[cfg(test)]
+use crate::arena::{DEFAULT_PAGE_SIZE, MIN_PAGE_SIZE};
 use crate::string::AsterStrHeader;
 
 /// Maximum arena capacity reserved by one execution context, shared by its
@@ -5950,7 +5950,7 @@ mod tests {
         let stats = context.memory_stats();
         assert_eq!(stats.requested_bytes, 16);
         assert_eq!(stats.used_bytes, 16);
-        assert_eq!(stats.reserved_bytes, 64 * 1024);
+        assert_eq!(stats.reserved_bytes, MIN_PAGE_SIZE as u64);
         assert_eq!(stats.peak_used_bytes, stats.used_bytes);
         assert_eq!(stats.peak_reserved_bytes, stats.reserved_bytes);
     }
@@ -6009,7 +6009,7 @@ mod tests {
         assert_eq!(temporary.used_bytes, 0);
         assert_eq!(temporary.reserved_bytes, 0);
         assert_eq!(stats.used_bytes, 32);
-        assert_eq!(stats.reserved_bytes, 64 * 1024);
+        assert_eq!(stats.reserved_bytes, MIN_PAGE_SIZE as u64);
         assert_eq!(stats.total_allocations, 1);
         assert_eq!(stats.object_allocations, 1);
         assert_eq!(stats.requested_bytes, 32);
@@ -6026,9 +6026,9 @@ mod tests {
 
         let stats = context.memory_stats();
         assert_eq!(stats.used_bytes, 32);
-        assert_eq!(stats.reserved_bytes, 64 * 1024);
+        assert_eq!(stats.reserved_bytes, MIN_PAGE_SIZE as u64);
         assert_eq!(stats.peak_used_bytes, 32);
-        assert_eq!(stats.peak_reserved_bytes, 64 * 1024);
+        assert_eq!(stats.peak_reserved_bytes, MIN_PAGE_SIZE as u64);
         assert_eq!(stats.total_allocations, 0);
         assert_eq!(stats.requested_bytes, 0);
     }
@@ -6174,7 +6174,7 @@ mod tests {
         assert_eq!(stats.object_allocations, 1);
         assert_eq!(stats.requested_bytes, 32);
         assert_eq!(stats.used_bytes, 0);
-        assert_eq!(stats.reserved_bytes, 64 * 1024);
+        assert_eq!(stats.reserved_bytes, MIN_PAGE_SIZE as u64);
         assert_eq!(stats.peak_used_bytes, 32);
     }
 

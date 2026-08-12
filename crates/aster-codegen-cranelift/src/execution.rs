@@ -29,7 +29,7 @@ impl PreparedProgram {
     /// binding every function's resolved symbol to its finalized address and
     /// return type for later invocation.
     pub(super) fn prepare(module: &mir::Module) -> Result<Self, BackendError> {
-        let mut builder = JITBuilder::new(default_libcall_names()).map_err(module_error)?;
+        let mut builder = jit_builder()?;
         for function in runtime_functions() {
             builder.symbol(function.name, function.address);
         }
@@ -267,6 +267,10 @@ impl PreparedProgram {
         }
         CombineOutcome { result: Ok(result) }
     }
+}
+
+fn jit_builder() -> Result<JITBuilder, BackendError> {
+    JITBuilder::with_flags(&[("opt_level", "speed")], default_libcall_names()).map_err(module_error)
 }
 
 fn chunk_error(index: i64, message: impl Into<String>) -> super::worker_pool::ChunkOutcome {
@@ -707,6 +711,14 @@ fn invoke_finalized(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cranelift_codegen::settings::OptLevel;
+    use cranelift_module::Module;
+
+    #[test]
+    fn jit_uses_cranelift_speed_optimizations() {
+        let module = JITModule::new(jit_builder().expect("native JIT builder"));
+        assert_eq!(module.isa().flags().opt_level(), OptLevel::Speed);
+    }
 
     fn compile(source: &str) -> mir::Module {
         aster_compiler::compile(source)
