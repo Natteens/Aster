@@ -141,6 +141,67 @@ therefore which logical worker first encounters memory exhaustion. ASTER's deter
 failure ordering requires an explicit admission or quota design before integration. AARM-2B owns
 that design; AARM-2A does not change worker-pool behavior.
 
+## AARM-2B1 deterministic Parallel partitions
+
+AARM-2B1 adds an opt-in research execution path for governed `Parallel.For`,
+`Parallel.ForEach`, and `Parallel.Reduce`. Default ASTER execution remains unchanged. Ordinary
+`Task.Run`, async tasks, and `MoveNext` contexts remain ungoverned, and governed Parallel testing is
+kept isolated from dynamic task admission until a later slice defines that policy.
+
+At the start of a Parallel operation, the host reads the governor hard limit and the capacity
+already retained by the governed main context, then computes:
+
+```text
+available headroom = hard limit - current retained capacity
+```
+
+The host thread is synchronously blocked inside the Parallel call after array values have been
+copied to host-owned scalar storage. No callback can allocate through the main context while worker
+chunks run. The captured main-context capacity is therefore stable for this isolated experimental
+operation.
+
+Available headroom is divided by logical chunk count, never worker identity. Because the current
+allocator needs one 4 KiB minimum page for a fresh small context, the planner first gives whole
+minimum-page entitlement to the lowest logical chunk indexes. If headroom cannot fund every chunk,
+the next logical chunk receives the remaining sub-page tail and later chunks receive zero. Once
+every chunk has one minimum page, surplus bytes are divided evenly and the earliest chunks receive
+one extra byte until the remainder is exhausted. This page-aware initial distribution prevents
+usable whole-page capacity from being stranded as sub-page fragments while every resulting local
+ceiling remains byte-based for growing regular and oversized pages. Shares sum exactly to the
+captured headroom. The entitlement travels in the owned `JobKind` value for that logical chunk, so
+any free worker can execute it without changing its budget.
+
+Each chunk context has two independent fail-closed authorities:
+
+```text
+fixed chunk-local retained-capacity ceiling
+AND
+shared MemoryGovernor hard ceiling
+```
+
+The local ceiling covers the chunk's Temporary and Persistent arenas together. It is not charged
+up front, and the unchanged 1 GiB context safety ceiling still caps any larger share: governor
+capacity records only real retained pages. Fresh pages must pass the effective local check before
+shared admission; active-page bumps and inactive retained-page reuse perform no quota or governor
+operation. Destroying the chunk context releases its real page reservations.
+
+An early-finishing chunk does not enlarge any surviving chunk's local ceiling. This deliberately
+rejects concurrent first-come borrowing: scheduler-dependent allocation success could create a
+scheduler-dependent worker failure, which is incompatible with deterministic language semantics.
+Dynamic Task admission and deterministic borrowing remain AARM-2B2/2B3 research problems.
+
+`Parallel.For` and `Parallel.ForEach` retain smallest-logical-index failure selection.
+`Parallel.Reduce` accumulation keeps chunk-index partial ordering and smallest logical array
+position failure selection. After accumulation contexts are destroyed, each left-to-right combine
+step runs alone with a newly calculated one-chunk share of the headroom available at that
+deterministic sequential point. Released accumulation capacity can therefore be reused by combine
+without introducing a concurrent admission race.
+
+The AARM matrix records host-side planning data separately from governor telemetry: initial
+governed capacity, available headroom, exact logical chunk shares, and their minimum/maximum. Worker
+allocator snapshots provide fast/slow allocation and fresh/reused page evidence. Governor metrics
+continue to describe real backing capacity only; quotas are never counted as granted capacity.
+
 ## Measurement invariants
 
 Every snapshot must satisfy:
@@ -188,20 +249,23 @@ workloads cover tiny allocations, long-scope temporary retention, helper-scoped 
 burst and rewind, repeated burst/reuse, persistent retention, and isolated 1/4/16-context worker
 shapes. AARM-2A extends it with paired governed/control tiny-allocation and page-growth cases,
 manually governed 1/4/16-context aggregates, shared-limit denial, and teardown/reuse. Default burst
-sizes are measured in tens of MiB or less; `large` must be selected explicitly.
+sizes are measured in tens of MiB or less; `large` must be selected explicitly. AARM-2B1 adds
+ordinary/governed `Parallel.For`, `ForEach`, and `Reduce` comparisons at 1/4/16 worker shapes,
+tight and uneven logical partitions, repeated deterministic denial, and sequential Reduce combine
+headroom reuse.
 
 ```console
 cargo run --release -p aster-codegen-cranelift --features aarm-telemetry --example aarm_memory_matrix -- --scale small
 cargo run --release -p aster-codegen-cranelift --features aarm-telemetry --example aarm_memory_matrix -- --scale small --json
 ```
 
-Structured output separates allocator telemetry, process RSS, checksum, scale, and informational
-elapsed time. Timing is never a correctness gate. Generated reports and machine-local baselines are
-not committed.
+Structured output separates allocator telemetry, Parallel planning, process RSS, checksum, scale,
+and informational elapsed time. Timing is never a correctness gate. Generated reports and
+machine-local baselines are not committed.
 
 ## Metrics that do not exist yet
 
-AARM-2A does not expose or infer:
+AARM-2B1 does not expose or infer:
 
 - `virtual_reserved_bytes`;
 - `committed_backing_bytes`;
@@ -216,7 +280,9 @@ These fields remain absent until an architecture exists that can measure them ac
 ```text
 AARM-1 observability
 -> AARM-2A shared MemoryGovernor foundation on current allocator
--> AARM-2B deterministic worker admission/quota design
+-> AARM-2B1 deterministic Parallel chunk partitions
+-> AARM-2B2 dynamic Task/async admission
+-> AARM-2B3 deterministic quota borrowing research
 -> AARM-2C host-adaptive policy research
 -> AARM-3 OS PageBackend
 -> AARM-4 delayed purge/hysteresis

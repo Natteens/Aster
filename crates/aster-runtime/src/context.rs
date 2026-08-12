@@ -573,6 +573,14 @@ impl Default for ExecutionContext {
 }
 
 impl ExecutionContext {
+    /// Smallest fresh arena page capacity used by experimental AARM planners.
+    #[doc(hidden)]
+    pub const AARM_MIN_PAGE_CAPACITY_BYTES: usize = crate::arena::MIN_PAGE_SIZE;
+
+    /// Largest regular arena page capacity used by experimental AARM tests.
+    #[doc(hidden)]
+    pub const AARM_DEFAULT_PAGE_CAPACITY_BYTES: usize = crate::arena::DEFAULT_PAGE_SIZE;
+
     #[must_use]
     pub fn new() -> Self {
         Self::with_options(false, EXECUTION_ALLOCATION_LIMIT_BYTES)
@@ -626,7 +634,22 @@ impl ExecutionContext {
     #[doc(hidden)]
     #[must_use]
     pub fn with_memory_governor(governor: Arc<MemoryGovernor>) -> Self {
-        Self::with_options_and_governor(true, EXECUTION_ALLOCATION_LIMIT_BYTES, Some(governor))
+        Self::with_memory_budget(governor, EXECUTION_ALLOCATION_LIMIT_BYTES)
+    }
+
+    /// Create an experimental statistics-enabled context with both a local
+    /// retained-capacity ceiling and one shared hard budget.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_memory_budget(
+        governor: Arc<MemoryGovernor>,
+        allocation_limit_bytes: usize,
+    ) -> Self {
+        Self::with_options_and_governor(
+            true,
+            allocation_limit_bytes.min(EXECUTION_ALLOCATION_LIMIT_BYTES),
+            Some(governor),
+        )
     }
 
     #[cfg(test)]
@@ -7022,6 +7045,78 @@ mod tests {
         assert_eq!(telemetry.current_capacity_bytes, 0);
         assert_eq!(telemetry.grant_events, 0);
         assert_eq!(telemetry.denial_events, 0);
+    }
+
+    #[test]
+    fn governed_local_budget_is_exact_at_fresh_page_boundaries() {
+        let below_governor = Arc::new(MemoryGovernor::new(MIN_PAGE_SIZE * 4));
+        let mut below =
+            ExecutionContext::with_memory_budget(Arc::clone(&below_governor), MIN_PAGE_SIZE - 1);
+        assert!(aster_rt_object_new(&raw mut below, 1).is_null());
+        assert_eq!(below_governor.telemetry().current_capacity_bytes, 0);
+
+        let exact_governor = Arc::new(MemoryGovernor::new(MIN_PAGE_SIZE * 4));
+        let mut exact =
+            ExecutionContext::with_memory_budget(Arc::clone(&exact_governor), MIN_PAGE_SIZE);
+        assert!(!aster_rt_object_new(&raw mut exact, 1).is_null());
+        assert_eq!(
+            exact_governor.telemetry().current_capacity_bytes,
+            MIN_PAGE_SIZE as u64
+        );
+
+        let above_governor = Arc::new(MemoryGovernor::new(MIN_PAGE_SIZE * 4));
+        let mut above =
+            ExecutionContext::with_memory_budget(Arc::clone(&above_governor), MIN_PAGE_SIZE + 1);
+        assert!(!aster_rt_object_new(&raw mut above, 1).is_null());
+        assert_eq!(
+            above_governor.telemetry().current_capacity_bytes,
+            MIN_PAGE_SIZE as u64
+        );
+
+        drop((exact, above));
+        assert_eq!(exact_governor.telemetry().current_capacity_bytes, 0);
+        assert_eq!(above_governor.telemetry().current_capacity_bytes, 0);
+    }
+
+    #[test]
+    fn governed_local_budget_never_weakens_the_one_gibibyte_safety_ceiling() {
+        let governor = Arc::new(MemoryGovernor::new(usize::MAX));
+        let context = ExecutionContext::with_memory_budget(governor, usize::MAX);
+        assert_eq!(
+            context.allocation_limit_bytes,
+            EXECUTION_ALLOCATION_LIMIT_BYTES
+        );
+    }
+
+    #[test]
+    fn governed_local_budget_caps_multiple_page_growth_before_global_admission() {
+        let local_limit = MIN_PAGE_SIZE * 3;
+        let governor = Arc::new(MemoryGovernor::new(local_limit * 4));
+        let mut context = ExecutionContext::with_memory_budget(Arc::clone(&governor), local_limit);
+
+        assert!(!aster_rt_object_new(&raw mut context, 1).is_null());
+        assert!(
+            !aster_rt_object_new(
+                &raw mut context,
+                i32::try_from(MIN_PAGE_SIZE).expect("page size fits i32")
+            )
+            .is_null()
+        );
+        let admitted = governor.telemetry();
+        assert_eq!(admitted.current_capacity_bytes, local_limit as u64);
+        assert_eq!(admitted.grant_events, 2);
+
+        assert!(
+            aster_rt_object_new(
+                &raw mut context,
+                i32::try_from(MIN_PAGE_SIZE * 2).expect("test allocation fits i32")
+            )
+            .is_null()
+        );
+        let denied = governor.telemetry();
+        assert_eq!(denied.current_capacity_bytes, local_limit as u64);
+        assert_eq!(denied.grant_events, 2);
+        assert_eq!(denied.denial_events, 0);
     }
 
     #[test]

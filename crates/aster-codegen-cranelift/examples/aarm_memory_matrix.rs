@@ -11,7 +11,11 @@ use std::{
     time::Instant,
 };
 
-use aster_codegen_cranelift::{AarmMemoryTelemetry, ExecutionValue, execute_with_aarm_telemetry};
+use aster_codegen_cranelift::{
+    AarmMemoryTelemetry, AarmParallelPlanningTelemetry, ExecutionValue,
+    execute_with_aarm_parallel_governor, execute_with_aarm_parallel_workers,
+    execute_with_aarm_telemetry, parallel_chunk_budgets,
+};
 use aster_compiler::compile;
 use aster_runtime::{
     AarmAllocatorEvents, AarmRegionTelemetry, ExecutionContext, MemoryGovernor,
@@ -98,6 +102,7 @@ pub struct CaseResult {
     pub checksum: i64,
     pub elapsed_micros: u128,
     pub telemetry: AarmMemoryTelemetry,
+    pub parallel_plans: Vec<AarmParallelPlanningTelemetry>,
     pub rss_before_bytes: Option<u64>,
     pub rss_at_peak_bytes: Option<u64>,
     pub rss_after_bytes: Option<u64>,
@@ -136,6 +141,19 @@ pub fn run_matrix(scales: &[Scale]) -> Vec<CaseResult> {
         }
         results.push(shared_governor_denial_case(scale));
         results.push(governor_teardown_reuse_case(scale));
+        for workers in [1, 4, 16] {
+            for kind in [
+                ParallelKind::For,
+                ParallelKind::ForEach,
+                ParallelKind::Reduce,
+            ] {
+                results.push(parallel_case(scale, workers, kind, false));
+                results.push(parallel_case(scale, workers, kind, true));
+            }
+        }
+        results.push(tight_parallel_partition_case(scale));
+        results.push(uneven_parallel_partition_case(scale));
+        results.push(deterministic_parallel_denial_case(scale));
     }
     results
 }
@@ -205,6 +223,7 @@ fn execute_compiled_case(
         checksum: execution_checksum(&value),
         elapsed_micros,
         telemetry,
+        parallel_plans: Vec::new(),
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: None,
         rss_after_bytes: after.rss_bytes,
@@ -250,6 +269,7 @@ fn direct_burst_case(scale: Scale, repeats: usize) -> CaseResult {
         checksum,
         elapsed_micros,
         telemetry,
+        parallel_plans: Vec::new(),
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: rss_at_peak,
         rss_after_bytes: after.rss_bytes,
@@ -337,6 +357,7 @@ fn worker_context_case(scale: Scale, workers: usize) -> CaseResult {
         checksum,
         elapsed_micros,
         telemetry,
+        parallel_plans: Vec::new(),
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: rss_at_peak,
         rss_after_bytes: after.rss_bytes,
@@ -378,6 +399,7 @@ fn direct_tiny_allocation_case(scale: Scale, governed: bool) -> CaseResult {
         checksum,
         elapsed_micros,
         telemetry,
+        parallel_plans: Vec::new(),
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: after.rss_bytes,
         rss_after_bytes: after.rss_bytes,
@@ -422,6 +444,7 @@ fn page_growth_case(scale: Scale, governed: bool) -> CaseResult {
         checksum: i64::try_from(pages).expect("page count fits i64"),
         elapsed_micros,
         telemetry,
+        parallel_plans: Vec::new(),
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: at_peak.rss_bytes,
         rss_after_bytes: at_peak.rss_bytes,
@@ -480,6 +503,7 @@ fn governed_contexts_case(scale: Scale, context_count: usize) -> CaseResult {
         checksum,
         elapsed_micros,
         telemetry,
+        parallel_plans: Vec::new(),
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: at_peak.rss_bytes,
         rss_after_bytes: after.rss_bytes,
@@ -520,6 +544,7 @@ fn shared_governor_denial_case(scale: Scale) -> CaseResult {
         checksum: 1,
         elapsed_micros,
         telemetry,
+        parallel_plans: Vec::new(),
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: at_peak.rss_bytes,
         rss_after_bytes: after.rss_bytes,
@@ -552,8 +577,234 @@ fn governor_teardown_reuse_case(scale: Scale) -> CaseResult {
         checksum: 2,
         elapsed_micros,
         telemetry,
+        parallel_plans: Vec::new(),
         rss_before_bytes: before.rss_bytes,
         rss_at_peak_bytes: at_peak.rss_bytes,
+        rss_after_bytes: after.rss_bytes,
+        process_peak_rss_bytes: after.peak_rss_bytes,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ParallelKind {
+    For,
+    ForEach,
+    Reduce,
+}
+
+impl ParallelKind {
+    fn source(self, iterations: usize) -> (String, ExecutionValue) {
+        match self {
+            Self::For => (
+                format!(
+                    "public void Body(int index) {{ int[] first = new int[1]; int[] second = new int[1]; first[0] = index; second[0] = first[0]; }} \
+                     public int Main() {{ Parallel.For(0, {iterations}, Body); return {iterations}; }}"
+                ),
+                ExecutionValue::Int(i32::try_from(iterations).expect("iterations fit int")),
+            ),
+            Self::ForEach => (
+                format!(
+                    "public void Body(int value) {{ int[] first = new int[1]; int[] second = new int[1]; first[0] = value; second[0] = first[0]; }} \
+                     public int Main() {{ int[] values = new int[{iterations}]; Parallel.ForEach(values, Body); return values.Length; }}"
+                ),
+                ExecutionValue::Int(i32::try_from(iterations).expect("iterations fit int")),
+            ),
+            Self::Reduce => (
+                format!(
+                    "public int AddValue(int total, int value) {{ int[] first = new int[1]; int[] second = new int[1]; return total + 1 + first[0] + second[0]; }} \
+                     public int AddPartial(int left, int right) {{ int[] first = new int[1]; int[] second = new int[1]; return left + right + first[0] + second[0]; }} \
+                     public int Main() {{ int[] values = new int[{iterations}]; return Parallel.Reduce(values, 0, AddValue, AddPartial); }}"
+                ),
+                ExecutionValue::Int(i32::try_from(iterations).expect("iterations fit int")),
+            ),
+        }
+    }
+
+    fn workload(self, governed: bool) -> &'static str {
+        match (self, governed) {
+            (Self::For, false) => "parallel_for_control",
+            (Self::For, true) => "governed_parallel_for",
+            (Self::ForEach, false) => "parallel_for_each_control",
+            (Self::ForEach, true) => "governed_parallel_for_each",
+            (Self::Reduce, false) => "parallel_reduce_control",
+            (Self::Reduce, true) => "governed_parallel_reduce",
+        }
+    }
+}
+
+fn parallel_case(scale: Scale, workers: usize, kind: ParallelKind, governed: bool) -> CaseResult {
+    let iterations = scale.scope_iterations();
+    let (source, expected) = kind.source(iterations);
+    let module = compile(&source)
+        .expect("Parallel AARM matrix source compiles")
+        .mir;
+    let before = process_memory();
+    let started = Instant::now();
+    let (value, telemetry, parallel_plans) = if governed {
+        let governor = Arc::new(MemoryGovernor::new(scale.burst_bytes()));
+        let (value, main, plans, worker_snapshots) =
+            execute_with_aarm_parallel_governor(&module, "Main", workers, Arc::clone(&governor))
+                .expect("governed Parallel matrix case executes");
+        assert_eq!(governor.telemetry().current_capacity_bytes, 0);
+        for plan in &plans {
+            assert_eq!(
+                plan.chunk_budgets_bytes.iter().sum::<u64>(),
+                plan.available_headroom_bytes
+            );
+        }
+        let mut snapshots = Vec::with_capacity(worker_snapshots.len() + 1);
+        snapshots.push(main);
+        snapshots.extend(worker_snapshots);
+        let mut combined = sum_telemetry(&snapshots);
+        combined.governor = main.governor;
+        (value, combined, plans)
+    } else {
+        let (value, telemetry) = execute_with_aarm_parallel_workers(&module, "Main", workers)
+            .expect("ordinary Parallel matrix control executes");
+        (value, telemetry, Vec::new())
+    };
+    let elapsed_micros = started.elapsed().as_micros();
+    assert_eq!(value, expected);
+    let after = process_memory();
+    CaseResult {
+        workload: kind.workload(governed),
+        scale,
+        iterations: u64::try_from(iterations).expect("iterations fit u64"),
+        workers: Some(u64::try_from(workers).expect("workers fit u64")),
+        checksum: execution_checksum(&value),
+        elapsed_micros,
+        telemetry,
+        parallel_plans,
+        rss_before_bytes: before.rss_bytes,
+        rss_at_peak_bytes: after.rss_bytes,
+        rss_after_bytes: after.rss_bytes,
+        process_peak_rss_bytes: after.peak_rss_bytes,
+    }
+}
+
+fn tight_parallel_partition_case(scale: Scale) -> CaseResult {
+    governed_parallel_shape_case("governed_parallel_tight_partition", scale, 4, 4, 16 * 1024)
+}
+
+fn uneven_parallel_partition_case(scale: Scale) -> CaseResult {
+    governed_parallel_shape_case(
+        "governed_parallel_uneven_chunks",
+        scale,
+        10,
+        4,
+        40 * 1024 + 2,
+    )
+}
+
+fn governed_parallel_shape_case(
+    workload: &'static str,
+    scale: Scale,
+    iterations: usize,
+    workers: usize,
+    hard_limit_bytes: usize,
+) -> CaseResult {
+    let source = format!(
+        "public void Body(int index) {{ int[] scratch = new int[1]; scratch[0] = index; }} \
+         public int Main() {{ Parallel.For(0, {iterations}, Body); return {iterations}; }}"
+    );
+    let module = compile(&source)
+        .expect("Parallel shape source compiles")
+        .mir;
+    let governor = Arc::new(MemoryGovernor::new(hard_limit_bytes));
+    let before = process_memory();
+    let started = Instant::now();
+    let (value, main, parallel_plans, worker_snapshots) =
+        execute_with_aarm_parallel_governor(&module, "Main", workers, Arc::clone(&governor))
+            .expect("governed Parallel shape executes");
+    let elapsed_micros = started.elapsed().as_micros();
+    assert_eq!(
+        value,
+        ExecutionValue::Int(i32::try_from(iterations).expect("iterations fit int"))
+    );
+    assert_eq!(parallel_plans.len(), 1);
+    assert_eq!(
+        parallel_plans[0].chunk_budgets_bytes.iter().sum::<u64>(),
+        parallel_plans[0].available_headroom_bytes
+    );
+    let mut snapshots = Vec::with_capacity(worker_snapshots.len() + 1);
+    snapshots.push(main);
+    snapshots.extend(worker_snapshots);
+    let mut telemetry = sum_telemetry(&snapshots);
+    telemetry.governor = main.governor;
+    assert_eq!(governor.telemetry().current_capacity_bytes, 0);
+    let after = process_memory();
+    CaseResult {
+        workload,
+        scale,
+        iterations: u64::try_from(iterations).expect("iterations fit u64"),
+        workers: Some(u64::try_from(workers).expect("workers fit u64")),
+        checksum: i64::try_from(iterations).expect("iterations fit i64"),
+        elapsed_micros,
+        telemetry,
+        parallel_plans,
+        rss_before_bytes: before.rss_bytes,
+        rss_at_peak_bytes: after.rss_bytes,
+        rss_after_bytes: after.rss_bytes,
+        process_peak_rss_bytes: after.peak_rss_bytes,
+    }
+}
+
+fn deterministic_parallel_denial_case(scale: Scale) -> CaseResult {
+    const REPETITIONS: usize = 20;
+    const WORKERS: usize = 4;
+    const HARD_LIMIT_BYTES: usize = 16 * 1024;
+    let module = compile(
+        "public void Body(int index) { int size = index == 2 || index == 5 || index == 9 ? 20000 : 1; int[] scratch = new int[size]; } \
+         public int Main() { Parallel.For(0, 16, Body); return 16; }",
+    )
+    .expect("deterministic denial source compiles")
+    .mir;
+    let governor = Arc::new(MemoryGovernor::new(HARD_LIMIT_BYTES));
+    let before = process_memory();
+    let started = Instant::now();
+    let mut expected_error = None;
+    for repetition in 0..REPETITIONS {
+        let error =
+            execute_with_aarm_parallel_governor(&module, "Main", WORKERS, Arc::clone(&governor))
+                .expect_err("logical index 2 must exceed its deterministic local ceiling");
+        assert!(error.message().contains("Parallel logical index 2"));
+        assert_eq!(
+            expected_error.get_or_insert_with(|| error.message().to_owned()),
+            error.message(),
+            "denial diagnostic changed at repetition {repetition}"
+        );
+        assert_eq!(governor.telemetry().current_capacity_bytes, 0);
+    }
+    let elapsed_micros = started.elapsed().as_micros();
+    let governor_telemetry = governor.telemetry();
+    assert!(governor_telemetry.peak_capacity_bytes <= governor_telemetry.hard_limit_bytes);
+    assert_eq!(
+        governor_telemetry.grant_events,
+        governor_telemetry.release_events
+    );
+    let budgets = parallel_chunk_budgets(HARD_LIMIT_BYTES as u64, WORKERS)
+        .expect("fixed denial plan is representable");
+    let telemetry = AarmMemoryTelemetry {
+        governor: Some(governor_telemetry),
+        ..AarmMemoryTelemetry::default()
+    };
+    let after = process_memory();
+    CaseResult {
+        workload: "governed_parallel_deterministic_denial",
+        scale,
+        iterations: REPETITIONS as u64,
+        workers: Some(WORKERS as u64),
+        checksum: 2,
+        elapsed_micros,
+        telemetry,
+        parallel_plans: vec![AarmParallelPlanningTelemetry {
+            operation: "Parallel.For",
+            initial_governor_capacity_bytes: 0,
+            available_headroom_bytes: HARD_LIMIT_BYTES as u64,
+            chunk_budgets_bytes: budgets,
+        }],
+        rss_before_bytes: before.rss_bytes,
+        rss_at_peak_bytes: after.rss_bytes,
         rss_after_bytes: after.rss_bytes,
         process_peak_rss_bytes: after.peak_rss_bytes,
     }
@@ -779,6 +1030,38 @@ fn json_governor(governor: Option<MemoryGovernorTelemetry>) -> String {
     )
 }
 
+fn json_parallel_plans(plans: &[AarmParallelPlanningTelemetry]) -> String {
+    let mut output = String::from("[");
+    for (index, plan) in plans.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        let budgets = plan
+            .chunk_budgets_bytes
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        write!(
+            output,
+            "{{\"operation\":\"{}\",\"initial_governor_capacity_bytes\":{},\
+             \"available_headroom_bytes\":{},\"chunk_count\":{},\
+             \"min_chunk_budget_bytes\":{},\"max_chunk_budget_bytes\":{},\
+             \"chunk_budgets_bytes\":[{}]}}",
+            plan.operation,
+            plan.initial_governor_capacity_bytes,
+            plan.available_headroom_bytes,
+            plan.chunk_budgets_bytes.len(),
+            json_option(plan.chunk_budgets_bytes.iter().min().copied()),
+            json_option(plan.chunk_budgets_bytes.iter().max().copied()),
+            budgets,
+        )
+        .expect("writing into a String cannot fail");
+    }
+    output.push(']');
+    output
+}
+
 fn json_case(result: &CaseResult) -> String {
     let workers = result
         .workers
@@ -787,6 +1070,7 @@ fn json_case(result: &CaseResult) -> String {
         "{{\"workload\":\"{}\",\"scale\":\"{}\",\"iterations\":{},\"workers\":{},\
          \"checksum\":{},\"elapsed_micros\":{},\"requested_bytes\":{},\
          \"temporary\":{},\"persistent\":{},\"total\":{},\"governor\":{},\
+         \"parallel_plans\":{},\
          \"process_rss_bytes\":{{\"before\":{},\"at_peak\":{},\"after\":{},\
          \"process_peak\":{}}}}}",
         result.workload,
@@ -800,6 +1084,7 @@ fn json_case(result: &CaseResult) -> String {
         json_region(result.telemetry.persistent),
         json_region(result.telemetry.total),
         json_governor(result.telemetry.governor),
+        json_parallel_plans(&result.parallel_plans),
         json_option(result.rss_before_bytes),
         json_option(result.rss_at_peak_bytes),
         json_option(result.rss_after_bytes),
@@ -809,7 +1094,7 @@ fn json_case(result: &CaseResult) -> String {
 
 #[must_use]
 pub fn serialize_results(results: &[CaseResult]) -> String {
-    let mut output = String::from("{\"schema_version\":2,\"results\":[");
+    let mut output = String::from("{\"schema_version\":3,\"results\":[");
     for (index, result) in results.iter().enumerate() {
         if index != 0 {
             output.push(',');
@@ -875,10 +1160,22 @@ fn main() {
                 )
             },
         );
+        let planning = result.parallel_plans.first().map_or_else(
+            || "none".to_string(),
+            |plan| {
+                format!(
+                    "headroom={} chunks={} min={} max={}",
+                    plan.available_headroom_bytes,
+                    plan.chunk_budgets_bytes.len(),
+                    plan.chunk_budgets_bytes.iter().min().copied().unwrap_or(0),
+                    plan.chunk_budgets_bytes.iter().max().copied().unwrap_or(0),
+                )
+            },
+        );
         println!(
             "workload={label:<36} scale={:<6} elapsed_ms={:>5}.{:03} requested={:>10} \
              final_used={:>10} peak_used={:>10} capacity={:>10} fast={:>8} slow={:>8} \
-             reuse={:>5} rewinds={:>5} governor={governor} rss_peak={}",
+             reuse={:>5} rewinds={:>5} governor={governor} plan={planning} rss_peak={}",
             result.scale.as_str(),
             result.elapsed_micros / 1000,
             result.elapsed_micros % 1000,

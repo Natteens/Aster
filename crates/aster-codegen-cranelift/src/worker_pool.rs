@@ -34,6 +34,8 @@ pub(super) enum TaskOutcome {
 #[derive(Debug)]
 pub(super) struct ChunkOutcome {
     pub(super) first_error: Option<(i64, BackendError)>,
+    #[cfg(feature = "aarm-telemetry")]
+    pub(super) telemetry: Option<aster_runtime::AarmMemoryTelemetry>,
 }
 
 /// The result of one `Parallel.Reduce` accumulation chunk: the chunk's owned
@@ -41,6 +43,8 @@ pub(super) struct ChunkOutcome {
 #[derive(Debug)]
 pub(super) struct ReduceChunkOutcome {
     pub(super) result: Result<ExecutionValue, (i64, BackendError)>,
+    #[cfg(feature = "aarm-telemetry")]
+    pub(super) telemetry: Option<aster_runtime::AarmMemoryTelemetry>,
 }
 
 /// The result of one `Parallel.Reduce` combine step: the combined scalar, or
@@ -49,6 +53,16 @@ pub(super) struct ReduceChunkOutcome {
 #[derive(Debug)]
 pub(super) struct CombineOutcome {
     pub(super) result: Result<ExecutionValue, BackendError>,
+    #[cfg(feature = "aarm-telemetry")]
+    pub(super) telemetry: Option<aster_runtime::AarmMemoryTelemetry>,
+}
+
+/// A deterministic retained-capacity entitlement carried by one logical
+/// Parallel chunk. It is not charged until that chunk creates real pages.
+#[derive(Clone)]
+pub(super) struct ParallelMemoryBudget {
+    pub(super) governor: Arc<aster_runtime::MemoryGovernor>,
+    pub(super) local_limit_bytes: usize,
 }
 
 /// What one job asks a worker to do. Every variant resolves a MIR function by
@@ -64,6 +78,7 @@ pub(super) enum JobKind {
         symbol: mir::SymbolId,
         start: i32,
         end: i32,
+        memory_budget: Option<ParallelMemoryBudget>,
     },
     /// `Body(T)` over host-owned scalar copies, whose first element is the
     /// original array position `base`.
@@ -72,6 +87,7 @@ pub(super) enum JobKind {
         base: usize,
         values: Arc<Vec<ExecutionValue>>,
         range: std::ops::Range<usize>,
+        memory_budget: Option<ParallelMemoryBudget>,
     },
     /// `Accumulate(identity, values[i])` folded sequentially over one
     /// `Parallel.Reduce` chunk of host-owned scalar copies, whose first
@@ -83,6 +99,7 @@ pub(super) enum JobKind {
         identity: ExecutionValue,
         values: Arc<Vec<ExecutionValue>>,
         range: std::ops::Range<usize>,
+        memory_budget: Option<ParallelMemoryBudget>,
     },
     /// One `Combine(left, right)` call submitted to the pool during a
     /// `Parallel.Reduce`'s sequential combination phase, so the host thread
@@ -93,6 +110,7 @@ pub(super) enum JobKind {
         symbol: mir::SymbolId,
         left: ExecutionValue,
         right: ExecutionValue,
+        memory_budget: Option<ParallelMemoryBudget>,
     },
     /// Test-only host panic injection used to verify pool-wide failure cleanup.
     #[cfg(test)]
@@ -198,6 +216,89 @@ impl JobQueue {
     }
 }
 
+fn run_job(program: &PreparedProgram, kind: JobKind, respond: Respond) {
+    match (kind, respond) {
+        (
+            JobKind::Task {
+                symbol,
+                collect_stats,
+            },
+            Respond::Task(reply),
+        ) => {
+            let outcome = match program.invoke(symbol, collect_stats, None, None, None) {
+                Ok((value, stats)) => TaskOutcome::Completed(value, stats),
+                Err(error) => TaskOutcome::Failed(error),
+            };
+            let _ = reply.send(outcome);
+        }
+        (
+            JobKind::ForChunk {
+                symbol,
+                start,
+                end,
+                memory_budget,
+            },
+            Respond::Chunk(reply),
+        ) => {
+            let _ = reply.send(program.run_for_chunk(symbol, start, end, memory_budget.as_ref()));
+        }
+        (
+            JobKind::ForEachChunk {
+                symbol,
+                base,
+                values,
+                range,
+                memory_budget,
+            },
+            Respond::Chunk(reply),
+        ) => {
+            let _ = reply.send(program.run_for_each_chunk(
+                symbol,
+                base,
+                &values[range],
+                memory_budget.as_ref(),
+            ));
+        }
+        (
+            JobKind::ReduceChunk {
+                symbol,
+                base,
+                identity,
+                values,
+                range,
+                memory_budget,
+            },
+            Respond::Reduce(reply),
+        ) => {
+            let _ = reply.send(program.run_reduce_chunk(
+                symbol,
+                base,
+                &identity,
+                &values[range],
+                memory_budget.as_ref(),
+            ));
+        }
+        (
+            JobKind::CombineStep {
+                symbol,
+                left,
+                right,
+                memory_budget,
+            },
+            Respond::Combine(reply),
+        ) => {
+            let _ =
+                reply.send(program.run_combine_step(symbol, &left, &right, memory_budget.as_ref()));
+        }
+        #[cfg(test)]
+        (JobKind::Panic(barrier), Respond::Task(_reply)) => {
+            barrier.wait();
+            panic!("simulated worker panic");
+        }
+        _ => {}
+    }
+}
+
 /// Build this worker's `PreparedProgram` and report the outcome to the pool
 /// constructor over `ready` before ever touching the job queue. On failure
 /// the worker reports the cause and exits without entering the job loop.
@@ -229,67 +330,7 @@ fn worker_loop(
             respond,
             completion,
         } = job;
-        match (kind, respond) {
-            (
-                JobKind::Task {
-                    symbol,
-                    collect_stats,
-                },
-                Respond::Task(reply),
-            ) => {
-                let outcome = match program.invoke(symbol, collect_stats, None, None, None) {
-                    Ok((value, stats)) => TaskOutcome::Completed(value, stats),
-                    Err(error) => TaskOutcome::Failed(error),
-                };
-                // The receiver may already have been dropped; ignore that.
-                let _ = reply.send(outcome);
-            }
-            (JobKind::ForChunk { symbol, start, end }, Respond::Chunk(reply)) => {
-                let _ = reply.send(program.run_for_chunk(symbol, start, end));
-            }
-            (
-                JobKind::ForEachChunk {
-                    symbol,
-                    base,
-                    values,
-                    range,
-                },
-                Respond::Chunk(reply),
-            ) => {
-                let _ = reply.send(program.run_for_each_chunk(symbol, base, &values[range]));
-            }
-            (
-                JobKind::ReduceChunk {
-                    symbol,
-                    base,
-                    identity,
-                    values,
-                    range,
-                },
-                Respond::Reduce(reply),
-            ) => {
-                let _ =
-                    reply.send(program.run_reduce_chunk(symbol, base, &identity, &values[range]));
-            }
-            (
-                JobKind::CombineStep {
-                    symbol,
-                    left,
-                    right,
-                },
-                Respond::Combine(reply),
-            ) => {
-                let _ = reply.send(program.run_combine_step(symbol, &left, &right));
-            }
-            #[cfg(test)]
-            (JobKind::Panic(barrier), Respond::Task(_reply)) => {
-                barrier.wait();
-                panic!("simulated worker panic");
-            }
-            // A kind/reply mismatch is impossible: both are built together in
-            // `submit`/`submit_parallel`. Nothing to report if it ever occurs.
-            _ => {}
-        }
+        run_job(&program, kind, respond);
         // Signal the awaited async task's completion token last, so the host
         // pump wakes even if the reply above could not be delivered.
         if let Some((queue, token)) = completion {
@@ -629,6 +670,7 @@ mod tests {
     fn job_kind_carries_only_owned_send_data_no_arena_pointer_or_context() {
         fn assert_send<T: Send>() {}
         assert_send::<JobKind>();
+        assert_send::<ParallelMemoryBudget>();
         assert_send::<ChunkOutcome>();
         assert_send::<TaskOutcome>();
         assert_send::<Arc<Vec<ExecutionValue>>>();
@@ -1084,6 +1126,7 @@ mod tests {
             base: 0,
             values: Arc::clone(&values),
             range: 0..1,
+            memory_budget: None,
         };
         let JobKind::ForEachChunk {
             values: shared,

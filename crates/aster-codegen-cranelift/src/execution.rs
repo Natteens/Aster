@@ -89,6 +89,7 @@ impl PreparedProgram {
             task_runtime,
             console_backend,
             filesystem_backend,
+            None,
         )
         .map(|(value, stats, _)| (value, stats))
     }
@@ -99,11 +100,27 @@ impl PreparedProgram {
         symbol: mir::SymbolId,
         task_runtime: Option<*mut ()>,
     ) -> Result<(ExecutionValue, aster_runtime::AarmMemoryTelemetry), BackendError> {
-        self.invoke_observed(symbol, true, task_runtime, None, None)
+        self.invoke_observed(symbol, true, task_runtime, None, None, None)
             .map(|(value, _, telemetry)| {
                 (
                     value,
                     telemetry.expect("statistics mode enables AARM telemetry"),
+                )
+            })
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    pub(super) fn invoke_with_memory_governor(
+        &self,
+        symbol: mir::SymbolId,
+        task_runtime: Option<*mut ()>,
+        governor: Arc<aster_runtime::MemoryGovernor>,
+    ) -> Result<(ExecutionValue, aster_runtime::AarmMemoryTelemetry), BackendError> {
+        self.invoke_observed(symbol, true, task_runtime, None, None, Some(governor))
+            .map(|(value, _, telemetry)| {
+                (
+                    value,
+                    telemetry.expect("governed statistics mode enables AARM telemetry"),
                 )
             })
     }
@@ -115,6 +132,7 @@ impl PreparedProgram {
         task_runtime: Option<*mut ()>,
         console_backend: Option<Box<dyn aster_runtime::ConsoleBackend>>,
         filesystem_backend: Option<Box<dyn aster_runtime::FileSystemBackend>>,
+        governor: Option<Arc<aster_runtime::MemoryGovernor>>,
     ) -> Result<
         (
             ExecutionValue,
@@ -127,11 +145,16 @@ impl PreparedProgram {
             .entries
             .get(&symbol)
             .ok_or_else(|| BackendError::new(format!("symbol {symbol:?} was not prepared")))?;
-        let mut execution_context = if collect_stats {
-            aster_runtime::ExecutionContext::with_stats()
-        } else {
-            aster_runtime::ExecutionContext::new()
-        };
+        let mut execution_context = governor.map_or_else(
+            || {
+                if collect_stats {
+                    aster_runtime::ExecutionContext::with_stats()
+                } else {
+                    aster_runtime::ExecutionContext::new()
+                }
+            },
+            aster_runtime::ExecutionContext::with_memory_governor,
+        );
         if let Some(pointer) = task_runtime {
             execution_context.set_task_runtime(pointer);
         }
@@ -190,6 +213,7 @@ impl PreparedProgram {
         symbol: mir::SymbolId,
         start: i32,
         end: i32,
+        memory_budget: Option<&super::worker_pool::ParallelMemoryBudget>,
     ) -> super::worker_pool::ChunkOutcome {
         let Some((pointer, _)) = self.entries.get(&symbol) else {
             return chunk_error(i64::from(start), "Parallel body was not prepared");
@@ -199,14 +223,30 @@ impl PreparedProgram {
         #[allow(unsafe_code)]
         let body: extern "C" fn(*mut aster_runtime::ExecutionContext, i32) =
             unsafe { std::mem::transmute(*pointer) };
-        let mut context = aster_runtime::ExecutionContext::new();
+        let mut context = parallel_context(memory_budget);
         for index in start..end {
             body(&raw mut context, index);
             if let Some(error) = context.take_error() {
-                return chunk_error(i64::from(index), format!("Aster runtime error: {error}"));
+                let logical = i64::from(index);
+                return super::worker_pool::ChunkOutcome {
+                    first_error: Some((
+                        logical,
+                        BackendError::new(parallel_runtime_error(
+                            logical,
+                            &error,
+                            memory_budget.is_some(),
+                        )),
+                    )),
+                    #[cfg(feature = "aarm-telemetry")]
+                    telemetry: context.aarm_memory_telemetry(),
+                };
             }
         }
-        super::worker_pool::ChunkOutcome { first_error: None }
+        super::worker_pool::ChunkOutcome {
+            first_error: None,
+            #[cfg(feature = "aarm-telemetry")]
+            telemetry: context.aarm_memory_telemetry(),
+        }
     }
 
     /// Run `Parallel.ForEach`'s `Body(T)` over the host-owned scalar copies of
@@ -216,19 +256,36 @@ impl PreparedProgram {
         symbol: mir::SymbolId,
         base: usize,
         values: &[ExecutionValue],
+        memory_budget: Option<&super::worker_pool::ParallelMemoryBudget>,
     ) -> super::worker_pool::ChunkOutcome {
         let logical = |offset: usize| i64::try_from(base + offset).unwrap_or(i64::MAX);
         let Some((pointer, _)) = self.entries.get(&symbol) else {
             return chunk_error(logical(0), "Parallel body was not prepared");
         };
-        let mut context = aster_runtime::ExecutionContext::new();
+        let mut context = parallel_context(memory_budget);
         for (offset, value) in values.iter().enumerate() {
             invoke_body_scalar(*pointer, &mut context, value);
             if let Some(error) = context.take_error() {
-                return chunk_error(logical(offset), format!("Aster runtime error: {error}"));
+                let logical = logical(offset);
+                return super::worker_pool::ChunkOutcome {
+                    first_error: Some((
+                        logical,
+                        BackendError::new(parallel_runtime_error(
+                            logical,
+                            &error,
+                            memory_budget.is_some(),
+                        )),
+                    )),
+                    #[cfg(feature = "aarm-telemetry")]
+                    telemetry: context.aarm_memory_telemetry(),
+                };
             }
         }
-        super::worker_pool::ChunkOutcome { first_error: None }
+        super::worker_pool::ChunkOutcome {
+            first_error: None,
+            #[cfg(feature = "aarm-telemetry")]
+            telemetry: context.aarm_memory_telemetry(),
+        }
     }
 
     /// Run one `Parallel.Reduce` accumulation chunk: fold `Accumulate` over
@@ -242,6 +299,7 @@ impl PreparedProgram {
         base: usize,
         identity: &ExecutionValue,
         values: &[ExecutionValue],
+        memory_budget: Option<&super::worker_pool::ParallelMemoryBudget>,
     ) -> super::worker_pool::ReduceChunkOutcome {
         use super::worker_pool::ReduceChunkOutcome;
         let logical = |offset: usize| i64::try_from(base + offset).unwrap_or(i64::MAX);
@@ -251,9 +309,11 @@ impl PreparedProgram {
                     logical(0),
                     BackendError::new("Parallel.Reduce Accumulate was not prepared"),
                 )),
+                #[cfg(feature = "aarm-telemetry")]
+                telemetry: None,
             };
         };
-        let mut context = aster_runtime::ExecutionContext::new();
+        let mut context = parallel_context(memory_budget);
         let mut accumulator = identity.clone();
         for (offset, value) in values.iter().enumerate() {
             let next = match invoke_binary_scalar(*pointer, &mut context, &accumulator, value) {
@@ -261,21 +321,32 @@ impl PreparedProgram {
                 Err(error) => {
                     return ReduceChunkOutcome {
                         result: Err((logical(offset), error)),
+                        #[cfg(feature = "aarm-telemetry")]
+                        telemetry: context.aarm_memory_telemetry(),
                     };
                 }
             };
             if let Some(error) = context.take_error() {
+                let logical = logical(offset);
                 return ReduceChunkOutcome {
                     result: Err((
-                        logical(offset),
-                        BackendError::new(format!("Aster runtime error: {error}")),
+                        logical,
+                        BackendError::new(parallel_runtime_error(
+                            logical,
+                            &error,
+                            memory_budget.is_some(),
+                        )),
                     )),
+                    #[cfg(feature = "aarm-telemetry")]
+                    telemetry: context.aarm_memory_telemetry(),
                 };
             }
             accumulator = next;
         }
         ReduceChunkOutcome {
             result: Ok(accumulator),
+            #[cfg(feature = "aarm-telemetry")]
+            telemetry: context.aarm_memory_telemetry(),
         }
     }
 
@@ -287,6 +358,7 @@ impl PreparedProgram {
         symbol: mir::SymbolId,
         left: &ExecutionValue,
         right: &ExecutionValue,
+        memory_budget: Option<&super::worker_pool::ParallelMemoryBudget>,
     ) -> super::worker_pool::CombineOutcome {
         use super::worker_pool::CombineOutcome;
         let Some((pointer, _)) = self.entries.get(&symbol) else {
@@ -294,20 +366,45 @@ impl PreparedProgram {
                 result: Err(BackendError::new(
                     "Parallel.Reduce Combine was not prepared",
                 )),
+                #[cfg(feature = "aarm-telemetry")]
+                telemetry: None,
             };
         };
-        let mut context = aster_runtime::ExecutionContext::new();
+        let mut context = parallel_context(memory_budget);
         let result = match invoke_binary_scalar(*pointer, &mut context, left, right) {
             Ok(value) => value,
-            Err(error) => return CombineOutcome { result: Err(error) },
+            Err(error) => {
+                return CombineOutcome {
+                    result: Err(error),
+                    #[cfg(feature = "aarm-telemetry")]
+                    telemetry: context.aarm_memory_telemetry(),
+                };
+            }
         };
         if let Some(error) = context.take_error() {
             return CombineOutcome {
                 result: Err(BackendError::new(format!("Aster runtime error: {error}"))),
+                #[cfg(feature = "aarm-telemetry")]
+                telemetry: context.aarm_memory_telemetry(),
             };
         }
-        CombineOutcome { result: Ok(result) }
+        CombineOutcome {
+            result: Ok(result),
+            #[cfg(feature = "aarm-telemetry")]
+            telemetry: context.aarm_memory_telemetry(),
+        }
     }
+}
+
+fn parallel_context(
+    memory_budget: Option<&super::worker_pool::ParallelMemoryBudget>,
+) -> aster_runtime::ExecutionContext {
+    memory_budget.map_or_else(aster_runtime::ExecutionContext::new, |budget| {
+        aster_runtime::ExecutionContext::with_memory_budget(
+            Arc::clone(&budget.governor),
+            budget.local_limit_bytes,
+        )
+    })
 }
 
 fn jit_builder() -> Result<JITBuilder, BackendError> {
@@ -317,6 +414,16 @@ fn jit_builder() -> Result<JITBuilder, BackendError> {
 fn chunk_error(index: i64, message: impl Into<String>) -> super::worker_pool::ChunkOutcome {
     super::worker_pool::ChunkOutcome {
         first_error: Some((index, BackendError::new(message))),
+        #[cfg(feature = "aarm-telemetry")]
+        telemetry: None,
+    }
+}
+
+fn parallel_runtime_error(logical: i64, error: &str, governed: bool) -> String {
+    if governed {
+        format!("Parallel logical index {logical}: Aster runtime error: {error}")
+    } else {
+        format!("Aster runtime error: {error}")
     }
 }
 
@@ -625,6 +732,54 @@ pub(super) fn execute_resolved_with_aarm_telemetry(
         return prepared.invoke_with_aarm_telemetry(entry.symbol, None);
     }
     let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let mut runtime = TaskRuntime::new(&Arc::new(module.clone()), worker_count)?;
+    let pointer = std::ptr::from_mut(&mut runtime).cast::<()>();
+    prepared.invoke_with_aarm_telemetry(entry.symbol, Some(pointer))
+}
+
+#[cfg(feature = "aarm-telemetry")]
+pub(super) fn execute_resolved_with_aarm_parallel_governor(
+    module: &mir::Module,
+    entry: &mir::Function,
+    worker_count: usize,
+    governor: Arc<aster_runtime::MemoryGovernor>,
+) -> Result<
+    (
+        ExecutionValue,
+        aster_runtime::AarmMemoryTelemetry,
+        Vec<super::AarmParallelPlanningTelemetry>,
+        Vec<aster_runtime::AarmMemoryTelemetry>,
+    ),
+    BackendError,
+> {
+    let prepared = PreparedProgram::prepare(module)?;
+    if !module_uses_tasks(module) {
+        return prepared
+            .invoke_with_memory_governor(entry.symbol, None, governor)
+            .map(|(value, telemetry)| (value, telemetry, Vec::new(), Vec::new()));
+    }
+    let mut runtime = TaskRuntime::with_memory_governor(
+        &Arc::new(module.clone()),
+        worker_count,
+        Arc::clone(&governor),
+    )?;
+    let pointer = std::ptr::from_mut(&mut runtime).cast::<()>();
+    let outcome = prepared.invoke_with_memory_governor(entry.symbol, Some(pointer), governor);
+    let plans = runtime.parallel_plans().to_vec();
+    let snapshots = runtime.parallel_snapshots().to_vec();
+    outcome.map(|(value, telemetry)| (value, telemetry, plans, snapshots))
+}
+
+#[cfg(feature = "aarm-telemetry")]
+pub(super) fn execute_resolved_with_aarm_parallel_workers(
+    module: &mir::Module,
+    entry: &mir::Function,
+    worker_count: usize,
+) -> Result<(ExecutionValue, aster_runtime::AarmMemoryTelemetry), BackendError> {
+    let prepared = PreparedProgram::prepare(module)?;
+    if !module_uses_tasks(module) {
+        return prepared.invoke_with_aarm_telemetry(entry.symbol, None);
+    }
     let mut runtime = TaskRuntime::new(&Arc::new(module.clone()), worker_count)?;
     let pointer = std::ptr::from_mut(&mut runtime).cast::<()>();
     prepared.invoke_with_aarm_telemetry(entry.symbol, Some(pointer))

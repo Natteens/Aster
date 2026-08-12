@@ -32,10 +32,21 @@ use std::sync::Arc;
 use super::completion_queue::{CompletionQueue, CompletionToken};
 use super::execution::PreparedProgram;
 use super::worker_pool::{
-    ChunkOutcome, CombineOutcome, ExecutionPool, JobKind, ReduceChunkOutcome, TaskHandle,
+    ChunkOutcome, ExecutionPool, JobKind, ParallelMemoryBudget, ReduceChunkOutcome, TaskHandle,
     TaskOutcome,
 };
 use super::{BackendError, ExecutionValue, MemoryStats, mir, scalar};
+
+/// Host-side record of one deterministic governed Parallel budget plan.
+#[cfg(feature = "aarm-telemetry")]
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AarmParallelPlanningTelemetry {
+    pub operation: &'static str,
+    pub initial_governor_capacity_bytes: u64,
+    pub available_headroom_bytes: u64,
+    pub chunk_budgets_bytes: Vec<u64>,
+}
 
 /// Opaque, stable identity for one task within its owning [`TaskRuntime`].
 /// Never an arena pointer, never reused; generated code only ever holds the
@@ -98,6 +109,11 @@ pub(super) struct TaskRuntime {
     ready: VecDeque<TaskHandleId>,
     worker_count: usize,
     task_worker_count: usize,
+    parallel_governor: Option<Arc<aster_runtime::MemoryGovernor>>,
+    #[cfg(feature = "aarm-telemetry")]
+    parallel_plans: Vec<AarmParallelPlanningTelemetry>,
+    #[cfg(feature = "aarm-telemetry")]
+    parallel_snapshots: Vec<aster_runtime::AarmMemoryTelemetry>,
     next_id: u64,
     next_token: CompletionToken,
 }
@@ -130,6 +146,14 @@ impl TaskRuntime {
         module: &Arc<mir::Module>,
         worker_count: usize,
     ) -> Result<Self, BackendError> {
+        Self::with_parallel_governor(module, worker_count, None)
+    }
+
+    fn with_parallel_governor(
+        module: &Arc<mir::Module>,
+        worker_count: usize,
+        parallel_governor: Option<Arc<aster_runtime::MemoryGovernor>>,
+    ) -> Result<Self, BackendError> {
         let pool = ExecutionPool::new(Arc::clone(module), worker_count)?;
         let driver = module_uses_async(module)
             .then(|| PreparedProgram::prepare(module))
@@ -145,9 +169,33 @@ impl TaskRuntime {
             ready: VecDeque::new(),
             worker_count,
             task_worker_count,
+            parallel_governor,
+            #[cfg(feature = "aarm-telemetry")]
+            parallel_plans: Vec::new(),
+            #[cfg(feature = "aarm-telemetry")]
+            parallel_snapshots: Vec::new(),
             next_id: 0,
             next_token: 0,
         })
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    pub(super) fn with_memory_governor(
+        module: &Arc<mir::Module>,
+        worker_count: usize,
+        governor: Arc<aster_runtime::MemoryGovernor>,
+    ) -> Result<Self, BackendError> {
+        Self::with_parallel_governor(module, worker_count, Some(governor))
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    pub(super) fn parallel_plans(&self) -> &[AarmParallelPlanningTelemetry] {
+        &self.parallel_plans
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    pub(super) fn parallel_snapshots(&self) -> &[aster_runtime::AarmMemoryTelemetry] {
+        &self.parallel_snapshots
     }
 
     fn fresh_id(&mut self) -> Result<TaskHandleId, BackendError> {
@@ -611,11 +659,71 @@ impl TaskRuntime {
 
     // --- Parallel ---------------------------------------------------------
 
+    fn parallel_memory_budgets(
+        &mut self,
+        operation: &'static str,
+        chunk_count: usize,
+    ) -> Result<Vec<Option<ParallelMemoryBudget>>, BackendError> {
+        let Some(governor) = self.parallel_governor.as_ref().map(Arc::clone) else {
+            return Ok(vec![None; chunk_count]);
+        };
+        let snapshot = governor.telemetry();
+        let available_headroom_bytes = snapshot
+            .hard_limit_bytes
+            .checked_sub(snapshot.current_capacity_bytes)
+            .ok_or_else(|| BackendError::new("memory governor capacity exceeds its hard limit"))?;
+        let shares = parallel_chunk_budgets(available_headroom_bytes, chunk_count)?;
+        #[cfg(feature = "aarm-telemetry")]
+        self.parallel_plans.push(AarmParallelPlanningTelemetry {
+            operation,
+            initial_governor_capacity_bytes: snapshot.current_capacity_bytes,
+            available_headroom_bytes,
+            chunk_budgets_bytes: shares.clone(),
+        });
+        #[cfg(not(feature = "aarm-telemetry"))]
+        let _ = operation;
+        shares
+            .into_iter()
+            .map(|share| {
+                usize::try_from(share)
+                    .map(|local_limit_bytes| {
+                        Some(ParallelMemoryBudget {
+                            governor: Arc::clone(&governor),
+                            local_limit_bytes,
+                        })
+                    })
+                    .map_err(|_| {
+                        BackendError::new("Parallel memory budget exceeds the addressable range")
+                    })
+            })
+            .collect()
+    }
+
+    fn collect_parallel_chunks(
+        &mut self,
+        receivers: Vec<std::sync::mpsc::Receiver<ChunkOutcome>>,
+    ) -> Result<(), BackendError> {
+        let collected = collect_chunks_observed(receivers);
+        #[cfg(feature = "aarm-telemetry")]
+        self.parallel_snapshots.extend(collected.telemetry);
+        collected.result
+    }
+
+    fn collect_parallel_reduce_chunks(
+        &mut self,
+        receivers: Vec<std::sync::mpsc::Receiver<ReduceChunkOutcome>>,
+    ) -> Result<Vec<ExecutionValue>, BackendError> {
+        let collected = collect_reduce_chunks_observed(receivers);
+        #[cfg(feature = "aarm-telemetry")]
+        self.parallel_snapshots.extend(collected.telemetry);
+        collected.result
+    }
+
     /// `Parallel.For(start, end, Body)`: run `Body` over `[start, end)` in
     /// contiguous, worker-balanced chunks, block until all finish, and
     /// propagate the failure with the smallest logical index, if any.
     pub(super) fn parallel_for(
-        &self,
+        &mut self,
         start: i32,
         end: i32,
         body: mir::SymbolId,
@@ -633,10 +741,11 @@ impl TaskRuntime {
             return Ok(());
         }
         let boundaries = chunk_boundaries(total, self.worker_count);
+        let budgets = self.parallel_memory_budgets("Parallel.For", boundaries.len())?;
         self.pool.ensure_workers(boundaries.len())?;
         let mut receivers = Vec::with_capacity(boundaries.len());
         let mut cursor = i64::from(start);
-        for length in boundaries {
+        for (length, memory_budget) in boundaries.into_iter().zip(budgets) {
             let chunk_start = i32::try_from(cursor)
                 .map_err(|_| BackendError::new("Parallel.For chunk start exceeds `int`"))?;
             cursor =
@@ -651,22 +760,23 @@ impl TaskRuntime {
                 symbol: body,
                 start: chunk_start,
                 end: chunk_end,
+                memory_budget,
             });
             match submission {
                 Ok(receiver) => receivers.push(receiver),
                 Err(error) => {
-                    let _ = collect_chunks(receivers);
+                    let _ = self.collect_parallel_chunks(receivers);
                     return Err(error);
                 }
             }
         }
-        collect_chunks(receivers)
+        self.collect_parallel_chunks(receivers)
     }
 
     /// `Parallel.ForEach(values, Body)`: `values` are already the host-owned
     /// scalar copies (see `async_abi`); no array pointer ever reaches a worker.
     pub(super) fn parallel_for_each(
-        &self,
+        &mut self,
         values: Vec<ExecutionValue>,
         body: mir::SymbolId,
     ) -> Result<(), BackendError> {
@@ -674,28 +784,30 @@ impl TaskRuntime {
             return Ok(());
         }
         let boundaries = chunk_boundaries(values.len(), self.worker_count);
+        let budgets = self.parallel_memory_budgets("Parallel.ForEach", boundaries.len())?;
         self.pool.ensure_workers(boundaries.len())?;
         let mut receivers = Vec::with_capacity(boundaries.len());
         let values = Arc::new(values);
         let mut base = 0;
-        for length in boundaries {
+        for (length, memory_budget) in boundaries.into_iter().zip(budgets) {
             let range = base..base + length;
             let submission = self.pool.submit_parallel(JobKind::ForEachChunk {
                 symbol: body,
                 base,
                 values: Arc::clone(&values),
                 range,
+                memory_budget,
             });
             match submission {
                 Ok(receiver) => receivers.push(receiver),
                 Err(error) => {
-                    let _ = collect_chunks(receivers);
+                    let _ = self.collect_parallel_chunks(receivers);
                     return Err(error);
                 }
             }
             base += length;
         }
-        collect_chunks(receivers)
+        self.collect_parallel_chunks(receivers)
     }
 
     /// `Parallel.Reduce(values, identity, Accumulate, Combine)`: `values` are
@@ -705,7 +817,7 @@ impl TaskRuntime {
     /// collected in chunk-index order (never completion order) and folded
     /// left to right with `Combine`.
     pub(super) fn parallel_reduce(
-        &self,
+        &mut self,
         values: Vec<ExecutionValue>,
         identity: ExecutionValue,
         accumulate: mir::SymbolId,
@@ -715,11 +827,13 @@ impl TaskRuntime {
             return Ok(identity);
         }
         let boundaries = chunk_boundaries(values.len(), self.worker_count);
+        let budgets =
+            self.parallel_memory_budgets("Parallel.Reduce accumulate", boundaries.len())?;
         self.pool.ensure_workers(boundaries.len())?;
         let mut receivers = Vec::with_capacity(boundaries.len());
         let values = Arc::new(values);
         let mut base = 0;
-        for length in boundaries {
+        for (length, memory_budget) in boundaries.into_iter().zip(budgets) {
             let range = base..base + length;
             let submission = self.pool.submit_reduce_chunk(JobKind::ReduceChunk {
                 symbol: accumulate,
@@ -727,17 +841,18 @@ impl TaskRuntime {
                 identity: identity.clone(),
                 values: Arc::clone(&values),
                 range,
+                memory_budget,
             });
             match submission {
                 Ok(receiver) => receivers.push(receiver),
                 Err(error) => {
-                    let _ = collect_reduce_chunks(receivers);
+                    let _ = self.collect_parallel_reduce_chunks(receivers);
                     return Err(error);
                 }
             }
             base += length;
         }
-        let partials = collect_reduce_chunks(receivers)?;
+        let partials = self.collect_parallel_reduce_chunks(receivers)?;
         self.combine_partials(combine, partials)
     }
 
@@ -749,7 +864,7 @@ impl TaskRuntime {
     /// the reduction: every `Combine` call runs on a pool worker, exactly
     /// like an accumulation chunk.
     fn combine_partials(
-        &self,
+        &mut self,
         combine: mir::SymbolId,
         mut partials: Vec<ExecutionValue>,
     ) -> Result<ExecutionValue, BackendError> {
@@ -759,15 +874,24 @@ impl TaskRuntime {
         // once `values` was non-empty.
         let mut accumulator = partials.remove(0);
         for right in partials {
+            let memory_budget = self
+                .parallel_memory_budgets("Parallel.Reduce combine", 1)?
+                .pop()
+                .expect("one combine budget was planned");
             let receiver = self.pool.submit_combine_step(JobKind::CombineStep {
                 symbol: combine,
                 left: accumulator.clone(),
                 right,
+                memory_budget,
             })?;
-            let CombineOutcome { result } = receiver.recv().map_err(|_| {
+            let outcome = receiver.recv().map_err(|_| {
                 BackendError::new("a Parallel.Reduce combine worker disconnected before finishing")
             })?;
-            accumulator = result?;
+            #[cfg(feature = "aarm-telemetry")]
+            if let Some(telemetry) = outcome.telemetry {
+                self.parallel_snapshots.push(telemetry);
+            }
+            accumulator = outcome.result?;
         }
         Ok(accumulator)
     }
@@ -780,6 +904,49 @@ impl Drop for TaskRuntime {
         // task entry drop with `self`, releasing all host-side frames.
         self.completion.close();
     }
+}
+
+/// Split fixed available governed headroom by logical chunk index. When not
+/// every chunk can receive one minimum arena page, earlier chunks receive
+/// whole-page entitlement first and the next chunk receives the sub-page
+/// tail. Once every chunk has one page, surplus bytes are split evenly and
+/// earlier chunks receive one extra byte until the remainder is exhausted.
+#[doc(hidden)]
+pub fn parallel_chunk_budgets(
+    available_headroom_bytes: u64,
+    chunk_count: usize,
+) -> Result<Vec<u64>, BackendError> {
+    if chunk_count == 0 {
+        return Ok(Vec::new());
+    }
+    let chunks = u64::try_from(chunk_count)
+        .map_err(|_| BackendError::new("Parallel chunk count exceeds the addressable range"))?;
+    let minimum_page = u64::try_from(aster_runtime::ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES)
+        .expect("minimum arena page capacity fits u64");
+    let page_winners = (available_headroom_bytes / minimum_page).min(chunks);
+    let guaranteed_bytes = page_winners
+        .checked_mul(minimum_page)
+        .expect("page winners are bounded by available headroom");
+    let remaining = available_headroom_bytes - guaranteed_bytes;
+    let winner_count =
+        usize::try_from(page_winners).expect("page winner count is bounded by the chunk count");
+    let mut budgets = Vec::new();
+    budgets
+        .try_reserve_exact(chunk_count)
+        .map_err(|_| BackendError::new("Parallel memory plan exceeds host limits"))?;
+    budgets.resize(chunk_count, 0);
+    budgets[..winner_count].fill(minimum_page);
+    if winner_count < chunk_count {
+        budgets[winner_count] = remaining;
+    } else {
+        let base = remaining / chunks;
+        let remainder = remaining % chunks;
+        for (index, budget) in budgets.iter_mut().enumerate() {
+            *budget +=
+                base + u64::from(u64::try_from(index).expect("chunk index fits u64") < remainder);
+        }
+    }
+    Ok(budgets)
 }
 
 /// Split `total` iterations into at most `worker_count` contiguous, balanced
@@ -799,16 +966,35 @@ fn chunk_boundaries(total: usize, worker_count: usize) -> Vec<usize> {
 
 /// Wait for every accepted chunk and propagate the failure with the smallest
 /// logical index, independent of completion order.
+#[cfg(test)]
 fn collect_chunks(
     receivers: Vec<std::sync::mpsc::Receiver<ChunkOutcome>>,
 ) -> Result<(), BackendError> {
+    collect_chunks_observed(receivers).result
+}
+
+struct CollectedChunks {
+    result: Result<(), BackendError>,
+    #[cfg(feature = "aarm-telemetry")]
+    telemetry: Vec<aster_runtime::AarmMemoryTelemetry>,
+}
+
+fn collect_chunks_observed(
+    receivers: Vec<std::sync::mpsc::Receiver<ChunkOutcome>>,
+) -> CollectedChunks {
     let mut first_error: Option<(i64, BackendError)> = None;
     let mut disconnected = false;
+    #[cfg(feature = "aarm-telemetry")]
+    let mut telemetry = Vec::with_capacity(receivers.len());
     for receiver in receivers {
         let Ok(outcome) = receiver.recv() else {
             disconnected = true;
             continue;
         };
+        #[cfg(feature = "aarm-telemetry")]
+        if let Some(snapshot) = outcome.telemetry {
+            telemetry.push(snapshot);
+        }
         if let Some((index, error)) = outcome.first_error {
             if first_error
                 .as_ref()
@@ -818,12 +1004,17 @@ fn collect_chunks(
             }
         }
     }
-    match first_error {
+    let result = match first_error {
         Some((_, error)) => Err(error),
         None if disconnected => Err(BackendError::new(
             "a Parallel worker disconnected before finishing",
         )),
         None => Ok(()),
+    };
+    CollectedChunks {
+        result,
+        #[cfg(feature = "aarm-telemetry")]
+        telemetry,
     }
 }
 
@@ -831,17 +1022,36 @@ fn collect_chunks(
 /// regardless of an earlier failure) and either propagate the failure with
 /// the smallest logical array position, independent of completion order, or
 /// return every chunk's owned partial result in chunk-index order.
+#[cfg(test)]
 fn collect_reduce_chunks(
     receivers: Vec<std::sync::mpsc::Receiver<ReduceChunkOutcome>>,
 ) -> Result<Vec<ExecutionValue>, BackendError> {
+    collect_reduce_chunks_observed(receivers).result
+}
+
+struct CollectedReduceChunks {
+    result: Result<Vec<ExecutionValue>, BackendError>,
+    #[cfg(feature = "aarm-telemetry")]
+    telemetry: Vec<aster_runtime::AarmMemoryTelemetry>,
+}
+
+fn collect_reduce_chunks_observed(
+    receivers: Vec<std::sync::mpsc::Receiver<ReduceChunkOutcome>>,
+) -> CollectedReduceChunks {
     let mut first_error: Option<(i64, BackendError)> = None;
     let mut partials = Vec::with_capacity(receivers.len());
     let mut disconnected = false;
+    #[cfg(feature = "aarm-telemetry")]
+    let mut telemetry = Vec::with_capacity(receivers.len());
     for receiver in receivers {
         let Ok(outcome) = receiver.recv() else {
             disconnected = true;
             continue;
         };
+        #[cfg(feature = "aarm-telemetry")]
+        if let Some(snapshot) = outcome.telemetry {
+            telemetry.push(snapshot);
+        }
         match outcome.result {
             Ok(value) => partials.push(value),
             Err((index, error)) => {
@@ -854,12 +1064,17 @@ fn collect_reduce_chunks(
             }
         }
     }
-    match first_error {
+    let result = match first_error {
         Some((_, error)) => Err(error),
         None if disconnected => Err(BackendError::new(
             "a Parallel.Reduce worker disconnected before finishing",
         )),
         None => Ok(partials),
+    };
+    CollectedReduceChunks {
+        result,
+        #[cfg(feature = "aarm-telemetry")]
+        telemetry,
     }
 }
 
@@ -1014,6 +1229,57 @@ mod tests {
         assert_eq!(chunk_boundaries(10, 4), vec![3, 3, 2, 2]);
         assert_eq!(chunk_boundaries(3, 8), vec![1, 1, 1]);
         assert_eq!(chunk_boundaries(1000, 1).iter().sum::<usize>(), 1000);
+    }
+
+    #[test]
+    fn parallel_memory_partitions_are_page_aware_and_exact() {
+        let page = u64::try_from(aster_runtime::ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES)
+            .expect("minimum page capacity fits u64");
+        assert_eq!(parallel_chunk_budgets(0, 0).unwrap(), Vec::<u64>::new());
+        assert_eq!(parallel_chunk_budgets(0, 4).unwrap(), [0, 0, 0, 0]);
+        assert_eq!(parallel_chunk_budgets(10, 1).unwrap(), [10]);
+        assert_eq!(
+            parallel_chunk_budgets(page - 1, 3).unwrap(),
+            [page - 1, 0, 0]
+        );
+        assert_eq!(parallel_chunk_budgets(page, 3).unwrap(), [page, 0, 0]);
+        assert_eq!(parallel_chunk_budgets(page + 1, 3).unwrap(), [page, 1, 0]);
+        assert_eq!(
+            parallel_chunk_budgets(2 * page - 1, 3).unwrap(),
+            [page, page - 1, 0]
+        );
+        assert_eq!(
+            parallel_chunk_budgets(2 * page, 3).unwrap(),
+            [page, page, 0]
+        );
+        assert_eq!(
+            parallel_chunk_budgets(3 * page - 1, 3).unwrap(),
+            [page, page, page - 1]
+        );
+        assert_eq!(
+            parallel_chunk_budgets(3 * page, 3).unwrap(),
+            [page, page, page]
+        );
+        assert_eq!(
+            parallel_chunk_budgets(3 * page + 2, 3).unwrap(),
+            [page + 1, page + 1, page]
+        );
+        assert_eq!(
+            parallel_chunk_budgets(5 * page / 2, 3).unwrap(),
+            [page, page, page / 2]
+        );
+    }
+
+    #[test]
+    fn parallel_memory_partitions_preserve_large_headroom_exactly() {
+        let first = parallel_chunk_budgets(u64::MAX, 3).expect("boundary plan succeeds");
+        let second = parallel_chunk_budgets(u64::MAX, 3).expect("same plan succeeds again");
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 3);
+        assert_eq!(
+            first.iter().map(|share| u128::from(*share)).sum::<u128>(),
+            u128::from(u64::MAX)
+        );
     }
 
     #[test]
@@ -1302,6 +1568,8 @@ mod tests {
         logical_tx
             .send(ChunkOutcome {
                 first_error: Some((7, BackendError::new("later logical failure"))),
+                #[cfg(feature = "aarm-telemetry")]
+                telemetry: None,
             })
             .expect("logical outcome is queued");
 
@@ -1342,7 +1610,7 @@ mod tests {
         for worker_count in [1, 2, 6] {
             let module = compile(source);
             let body = symbol(&module, "Body");
-            let runtime = TaskRuntime::new(&Arc::new(module), worker_count)
+            let mut runtime = TaskRuntime::new(&Arc::new(module), worker_count)
                 .expect("runtime starts with the requested worker count");
             let error = runtime
                 .parallel_for(0, 16, body)
@@ -1360,7 +1628,7 @@ mod tests {
         for worker_count in [1, 2, 6] {
             let module = compile(source);
             let body = symbol(&module, "Body");
-            let runtime = TaskRuntime::new(&Arc::new(module), worker_count)
+            let mut runtime = TaskRuntime::new(&Arc::new(module), worker_count)
                 .expect("runtime starts with the requested worker count");
             runtime
                 .parallel_for(0, 500, body)
@@ -1379,7 +1647,7 @@ mod tests {
         for worker_count in [1, 2, 6] {
             let module = compile(source);
             let body = symbol(&module, "Body");
-            let runtime = TaskRuntime::new(&Arc::new(module), worker_count)
+            let mut runtime = TaskRuntime::new(&Arc::new(module), worker_count)
                 .expect("runtime starts with the requested worker count");
             let error = runtime
                 .parallel_for_each(values.clone(), body)
@@ -1396,11 +1664,112 @@ mod tests {
         let for_source = "public void Body(int index) { }";
         let module = Arc::new(compile(for_source));
         let body = symbol(&module, "Body");
-        let runtime = TaskRuntime::new(&module, 4).expect("runtime starts");
+        let mut runtime = TaskRuntime::new(&module, 4).expect("runtime starts");
         for repetition in 0..10 {
             runtime
                 .parallel_for(0, 300, body)
                 .unwrap_or_else(|error| panic!("repetition {repetition}: {error}"));
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "aarm-telemetry")]
+    fn governed_parallel_for_is_scheduler_independent_under_memory_pressure() {
+        const HARD_LIMIT: usize = 64 * 1024;
+        let source = "public void Body(int index) { \
+             int size = index == 2 || index == 5 || index == 9 ? 20000 : 1; \
+             int[] scratch = new int[size]; \
+         }";
+        for worker_count in [1, 2, 4, 16] {
+            let module = Arc::new(compile(source));
+            let body = symbol(&module, "Body");
+            let governor = Arc::new(aster_runtime::MemoryGovernor::new(HARD_LIMIT));
+            let mut runtime =
+                TaskRuntime::with_memory_governor(&module, worker_count, Arc::clone(&governor))
+                    .expect("governed runtime starts");
+            let mut expected_error = None;
+            for repetition in 0..20 {
+                let error = runtime
+                    .parallel_for(0, 16, body)
+                    .expect_err("logical index 2 exceeds every fixed chunk ceiling");
+                assert!(
+                    error.message().contains("Parallel logical index 2"),
+                    "worker_count {worker_count}, repetition {repetition}: {error}"
+                );
+                assert_eq!(
+                    expected_error.get_or_insert_with(|| error.message().to_owned()),
+                    error.message(),
+                    "worker_count {worker_count}: diagnostic changed between repetitions"
+                );
+                let telemetry = governor.telemetry();
+                assert_eq!(telemetry.current_capacity_bytes, 0);
+                assert!(telemetry.peak_capacity_bytes <= telemetry.hard_limit_bytes);
+                assert_eq!(telemetry.grant_events, telemetry.release_events);
+                assert_eq!(
+                    telemetry.granted_bytes_cumulative,
+                    telemetry.released_bytes_cumulative
+                );
+            }
+            for plan in runtime.parallel_plans() {
+                assert_eq!(
+                    plan.chunk_budgets_bytes.iter().sum::<u64>(),
+                    plan.available_headroom_bytes
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "aarm-telemetry")]
+    fn governed_for_each_and_reduce_keep_the_same_logical_failure() {
+        const HARD_LIMIT: usize = 16 * 1024;
+        let module = Arc::new(compile(
+            "public void Each(int value) { int size = value == 2 || value == 5 ? 20000 : 1; int[] scratch = new int[size]; } \
+             public int Accumulate(int total, int value) { int size = value == 2 || value == 5 ? 20000 : 1; int[] scratch = new int[size]; return total + value; } \
+             public int Combine(int left, int right) { return left + right; }",
+        ));
+        let each = symbol(&module, "Each");
+        let accumulate = symbol(&module, "Accumulate");
+        let combine = symbol(&module, "Combine");
+        let values = (0..8).map(ExecutionValue::Int).collect::<Vec<_>>();
+
+        for reduce in [false, true] {
+            let governor = Arc::new(aster_runtime::MemoryGovernor::new(HARD_LIMIT));
+            let mut runtime = TaskRuntime::with_memory_governor(&module, 4, Arc::clone(&governor))
+                .expect("governed runtime starts");
+            let mut expected_error = None;
+            for repetition in 0..20 {
+                let error = if reduce {
+                    runtime
+                        .parallel_reduce(
+                            values.clone(),
+                            ExecutionValue::Int(0),
+                            accumulate,
+                            combine,
+                        )
+                        .expect_err("Reduce position 2 exceeds its fixed ceiling")
+                } else {
+                    runtime
+                        .parallel_for_each(values.clone(), each)
+                        .expect_err("ForEach position 2 exceeds its fixed ceiling")
+                };
+                assert!(
+                    error.message().contains("Parallel logical index 2"),
+                    "repetition {repetition}: {error}"
+                );
+                assert_eq!(
+                    expected_error.get_or_insert_with(|| error.message().to_owned()),
+                    error.message()
+                );
+                assert_eq!(governor.telemetry().current_capacity_bytes, 0);
+            }
+            let telemetry = governor.telemetry();
+            assert!(telemetry.peak_capacity_bytes <= telemetry.hard_limit_bytes);
+            assert_eq!(telemetry.grant_events, telemetry.release_events);
+            assert_eq!(
+                telemetry.granted_bytes_cumulative,
+                telemetry.released_bytes_cumulative
+            );
         }
     }
 
@@ -1423,14 +1792,20 @@ mod tests {
         let (tx2, rx2) = mpsc::channel();
         tx2.send(ReduceChunkOutcome {
             result: Ok(ExecutionValue::Int(3)),
+            #[cfg(feature = "aarm-telemetry")]
+            telemetry: None,
         })
         .expect("chunk 2 sends first");
         tx0.send(ReduceChunkOutcome {
             result: Ok(ExecutionValue::Int(1)),
+            #[cfg(feature = "aarm-telemetry")]
+            telemetry: None,
         })
         .expect("chunk 0 sends second");
         tx1.send(ReduceChunkOutcome {
             result: Ok(ExecutionValue::Int(2)),
+            #[cfg(feature = "aarm-telemetry")]
+            telemetry: None,
         })
         .expect("chunk 1 sends last");
 
@@ -1454,10 +1829,14 @@ mod tests {
         // The chunk covering the *later* logical position reports first.
         tx1.send(ReduceChunkOutcome {
             result: Err((5, BackendError::new("late position failure"))),
+            #[cfg(feature = "aarm-telemetry")]
+            telemetry: None,
         })
         .expect("chunk 1 sends first");
         tx0.send(ReduceChunkOutcome {
             result: Err((2, BackendError::new("early position failure"))),
+            #[cfg(feature = "aarm-telemetry")]
+            telemetry: None,
         })
         .expect("chunk 0 sends second");
 
@@ -1476,6 +1855,8 @@ mod tests {
         logical_tx
             .send(ReduceChunkOutcome {
                 result: Err((7, BackendError::new("later logical failure"))),
+                #[cfg(feature = "aarm-telemetry")]
+                telemetry: None,
             })
             .expect("logical outcome is queued");
 
@@ -1492,7 +1873,7 @@ mod tests {
             let module = compile(REDUCE_SOURCE);
             let accumulate = symbol(&module, "AddValue");
             let combine = symbol(&module, "AddPartial");
-            let runtime = TaskRuntime::new(&Arc::new(module), worker_count)
+            let mut runtime = TaskRuntime::new(&Arc::new(module), worker_count)
                 .expect("runtime starts with the requested worker count");
             let result = runtime
                 .parallel_reduce(values.clone(), ExecutionValue::Int(0), accumulate, combine)
@@ -1509,7 +1890,7 @@ mod tests {
         let module = compile(REDUCE_SOURCE);
         let accumulate = symbol(&module, "AddValue");
         let combine = symbol(&module, "AddPartial");
-        let runtime = TaskRuntime::new(&Arc::new(module), 4).expect("runtime starts");
+        let mut runtime = TaskRuntime::new(&Arc::new(module), 4).expect("runtime starts");
         let result = runtime
             .parallel_reduce(Vec::new(), ExecutionValue::Int(99), accumulate, combine)
             .expect("an empty array never fails");
@@ -1530,7 +1911,7 @@ mod tests {
         );
         let accumulate = symbol(&module, "AddValue");
         let combine = symbol(&module, "Weighted");
-        let runtime = TaskRuntime::new(&Arc::new(module), 4).expect("runtime starts");
+        let mut runtime = TaskRuntime::new(&Arc::new(module), 4).expect("runtime starts");
         let values = vec![
             ExecutionValue::Int(1),
             ExecutionValue::Int(2),
@@ -1544,11 +1925,50 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "aarm-telemetry")]
+    fn governed_reduce_combine_reuses_released_headroom_sequentially() {
+        const HARD_LIMIT: usize = 64 * 1024;
+        let module = Arc::new(compile(
+            "public int AddValue(int total, int value) { return total + value; } \
+             public int AddPartial(int left, int right) { int[] scratch = new int[1]; return left + right; }",
+        ));
+        let accumulate = symbol(&module, "AddValue");
+        let combine = symbol(&module, "AddPartial");
+        let governor = Arc::new(aster_runtime::MemoryGovernor::new(HARD_LIMIT));
+        let mut runtime = TaskRuntime::with_memory_governor(&module, 4, Arc::clone(&governor))
+            .expect("governed runtime starts");
+
+        let result = runtime
+            .parallel_reduce(
+                (1..=4).map(ExecutionValue::Int).collect(),
+                ExecutionValue::Int(0),
+                accumulate,
+                combine,
+            )
+            .expect("governed reduction succeeds");
+        assert_eq!(result, ExecutionValue::Int(10));
+        let plans = runtime.parallel_plans();
+        assert_eq!(plans[0].operation, "Parallel.Reduce accumulate");
+        assert_eq!(plans[0].chunk_budgets_bytes, [16 * 1024; 4]);
+        assert_eq!(plans.len(), 4);
+        for plan in &plans[1..] {
+            assert_eq!(plan.operation, "Parallel.Reduce combine");
+            assert_eq!(plan.initial_governor_capacity_bytes, 0);
+            assert_eq!(plan.available_headroom_bytes, HARD_LIMIT as u64);
+            assert_eq!(plan.chunk_budgets_bytes, [HARD_LIMIT as u64]);
+        }
+        let telemetry = governor.telemetry();
+        assert_eq!(telemetry.current_capacity_bytes, 0);
+        assert_eq!(telemetry.grant_events, 3);
+        assert_eq!(telemetry.release_events, 3);
+    }
+
+    #[test]
     fn parallel_reduce_repeated_executions_with_the_same_worker_count_return_the_same_result() {
         let module = Arc::new(compile(REDUCE_SOURCE));
         let accumulate = symbol(&module, "AddValue");
         let combine = symbol(&module, "AddPartial");
-        let runtime = TaskRuntime::new(&module, 4).expect("runtime starts");
+        let mut runtime = TaskRuntime::new(&module, 4).expect("runtime starts");
         let values: Vec<ExecutionValue> = (1..=30).map(ExecutionValue::Int).collect();
         for _ in 0..10 {
             let result = runtime
@@ -1566,7 +1986,7 @@ mod tests {
         ));
         let boom = symbol(&module, "Boom");
         let combine = symbol(&module, "AddPartial");
-        let runtime = TaskRuntime::new(&module, 2).expect("runtime starts");
+        let mut runtime = TaskRuntime::new(&module, 2).expect("runtime starts");
 
         let failing = runtime.parallel_reduce(
             vec![ExecutionValue::Int(5)],
@@ -1597,7 +2017,7 @@ mod tests {
         ));
         let accumulate = symbol(&module, "AddValue");
         let boom_combine = symbol(&module, "BoomCombine");
-        let runtime = TaskRuntime::new(&module, 4).expect("runtime starts");
+        let mut runtime = TaskRuntime::new(&module, 4).expect("runtime starts");
 
         // Two single-element chunks (4 workers, 2 elements) force exactly one
         // combine step; `left + right` (1) is out of bounds against `a`.

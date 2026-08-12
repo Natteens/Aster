@@ -16,7 +16,7 @@ fn small_results() -> &'static [CaseResult] {
 #[test]
 fn small_matrix_covers_required_workload_shapes() {
     let results = small_results();
-    assert_eq!(results.len(), 18);
+    assert_eq!(results.len(), 39);
     for workload in [
         "tiny_allocations",
         "long_scope_temporary",
@@ -33,6 +33,15 @@ fn small_matrix_covers_required_workload_shapes() {
         "governed_contexts_16",
         "shared_governor_denial",
         "governor_teardown_reuse",
+        "parallel_for_control",
+        "governed_parallel_for",
+        "parallel_for_each_control",
+        "governed_parallel_for_each",
+        "parallel_reduce_control",
+        "governed_parallel_reduce",
+        "governed_parallel_tight_partition",
+        "governed_parallel_uneven_chunks",
+        "governed_parallel_deterministic_denial",
     ] {
         assert!(results.iter().any(|result| result.workload == workload));
     }
@@ -125,6 +134,46 @@ fn governed_cases_report_shared_admission_denial_and_release() {
 }
 
 #[test]
+fn governed_parallel_plans_are_exact_and_bound_to_logical_chunk_count() {
+    let results = small_results();
+    for result in results
+        .iter()
+        .filter(|result| result.workload.starts_with("governed_parallel"))
+    {
+        for plan in &result.parallel_plans {
+            assert_eq!(
+                plan.chunk_budgets_bytes.iter().sum::<u64>(),
+                plan.available_headroom_bytes
+            );
+        }
+        let governor = result
+            .telemetry
+            .governor
+            .expect("governed Parallel cases report governor telemetry");
+        assert!(governor.current_capacity_bytes <= governor.hard_limit_bytes);
+        assert!(governor.peak_capacity_bytes <= governor.hard_limit_bytes);
+    }
+
+    let uneven = results
+        .iter()
+        .find(|result| result.workload == "governed_parallel_uneven_chunks")
+        .expect("uneven partition case exists");
+    assert_eq!(
+        uneven.parallel_plans[0].chunk_budgets_bytes,
+        [10_241, 10_241, 10_240, 10_240]
+    );
+
+    let denial = results
+        .iter()
+        .find(|result| result.workload == "governed_parallel_deterministic_denial")
+        .expect("deterministic denial case exists");
+    assert_eq!(denial.checksum, 2);
+    let governor = denial.telemetry.governor.expect("denial has governor data");
+    assert_eq!(governor.current_capacity_bytes, 0);
+    assert_eq!(governor.grant_events, governor.release_events);
+}
+
+#[test]
 fn rewind_reuse_and_persistence_are_visible_without_policy_changes() {
     let results = small_results();
     let burst = results
@@ -161,7 +210,7 @@ fn rewind_reuse_and_persistence_are_visible_without_policy_changes() {
 #[test]
 fn structured_output_contains_no_future_aarm_claims() {
     let json = serialize_results(small_results());
-    assert!(json.starts_with("{\"schema_version\":2,"));
+    assert!(json.starts_with("{\"schema_version\":3,"));
     assert!(json.contains("\"requested_bytes\""));
     assert!(json.contains("\"arena_capacity_bytes\""));
     assert!(json.contains("\"last_rewind\""));
@@ -170,10 +219,13 @@ fn structured_output_contains_no_future_aarm_claims() {
     assert!(json.contains("\"grant_events\""));
     assert!(json.contains("\"denial_events\""));
     assert!(json.contains("\"release_events\""));
+    assert!(json.contains("\"parallel_plans\""));
+    assert!(json.contains("\"available_headroom_bytes\""));
+    assert!(json.contains("\"chunk_budgets_bytes\""));
     assert!(!json.contains("virtual_reserved_bytes"));
     assert!(!json.contains("committed_backing_bytes"));
     assert!(!json.contains("purge_events"));
-    assert_eq!(json.matches("\"workload\":").count(), 18);
+    assert_eq!(json.matches("\"workload\":").count(), 39);
 }
 
 #[test]

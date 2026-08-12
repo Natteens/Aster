@@ -47,8 +47,15 @@ use backend::module_error;
 use declarations::runtime_type;
 use execution::execute_resolved;
 #[cfg(feature = "aarm-telemetry")]
+use execution::execute_resolved_with_aarm_parallel_governor;
+#[cfg(feature = "aarm-telemetry")]
+use execution::execute_resolved_with_aarm_parallel_workers;
+#[cfg(feature = "aarm-telemetry")]
 use execution::execute_resolved_with_aarm_telemetry;
 use layouts::Layouts;
+#[cfg(feature = "aarm-telemetry")]
+#[doc(hidden)]
+pub use task_runtime::{AarmParallelPlanningTelemetry, parallel_chunk_budgets};
 use validation::{select_entry, validate_invocable_entry, validate_module};
 use values::{
     cast_value, integer_constant_bits, is_aggregate, primitive, scalar_from_bits, scalar_kind,
@@ -208,6 +215,55 @@ pub fn execute_with_aarm_telemetry(
     validate_module(module)?;
     let entry = select_entry(module, function_name)?;
     execute_resolved_with_aarm_telemetry(module, entry)
+}
+
+/// Execute with the experimental shared governor applied to the main context
+/// and deterministic logical Parallel chunk partitions.
+///
+/// Ordinary `Task.Run` and async worker contexts remain ungoverned.
+///
+/// # Errors
+///
+/// Returns the same controlled validation, preparation, and runtime errors as
+/// [`execute_with_aarm_telemetry`].
+#[doc(hidden)]
+#[cfg(feature = "aarm-telemetry")]
+pub fn execute_with_aarm_parallel_governor(
+    module: &mir::Module,
+    function_name: &str,
+    worker_count: usize,
+    governor: std::sync::Arc<aster_runtime::MemoryGovernor>,
+) -> Result<
+    (
+        ExecutionValue,
+        AarmMemoryTelemetry,
+        Vec<AarmParallelPlanningTelemetry>,
+        Vec<AarmMemoryTelemetry>,
+    ),
+    BackendError,
+> {
+    validate_module(module)?;
+    let entry = select_entry(module, function_name)?;
+    execute_resolved_with_aarm_parallel_governor(module, entry, worker_count, governor)
+}
+
+/// Execute the ordinary ungoverned Parallel runtime with an explicit worker
+/// count for AARM comparison measurements.
+///
+/// # Errors
+///
+/// Returns the same controlled validation, preparation, and runtime errors as
+/// [`execute_with_aarm_telemetry`].
+#[doc(hidden)]
+#[cfg(feature = "aarm-telemetry")]
+pub fn execute_with_aarm_parallel_workers(
+    module: &mir::Module,
+    function_name: &str,
+    worker_count: usize,
+) -> Result<(ExecutionValue, AarmMemoryTelemetry), BackendError> {
+    validate_module(module)?;
+    let entry = select_entry(module, function_name)?;
+    execute_resolved_with_aarm_parallel_workers(module, entry, worker_count)
 }
 
 /// Like [`execute`], but injects `console_backend` for `aster.io.Write`/
