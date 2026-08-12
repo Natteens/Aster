@@ -65,6 +65,152 @@ pub(super) struct ParallelMemoryBudget {
     pub(super) local_limit_bytes: usize,
 }
 
+/// One frozen execution-owned memory domain shared by governed plain
+/// `Task.Run` jobs. The local byte ceiling is uniform; the condition variable
+/// limits how many task contexts may own that entitlement concurrently.
+pub(super) struct TaskMemoryDomain {
+    governor: Arc<aster_runtime::MemoryGovernor>,
+    local_limit_bytes: usize,
+    concurrency_limit: usize,
+    active_contexts: Mutex<usize>,
+    slot_available: Condvar,
+    submissions: AtomicU64,
+    contexts_started: AtomicU64,
+    contexts_completed: AtomicU64,
+    memory_failures: AtomicU64,
+    active_page_fast_path_allocations: AtomicU64,
+    fresh_page_allocations: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(feature = "aarm-telemetry")]
+pub(super) struct TaskMemoryDomainCounters {
+    pub(super) submissions: u64,
+    pub(super) contexts_started: u64,
+    pub(super) contexts_completed: u64,
+    pub(super) memory_failures: u64,
+    pub(super) active_page_fast_path_allocations: u64,
+    pub(super) fresh_page_allocations: u64,
+}
+
+impl TaskMemoryDomain {
+    pub(super) fn new(
+        governor: Arc<aster_runtime::MemoryGovernor>,
+        local_limit_bytes: usize,
+        concurrency_limit: usize,
+    ) -> Self {
+        assert!(
+            concurrency_limit > 0,
+            "task memory concurrency must be nonzero"
+        );
+        Self {
+            governor,
+            local_limit_bytes,
+            concurrency_limit,
+            active_contexts: Mutex::new(0),
+            slot_available: Condvar::new(),
+            submissions: AtomicU64::new(0),
+            contexts_started: AtomicU64::new(0),
+            contexts_completed: AtomicU64::new(0),
+            memory_failures: AtomicU64::new(0),
+            active_page_fast_path_allocations: AtomicU64::new(0),
+            fresh_page_allocations: AtomicU64::new(0),
+        }
+    }
+
+    pub(super) fn governor(&self) -> &Arc<aster_runtime::MemoryGovernor> {
+        &self.governor
+    }
+
+    pub(super) fn local_limit_bytes(&self) -> usize {
+        self.local_limit_bytes
+    }
+
+    pub(super) fn concurrency_limit(&self) -> usize {
+        self.concurrency_limit
+    }
+
+    fn record_submission(&self) {
+        self.submissions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn acquire(self: &Arc<Self>) -> TaskMemoryPermit {
+        let mut active = self
+            .active_contexts
+            .lock()
+            .expect("task memory-domain mutex is not poisoned");
+        while *active >= self.concurrency_limit {
+            active = self
+                .slot_available
+                .wait(active)
+                .expect("task memory-domain mutex is not poisoned");
+        }
+        *active += 1;
+        self.contexts_started.fetch_add(1, Ordering::Relaxed);
+        TaskMemoryPermit {
+            domain: Arc::clone(self),
+        }
+    }
+
+    fn record_outcome(
+        &self,
+        outcome: &TaskOutcome,
+        telemetry: Option<&aster_runtime::AarmMemoryTelemetry>,
+    ) {
+        if matches!(outcome, TaskOutcome::Failed(error) if error.message().contains("deterministic Task.Run memory entitlement"))
+        {
+            self.memory_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(telemetry) = telemetry {
+            self.active_page_fast_path_allocations.fetch_add(
+                telemetry.total.events.active_page_fast_path_allocations,
+                Ordering::Relaxed,
+            );
+            self.fresh_page_allocations.fetch_add(
+                telemetry.total.events.fresh_regular_page_allocations
+                    + telemetry.total.events.fresh_oversized_page_allocations,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    pub(super) fn counters(&self) -> TaskMemoryDomainCounters {
+        TaskMemoryDomainCounters {
+            submissions: self.submissions.load(Ordering::Relaxed),
+            contexts_started: self.contexts_started.load(Ordering::Relaxed),
+            contexts_completed: self.contexts_completed.load(Ordering::Relaxed),
+            memory_failures: self.memory_failures.load(Ordering::Relaxed),
+            active_page_fast_path_allocations: self
+                .active_page_fast_path_allocations
+                .load(Ordering::Relaxed),
+            fresh_page_allocations: self.fresh_page_allocations.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct TaskMemoryPermit {
+    domain: Arc<TaskMemoryDomain>,
+}
+
+impl Drop for TaskMemoryPermit {
+    fn drop(&mut self) {
+        let mut active = self
+            .domain
+            .active_contexts
+            .lock()
+            .expect("task memory-domain mutex is not poisoned");
+        *active = active
+            .checked_sub(1)
+            .expect("task memory-domain active count underflow");
+        self.domain
+            .contexts_completed
+            .fetch_add(1, Ordering::Relaxed);
+        drop(active);
+        self.domain.slot_available.notify_one();
+    }
+}
+
 /// What one job asks a worker to do. Every variant resolves a MIR function by
 /// its concrete symbol; no textual lookup and no per-iteration JIT happen.
 pub(super) enum JobKind {
@@ -72,6 +218,7 @@ pub(super) enum JobKind {
     Task {
         symbol: mir::SymbolId,
         collect_stats: bool,
+        memory_domain: Option<Arc<TaskMemoryDomain>>,
     },
     /// `Body(int)` over a contiguous half-open range `[start, end)`.
     ForChunk {
@@ -222,13 +369,17 @@ fn run_job(program: &PreparedProgram, kind: JobKind, respond: Respond) {
             JobKind::Task {
                 symbol,
                 collect_stats,
+                memory_domain,
             },
             Respond::Task(reply),
         ) => {
-            let outcome = match program.invoke(symbol, collect_stats, None, None, None) {
-                Ok((value, stats)) => TaskOutcome::Completed(value, stats),
-                Err(error) => TaskOutcome::Failed(error),
-            };
+            let permit = memory_domain.as_ref().map(TaskMemoryDomain::acquire);
+            let (outcome, telemetry) =
+                program.run_task(symbol, collect_stats, memory_domain.as_deref());
+            if let Some(domain) = &memory_domain {
+                domain.record_outcome(&outcome, telemetry.as_ref());
+            }
+            drop(permit);
             let _ = reply.send(outcome);
         }
         (
@@ -531,17 +682,40 @@ impl ExecutionPool {
         collect_stats: bool,
         completion: Option<(Arc<CompletionQueue>, CompletionToken)>,
     ) -> Result<TaskHandle, BackendError> {
+        self.submit_task(symbol, collect_stats, None, completion)
+    }
+
+    pub(super) fn submit_governed_task(
+        &self,
+        symbol: mir::SymbolId,
+        domain: Arc<TaskMemoryDomain>,
+    ) -> Result<TaskHandle, BackendError> {
+        self.submit_task(symbol, true, Some(domain), None)
+    }
+
+    fn submit_task(
+        &self,
+        symbol: mir::SymbolId,
+        collect_stats: bool,
+        memory_domain: Option<Arc<TaskMemoryDomain>>,
+        completion: Option<(Arc<CompletionQueue>, CompletionToken)>,
+    ) -> Result<TaskHandle, BackendError> {
         self.ensure_workers(1)?;
         let id = TaskId(self.next_task_id.fetch_add(1, Ordering::Relaxed));
         let (reply, receiver) = mpsc::channel();
+        let submitted_domain = memory_domain.as_ref().map(Arc::clone);
         self.queue.push(Job {
             kind: JobKind::Task {
                 symbol,
                 collect_stats,
+                memory_domain,
             },
             respond: Respond::Task(reply),
             completion,
         })?;
+        if let Some(domain) = submitted_domain {
+            domain.record_submission();
+        }
         Ok(TaskHandle { id, receiver })
     }
 
@@ -629,6 +803,8 @@ impl Drop for ExecutionPool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "aarm-telemetry")]
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     use super::*;
@@ -678,6 +854,93 @@ mod tests {
         // guarantee: only owned scalars, never a pointer or `ExecutionContext`.
         assert_send::<ReduceChunkOutcome>();
         assert_send::<CombineOutcome>();
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    fn assert_task_domain_context_cap(
+        physical_workers: usize,
+        memory_concurrency: usize,
+        queued_tasks: usize,
+    ) {
+        let governor = Arc::new(aster_runtime::MemoryGovernor::new(64 * 1024));
+        let domain = Arc::new(TaskMemoryDomain::new(
+            Arc::clone(&governor),
+            64 * 1024,
+            memory_concurrency,
+        ));
+        let live_contexts = Arc::new(AtomicUsize::new(0));
+        let peak_contexts = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut workers = Vec::with_capacity(physical_workers);
+
+        for _ in 0..physical_workers {
+            let domain = Arc::clone(&domain);
+            let live_contexts = Arc::clone(&live_contexts);
+            let peak_contexts = Arc::clone(&peak_contexts);
+            let completed = Arc::clone(&completed);
+            let entered_sender = entered_sender.clone();
+            let release = Arc::clone(&release);
+            workers.push(thread::spawn(move || {
+                for _ in 0..(queued_tasks / physical_workers) {
+                    let permit = domain.acquire();
+                    let context = aster_runtime::ExecutionContext::with_task_memory_budget(
+                        Arc::clone(domain.governor()),
+                        domain.local_limit_bytes(),
+                    );
+                    let live = live_contexts.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak_contexts.fetch_max(live, Ordering::SeqCst);
+                    entered_sender.send(()).expect("observer remains live");
+                    let (lock, wake) = &*release;
+                    let mut released = lock.lock().expect("release mutex is not poisoned");
+                    while !*released {
+                        released = wake.wait(released).expect("release mutex is not poisoned");
+                    }
+                    drop(context);
+                    live_contexts.fetch_sub(1, Ordering::SeqCst);
+                    drop(permit);
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        drop(entered_sender);
+
+        for _ in 0..memory_concurrency {
+            entered_receiver
+                .recv_timeout(TEST_TIMEOUT)
+                .expect("each permitted governed context starts");
+        }
+        assert_eq!(live_contexts.load(Ordering::SeqCst), memory_concurrency);
+        assert_eq!(peak_contexts.load(Ordering::SeqCst), memory_concurrency);
+        assert!(
+            entered_receiver
+                .recv_timeout(Duration::from_millis(25))
+                .is_err(),
+            "a queued task began a governed context above the memory cap"
+        );
+
+        let (lock, wake) = &*release;
+        *lock.lock().expect("release mutex is not poisoned") = true;
+        wake.notify_all();
+        for worker in workers {
+            worker.join().expect("bounded task worker completes");
+        }
+        assert_eq!(completed.load(Ordering::SeqCst), queued_tasks);
+        assert_eq!(peak_contexts.load(Ordering::SeqCst), memory_concurrency);
+        assert_eq!(live_contexts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "aarm-telemetry")]
+    fn task_domain_cap_structurally_limits_eight_workers_to_two_live_contexts() {
+        assert_task_domain_context_cap(8, 2, 8);
+    }
+
+    #[test]
+    #[cfg(feature = "aarm-telemetry")]
+    fn task_domain_one_slot_serializes_multiple_queued_contexts() {
+        assert_task_domain_context_cap(4, 1, 8);
     }
 
     #[test]

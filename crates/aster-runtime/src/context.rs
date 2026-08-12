@@ -509,6 +509,13 @@ enum AllocationCategory {
     String,
 }
 
+#[derive(Clone, Copy)]
+enum AllocationLimitKind {
+    Execution,
+    TaskDomainMain,
+    TaskEntitlement,
+}
+
 /// Opaque checkpoint for the temporary arena owned by one execution context.
 ///
 /// The token is intentionally neither `Copy` nor `Clone`: rewinding consumes
@@ -526,6 +533,7 @@ pub struct ExecutionContext {
     temporary_arena: PagedArena,
     temporary_scopes: Vec<TemporaryArenaMark>,
     allocation_limit_bytes: usize,
+    allocation_limit_kind: AllocationLimitKind,
     call_depth: u32,
     error: Option<String>,
     collect_stats: bool,
@@ -573,6 +581,10 @@ impl Default for ExecutionContext {
 }
 
 impl ExecutionContext {
+    /// Existing local safety ceiling used by experimental AARM planners.
+    #[doc(hidden)]
+    pub const AARM_MAX_CONTEXT_CAPACITY_BYTES: usize = EXECUTION_ALLOCATION_LIMIT_BYTES;
+
     /// Smallest fresh arena page capacity used by experimental AARM planners.
     #[doc(hidden)]
     pub const AARM_MIN_PAGE_CAPACITY_BYTES: usize = crate::arena::MIN_PAGE_SIZE;
@@ -611,6 +623,7 @@ impl ExecutionContext {
             temporary_arena,
             temporary_scopes: Vec::new(),
             allocation_limit_bytes,
+            allocation_limit_kind: AllocationLimitKind::Execution,
             call_depth: 0,
             error: None,
             collect_stats,
@@ -650,6 +663,50 @@ impl ExecutionContext {
             allocation_limit_bytes.min(EXECUTION_ALLOCATION_LIMIT_BYTES),
             Some(governor),
         )
+    }
+
+    /// Create one experimental governed plain-task context. The byte ceiling
+    /// remains local to this invocation and actual fresh pages still require
+    /// admission from the shared governor.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_task_memory_budget(
+        governor: Arc<MemoryGovernor>,
+        allocation_limit_bytes: usize,
+    ) -> Self {
+        let mut context = Self::with_memory_budget(governor, allocation_limit_bytes);
+        context.allocation_limit_kind = AllocationLimitKind::TaskEntitlement;
+        context
+    }
+
+    /// Freeze the governed main context at its already-retained capacity plus
+    /// a deterministic future-growth entitlement. Returns the effective local
+    /// ceiling, or `None` if the arithmetic is not addressable.
+    #[doc(hidden)]
+    pub fn freeze_task_domain_main_limit(&mut self, future_growth_bytes: usize) -> Option<usize> {
+        let retained = self.retained_arena_capacity_bytes()?;
+        let requested = retained.checked_add(future_growth_bytes)?;
+        self.allocation_limit_bytes = self.allocation_limit_bytes.min(requested).max(retained);
+        self.allocation_limit_kind = AllocationLimitKind::TaskDomainMain;
+        Some(self.allocation_limit_bytes)
+    }
+
+    /// Capacity currently retained by both arenas in this context.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn retained_arena_capacity_bytes(&self) -> Option<usize> {
+        self.arena
+            .metrics()
+            .reserved_bytes
+            .checked_add(self.temporary_arena.metrics().reserved_bytes)
+    }
+
+    /// Whether both regions draw fresh-page capacity from this exact shared
+    /// governor. Used to validate experimental execution-domain wiring.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_governed_by(&self, governor: &Arc<MemoryGovernor>) -> bool {
+        self.arena.is_governed_by(governor) && self.temporary_arena.is_governed_by(governor)
     }
 
     #[cfg(test)]
@@ -864,8 +921,17 @@ impl ExecutionContext {
                 self.fail("allocation size exceeds the addressable range");
             }
             ArenaAllocError::Limit => {
+                let authority = match self.allocation_limit_kind {
+                    AllocationLimitKind::Execution => "execution memory limit",
+                    AllocationLimitKind::TaskDomainMain => {
+                        "deterministic Task.Run main-context memory entitlement"
+                    }
+                    AllocationLimitKind::TaskEntitlement => {
+                        "deterministic Task.Run memory entitlement"
+                    }
+                };
                 self.fail(format!(
-                    "allocation exceeds the execution memory limit of {} bytes",
+                    "allocation exceeds the {authority} of {} bytes",
                     self.allocation_limit_bytes
                 ));
             }
@@ -3602,6 +3668,69 @@ mod tests {
         let ordinary = independent.allocate_array(1_000_000, 4);
         assert!(!ordinary.is_null());
         assert!(independent.take_error().is_none());
+    }
+
+    #[test]
+    fn task_domain_main_limit_preserves_retained_capacity_and_freezes_future_growth() {
+        let governor = Arc::new(MemoryGovernor::new(64 * 1024));
+        let mut context = ExecutionContext::with_memory_governor(Arc::clone(&governor));
+        let unrelated = Arc::new(MemoryGovernor::new(64 * 1024));
+        assert!(context.is_governed_by(&governor));
+        assert!(!context.is_governed_by(&unrelated));
+        assert!(!ExecutionContext::new().is_governed_by(&governor));
+        assert!(!context.allocate_array(1, 1).is_null());
+        let retained = context
+            .retained_arena_capacity_bytes()
+            .expect("retained capacity is addressable");
+        assert_eq!(retained, ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES);
+        assert_eq!(context.freeze_task_domain_main_limit(0), Some(retained));
+
+        assert!(context.allocate_array(2_000, 4).is_null());
+        assert_eq!(context.retained_arena_capacity_bytes(), Some(retained));
+        assert_eq!(governor.telemetry().grant_events, 1);
+        assert!(context.take_error().is_some_and(|error| {
+            error.contains("deterministic Task.Run main-context memory entitlement")
+        }));
+    }
+
+    #[test]
+    fn task_entitlement_denial_precedes_shared_governor_admission() {
+        let governor = Arc::new(MemoryGovernor::new(64 * 1024));
+        let mut context = ExecutionContext::with_task_memory_budget(
+            Arc::clone(&governor),
+            ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES - 1,
+        );
+
+        assert!(context.allocate_array(1, 1).is_null());
+        assert_eq!(context.retained_arena_capacity_bytes(), Some(0));
+        assert_eq!(governor.telemetry().grant_events, 0);
+        assert!(
+            context
+                .take_error()
+                .is_some_and(|error| error.contains("deterministic Task.Run memory entitlement"))
+        );
+    }
+
+    #[test]
+    fn shared_governor_remains_final_authority_for_task_contexts() {
+        let page = ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES;
+        let governor = Arc::new(MemoryGovernor::new(page));
+        let mut first = ExecutionContext::with_task_memory_budget(Arc::clone(&governor), 2 * page);
+        let mut second = ExecutionContext::with_task_memory_budget(Arc::clone(&governor), 2 * page);
+
+        assert!(!first.allocate_array(1, 1).is_null());
+        assert!(second.allocate_array(1, 1).is_null());
+        assert!(
+            second
+                .take_error()
+                .is_some_and(|error| error.contains("shared execution memory budget"))
+        );
+        let telemetry = governor.telemetry();
+        let page = u64::try_from(page).expect("page capacity fits u64");
+        assert_eq!(telemetry.current_capacity_bytes, page);
+        assert_eq!(telemetry.peak_capacity_bytes, page);
+        assert_eq!(telemetry.grant_events, 1);
+        assert_eq!(telemetry.denial_events, 1);
     }
 
     #[test]

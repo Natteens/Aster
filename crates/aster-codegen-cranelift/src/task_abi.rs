@@ -96,24 +96,6 @@ pub(super) fn bind_task_functions(builder: &mut super::JITBuilder) {
     }
 }
 
-/// Reborrow the `TaskRuntime` the host registered via
-/// `ExecutionContext::set_task_runtime`, or report the controlled "no task
-/// support here" error and return `None`.
-///
-/// # Safety
-/// The host that called `set_task_runtime` must guarantee the pointer is a
-/// live `TaskRuntime` for the whole duration of this invocation (see
-/// `execution::execute_resolved`), and that it is never aliased by any
-/// other live reference while this call runs (this crate only ever calls
-/// into a `TaskRuntime` from the single thread running the top-level
-/// entry function; a worker's own `PreparedProgram` never registers one).
-#[allow(unsafe_code)]
-unsafe fn task_runtime(context: &mut ExecutionContext) -> Option<&mut TaskRuntime> {
-    let pointer = context.task_runtime()?;
-    // SAFETY: forwarded from this function's own contract, documented above.
-    Some(unsafe { &mut *pointer.cast::<TaskRuntime>() })
-}
-
 /// `aster.core.Task.Run(function)`. `function_symbol` is `SymbolId::0` of a
 /// resolved, zero-parameter free function or static method, embedded as a
 /// compile-time constant by codegen. Submits one task to the `TaskRuntime`
@@ -128,15 +110,18 @@ extern "C" fn aster_task_run(context: *mut ExecutionContext, function_symbol: i3
     // hidden first argument; it cannot outlive the invocation.
     #[allow(unsafe_code)]
     let context = unsafe { &mut *context };
-    // SAFETY: `task_runtime`'s own contract, upheld by the host.
-    #[allow(unsafe_code)]
-    let Some(runtime) = (unsafe { task_runtime(context) }) else {
+    let Some(pointer) = context.task_runtime() else {
         context
             .fail("Task.Run is not available from this entry point (no task runtime registered)");
         return 0;
     };
     let symbol = mir::SymbolId(u32::from_ne_bytes(function_symbol.to_ne_bytes()));
-    match runtime.run(symbol) {
+    let runtime = pointer.cast::<TaskRuntime>();
+    // SAFETY: the host keeps this runtime live and exclusively reachable from
+    // the top-level invocation. `context` is a separate owned object whose
+    // governed local ceiling may be frozen by the runtime before submission.
+    #[allow(unsafe_code)]
+    match unsafe { (*runtime).run_from_context(symbol, context) } {
         Ok(id) => id.to_bits(),
         Err(error) => {
             context.fail(error.message().to_owned());

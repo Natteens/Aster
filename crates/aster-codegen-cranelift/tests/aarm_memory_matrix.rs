@@ -16,7 +16,7 @@ fn small_results() -> &'static [CaseResult] {
 #[test]
 fn small_matrix_covers_required_workload_shapes() {
     let results = small_results();
-    assert_eq!(results.len(), 39);
+    assert_eq!(results.len(), 76);
     for workload in [
         "tiny_allocations",
         "long_scope_temporary",
@@ -42,6 +42,19 @@ fn small_matrix_covers_required_workload_shapes() {
         "governed_parallel_tight_partition",
         "governed_parallel_uneven_chunks",
         "governed_parallel_deterministic_denial",
+        "task_empty_control",
+        "governed_task_empty",
+        "task_small_allocation_control",
+        "governed_task_small_allocation",
+        "task_moderate_allocation_control",
+        "governed_task_moderate_allocation",
+        "task_swarm_control",
+        "governed_task_swarm",
+        "governed_task_more_than_workers",
+        "governed_task_main_worker_growth",
+        "governed_task_teardown_reuse",
+        "governed_task_tight_page_domain",
+        "governed_task_deterministic_denial",
     ] {
         assert!(results.iter().any(|result| result.workload == workload));
     }
@@ -174,6 +187,57 @@ fn governed_parallel_plans_are_exact_and_bound_to_logical_chunk_count() {
 }
 
 #[test]
+fn governed_task_domains_are_frozen_page_aware_and_quiescent() {
+    let results = small_results();
+    for result in results
+        .iter()
+        .filter(|result| result.workload.starts_with("governed_task"))
+    {
+        let domain = result
+            .task_domain
+            .expect("governed Task.Run cases report their frozen domain");
+        assert!(domain.task_memory_concurrency_limit > 0);
+        assert_eq!(domain.task_submissions, domain.task_contexts_started);
+        assert_eq!(domain.task_contexts_started, domain.task_contexts_completed);
+        assert!(
+            u128::from(domain.main_future_growth_bytes)
+                + u128::from(domain.task_context_ceiling_bytes)
+                    * u128::try_from(domain.task_memory_concurrency_limit)
+                        .expect("concurrency fits u128")
+                <= u128::from(domain.available_headroom_bytes)
+        );
+        let governor = result
+            .telemetry
+            .governor
+            .expect("governed Task.Run cases report governor telemetry");
+        assert_eq!(governor.current_capacity_bytes, 0);
+        assert!(governor.peak_capacity_bytes <= governor.hard_limit_bytes);
+        assert_eq!(governor.grant_events, governor.release_events);
+        assert_eq!(
+            governor.granted_bytes_cumulative,
+            governor.released_bytes_cumulative
+        );
+    }
+
+    let tight = results
+        .iter()
+        .find(|result| result.workload == "governed_task_tight_page_domain")
+        .expect("tight task domain case exists")
+        .task_domain
+        .expect("tight task domain reports planning");
+    assert_eq!(tight.task_memory_concurrency_limit, 2);
+    assert_eq!(tight.task_submissions, 8);
+
+    let denial = results
+        .iter()
+        .find(|result| result.workload == "governed_task_deterministic_denial")
+        .expect("task denial case exists")
+        .task_domain
+        .expect("task denial reports planning");
+    assert_eq!(denial.task_context_memory_failures, 20);
+}
+
+#[test]
 fn rewind_reuse_and_persistence_are_visible_without_policy_changes() {
     let results = small_results();
     let burst = results
@@ -210,7 +274,7 @@ fn rewind_reuse_and_persistence_are_visible_without_policy_changes() {
 #[test]
 fn structured_output_contains_no_future_aarm_claims() {
     let json = serialize_results(small_results());
-    assert!(json.starts_with("{\"schema_version\":3,"));
+    assert!(json.starts_with("{\"schema_version\":4,"));
     assert!(json.contains("\"requested_bytes\""));
     assert!(json.contains("\"arena_capacity_bytes\""));
     assert!(json.contains("\"last_rewind\""));
@@ -222,10 +286,12 @@ fn structured_output_contains_no_future_aarm_claims() {
     assert!(json.contains("\"parallel_plans\""));
     assert!(json.contains("\"available_headroom_bytes\""));
     assert!(json.contains("\"chunk_budgets_bytes\""));
+    assert!(json.contains("\"task_memory_domain\""));
+    assert!(json.contains("\"task_context_ceiling_bytes\""));
     assert!(!json.contains("virtual_reserved_bytes"));
     assert!(!json.contains("committed_backing_bytes"));
     assert!(!json.contains("purge_events"));
-    assert_eq!(json.matches("\"workload\":").count(), 39);
+    assert_eq!(json.matches("\"workload\":").count(), 76);
 }
 
 #[test]

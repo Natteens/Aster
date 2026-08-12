@@ -249,6 +249,12 @@ impl PagedArena {
         self.governor.as_ref().map(|governor| governor.telemetry())
     }
 
+    pub(crate) fn is_governed_by(&self, governor: &Arc<MemoryGovernor>) -> bool {
+        self.governor
+            .as_ref()
+            .is_some_and(|owned| Arc::ptr_eq(owned, governor))
+    }
+
     /// Fallibly allocate zeroed arena storage without invoking Rust's global
     /// allocation-error handler. `max_reserved_bytes` is the caller-owned
     /// execution budget available to this arena.

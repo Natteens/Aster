@@ -202,6 +202,77 @@ governed capacity, available headroom, exact logical chunk shares, and their min
 allocator snapshots provide fast/slow allocation and fresh/reused page evidence. Governor metrics
 continue to describe real backing capacity only; quotas are never counted as granted capacity.
 
+## AARM-2B2A deterministic Task.Run memory domains
+
+AARM-2B2A adds a separate opt-in research entry point for governed plain `Task.Run`. It does not
+govern async `MoveNext`, `AsyncSpawnInner`, or awaited async-inner jobs. Default ASTER execution is
+unchanged. The experimental entry point rejects modules containing async execution or Parallel
+operations before execution; those domains are not silently combined while their entitlement
+interaction remains unproven.
+
+Unlike Parallel chunks, the total number of future `Task.Run` submissions is not known in advance.
+The first governed plain-task submission therefore freezes one execution-owned Task Memory Domain
+before that job can enter the worker queue. At this capture point no task in the domain has begun
+allocating. The runtime records the governor's current retained capacity, subtracts it from the hard
+limit, and divides only that remaining future headroom between Main and a bounded number of
+simultaneously live task contexts. Main keeps every page it already owns; its local limit becomes:
+
+```text
+Main capacity retained at capture + frozen Main future-growth entitlement
+```
+
+The limit can never be tightened below retained capacity. This removes first-come competition
+between later Main growth and task growth. Main is synchronously executing the submission ABI while
+the plan is installed, and all subsequent growth is checked against the frozen local authority
+before shared governor admission.
+
+The task planner uses the allocator's actual 4 KiB minimum fresh-page capacity. It first chooses a
+memory concurrency limit equal to the smaller of the physical worker bound and the number of whole
+minimum pages available. If less than one page remains, one task slot receives the sub-page byte
+tail and therefore fails ordinary allocation deterministically rather than multiplying unusable
+fragments across every worker. Each memory-active slot receives one minimum-page entitlement.
+Remaining bytes are divided uniformly among those task slots plus Main; every task receives the
+same extra amount and Main receives the deterministic remainder. The existing 1 GiB local ceiling
+caps either entitlement. Resulting limits remain bytes, so regular-page growth and oversized pages
+are admitted or rejected using their actual capacity rather than page-count approximations.
+
+Every plain task in the frozen domain receives the same task-context ceiling. The immutable domain
+travels with the logical job, not a worker identity, and any worker constructs an equivalent fresh
+governed `ExecutionContext`. If useful whole-page entitlement cannot cover every physical worker,
+worker preparation is deterministically capped to the domain's memory concurrency. Additional
+tasks remain FIFO-queued. A queued handle owns no page, grant, or pre-charged quota. More task
+handles may exist than workers or memory-active slots.
+
+A task context owns its real page reservations only for that invocation. Completion or controlled
+failure destroys the context and releases those reservations exactly once; the cached scalar
+`TaskOutcome` retains no arena. A later queued task can use its same fixed entitlement after a slot
+and real governor capacity are released. That is sequential reuse, not quota borrowing. Completion
+never enlarges the entitlement of an already-live or later task, and `Wait` order only observes the
+already-cached per-handle result.
+
+Fresh task pages retain both fail-closed authorities:
+
+```text
+uniform frozen task-context ceiling
+AND
+shared MemoryGovernor hard ceiling
+```
+
+Quotas are not governor grants. Only an actual fresh page performs local checking, shared
+admission, and host allocation. Active-page bump allocation and inactive-page reuse do not touch
+the Task Memory Domain or governor shared state. The shared governor remains the final authority if
+a planner defect or another participant invalidates the entitlement assumptions.
+
+Task-domain telemetry records the initial governed capacity, captured headroom, Main retained and
+future-growth bytes, effective Main and task local ceilings, memory concurrency limit, submissions,
+contexts started/completed, task-local memory failures, task fast-path allocations, and task fresh
+page allocations. These are experimental planning/counter observations, not committed or reserved
+OS memory. Counter snapshots use independent relaxed atomics and are observational during active
+mutation; equality assertions are made after worker quiescence.
+
+There is no task quota borrowing or dynamic enlargement in AARM-2B2A. Async governance and a safe
+unified Task/Parallel entitlement plan are explicitly deferred.
+
 ## Measurement invariants
 
 Every snapshot must satisfy:
@@ -253,19 +324,23 @@ sizes are measured in tens of MiB or less; `large` must be selected explicitly. 
 ordinary/governed `Parallel.For`, `ForEach`, and `Reduce` comparisons at 1/4/16 worker shapes,
 tight and uneven logical partitions, repeated deterministic denial, and sequential Reduce combine
 headroom reuse.
+AARM-2B2A adds ordinary/governed empty-task, fast-path-heavy small-allocation, moderate-allocation,
+and task-swarm controls at 1/2/4/16 worker shapes. It also covers more-task-than-worker queueing,
+concurrent Main/task growth, teardown and sequential reuse, a tight page-aware domain, and repeated
+deterministic task-local denial.
 
 ```console
 cargo run --release -p aster-codegen-cranelift --features aarm-telemetry --example aarm_memory_matrix -- --scale small
 cargo run --release -p aster-codegen-cranelift --features aarm-telemetry --example aarm_memory_matrix -- --scale small --json
 ```
 
-Structured output separates allocator telemetry, Parallel planning, process RSS, checksum, scale,
-and informational elapsed time. Timing is never a correctness gate. Generated reports and
-machine-local baselines are not committed.
+Structured output separates allocator telemetry, Parallel planning, Task Memory Domain planning,
+process RSS, checksum, scale, and informational elapsed time. Timing is never a correctness gate.
+Generated reports and machine-local baselines are not committed.
 
 ## Metrics that do not exist yet
 
-AARM-2B1 does not expose or infer:
+AARM-2B2A does not expose or infer:
 
 - `virtual_reserved_bytes`;
 - `committed_backing_bytes`;
@@ -281,7 +356,8 @@ These fields remain absent until an architecture exists that can measure them ac
 AARM-1 observability
 -> AARM-2A shared MemoryGovernor foundation on current allocator
 -> AARM-2B1 deterministic Parallel chunk partitions
--> AARM-2B2 dynamic Task/async admission
+-> AARM-2B2A deterministic plain Task.Run memory domains
+-> AARM-2B2B async task memory domains
 -> AARM-2B3 deterministic quota borrowing research
 -> AARM-2C host-adaptive policy research
 -> AARM-3 OS PageBackend

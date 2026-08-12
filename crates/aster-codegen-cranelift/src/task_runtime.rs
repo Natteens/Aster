@@ -33,7 +33,7 @@ use super::completion_queue::{CompletionQueue, CompletionToken};
 use super::execution::PreparedProgram;
 use super::worker_pool::{
     ChunkOutcome, ExecutionPool, JobKind, ParallelMemoryBudget, ReduceChunkOutcome, TaskHandle,
-    TaskOutcome,
+    TaskMemoryDomain, TaskOutcome,
 };
 use super::{BackendError, ExecutionValue, MemoryStats, mir, scalar};
 
@@ -46,6 +46,33 @@ pub struct AarmParallelPlanningTelemetry {
     pub initial_governor_capacity_bytes: u64,
     pub available_headroom_bytes: u64,
     pub chunk_budgets_bytes: Vec<u64>,
+}
+
+/// Frozen plan and observational counters for one governed plain-task domain.
+#[cfg(feature = "aarm-telemetry")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AarmTaskMemoryDomainTelemetry {
+    pub initial_governor_capacity_bytes: u64,
+    pub available_headroom_bytes: u64,
+    pub main_retained_capacity_bytes: u64,
+    pub main_future_growth_bytes: u64,
+    pub main_local_capacity_ceiling_bytes: u64,
+    pub task_context_ceiling_bytes: u64,
+    pub task_memory_concurrency_limit: usize,
+    pub task_submissions: u64,
+    pub task_contexts_started: u64,
+    pub task_contexts_completed: u64,
+    pub task_context_memory_failures: u64,
+    pub active_page_fast_path_allocations: u64,
+    pub fresh_page_allocations: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TaskMemoryDomainPlan {
+    main_future_growth_bytes: u64,
+    task_context_ceiling_bytes: u64,
+    task_memory_concurrency_limit: usize,
 }
 
 /// Opaque, stable identity for one task within its owning [`TaskRuntime`].
@@ -110,6 +137,10 @@ pub(super) struct TaskRuntime {
     worker_count: usize,
     task_worker_count: usize,
     parallel_governor: Option<Arc<aster_runtime::MemoryGovernor>>,
+    task_governor: Option<Arc<aster_runtime::MemoryGovernor>>,
+    task_memory_domain: Option<Arc<TaskMemoryDomain>>,
+    #[cfg(feature = "aarm-telemetry")]
+    task_domain_telemetry: Option<AarmTaskMemoryDomainTelemetry>,
     #[cfg(feature = "aarm-telemetry")]
     parallel_plans: Vec<AarmParallelPlanningTelemetry>,
     #[cfg(feature = "aarm-telemetry")]
@@ -146,13 +177,14 @@ impl TaskRuntime {
         module: &Arc<mir::Module>,
         worker_count: usize,
     ) -> Result<Self, BackendError> {
-        Self::with_parallel_governor(module, worker_count, None)
+        Self::with_governors(module, worker_count, None, None)
     }
 
-    fn with_parallel_governor(
+    fn with_governors(
         module: &Arc<mir::Module>,
         worker_count: usize,
         parallel_governor: Option<Arc<aster_runtime::MemoryGovernor>>,
+        task_governor: Option<Arc<aster_runtime::MemoryGovernor>>,
     ) -> Result<Self, BackendError> {
         let pool = ExecutionPool::new(Arc::clone(module), worker_count)?;
         let driver = module_uses_async(module)
@@ -170,6 +202,10 @@ impl TaskRuntime {
             worker_count,
             task_worker_count,
             parallel_governor,
+            task_governor,
+            task_memory_domain: None,
+            #[cfg(feature = "aarm-telemetry")]
+            task_domain_telemetry: None,
             #[cfg(feature = "aarm-telemetry")]
             parallel_plans: Vec::new(),
             #[cfg(feature = "aarm-telemetry")]
@@ -185,7 +221,16 @@ impl TaskRuntime {
         worker_count: usize,
         governor: Arc<aster_runtime::MemoryGovernor>,
     ) -> Result<Self, BackendError> {
-        Self::with_parallel_governor(module, worker_count, Some(governor))
+        Self::with_governors(module, worker_count, Some(governor), None)
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    pub(super) fn with_task_memory_governor(
+        module: &Arc<mir::Module>,
+        worker_count: usize,
+        governor: Arc<aster_runtime::MemoryGovernor>,
+    ) -> Result<Self, BackendError> {
+        Self::with_governors(module, worker_count, None, Some(governor))
     }
 
     #[cfg(feature = "aarm-telemetry")]
@@ -196,6 +241,24 @@ impl TaskRuntime {
     #[cfg(feature = "aarm-telemetry")]
     pub(super) fn parallel_snapshots(&self) -> &[aster_runtime::AarmMemoryTelemetry] {
         &self.parallel_snapshots
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    pub(super) fn task_domain_telemetry(&self) -> Option<AarmTaskMemoryDomainTelemetry> {
+        let mut telemetry = self.task_domain_telemetry?;
+        let counters = self.task_memory_domain.as_ref()?.counters();
+        telemetry.task_submissions = counters.submissions;
+        telemetry.task_contexts_started = counters.contexts_started;
+        telemetry.task_contexts_completed = counters.contexts_completed;
+        telemetry.task_context_memory_failures = counters.memory_failures;
+        telemetry.active_page_fast_path_allocations = counters.active_page_fast_path_allocations;
+        telemetry.fresh_page_allocations = counters.fresh_page_allocations;
+        Some(telemetry)
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    pub(super) fn quiesce_workers(&self) {
+        self.pool.shutdown();
     }
 
     fn fresh_id(&mut self) -> Result<TaskHandleId, BackendError> {
@@ -219,12 +282,106 @@ impl TaskRuntime {
     // --- plain `Task.Run` / `Wait` (unchanged behavior) -------------------
 
     /// `Task.Run(function)`: submit one plain task and return its handle.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn run(&mut self, symbol: mir::SymbolId) -> Result<TaskHandleId, BackendError> {
+        self.submit_plain_task(symbol, None)
+    }
+
+    pub(super) fn run_from_context(
+        &mut self,
+        symbol: mir::SymbolId,
+        main_context: &mut aster_runtime::ExecutionContext,
+    ) -> Result<TaskHandleId, BackendError> {
+        let memory_domain = if self.task_governor.is_some() {
+            Some(self.activate_task_memory_domain(main_context)?)
+        } else {
+            None
+        };
+        self.submit_plain_task(symbol, memory_domain)
+    }
+
+    fn submit_plain_task(
+        &mut self,
+        symbol: mir::SymbolId,
+        memory_domain: Option<Arc<TaskMemoryDomain>>,
+    ) -> Result<TaskHandleId, BackendError> {
         self.pool.ensure_workers(self.pending_worker_demand())?;
         let id = self.fresh_id()?;
-        let handle = self.pool.submit(symbol, false, None)?;
+        let handle = match memory_domain {
+            Some(domain) => self.pool.submit_governed_task(symbol, domain)?,
+            None => self.pool.submit(symbol, false, None)?,
+        };
         self.entries.insert(id, TaskEntry::Pending(handle));
         Ok(id)
+    }
+
+    fn activate_task_memory_domain(
+        &mut self,
+        main_context: &mut aster_runtime::ExecutionContext,
+    ) -> Result<Arc<TaskMemoryDomain>, BackendError> {
+        if let Some(domain) = &self.task_memory_domain {
+            return Ok(Arc::clone(domain));
+        }
+        let governor = self
+            .task_governor
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| BackendError::new("task memory governor is unavailable"))?;
+        if !main_context.is_governed_by(&governor) {
+            return Err(BackendError::new(
+                "main context does not use the Task.Run memory governor",
+            ));
+        }
+        let snapshot = governor.telemetry();
+        let main_retained = main_context
+            .retained_arena_capacity_bytes()
+            .ok_or_else(|| BackendError::new("main retained arena capacity overflow"))?;
+        let main_retained_u64 = u64::try_from(main_retained)
+            .map_err(|_| BackendError::new("main retained arena capacity exceeds telemetry"))?;
+        if snapshot.current_capacity_bytes < main_retained_u64 {
+            return Err(BackendError::new(
+                "governed main capacity is not owned by the Task.Run memory governor",
+            ));
+        }
+        let available_headroom_bytes = snapshot
+            .hard_limit_bytes
+            .checked_sub(snapshot.current_capacity_bytes)
+            .ok_or_else(|| BackendError::new("memory governor capacity exceeds its hard limit"))?;
+        let plan = plan_task_memory_domain(
+            available_headroom_bytes,
+            main_retained_u64,
+            self.worker_count,
+        )?;
+        let main_future_growth = usize::try_from(plan.main_future_growth_bytes)
+            .map_err(|_| BackendError::new("main Task.Run entitlement exceeds host limits"))?;
+        let main_local_capacity_ceiling = main_context
+            .freeze_task_domain_main_limit(main_future_growth)
+            .ok_or_else(|| BackendError::new("main Task.Run entitlement exceeds host limits"))?;
+        #[cfg(not(feature = "aarm-telemetry"))]
+        let _ = main_local_capacity_ceiling;
+        let task_context_ceiling = usize::try_from(plan.task_context_ceiling_bytes)
+            .map_err(|_| BackendError::new("Task.Run entitlement exceeds host limits"))?;
+        let domain = Arc::new(TaskMemoryDomain::new(
+            governor,
+            task_context_ceiling,
+            plan.task_memory_concurrency_limit,
+        ));
+        #[cfg(feature = "aarm-telemetry")]
+        {
+            self.task_domain_telemetry = Some(AarmTaskMemoryDomainTelemetry {
+                initial_governor_capacity_bytes: snapshot.current_capacity_bytes,
+                available_headroom_bytes,
+                main_retained_capacity_bytes: main_retained_u64,
+                main_future_growth_bytes: plan.main_future_growth_bytes,
+                main_local_capacity_ceiling_bytes: u64::try_from(main_local_capacity_ceiling)
+                    .expect("execution capacity ceilings fit governor telemetry"),
+                task_context_ceiling_bytes: plan.task_context_ceiling_bytes,
+                task_memory_concurrency_limit: plan.task_memory_concurrency_limit,
+                ..AarmTaskMemoryDomainTelemetry::default()
+            });
+        }
+        self.task_memory_domain = Some(Arc::clone(&domain));
+        Ok(domain)
     }
 
     pub(super) fn is_async_handle(&self, id: TaskHandleId) -> bool {
@@ -401,12 +558,15 @@ impl TaskRuntime {
             .values()
             .filter(|task| task.inner.is_some())
             .count();
-        self.task_worker_count.max(
+        let demand = self.task_worker_count.max(
             plain
                 .saturating_add(async_inners)
                 .saturating_add(1)
                 .min(self.worker_count),
-        )
+        );
+        self.task_memory_domain
+            .as_ref()
+            .map_or(demand, |domain| demand.min(domain.concurrency_limit()))
     }
 
     pub(super) fn async_await_result(&self, id: TaskHandleId) -> Result<i64, BackendError> {
@@ -906,6 +1066,69 @@ impl Drop for TaskRuntime {
     }
 }
 
+/// Freeze one uniform plain-task entitlement and a deterministic maximum
+/// number of simultaneously live governed task contexts. Task slots receive
+/// useful minimum-page capacity before surplus is shared with Main.
+fn plan_task_memory_domain(
+    available_headroom_bytes: u64,
+    main_retained_capacity_bytes: u64,
+    worker_count: usize,
+) -> Result<TaskMemoryDomainPlan, BackendError> {
+    if worker_count == 0 {
+        return Err(BackendError::new(
+            "Task.Run memory planning requires at least one worker",
+        ));
+    }
+    let minimum_page = u64::try_from(aster_runtime::ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES)
+        .expect("minimum arena page capacity fits u64");
+    let local_limit =
+        u64::try_from(aster_runtime::ExecutionContext::AARM_MAX_CONTEXT_CAPACITY_BYTES)
+            .expect("execution allocation limit fits governor telemetry");
+    let usable_page_slots = available_headroom_bytes / minimum_page;
+    let concurrency_limit = if usable_page_slots == 0 {
+        1
+    } else {
+        usize::try_from(usable_page_slots)
+            .unwrap_or(usize::MAX)
+            .min(worker_count)
+    };
+    let concurrency = u64::try_from(concurrency_limit)
+        .map_err(|_| BackendError::new("Task.Run memory concurrency exceeds telemetry"))?;
+    let initial_task_ceiling = if usable_page_slots == 0 {
+        available_headroom_bytes.min(local_limit)
+    } else {
+        minimum_page
+    };
+    let initial_task_total = initial_task_ceiling
+        .checked_mul(concurrency)
+        .ok_or_else(|| BackendError::new("Task.Run memory plan overflow"))?;
+    let remaining = available_headroom_bytes
+        .checked_sub(initial_task_total)
+        .ok_or_else(|| BackendError::new("Task.Run memory plan exceeds available headroom"))?;
+    let participants = concurrency
+        .checked_add(1)
+        .ok_or_else(|| BackendError::new("Task.Run memory participant count overflow"))?;
+    let uniform_extra =
+        (remaining / participants).min(local_limit.saturating_sub(initial_task_ceiling));
+    let task_context_ceiling_bytes = initial_task_ceiling
+        .checked_add(uniform_extra)
+        .ok_or_else(|| BackendError::new("Task.Run context entitlement overflow"))?;
+    let task_total = task_context_ceiling_bytes
+        .checked_mul(concurrency)
+        .ok_or_else(|| BackendError::new("Task.Run aggregate entitlement overflow"))?;
+    let main_local_headroom = local_limit.saturating_sub(main_retained_capacity_bytes);
+    let main_future_growth_bytes = available_headroom_bytes
+        .checked_sub(task_total)
+        .ok_or_else(|| BackendError::new("Task.Run aggregate entitlement exceeds headroom"))?
+        .min(main_local_headroom);
+
+    Ok(TaskMemoryDomainPlan {
+        main_future_growth_bytes,
+        task_context_ceiling_bytes,
+        task_memory_concurrency_limit: concurrency_limit,
+    })
+}
+
 /// Split fixed available governed headroom by logical chunk index. When not
 /// every chunk can receive one minimum arena page, earlier chunks receive
 /// whole-page entitlement first and the next chunk receives the sub-page
@@ -1104,7 +1327,7 @@ pub(super) fn module_uses_tasks(module: &mir::Module) -> bool {
     })
 }
 
-fn module_uses_async(module: &mir::Module) -> bool {
+pub(super) fn module_uses_async(module: &mir::Module) -> bool {
     module.functions.iter().any(|function| {
         function.blocks.iter().any(|block| {
             block.instructions.iter().any(|instruction| {
@@ -1112,6 +1335,25 @@ fn module_uses_async(module: &mir::Module) -> bool {
                     instruction,
                     mir::Instruction::CallIntrinsic {
                         intrinsic: mir::Intrinsic::AsyncSpawn | mir::Intrinsic::AsyncSpawnInner,
+                        ..
+                    }
+                )
+            })
+        })
+    })
+}
+
+#[cfg(feature = "aarm-telemetry")]
+pub(super) fn module_uses_parallel(module: &mir::Module) -> bool {
+    module.functions.iter().any(|function| {
+        function.blocks.iter().any(|block| {
+            block.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    mir::Instruction::CallIntrinsic {
+                        intrinsic: mir::Intrinsic::ParallelFor
+                            | mir::Intrinsic::ParallelForEach
+                            | mir::Intrinsic::ParallelReduce,
                         ..
                     }
                 )
@@ -1200,6 +1442,185 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "aarm-telemetry")]
+    fn governed_plain_task_outcomes_are_scheduler_and_wait_order_independent() {
+        const HARD_LIMIT: usize = 64 * 1024;
+        let module = Arc::new(compile(
+            "public int Small() { int[] scratch = new int[1]; return 1; } \
+             public int Large() { int[] scratch = new int[20000]; return 2; }",
+        ));
+        let small = symbol(&module, "Small");
+        let large = symbol(&module, "Large");
+
+        for worker_count in [1, 2, 4, 16] {
+            let governor = Arc::new(aster_runtime::MemoryGovernor::new(HARD_LIMIT));
+            let mut main =
+                aster_runtime::ExecutionContext::with_memory_governor(Arc::clone(&governor));
+            let mut runtime = TaskRuntime::with_task_memory_governor(
+                &module,
+                worker_count,
+                Arc::clone(&governor),
+            )
+            .expect("governed task runtime starts");
+            let mut expected_failure = None;
+
+            for repetition in 0..10 {
+                let a = runtime
+                    .run_from_context(small, &mut main)
+                    .expect("small A submits");
+                let b = runtime
+                    .run_from_context(large, &mut main)
+                    .expect("large B submits");
+                let c = runtime
+                    .run_from_context(small, &mut main)
+                    .expect("small C submits");
+                let d = runtime
+                    .run_from_context(large, &mut main)
+                    .expect("large D submits");
+                let perturbation = thread::spawn(|| {
+                    for _ in 0..64 {
+                        thread::yield_now();
+                    }
+                });
+                let order = if repetition % 2 == 0 {
+                    [d, a, c, b]
+                } else {
+                    [a, b, c, d]
+                };
+                let outcomes = order.map(|id| runtime.wait(id).expect("task handle is known"));
+                perturbation.join().expect("perturbation completes");
+
+                for (position, outcome) in outcomes.into_iter().enumerate() {
+                    let should_fail = if repetition % 2 == 0 {
+                        matches!(position, 0 | 3)
+                    } else {
+                        matches!(position, 1 | 3)
+                    };
+                    match (should_fail, outcome) {
+                        (false, TaskOutcome::Completed(ExecutionValue::Int(1), _)) => {}
+                        (true, TaskOutcome::Failed(error)) => {
+                            assert!(
+                                error
+                                    .message()
+                                    .contains("deterministic Task.Run memory entitlement"),
+                                "unexpected task error: {error}"
+                            );
+                            assert_eq!(
+                                expected_failure.get_or_insert_with(|| error.message().to_owned()),
+                                error.message()
+                            );
+                        }
+                        (_, outcome) => panic!("unexpected task outcome: {outcome:?}"),
+                    }
+                }
+                assert_eq!(governor.telemetry().current_capacity_bytes, 0);
+            }
+
+            runtime.quiesce_workers();
+            let domain = runtime
+                .task_domain_telemetry()
+                .expect("first submission freezes the domain");
+            assert_eq!(domain.task_submissions, 40);
+            assert_eq!(domain.task_contexts_started, 40);
+            assert_eq!(domain.task_contexts_completed, 40);
+            assert_eq!(domain.task_context_memory_failures, 20);
+            let telemetry = governor.telemetry();
+            assert_eq!(telemetry.current_capacity_bytes, 0);
+            assert!(telemetry.peak_capacity_bytes <= telemetry.hard_limit_bytes);
+            assert_eq!(telemetry.grant_events, telemetry.release_events);
+            assert_eq!(
+                telemetry.granted_bytes_cumulative,
+                telemetry.released_bytes_cumulative
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "aarm-telemetry")]
+    fn queued_plain_tasks_do_not_precharge_their_entitlements() {
+        let module = Arc::new(compile("public int One() { return 1; }"));
+        let one = symbol(&module, "One");
+        let governor = Arc::new(aster_runtime::MemoryGovernor::new(64 * 1024));
+        let mut main = aster_runtime::ExecutionContext::with_memory_governor(Arc::clone(&governor));
+        let mut runtime = TaskRuntime::with_task_memory_governor(&module, 2, Arc::clone(&governor))
+            .expect("governed task runtime starts");
+
+        let handles = (0..16)
+            .map(|_| {
+                runtime
+                    .run_from_context(one, &mut main)
+                    .expect("queued task submits")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(governor.telemetry().current_capacity_bytes, 0);
+        for handle in handles {
+            assert!(matches!(
+                runtime.wait(handle).expect("queued task completes"),
+                TaskOutcome::Completed(ExecutionValue::Int(1), _)
+            ));
+        }
+        runtime.quiesce_workers();
+        let domain = runtime.task_domain_telemetry().expect("domain exists");
+        assert_eq!(domain.task_memory_concurrency_limit, 2);
+        assert_eq!(domain.task_submissions, 16);
+        assert_eq!(domain.task_contexts_completed, 16);
+        assert_eq!(governor.telemetry().grant_events, 0);
+    }
+
+    #[test]
+    #[cfg(feature = "aarm-telemetry")]
+    fn main_and_tasks_do_not_race_for_unpartitioned_future_headroom() {
+        let module = Arc::new(compile(
+            "public int Small() { int[] scratch = new int[1]; return 1; }",
+        ));
+        let small = symbol(&module, "Small");
+
+        for worker_count in [1, 2, 4, 16] {
+            for _ in 0..10 {
+                let governor = Arc::new(aster_runtime::MemoryGovernor::new(64 * 1024));
+                let mut main =
+                    aster_runtime::ExecutionContext::with_memory_governor(Arc::clone(&governor));
+                assert!(!aster_runtime::context::aster_rt_array_new(&raw mut main, 1, 1).is_null());
+                let mut runtime = TaskRuntime::with_task_memory_governor(
+                    &module,
+                    worker_count,
+                    Arc::clone(&governor),
+                )
+                .expect("governed task runtime starts");
+
+                let first = runtime
+                    .run_from_context(small, &mut main)
+                    .expect("first task submits");
+                let second = runtime
+                    .run_from_context(small, &mut main)
+                    .expect("second task submits");
+                assert!(
+                    aster_runtime::context::aster_rt_array_new(&raw mut main, 10_000, 4).is_null()
+                );
+                assert!(main.take_error().is_some_and(|error| {
+                    error.contains("deterministic Task.Run main-context memory entitlement")
+                }));
+
+                for handle in [second, first] {
+                    assert!(matches!(
+                        runtime.wait(handle).expect("task outcome is cached"),
+                        TaskOutcome::Completed(ExecutionValue::Int(1), _)
+                    ));
+                }
+                runtime.quiesce_workers();
+                assert_eq!(
+                    governor.telemetry().current_capacity_bytes,
+                    u64::try_from(aster_runtime::ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES)
+                        .expect("minimum page fits u64")
+                );
+                drop(runtime);
+                drop(main);
+                assert_eq!(governor.telemetry().current_capacity_bytes, 0);
+            }
+        }
+    }
+
+    #[test]
     fn independent_static_task_submissions_prepare_together() {
         let module = Arc::new(compile(
             "public int Work() { return 1; } public int Main() { Task<int> a = Task.Run(Work); Task<int> b = Task.Run(Work); return a.Wait() + b.Wait(); }",
@@ -1268,6 +1689,44 @@ mod tests {
             parallel_chunk_budgets(5 * page / 2, 3).unwrap(),
             [page, page, page / 2]
         );
+    }
+
+    #[test]
+    fn task_memory_domain_planning_is_page_aware_uniform_and_bounded() {
+        let page = u64::try_from(aster_runtime::ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES)
+            .expect("minimum page capacity fits u64");
+        let local_limit =
+            u64::try_from(aster_runtime::ExecutionContext::AARM_MAX_CONTEXT_CAPACITY_BYTES)
+                .expect("local limit fits u64");
+
+        let cases = [
+            (0, 4, 1, 0, 0),
+            (page - 1, 4, 1, page - 1, 0),
+            (page, 4, 1, page, 0),
+            (2 * page, 4, 2, page, 0),
+            (4 * page, 4, 4, page, 0),
+            (4 * page + 10, 4, 4, page + 2, 2),
+        ];
+        for (headroom, workers, concurrency, task_ceiling, main_growth) in cases {
+            let plan = plan_task_memory_domain(headroom, 0, workers).expect("plan succeeds");
+            assert_eq!(plan.task_memory_concurrency_limit, concurrency);
+            assert_eq!(plan.task_context_ceiling_bytes, task_ceiling);
+            assert_eq!(plan.main_future_growth_bytes, main_growth);
+            assert!(
+                u128::from(plan.main_future_growth_bytes)
+                    + u128::from(plan.task_context_ceiling_bytes)
+                        * u128::try_from(plan.task_memory_concurrency_limit)
+                            .expect("concurrency fits u128")
+                    <= u128::from(headroom)
+            );
+        }
+
+        let almost_full_main = local_limit - 100;
+        let bounded = plan_task_memory_domain(u64::MAX, almost_full_main, 16)
+            .expect("large addressable plan succeeds");
+        assert_eq!(bounded.main_future_growth_bytes, 100);
+        assert_eq!(bounded.task_context_ceiling_bytes, local_limit);
+        assert_eq!(bounded.task_memory_concurrency_limit, 16);
     }
 
     #[test]

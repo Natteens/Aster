@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use super::task_runtime::{TaskRuntime, module_uses_tasks};
+#[cfg(feature = "aarm-telemetry")]
+use super::task_runtime::{module_uses_async, module_uses_parallel};
 use super::{
     BackendError, Codegen, ExecutionValue, HashMap, JITBuilder, JITModule, default_libcall_names,
     mir, module_error, runtime_functions,
@@ -173,6 +175,59 @@ impl PreparedProgram {
         } else {
             value.map(|v| (v, stats, telemetry))
         }
+    }
+
+    /// Invoke one plain `Task.Run` target in its own fresh context. Governed
+    /// jobs receive the frozen task-domain ceiling; ordinary and awaited
+    /// async-inner jobs retain the existing ungoverned path.
+    pub(super) fn run_task(
+        &self,
+        symbol: mir::SymbolId,
+        collect_stats: bool,
+        memory_domain: Option<&super::worker_pool::TaskMemoryDomain>,
+    ) -> (
+        super::worker_pool::TaskOutcome,
+        Option<aster_runtime::AarmMemoryTelemetry>,
+    ) {
+        use super::worker_pool::TaskOutcome;
+
+        let Some((pointer, return_type)) = self.entries.get(&symbol) else {
+            return (
+                TaskOutcome::Failed(BackendError::new(format!(
+                    "symbol {symbol:?} was not prepared"
+                ))),
+                None,
+            );
+        };
+        let mut context = memory_domain.map_or_else(
+            || {
+                if collect_stats {
+                    aster_runtime::ExecutionContext::with_stats()
+                } else {
+                    aster_runtime::ExecutionContext::new()
+                }
+            },
+            |domain| {
+                aster_runtime::ExecutionContext::with_task_memory_budget(
+                    Arc::clone(domain.governor()),
+                    domain.local_limit_bytes(),
+                )
+            },
+        );
+        let value = invoke_finalized(*pointer, return_type, &mut context);
+        let runtime_error = context.take_error();
+        let stats = context.memory_stats().clone();
+        let telemetry = context.aarm_memory_telemetry();
+        let outcome = match runtime_error {
+            Some(error) => {
+                TaskOutcome::Failed(BackendError::new(format!("Aster runtime error: {error}")))
+            }
+            None => match value {
+                Ok(value) => TaskOutcome::Completed(value, stats),
+                Err(error) => TaskOutcome::Failed(error),
+            },
+        };
+        (outcome, telemetry)
     }
 
     /// Run one async `MoveNext` step on the host, passing the outer task's
@@ -783,6 +838,48 @@ pub(super) fn execute_resolved_with_aarm_parallel_workers(
     let mut runtime = TaskRuntime::new(&Arc::new(module.clone()), worker_count)?;
     let pointer = std::ptr::from_mut(&mut runtime).cast::<()>();
     prepared.invoke_with_aarm_telemetry(entry.symbol, Some(pointer))
+}
+
+#[cfg(feature = "aarm-telemetry")]
+pub(super) fn execute_resolved_with_aarm_task_governor(
+    module: &mir::Module,
+    entry: &mir::Function,
+    worker_count: usize,
+    governor: Arc<aster_runtime::MemoryGovernor>,
+) -> Result<
+    (
+        ExecutionValue,
+        aster_runtime::AarmMemoryTelemetry,
+        Option<super::AarmTaskMemoryDomainTelemetry>,
+    ),
+    BackendError,
+> {
+    if module_uses_async(module) {
+        return Err(BackendError::new(
+            "experimental governed Task.Run does not support async execution",
+        ));
+    }
+    if module_uses_parallel(module) {
+        return Err(BackendError::new(
+            "experimental governed Task.Run does not support mixed Parallel execution",
+        ));
+    }
+    let prepared = PreparedProgram::prepare(module)?;
+    if !module_uses_tasks(module) {
+        return prepared
+            .invoke_with_memory_governor(entry.symbol, None, governor)
+            .map(|(value, telemetry)| (value, telemetry, None));
+    }
+    let mut runtime = TaskRuntime::with_task_memory_governor(
+        &Arc::new(module.clone()),
+        worker_count,
+        Arc::clone(&governor),
+    )?;
+    let pointer = std::ptr::from_mut(&mut runtime).cast::<()>();
+    let outcome = prepared.invoke_with_memory_governor(entry.symbol, Some(pointer), governor);
+    runtime.quiesce_workers();
+    let task_domain = runtime.task_domain_telemetry();
+    outcome.map(|(value, telemetry)| (value, telemetry, task_domain))
 }
 
 /// This is the only unsafe boundary in the backend. Cranelift returns an untyped

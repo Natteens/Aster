@@ -51,11 +51,15 @@ use execution::execute_resolved_with_aarm_parallel_governor;
 #[cfg(feature = "aarm-telemetry")]
 use execution::execute_resolved_with_aarm_parallel_workers;
 #[cfg(feature = "aarm-telemetry")]
+use execution::execute_resolved_with_aarm_task_governor;
+#[cfg(feature = "aarm-telemetry")]
 use execution::execute_resolved_with_aarm_telemetry;
 use layouts::Layouts;
 #[cfg(feature = "aarm-telemetry")]
 #[doc(hidden)]
-pub use task_runtime::{AarmParallelPlanningTelemetry, parallel_chunk_budgets};
+pub use task_runtime::{
+    AarmParallelPlanningTelemetry, AarmTaskMemoryDomainTelemetry, parallel_chunk_budgets,
+};
 use validation::{select_entry, validate_invocable_entry, validate_module};
 use values::{
     cast_value, integer_constant_bits, is_aggregate, primitive, scalar_from_bits, scalar_kind,
@@ -264,6 +268,36 @@ pub fn execute_with_aarm_parallel_workers(
     validate_module(module)?;
     let entry = select_entry(module, function_name)?;
     execute_resolved_with_aarm_parallel_workers(module, entry, worker_count)
+}
+
+/// Execute with the experimental governor applied to Main and plain
+/// `Task.Run` through one frozen deterministic task memory domain.
+///
+/// Async and Parallel execution are rejected by this research-only entry
+/// point until their memory domains are integrated explicitly.
+///
+/// # Errors
+///
+/// Returns controlled validation, unsupported-domain, preparation, and
+/// runtime errors.
+#[doc(hidden)]
+#[cfg(feature = "aarm-telemetry")]
+pub fn execute_with_aarm_task_governor(
+    module: &mir::Module,
+    function_name: &str,
+    worker_count: usize,
+    governor: std::sync::Arc<aster_runtime::MemoryGovernor>,
+) -> Result<
+    (
+        ExecutionValue,
+        AarmMemoryTelemetry,
+        Option<AarmTaskMemoryDomainTelemetry>,
+    ),
+    BackendError,
+> {
+    validate_module(module)?;
+    let entry = select_entry(module, function_name)?;
+    execute_resolved_with_aarm_task_governor(module, entry, worker_count, governor)
 }
 
 /// Like [`execute`], but injects `console_backend` for `aster.io.Write`/
