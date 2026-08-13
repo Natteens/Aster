@@ -21,6 +21,8 @@ validated 50,000,000-element `long` array workload (about 400 MB of payload). Al
 arithmetic is checked and arena pages are obtained fallibly; an impossible size, an exceeded
 budget, or a host allocation failure records the first controlled ASTER runtime error. No partial
 collection header is published on failure. The limit applies equally to worker-owned contexts.
+These guarantees apply to allocations that remain after compiler optimization. A proven
+unobservable allocation may be removed completely, so it never reaches the context or governor.
 
 This per-execution model keeps cleanup deterministic while ASTER has no general ownership syntax.
 Escape analysis selects a region for compiler-known dynamic allocations; see
@@ -35,10 +37,12 @@ worker or the caller.
 
 ## Object ABI
 
-A class value is a non-null pointer to zeroed context-owned storage laid out in declaration order
-with natural field alignment. `new Class(arguments)` allocates that storage and immediately invokes
-the resolved constructor with the object as a hidden receiver. Methods receive the same receiver;
-assigning or passing a class value copies only its pointer.
+A materialized class value is a non-null pointer to zeroed context-owned storage laid out in
+declaration order with natural field alignment. A materialized `new Class(arguments)` allocates
+that storage and immediately invokes the resolved constructor with the object as a hidden receiver.
+When identity and storage are compiler-proven unobservable, `new` does not guarantee a physical
+arena allocation. Methods receive the same receiver; assigning or passing a class value copies only
+its pointer.
 
 The compiler permits zero defaults only for fields whose all-zero representation is valid. Array
 and class references have no hidden null value and must be initialized by the constructor before

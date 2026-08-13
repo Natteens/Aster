@@ -7,6 +7,7 @@ mod generics;
 mod git_source;
 mod hir_lowering;
 mod lifetime_analysis;
+mod local_object_elimination;
 mod lockfile;
 mod manifest;
 mod mir_lowering;
@@ -95,6 +96,7 @@ fn compile_module(
         let hir = hir_lowering::lower(&module, &semantic_model, intrinsic_bindings);
         let mut mir = mir_lowering::lower(&hir);
         escape_analysis::assign_allocation_regions(&mut mir);
+        local_object_elimination::eliminate(&mut mir);
         temporary_subregions::lower_production_aarm_temporary_subregions(&mut mir);
         Ok(Compilation {
             tokens,

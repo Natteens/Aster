@@ -38,6 +38,28 @@ The analysis is intentionally conservative. Uncertainty selects persistent
 storage. There is no silent fallback in the backend: each MIR region maps to a
 specific runtime ABI function.
 
+### Local object allocation elimination
+
+After escape analysis assigns regions, the compiler removes one deliberately
+narrow class-object representation when identity is unobservable. The accepted
+shape is a `Temporary`, direct-local object with an empty parameterless
+constructor, only scalar fields, and only direct local field reads and writes.
+The allocation, constructor receiver, and lowering-only object copy become
+ordinary typed MIR scalar locals; field locals are zero-initialized at every
+dynamic `new`, matching the class ABI's zeroed storage.
+
+This is complete allocation elision: the removed allocation performs no arena
+operation, consumes no governor budget, creates no resource-failure point, and
+contributes nothing to runtime memory statistics. This does not weaken checked
+failure and cleanup for allocations that remain in executable MIR.
+
+Any source-visible alias, identity comparison, nontrivial constructor, return,
+storage or containment, method/call/interface boundary, reference field, or
+unsupported use keeps the ordinary object allocation. Escape analysis remains
+the lifetime authority. Eliminated allocations disappear before AARM lifetime
+planning, and Cranelift receives already-transformed typed MIR; neither the
+backend nor runtime performs object-elimination inference.
+
 ### AARM lifetime analysis
 
 After allocation regions are assigned, normal compilation invokes an internal MIR lifetime
@@ -128,10 +150,12 @@ region determines the lifetime.
 
 `aster run <FILE> --memory-stats` prints one snapshot after execution.
 
-- `allocations`, `objects`, `arrays`, and `strings` are cumulative logical allocation counts.
+- `allocations`, `objects`, `arrays`, and `strings` count dynamic runtime allocations that actually
+  execute after compiler optimization. A source-level `new` eliminated because its identity and
+  storage are unobservable contributes no allocation or requested bytes.
   Collection and `StringBuilder` headers/backing buffers use the existing object category;
   immutable snapshots use the string category.
-- `requested` is cumulative logical requested storage. It excludes arena
+- `requested` is cumulative storage requested by dynamic runtime allocations. It excludes arena
   alignment padding and excludes the separate array header.
 - `used` is the current consumed storage across both arenas.
 - `reserved` is the total page capacity retained by both arenas.

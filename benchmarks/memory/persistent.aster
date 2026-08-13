@@ -1,12 +1,16 @@
 public class BenchmarkBox
 {
     public int value;
+
+    public BenchmarkBox(int value)
+    {
+        this.value = value;
+    }
 }
 
 internal BenchmarkBox MakeBox()
 {
-    BenchmarkBox box = new BenchmarkBox();
-    box.value = 39;
+    BenchmarkBox box = new BenchmarkBox(39);
     return box;
 }
 

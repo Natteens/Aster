@@ -59,10 +59,9 @@ fn string_regions(module: &mir::Module, function_name: &str) -> Vec<mir::Allocat
 #[test]
 fn compiler_marks_local_object_temporary_and_rewinds_at_return() {
     let source = r"
-        public class Point { public int value; }
+        public class Point { public int value; public Point(int value) { this.value = value; } }
         public int Run() {
-            Point point = new Point();
-            point.value = 42;
+            Point point = new Point(42);
             return point.value;
         }
     ";
@@ -87,17 +86,15 @@ fn compiler_marks_local_object_temporary_and_rewinds_at_return() {
 #[test]
 fn direct_and_helper_object_loops_match_and_rewind_at_their_existing_boundaries() {
     let source = r"
-        public class Box { public int value; }
+        public class Box { public int value; public Box(int value) { this.value = value; } }
         internal int Build() {
-            Box box = new Box();
-            box.value = 1;
+            Box box = new Box(1);
             return box.value;
         }
         public int Direct() {
             int total = 0;
             for (int index = 0; index < 1000; index++) {
-                Box box = new Box();
-                box.value = 1;
+                Box box = new Box(1);
                 total += box.value;
             }
             return total;
@@ -130,15 +127,13 @@ fn direct_and_helper_object_loops_match_and_rewind_at_their_existing_boundaries(
 #[test]
 fn nested_function_scopes_preserve_the_callers_temporary_object() {
     let source = r"
-        public class Box { public int value; }
+        public class Box { public int value; public Box(int value) { this.value = value; } }
         internal int Build() {
-            Box inner = new Box();
-            inner.value = 22;
+            Box inner = new Box(22);
             return inner.value;
         }
         public int Run() {
-            Box outer = new Box();
-            outer.value = 20;
+            Box outer = new Box(20);
             return outer.value + Build();
         }
     ";
@@ -168,16 +163,15 @@ fn leaving_a_nested_temporary_scope_does_not_rewind_persistent_storage() {
         public interface IBox { int Get(); }
         public class Box : IBox {
             public int value;
+            public Box(int value) { this.value = value; }
             public int Get() { return value; }
         }
         internal int Build() {
-            Box temporary = new Box();
-            temporary.value = 22;
+            Box temporary = new Box(22);
             return temporary.value;
         }
         public int Run() {
-            Box persistent = new Box();
-            persistent.value = 20;
+            Box persistent = new Box(20);
             IBox view = persistent;
             return view.Get() + Build();
         }
@@ -204,9 +198,9 @@ fn leaving_a_nested_temporary_scope_does_not_rewind_persistent_storage() {
 #[test]
 fn every_early_return_path_leaves_its_temporary_scope() {
     let source = r"
-        public class Box { public int value; }
+        public class Box { public int value; public Box(int value) { this.value = value; } }
         internal int Choose(bool first) {
-            Box box = new Box();
+            Box box = new Box(0);
             if (first) {
                 box.value = 20;
                 return box.value;
@@ -235,10 +229,9 @@ fn every_early_return_path_leaves_its_temporary_scope() {
 #[test]
 fn implicit_end_leaves_a_temporary_scope() {
     let source = r"
-        public class Box { public int value; }
+        public class Box { public int value; public Box(int value) { this.value = value; } }
         internal void Work() {
-            Box box = new Box();
-            box.value = 42;
+            Box box = new Box(42);
         }
         public int Run() {
             Work();

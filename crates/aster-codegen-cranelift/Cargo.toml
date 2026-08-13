@@ -19,6 +19,11 @@ required-features = ["aarm-telemetry"]
 name = "aarm_iteration_loop"
 path = "examples/aarm_iteration_loop.rs"
 
+[[example]]
+name = "local_object_elimination_matrix"
+path = "examples/local_object_elimination_matrix.rs"
+required-features = ["aarm-telemetry"]
+
 [dependencies]
 aster-mir = { path = "../aster-mir", version = "0.56.0" }
 aster-runtime = { path = "../aster-runtime", version = "0.56.0" }

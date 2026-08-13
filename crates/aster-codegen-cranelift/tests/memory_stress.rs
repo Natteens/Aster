@@ -4,11 +4,11 @@ use aster_compiler::compile;
 const TEMPORARY_STRESS: &str = r#"
     public class StressBox {
         public int value;
+        public StressBox(int value) { this.value = value; }
     }
 
     internal int BuildTemporary() {
-        StressBox box = new StressBox();
-        box.value = 39;
+        StressBox box = new StressBox(39);
 
         int[] values = [1];
 
@@ -30,11 +30,11 @@ const TEMPORARY_STRESS: &str = r#"
 const PERSISTENT_STRESS: &str = r#"
     public class StressBox {
         public int value;
+        public StressBox(int value) { this.value = value; }
     }
 
     internal StressBox MakeBox() {
-        StressBox box = new StressBox();
-        box.value = 39;
+        StressBox box = new StressBox(39);
         return box;
     }
 

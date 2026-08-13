@@ -181,6 +181,73 @@ impl fmt::Display for BackendError {
 
 impl Error for BackendError {}
 
+/// Release-benchmark seam that prepares sequential machine code once and
+/// invokes it repeatedly against fresh execution contexts.
+///
+/// Normal ASTER execution continues to use [`execute`]. This type exists so
+/// research measurements can exclude MIR validation, Cranelift compilation,
+/// and JIT finalization from the timed execution interval.
+#[cfg(feature = "aarm-telemetry")]
+#[doc(hidden)]
+pub struct PreparedSequentialExecution {
+    program: execution::PreparedProgram,
+    entry: mir::SymbolId,
+}
+
+#[cfg(feature = "aarm-telemetry")]
+impl PreparedSequentialExecution {
+    /// Validate and finalize one sequential entry before measurement.
+    ///
+    /// # Errors
+    ///
+    /// Returns a controlled error for invalid MIR, an invalid entry, task
+    /// operations, or Cranelift preparation failure.
+    pub fn prepare(module: &mir::Module, function_name: &str) -> Result<Self, BackendError> {
+        validate_module(module)?;
+        if task_runtime::module_uses_tasks(module) {
+            return Err(BackendError::new(
+                "prepared sequential research execution does not support Task.Run",
+            ));
+        }
+        let entry = select_entry(module, function_name)?.symbol;
+        let program = execution::PreparedProgram::prepare(module)?;
+        Ok(Self { program, entry })
+    }
+
+    /// Invoke finalized code once without collecting memory statistics.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same controlled runtime and entry errors as [`execute`].
+    pub fn invoke(&self) -> Result<ExecutionValue, BackendError> {
+        self.program
+            .invoke(self.entry, false, None, None, None)
+            .map(|(value, _)| value)
+    }
+
+    /// Invoke finalized code once and return stable runtime memory statistics.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same controlled runtime and entry errors as [`execute_with_stats`].
+    pub fn invoke_with_stats(&self) -> Result<(ExecutionValue, MemoryStats), BackendError> {
+        self.program.invoke(self.entry, true, None, None, None)
+    }
+
+    /// Invoke finalized code once with experimental allocator telemetry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same controlled runtime and entry errors as
+    /// [`execute_with_aarm_telemetry`].
+    #[cfg(feature = "aarm-telemetry")]
+    pub fn invoke_with_aarm_telemetry(
+        &self,
+    ) -> Result<(ExecutionValue, AarmMemoryTelemetry), BackendError> {
+        self.program.invoke_with_aarm_telemetry(self.entry, None)
+    }
+}
+
 /// Compile a validated MIR module in memory and invoke one explicitly selected function.
 ///
 /// If, and only if, `module` contains `aster.core.Task.Run`/`Task<T>.Wait`

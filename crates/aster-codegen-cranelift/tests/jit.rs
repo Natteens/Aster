@@ -1625,8 +1625,8 @@ fn run_with_stats(
 #[test]
 fn execute_without_stats_returns_zero_metrics() {
     let source = r"
-        public class Point { public int x; public int y; }
-        public int Run() { Point p = new Point(); return 1; }
+        public class Point { public int x; public int y; public Point(int x) { this.x = x; } }
+        public int Run() { Point p = new Point(0); return 1; }
     ";
     let compilation = compile(source).expect("should compile");
     let (_, stats) = aster_codegen_cranelift::execute_with_stats(&compilation.mir, "Run")
@@ -1654,8 +1654,8 @@ fn stats_same_result_with_or_without_stats() {
 #[test]
 fn stats_object_allocation_from_class() {
     let source = r"
-        public class Point { public int x; public int y; }
-        public int Run() { Point p = new Point(); return 1; }
+        public class Point { public int x; public int y; public Point(int x) { this.x = x; } }
+        public int Run() { Point p = new Point(0); return 1; }
     ";
     let (value, stats) = run_with_stats(source, "Run").expect("should run");
     assert_eq!(value, ExecutionValue::Int(1));
@@ -1758,9 +1758,9 @@ fn static_string_concat_chain_allocates_once() {
 #[test]
 fn stats_multiple_allocation_types() {
     let source = r#"
-        public class Box { public int value; }
+        public class Box { public int value; public Box(int value) { this.value = value; } }
         public string Run() {
-            Box b = new Box();
+            Box b = new Box(0);
             int[] arr = new int[3];
             return $"box={b.value}, len={arr.Length}";
         }
