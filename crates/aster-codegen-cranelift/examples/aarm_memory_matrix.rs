@@ -12,12 +12,13 @@ use std::{
 };
 
 use aster_codegen_cranelift::{
-    AarmAsyncMemoryDomainTelemetry, AarmAutoBudgetTelemetry, AarmHostMemoryCapacity,
-    AarmMemoryTelemetry, AarmParallelPlanningTelemetry, AarmTaskMemoryDomainTelemetry,
-    ExecutionValue, aarm_auto_governor_from_capacity, discover_aarm_host_memory_capacity,
-    execute_with_aarm_async_governor, execute_with_aarm_parallel_governor,
-    execute_with_aarm_parallel_workers, execute_with_aarm_task_governor,
-    execute_with_aarm_telemetry, parallel_chunk_budgets, resolve_aarm_auto_budget,
+    AarmAsyncMemoryDomainTelemetry, AarmAutoBudgetTelemetry, AarmBudgetPolicy,
+    AarmHostMemoryCapacity, AarmMemoryTelemetry, AarmParallelPlanningTelemetry,
+    AarmTaskMemoryDomainTelemetry, ExecutionValue, aarm_auto_governor_from_capacity,
+    aarm_explicit_governor, discover_aarm_host_memory_capacity, execute_with_aarm_async_governor,
+    execute_with_aarm_parallel_governor, execute_with_aarm_parallel_workers,
+    execute_with_aarm_task_governor, execute_with_aarm_telemetry, parallel_chunk_budgets,
+    resolve_aarm_auto_budget, resolve_aarm_explicit_budget,
 };
 use aster_compiler::compile;
 use aster_runtime::{
@@ -116,12 +117,17 @@ pub struct CaseResult {
 
 #[must_use]
 pub fn run_matrix(scales: &[Scale]) -> Vec<CaseResult> {
-    run_matrix_with_host_capacity(scales, discover_aarm_host_memory_capacity())
+    run_matrix_with_budget(
+        scales,
+        AarmBudgetPolicy::Auto,
+        Some(discover_aarm_host_memory_capacity()),
+    )
 }
 
-fn run_matrix_with_host_capacity(
+fn run_matrix_with_budget(
     scales: &[Scale],
-    host_capacity: AarmHostMemoryCapacity,
+    budget_policy: AarmBudgetPolicy,
+    host_capacity: Option<AarmHostMemoryCapacity>,
 ) -> Vec<CaseResult> {
     let mut results = Vec::new();
     for &scale in scales {
@@ -202,49 +208,63 @@ fn run_matrix_with_host_capacity(
         results.push(async_temporal_inner_case(scale));
         results.push(async_temporal_after_await_case(scale));
         for kind in [
-            AutoWorkload::Plain,
-            AutoWorkload::Parallel,
-            AutoWorkload::Task,
-            AutoWorkload::Async,
+            BudgetWorkload::Plain,
+            BudgetWorkload::Parallel,
+            BudgetWorkload::Task,
+            BudgetWorkload::Async,
         ] {
-            results.push(auto_governor_case(scale, kind, host_capacity));
+            results.push(budget_governor_case(
+                scale,
+                kind,
+                budget_policy,
+                host_capacity,
+            ));
         }
     }
     results
 }
 
 #[derive(Clone, Copy)]
-enum AutoWorkload {
+enum BudgetWorkload {
     Plain,
     Parallel,
     Task,
     Async,
 }
 
-fn auto_governor_case(
+fn budget_governor_case(
     scale: Scale,
-    kind: AutoWorkload,
-    host_capacity: AarmHostMemoryCapacity,
+    kind: BudgetWorkload,
+    budget_policy: AarmBudgetPolicy,
+    host_capacity: Option<AarmHostMemoryCapacity>,
 ) -> CaseResult {
-    let auto = aarm_auto_governor_from_capacity(host_capacity).expect("Auto capacity resolves");
+    let budget = match budget_policy {
+        AarmBudgetPolicy::Auto => aarm_auto_governor_from_capacity(
+            host_capacity.expect("Auto matrix execution has its captured capacity"),
+        )
+        .expect("Auto capacity resolves"),
+        AarmBudgetPolicy::ExactBytes(requested_bytes) => {
+            aarm_explicit_governor(requested_bytes).expect("explicit capacity resolves")
+        }
+    };
     let (workload, source, workers) = match kind {
-        AutoWorkload::Plain => (
-            "auto_governed_plain",
+        BudgetWorkload::Plain => (
+            "budget_governed_plain",
             "public int Main() { int[] values = new int[1]; return values.Length; }",
             1,
         ),
-        AutoWorkload::Parallel => (
-            "auto_governed_parallel",
+        BudgetWorkload::Parallel => (
+            "budget_governed_parallel",
             "public void Body(int index) { int[] values = new int[1]; } public int Main() { Parallel.For(0, 4, Body); return 4; }",
             4,
         ),
-        AutoWorkload::Task => (
-            "auto_governed_task",
+        BudgetWorkload::Task => (
+            "budget_governed_task",
             "public int Work() { int[] values = new int[1]; return values.Length; } public int Main() { return Task.Run(Work).Wait(); }",
             4,
         ),
-        AutoWorkload::Async => (
-            "auto_governed_async",
+        BudgetWorkload::Async => (
+            "budget_governed_async",
             "public int Work() { int[] values = new int[1]; return values.Length; } public async Task<int> Later() { return await Task.Run(Work); } public int Main() { return Later().Wait(); }",
             4,
         ),
@@ -253,26 +273,26 @@ fn auto_governor_case(
     let before = process_memory();
     let started = Instant::now();
     let (value, mut telemetry, parallel_plans, task_domain, async_domain) = match kind {
-        AutoWorkload::Plain | AutoWorkload::Parallel => {
+        BudgetWorkload::Plain | BudgetWorkload::Parallel => {
             let (value, telemetry, plans, _) =
-                execute_with_aarm_parallel_governor(&module, "Main", workers, auto.governor())
-                    .expect("Auto Parallel path executes");
+                execute_with_aarm_parallel_governor(&module, "Main", workers, budget.governor())
+                    .expect("budget Parallel path executes");
             (value, telemetry, plans, None, None)
         }
-        AutoWorkload::Task => {
+        BudgetWorkload::Task => {
             let (value, telemetry, domain) =
-                execute_with_aarm_task_governor(&module, "Main", workers, auto.governor())
-                    .expect("Auto Task path executes");
+                execute_with_aarm_task_governor(&module, "Main", workers, budget.governor())
+                    .expect("budget Task path executes");
             (value, telemetry, Vec::new(), domain, None)
         }
-        AutoWorkload::Async => {
+        BudgetWorkload::Async => {
             let (value, telemetry, domain) =
-                execute_with_aarm_async_governor(&module, "Main", workers, auto.governor())
-                    .expect("Auto async path executes");
+                execute_with_aarm_async_governor(&module, "Main", workers, budget.governor())
+                    .expect("budget async path executes");
             (value, telemetry, Vec::new(), None, domain)
         }
     };
-    telemetry.governor = Some(auto.governor().telemetry());
+    telemetry.governor = Some(budget.governor().telemetry());
     let elapsed_micros = started.elapsed().as_micros();
     let after = process_memory();
     let checksum = match value {
@@ -1848,7 +1868,10 @@ fn json_case(result: &CaseResult) -> String {
     )
 }
 
-fn json_host_memory_capacity(capacity: AarmHostMemoryCapacity) -> String {
+fn json_host_memory_capacity(capacity: Option<AarmHostMemoryCapacity>) -> String {
+    let Some(capacity) = capacity else {
+        return "null".to_string();
+    };
     let source = capacity.source.map_or_else(
         || "null".to_string(),
         |source| format!("\"{}\"", source.as_str()),
@@ -1862,17 +1885,23 @@ fn json_host_memory_capacity(capacity: AarmHostMemoryCapacity) -> String {
     )
 }
 
-fn json_auto_memory_budget(budget: Option<AarmAutoBudgetTelemetry>) -> String {
+fn json_memory_budget(budget: Option<AarmAutoBudgetTelemetry>) -> String {
     budget.map_or_else(
         || "null".to_string(),
         |budget| {
             format!(
-                "{{\"effective_capacity_bytes\":{},\"resolved_hard_limit_bytes\":{},\
-             \"address_width_clamped\":{},\"capacity_source\":\"{}\"}}",
-                budget.effective_capacity_bytes,
+                "{{\"source\":\"{}\",\"requested_explicit_bytes\":{},\
+             \"effective_capacity_bytes\":{},\"resolved_hard_limit_bytes\":{},\
+             \"address_width_clamped\":{},\"capacity_source\":{}}}",
+                budget.source.as_str(),
+                json_option(budget.requested_explicit_bytes),
+                json_option(budget.effective_capacity_bytes),
                 budget.resolved_hard_limit_bytes,
                 budget.address_width_clamped,
-                budget.capacity_source.as_str(),
+                budget.capacity_source.map_or_else(
+                    || "null".to_string(),
+                    |source| format!("\"{}\"", source.as_str())
+                ),
             )
         },
     )
@@ -1880,7 +1909,12 @@ fn json_auto_memory_budget(budget: Option<AarmAutoBudgetTelemetry>) -> String {
 
 #[must_use]
 pub fn serialize_results(results: &[CaseResult]) -> String {
-    serialize_results_with_host_capacity(results, discover_aarm_host_memory_capacity())
+    let host_capacity = discover_aarm_host_memory_capacity();
+    serialize_results_with_budget(
+        results,
+        Some(host_capacity),
+        resolve_aarm_auto_budget(host_capacity).ok(),
+    )
 }
 
 #[must_use]
@@ -1888,10 +1922,23 @@ pub fn serialize_results_with_host_capacity(
     results: &[CaseResult],
     host_capacity: AarmHostMemoryCapacity,
 ) -> String {
+    serialize_results_with_budget(
+        results,
+        Some(host_capacity),
+        resolve_aarm_auto_budget(host_capacity).ok(),
+    )
+}
+
+#[must_use]
+pub fn serialize_results_with_budget(
+    results: &[CaseResult],
+    host_capacity: Option<AarmHostMemoryCapacity>,
+    budget: Option<AarmAutoBudgetTelemetry>,
+) -> String {
     let mut output = format!(
-        "{{\"schema_version\":8,\"host_memory_capacity\":{},\"auto_memory_budget\":{},\"results\":[",
+        "{{\"schema_version\":9,\"host_memory_capacity\":{},\"memory_budget\":{},\"results\":[",
         json_host_memory_capacity(host_capacity),
-        json_auto_memory_budget(resolve_aarm_auto_budget(host_capacity).ok())
+        json_memory_budget(budget)
     );
     for (index, result) in results.iter().enumerate() {
         if index != 0 {
@@ -1903,10 +1950,35 @@ pub fn serialize_results_with_host_capacity(
     output
 }
 
-fn selected_scales() -> Vec<Scale> {
+struct MatrixOptions {
+    scales: Vec<Scale>,
+    budget_policy: AarmBudgetPolicy,
+    json: bool,
+}
+
+fn parse_matrix_options(
+    arguments: impl IntoIterator<Item = String>,
+) -> Result<MatrixOptions, String> {
     let mut selected = Vec::new();
-    let mut arguments = std::env::args().skip(1);
+    let mut budget_bytes = None;
+    let mut json = false;
+    let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
+        if argument == "--json" {
+            json = true;
+            continue;
+        }
+        if let Some(value) = argument.strip_prefix("--budget-bytes=") {
+            set_budget_bytes(&mut budget_bytes, value)?;
+            continue;
+        }
+        if argument == "--budget-bytes" {
+            let value = arguments.next().ok_or_else(|| {
+                "--budget-bytes requires a positive decimal byte count".to_string()
+            })?;
+            set_budget_bytes(&mut budget_bytes, &value)?;
+            continue;
+        }
         let value = if let Some(value) = argument.strip_prefix("--scale=") {
             Some(value.to_string())
         } else if argument == "--scale" {
@@ -1917,7 +1989,8 @@ fn selected_scales() -> Vec<Scale> {
         if let Some(value) = value {
             for token in value.split(',') {
                 if token == "all" {
-                    return vec![Scale::Small, Scale::Medium, Scale::Large];
+                    selected = vec![Scale::Small, Scale::Medium, Scale::Large];
+                    continue;
                 }
                 if let Some(scale) = Scale::parse(token) {
                     if !selected.contains(&scale) {
@@ -1927,20 +2000,57 @@ fn selected_scales() -> Vec<Scale> {
             }
         }
     }
-    if selected.is_empty() {
+    let scales = if selected.is_empty() {
         vec![Scale::Small, Scale::Medium]
     } else {
         selected
+    };
+    Ok(MatrixOptions {
+        scales,
+        budget_policy: budget_bytes.map_or(AarmBudgetPolicy::Auto, AarmBudgetPolicy::ExactBytes),
+        json,
+    })
+}
+
+fn set_budget_bytes(slot: &mut Option<u64>, value: &str) -> Result<(), String> {
+    if slot.is_some() {
+        return Err("--budget-bytes may be specified only once".to_string());
     }
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("--budget-bytes requires a positive decimal byte count".to_string());
+    }
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| "--budget-bytes is outside the u64 byte range".to_string())?;
+    if parsed == 0 {
+        return Err("--budget-bytes requires a positive decimal byte count".to_string());
+    }
+    *slot = Some(parsed);
+    Ok(())
 }
 
 fn main() {
-    let host_capacity = discover_aarm_host_memory_capacity();
-    let results = run_matrix_with_host_capacity(&selected_scales(), host_capacity);
-    if std::env::args().any(|argument| argument == "--json") {
+    let options = parse_matrix_options(std::env::args().skip(1)).unwrap_or_else(|error| {
+        eprintln!("aarm_memory_matrix: {error}");
+        std::process::exit(2);
+    });
+    let host_capacity = match options.budget_policy {
+        AarmBudgetPolicy::Auto => Some(discover_aarm_host_memory_capacity()),
+        AarmBudgetPolicy::ExactBytes(_) => None,
+    };
+    let budget = match options.budget_policy {
+        AarmBudgetPolicy::Auto => {
+            host_capacity.and_then(|capacity| resolve_aarm_auto_budget(capacity).ok())
+        }
+        AarmBudgetPolicy::ExactBytes(requested_bytes) => {
+            resolve_aarm_explicit_budget(requested_bytes).ok()
+        }
+    };
+    let results = run_matrix_with_budget(&options.scales, options.budget_policy, host_capacity);
+    if options.json {
         println!(
             "{}",
-            serialize_results_with_host_capacity(&results, host_capacity)
+            serialize_results_with_budget(&results, host_capacity, budget)
         );
         return;
     }
@@ -2016,9 +2126,37 @@ mod tests {
     #[test]
     fn structured_output_advertises_the_research_schema() {
         let json = serialize_results(&[]);
-        assert!(json.starts_with("{\"schema_version\":8,"));
+        assert!(json.starts_with("{\"schema_version\":9,"));
         assert!(json.contains("\"host_memory_capacity\""));
-        assert!(json.contains("\"auto_memory_budget\""));
+        assert!(json.contains("\"memory_budget\""));
         assert!(json.ends_with("\"results\":[]}"));
+    }
+
+    #[test]
+    fn budget_cli_parser_accepts_only_one_strict_positive_decimal_override() {
+        let options = parse_matrix_options([
+            "--scale".to_string(),
+            "small".to_string(),
+            "--budget-bytes=67108864".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("strict explicit budget parses");
+        assert_eq!(options.scales, [Scale::Small]);
+        assert_eq!(
+            options.budget_policy,
+            AarmBudgetPolicy::ExactBytes(67_108_864)
+        );
+        assert!(options.json);
+        for arguments in [
+            vec!["--budget-bytes"],
+            vec!["--budget-bytes", "0"],
+            vec!["--budget-bytes", "64MB"],
+            vec!["--budget-bytes", "-1"],
+            vec!["--budget-bytes", "1.5"],
+            vec!["--budget-bytes", "18446744073709551616"],
+            vec!["--budget-bytes", "1", "--budget-bytes=2"],
+        ] {
+            assert!(parse_matrix_options(arguments.into_iter().map(str::to_string)).is_err());
+        }
     }
 }

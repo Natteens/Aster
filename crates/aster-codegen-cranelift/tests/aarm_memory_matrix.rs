@@ -7,7 +7,10 @@ mod matrix;
 use std::sync::OnceLock;
 
 use aster_runtime::ExecutionContext;
-use matrix::{CaseResult, Scale, run_matrix, serialize_results_with_host_capacity};
+use matrix::{
+    CaseResult, Scale, run_matrix, serialize_results_with_budget,
+    serialize_results_with_host_capacity,
+};
 
 fn small_results() -> &'static [CaseResult] {
     static RESULTS: OnceLock<Vec<CaseResult>> = OnceLock::new();
@@ -73,10 +76,10 @@ fn small_matrix_covers_required_workload_shapes() {
         "governed_async_temporal_before_await",
         "governed_async_temporal_inner",
         "governed_async_temporal_after_await",
-        "auto_governed_plain",
-        "auto_governed_parallel",
-        "auto_governed_task",
-        "auto_governed_async",
+        "budget_governed_plain",
+        "budget_governed_parallel",
+        "budget_governed_task",
+        "budget_governed_async",
     ] {
         assert!(results.iter().any(|result| result.workload == workload));
     }
@@ -93,7 +96,7 @@ fn governed_async_domains_are_frozen_page_aware_and_quiescent() {
     let results = small_results();
     for result in results
         .iter()
-        .filter(|result| result.async_domain.is_some() && !result.workload.starts_with("auto_"))
+        .filter(|result| result.async_domain.is_some() && !result.workload.starts_with("budget_"))
     {
         let domain = result.async_domain.expect("async domain exists");
         assert!(domain.temporal_borrowing_enabled);
@@ -381,9 +384,9 @@ fn structured_output_contains_no_future_aarm_claims() {
         ),
     };
     let json = serialize_results_with_host_capacity(small_results(), capacity);
-    assert!(json.starts_with("{\"schema_version\":8,"));
+    assert!(json.starts_with("{\"schema_version\":9,"));
     assert!(json.contains("\"host_memory_capacity\""));
-    assert!(json.contains("\"auto_memory_budget\""));
+    assert!(json.contains("\"memory_budget\""));
     assert!(json.contains("\"physical_total_bytes\":16384"));
     assert!(json.contains("\"environment_limit_bytes\":4096"));
     assert!(json.contains("\"effective_capacity_bytes\":4096"));
@@ -410,6 +413,15 @@ fn structured_output_contains_no_future_aarm_claims() {
     assert!(!json.contains("committed_backing_bytes"));
     assert!(!json.contains("purge_events"));
     assert_eq!(json.matches("\"workload\":").count(), 117);
+
+    let explicit = aster_codegen_cranelift::resolve_aarm_explicit_budget(64 * 1024 * 1024)
+        .expect("explicit budget resolves");
+    let explicit_json = serialize_results_with_budget(small_results(), None, Some(explicit));
+    assert!(explicit_json.starts_with("{\"schema_version\":9,"));
+    assert!(explicit_json.contains("\"host_memory_capacity\":null"));
+    assert!(explicit_json.contains("\"source\":\"explicit\""));
+    assert!(explicit_json.contains("\"requested_explicit_bytes\":67108864"));
+    assert!(explicit_json.contains("\"resolved_hard_limit_bytes\":67108864"));
 }
 
 #[test]

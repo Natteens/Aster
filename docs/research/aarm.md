@@ -418,7 +418,35 @@ Matrix schema version 8 emits the stable `host_memory_capacity` snapshot and the
 named `auto_memory_budget` resolution. It includes small integration cases for plain, Parallel,
 Task.Run, and async governed execution without consuming the machine-sized Auto ceiling.
 
-**Explicit reproducible override: deferred to AARM-2C3.**
+## AARM-2C3 explicit reproducible memory-budget override
+
+AARM-2C3 completes the experimental AARM-2 governor foundation with two frozen policies:
+
+- **Auto** discovers stable effective host capacity once, clamps only to process `usize`
+  representability, and then freezes the resulting governor limit.
+- **Explicit** accepts one caller-provided positive decimal byte count and freezes that exact logical
+  governor limit. It performs no host-capacity discovery, percentage calculation, reserve
+  subtraction, host/cgroup clamp, free-memory or RSS query, or page-size rounding. An explicit
+  value that cannot fit `usize` is rejected rather than silently clamped.
+
+Both policies create one explicit shared `MemoryGovernor` per supported experimental top-level
+execution. The governor remains an ASTER retained-`PagedArena` capacity ceiling, not a process RSS
+guarantee or memory-consumption target. An explicit limit may exceed discovered host capacity; the
+OS can still reject backing earlier through the existing controlled host-allocation path. The 1 GiB
+per-`ExecutionContext` local safety ceiling remains authoritative alongside the shared limit.
+
+The research-only matrix accepts `--budget-bytes 67108864` or
+`--budget-bytes=67108864`. The value must be one positive base-10 `u64` byte count; zero, signs,
+fractions, suffixes, overflow, and duplicate overrides are rejected. Without it, the matrix uses
+Auto. Explicit runs expose `host_memory_capacity: null` deliberately: execution behavior did not
+query or depend on the host snapshot. Schema version 9 replaces `auto_memory_budget` with one
+`memory_budget` object identifying `auto` or `explicit`, requested explicit bytes where applicable,
+the resolved hard limit, and address-width handling.
+
+**AARM-2 MemoryGovernor research foundation: COMPLETE.** It consists of shared governor accounting
+(2A); deterministic Parallel (2B1), Task.Run (2B2A), async (2B2B), and temporal borrowing (2B3)
+domains; stable capacity discovery (2C1); frozen Auto (2C2); and this explicit reproducible
+override (2C3). This does not make AARM production-complete: AARM-3 through AARM-6 remain.
 
 ## Measurement invariants
 
@@ -513,6 +541,7 @@ AARM-1 observability
 -> AARM-2B3 deterministic temporal borrowing
 -> AARM-2C1 stable host capacity discovery
 -> AARM-2C2 Auto governor budget policy
+-> AARM-2C3 explicit reproducible governor budget override
 -> AARM-3 OS PageBackend
 -> AARM-4 delayed purge/hysteresis
 -> AARM-5 MIR lifetime refinement

@@ -61,9 +61,11 @@ use execution::execute_resolved_with_aarm_telemetry;
 #[cfg(feature = "aarm-telemetry")]
 #[doc(hidden)]
 pub use host_memory::{
-    AarmAutoBudgetError, AarmAutoBudgetTelemetry, AarmAutoGovernor, AarmHostMemoryCapacity,
-    AarmHostMemoryCapacitySource, aarm_auto_governor_from_capacity, discover_aarm_auto_governor,
-    discover_aarm_host_memory_capacity, resolve_aarm_auto_budget,
+    AarmAutoBudgetError, AarmAutoBudgetTelemetry, AarmAutoGovernor, AarmBudgetPolicy,
+    AarmBudgetSource, AarmHostMemoryCapacity, AarmHostMemoryCapacitySource,
+    aarm_auto_governor_from_capacity, aarm_explicit_governor, aarm_governor_from_policy,
+    discover_aarm_auto_governor, discover_aarm_host_memory_capacity, resolve_aarm_auto_budget,
+    resolve_aarm_explicit_budget,
 };
 use layouts::Layouts;
 #[cfg(feature = "aarm-telemetry")]
@@ -413,6 +415,73 @@ pub fn execute_with_aarm_auto_async_governor(
         discover_aarm_auto_governor().map_err(|error| BackendError::new(error.to_string()))?;
     let telemetry = auto.telemetry();
     execute_with_aarm_async_governor(module, function_name, worker_count, auto.governor())
+        .map(|(value, main, domain)| (value, main, domain, telemetry))
+}
+
+/// Resolve one exact experimental budget and apply its one shared governor to
+/// deterministic Parallel execution without host-capacity discovery.
+#[doc(hidden)]
+#[cfg(feature = "aarm-telemetry")]
+pub fn execute_with_aarm_exact_parallel_governor(
+    module: &mir::Module,
+    function_name: &str,
+    worker_count: usize,
+    requested_bytes: u64,
+) -> Result<AarmAutoParallelExecution, BackendError> {
+    let explicit = aarm_explicit_governor(requested_bytes)
+        .map_err(|error| BackendError::new(error.to_string()))?;
+    let telemetry = explicit.telemetry();
+    execute_with_aarm_parallel_governor(module, function_name, worker_count, explicit.governor())
+        .map(|(value, main, plans, workers)| (value, main, plans, workers, telemetry))
+}
+
+/// Resolve one exact experimental budget and apply its one shared governor to
+/// deterministic plain `Task.Run` execution without host-capacity discovery.
+#[doc(hidden)]
+#[cfg(feature = "aarm-telemetry")]
+pub fn execute_with_aarm_exact_task_governor(
+    module: &mir::Module,
+    function_name: &str,
+    worker_count: usize,
+    requested_bytes: u64,
+) -> Result<
+    (
+        ExecutionValue,
+        AarmMemoryTelemetry,
+        Option<AarmTaskMemoryDomainTelemetry>,
+        AarmAutoBudgetTelemetry,
+    ),
+    BackendError,
+> {
+    let explicit = aarm_explicit_governor(requested_bytes)
+        .map_err(|error| BackendError::new(error.to_string()))?;
+    let telemetry = explicit.telemetry();
+    execute_with_aarm_task_governor(module, function_name, worker_count, explicit.governor())
+        .map(|(value, main, domain)| (value, main, domain, telemetry))
+}
+
+/// Resolve one exact experimental budget and apply its one shared governor to
+/// deterministic governed async execution without host-capacity discovery.
+#[doc(hidden)]
+#[cfg(feature = "aarm-telemetry")]
+pub fn execute_with_aarm_exact_async_governor(
+    module: &mir::Module,
+    function_name: &str,
+    worker_count: usize,
+    requested_bytes: u64,
+) -> Result<
+    (
+        ExecutionValue,
+        AarmMemoryTelemetry,
+        Option<AarmAsyncMemoryDomainTelemetry>,
+        AarmAutoBudgetTelemetry,
+    ),
+    BackendError,
+> {
+    let explicit = aarm_explicit_governor(requested_bytes)
+        .map_err(|error| BackendError::new(error.to_string()))?;
+    let telemetry = explicit.telemetry();
+    execute_with_aarm_async_governor(module, function_name, worker_count, explicit.governor())
         .map(|(value, main, domain)| (value, main, domain, telemetry))
 }
 
