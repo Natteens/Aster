@@ -1518,20 +1518,31 @@ fn public_research_lowering_emits_no_markers_for_proof_barriers() {
             RUN,
             "Run",
             mir::Visibility::Public,
-            vec![local(0, "text", mir::Type::String)],
+            vec![
+                local(0, "text", mir::Type::String),
+                local(1, "length", mir::Type::Int),
+            ],
             mir::Type::Int,
-            vec![mir::Instruction::CallIntrinsic {
-                destination: Some(mir::Place::Local(mir::LocalId(0))),
-                intrinsic: mir::Intrinsic::StringFromLongTemporary,
-                arguments: vec![mir::Operand {
-                    type_: mir::Type::Long,
-                    kind: mir::OperandKind::Constant(mir::Constant::Integer("42".to_owned())),
-                }],
-                return_type: mir::Type::String,
-            }],
-            Some(integer(42)),
+            vec![
+                mir::Instruction::CallIntrinsic {
+                    destination: Some(mir::Place::Local(mir::LocalId(0))),
+                    intrinsic: mir::Intrinsic::StringFromLongTemporary,
+                    arguments: vec![mir::Operand {
+                        type_: mir::Type::Long,
+                        kind: mir::OperandKind::Constant(mir::Constant::Integer("42".to_owned())),
+                    }],
+                    return_type: mir::Type::String,
+                },
+                mir::Instruction::CallIntrinsic {
+                    destination: Some(mir::Place::Local(mir::LocalId(1))),
+                    intrinsic: mir::Intrinsic::StringLength,
+                    arguments: vec![copy(0, mir::Type::String)],
+                    return_type: mir::Type::Int,
+                },
+            ],
+            Some(copy(1, mir::Type::Int)),
         )]),
-        "dynamic string allocation",
+        "string result used after its candidate boundary",
     );
 
     let build = function(
@@ -1612,6 +1623,189 @@ fn public_research_lowering_emits_no_markers_for_proof_barriers() {
     )]);
     loop_module.functions[0].blocks[0].terminator = mir::Terminator::Goto(BLOCK);
     assert_rejected(loop_module, "loop CFG");
+}
+
+#[test]
+fn immutable_temporary_concat_reclaims_without_invalidating_an_older_string() {
+    let string = mir::Type::String;
+    let mut module = module(vec![function(
+        RUN,
+        "Run",
+        mir::Visibility::Public,
+        vec![
+            local(0, "older", string.clone()),
+            local(1, "result", string.clone()),
+            local(2, "length", mir::Type::Int),
+        ],
+        mir::Type::Int,
+        vec![
+            mir::Instruction::CallIntrinsic {
+                destination: Some(mir::Place::Local(mir::LocalId(0))),
+                intrinsic: mir::Intrinsic::StringFromLongTemporary,
+                arguments: vec![mir::Operand {
+                    type_: mir::Type::Long,
+                    kind: mir::OperandKind::Constant(mir::Constant::Integer("7".to_owned())),
+                }],
+                return_type: string.clone(),
+            },
+            mir::Instruction::CallIntrinsic {
+                destination: Some(mir::Place::Local(mir::LocalId(1))),
+                intrinsic: mir::Intrinsic::StringConcatTemporary,
+                arguments: vec![
+                    copy(0, string.clone()),
+                    mir::Operand {
+                        type_: string.clone(),
+                        kind: mir::OperandKind::Constant(mir::Constant::String("x".to_owned())),
+                    },
+                ],
+                return_type: string.clone(),
+            },
+            mir::Instruction::CallIntrinsic {
+                destination: Some(mir::Place::Local(mir::LocalId(2))),
+                intrinsic: mir::Intrinsic::StringLength,
+                arguments: vec![copy(0, string)],
+                return_type: mir::Type::Int,
+            },
+        ],
+        Some(copy(2, mir::Type::Int)),
+    )]);
+    let baseline = execute_with_stats(&module, "Run").expect("baseline executes");
+    let report = lower_aarm_temporary_subregions_for_research(&mut module)
+        .expect("immutable string lowering succeeds");
+    let lowered = execute_with_stats(&module, "Run").expect("lowered executes");
+
+    assert_eq!(baseline.0, ExecutionValue::Int(1));
+    assert_eq!(lowered.0, baseline.0);
+    assert_eq!(lowered.1.requested_bytes, baseline.1.requested_bytes);
+    assert_eq!(report.subregions_lowered, 1);
+    assert_eq!(marker_count(&module), 2);
+}
+
+#[test]
+fn immutable_temporary_formatting_reclaims_each_loop_iteration() {
+    let string = mir::Type::String;
+    let mut run = function(
+        RUN,
+        "Run",
+        mir::Visibility::Public,
+        vec![
+            local(0, "text", string.clone()),
+            local(1, "index", mir::Type::Int),
+            local(2, "condition", mir::Type::Bool),
+            local(3, "one", mir::Type::Int),
+        ],
+        mir::Type::Int,
+        Vec::new(),
+        None,
+    );
+    run.blocks = vec![
+        mir::BasicBlock {
+            id: mir::BasicBlockId(0),
+            instructions: vec![
+                assign(mir::Place::Local(mir::LocalId(1)), integer(0)),
+                assign(mir::Place::Local(mir::LocalId(3)), integer(1)),
+            ],
+            terminator: mir::Terminator::Goto(mir::BasicBlockId(1)),
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(1),
+            instructions: vec![less(2, 1, 128)],
+            terminator: mir::Terminator::Branch {
+                condition: copy(2, mir::Type::Bool),
+                then_block: mir::BasicBlockId(2),
+                else_block: mir::BasicBlockId(3),
+            },
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(2),
+            instructions: vec![
+                mir::Instruction::CallIntrinsic {
+                    destination: Some(mir::Place::Local(mir::LocalId(0))),
+                    intrinsic: mir::Intrinsic::StringFromLongTemporary,
+                    arguments: vec![mir::Operand {
+                        type_: mir::Type::Long,
+                        kind: mir::OperandKind::Constant(mir::Constant::Integer("42".to_owned())),
+                    }],
+                    return_type: string,
+                },
+                add(1, 1, 3),
+            ],
+            terminator: mir::Terminator::Goto(mir::BasicBlockId(1)),
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(3),
+            instructions: Vec::new(),
+            terminator: mir::Terminator::Return(Some(copy(1, mir::Type::Int))),
+        },
+    ];
+    let baseline = module(vec![run]);
+    let baseline_result = execute_with_stats(&baseline, "Run").expect("baseline executes");
+    let mut lowered = baseline.clone();
+    let report = lower_aarm_temporary_subregions_for_research(&mut lowered)
+        .expect("string loop lowering succeeds");
+    let lowered_result = execute_with_stats(&lowered, "Run").expect("lowered executes");
+
+    assert_eq!(baseline_result.0, ExecutionValue::Int(128));
+    assert_eq!(lowered_result.0, baseline_result.0);
+    assert_eq!(
+        lowered_result.1.requested_bytes,
+        baseline_result.1.requested_bytes
+    );
+    assert!(lowered_result.1.peak_used_bytes < baseline_result.1.peak_used_bytes);
+    assert_eq!(report.subregions_lowered, 1);
+}
+
+#[test]
+fn mixed_object_array_and_immutable_string_subregions_preserve_results() {
+    let string = mir::Type::String;
+    let mut module = module(vec![function(
+        RUN,
+        "Run",
+        mir::Visibility::Public,
+        vec![
+            local(0, "object", mir::Type::Class(BOX_CLASS)),
+            local(1, "array", mir::Type::Array(Box::new(mir::Type::Int))),
+            local(2, "text", string.clone()),
+            local(3, "length", mir::Type::Int),
+        ],
+        mir::Type::Int,
+        vec![
+            temporary_object(0),
+            assign(object_field(0), integer(7)),
+            temporary_array(1, 4),
+            mir::Instruction::Assign {
+                target: mir::Place::Local(mir::LocalId(3)),
+                value: mir::Rvalue {
+                    type_: mir::Type::Int,
+                    kind: mir::RvalueKind::ArrayLength(copy(
+                        1,
+                        mir::Type::Array(Box::new(mir::Type::Int)),
+                    )),
+                },
+            },
+            mir::Instruction::CallIntrinsic {
+                destination: Some(mir::Place::Local(mir::LocalId(2))),
+                intrinsic: mir::Intrinsic::StringFromBoolTemporary,
+                arguments: vec![mir::Operand {
+                    type_: mir::Type::Bool,
+                    kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                }],
+                return_type: string,
+            },
+        ],
+        Some(copy(3, mir::Type::Int)),
+    )]);
+    let baseline = execute_with_stats(&module, "Run").expect("baseline executes");
+    let report =
+        lower_aarm_temporary_subregions_for_research(&mut module).expect("mixed lowering succeeds");
+    let lowered = execute_with_stats(&module, "Run").expect("lowered executes");
+
+    assert_eq!(baseline.0, ExecutionValue::Int(4));
+    assert_eq!(lowered.0, baseline.0);
+    assert_eq!(lowered.1.requested_bytes, baseline.1.requested_bytes);
+    assert!(lowered.1.peak_used_bytes < baseline.1.peak_used_bytes);
+    assert!(lowered.1.reserved_bytes <= baseline.1.reserved_bytes);
+    assert_eq!(report.subregions_lowered, 3);
 }
 
 #[test]

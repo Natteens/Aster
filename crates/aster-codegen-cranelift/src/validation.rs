@@ -1028,16 +1028,7 @@ fn validate_executable_temporary_subregion_cfg(
                     current = FineState::Inactive;
                 }
                 instruction if current != FineState::Inactive => {
-                    if matches!(
-                        instruction,
-                        mir::Instruction::AllocateObject {
-                            region: mir::AllocationRegion::Temporary,
-                            ..
-                        } | mir::Instruction::AllocateArray {
-                            region: mir::AllocationRegion::Temporary,
-                            ..
-                        }
-                    ) {
+                    if temporary_subregion_allocation_is_executable(instruction) {
                         allocations.insert(current);
                     }
                     if !temporary_subregion_instruction_is_executable(instruction) {
@@ -1083,6 +1074,31 @@ fn validate_executable_temporary_subregion_cfg(
         ));
     }
     Ok(())
+}
+
+fn temporary_subregion_allocation_is_executable(instruction: &mir::Instruction) -> bool {
+    matches!(
+        instruction,
+        mir::Instruction::AllocateObject {
+            region: mir::AllocationRegion::Temporary,
+            ..
+        } | mir::Instruction::AllocateArray {
+            region: mir::AllocationRegion::Temporary,
+            ..
+        }
+    ) || matches!(
+        instruction,
+        mir::Instruction::CallIntrinsic {
+            intrinsic: mir::Intrinsic::StringConcatTemporary
+                | mir::Intrinsic::StringFromLongTemporary
+                | mir::Intrinsic::StringFromULongTemporary
+                | mir::Intrinsic::StringFromDoubleTemporary
+                | mir::Intrinsic::StringFromFloatTemporary
+                | mir::Intrinsic::StringFromBoolTemporary
+                | mir::Intrinsic::StringFromCharTemporary,
+            ..
+        }
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1211,11 +1227,21 @@ fn temporary_subregion_instruction_is_executable(instruction: &mir::Instruction)
         mir::Instruction::AllocateObject { destination, .. } => {
             matches!(destination, mir::Place::Local(_))
         }
+        mir::Instruction::CallIntrinsic {
+            destination,
+            intrinsic,
+            arguments,
+            return_type,
+        } => temporary_subregion_immutable_string_intrinsic_is_executable(
+            destination.as_ref(),
+            *intrinsic,
+            arguments,
+            return_type,
+        ),
         mir::Instruction::TemporarySubregionEnter { .. }
         | mir::Instruction::TemporarySubregionExit { .. }
         | mir::Instruction::Call { .. }
         | mir::Instruction::CallInterface { .. }
-        | mir::Instruction::CallIntrinsic { .. }
         | mir::Instruction::AllocateList { .. }
         | mir::Instruction::AllocateDictionary { .. }
         | mir::Instruction::AllocateStringBuilder { .. }
@@ -1232,6 +1258,45 @@ fn temporary_subregion_instruction_is_executable(instruction: &mir::Instruction)
         | mir::Instruction::ListRemoveAt { .. }
         | mir::Instruction::StringDecodeNext { .. } => false,
     }
+}
+
+fn temporary_subregion_immutable_string_intrinsic_is_executable(
+    destination: Option<&mir::Place>,
+    intrinsic: mir::Intrinsic,
+    arguments: &[mir::Operand],
+    return_type: &mir::Type,
+) -> bool {
+    matches!(destination, Some(mir::Place::Local(_)))
+        && return_type == &mir::Type::String
+        && match intrinsic {
+            mir::Intrinsic::StringConcatTemporary => {
+                matches!(arguments, [left, right] if temporary_subregion_string_input_is_executable(left) && temporary_subregion_string_input_is_executable(right))
+            }
+            mir::Intrinsic::StringFromLongTemporary | mir::Intrinsic::StringFromULongTemporary => {
+                matches!(arguments, [value] if matches!(value.type_, mir::Type::Long | mir::Type::ULong))
+            }
+            mir::Intrinsic::StringFromDoubleTemporary => {
+                matches!(arguments, [value] if value.type_ == mir::Type::Double)
+            }
+            mir::Intrinsic::StringFromFloatTemporary => {
+                matches!(arguments, [value] if value.type_ == mir::Type::Float)
+            }
+            mir::Intrinsic::StringFromBoolTemporary => {
+                matches!(arguments, [value] if value.type_ == mir::Type::Bool)
+            }
+            mir::Intrinsic::StringFromCharTemporary => {
+                matches!(arguments, [value] if value.type_ == mir::Type::Char)
+            }
+            _ => false,
+        }
+}
+
+fn temporary_subregion_string_input_is_executable(operand: &mir::Operand) -> bool {
+    operand.type_ == mir::Type::String
+        && matches!(
+            operand.kind,
+            mir::OperandKind::Constant(mir::Constant::String(_)) | mir::OperandKind::Copy(_)
+        )
 }
 
 fn temporary_subregion_rvalue_is_executable(value: &mir::Rvalue) -> bool {

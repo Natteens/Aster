@@ -159,20 +159,10 @@ fn lower_validated_exact_snapshot(
                                 let block = &function.blocks[*index];
                                 site.instruction_index >= block.instructions.len()
                             })
-                            || !matches!(
-                                function.blocks[blocks[&site.block]]
-                                    .instructions
-                                    .get(site.instruction_index),
-                                Some(
-                                    mir::Instruction::AllocateObject {
-                                        region: mir::AllocationRegion::Temporary,
-                                        ..
-                                    } | mir::Instruction::AllocateArray {
-                                        region: mir::AllocationRegion::Temporary,
-                                        ..
-                                    }
-                                )
-                            )
+                            || !function.blocks[blocks[&site.block]]
+                                .instructions
+                                .get(site.instruction_index)
+                                .is_some_and(validated_temporary_allocation_form)
                     })
                 {
                     return Err(AarmTemporarySubregionLoweringError::new(
@@ -260,6 +250,31 @@ fn lower_validated_exact_snapshot(
     }
 
     Ok((lowered, report))
+}
+
+fn validated_temporary_allocation_form(instruction: &mir::Instruction) -> bool {
+    matches!(
+        instruction,
+        mir::Instruction::AllocateObject {
+            region: mir::AllocationRegion::Temporary,
+            ..
+        } | mir::Instruction::AllocateArray {
+            region: mir::AllocationRegion::Temporary,
+            ..
+        }
+    ) || matches!(
+        instruction,
+        mir::Instruction::CallIntrinsic {
+            intrinsic: mir::Intrinsic::StringConcatTemporary
+                | mir::Intrinsic::StringFromLongTemporary
+                | mir::Intrinsic::StringFromULongTemporary
+                | mir::Intrinsic::StringFromDoubleTemporary
+                | mir::Intrinsic::StringFromFloatTemporary
+                | mir::Intrinsic::StringFromBoolTemporary
+                | mir::Intrinsic::StringFromCharTemporary,
+            ..
+        }
+    )
 }
 
 /// Run the explicit research-only AARM-5A -> AARM-5B -> AARM-5C orchestration.
@@ -2496,10 +2511,10 @@ public int Main() {
                 vec![candidate(0, 0, 2, vec![0])],
             );
             assert!(report.validated.is_empty());
-            assert!(matches!(
+            assert_eq!(
                 report.rejected[0].reason,
-                Reason::StringBarrier | Reason::UnaccountedTemporaryAllocation
-            ));
+                Reason::UnaccountedTemporaryAllocation
+            );
         }
 
         #[test]
@@ -2767,7 +2782,7 @@ public int Main() {
         }
 
         #[test]
-        fn collection_builder_and_dynamic_string_candidates_are_deferred() {
+        fn collection_builder_candidates_are_deferred_but_immutable_strings_validate() {
             let list_type = mir::Type::List(Box::new(mir::Type::Int));
             let list = mir::Instruction::AllocateList {
                 destination: mir::Place::Local(mir::LocalId(1)),
@@ -2820,9 +2835,28 @@ public int Main() {
                 }],
                 return_type: mir::Type::String,
             };
+            let string_report = validate_raw(
+                end_function(vec![string], vec![local(1, mir::Type::String)]),
+                vec![candidate(0, 0, 1, vec![0])],
+            );
+            assert_eq!(string_report.validated.len(), 1, "{string_report:#?}");
+            assert!(string_report.rejected.is_empty());
+
+            let join = mir::Instruction::CallIntrinsic {
+                destination: Some(mir::Place::Local(mir::LocalId(1))),
+                intrinsic: mir::Intrinsic::StringJoinTemporary,
+                arguments: vec![copy(2, mir::Type::Array(Box::new(mir::Type::String)))],
+                return_type: mir::Type::String,
+            };
             assert_eq!(
                 reason(&validate_raw(
-                    end_function(vec![string], vec![local(1, mir::Type::String)]),
+                    end_function(
+                        vec![join],
+                        vec![
+                            local(1, mir::Type::String),
+                            local(2, mir::Type::Array(Box::new(mir::Type::String))),
+                        ],
+                    ),
                     vec![candidate(0, 0, 1, vec![0])]
                 )),
                 Reason::StringBarrier
@@ -2844,6 +2878,56 @@ public int Main() {
                 )),
                 Reason::StringBarrier
             );
+        }
+
+        #[test]
+        fn every_supported_immutable_temporary_string_producer_validates() {
+            let scalar = |type_, constant| mir::Operand {
+                type_,
+                kind: mir::OperandKind::Constant(constant),
+            };
+            let producers = vec![
+                (
+                    mir::Intrinsic::StringFromLongTemporary,
+                    scalar(mir::Type::Long, mir::Constant::Integer("7".to_owned())),
+                ),
+                (
+                    mir::Intrinsic::StringFromULongTemporary,
+                    scalar(mir::Type::ULong, mir::Constant::Integer("7".to_owned())),
+                ),
+                (
+                    mir::Intrinsic::StringFromDoubleTemporary,
+                    scalar(mir::Type::Double, mir::Constant::Float("7.5".to_owned())),
+                ),
+                (
+                    mir::Intrinsic::StringFromFloatTemporary,
+                    scalar(mir::Type::Float, mir::Constant::Float("7.5".to_owned())),
+                ),
+                (
+                    mir::Intrinsic::StringFromBoolTemporary,
+                    scalar(mir::Type::Bool, mir::Constant::Boolean(true)),
+                ),
+                (
+                    mir::Intrinsic::StringFromCharTemporary,
+                    scalar(mir::Type::Char, mir::Constant::Character('x')),
+                ),
+            ];
+            for (intrinsic, argument) in producers {
+                let report = validate_raw(
+                    end_function(
+                        vec![mir::Instruction::CallIntrinsic {
+                            destination: Some(mir::Place::Local(mir::LocalId(1))),
+                            intrinsic,
+                            arguments: vec![argument],
+                            return_type: mir::Type::String,
+                        }],
+                        vec![local(1, mir::Type::String)],
+                    ),
+                    vec![candidate(0, 0, 1, vec![0])],
+                );
+                assert_eq!(report.validated.len(), 1, "{intrinsic:?}: {report:#?}");
+                assert!(report.rejected.is_empty());
+            }
         }
 
         #[test]

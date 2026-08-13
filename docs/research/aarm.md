@@ -1037,6 +1037,38 @@ runtime loop knowledge / nested mark stack / new ABI: NO
 normal compiler invokes AARM-5E2B2A: NO
 ```
 
+## AARM-5E completion boundary
+
+AARM-5E is complete for the current research scope: straight-line code,
+acyclic branches and joins, early returns, simple loops, break, continue,
+multiple latches, and nested-loop leaf reclaim all have compiler-owned proof
+and fail-closed backend validation. Simultaneous outer-and-inner reclaim and a
+nested fine-mark stack remain deliberately deferred. Leaf reclaim already
+bounds the dominant inner-loop working set, while profiling does not yet
+justify the additional checkpoint overhead and mark-stack complexity.
+
+## AARM-5F1 immutable dynamic strings
+
+AARM-5F1 admits only self-contained immutable dynamic string results into an
+explicit research fine subregion. The runtime allocates every such result as
+one contiguous `AsterStrHeader` followed immediately by its UTF-8 payload in
+the selected Temporary arena; FineExit therefore reclaims the complete string
+without a string-specific destructor or separate backing owner.
+
+The executable subset is deliberately narrow:
+
+- `StringConcatTemporary`;
+- `StringFromLongTemporary`, `StringFromULongTemporary`,
+  `StringFromDoubleTemporary`, `StringFromFloatTemporary`,
+  `StringFromBoolTemporary`, and `StringFromCharTemporary`.
+
+Each still requires the existing Temporary-region classification and exact
+AARM-5A reference-death proof. String literals remain JIT module data and are
+only read as inputs; they are never reclaimable allocation sites. `StringBuilder`,
+`StringBuilderToString`, `List`, `Dictionary`, joins, substrings, host I/O,
+and every other string operation remain blocked from executable fine regions.
+Normal compilation still emits no fine instructions.
+
 ## Measurement invariants
 
 Every snapshot must satisfy:

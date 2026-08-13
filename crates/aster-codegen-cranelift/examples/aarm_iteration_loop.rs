@@ -20,6 +20,7 @@ const SAMPLES: usize = 5;
 enum AllocationShape {
     Object,
     Array,
+    String,
 }
 
 impl AllocationShape {
@@ -27,6 +28,7 @@ impl AllocationShape {
         match self {
             Self::Object => "object",
             Self::Array => "array",
+            Self::String => "string",
         }
     }
 
@@ -34,6 +36,7 @@ impl AllocationShape {
         match self {
             Self::Object => mir::Type::Class(BOX),
             Self::Array => mir::Type::Array(Box::new(mir::Type::Int)),
+            Self::String => mir::Type::String,
         }
     }
 
@@ -50,6 +53,15 @@ impl AllocationShape {
                 length: integer(8),
                 requires_default: false,
                 region: mir::AllocationRegion::Temporary,
+            },
+            Self::String => mir::Instruction::CallIntrinsic {
+                destination: Some(mir::Place::Local(mir::LocalId(local))),
+                intrinsic: mir::Intrinsic::StringFromLongTemporary,
+                arguments: vec![mir::Operand {
+                    type_: mir::Type::Long,
+                    kind: mir::OperandKind::Constant(mir::Constant::Integer("42".to_owned())),
+                }],
+                return_type: mir::Type::String,
             },
         }
     }
@@ -363,7 +375,11 @@ fn run_nested_case(
 
 fn main() {
     for iterations in [100_000, 1_000_000, 4_000_000] {
-        for shape in [AllocationShape::Object, AllocationShape::Array] {
+        for shape in [
+            AllocationShape::Object,
+            AllocationShape::Array,
+            AllocationShape::String,
+        ] {
             for (variant, helper_scoped, iteration_reclaim) in [
                 ("direct", false, false),
                 ("helper", true, false),
@@ -372,9 +388,10 @@ fn main() {
                 let (median_ms, stats) =
                     run_case(iterations, shape, helper_scoped, iteration_reclaim);
                 println!(
-                    "shape={:<6} variant={variant:<6} iterations={iterations:<7} median_ms={median_ms:>9.3} allocations={:>8} requested={:>10} peak_used={:>10} capacity={:>10}",
+                    "shape={:<6} variant={variant:<6} iterations={iterations:<7} median_ms={median_ms:>9.3} allocations={:>8} strings={:>8} requested={:>10} peak_used={:>10} capacity={:>10}",
                     shape.name(),
                     stats.total_allocations,
+                    stats.string_allocations,
                     stats.requested_bytes,
                     stats.peak_used_bytes,
                     stats.reserved_bytes,

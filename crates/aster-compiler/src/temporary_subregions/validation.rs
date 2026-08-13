@@ -370,11 +370,7 @@ fn validate_candidate(
         }
         match allocation_form_barrier(instruction) {
             Some(reason) => return Err(reason),
-            None if !matches!(
-                instruction,
-                mir::Instruction::AllocateObject { .. } | mir::Instruction::AllocateArray { .. }
-            ) =>
-            {
+            None if !supported_allocation_form(instruction) => {
                 return Err(TemporarySubregionRejectionReason::MalformedAllocationSite);
             }
             None => {}
@@ -508,11 +504,7 @@ fn validate_loop_candidate(
         {
             return Err(TemporarySubregionRejectionReason::PersistentAllocation);
         }
-        if allocation_form_barrier(instruction).is_some()
-            || !matches!(
-                instruction,
-                mir::Instruction::AllocateObject { .. } | mir::Instruction::AllocateArray { .. }
-            )
+        if allocation_form_barrier(instruction).is_some() || !supported_allocation_form(instruction)
         {
             return Err(allocation_form_barrier(instruction)
                 .unwrap_or(TemporarySubregionRejectionReason::MalformedAllocationSite));
@@ -646,11 +638,7 @@ fn validate_cfg_candidate(
         {
             return Err(TemporarySubregionRejectionReason::PersistentAllocation);
         }
-        if allocation_form_barrier(instruction).is_some()
-            || !matches!(
-                instruction,
-                mir::Instruction::AllocateObject { .. } | mir::Instruction::AllocateArray { .. }
-            )
+        if allocation_form_barrier(instruction).is_some() || !supported_allocation_form(instruction)
         {
             return Err(allocation_form_barrier(instruction)
                 .unwrap_or(TemporarySubregionRejectionReason::MalformedAllocationSite));
@@ -683,6 +671,24 @@ fn validate_cfg_candidate(
     })
 }
 
+fn supported_allocation_form(instruction: &mir::Instruction) -> bool {
+    match instruction {
+        mir::Instruction::AllocateObject { .. } | mir::Instruction::AllocateArray { .. } => true,
+        mir::Instruction::CallIntrinsic {
+            destination,
+            intrinsic,
+            arguments,
+            return_type,
+        } => immutable_temporary_string_intrinsic_is_executable(
+            destination.as_ref(),
+            *intrinsic,
+            arguments,
+            return_type,
+        ),
+        _ => false,
+    }
+}
+
 fn allocation_form_barrier(
     instruction: &mir::Instruction,
 ) -> Option<TemporarySubregionRejectionReason> {
@@ -692,6 +698,20 @@ fn allocation_form_barrier(
         | mir::Instruction::AllocateStringBuilder { .. }
         | mir::Instruction::DictionaryEntries { .. } => {
             Some(TemporarySubregionRejectionReason::CollectionBarrier)
+        }
+        mir::Instruction::CallIntrinsic {
+            destination,
+            intrinsic,
+            arguments,
+            return_type,
+        } if immutable_temporary_string_intrinsic_is_executable(
+            destination.as_ref(),
+            *intrinsic,
+            arguments,
+            return_type,
+        ) =>
+        {
+            None
         }
         mir::Instruction::StringBuilderToString { .. } | mir::Instruction::CallIntrinsic { .. } => {
             Some(TemporarySubregionRejectionReason::StringBarrier)
@@ -722,9 +742,21 @@ fn span_barrier(instructions: &[mir::Instruction]) -> Option<TemporarySubregionR
             mir::Instruction::Call { .. } | mir::Instruction::CallInterface { .. } => {
                 Some(TemporarySubregionRejectionReason::CallBarrier)
             }
-            mir::Instruction::CallIntrinsic { intrinsic, .. } => {
+            mir::Instruction::CallIntrinsic {
+                destination,
+                intrinsic,
+                arguments,
+                return_type,
+            } => {
                 if super::is_concurrency_intrinsic(*intrinsic) {
                     Some(TemporarySubregionRejectionReason::ConcurrencyBarrier)
+                } else if immutable_temporary_string_intrinsic_is_executable(
+                    destination.as_ref(),
+                    *intrinsic,
+                    arguments,
+                    return_type,
+                ) {
+                    None
                 } else if intrinsic.allocation_region().is_some() {
                     Some(TemporarySubregionRejectionReason::StringBarrier)
                 } else {
@@ -775,6 +807,27 @@ fn span_barrier(instructions: &[mir::Instruction]) -> Option<TemporarySubregionR
         }
     }
     None
+}
+
+fn immutable_temporary_string_intrinsic_is_executable(
+    destination: Option<&mir::Place>,
+    intrinsic: mir::Intrinsic,
+    arguments: &[mir::Operand],
+    return_type: &mir::Type,
+) -> bool {
+    let _ = arguments;
+    matches!(destination, Some(mir::Place::Local(_)))
+        && return_type == &mir::Type::String
+        && matches!(
+            intrinsic,
+            mir::Intrinsic::StringConcatTemporary
+                | mir::Intrinsic::StringFromLongTemporary
+                | mir::Intrinsic::StringFromULongTemporary
+                | mir::Intrinsic::StringFromDoubleTemporary
+                | mir::Intrinsic::StringFromFloatTemporary
+                | mir::Intrinsic::StringFromBoolTemporary
+                | mir::Intrinsic::StringFromCharTemporary
+        )
 }
 
 fn assign_barrier(
