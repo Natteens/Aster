@@ -2,9 +2,11 @@ use aster_codegen_cranelift::{ExecutionValue, MemoryStats, execute_with_stats};
 use aster_compiler::compile;
 
 const TEMPORARY_STRESS: &str = r#"
+    internal int KeepStressValue(int value) { return value; }
+
     public class StressBox {
         public int value;
-        public StressBox(int value) { this.value = value; }
+        public StressBox(int value) { this.value = KeepStressValue(value); }
     }
 
     internal int BuildTemporary() {

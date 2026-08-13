@@ -42,23 +42,26 @@ specific runtime ABI function.
 
 After escape analysis assigns regions, the compiler removes one deliberately
 narrow class-object representation when identity is unobservable. The accepted
-shape is a `Temporary`, direct-local object with an empty parameterless
-constructor, only scalar fields, and only direct local field reads and writes.
-The allocation, constructor receiver, and lowering-only object copy become
-ordinary typed MIR scalar locals; field locals are zero-initialized at every
-dynamic `new`, matching the class ABI's zeroed storage.
+shape is a `Temporary`, direct-local object with only scalar fields and direct
+local field reads and writes. Its constructor must be either empty and
+parameterless or a single-block scalar initializer that assigns distinct fields
+from scalar parameters or constants without calls, control flow, aliases, or
+other effects. The allocation, constructor call, receiver, and lowering-only
+object copy become ordinary typed MIR scalar locals; field locals are
+zero-initialized at every dynamic `new`, matching the class ABI's zeroed storage.
 
 This is complete allocation elision: the removed allocation performs no arena
 operation, consumes no governor budget, creates no resource-failure point, and
 contributes nothing to runtime memory statistics. This does not weaken checked
 failure and cleanup for allocations that remain in executable MIR.
 
-Any source-visible alias, identity comparison, nontrivial constructor, return,
-storage or containment, method/call/interface boundary, reference field, or
-unsupported use keeps the ordinary object allocation. Escape analysis remains
-the lifetime authority. Eliminated allocations disappear before AARM lifetime
-planning, and Cranelift receives already-transformed typed MIR; neither the
-backend nor runtime performs object-elimination inference.
+Any source-visible alias, identity comparison, effectful or unsupported
+constructor, return, storage or containment, method/call/interface boundary,
+reference field, or unsupported use keeps the ordinary object allocation.
+Escape analysis remains the lifetime authority. Eliminated allocations
+disappear before AARM lifetime planning, and Cranelift receives
+already-transformed typed MIR; neither the backend nor runtime performs
+object-elimination inference.
 
 ### AARM lifetime analysis
 

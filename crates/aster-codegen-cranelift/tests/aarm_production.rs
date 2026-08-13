@@ -39,6 +39,16 @@ fn marker_count(module: &mir::Module) -> usize {
         .count()
 }
 
+fn object_allocation_count(module: &mir::Module) -> usize {
+    module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| matches!(instruction, mir::Instruction::AllocateObject { .. }))
+        .count()
+}
+
 fn execute(module: &mir::Module, expected: i32) {
     let (value, stats) = execute_with_stats(module, "Run").expect("production AARM executes");
     assert_eq!(value, ExecutionValue::Int(expected));
@@ -203,6 +213,41 @@ fn production_region_amortizes_safe_array_and_string_work() {
     );
     assert_eq!(marker_count(&module), 2);
     execute(&module, 499_500);
+}
+
+#[test]
+fn constructor_elimination_composes_with_all_v1_hidden_backing_mutations() {
+    let module = project_module(
+        r#"
+        using aster.core;
+        public class Pair {
+            public int left;
+            public int right;
+            public Pair(int left, int right) {
+                this.left = left;
+                this.right = right;
+            }
+        }
+        public int Run() {
+            int total = 0;
+            for (int i = 0; i < 1000; i++) {
+                Pair pair = new Pair(i, 1);
+                StringBuilder builder = new StringBuilder();
+                builder.Append("value");
+                List<int> list = new List<int>();
+                list.Add(i);
+                Dictionary<int, int> dictionary = new Dictionary<int, int>();
+                dictionary.Add(1, i);
+                dictionary.Set(2, i + 1);
+                total += pair.right;
+            }
+            return total;
+        }
+        "#,
+    );
+    assert_eq!(object_allocation_count(&module), 0);
+    assert_eq!(marker_count(&module), 2);
+    execute(&module, 1000);
 }
 
 #[cfg(feature = "aarm-telemetry")]

@@ -1,10 +1,15 @@
+internal int KeepObjectValue(int value)
+{
+    return value;
+}
+
 public class BenchmarkBox
 {
     public int value;
 
     public BenchmarkBox(int value)
     {
-        this.value = value;
+        this.value = KeepObjectValue(value);
     }
 }
 

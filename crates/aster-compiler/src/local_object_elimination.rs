@@ -23,6 +23,32 @@ struct Candidate {
     origin: mir::LocalId,
     object: mir::LocalId,
     fields: Vec<mir::FieldDefinition>,
+    initializations: Vec<FieldInitialization>,
+}
+
+#[derive(Clone, Debug)]
+struct ConstructorPlan {
+    class: mir::SymbolId,
+    parameter_types: Vec<mir::Type>,
+    initializations: Vec<ConstructorInitialization>,
+}
+
+#[derive(Clone, Debug)]
+struct ConstructorInitialization {
+    field: mir::SymbolId,
+    source: InitializationSource,
+}
+
+#[derive(Clone, Debug)]
+enum InitializationSource {
+    Argument(usize),
+    Constant(mir::Operand),
+}
+
+#[derive(Clone, Debug)]
+struct FieldInitialization {
+    field: mir::SymbolId,
+    value: mir::Operand,
 }
 
 /// Replace the narrowest proven-unobservable object representation with
@@ -35,16 +61,17 @@ pub(super) fn eliminate(module: &mut mir::Module) {
         .filter(|class| class.fields.iter().all(|field| is_scalar(&field.type_)))
         .map(|class| (class.symbol, class.fields.clone()))
         .collect::<HashMap<_, _>>();
-    let trivial_constructors = module
+    let constructors = module
         .functions
         .iter()
         .filter_map(|function| {
-            is_trivial_constructor(function).then_some((function.symbol, function.owner?))
+            analyze_constructor(function, &scalar_classes)
+                .map(|constructor| (function.symbol, constructor))
         })
         .collect::<HashMap<_, _>>();
 
     for function in &mut module.functions {
-        let candidates = discover_candidates(function, &scalar_classes, &trivial_constructors)
+        let candidates = discover_candidates(function, &scalar_classes, &constructors)
             .into_iter()
             .filter(|candidate| candidate_uses_are_scalarizable(function, candidate))
             .collect::<Vec<_>>();
@@ -72,27 +99,100 @@ fn is_scalar(type_: &mir::Type) -> bool {
     )
 }
 
-fn is_trivial_constructor(function: &mir::Function) -> bool {
-    function.constructor
-        && function.owner.is_some()
-        && function.parameters.len() == 1
-        && function
-            .owner
-            .is_some_and(|owner| function.parameters[0].type_ == mir::Type::Class(owner))
-        && function.locals.is_empty()
-        && function.blocks.len() == 1
-        && function.blocks[0].id == function.entry
-        && function.blocks[0].instructions.is_empty()
-        && matches!(
+fn analyze_constructor(
+    function: &mir::Function,
+    scalar_classes: &HashMap<mir::SymbolId, Vec<mir::FieldDefinition>>,
+) -> Option<ConstructorPlan> {
+    let class = function.owner?;
+    let fields = scalar_classes.get(&class)?;
+    let receiver = function.parameters.first()?;
+    if !function.constructor
+        || receiver.type_ != mir::Type::Class(class)
+        || !function.locals.is_empty()
+        || function.blocks.len() != 1
+        || function.blocks[0].id != function.entry
+        || !matches!(
             function.blocks[0].terminator,
             mir::Terminator::End | mir::Terminator::Return(None)
         )
+    {
+        return None;
+    }
+
+    let block = &function.blocks[0];
+    if function.parameters.len() == 1 {
+        return block.instructions.is_empty().then(|| ConstructorPlan {
+            class,
+            parameter_types: vec![receiver.type_.clone()],
+            initializations: Vec::new(),
+        });
+    }
+    if function.parameters[1..]
+        .iter()
+        .any(|parameter| !is_scalar(&parameter.type_))
+    {
+        return None;
+    }
+
+    let parameter_indexes = function
+        .parameters
+        .iter()
+        .enumerate()
+        .map(|(index, parameter)| (parameter.id, index))
+        .collect::<HashMap<_, _>>();
+    let mut assigned_fields = HashSet::new();
+    let mut initializations = Vec::with_capacity(block.instructions.len());
+    for instruction in &block.instructions {
+        let mir::Instruction::Assign {
+            target: mir::Place::ObjectField { object, field },
+            value:
+                mir::Rvalue {
+                    type_: value_type,
+                    kind: mir::RvalueKind::Use(value),
+                },
+        } = instruction
+        else {
+            return None;
+        };
+        if direct_local(object) != Some(receiver.id) || !assigned_fields.insert(*field) {
+            return None;
+        }
+        let field_definition = fields.iter().find(|candidate| candidate.symbol == *field)?;
+        if *value_type != field_definition.type_ || value.type_ != field_definition.type_ {
+            return None;
+        }
+        let source = match &value.kind {
+            mir::OperandKind::Copy(mir::Place::Local(local)) => {
+                let index = *parameter_indexes.get(local)?;
+                if index == 0 || function.parameters[index].type_ != field_definition.type_ {
+                    return None;
+                }
+                InitializationSource::Argument(index)
+            }
+            mir::OperandKind::Constant(_) => InitializationSource::Constant(value.clone()),
+            mir::OperandKind::Copy(_) | mir::OperandKind::Function(_) => return None,
+        };
+        initializations.push(ConstructorInitialization {
+            field: *field,
+            source,
+        });
+    }
+
+    Some(ConstructorPlan {
+        class,
+        parameter_types: function
+            .parameters
+            .iter()
+            .map(|parameter| parameter.type_.clone())
+            .collect(),
+        initializations,
+    })
 }
 
 fn discover_candidates(
     function: &mir::Function,
     scalar_classes: &HashMap<mir::SymbolId, Vec<mir::FieldDefinition>>,
-    trivial_constructors: &HashMap<mir::SymbolId, mir::SymbolId>,
+    constructors: &HashMap<mir::SymbolId, ConstructorPlan>,
 ) -> Vec<Candidate> {
     let mut candidates = Vec::new();
     for block in &function.blocks {
@@ -117,11 +217,14 @@ fn discover_candidates(
             else {
                 continue;
             };
-            if trivial_constructors.get(constructor) != Some(class)
-                || !is_direct_object_operand(arguments.as_slice(), *origin, *class)
-            {
+            let Some(constructor) = constructors.get(constructor) else {
                 continue;
-            }
+            };
+            let Some(initializations) =
+                instantiate_constructor(constructor, arguments.as_slice(), *origin, *class)
+            else {
+                continue;
+            };
 
             let (object, alias) = match block.instructions.get(index + 2) {
                 Some(mir::Instruction::Assign {
@@ -154,20 +257,43 @@ fn discover_candidates(
                 origin: *origin,
                 object,
                 fields: fields.clone(),
+                initializations,
             });
         }
     }
     candidates
 }
 
-fn is_direct_object_operand(
+fn instantiate_constructor(
+    constructor: &ConstructorPlan,
     arguments: &[mir::Operand],
     local: mir::LocalId,
     class: mir::SymbolId,
-) -> bool {
-    arguments.len() == 1
-        && arguments[0].type_ == mir::Type::Class(class)
-        && direct_local(&arguments[0]) == Some(local)
+) -> Option<Vec<FieldInitialization>> {
+    if constructor.class != class
+        || arguments.len() != constructor.parameter_types.len()
+        || arguments
+            .iter()
+            .zip(&constructor.parameter_types)
+            .any(|(argument, parameter)| argument.type_ != *parameter)
+        || arguments.first().and_then(direct_local) != Some(local)
+    {
+        return None;
+    }
+    constructor
+        .initializations
+        .iter()
+        .map(|initialization| {
+            let value = match &initialization.source {
+                InitializationSource::Argument(index) => arguments.get(*index)?.clone(),
+                InitializationSource::Constant(value) => value.clone(),
+            };
+            Some(FieldInitialization {
+                field: initialization.field,
+                value,
+            })
+        })
+        .collect()
 }
 
 fn direct_local(operand: &mir::Operand) -> Option<mir::LocalId> {
@@ -178,6 +304,13 @@ fn direct_local(operand: &mir::Operand) -> Option<mir::LocalId> {
 }
 
 fn candidate_uses_are_scalarizable(function: &mir::Function, candidate: &Candidate) -> bool {
+    if candidate
+        .initializations
+        .iter()
+        .any(|initialization| !operand_is_legal(&initialization.value, candidate))
+    {
+        return false;
+    }
     for block in &function.blocks {
         for (index, instruction) in block.instructions.iter().enumerate() {
             let point = InstructionPoint {
@@ -431,10 +564,13 @@ fn scalarize(function: &mut mir::Function, candidates: &[Candidate]) {
         .iter()
         .map(|candidate| (candidate.allocation, candidate))
         .collect::<HashMap<_, _>>();
+    let constructors = candidates
+        .iter()
+        .map(|candidate| (candidate.constructor, candidate))
+        .collect::<HashMap<_, _>>();
     let removed = candidates
         .iter()
-        .flat_map(|candidate| [Some(candidate.constructor), candidate.alias])
-        .flatten()
+        .filter_map(|candidate| candidate.alias)
         .collect::<HashSet<_>>();
 
     for block in &mut function.blocks {
@@ -451,6 +587,20 @@ fn scalarize(function: &mut mir::Function, candidates: &[Candidate]) {
                         field_locals[&(candidate.object, field.symbol)],
                         &field.type_,
                     ));
+                }
+            } else if let Some(candidate) = constructors.get(&point) {
+                for initialization in &candidate.initializations {
+                    let mut instruction = mir::Instruction::Assign {
+                        target: mir::Place::Local(
+                            field_locals[&(candidate.object, initialization.field)],
+                        ),
+                        value: mir::Rvalue {
+                            type_: initialization.value.type_.clone(),
+                            kind: mir::RvalueKind::Use(initialization.value.clone()),
+                        },
+                    };
+                    rewrite_instruction(&mut instruction, &field_locals);
+                    rewritten.push(instruction);
                 }
             } else if !removed.contains(&point) {
                 rewrite_instruction(&mut instruction, &field_locals);

@@ -59,7 +59,8 @@ fn string_regions(module: &mir::Module, function_name: &str) -> Vec<mir::Allocat
 #[test]
 fn compiler_marks_local_object_temporary_and_rewinds_at_return() {
     let source = r"
-        public class Point { public int value; public Point(int value) { this.value = value; } }
+        internal int Keep(int value) { return value; }
+        public class Point { public int value; public Point(int value) { this.value = Keep(value); } }
         public int Run() {
             Point point = new Point(42);
             return point.value;
@@ -86,7 +87,8 @@ fn compiler_marks_local_object_temporary_and_rewinds_at_return() {
 #[test]
 fn direct_and_helper_object_loops_match_and_rewind_at_their_existing_boundaries() {
     let source = r"
-        public class Box { public int value; public Box(int value) { this.value = value; } }
+        internal int Keep(int value) { return value; }
+        public class Box { public int value; public Box(int value) { this.value = Keep(value); } }
         internal int Build() {
             Box box = new Box(1);
             return box.value;
@@ -127,7 +129,8 @@ fn direct_and_helper_object_loops_match_and_rewind_at_their_existing_boundaries(
 #[test]
 fn nested_function_scopes_preserve_the_callers_temporary_object() {
     let source = r"
-        public class Box { public int value; public Box(int value) { this.value = value; } }
+        internal int Keep(int value) { return value; }
+        public class Box { public int value; public Box(int value) { this.value = Keep(value); } }
         internal int Build() {
             Box inner = new Box(22);
             return inner.value;
@@ -160,10 +163,11 @@ fn nested_function_scopes_preserve_the_callers_temporary_object() {
 #[test]
 fn leaving_a_nested_temporary_scope_does_not_rewind_persistent_storage() {
     let source = r"
+        internal int Keep(int value) { return value; }
         public interface IBox { int Get(); }
         public class Box : IBox {
             public int value;
-            public Box(int value) { this.value = value; }
+            public Box(int value) { this.value = Keep(value); }
             public int Get() { return value; }
         }
         internal int Build() {
@@ -198,7 +202,8 @@ fn leaving_a_nested_temporary_scope_does_not_rewind_persistent_storage() {
 #[test]
 fn every_early_return_path_leaves_its_temporary_scope() {
     let source = r"
-        public class Box { public int value; public Box(int value) { this.value = value; } }
+        internal int Keep(int value) { return value; }
+        public class Box { public int value; public Box(int value) { this.value = Keep(value); } }
         internal int Choose(bool first) {
             Box box = new Box(0);
             if (first) {
@@ -229,7 +234,8 @@ fn every_early_return_path_leaves_its_temporary_scope() {
 #[test]
 fn implicit_end_leaves_a_temporary_scope() {
     let source = r"
-        public class Box { public int value; public Box(int value) { this.value = value; } }
+        internal int Keep(int value) { return value; }
+        public class Box { public int value; public Box(int value) { this.value = Keep(value); } }
         internal void Work() {
             Box box = new Box(42);
         }
