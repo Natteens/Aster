@@ -193,6 +193,34 @@ fn every_region_and_total_obey_allocator_invariants() {
             telemetry.total.arena_capacity_bytes,
             telemetry.temporary.arena_capacity_bytes + telemetry.persistent.arena_capacity_bytes
         );
+        assert_eq!(
+            telemetry.total.virtual_extent_bytes,
+            sum_known(
+                telemetry.temporary.virtual_extent_bytes,
+                telemetry.persistent.virtual_extent_bytes,
+            )
+        );
+        assert_eq!(
+            telemetry.total.backing_retained_bytes,
+            sum_known(
+                telemetry.temporary.backing_retained_bytes,
+                telemetry.persistent.backing_retained_bytes,
+            )
+        );
+        assert_eq!(
+            telemetry.total.backing_discarded_bytes,
+            sum_known(
+                telemetry.temporary.backing_discarded_bytes,
+                telemetry.persistent.backing_discarded_bytes,
+            )
+        );
+        if let (Some(virtual_extent), Some(retained), Some(discarded)) = (
+            telemetry.total.virtual_extent_bytes,
+            telemetry.total.backing_retained_bytes,
+            telemetry.total.backing_discarded_bytes,
+        ) {
+            assert_eq!(virtual_extent, retained + discarded);
+        }
         if let Some(governor) = telemetry.governor {
             assert!(governor.current_capacity_bytes <= governor.hard_limit_bytes);
             assert!(governor.peak_capacity_bytes >= governor.current_capacity_bytes);
@@ -384,7 +412,7 @@ fn structured_output_contains_no_future_aarm_claims() {
         ),
     };
     let json = serialize_results_with_host_capacity(small_results(), capacity);
-    assert!(json.starts_with("{\"schema_version\":9,"));
+    assert!(json.starts_with("{\"schema_version\":10,"));
     assert!(json.contains("\"host_memory_capacity\""));
     assert!(json.contains("\"memory_budget\""));
     assert!(json.contains("\"physical_total_bytes\":16384"));
@@ -393,6 +421,10 @@ fn structured_output_contains_no_future_aarm_claims() {
     assert!(json.contains("\"capacity_source\":\"physical_total_and_environment_limit\""));
     assert!(json.contains("\"requested_bytes\""));
     assert!(json.contains("\"arena_capacity_bytes\""));
+    assert!(json.contains("\"virtual_extent_bytes\""));
+    assert!(json.contains("\"backing_retained_bytes\""));
+    assert!(json.contains("\"backing_discarded_bytes\""));
+    assert!(json.contains("\"peak_backing_retained_bytes\""));
     assert!(json.contains("\"last_rewind\""));
     assert!(json.contains("\"process_rss_bytes\""));
     assert!(json.contains("\"current_capacity_bytes\""));
@@ -417,11 +449,15 @@ fn structured_output_contains_no_future_aarm_claims() {
     let explicit = aster_codegen_cranelift::resolve_aarm_explicit_budget(64 * 1024 * 1024)
         .expect("explicit budget resolves");
     let explicit_json = serialize_results_with_budget(small_results(), None, Some(explicit));
-    assert!(explicit_json.starts_with("{\"schema_version\":9,"));
+    assert!(explicit_json.starts_with("{\"schema_version\":10,"));
     assert!(explicit_json.contains("\"host_memory_capacity\":null"));
     assert!(explicit_json.contains("\"source\":\"explicit\""));
     assert!(explicit_json.contains("\"requested_explicit_bytes\":67108864"));
     assert!(explicit_json.contains("\"resolved_hard_limit_bytes\":67108864"));
+}
+
+fn sum_known(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    left?.checked_add(right?)
 }
 
 #[test]

@@ -511,6 +511,7 @@ fn worker_context_case(scale: Scale, workers: usize) -> CaseResult {
     let active_sum = sum_telemetry(&active);
     telemetry.total.peak_live_used_bytes = active_sum.total.live_used_bytes;
     telemetry.total.peak_arena_capacity_bytes = active_sum.total.arena_capacity_bytes;
+    telemetry.total.peak_backing_retained_bytes = active_sum.total.backing_retained_bytes;
     let after = process_memory();
     CaseResult {
         workload: "worker_contexts",
@@ -1547,8 +1548,11 @@ fn max_option(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 }
 
 fn sum_telemetry(snapshots: &[AarmMemoryTelemetry]) -> AarmMemoryTelemetry {
-    let mut result = AarmMemoryTelemetry::default();
-    for snapshot in snapshots {
+    let Some((first, remaining)) = snapshots.split_first() else {
+        return AarmMemoryTelemetry::default();
+    };
+    let mut result = *first;
+    for snapshot in remaining {
         result.requested_bytes += snapshot.requested_bytes;
         add_region(&mut result.temporary, snapshot.temporary);
         add_region(&mut result.persistent, snapshot.persistent);
@@ -1564,6 +1568,16 @@ fn sum_telemetry(snapshots: &[AarmMemoryTelemetry]) -> AarmMemoryTelemetry {
 fn add_region(total: &mut AarmRegionTelemetry, value: AarmRegionTelemetry) {
     total.live_used_bytes += value.live_used_bytes;
     total.arena_capacity_bytes += value.arena_capacity_bytes;
+    total.virtual_extent_bytes =
+        sum_known_option(total.virtual_extent_bytes, value.virtual_extent_bytes);
+    total.backing_retained_bytes =
+        sum_known_option(total.backing_retained_bytes, value.backing_retained_bytes);
+    total.backing_discarded_bytes =
+        sum_known_option(total.backing_discarded_bytes, value.backing_discarded_bytes);
+    total.peak_backing_retained_bytes = sum_known_option(
+        total.peak_backing_retained_bytes,
+        value.peak_backing_retained_bytes,
+    );
     total.active_page_capacity_bytes += value.active_page_capacity_bytes;
     total.inactive_page_capacity_bytes += value.inactive_page_capacity_bytes;
     total.page_count += value.page_count;
@@ -1573,6 +1587,10 @@ fn add_region(total: &mut AarmRegionTelemetry, value: AarmRegionTelemetry) {
     total.peak_arena_capacity_bytes += value.peak_arena_capacity_bytes;
     add_events(&mut total.events, value.events);
     total.last_rewind = value.last_rewind.or(total.last_rewind);
+}
+
+fn sum_known_option(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    left?.checked_add(right?)
 }
 
 fn add_events(total: &mut AarmAllocatorEvents, value: AarmAllocatorEvents) {
@@ -1687,12 +1705,18 @@ fn json_rewind(rewind: Option<aster_runtime::AarmRewindTelemetry>) -> String {
 fn json_region(region: AarmRegionTelemetry) -> String {
     format!(
         "{{\"live_used_bytes\":{},\"arena_capacity_bytes\":{},\
+         \"virtual_extent_bytes\":{},\"backing_retained_bytes\":{},\
+         \"backing_discarded_bytes\":{},\"peak_backing_retained_bytes\":{},\
          \"peak_live_used_bytes\":{},\"peak_arena_capacity_bytes\":{},\
          \"active_page_capacity_bytes\":{},\"inactive_page_capacity_bytes\":{},\
          \"page_count\":{},\"active_page_count\":{},\"inactive_page_count\":{},\
          \"events\":{},\"last_rewind\":{}}}",
         region.live_used_bytes,
         region.arena_capacity_bytes,
+        json_option(region.virtual_extent_bytes),
+        json_option(region.backing_retained_bytes),
+        json_option(region.backing_discarded_bytes),
+        json_option(region.peak_backing_retained_bytes),
         region.peak_live_used_bytes,
         region.peak_arena_capacity_bytes,
         region.active_page_capacity_bytes,
@@ -1936,7 +1960,7 @@ pub fn serialize_results_with_budget(
     budget: Option<AarmAutoBudgetTelemetry>,
 ) -> String {
     let mut output = format!(
-        "{{\"schema_version\":9,\"host_memory_capacity\":{},\"memory_budget\":{},\"results\":[",
+        "{{\"schema_version\":10,\"host_memory_capacity\":{},\"memory_budget\":{},\"results\":[",
         json_host_memory_capacity(host_capacity),
         json_memory_budget(budget)
     );
@@ -2084,10 +2108,28 @@ fn main() {
                 )
             },
         );
+        let backing = result.telemetry.total.virtual_extent_bytes.map_or_else(
+            || "unavailable".to_string(),
+            |virtual_extent| {
+                format!(
+                    "{virtual_extent}/{}/{}",
+                    result
+                        .telemetry
+                        .total
+                        .backing_retained_bytes
+                        .expect("known VM extent has known retained backing"),
+                    result
+                        .telemetry
+                        .total
+                        .backing_discarded_bytes
+                        .expect("known VM extent has known discarded backing"),
+                )
+            },
+        );
         println!(
             "workload={label:<36} scale={:<6} elapsed_ms={:>5}.{:03} requested={:>10} \
              final_used={:>10} peak_used={:>10} capacity={:>10} fast={:>8} slow={:>8} \
-             reuse={:>5} rewinds={:>5} governor={governor} plan={planning} rss_peak={}",
+             reuse={:>5} rewinds={:>5} backing={backing} governor={governor} plan={planning} rss_peak={}",
             result.scale.as_str(),
             result.elapsed_micros / 1000,
             result.elapsed_micros % 1000,
@@ -2126,7 +2168,7 @@ mod tests {
     #[test]
     fn structured_output_advertises_the_research_schema() {
         let json = serialize_results(&[]);
-        assert!(json.starts_with("{\"schema_version\":9,"));
+        assert!(json.starts_with("{\"schema_version\":10,"));
         assert!(json.contains("\"host_memory_capacity\""));
         assert!(json.contains("\"memory_budget\""));
         assert!(json.ends_with("\"results\":[]}"));

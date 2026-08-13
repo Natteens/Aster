@@ -61,12 +61,25 @@ struct PageBacking {
     logical_capacity: usize,
     vm_allocation_size: Option<usize>,
     system_layout: Option<Layout>,
+    state: PageBackingState,
 }
 
 impl PageBacking {
     fn capacity(&self) -> usize {
         self.logical_capacity
     }
+
+    #[cfg(feature = "aarm-telemetry")]
+    fn virtual_extent(&self) -> Option<usize> {
+        self.vm_allocation_size
+    }
+}
+
+/// AARM's explicit lifecycle state for one complete host backing range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageBackingState {
+    Retained,
+    Discarded,
 }
 
 /// Runtime-private mechanism for the stable zeroed backing of one arena page.
@@ -81,6 +94,20 @@ trait PageBackend {
     ) -> Result<PageBacking, ArenaAllocError>;
 
     fn release(&self, backing: PageBacking);
+
+    #[allow(dead_code)]
+    fn discard(&self, _backing: &mut PageBacking) -> Result<(), ArenaAllocError> {
+        Err(ArenaAllocError::AddressSpace)
+    }
+
+    fn prepare_for_reuse(&self, _backing: &mut PageBacking) -> Result<(), ArenaAllocError> {
+        Err(ArenaAllocError::AddressSpace)
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    fn has_known_virtual_extent(&self) -> bool {
+        false
+    }
 
     #[cfg(all(test, windows))]
     fn is_windows_virtual(&self) -> bool {
@@ -117,6 +144,7 @@ impl PageBackend for SystemAllocatorPageBackend {
             logical_capacity: capacity,
             vm_allocation_size: None,
             system_layout: Some(layout),
+            state: PageBackingState::Retained,
         })
     }
 
@@ -207,12 +235,26 @@ impl PageBackend for WindowsVirtualPageBackend {
             logical_capacity: capacity,
             vm_allocation_size: Some(allocation_size),
             system_layout: None,
+            state: PageBackingState::Retained,
         })
     }
 
     fn release(&self, backing: PageBacking) {
         let released = Self::release_backing(&backing);
         debug_assert!(released, "Windows virtual page release must succeed");
+    }
+
+    fn discard(&self, backing: &mut PageBacking) -> Result<(), ArenaAllocError> {
+        Self::decommit(backing)
+    }
+
+    fn prepare_for_reuse(&self, backing: &mut PageBacking) -> Result<(), ArenaAllocError> {
+        Self::recommit(backing)
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    fn has_known_virtual_extent(&self) -> bool {
+        true
     }
 
     #[cfg(all(test, windows))]
@@ -319,12 +361,26 @@ impl PageBackend for LinuxAnonymousPageBackend {
             logical_capacity: capacity,
             vm_allocation_size: Some(mapping_size),
             system_layout: None,
+            state: PageBackingState::Retained,
         })
     }
 
     fn release(&self, backing: PageBacking) {
         let released = Self::release_backing(&backing);
         debug_assert!(released, "Linux anonymous page release must succeed");
+    }
+
+    fn discard(&self, backing: &mut PageBacking) -> Result<(), ArenaAllocError> {
+        Self::discard(backing)
+    }
+
+    fn prepare_for_reuse(&self, _backing: &mut PageBacking) -> Result<(), ArenaAllocError> {
+        Ok(())
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    fn has_known_virtual_extent(&self) -> bool {
+        true
     }
 
     #[cfg(all(test, target_os = "linux"))]
@@ -431,6 +487,50 @@ impl BackendPageBacking {
             .expect("live page backing is present")
             .capacity()
     }
+
+    fn state(&self) -> PageBackingState {
+        self.backing
+            .as_ref()
+            .expect("live page backing is present")
+            .state
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    fn virtual_extent(&self) -> Option<usize> {
+        self.backing
+            .as_ref()
+            .expect("live page backing is present")
+            .virtual_extent()
+    }
+
+    #[allow(dead_code)]
+    fn discard(&mut self) -> Result<(), ArenaAllocError> {
+        let backing = self.backing.as_mut().expect("live page backing is present");
+        assert_eq!(
+            backing.state,
+            PageBackingState::Retained,
+            "only retained backing may be discarded"
+        );
+        self.backend.discard(backing)?;
+        backing.state = PageBackingState::Discarded;
+        Ok(())
+    }
+
+    fn prepare_for_reuse(&mut self) -> Result<(), ArenaAllocError> {
+        let backing = self.backing.as_mut().expect("live page backing is present");
+        assert_eq!(
+            backing.state,
+            PageBackingState::Discarded,
+            "only discarded backing needs reuse preparation"
+        );
+        let base = backing.base;
+        self.backend.prepare_for_reuse(backing)?;
+        if backing.base != base {
+            return Err(ArenaAllocError::AddressSpace);
+        }
+        backing.state = PageBackingState::Retained;
+        Ok(())
+    }
 }
 
 impl Drop for BackendPageBacking {
@@ -474,10 +574,34 @@ impl Page {
         self.backing.capacity()
     }
 
+    fn backing_state(&self) -> PageBackingState {
+        self.backing.state()
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    fn virtual_extent(&self) -> Option<usize> {
+        self.backing.virtual_extent()
+    }
+
+    fn prepare_for_reuse(&mut self) -> Result<(), ArenaAllocError> {
+        if self.backing_state() == PageBackingState::Discarded {
+            self.backing.prepare_for_reuse()?;
+        }
+        debug_assert_eq!(self.backing_state(), PageBackingState::Retained);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn discard_for_test(&mut self) -> Result<(), ArenaAllocError> {
+        assert_eq!(self.cursor, 0, "only fully inactive pages may be discarded");
+        self.backing.discard()
+    }
+
     /// Try to place `size` bytes at the given alignment inside this page.
     /// Returns the pointer and the number of bytes consumed (including padding)
     /// on success.
     fn try_alloc(&mut self, size: usize, align: usize) -> Option<(*mut u8, usize)> {
+        debug_assert_eq!(self.backing_state(), PageBackingState::Retained);
         let aligned = align_up(self.cursor, align)?;
         let end = aligned.checked_add(size)?;
         if end > self.capacity() {
@@ -566,6 +690,10 @@ pub(crate) struct ArenaTelemetrySnapshot {
     pub inactive_page_count: usize,
     pub peak_used_bytes: usize,
     pub peak_capacity_bytes: usize,
+    pub virtual_extent_bytes: Option<usize>,
+    pub backing_retained_bytes: Option<usize>,
+    pub backing_discarded_bytes: Option<usize>,
+    pub peak_backing_retained_bytes: Option<usize>,
     pub events: ArenaEventMetrics,
     pub last_rewind: Option<ArenaRewindMetrics>,
 }
@@ -576,8 +704,17 @@ struct ArenaTelemetryState {
     active_page_capacity_bytes: usize,
     peak_used_bytes: usize,
     peak_capacity_bytes: usize,
+    peak_backing_retained_bytes: Option<usize>,
     events: ArenaEventMetrics,
     last_rewind: Option<ArenaRewindMetrics>,
+}
+
+#[cfg(feature = "aarm-telemetry")]
+#[derive(Default)]
+struct BackingTelemetry {
+    virtual_extent: Option<usize>,
+    retained: Option<usize>,
+    discarded: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -616,7 +753,12 @@ impl PagedArena {
             next_mark_id: 1,
             mark_stack: Vec::new(),
             #[cfg(feature = "aarm-telemetry")]
-            telemetry: ArenaTelemetryState::default(),
+            telemetry: ArenaTelemetryState {
+                peak_backing_retained_bytes: default_page_backend()
+                    .has_known_virtual_extent()
+                    .then_some(0),
+                ..ArenaTelemetryState::default()
+            },
         }
     }
 
@@ -629,10 +771,22 @@ impl PagedArena {
 
     #[cfg(test)]
     fn with_backend(backend: &'static dyn PageBackend) -> Self {
-        Self {
+        #[cfg(feature = "aarm-telemetry")]
+        let mut arena = Self {
             backend,
             ..Self::new()
+        };
+        #[cfg(not(feature = "aarm-telemetry"))]
+        let arena = Self {
+            backend,
+            ..Self::new()
+        };
+        #[cfg(feature = "aarm-telemetry")]
+        {
+            arena.telemetry.peak_backing_retained_bytes =
+                backend.has_known_virtual_extent().then_some(0);
         }
+        arena
     }
 
     #[cfg(test)]
@@ -640,11 +794,27 @@ impl PagedArena {
         backend: &'static dyn PageBackend,
         governor: Arc<MemoryGovernor>,
     ) -> Self {
-        Self {
-            backend,
-            governor: Some(governor),
-            ..Self::new()
-        }
+        let mut arena = Self::with_backend(backend);
+        arena.governor = Some(governor);
+        arena
+    }
+
+    #[cfg(test)]
+    fn discard_inactive_page_for_test(&mut self, index: usize) -> Result<*mut u8, ArenaAllocError> {
+        assert!(
+            index >= self.active_pages,
+            "only inactive pages may be discarded"
+        );
+        let page = self
+            .pages
+            .get_mut(index)
+            .expect("test discard references an existing page");
+        assert_eq!(page.cursor, 0, "only zero-cursor pages may be discarded");
+        let base = page.backing.base();
+        page.discard_for_test()?;
+        #[cfg(feature = "aarm-telemetry")]
+        self.refresh_telemetry_peaks();
+        Ok(base)
     }
 
     pub(crate) fn governor_telemetry(&self) -> Option<MemoryGovernorTelemetry> {
@@ -682,34 +852,8 @@ impl PagedArena {
             "inactive arena page must have zero cursor"
         );
 
-        let reusable_index = self.pages[self.active_pages..]
-            .iter()
-            .enumerate()
-            .filter(|(_, page)| page.capacity() >= size)
-            .min_by_key(|(_, page)| page.capacity())
-            .map(|(offset, _)| self.active_pages + offset);
-
-        if let Some(index) = reusable_index {
-            self.pages.swap(self.active_pages, index);
-            let page = &mut self.pages[self.active_pages];
-            #[cfg(feature = "aarm-telemetry")]
-            let activated_capacity = page.capacity();
-            let (ptr, consumed) = page
-                .try_alloc(size, align)
-                .expect("reused page must satisfy the allocation");
-            self.active_pages += 1;
-            self.used_bytes = self
-                .used_bytes
-                .checked_add(consumed)
-                .ok_or(ArenaAllocError::AddressSpace)?;
-            #[cfg(feature = "aarm-telemetry")]
-            {
-                self.telemetry.events.inactive_page_reuse_events += 1;
-                self.telemetry.active_page_capacity_bytes += activated_capacity;
-            }
-            #[cfg(feature = "aarm-telemetry")]
-            self.refresh_telemetry_peaks();
-            return Ok(ptr);
+        if let Some(pointer) = self.try_reuse_inactive_page(size, align)? {
+            return Ok(pointer);
         }
 
         // Regular pages grow geometrically to keep tiny contexts dense without
@@ -776,6 +920,44 @@ impl PagedArena {
         #[cfg(feature = "aarm-telemetry")]
         self.refresh_telemetry_peaks();
         Ok(ptr)
+    }
+
+    fn try_reuse_inactive_page(
+        &mut self,
+        size: usize,
+        align: usize,
+    ) -> Result<Option<*mut u8>, ArenaAllocError> {
+        let reusable_index = self.pages[self.active_pages..]
+            .iter()
+            .enumerate()
+            .filter(|(_, page)| page.capacity() >= size)
+            .min_by_key(|(_, page)| page.capacity())
+            .map(|(offset, _)| self.active_pages + offset);
+        let Some(index) = reusable_index else {
+            return Ok(None);
+        };
+
+        self.pages[index].prepare_for_reuse()?;
+        self.pages.swap(self.active_pages, index);
+        let page = &mut self.pages[self.active_pages];
+        #[cfg(feature = "aarm-telemetry")]
+        let activated_capacity = page.capacity();
+        let (ptr, consumed) = page
+            .try_alloc(size, align)
+            .expect("reused page must satisfy the allocation");
+        self.active_pages += 1;
+        self.used_bytes = self
+            .used_bytes
+            .checked_add(consumed)
+            .ok_or(ArenaAllocError::AddressSpace)?;
+        #[cfg(feature = "aarm-telemetry")]
+        {
+            self.telemetry.events.inactive_page_reuse_events += 1;
+            self.telemetry.active_page_capacity_bytes += activated_capacity;
+        }
+        #[cfg(feature = "aarm-telemetry")]
+        self.refresh_telemetry_peaks();
+        Ok(Some(ptr))
     }
 
     /// Allocate only when the current active page already has capacity.
@@ -961,6 +1143,8 @@ impl PagedArena {
         #[cfg(feature = "aarm-telemetry")]
         let active_page_capacity_bytes = self.telemetry.active_page_capacity_bytes;
         #[cfg(feature = "aarm-telemetry")]
+        let backing = self.backing_telemetry();
+        #[cfg(feature = "aarm-telemetry")]
         Some(ArenaTelemetrySnapshot {
             used_bytes: self.used_bytes,
             capacity_bytes: self.reserved_bytes,
@@ -971,6 +1155,10 @@ impl PagedArena {
             inactive_page_count: self.pages.len() - self.active_pages,
             peak_used_bytes: self.telemetry.peak_used_bytes,
             peak_capacity_bytes: self.telemetry.peak_capacity_bytes,
+            virtual_extent_bytes: backing.virtual_extent,
+            backing_retained_bytes: backing.retained,
+            backing_discarded_bytes: backing.discarded,
+            peak_backing_retained_bytes: self.telemetry.peak_backing_retained_bytes,
             events: self.telemetry.events,
             last_rewind: self.telemetry.last_rewind,
         })
@@ -981,6 +1169,56 @@ impl PagedArena {
         self.telemetry.peak_used_bytes = self.telemetry.peak_used_bytes.max(self.used_bytes);
         self.telemetry.peak_capacity_bytes =
             self.telemetry.peak_capacity_bytes.max(self.reserved_bytes);
+        if let Some(retained_bytes) = self.backing_telemetry().retained {
+            self.telemetry.peak_backing_retained_bytes = Some(
+                self.telemetry
+                    .peak_backing_retained_bytes
+                    .unwrap_or(0)
+                    .max(retained_bytes),
+            );
+        }
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    fn backing_telemetry(&self) -> BackingTelemetry {
+        if !self.backend.has_known_virtual_extent() {
+            return BackingTelemetry::default();
+        }
+
+        let Some(virtual_extent_bytes) = self
+            .pages
+            .iter()
+            .map(Page::virtual_extent)
+            .try_fold(0usize, |total, extent| total.checked_add(extent?))
+        else {
+            return BackingTelemetry::default();
+        };
+
+        let mut retained_bytes = 0usize;
+        let mut discarded_bytes = 0usize;
+        for page in &self.pages {
+            let Some(extent) = page.virtual_extent() else {
+                return BackingTelemetry::default();
+            };
+            let target = match page.backing_state() {
+                PageBackingState::Retained => &mut retained_bytes,
+                PageBackingState::Discarded => &mut discarded_bytes,
+            };
+            let Some(next) = target.checked_add(extent) else {
+                return BackingTelemetry::default();
+            };
+            *target = next;
+        }
+        debug_assert_eq!(
+            virtual_extent_bytes,
+            retained_bytes + discarded_bytes,
+            "whole-backing states partition the VM extent"
+        );
+        BackingTelemetry {
+            virtual_extent: Some(virtual_extent_bytes),
+            retained: Some(retained_bytes),
+            discarded: Some(discarded_bytes),
+        }
     }
 
     /// Number of pages currently held. Exposed for internal assertions only.
@@ -1028,6 +1266,68 @@ mod tests {
         release_calls: AtomicUsize,
     }
 
+    struct RestoreFailingPageBackend;
+
+    struct DiscardFailingPageBackend;
+
+    impl PageBackend for RestoreFailingPageBackend {
+        fn allocate_zeroed(
+            &self,
+            capacity: usize,
+            alignment: usize,
+        ) -> Result<PageBacking, ArenaAllocError> {
+            let mut backing = SYSTEM_ALLOCATOR_PAGE_BACKEND.allocate_zeroed(capacity, alignment)?;
+            backing.vm_allocation_size = Some(capacity);
+            Ok(backing)
+        }
+
+        fn release(&self, backing: PageBacking) {
+            SYSTEM_ALLOCATOR_PAGE_BACKEND.release(backing);
+        }
+
+        fn discard(&self, _backing: &mut PageBacking) -> Result<(), ArenaAllocError> {
+            Ok(())
+        }
+
+        fn prepare_for_reuse(&self, _backing: &mut PageBacking) -> Result<(), ArenaAllocError> {
+            Err(ArenaAllocError::OutOfMemory)
+        }
+
+        #[cfg(feature = "aarm-telemetry")]
+        fn has_known_virtual_extent(&self) -> bool {
+            true
+        }
+    }
+
+    static RESTORE_FAILING_PAGE_BACKEND: RestoreFailingPageBackend = RestoreFailingPageBackend;
+
+    impl PageBackend for DiscardFailingPageBackend {
+        fn allocate_zeroed(
+            &self,
+            capacity: usize,
+            alignment: usize,
+        ) -> Result<PageBacking, ArenaAllocError> {
+            let mut backing = SYSTEM_ALLOCATOR_PAGE_BACKEND.allocate_zeroed(capacity, alignment)?;
+            backing.vm_allocation_size = Some(capacity);
+            Ok(backing)
+        }
+
+        fn release(&self, backing: PageBacking) {
+            SYSTEM_ALLOCATOR_PAGE_BACKEND.release(backing);
+        }
+
+        fn discard(&self, _backing: &mut PageBacking) -> Result<(), ArenaAllocError> {
+            Err(ArenaAllocError::OutOfMemory)
+        }
+
+        #[cfg(feature = "aarm-telemetry")]
+        fn has_known_virtual_extent(&self) -> bool {
+            true
+        }
+    }
+
+    static DISCARD_FAILING_PAGE_BACKEND: DiscardFailingPageBackend = DiscardFailingPageBackend;
+
     impl CountingPageBackend {
         fn new(fail_allocations: bool) -> Self {
             Self {
@@ -1059,6 +1359,155 @@ mod tests {
 
     fn test_backend(fail_allocations: bool) -> &'static CountingPageBackend {
         Box::leak(Box::new(CountingPageBackend::new(fail_allocations)))
+    }
+
+    #[test]
+    fn discarded_inactive_page_restore_failure_is_atomic_and_keeps_governor_capacity() {
+        let governor = Arc::new(MemoryGovernor::new(MIN_PAGE_SIZE));
+        let mut arena = PagedArena::with_backend_and_memory_governor(
+            &RESTORE_FAILING_PAGE_BACKEND,
+            Arc::clone(&governor),
+        );
+        let mark = arena.mark();
+        let pointer = arena
+            .try_alloc(1, 1, MIN_PAGE_SIZE)
+            .expect("fresh page allocation succeeds");
+        arena.rewind(mark);
+        let base = arena
+            .discard_inactive_page_for_test(0)
+            .expect("test backend discards inactive backing");
+        assert_eq!(base, pointer);
+        assert_eq!(arena.pages[0].backing_state(), PageBackingState::Discarded);
+
+        let used_before = arena.used_bytes;
+        let capacity_before = arena.reserved_bytes;
+        let governor_before = governor.telemetry();
+        assert_eq!(
+            arena.try_alloc(1, 1, MIN_PAGE_SIZE),
+            Err(ArenaAllocError::OutOfMemory)
+        );
+        assert_eq!(arena.active_pages, 0);
+        assert_eq!(arena.used_bytes, used_before);
+        assert_eq!(arena.reserved_bytes, capacity_before);
+        assert_eq!(arena.pages[0].backing_state(), PageBackingState::Discarded);
+        assert_eq!(governor.telemetry(), governor_before);
+    }
+
+    #[test]
+    fn failed_discard_keeps_inactive_backing_retained() {
+        let mut arena = PagedArena::with_backend(&DISCARD_FAILING_PAGE_BACKEND);
+        let mark = arena.mark();
+        arena
+            .try_alloc(1, 1, MIN_PAGE_SIZE)
+            .expect("fresh page allocation succeeds");
+        arena.rewind(mark);
+
+        assert_eq!(
+            arena.discard_inactive_page_for_test(0),
+            Err(ArenaAllocError::OutOfMemory)
+        );
+        assert_eq!(arena.pages[0].backing_state(), PageBackingState::Retained);
+        assert_eq!(arena.metrics().reserved_bytes, MIN_PAGE_SIZE);
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    #[test]
+    fn backing_telemetry_marks_discarded_backing_without_changing_logical_capacity() {
+        let mut arena = PagedArena::with_backend(&RESTORE_FAILING_PAGE_BACKEND);
+        let mark = arena.mark();
+        arena
+            .try_alloc(1, 1, MIN_PAGE_SIZE)
+            .expect("fresh page allocation succeeds");
+        arena.rewind(mark);
+        let retained = arena.telemetry_snapshot().expect("telemetry is enabled");
+        assert_eq!(retained.capacity_bytes, MIN_PAGE_SIZE);
+        assert_eq!(retained.virtual_extent_bytes, Some(MIN_PAGE_SIZE));
+        assert_eq!(retained.backing_retained_bytes, Some(MIN_PAGE_SIZE));
+        assert_eq!(retained.backing_discarded_bytes, Some(0));
+        assert_eq!(retained.peak_backing_retained_bytes, Some(MIN_PAGE_SIZE));
+
+        arena
+            .discard_inactive_page_for_test(0)
+            .expect("test backend discards inactive backing");
+        let discarded = arena.telemetry_snapshot().expect("telemetry is enabled");
+        assert_eq!(discarded.capacity_bytes, MIN_PAGE_SIZE);
+        assert_eq!(discarded.virtual_extent_bytes, Some(MIN_PAGE_SIZE));
+        assert_eq!(discarded.backing_retained_bytes, Some(0));
+        assert_eq!(discarded.backing_discarded_bytes, Some(MIN_PAGE_SIZE));
+        assert_eq!(discarded.peak_backing_retained_bytes, Some(MIN_PAGE_SIZE));
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    #[test]
+    fn system_backing_reports_vm_capacity_as_unavailable() {
+        let backend = test_backend(false);
+        let mut arena = PagedArena::with_backend(backend);
+        arena
+            .try_alloc(1, 1, MIN_PAGE_SIZE)
+            .expect("system-backed page allocation succeeds");
+
+        let telemetry = arena.telemetry_snapshot().expect("telemetry is enabled");
+        assert_eq!(telemetry.virtual_extent_bytes, None);
+        assert_eq!(telemetry.backing_retained_bytes, None);
+        assert_eq!(telemetry.backing_discarded_bytes, None);
+        assert_eq!(telemetry.peak_backing_retained_bytes, None);
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn retained_inactive_vm_page_reuse_keeps_its_backing_state() {
+        let mut arena = PagedArena::new();
+        let mark = arena.mark();
+        let pointer = arena
+            .try_alloc(16, 1, MIN_PAGE_SIZE)
+            .expect("fresh VM page allocation succeeds");
+        arena.rewind(mark);
+        assert_eq!(arena.pages[0].backing_state(), PageBackingState::Retained);
+
+        let reused = arena
+            .try_alloc(16, 1, MIN_PAGE_SIZE)
+            .expect("retained inactive page reuses without restoration");
+        assert_eq!(reused, pointer);
+        assert_eq!(arena.pages[0].backing_state(), PageBackingState::Retained);
+    }
+
+    #[cfg(all(feature = "aarm-telemetry", any(windows, target_os = "linux")))]
+    #[test]
+    fn retained_inactive_vm_page_reuse_keeps_backing_telemetry() {
+        let mut arena = PagedArena::new();
+        let mark = arena.mark();
+        arena
+            .try_alloc(16, 1, MIN_PAGE_SIZE)
+            .expect("fresh VM page allocation succeeds");
+        arena.rewind(mark);
+        let before = arena.telemetry_snapshot().expect("telemetry is enabled");
+
+        arena
+            .try_alloc(16, 1, MIN_PAGE_SIZE)
+            .expect("retained inactive page reuses without restoration");
+        let after = arena.telemetry_snapshot().expect("telemetry is enabled");
+        assert_eq!(after.virtual_extent_bytes, before.virtual_extent_bytes);
+        assert_eq!(after.backing_retained_bytes, before.backing_retained_bytes);
+        assert_eq!(after.backing_discarded_bytes, Some(0));
+    }
+
+    #[cfg(all(feature = "aarm-telemetry", any(windows, target_os = "linux")))]
+    #[test]
+    fn oversized_vm_page_keeps_exact_logical_capacity_and_rounded_extent() {
+        let capacity = DEFAULT_PAGE_SIZE + 1;
+        let mut arena = PagedArena::new();
+        arena
+            .try_alloc(capacity, 1, usize::MAX)
+            .expect("oversized VM page allocation succeeds");
+
+        let telemetry = arena.telemetry_snapshot().expect("telemetry is enabled");
+        assert_eq!(telemetry.capacity_bytes, capacity);
+        let virtual_extent = telemetry
+            .virtual_extent_bytes
+            .expect("VM backend reports its extent");
+        assert!(virtual_extent >= capacity);
+        assert_eq!(telemetry.backing_retained_bytes, Some(virtual_extent));
+        assert_eq!(telemetry.backing_discarded_bytes, Some(0));
     }
 
     #[test]
@@ -1215,20 +1664,79 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_anonymous_backing_raii_drop_releases_its_mapping() {
-        let backing =
+        let mut backing =
             BackendPageBacking::allocate(&LINUX_ANONYMOUS_PAGE_BACKEND, MIN_PAGE_SIZE, MAX_ALIGN)
                 .expect("Linux anonymous mapping succeeds");
         assert!(!backing.base().is_null());
+        backing
+            .discard()
+            .expect("MADV_DONTNEED succeeds before release");
         drop(backing);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_discarded_inactive_page_restores_zeroed_at_its_original_base() {
+        let mut arena = PagedArena::new();
+        let mark = arena.mark();
+        let pointer = arena
+            .try_alloc(16, 1, MIN_PAGE_SIZE)
+            .expect("fresh Linux mapping succeeds");
+        arena.rewind(mark);
+        #[cfg(feature = "aarm-telemetry")]
+        let virtual_extent = {
+            let retained = arena.telemetry_snapshot().expect("telemetry is enabled");
+            let virtual_extent = retained
+                .virtual_extent_bytes
+                .expect("Linux mapping extent is known");
+            assert_eq!(retained.backing_retained_bytes, Some(virtual_extent));
+            assert_eq!(retained.backing_discarded_bytes, Some(0));
+            virtual_extent
+        };
+        // SAFETY: the page remains mapped after rewind and owned by the arena.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::write_bytes(pointer, 0xA5, 16);
+        }
+        let base = arena
+            .discard_inactive_page_for_test(0)
+            .expect("MADV_DONTNEED succeeds");
+        assert_eq!(base, pointer);
+        assert_eq!(arena.pages[0].backing_state(), PageBackingState::Discarded);
+        #[cfg(feature = "aarm-telemetry")]
+        {
+            let discarded = arena.telemetry_snapshot().expect("telemetry is enabled");
+            assert_eq!(discarded.virtual_extent_bytes, Some(virtual_extent));
+            assert_eq!(discarded.backing_retained_bytes, Some(0));
+            assert_eq!(discarded.backing_discarded_bytes, Some(virtual_extent));
+        }
+
+        let reused = arena
+            .try_alloc(16, 1, MIN_PAGE_SIZE)
+            .expect("Linux mapping remains reusable");
+        assert_eq!(reused, pointer);
+        assert_eq!(arena.pages[0].backing_state(), PageBackingState::Retained);
+        // SAFETY: Linux discard retains the mapping before it is reused.
+        #[allow(unsafe_code)]
+        let bytes = unsafe { std::slice::from_raw_parts(reused, 16) };
+        assert!(bytes.iter().all(|&byte| byte == 0));
+        #[cfg(feature = "aarm-telemetry")]
+        {
+            let retained = arena.telemetry_snapshot().expect("telemetry is enabled");
+            assert_eq!(retained.virtual_extent_bytes, Some(virtual_extent));
+            assert_eq!(retained.backing_retained_bytes, Some(virtual_extent));
+            assert_eq!(retained.backing_discarded_bytes, Some(0));
+        }
     }
 
     #[cfg(windows)]
     #[test]
     fn windows_virtual_backing_raii_drop_releases_its_reservation() {
-        let backing =
+        let mut backing =
             BackendPageBacking::allocate(&WINDOWS_VIRTUAL_PAGE_BACKEND, MIN_PAGE_SIZE, MAX_ALIGN)
                 .expect("Windows virtual allocation succeeds");
         let base = backing.base();
+        backing.discard().expect("decommit succeeds before release");
         drop(backing);
 
         let reacquired = virtual_alloc(
@@ -1238,6 +1746,61 @@ mod tests {
         );
         assert_eq!(reacquired.cast::<u8>(), base);
         assert!(virtual_free(reacquired.cast::<u8>(), 0, MEM_RELEASE));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_discarded_inactive_page_restores_zeroed_at_its_original_base() {
+        let mut arena = PagedArena::new();
+        let mark = arena.mark();
+        let pointer = arena
+            .try_alloc(16, 1, MIN_PAGE_SIZE)
+            .expect("fresh Windows page allocation succeeds");
+        arena.rewind(mark);
+        #[cfg(feature = "aarm-telemetry")]
+        let virtual_extent = {
+            let retained = arena.telemetry_snapshot().expect("telemetry is enabled");
+            let virtual_extent = retained
+                .virtual_extent_bytes
+                .expect("Windows reservation extent is known");
+            assert_eq!(retained.backing_retained_bytes, Some(virtual_extent));
+            assert_eq!(retained.backing_discarded_bytes, Some(0));
+            virtual_extent
+        };
+        // SAFETY: the page remains retained after rewind and owned by the arena.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::write_bytes(pointer, 0xA5, 16);
+        }
+        let base = arena
+            .discard_inactive_page_for_test(0)
+            .expect("Windows decommit succeeds");
+        assert_eq!(base, pointer);
+        assert_eq!(arena.pages[0].backing_state(), PageBackingState::Discarded);
+        #[cfg(feature = "aarm-telemetry")]
+        {
+            let discarded = arena.telemetry_snapshot().expect("telemetry is enabled");
+            assert_eq!(discarded.virtual_extent_bytes, Some(virtual_extent));
+            assert_eq!(discarded.backing_retained_bytes, Some(0));
+            assert_eq!(discarded.backing_discarded_bytes, Some(virtual_extent));
+        }
+
+        let reused = arena
+            .try_alloc(16, 1, MIN_PAGE_SIZE)
+            .expect("Windows recommit succeeds");
+        assert_eq!(reused, pointer);
+        assert_eq!(arena.pages[0].backing_state(), PageBackingState::Retained);
+        // SAFETY: reuse prepared the backing before it was activated.
+        #[allow(unsafe_code)]
+        let bytes = unsafe { std::slice::from_raw_parts(reused, 16) };
+        assert!(bytes.iter().all(|&byte| byte == 0));
+        #[cfg(feature = "aarm-telemetry")]
+        {
+            let retained = arena.telemetry_snapshot().expect("telemetry is enabled");
+            assert_eq!(retained.virtual_extent_bytes, Some(virtual_extent));
+            assert_eq!(retained.backing_retained_bytes, Some(virtual_extent));
+            assert_eq!(retained.backing_discarded_bytes, Some(0));
+        }
     }
 
     #[cfg(windows)]

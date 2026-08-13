@@ -414,6 +414,10 @@ pub struct AarmRewindTelemetry {
 pub struct AarmRegionTelemetry {
     pub live_used_bytes: u64,
     pub arena_capacity_bytes: u64,
+    pub virtual_extent_bytes: Option<u64>,
+    pub backing_retained_bytes: Option<u64>,
+    pub backing_discarded_bytes: Option<u64>,
+    pub peak_backing_retained_bytes: Option<u64>,
     pub active_page_capacity_bytes: u64,
     pub inactive_page_capacity_bytes: u64,
     pub page_count: u64,
@@ -469,6 +473,12 @@ impl From<ArenaTelemetrySnapshot> for AarmRegionTelemetry {
         Self {
             live_used_bytes: snapshot.used_bytes as u64,
             arena_capacity_bytes: snapshot.capacity_bytes as u64,
+            virtual_extent_bytes: snapshot.virtual_extent_bytes.map(|value| value as u64),
+            backing_retained_bytes: snapshot.backing_retained_bytes.map(|value| value as u64),
+            backing_discarded_bytes: snapshot.backing_discarded_bytes.map(|value| value as u64),
+            peak_backing_retained_bytes: snapshot
+                .peak_backing_retained_bytes
+                .map(|value| value as u64),
             active_page_capacity_bytes: snapshot.active_page_capacity_bytes as u64,
             inactive_page_capacity_bytes: snapshot.inactive_page_capacity_bytes as u64,
             page_count: snapshot.page_count as u64,
@@ -774,6 +784,22 @@ impl ExecutionContext {
         let total = AarmRegionTelemetry {
             live_used_bytes: temporary.live_used_bytes + persistent.live_used_bytes,
             arena_capacity_bytes: temporary.arena_capacity_bytes + persistent.arena_capacity_bytes,
+            virtual_extent_bytes: sum_known_u64(
+                temporary.virtual_extent_bytes,
+                persistent.virtual_extent_bytes,
+            ),
+            backing_retained_bytes: sum_known_u64(
+                temporary.backing_retained_bytes,
+                persistent.backing_retained_bytes,
+            ),
+            backing_discarded_bytes: sum_known_u64(
+                temporary.backing_discarded_bytes,
+                persistent.backing_discarded_bytes,
+            ),
+            peak_backing_retained_bytes: sum_known_u64(
+                temporary.peak_backing_retained_bytes,
+                persistent.peak_backing_retained_bytes,
+            ),
             active_page_capacity_bytes: temporary.active_page_capacity_bytes
                 + persistent.active_page_capacity_bytes,
             inactive_page_capacity_bytes: temporary.inactive_page_capacity_bytes
@@ -2917,6 +2943,10 @@ impl ExecutionContext {
     ) -> *const AsterStrHeader {
         self.allocate_string_parts_in_region(parts, true)
     }
+}
+
+fn sum_known_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    left?.checked_add(right?)
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -7031,6 +7061,27 @@ mod tests {
         assert_eq!(
             telemetry.total.arena_capacity_bytes,
             telemetry.temporary.arena_capacity_bytes + telemetry.persistent.arena_capacity_bytes
+        );
+        assert_eq!(
+            telemetry.total.virtual_extent_bytes,
+            sum_known_u64(
+                telemetry.temporary.virtual_extent_bytes,
+                telemetry.persistent.virtual_extent_bytes,
+            )
+        );
+        assert_eq!(
+            telemetry.total.backing_retained_bytes,
+            sum_known_u64(
+                telemetry.temporary.backing_retained_bytes,
+                telemetry.persistent.backing_retained_bytes,
+            )
+        );
+        assert_eq!(
+            telemetry.total.backing_discarded_bytes,
+            sum_known_u64(
+                telemetry.temporary.backing_discarded_bytes,
+                telemetry.persistent.backing_discarded_bytes,
+            )
         );
         assert_eq!(
             telemetry.total.active_page_capacity_bytes,

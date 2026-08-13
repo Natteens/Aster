@@ -500,8 +500,54 @@ zeroes reclaimed bytes, retains inactive backing for immediate reuse, and keeps 
 charged.
 
 `reserved_bytes` and `arena_capacity_bytes` remain logical retained page capacity, not Windows
-reservation, Linux mapping extent, resident/backed bytes, or RSS. Cross-platform VM
-reserve/backing telemetry, automatic arena decommit/discard, and purge policy are not implemented.
+reservation, Linux mapping extent, resident/backed bytes, or RSS. Automatic arena
+decommit/discard and purge policy are not implemented.
+
+## AARM-3D page backing state and VM telemetry
+
+AARM-3D makes host backing state explicit inside the runtime-private `PageBacking` owner. A page
+is either **Retained** or **Discarded**. A discarded page is always inactive with a zero cursor;
+it keeps the same page object, logical capacity, governor reservation, and virtual extent. The
+state changes only after the selected backend operation succeeds. Before a discarded page returns
+to ordinary arena allocation, the backend restores it and the runtime verifies the original base
+address before marking it retained again. A restore failure leaves the page inactive and discarded,
+without changing logical arena or governor accounting.
+
+The platform contracts deliberately remain distinct:
+
+- Windows discard is `MEM_DECOMMIT`. The reservation survives but its range is inaccessible until
+  a fixed-base `MEM_COMMIT` restore succeeds.
+- Linux discard is `MADV_DONTNEED`. The anonymous mapping remains addressable and later access
+  obtains demand-zero contents; there is no Linux recommit operation.
+- The system-allocator fallback has no meaningful virtual extent or backing-state measurement, so
+  those experimental values are explicitly unavailable rather than fabricated from logical
+  capacity.
+
+Production rewind remains unchanged. It zeroes reclaimed bytes, retains inactive backing, retains
+the governor reservation, and makes no discard/decommit request. The discard/restore seam is
+exercised only by controlled runtime tests in this slice; automatic discard, purge, and hysteresis
+remain deferred.
+
+With the `aarm-telemetry` research feature, each Temporary/Persistent region and its derived total
+now expose these optional fields:
+
+- `virtual_extent_bytes`: known VM mapping/reservation extent;
+- `backing_retained_bytes`: known extent currently retained by the backing mechanism;
+- `backing_discarded_bytes`: known extent discarded but still owned;
+- `peak_backing_retained_bytes`: observed high-water retained backing extent.
+
+On Windows and Linux, a known region satisfies `virtual_extent_bytes =
+backing_retained_bytes + backing_discarded_bytes`. Totals use checked aggregation and become
+unavailable if any participating region is unavailable. Logical `arena_capacity_bytes` and
+governor charging remain exact ASTER requested capacities, even when the OS mapping/reservation is
+page-rounded. On Windows, retained backing denotes AARM page extents still committed by the backend.
+On Linux, it denotes mapping extent not explicitly `MADV_DONTNEED`-discarded by AARM; it is not
+RSS, residency, or a physical-memory guarantee. These backing fields are neither RSS nor a promise
+of immediate physical-residency change.
+
+The research matrix schema is **10**. It serializes the four optional backing fields as numbers or
+`null`, retains process RSS as a separate whole-process observation, and does not add backing state
+or VM work to active-page allocation or inactive retained-page reuse.
 
 ## Measurement invariants
 
@@ -521,6 +567,9 @@ arena_capacity_bytes =
     active_page_capacity_bytes + inactive_page_capacity_bytes
 
 page_count = active_page_count + inactive_page_count
+
+when VM backing telemetry is known:
+virtual_extent_bytes = backing_retained_bytes + backing_discarded_bytes
 ```
 
 Per-region peaks are local maxima. Total peaks remain the maximum simultaneous combined value from
@@ -569,17 +618,18 @@ cargo run --release -p aster-codegen-cranelift --features aarm-telemetry --examp
 cargo run --release -p aster-codegen-cranelift --features aarm-telemetry --example aarm_memory_matrix -- --scale small --json
 ```
 
-Structured output separates allocator telemetry, Parallel planning, Task/Async Memory Domain planning,
-process RSS, checksum, scale, and informational elapsed time. Timing is never a correctness gate.
+Structured output separates allocator telemetry (including optional AARM-3D backing state), Parallel
+planning, Task/Async Memory Domain planning, process RSS, checksum, scale, and informational elapsed
+time. Timing is never a correctness gate.
 Generated reports and machine-local baselines are not committed.
 
 ## Metrics that do not exist yet
 
-AARM-2B3 does not expose or infer:
+AARM-3D does not expose or infer:
 
-- `virtual_reserved_bytes`;
-- `committed_backing_bytes`;
-- purge or decommit events and bytes;
+- operating-system committed/resident bytes;
+- virtual reservation telemetry for the system allocator fallback;
+- purge or automatic discard events and bytes;
 - adaptive governor quotas, borrows, or host-memory policy;
 - decay, hysteresis, or pressure state.
 
