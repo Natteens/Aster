@@ -701,6 +701,52 @@ production purge timing/default cache budget: NOT CHOSEN
 automatic host pressure threshold: NOT CHOSEN
 ```
 
+## AARM-5A conservative MIR reference-lifetime proofs
+
+AARM-5A adds compiler-internal proof infrastructure only. The existing escape analysis remains the
+sole authority for direct-call summaries, recursive SCC fixpoints, alias propagation, escape
+barriers, and final `Persistent` versus `Temporary` region selection. It now exposes a sorted
+per-allocation fact containing the static `(function, block, instruction index)` site, selected
+region, destination local, and its existing flow-insensitive alias closure. The lifetime analysis
+reuses those facts; it does not implement a second escape classifier.
+
+For each well-formed MIR function, AARM-5A builds duplicate-checked dense local and block maps and
+solves ordinary backwards local liveness to a fixed point:
+
+```text
+LiveOut[B] = union LiveIn[S] for every successor S
+LiveIn[B]  = Use[B] union (LiveOut[B] - Def[B])
+```
+
+`MirLocation { block, instruction_index }` means the point immediately after that instruction. A
+`Temporary` allocation receives `ReferenceDeadAfter(P)` evidence only when every local in its
+conservative alias closure is absent from `LiveAfter(P)`, and only at forward-reachable points at
+or after the allocation. `Persistent` sites never receive early-death evidence. Duplicate or
+unknown locals, malformed CFG edges, duplicate block/function identities, and overlapping
+flow-insensitive allocation alias sets conservatively produce no death location rather than a
+guess. Flow-insensitive aliasing may intentionally retain references longer than necessary; this
+is conservative, not a reclaim bug. Sites, aliases, and locations have explicit numeric ordering.
+
+This is a reference-death proof, not a reclaim or rewind authorization. For example, allocation A
+may be reference-dead while a younger allocation B remains live; the shared LIFO Temporary arena
+cannot necessarily rewind A without invalidating B. A static allocation site inside a loop may also
+execute many times dynamically. Checkpoint representation, dominance/LIFO validation, runtime
+integration, and complex-CFG instance safety belong to later AARM-5 slices.
+
+List, Dictionary, and StringBuilder proofs concern their owning Temporary reference only; they do
+not claim individual backing allocations are reclaimable at the same point. Task, async, and
+Parallel operands retain the existing escape/concurrency barriers, with no cross-worker lifetime
+inference.
+
+```text
+normal compiler invocation of lifetime proofs: NO
+executable MIR changed: NO
+MIR checkpoint instruction: NOT IMPLEMENTED
+runtime reclaim/rewind: NOT IMPLEMENTED
+runtime ABI or generated code changed: NO
+public telemetry schema changed: NO
+```
+
 ## Measurement invariants
 
 Every snapshot must satisfy:
@@ -808,7 +854,13 @@ AARM-1 observability
 -> AARM-4B delayed purge/hysteresis
 -> AARM-4C pressure-triggered purge
 -> AARM-4D oversized/hot-cache policy and tuning
--> AARM-5 MIR lifetime refinement
+-> AARM-5A liveness/escape proof model
+-> AARM-5B checkpoint/subregion MIR representation
+-> AARM-5C conservative validation/proof barriers
+-> AARM-5D runtime checkpoint integration + early reclaim
+-> AARM-5E loops/branches/early returns/complex CFG
+-> AARM-5F collections/strings/promotion
+-> AARM-5G UAF/alias/corruption stress
 -> AARM-6 integration/production decision
 ```
 

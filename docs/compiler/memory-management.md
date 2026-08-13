@@ -38,6 +38,19 @@ The analysis is intentionally conservative. Uncertainty selects persistent
 storage. There is no silent fallback in the backend: each MIR region maps to a
 specific runtime ABI function.
 
+### AARM-5A research analysis
+
+The `research/aarm` branch also production-compiles, but does not normally invoke, an internal MIR
+lifetime analysis. It consumes the existing escape pass's region and flow-insensitive alias facts,
+then solves backwards local liveness to identify instruction points after which every conservative
+alias of an already-Temporary allocation is dead. Malformed CFG/local data and ambiguous
+overlapping allocation sites withhold proof.
+
+These results are research-only reference-death facts. They do not change emitted allocation
+regions or executable MIR, do not insert checkpoints, and do not authorize an arena rewind. A
+later phase must separately prove LIFO/checkpoint safety, including overlapping allocations and
+dynamic executions of loop sites, before runtime reclamation can change.
+
 ## Collections and strings
 
 An array header and its element buffer always use the same arena. Rewinding

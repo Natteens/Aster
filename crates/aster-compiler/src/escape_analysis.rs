@@ -70,24 +70,30 @@ enum EscapeReason {
     UnsupportedUse,
 }
 
+/// One allocation's authoritative escape result and conservative local alias
+/// closure. AARM lifetime research consumes these facts instead of deriving a
+/// second escape classification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AllocationEscapeFact {
+    pub function: mir::SymbolId,
+    pub block: mir::BasicBlockId,
+    pub instruction_index: usize,
+    pub region: mir::AllocationRegion,
+    pub origin: Option<mir::LocalId>,
+    pub aliases: Vec<mir::LocalId>,
+}
+
 /// Classify every MIR allocation and apply its storage region.
 ///
 /// This is deliberately conservative: only [`EscapeClassification::LocalCandidate`]
 /// becomes temporary. Any escape reason keeps the original persistent lifetime.
 pub(super) fn assign_allocation_regions(module: &mut mir::Module) {
-    let summaries = build_function_summaries(module);
-    let classifications = module
-        .functions
-        .iter()
-        .map(|function| classify_function(function, &summaries))
-        .collect::<Vec<_>>();
-
+    let facts = allocation_escape_facts_in_mir_order(module);
+    let mut facts = facts.into_iter();
     let mut local_candidates = 0_usize;
     let mut persistent = 0_usize;
 
-    for (function, function_classifications) in module.functions.iter_mut().zip(classifications) {
-        let mut function_classifications = function_classifications.into_iter();
-
+    for function in &mut module.functions {
         for instruction in function
             .blocks
             .iter_mut()
@@ -96,33 +102,84 @@ pub(super) fn assign_allocation_regions(module: &mut mir::Module) {
             if !is_dynamic_allocation(instruction) {
                 continue;
             }
-            let classification = function_classifications
+            let fact = facts
                 .next()
-                .expect("every MIR allocation has an escape classification");
-            let region = match classification {
-                EscapeClassification::LocalCandidate => {
+                .expect("every MIR allocation has one escape fact");
+            match fact.region {
+                mir::AllocationRegion::Temporary => {
                     local_candidates += 1;
-                    mir::AllocationRegion::Temporary
                 }
-                EscapeClassification::Persistent(_) => {
+                mir::AllocationRegion::Persistent => {
                     persistent += 1;
-                    mir::AllocationRegion::Persistent
                 }
-            };
-            set_allocation_region(instruction, region);
+            }
+            set_allocation_region(instruction, fact.region);
         }
-
-        debug_assert!(
-            function_classifications.next().is_none(),
-            "escape analysis produced more classifications than allocations"
-        );
     }
+    debug_assert!(
+        facts.next().is_none(),
+        "escape analysis produced extra facts"
+    );
 
     debug_assert_eq!(
         local_candidates + persistent,
         dynamic_allocation_count(module),
         "every MIR allocation must receive one escape classification"
     );
+}
+
+/// Compute allocation facts in deterministic function/block/instruction
+/// order. This reuses the exact summaries, alias closure, and classification
+/// authority used by normal region assignment; AARM lifetime research does not
+/// maintain a second escape model.
+pub(super) fn allocation_escape_facts(module: &mir::Module) -> Vec<AllocationEscapeFact> {
+    let mut facts = allocation_escape_facts_in_mir_order(module);
+    facts.sort_by_key(|fact| (fact.function.0, fact.block.0, fact.instruction_index));
+    facts
+}
+
+fn allocation_escape_facts_in_mir_order(module: &mir::Module) -> Vec<AllocationEscapeFact> {
+    let summaries = build_function_summaries(module);
+    let mut facts = Vec::with_capacity(dynamic_allocation_count(module));
+
+    for function in &module.functions {
+        for block in &function.blocks {
+            for (instruction_index, instruction) in block.instructions.iter().enumerate() {
+                if !is_dynamic_allocation(instruction) {
+                    continue;
+                }
+                let (origin, aliases, classification) =
+                    if let Some(mir::Place::Local(origin)) = allocation_destination(instruction) {
+                        let aliases = collect_aliases(function, *origin, &summaries);
+                        let classification =
+                            classify_allocation_with_aliases(function, &aliases, &summaries);
+                        (Some(*origin), aliases, classification)
+                    } else {
+                        (
+                            None,
+                            HashSet::new(),
+                            EscapeClassification::Persistent(EscapeReason::NonLocalDestination),
+                        )
+                    };
+                let mut aliases = aliases.into_iter().collect::<Vec<_>>();
+                aliases.sort_unstable_by_key(|local| local.0);
+                let region = match classification {
+                    EscapeClassification::LocalCandidate => mir::AllocationRegion::Temporary,
+                    EscapeClassification::Persistent(_) => mir::AllocationRegion::Persistent,
+                };
+                facts.push(AllocationEscapeFact {
+                    function: function.symbol,
+                    block: block.id,
+                    instruction_index,
+                    region,
+                    origin,
+                    aliases,
+                });
+            }
+        }
+    }
+
+    facts
 }
 
 fn build_function_summaries(module: &mir::Module) -> HashMap<mir::SymbolId, FunctionSummary> {
@@ -369,6 +426,7 @@ fn dynamic_allocation_count(module: &mir::Module) -> usize {
         .count()
 }
 
+#[cfg(test)]
 fn classify_function(
     function: &mir::Function,
     summaries: &HashMap<mir::SymbolId, FunctionSummary>,
@@ -393,20 +451,28 @@ fn classify_function(
     classifications
 }
 
+#[cfg(test)]
 fn classify_allocation(
     function: &mir::Function,
     origin: mir::LocalId,
     summaries: &HashMap<mir::SymbolId, FunctionSummary>,
 ) -> EscapeClassification {
     let aliases = collect_aliases(function, origin, summaries);
+    classify_allocation_with_aliases(function, &aliases, summaries)
+}
 
+fn classify_allocation_with_aliases(
+    function: &mir::Function,
+    aliases: &HashSet<mir::LocalId>,
+    summaries: &HashMap<mir::SymbolId, FunctionSummary>,
+) -> EscapeClassification {
     for block in &function.blocks {
         for instruction in &block.instructions {
-            if let Some(reason) = instruction_escape(instruction, &aliases, summaries) {
+            if let Some(reason) = instruction_escape(instruction, aliases, summaries) {
                 return EscapeClassification::Persistent(reason);
             }
         }
-        if terminator_returns_alias(&block.terminator, &aliases) {
+        if terminator_returns_alias(&block.terminator, aliases) {
             return EscapeClassification::Persistent(EscapeReason::Returned);
         }
     }

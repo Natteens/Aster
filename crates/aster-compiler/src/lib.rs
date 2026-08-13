@@ -6,6 +6,7 @@ mod escape_analysis;
 mod generics;
 mod git_source;
 mod hir_lowering;
+mod lifetime_analysis;
 mod lockfile;
 mod manifest;
 mod mir_lowering;
