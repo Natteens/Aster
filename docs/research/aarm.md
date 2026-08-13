@@ -464,15 +464,15 @@ Neither active-page bump allocation nor inactive-page reuse touches the backend.
 Virtual-reserve/backing separation is **not** implemented. The fallback backend means
 `MemoryStats.reserved_bytes`, AARM `arena_capacity_bytes`, and governor current capacity retain
 their existing meaning: retained logical page capacity backed by the current host allocator. They
-are not OS virtual-reservation or committed-backing metrics. Linux `mmap` and automatic
-purge/decommit remain later AARM work.
+are not OS virtual-reservation or committed-backing metrics. At this AARM-3A foundation point,
+native VM backends and automatic purge/decommit were still deferred.
 
-## AARM-3B Windows virtual-memory PageBackend
+## AARM-3B/3C native virtual-memory PageBackends
 
 On Windows, AARM-3B selects `WindowsVirtualPageBackend` as the one production page backend.
 Fresh pages use `VirtualAlloc` with `MEM_RESERVE | MEM_COMMIT` and `PAGE_READWRITE`; their
 reservation is released once by `VirtualFree(base, 0, MEM_RELEASE)` through the existing backing
-RAII owner. Non-Windows targets continue to use `SystemAllocatorPageBackend`.
+RAII owner.
 
 The Windows backend preserves ASTER page semantics. A fresh page is committed and zeroed before
 publication, its base remains stable until release, and its logical capacity remains the exact
@@ -484,8 +484,24 @@ The backend also contains tested low-level `MEM_DECOMMIT` and fixed-address `MEM
 mechanics for future work. Decommit retains the reservation; recommit must return the original
 base and exposes zeroed bytes. Those primitives are not connected to ordinary arena lifecycle in
 this slice. `reserved_bytes` and `arena_capacity_bytes` still mean logical retained page capacity,
-not Windows virtual reservation or committed/backed bytes. VM reserve/backing telemetry, automatic
-arena decommit, purge policy, and the Linux `mmap` backend are not implemented.
+not Windows virtual reservation or committed/backed bytes.
+
+On Linux, AARM-3C selects `LinuxAnonymousPageBackend`. Fresh pages are anonymous private writable
+`mmap` mappings, released exactly once by `munmap` through the same RAII owner. The mapping extent
+is page-rounded internally for the Linux API, while page capacity, arena capacity, and governor
+charging remain the exact logical ASTER request. Fresh mappings are zero-filled and retain a stable
+base until final release. Other targets continue to use `SystemAllocatorPageBackend`.
+
+The Linux backend contains a tested low-level `MADV_DONTNEED` discard primitive for a complete live
+anonymous mapping. Unlike Windows `MEM_DECOMMIT`, this leaves the Linux mapping addressable; a later
+access faults in demand-zero contents without an explicit recommit. The two operations are not
+treated as interchangeable. Ordinary arena rewind does not call either platform primitive: it still
+zeroes reclaimed bytes, retains inactive backing for immediate reuse, and keeps governor capacity
+charged.
+
+`reserved_bytes` and `arena_capacity_bytes` remain logical retained page capacity, not Windows
+reservation, Linux mapping extent, resident/backed bytes, or RSS. Cross-platform VM
+reserve/backing telemetry, automatic arena decommit/discard, and purge policy are not implemented.
 
 ## Measurement invariants
 

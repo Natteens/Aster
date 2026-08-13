@@ -74,6 +74,7 @@ dependencies = [
 name = "aster-runtime"
 version = "0.55.0"
 dependencies = [
+ "libc",
  "windows-sys 0.59.0",
 ]
 

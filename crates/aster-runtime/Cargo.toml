@@ -16,6 +16,9 @@ windows-sys = { version = "0.59.0", features = [
     "Win32_System_SystemInformation",
 ] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.186"
+
 [lints.rust]
 unsafe_code = "deny"
 

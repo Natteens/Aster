@@ -19,8 +19,10 @@ use std::{
 
 use crate::memory_governor::{GovernorReservation, MemoryGovernor, MemoryGovernorTelemetry};
 
+#[cfg(any(windows, target_os = "linux"))]
+use std::ffi::c_void;
 #[cfg(windows)]
-use std::{ffi::c_void, mem::MaybeUninit};
+use std::mem::MaybeUninit;
 #[cfg(windows)]
 use windows_sys::Win32::System::{
     Memory::{
@@ -50,15 +52,14 @@ fn next_arena_id() -> u64 {
 
 /// One stable, zeroed host allocation owned by a [`PageBackend`].
 ///
-/// The backing keeps its exact layout so the backend can release it exactly
-/// once when the page drops. It is intentionally private: page allocation
-/// mechanics are a runtime concern, not an arena allocation policy.
+/// The backing keeps its exact host-allocation metadata so the backend can
+/// release it exactly once when the page drops. It is intentionally private:
+/// page allocation mechanics are a runtime concern, not an arena allocation
+/// policy.
 struct PageBacking {
     base: *mut u8,
     logical_capacity: usize,
-    #[cfg_attr(windows, allow(dead_code))]
-    #[cfg(windows)]
-    allocation_size: usize,
+    vm_allocation_size: Option<usize>,
     system_layout: Option<Layout>,
 }
 
@@ -85,11 +86,16 @@ trait PageBackend {
     fn is_windows_virtual(&self) -> bool {
         false
     }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn is_linux_anonymous(&self) -> bool {
+        false
+    }
 }
 
 /// Current fallback backend: the exact system allocator mechanics previously
 /// owned directly by [`Page`].
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg_attr(any(windows, target_os = "linux"), allow(dead_code))]
 struct SystemAllocatorPageBackend;
 
 impl PageBackend for SystemAllocatorPageBackend {
@@ -109,8 +115,7 @@ impl PageBackend for SystemAllocatorPageBackend {
         Ok(PageBacking {
             base,
             logical_capacity: capacity,
-            #[cfg(windows)]
-            allocation_size: capacity,
+            vm_allocation_size: None,
             system_layout: Some(layout),
         })
     }
@@ -128,7 +133,7 @@ impl PageBackend for SystemAllocatorPageBackend {
     }
 }
 
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg_attr(any(windows, target_os = "linux"), allow(dead_code))]
 static SYSTEM_ALLOCATOR_PAGE_BACKEND: SystemAllocatorPageBackend = SystemAllocatorPageBackend;
 
 #[cfg(windows)]
@@ -148,7 +153,10 @@ impl WindowsVirtualPageBackend {
     #[allow(dead_code)]
     fn decommit(backing: &PageBacking) -> Result<(), ArenaAllocError> {
         debug_assert!(backing.system_layout.is_none());
-        if virtual_free(backing.base, backing.allocation_size, MEM_DECOMMIT) {
+        let allocation_size = backing
+            .vm_allocation_size
+            .expect("Windows virtual backing has its allocation size");
+        if virtual_free(backing.base, allocation_size, MEM_DECOMMIT) {
             Ok(())
         } else {
             Err(ArenaAllocError::OutOfMemory)
@@ -158,11 +166,10 @@ impl WindowsVirtualPageBackend {
     #[allow(dead_code)]
     fn recommit(backing: &PageBacking) -> Result<(), ArenaAllocError> {
         debug_assert!(backing.system_layout.is_none());
-        let committed = virtual_alloc(
-            backing.base.cast::<c_void>(),
-            backing.allocation_size,
-            MEM_COMMIT,
-        );
+        let allocation_size = backing
+            .vm_allocation_size
+            .expect("Windows virtual backing has its allocation size");
+        let committed = virtual_alloc(backing.base.cast::<c_void>(), allocation_size, MEM_COMMIT);
         if committed.is_null() {
             return Err(ArenaAllocError::OutOfMemory);
         }
@@ -198,7 +205,7 @@ impl PageBackend for WindowsVirtualPageBackend {
         Ok(PageBacking {
             base: base.cast::<u8>(),
             logical_capacity: capacity,
-            allocation_size,
+            vm_allocation_size: Some(allocation_size),
             system_layout: None,
         })
     }
@@ -254,12 +261,140 @@ fn virtual_free(address: *mut u8, size: usize, free_type: u32) -> bool {
 #[cfg(windows)]
 static WINDOWS_VIRTUAL_PAGE_BACKEND: WindowsVirtualPageBackend = WindowsVirtualPageBackend;
 
+#[cfg(target_os = "linux")]
+/// Linux anonymous private mapping backing for one stable arena page.
+struct LinuxAnonymousPageBackend;
+
+#[cfg(target_os = "linux")]
+impl LinuxAnonymousPageBackend {
+    fn mapping_size(capacity: usize) -> Result<usize, ArenaAllocError> {
+        let page_size = linux_page_size()?;
+        capacity
+            .checked_add(page_size - 1)
+            .map(|value| value / page_size * page_size)
+            .ok_or(ArenaAllocError::AddressSpace)
+    }
+
+    #[allow(dead_code)]
+    fn discard(backing: &PageBacking) -> Result<(), ArenaAllocError> {
+        debug_assert!(backing.system_layout.is_none());
+        let mapping_size = backing
+            .vm_allocation_size
+            .expect("Linux anonymous backing has its mapping size");
+        if linux_madvise_dontneed(backing.base, mapping_size) {
+            Ok(())
+        } else {
+            Err(ArenaAllocError::OutOfMemory)
+        }
+    }
+
+    fn release_backing(backing: &PageBacking) -> bool {
+        debug_assert!(backing.system_layout.is_none());
+        let mapping_size = backing
+            .vm_allocation_size
+            .expect("Linux anonymous backing has its mapping size");
+        linux_munmap(backing.base, mapping_size)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PageBackend for LinuxAnonymousPageBackend {
+    fn allocate_zeroed(
+        &self,
+        capacity: usize,
+        alignment: usize,
+    ) -> Result<PageBacking, ArenaAllocError> {
+        let mapping_size = Self::mapping_size(capacity)?;
+        let base = linux_mmap(mapping_size);
+        if base == libc::MAP_FAILED {
+            return Err(ArenaAllocError::OutOfMemory);
+        }
+        if base as usize % alignment != 0 {
+            let released = linux_munmap(base.cast::<u8>(), mapping_size);
+            debug_assert!(released, "misaligned Linux mapping must release");
+            return Err(ArenaAllocError::AddressSpace);
+        }
+        Ok(PageBacking {
+            base: base.cast::<u8>(),
+            logical_capacity: capacity,
+            vm_allocation_size: Some(mapping_size),
+            system_layout: None,
+        })
+    }
+
+    fn release(&self, backing: PageBacking) {
+        let released = Self::release_backing(&backing);
+        debug_assert!(released, "Linux anonymous page release must succeed");
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    fn is_linux_anonymous(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_page_size() -> Result<usize, ArenaAllocError> {
+    // SAFETY: `_SC_PAGESIZE` takes no pointer and returns the host page size or
+    // a negative error result.
+    #[allow(unsafe_code)]
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return Err(ArenaAllocError::AddressSpace);
+    }
+    usize::try_from(page_size).map_err(|_| ArenaAllocError::AddressSpace)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_mmap(mapping_size: usize) -> *mut c_void {
+    // SAFETY: this creates one anonymous private writable mapping with no file
+    // descriptor ownership; the returned base is retained only by PageBacking.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            mapping_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_munmap(base: *mut u8, mapping_size: usize) -> bool {
+    // SAFETY: callers pass exactly the live mapping base and mapping extent
+    // recorded when mmap succeeded.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::munmap(base.cast::<c_void>(), mapping_size) == 0
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_madvise_dontneed(base: *mut u8, mapping_size: usize) -> bool {
+    // SAFETY: callers pass exactly one still-owned, page-aligned anonymous
+    // mapping range; MADV_DONTNEED keeps that mapping addressable.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::madvise(base.cast::<c_void>(), mapping_size, libc::MADV_DONTNEED) == 0
+    }
+}
+
+#[cfg(target_os = "linux")]
+static LINUX_ANONYMOUS_PAGE_BACKEND: LinuxAnonymousPageBackend = LinuxAnonymousPageBackend;
+
 fn default_page_backend() -> &'static dyn PageBackend {
     #[cfg(windows)]
     {
         &WINDOWS_VIRTUAL_PAGE_BACKEND
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        &LINUX_ANONYMOUS_PAGE_BACKEND
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         &SYSTEM_ALLOCATOR_PAGE_BACKEND
     }
@@ -997,6 +1132,22 @@ mod tests {
         assert!(arena.backend.is_windows_virtual());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_default_backend_is_anonymous_memory_backed() {
+        let arena = PagedArena::new();
+        assert!(arena.backend.is_linux_anonymous());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_mapping_size_overflow_is_controlled() {
+        assert_eq!(
+            LinuxAnonymousPageBackend::mapping_size(usize::MAX),
+            Err(ArenaAllocError::AddressSpace)
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_virtual_backing_decommits_recommits_at_its_original_zeroed_address() {
@@ -1005,7 +1156,7 @@ mod tests {
             .allocate_zeroed(capacity, MAX_ALIGN)
             .expect("Windows virtual allocation succeeds");
         assert_eq!(backing.capacity(), capacity);
-        assert!(backing.allocation_size >= capacity);
+        assert!(backing.vm_allocation_size.expect("Windows allocation size") >= capacity);
         assert_eq!(backing.base as usize % MAX_ALIGN, 0);
         // SAFETY: `backing` owns a writable committed allocation of `capacity` bytes.
         #[allow(unsafe_code)]
@@ -1024,6 +1175,51 @@ mod tests {
         let bytes = unsafe { std::slice::from_raw_parts(backing.base, capacity) };
         assert!(bytes.iter().all(|&byte| byte == 0));
         assert!(WindowsVirtualPageBackend::release_backing(&backing));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_anonymous_backing_discards_to_demand_zero_without_moving() {
+        let capacity = DEFAULT_PAGE_SIZE + 1;
+        let backing = LINUX_ANONYMOUS_PAGE_BACKEND
+            .allocate_zeroed(capacity, MAX_ALIGN)
+            .expect("Linux anonymous mapping succeeds");
+        let mapping_size = backing
+            .vm_allocation_size
+            .expect("Linux mapping size is recorded");
+        let page_size = linux_page_size().expect("Linux page size is valid");
+        assert_eq!(backing.capacity(), capacity);
+        assert!(mapping_size >= capacity);
+        assert_eq!(mapping_size % page_size, 0);
+        assert_eq!(backing.base as usize % MAX_ALIGN, 0);
+        let base = backing.base;
+        // SAFETY: `backing` owns a writable anonymous mapping of `capacity` bytes.
+        #[allow(unsafe_code)]
+        unsafe {
+            let bytes = std::slice::from_raw_parts_mut(backing.base, capacity);
+            assert!(bytes.iter().all(|&byte| byte == 0));
+            bytes.fill(0xA5);
+        }
+
+        LinuxAnonymousPageBackend::discard(&backing)
+            .expect("MADV_DONTNEED keeps the anonymous mapping accessible");
+        // SAFETY: MADV_DONTNEED preserves the mapping and future anonymous pages
+        // fault back in as zero-filled memory at the same base.
+        #[allow(unsafe_code)]
+        let bytes = unsafe { std::slice::from_raw_parts(backing.base, capacity) };
+        assert_eq!(backing.base, base);
+        assert!(bytes.iter().all(|&byte| byte == 0));
+        assert!(LinuxAnonymousPageBackend::release_backing(&backing));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_anonymous_backing_raii_drop_releases_its_mapping() {
+        let backing =
+            BackendPageBacking::allocate(&LINUX_ANONYMOUS_PAGE_BACKEND, MIN_PAGE_SIZE, MAX_ALIGN)
+                .expect("Linux anonymous mapping succeeds");
+        assert!(!backing.base().is_null());
+        drop(backing);
     }
 
     #[cfg(windows)]
@@ -1047,6 +1243,19 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_default_arena_preserves_exact_oversized_logical_capacity() {
+        let mut arena = PagedArena::new();
+        let capacity = DEFAULT_PAGE_SIZE + 1;
+        let pointer = arena.alloc(capacity, MAX_ALIGN);
+        assert_eq!(arena.metrics().reserved_bytes, capacity);
+        // SAFETY: `pointer` is a live zeroed allocation of `capacity` bytes.
+        #[allow(unsafe_code)]
+        let bytes = unsafe { std::slice::from_raw_parts(pointer, capacity) };
+        assert!(bytes.iter().all(|&byte| byte == 0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_default_arena_preserves_exact_oversized_logical_capacity() {
         let mut arena = PagedArena::new();
         let capacity = DEFAULT_PAGE_SIZE + 1;
         let pointer = arena.alloc(capacity, MAX_ALIGN);
