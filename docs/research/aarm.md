@@ -977,6 +977,39 @@ calls/concurrency/collections/strings: REJECTED
 normal compiler invokes AARM-5E2A: NO
 ```
 
+## AARM-5E2B1 loop-exit coverage
+
+AARM-5E2B1 extends the same research-only iteration checkpoint to a single,
+non-nested natural loop with several mutually exclusive static exit sites. A
+body entry FineEnter is still reached only after the header condition selects
+the body, so zero iterations execute neither marker. Every supported normal
+latch, continue-to-header path, explicit break path, and early Return/End
+path receives a FineExit using the same subregion ID. The compiler requires
+the exact AARM-5A reference-death point at every exit reachable from each
+Temporary allocation; it withholds the whole candidate when any path lacks
+that proof.
+
+Multiple latches are supported when their backedges all target one dominating
+header and the union of their natural-loop bodies becomes acyclic after those
+backedges are removed. The backend propagates only FineInactive or
+FineActive(id), requires equal states at joins, and rejects any active
+backedge, loop-exit edge, Return, or End. Thus a dynamic iteration enters once
+and can reach only one of the mutually exclusive static exits before the next
+iteration, a break successor, or function cleanup.
+
+```text
+break/continue/early function exit: IMPLEMENTED (research-only subset)
+multiple latches to one header: IMPLEMENTED
+path-specific FineExit sites: IMPLEMENTED
+loop-carried or break-surviving Temporary alias: REJECTED
+header Temporary allocation: REJECTED
+nested loops and nested fine regions: DEFERRED TO AARM-5E2B2
+irreducible CFG: REJECTED
+calls/interfaces/collections/strings/Task/async/Parallel: REJECTED
+runtime loop knowledge or new ABI: NO
+normal compiler invokes AARM-5E2B1: NO
+```
+
 ## Measurement invariants
 
 Every snapshot must satisfy:

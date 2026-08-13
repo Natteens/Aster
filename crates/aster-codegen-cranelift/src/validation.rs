@@ -1150,36 +1150,39 @@ fn validate_executable_temporary_subregion_cycles(
     if backedges.is_empty() {
         return Ok(());
     }
-    let [(latch, header)] = backedges.as_slice() else {
-        return Err(unsupported(
-            &function.name,
-            "multiple executable AARM temporary-subregion loop latches",
-        ));
-    };
-    if latch == header
-        || !matches!(function.blocks[blocks[latch]].terminator, mir::Terminator::Goto(target) if target == *header)
+    let header = backedges[0].1;
+    if backedges
+        .iter()
+        .any(|(latch, target)| *latch == header || *target != header)
     {
         return Err(unsupported(
             &function.name,
-            "unsupported executable AARM temporary-subregion loop shape",
+            "unsupported executable AARM temporary-subregion loop headers",
         ));
     }
+    let mut latches = backedges
+        .iter()
+        .map(|(latch, _)| *latch)
+        .collect::<Vec<_>>();
+    latches.sort_unstable_by_key(|block| block.0);
+    latches.dedup();
     let mir::Terminator::Branch {
         then_block,
         else_block,
         ..
-    } = function.blocks[blocks[header]].terminator
+    } = function.blocks[blocks[&header]].terminator
     else {
         return Err(unsupported(
             &function.name,
             "unsupported executable AARM temporary-subregion loop header",
         ));
     };
-    let mut body = HashSet::from([*header, *latch]);
-    let mut pending = vec![*latch];
+    let mut body = HashSet::from([header]);
+    let mut pending = latches.clone();
     while let Some(block) = pending.pop() {
+        body.insert(block);
         for predecessor in &predecessors[&block] {
-            if *predecessor != *header && body.insert(*predecessor) {
+            if *predecessor != header && body.insert(*predecessor) {
                 pending.push(*predecessor);
             }
         }
@@ -1196,13 +1199,10 @@ fn validate_executable_temporary_subregion_cycles(
             .count()
             != 1
         || body.iter().any(|block| {
-            *block != *header
-                && (predecessors[block]
+            *block != header
+                && predecessors[block]
                     .iter()
                     .any(|predecessor| !body.contains(predecessor))
-                    || successors[block]
-                        .iter()
-                        .any(|successor| !body.contains(successor)))
         })
     {
         return Err(unsupported(
@@ -1217,7 +1217,7 @@ fn validate_executable_temporary_subregion_cycles(
         .collect::<HashMap<_, _>>();
     for block in &body {
         for successor in &successors[block] {
-            if body.contains(successor) && !(*block == *latch && *successor == *header) {
+            if body.contains(successor) && !(*successor == header && latches.contains(block)) {
                 *indegree
                     .get_mut(successor)
                     .expect("loop successor is in the loop") += 1;
@@ -1233,7 +1233,7 @@ fn validate_executable_temporary_subregion_cycles(
     while let Some(block) = ready.pop() {
         visited += 1;
         for successor in &successors[&block] {
-            if !body.contains(successor) || (block == *latch && *successor == *header) {
+            if !body.contains(successor) || (*successor == header && latches.contains(&block)) {
                 continue;
             }
             let degree = indegree

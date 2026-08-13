@@ -419,17 +419,16 @@ fn validate_loop_candidate(
     proofs: &HashMap<mir::MirAllocationSite, &crate::lifetime_analysis::AllocationLifetimeProof>,
     has_concurrency: bool,
 ) -> Result<ValidatedTemporarySubregion, TemporarySubregionRejectionReason> {
-    let rewind = mir::MirPoint {
-        block: loop_cfg.latch,
-        instruction_boundary: loop_cfg.block(function, loop_cfg.latch).instructions.len(),
+    let Some(rewinds) = super::simple_loop_rewinds(function, loop_cfg) else {
+        return Err(TemporarySubregionRejectionReason::UnsupportedControlFlow);
     };
+    let rewind = rewinds[0];
     if candidate.checkpoint
         != (mir::MirPoint {
             block: loop_cfg.body_entry,
             instruction_boundary: 0,
         })
-        || candidate.rewinds.as_slice() != [rewind]
-        || rewind.instruction_boundary == 0
+        || candidate.rewinds != rewinds
     {
         return Err(TemporarySubregionRejectionReason::MalformedPoint);
     }
@@ -505,7 +504,11 @@ fn validate_loop_candidate(
         let Some(proof) = proofs.get(site) else {
             return Err(TemporarySubregionRejectionReason::MissingReferenceDeathProof);
         };
-        if proof.region != mir::AllocationRegion::Temporary || !proof.dead_after.contains(&rewind) {
+        if proof.region != mir::AllocationRegion::Temporary
+            || super::simple_loop_reachable_rewinds(loop_cfg, site.block, &rewinds)
+                .iter()
+                .any(|rewind| !proof.dead_after.contains(rewind))
+        {
             return Err(TemporarySubregionRejectionReason::MissingReferenceDeathProof);
         }
     }
@@ -514,7 +517,7 @@ fn validate_loop_candidate(
         id: candidate.id,
         checkpoint: candidate.checkpoint,
         rewind,
-        rewinds: vec![rewind],
+        rewinds,
         allocations: candidate.allocations.clone(),
     })
 }

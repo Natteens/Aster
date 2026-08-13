@@ -383,6 +383,287 @@ fn simple_natural_array_loop_rewinds_each_iteration_without_changing_result() {
 }
 
 #[test]
+fn loop_continue_paths_and_break_after_several_iterations_rewind_exactly_once() {
+    let mut run = function(
+        RUN,
+        "Run",
+        mir::Visibility::Public,
+        vec![
+            local(0, "values", mir::Type::Array(Box::new(mir::Type::Int))),
+            local(1, "index", mir::Type::Int),
+            local(2, "condition", mir::Type::Bool),
+            local(3, "one", mir::Type::Int),
+        ],
+        mir::Type::Int,
+        Vec::new(),
+        None,
+    );
+    run.blocks = vec![
+        mir::BasicBlock {
+            id: mir::BasicBlockId(0),
+            instructions: vec![assign(mir::Place::Local(mir::LocalId(1)), integer(0))],
+            terminator: mir::Terminator::Goto(mir::BasicBlockId(1)),
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(1),
+            instructions: vec![less(2, 1, 8)],
+            terminator: mir::Terminator::Branch {
+                condition: copy(2, mir::Type::Bool),
+                then_block: mir::BasicBlockId(2),
+                else_block: mir::BasicBlockId(5),
+            },
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(2),
+            instructions: vec![temporary_array(0, 256), less(2, 1, 3)],
+            terminator: mir::Terminator::Branch {
+                condition: copy(2, mir::Type::Bool),
+                then_block: mir::BasicBlockId(3),
+                else_block: mir::BasicBlockId(4),
+            },
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(3),
+            instructions: vec![
+                assign(mir::Place::Local(mir::LocalId(3)), integer(1)),
+                add(1, 1, 3),
+            ],
+            terminator: mir::Terminator::Goto(mir::BasicBlockId(1)),
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(4),
+            instructions: vec![assign(
+                mir::Place::Local(mir::LocalId(3)),
+                copy(1, mir::Type::Int),
+            )],
+            terminator: mir::Terminator::Goto(mir::BasicBlockId(5)),
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(5),
+            instructions: Vec::new(),
+            terminator: mir::Terminator::Return(Some(copy(1, mir::Type::Int))),
+        },
+    ];
+    let baseline = module(vec![run]);
+    let baseline_result = execute_with_stats(&baseline, "Run").expect("baseline executes");
+    let mut lowered = baseline.clone();
+    let report = lower_aarm_temporary_subregions_for_research(&mut lowered)
+        .expect("continue and break loop lowers");
+    assert_eq!(
+        (
+            report.subregions_lowered,
+            report.enter_instructions_inserted,
+            report.exit_instructions_inserted,
+        ),
+        (1, 1, 2)
+    );
+    let lowered_result = execute_with_stats(&lowered, "Run").expect("lowered executes");
+    assert_eq!(baseline_result.0, ExecutionValue::Int(3));
+    assert_eq!(lowered_result.0, baseline_result.0);
+    assert_eq!(
+        lowered_result.1.requested_bytes,
+        baseline_result.1.requested_bytes
+    );
+    assert!(lowered_result.1.peak_used_bytes < baseline_result.1.peak_used_bytes);
+
+    let mut active_break = lowered;
+    active_break.functions[0].blocks[4]
+        .instructions
+        .retain(|instruction| {
+            !matches!(instruction, mir::Instruction::TemporarySubregionExit { .. })
+        });
+    validate(&active_break).expect_err("a loop break target cannot receive an active fine state");
+}
+
+#[test]
+fn multiple_latches_return_to_the_header_with_an_inactive_fine_state() {
+    for select_first_latch in [true, false] {
+        let mut run = function(
+            RUN,
+            "Run",
+            mir::Visibility::Public,
+            vec![
+                local(0, "values", mir::Type::Array(Box::new(mir::Type::Int))),
+                local(1, "index", mir::Type::Int),
+                local(2, "condition", mir::Type::Bool),
+                local(3, "one", mir::Type::Int),
+            ],
+            mir::Type::Int,
+            Vec::new(),
+            None,
+        );
+        run.blocks = vec![
+            mir::BasicBlock {
+                id: mir::BasicBlockId(0),
+                instructions: vec![assign(mir::Place::Local(mir::LocalId(1)), integer(0))],
+                terminator: mir::Terminator::Goto(mir::BasicBlockId(1)),
+            },
+            mir::BasicBlock {
+                id: mir::BasicBlockId(1),
+                instructions: vec![less(2, 1, 8)],
+                terminator: mir::Terminator::Branch {
+                    condition: copy(2, mir::Type::Bool),
+                    then_block: mir::BasicBlockId(2),
+                    else_block: mir::BasicBlockId(5),
+                },
+            },
+            mir::BasicBlock {
+                id: mir::BasicBlockId(2),
+                instructions: vec![temporary_array(0, 128)],
+                terminator: mir::Terminator::Branch {
+                    condition: mir::Operand {
+                        type_: mir::Type::Bool,
+                        kind: mir::OperandKind::Constant(mir::Constant::Boolean(
+                            select_first_latch,
+                        )),
+                    },
+                    then_block: mir::BasicBlockId(3),
+                    else_block: mir::BasicBlockId(4),
+                },
+            },
+            mir::BasicBlock {
+                id: mir::BasicBlockId(3),
+                instructions: vec![
+                    assign(mir::Place::Local(mir::LocalId(3)), integer(1)),
+                    add(1, 1, 3),
+                ],
+                terminator: mir::Terminator::Goto(mir::BasicBlockId(1)),
+            },
+            mir::BasicBlock {
+                id: mir::BasicBlockId(4),
+                instructions: vec![
+                    assign(mir::Place::Local(mir::LocalId(3)), integer(1)),
+                    add(1, 1, 3),
+                ],
+                terminator: mir::Terminator::Goto(mir::BasicBlockId(1)),
+            },
+            mir::BasicBlock {
+                id: mir::BasicBlockId(5),
+                instructions: Vec::new(),
+                terminator: mir::Terminator::Return(Some(copy(1, mir::Type::Int))),
+            },
+        ];
+        let baseline = module(vec![run]);
+        let baseline_result = execute_with_stats(&baseline, "Run").expect("baseline executes");
+        let mut lowered = baseline.clone();
+        let report = lower_aarm_temporary_subregions_for_research(&mut lowered)
+            .expect("multiple-latch loop lowers");
+        assert_eq!(
+            (
+                report.subregions_lowered,
+                report.enter_instructions_inserted,
+                report.exit_instructions_inserted,
+            ),
+            (1, 1, 2)
+        );
+        let lowered_result = execute_with_stats(&lowered, "Run").expect("lowered executes");
+        assert_eq!(baseline_result.0, ExecutionValue::Int(8));
+        assert_eq!(lowered_result.0, baseline_result.0);
+
+        let mut active_latch = lowered;
+        active_latch.functions[0].blocks[4]
+            .instructions
+            .retain(|instruction| {
+                !matches!(instruction, mir::Instruction::TemporarySubregionExit { .. })
+            });
+        assert!(
+            validate(&active_latch)
+                .expect_err("every latch must return an inactive fine state")
+                .message()
+                .contains("inconsistent")
+        );
+    }
+}
+
+#[test]
+fn early_return_from_a_loop_body_exits_the_active_fine_region() {
+    let mut run = function(
+        RUN,
+        "Run",
+        mir::Visibility::Public,
+        vec![
+            local(0, "values", mir::Type::Array(Box::new(mir::Type::Int))),
+            local(1, "index", mir::Type::Int),
+            local(2, "condition", mir::Type::Bool),
+            local(3, "result", mir::Type::Int),
+        ],
+        mir::Type::Int,
+        Vec::new(),
+        None,
+    );
+    run.blocks = vec![
+        mir::BasicBlock {
+            id: mir::BasicBlockId(0),
+            instructions: vec![assign(mir::Place::Local(mir::LocalId(1)), integer(0))],
+            terminator: mir::Terminator::Goto(mir::BasicBlockId(1)),
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(1),
+            instructions: vec![less(2, 1, 8)],
+            terminator: mir::Terminator::Branch {
+                condition: copy(2, mir::Type::Bool),
+                then_block: mir::BasicBlockId(2),
+                else_block: mir::BasicBlockId(5),
+            },
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(2),
+            instructions: vec![temporary_array(0, 64)],
+            terminator: mir::Terminator::Branch {
+                condition: mir::Operand {
+                    type_: mir::Type::Bool,
+                    kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                },
+                then_block: mir::BasicBlockId(4),
+                else_block: mir::BasicBlockId(3),
+            },
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(3),
+            instructions: vec![
+                assign(mir::Place::Local(mir::LocalId(3)), integer(1)),
+                add(1, 1, 3),
+            ],
+            terminator: mir::Terminator::Goto(mir::BasicBlockId(1)),
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(4),
+            instructions: vec![assign(mir::Place::Local(mir::LocalId(3)), integer(7))],
+            terminator: mir::Terminator::Return(Some(copy(3, mir::Type::Int))),
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(5),
+            instructions: Vec::new(),
+            terminator: mir::Terminator::Return(Some(integer(0))),
+        },
+    ];
+    let baseline = module(vec![run]);
+    let baseline_result = execute_with_stats(&baseline, "Run").expect("baseline executes");
+    let mut lowered = baseline.clone();
+    let report = lower_aarm_temporary_subregions_for_research(&mut lowered)
+        .expect("early-return loop lowers");
+    assert_eq!(
+        (
+            report.subregions_lowered,
+            report.enter_instructions_inserted,
+            report.exit_instructions_inserted,
+        ),
+        (1, 1, 2)
+    );
+    let lowered_result = execute_with_stats(&lowered, "Run").expect("lowered executes");
+    assert_eq!(baseline_result.0, ExecutionValue::Int(7));
+    assert_eq!(lowered_result.0, baseline_result.0);
+
+    let mut active_return = lowered;
+    active_return.functions[0].blocks[4]
+        .instructions
+        .retain(|instruction| {
+            !matches!(instruction, mir::Instruction::TemporarySubregionExit { .. })
+        });
+    validate(&active_return).expect_err("a loop-body Return cannot receive an active fine state");
+}
+
+#[test]
 fn simple_natural_object_loop_reclaims_a_bounded_working_set() {
     let mut run = function(
         RUN,
@@ -529,8 +810,7 @@ fn simple_natural_loop_supports_conditional_and_both_branch_temporary_work() {
             ),
             (1, 1, 1)
         );
-        let lowered_result =
-            execute_with_stats(&lowered, "Run").expect("lowered loop executes");
+        let lowered_result = execute_with_stats(&lowered, "Run").expect("lowered loop executes");
         assert_eq!(lowered_result.0, ExecutionValue::Int(32));
         assert_eq!(lowered_result.0, baseline_result.0);
         assert!(lowered_result.1.peak_used_bytes < baseline_result.1.peak_used_bytes);
