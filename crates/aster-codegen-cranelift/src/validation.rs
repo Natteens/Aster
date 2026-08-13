@@ -1,4 +1,5 @@
 use super::{BackendError, HashMap, HashSet, integer_constant_bits, mir, primitive, type_name};
+use std::collections::BTreeMap;
 
 pub(super) fn select_entry<'a>(
     module: &'a mir::Module,
@@ -936,6 +937,141 @@ enum FineState {
     Active(mir::TemporarySubregionId),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FineExecutionState {
+    fine: FineState,
+    owned: BTreeMap<u32, FineOwnedKind>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FineOwnedKind {
+    StringBuilder,
+    List,
+    Dictionary,
+}
+
+impl FineExecutionState {
+    fn inactive() -> Self {
+        Self {
+            fine: FineState::Inactive,
+            owned: BTreeMap::new(),
+        }
+    }
+
+    fn enter(&mut self, id: mir::TemporarySubregionId) -> Result<(), &'static str> {
+        if self.fine != FineState::Inactive {
+            return Err("nested executable AARM temporary subregion enter");
+        }
+        self.fine = FineState::Active(id);
+        self.owned.clear();
+        Ok(())
+    }
+
+    fn exit(&mut self, id: mir::TemporarySubregionId) -> Result<(), &'static str> {
+        if self.fine != FineState::Active(id) {
+            return Err("unmatched executable AARM temporary subregion exit");
+        }
+        *self = Self::inactive();
+        Ok(())
+    }
+
+    fn validate_builder_instruction(
+        &mut self,
+        instruction: &mir::Instruction,
+    ) -> Result<(), &'static str> {
+        if self.fine == FineState::Inactive {
+            return Ok(());
+        }
+        match instruction {
+            mir::Instruction::AllocateStringBuilder {
+                destination: mir::Place::Local(local),
+                region: mir::AllocationRegion::Temporary,
+                ..
+            } => {
+                if self
+                    .owned
+                    .insert(local.0, FineOwnedKind::StringBuilder)
+                    .is_some()
+                {
+                    return Err("duplicate executable AARM StringBuilder local");
+                }
+            }
+            mir::Instruction::StringBuilderAppend { builder, .. }
+            | mir::Instruction::StringBuilderToString { builder, .. } => {
+                let mir::OperandKind::Copy(mir::Place::Local(local)) = builder.kind else {
+                    return Err("non-local executable AARM StringBuilder receiver");
+                };
+                if self.owned.get(&local.0) != Some(&FineOwnedKind::StringBuilder) {
+                    return Err("unowned executable AARM StringBuilder receiver");
+                }
+            }
+            mir::Instruction::AllocateList {
+                destination: mir::Place::Local(local),
+                region: mir::AllocationRegion::Temporary,
+                ..
+            } => {
+                if self.owned.insert(local.0, FineOwnedKind::List).is_some() {
+                    return Err("duplicate executable AARM List local");
+                }
+            }
+            mir::Instruction::AllocateDictionary {
+                destination: mir::Place::Local(local),
+                region: mir::AllocationRegion::Temporary,
+                ..
+            } => {
+                if self
+                    .owned
+                    .insert(local.0, FineOwnedKind::Dictionary)
+                    .is_some()
+                {
+                    return Err("duplicate executable AARM Dictionary local");
+                }
+            }
+            mir::Instruction::ListAdd { list, .. }
+            | mir::Instruction::ListGet { list, .. }
+            | mir::Instruction::ListRemoveAt { list, .. } => {
+                if !fine_receiver_is_owned(list, FineOwnedKind::List, &self.owned) {
+                    return Err("unowned executable AARM List receiver");
+                }
+            }
+            mir::Instruction::DictionaryAdd { dictionary, .. }
+            | mir::Instruction::DictionarySet { dictionary, .. }
+            | mir::Instruction::DictionaryTryGet { dictionary, .. }
+            | mir::Instruction::DictionaryContainsKey { dictionary, .. }
+            | mir::Instruction::DictionaryRemove { dictionary, .. } => {
+                if !fine_receiver_is_owned(dictionary, FineOwnedKind::Dictionary, &self.owned) {
+                    return Err("unowned executable AARM Dictionary receiver");
+                }
+            }
+            mir::Instruction::Assign { target, value }
+                if fine_rvalue_mentions_owned_builder(value, &self.owned)
+                    || matches!(target, mir::Place::Local(local) if self.owned.contains_key(&local.0)) =>
+            {
+                return Err("aliased or overwritten executable AARM StringBuilder local");
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+fn fine_receiver_is_owned(
+    operand: &mir::Operand,
+    expected: FineOwnedKind,
+    owned: &BTreeMap<u32, FineOwnedKind>,
+) -> bool {
+    matches!(operand.kind, mir::OperandKind::Copy(mir::Place::Local(local))
+        if owned.get(&local.0) == Some(&expected))
+}
+
+fn fine_rvalue_mentions_owned_builder(
+    value: &mir::Rvalue,
+    owned: &BTreeMap<u32, FineOwnedKind>,
+) -> bool {
+    matches!(&value.kind, mir::RvalueKind::Use(operand) | mir::RvalueKind::Cast(operand)
+        if matches!(operand.kind, mir::OperandKind::Copy(mir::Place::Local(local)) if owned.contains_key(&local.0)))
+}
+
 #[allow(clippy::too_many_lines)]
 fn validate_executable_temporary_subregion_cfg(
     function: &mir::Function,
@@ -996,40 +1132,41 @@ fn validate_executable_temporary_subregion_cfg(
         ));
     }
     validate_executable_temporary_subregion_cycles(function, &successors, &reachable)?;
-    let mut state = HashMap::from([(function.entry, FineState::Inactive)]);
+    let mut state = HashMap::from([(function.entry, FineExecutionState::inactive())]);
     let mut entered = HashMap::new();
     let mut allocations = HashSet::new();
     let mut pending = vec![function.entry];
     while let Some(block_id) = pending.pop() {
-        let mut current = state[&block_id];
+        let mut current = state[&block_id].clone();
         let block = &function.blocks[blocks[&block_id]];
         for (instruction_index, instruction) in block.instructions.iter().enumerate() {
             match instruction {
                 mir::Instruction::TemporarySubregionEnter { id } => {
-                    if current != FineState::Inactive
-                        || entered
-                            .insert(*id, (block_id, instruction_index))
-                            .is_some_and(|previous| previous != (block_id, instruction_index))
+                    if entered
+                        .insert(*id, (block_id, instruction_index))
+                        .is_some_and(|previous| previous != (block_id, instruction_index))
+                        || current.enter(*id).is_err()
                     {
                         return Err(unsupported(
                             &function.name,
                             "nested or duplicate executable AARM temporary subregion enter",
                         ));
                     }
-                    current = FineState::Active(*id);
                 }
                 mir::Instruction::TemporarySubregionExit { id } => {
-                    if current != FineState::Active(*id) {
+                    if current.exit(*id).is_err() {
                         return Err(unsupported(
                             &function.name,
                             "unmatched executable AARM temporary subregion exit",
                         ));
                     }
-                    current = FineState::Inactive;
                 }
-                instruction if current != FineState::Inactive => {
+                instruction if current.fine != FineState::Inactive => {
+                    current
+                        .validate_builder_instruction(instruction)
+                        .map_err(|feature| unsupported(&function.name, feature))?;
                     if temporary_subregion_allocation_is_executable(instruction) {
-                        allocations.insert(current);
+                        allocations.insert(current.fine);
                     }
                     if !temporary_subregion_instruction_is_executable(instruction) {
                         return Err(unsupported(
@@ -1044,7 +1181,7 @@ fn validate_executable_temporary_subregion_cfg(
         if matches!(
             block.terminator,
             mir::Terminator::Return(_) | mir::Terminator::End
-        ) && current != FineState::Inactive
+        ) && current.fine != FineState::Inactive
         {
             return Err(unsupported(
                 &function.name,
@@ -1052,7 +1189,7 @@ fn validate_executable_temporary_subregion_cfg(
             ));
         }
         for successor in &successors[&block_id] {
-            if let Some(existing) = state.insert(*successor, current) {
+            if let Some(existing) = state.insert(*successor, current.clone()) {
                 if existing != current {
                     return Err(unsupported(
                         &function.name,
@@ -1085,11 +1222,26 @@ fn temporary_subregion_allocation_is_executable(instruction: &mir::Instruction) 
         } | mir::Instruction::AllocateArray {
             region: mir::AllocationRegion::Temporary,
             ..
+        } | mir::Instruction::AllocateStringBuilder {
+            region: mir::AllocationRegion::Temporary,
+            ..
+        } | mir::Instruction::StringBuilderToString {
+            region: mir::AllocationRegion::Temporary,
+            ..
+        } | mir::Instruction::AllocateList {
+            region: mir::AllocationRegion::Temporary,
+            ..
+        } | mir::Instruction::AllocateDictionary {
+            region: mir::AllocationRegion::Temporary,
+            ..
         }
     ) || matches!(
         instruction,
         mir::Instruction::CallIntrinsic {
             intrinsic: mir::Intrinsic::StringConcatTemporary
+                | mir::Intrinsic::StringJoinTemporary
+                | mir::Intrinsic::StringSubstringFromTemporary
+                | mir::Intrinsic::StringSubstringRangeTemporary
                 | mir::Intrinsic::StringFromLongTemporary
                 | mir::Intrinsic::StringFromULongTemporary
                 | mir::Intrinsic::StringFromDoubleTemporary
@@ -1208,6 +1360,7 @@ fn validate_executable_temporary_subregion_cycles(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn temporary_subregion_instruction_is_executable(instruction: &mir::Instruction) -> bool {
     match instruction {
         mir::Instruction::Assign { target, value } => {
@@ -1227,6 +1380,111 @@ fn temporary_subregion_instruction_is_executable(instruction: &mir::Instruction)
         mir::Instruction::AllocateObject { destination, .. } => {
             matches!(destination, mir::Place::Local(_))
         }
+        mir::Instruction::AllocateStringBuilder {
+            destination,
+            region: mir::AllocationRegion::Temporary,
+            ..
+        } => matches!(destination, mir::Place::Local(_)),
+        mir::Instruction::AllocateList {
+            destination,
+            element_type,
+            region: mir::AllocationRegion::Temporary,
+        } => {
+            matches!(destination, mir::Place::Local(_))
+                && temporary_subregion_type_is_executable(element_type)
+        }
+        mir::Instruction::AllocateDictionary {
+            destination,
+            key_type,
+            value_type,
+            region: mir::AllocationRegion::Temporary,
+        } => {
+            matches!(destination, mir::Place::Local(_))
+                && temporary_subregion_type_is_executable(key_type)
+                && temporary_subregion_type_is_executable(value_type)
+        }
+        mir::Instruction::StringBuilderAppend { builder, .. } => {
+            matches!(builder.kind, mir::OperandKind::Copy(mir::Place::Local(_)))
+        }
+        mir::Instruction::StringBuilderToString {
+            destination,
+            builder,
+            ..
+        } => {
+            matches!(destination, mir::Place::Local(_))
+                && matches!(builder.kind, mir::OperandKind::Copy(mir::Place::Local(_)))
+        }
+        mir::Instruction::ListAdd { list, value } => {
+            matches!(list.kind, mir::OperandKind::Copy(mir::Place::Local(_)))
+                && temporary_subregion_operand_is_executable(value)
+        }
+        mir::Instruction::ListGet {
+            destination,
+            list,
+            index,
+            element_type,
+        } => {
+            matches!(destination, mir::Place::Local(_))
+                && matches!(list.kind, mir::OperandKind::Copy(mir::Place::Local(_)))
+                && temporary_subregion_operand_is_executable(index)
+                && temporary_subregion_type_is_executable(element_type)
+        }
+        mir::Instruction::ListRemoveAt { list, index } => {
+            matches!(list.kind, mir::OperandKind::Copy(mir::Place::Local(_)))
+                && temporary_subregion_operand_is_executable(index)
+        }
+        mir::Instruction::DictionaryAdd {
+            destination,
+            dictionary,
+            key,
+            value,
+        }
+        | mir::Instruction::DictionarySet {
+            destination,
+            dictionary,
+            key,
+            value,
+        } => {
+            matches!(destination, mir::Place::Local(_))
+                && matches!(
+                    dictionary.kind,
+                    mir::OperandKind::Copy(mir::Place::Local(_))
+                )
+                && temporary_subregion_operand_is_executable(key)
+                && temporary_subregion_operand_is_executable(value)
+        }
+        mir::Instruction::DictionaryContainsKey {
+            destination,
+            dictionary,
+            key,
+        }
+        | mir::Instruction::DictionaryRemove {
+            destination,
+            dictionary,
+            key,
+        } => {
+            matches!(destination, mir::Place::Local(_))
+                && matches!(
+                    dictionary.kind,
+                    mir::OperandKind::Copy(mir::Place::Local(_))
+                )
+                && temporary_subregion_operand_is_executable(key)
+        }
+        mir::Instruction::DictionaryTryGet {
+            destination,
+            dictionary,
+            key,
+            value_type,
+            ..
+        } => {
+            matches!(destination, mir::Place::Local(_))
+                && matches!(
+                    dictionary.kind,
+                    mir::OperandKind::Copy(mir::Place::Local(_))
+                )
+                && temporary_subregion_operand_is_executable(key)
+                && temporary_subregion_type_is_executable(value_type)
+        }
         mir::Instruction::CallIntrinsic {
             destination,
             intrinsic,
@@ -1242,20 +1500,19 @@ fn temporary_subregion_instruction_is_executable(instruction: &mir::Instruction)
         | mir::Instruction::TemporarySubregionExit { .. }
         | mir::Instruction::Call { .. }
         | mir::Instruction::CallInterface { .. }
-        | mir::Instruction::AllocateList { .. }
-        | mir::Instruction::AllocateDictionary { .. }
-        | mir::Instruction::AllocateStringBuilder { .. }
-        | mir::Instruction::StringBuilderAppend { .. }
-        | mir::Instruction::StringBuilderToString { .. }
-        | mir::Instruction::DictionaryAdd { .. }
-        | mir::Instruction::DictionarySet { .. }
-        | mir::Instruction::DictionaryTryGet { .. }
-        | mir::Instruction::DictionaryContainsKey { .. }
-        | mir::Instruction::DictionaryRemove { .. }
+        | mir::Instruction::AllocateList {
+            region: mir::AllocationRegion::Persistent,
+            ..
+        }
+        | mir::Instruction::AllocateDictionary {
+            region: mir::AllocationRegion::Persistent,
+            ..
+        }
+        | mir::Instruction::AllocateStringBuilder {
+            region: mir::AllocationRegion::Persistent,
+            ..
+        }
         | mir::Instruction::DictionaryEntries { .. }
-        | mir::Instruction::ListAdd { .. }
-        | mir::Instruction::ListGet { .. }
-        | mir::Instruction::ListRemoveAt { .. }
         | mir::Instruction::StringDecodeNext { .. } => false,
     }
 }
@@ -1271,6 +1528,23 @@ fn temporary_subregion_immutable_string_intrinsic_is_executable(
         && match intrinsic {
             mir::Intrinsic::StringConcatTemporary => {
                 matches!(arguments, [left, right] if temporary_subregion_string_input_is_executable(left) && temporary_subregion_string_input_is_executable(right))
+            }
+            mir::Intrinsic::StringJoinTemporary => arguments
+                .iter()
+                .all(temporary_subregion_string_input_is_executable),
+            mir::Intrinsic::StringSubstringFromTemporary => {
+                matches!(arguments, [value, start]
+                    if temporary_subregion_string_input_is_executable(value)
+                        && start.type_ == mir::Type::Int
+                        && temporary_subregion_operand_is_executable(start))
+            }
+            mir::Intrinsic::StringSubstringRangeTemporary => {
+                matches!(arguments, [value, start, length]
+                    if temporary_subregion_string_input_is_executable(value)
+                        && start.type_ == mir::Type::Int
+                        && length.type_ == mir::Type::Int
+                        && temporary_subregion_operand_is_executable(start)
+                        && temporary_subregion_operand_is_executable(length))
             }
             mir::Intrinsic::StringFromLongTemporary | mir::Intrinsic::StringFromULongTemporary => {
                 matches!(arguments, [value] if matches!(value.type_, mir::Type::Long | mir::Type::ULong))
@@ -3087,6 +3361,88 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_STRING_BUILDER_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn fine_builder_allocation(local: u32, region: mir::AllocationRegion) -> mir::Instruction {
+        mir::Instruction::AllocateStringBuilder {
+            destination: mir::Place::Local(mir::LocalId(local)),
+            class: mir::SymbolId(900),
+            region,
+        }
+    }
+
+    fn fine_builder_append(local: u32) -> mir::Instruction {
+        mir::Instruction::StringBuilderAppend {
+            builder: mir::Operand {
+                type_: mir::Type::Class(mir::SymbolId(900)),
+                kind: mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(local))),
+            },
+            value: mir::Operand {
+                type_: mir::Type::String,
+                kind: mir::OperandKind::Constant(mir::Constant::String("x".to_owned())),
+            },
+            class: mir::SymbolId(900),
+        }
+    }
+
+    #[test]
+    fn fine_builder_provenance_state_is_exact_at_joins_and_resets_per_region() {
+        let id = mir::TemporarySubregionId(7);
+        let allocation = fine_builder_allocation(1, mir::AllocationRegion::Temporary);
+        let append = fine_builder_append(1);
+        let mut state = FineExecutionState::inactive();
+
+        state.enter(id).expect("fine Enter starts ownership domain");
+        assert!(state.owned.is_empty());
+        state
+            .validate_builder_instruction(&allocation)
+            .expect("Temporary direct-local builder becomes owned");
+        assert_eq!(
+            state.owned,
+            BTreeMap::from([(1, FineOwnedKind::StringBuilder)])
+        );
+        state
+            .validate_builder_instruction(&append)
+            .expect("Append on the owned local is structurally valid");
+
+        let identical_join = state.clone();
+        assert_eq!(state, identical_join, "identical incoming sets join");
+        let mut mismatched_join = state.clone();
+        mismatched_join
+            .owned
+            .insert(2, FineOwnedKind::StringBuilder);
+        assert_ne!(
+            state, mismatched_join,
+            "different incoming sets cannot join"
+        );
+
+        state
+            .exit(id)
+            .expect("matching Exit closes ownership domain");
+        assert_eq!(state, FineExecutionState::inactive());
+        state
+            .enter(id)
+            .expect("next loop iteration starts a new domain");
+        assert!(state.owned.is_empty());
+        assert!(state.validate_builder_instruction(&append).is_err());
+        assert!(state.enter(mir::TemporarySubregionId(8)).is_err());
+        assert!(state.exit(mir::TemporarySubregionId(8)).is_err());
+
+        let persistent = fine_builder_allocation(1, mir::AllocationRegion::Persistent);
+        let mut persistent_state = FineExecutionState::inactive();
+        persistent_state.enter(id).expect("fine Enter");
+        persistent_state
+            .validate_builder_instruction(&persistent)
+            .expect("Persistent builder is observed but not owned");
+        assert!(persistent_state.owned.is_empty());
+        assert!(
+            persistent_state
+                .validate_builder_instruction(&append)
+                .is_err()
+        );
+
+        assert!(temporary_subregion_instruction_is_executable(&allocation));
+        assert!(temporary_subregion_instruction_is_executable(&append));
+    }
 
     fn string_builder_module() -> mir::Module {
         let id = NEXT_STRING_BUILDER_ID.fetch_add(1, Ordering::Relaxed);

@@ -234,3 +234,13 @@ share arena references, so either future model must preserve that isolation.
 
 These are runtime/JIT contracts, not backend heuristics. No production RC or
 tracing abstraction exists until the required evidence is demonstrated.
+## Research-only fine reclaim status
+
+The explicit AARM research lowering can validate deterministic fine-owned
+StringBuilder, List, and Dictionary locals in addition to object, array, and
+self-contained immutable-string allocations. This does not change normal
+compilation or semantic Temporary scope depth. Hidden backing is eligible only
+when its direct-local header is allocated after FineEnter and the existing
+escape/liveness proof shows the value dead on every FineExit path. Alias,
+pre-checkpoint, call, collection-snapshot, and concurrency shapes remain
+conservative.

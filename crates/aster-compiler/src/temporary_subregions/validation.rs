@@ -5,7 +5,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
 };
 
 use aster_mir as mir;
@@ -50,7 +50,15 @@ pub(super) enum TemporarySubregionRejectionReason {
     ConcurrencyBarrier,
     CollectionBarrier,
     StringBarrier,
+    BuilderOwnershipBarrier,
     UnsupportedInstruction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FineOwnedKind {
+    StringBuilder,
+    List,
+    Dictionary,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -339,6 +347,17 @@ fn validate_candidate(
     if candidate.allocations.is_empty() {
         return Err(TemporarySubregionRejectionReason::MalformedAllocationSite);
     }
+    let straight_successors = HashMap::from([(block.id, Vec::new())]);
+    validate_builder_provenance(
+        block.id,
+        &[(
+            block.id,
+            &block.instructions
+                [candidate.checkpoint.instruction_boundary..rewind.instruction_boundary],
+        )],
+        &straight_successors,
+        &[rewind],
+    )?;
 
     let mut previous_site = None;
     for site in &candidate.allocations {
@@ -380,6 +399,7 @@ fn validate_candidate(
     if has_concurrency {
         return Err(TemporarySubregionRejectionReason::ConcurrencyBarrier);
     }
+
     if let Some(reason) = span_barrier(
         &block.instructions[candidate.checkpoint.instruction_boundary..rewind.instruction_boundary],
     ) {
@@ -465,6 +485,48 @@ fn validate_loop_candidate(
         .filter(|block| *block != loop_cfg.header)
         .collect::<Vec<_>>();
     body_blocks.sort_unstable_by_key(|block| block.0);
+    let provenance_blocks = body_blocks
+        .iter()
+        .map(|block| {
+            let instructions = &loop_cfg.block(function, *block).instructions;
+            let start = if *block == loop_cfg.body_entry {
+                candidate.checkpoint.instruction_boundary
+            } else {
+                0
+            };
+            let end = rewinds
+                .iter()
+                .filter(|rewind| rewind.block == *block)
+                .map(|rewind| rewind.instruction_boundary)
+                .min()
+                .unwrap_or(instructions.len());
+            (*block, &instructions[start..end])
+        })
+        .collect::<Vec<_>>();
+    let provenance_successors = loop_cfg
+        .successors
+        .iter()
+        .map(|(block, successors)| {
+            (
+                *block,
+                successors
+                    .iter()
+                    .copied()
+                    .filter(|successor| {
+                        provenance_blocks
+                            .iter()
+                            .any(|(block, _)| block == successor)
+                    })
+                    .collect(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    validate_builder_provenance(
+        loop_cfg.body_entry,
+        &provenance_blocks,
+        &provenance_successors,
+        &rewinds,
+    )?;
     let mut expected_sites = Vec::new();
     for block in &body_blocks {
         let instructions = &loop_cfg.block(function, *block).instructions;
@@ -595,6 +657,52 @@ fn validate_cfg_candidate(
         return Err(TemporarySubregionRejectionReason::ConcurrencyBarrier);
     }
 
+    let provenance_blocks = cfg
+        .topological
+        .iter()
+        .filter(|block| region.contains(block))
+        .map(|block| {
+            let instructions = &cfg.block(function, *block).instructions;
+            let start = if *block == candidate.checkpoint.block {
+                candidate.checkpoint.instruction_boundary
+            } else {
+                0
+            };
+            let end = candidate
+                .rewinds
+                .iter()
+                .filter(|rewind| rewind.block == *block)
+                .map(|rewind| rewind.instruction_boundary)
+                .min()
+                .unwrap_or(instructions.len());
+            (*block, &instructions[start..end])
+        })
+        .collect::<Vec<_>>();
+    let provenance_successors = cfg
+        .successors
+        .iter()
+        .map(|(block, successors)| {
+            (
+                *block,
+                successors
+                    .iter()
+                    .copied()
+                    .filter(|successor| {
+                        provenance_blocks
+                            .iter()
+                            .any(|(block, _)| block == successor)
+                    })
+                    .collect(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    validate_builder_provenance(
+        candidate.checkpoint.block,
+        &provenance_blocks,
+        &provenance_successors,
+        &candidate.rewinds,
+    )?;
+
     let mut expected_sites = Vec::new();
     for block in &cfg.topological {
         if !region.contains(block) {
@@ -671,9 +779,36 @@ fn validate_cfg_candidate(
     })
 }
 
+#[allow(clippy::match_same_arms)]
 fn supported_allocation_form(instruction: &mir::Instruction) -> bool {
     match instruction {
         mir::Instruction::AllocateObject { .. } | mir::Instruction::AllocateArray { .. } => true,
+        mir::Instruction::AllocateStringBuilder {
+            destination: mir::Place::Local(_),
+            region: mir::AllocationRegion::Temporary,
+            ..
+        }
+        | mir::Instruction::StringBuilderToString {
+            destination: mir::Place::Local(_),
+            builder:
+                mir::Operand {
+                    kind: mir::OperandKind::Copy(mir::Place::Local(_)),
+                    ..
+                },
+            region: mir::AllocationRegion::Temporary,
+            ..
+        } => true,
+        mir::Instruction::AllocateList {
+            destination: mir::Place::Local(_),
+            element_type,
+            region: mir::AllocationRegion::Temporary,
+        } => is_execution_safe_type(element_type),
+        mir::Instruction::AllocateDictionary {
+            destination: mir::Place::Local(_),
+            key_type,
+            value_type,
+            region: mir::AllocationRegion::Temporary,
+        } => is_execution_safe_type(key_type) && is_execution_safe_type(value_type),
         mir::Instruction::CallIntrinsic {
             destination,
             intrinsic,
@@ -689,15 +824,45 @@ fn supported_allocation_form(instruction: &mir::Instruction) -> bool {
     }
 }
 
+#[allow(clippy::match_same_arms)]
 fn allocation_form_barrier(
     instruction: &mir::Instruction,
 ) -> Option<TemporarySubregionRejectionReason> {
     match instruction {
-        mir::Instruction::AllocateList { .. }
-        | mir::Instruction::AllocateDictionary { .. }
-        | mir::Instruction::AllocateStringBuilder { .. }
-        | mir::Instruction::DictionaryEntries { .. } => {
+        mir::Instruction::DictionaryEntries { .. } => {
             Some(TemporarySubregionRejectionReason::CollectionBarrier)
+        }
+        mir::Instruction::AllocateList {
+            destination: mir::Place::Local(_),
+            element_type,
+            region: mir::AllocationRegion::Temporary,
+        } if is_execution_safe_type(element_type) => None,
+        mir::Instruction::AllocateDictionary {
+            destination: mir::Place::Local(_),
+            key_type,
+            value_type,
+            region: mir::AllocationRegion::Temporary,
+        } if is_execution_safe_type(key_type) && is_execution_safe_type(value_type) => None,
+        mir::Instruction::AllocateList { .. } | mir::Instruction::AllocateDictionary { .. } => {
+            Some(TemporarySubregionRejectionReason::CollectionBarrier)
+        }
+        mir::Instruction::AllocateStringBuilder {
+            destination: mir::Place::Local(_),
+            region: mir::AllocationRegion::Temporary,
+            ..
+        }
+        | mir::Instruction::StringBuilderToString {
+            destination: mir::Place::Local(_),
+            builder:
+                mir::Operand {
+                    kind: mir::OperandKind::Copy(mir::Place::Local(_)),
+                    ..
+                },
+            region: mir::AllocationRegion::Temporary,
+            ..
+        } => None,
+        mir::Instruction::AllocateStringBuilder { .. } => {
+            Some(TemporarySubregionRejectionReason::BuilderOwnershipBarrier)
         }
         mir::Instruction::CallIntrinsic {
             destination,
@@ -732,6 +897,7 @@ pub(super) fn span_barrier_for_research(
     None
 }
 
+#[allow(clippy::match_same_arms, clippy::too_many_lines)]
 fn span_barrier(instructions: &[mir::Instruction]) -> Option<TemporarySubregionRejectionReason> {
     for instruction in instructions {
         let reason = match instruction {
@@ -763,19 +929,116 @@ fn span_barrier(instructions: &[mir::Instruction]) -> Option<TemporarySubregionR
                     Some(TemporarySubregionRejectionReason::CallBarrier)
                 }
             }
+            mir::Instruction::DictionaryEntries { .. } => {
+                Some(TemporarySubregionRejectionReason::CollectionBarrier)
+            }
+            mir::Instruction::AllocateList {
+                destination: mir::Place::Local(_),
+                element_type,
+                region: mir::AllocationRegion::Temporary,
+            } if is_execution_safe_type(element_type) => None,
+            mir::Instruction::AllocateDictionary {
+                destination: mir::Place::Local(_),
+                key_type,
+                value_type,
+                region: mir::AllocationRegion::Temporary,
+            } if is_execution_safe_type(key_type) && is_execution_safe_type(value_type) => None,
+            mir::Instruction::ListAdd { list, value }
+                if direct_local_operand(list) && is_execution_safe_operand(value) =>
+            {
+                None
+            }
+            mir::Instruction::ListGet {
+                destination: mir::Place::Local(_),
+                list,
+                index,
+                element_type,
+            } if direct_local_operand(list)
+                && is_execution_safe_operand(index)
+                && is_execution_safe_type(element_type) =>
+            {
+                None
+            }
+            mir::Instruction::ListRemoveAt { list, index }
+                if direct_local_operand(list) && is_execution_safe_operand(index) =>
+            {
+                None
+            }
+            mir::Instruction::DictionaryAdd {
+                destination: mir::Place::Local(_),
+                dictionary,
+                key,
+                value,
+            }
+            | mir::Instruction::DictionarySet {
+                destination: mir::Place::Local(_),
+                dictionary,
+                key,
+                value,
+            } if direct_local_operand(dictionary)
+                && is_execution_safe_operand(key)
+                && is_execution_safe_operand(value) =>
+            {
+                None
+            }
+            mir::Instruction::DictionaryTryGet {
+                destination: mir::Place::Local(_),
+                dictionary,
+                key,
+                value_type,
+                ..
+            } if direct_local_operand(dictionary)
+                && is_execution_safe_operand(key)
+                && is_execution_safe_type(value_type) =>
+            {
+                None
+            }
+            mir::Instruction::DictionaryContainsKey {
+                destination: mir::Place::Local(_),
+                dictionary,
+                key,
+            }
+            | mir::Instruction::DictionaryRemove {
+                destination: mir::Place::Local(_),
+                dictionary,
+                key,
+            } if direct_local_operand(dictionary) && is_execution_safe_operand(key) => None,
             mir::Instruction::AllocateList { .. }
             | mir::Instruction::AllocateDictionary { .. }
-            | mir::Instruction::AllocateStringBuilder { .. }
             | mir::Instruction::DictionaryAdd { .. }
             | mir::Instruction::DictionarySet { .. }
             | mir::Instruction::DictionaryTryGet { .. }
             | mir::Instruction::DictionaryContainsKey { .. }
             | mir::Instruction::DictionaryRemove { .. }
-            | mir::Instruction::DictionaryEntries { .. }
             | mir::Instruction::ListAdd { .. }
             | mir::Instruction::ListGet { .. }
             | mir::Instruction::ListRemoveAt { .. } => {
                 Some(TemporarySubregionRejectionReason::CollectionBarrier)
+            }
+            mir::Instruction::AllocateStringBuilder {
+                destination: mir::Place::Local(_),
+                region: mir::AllocationRegion::Temporary,
+                ..
+            }
+            | mir::Instruction::StringBuilderAppend {
+                builder:
+                    mir::Operand {
+                        kind: mir::OperandKind::Copy(mir::Place::Local(_)),
+                        ..
+                    },
+                ..
+            }
+            | mir::Instruction::StringBuilderToString {
+                destination: mir::Place::Local(_),
+                builder:
+                    mir::Operand {
+                        kind: mir::OperandKind::Copy(mir::Place::Local(_)),
+                        ..
+                    },
+                ..
+            } => None,
+            mir::Instruction::AllocateStringBuilder { .. } => {
+                Some(TemporarySubregionRejectionReason::BuilderOwnershipBarrier)
             }
             mir::Instruction::StringBuilderAppend { .. }
             | mir::Instruction::StringBuilderToString { .. }
@@ -809,6 +1072,198 @@ fn span_barrier(instructions: &[mir::Instruction]) -> Option<TemporarySubregionR
     None
 }
 
+/// Structural, candidate-local provenance for direct-local hidden-backing
+/// owners. Semantic lifetime and escape authority remains with AARM-5A; this
+/// pass only proves the executable representation accepted by the compiler
+/// and independently rechecked by the backend.
+#[cfg_attr(test, allow(dead_code))]
+#[allow(clippy::too_many_lines)]
+pub(super) fn validate_builder_provenance(
+    entry: mir::BasicBlockId,
+    blocks: &[(mir::BasicBlockId, &[mir::Instruction])],
+    successors: &HashMap<mir::BasicBlockId, Vec<mir::BasicBlockId>>,
+    rewinds: &[mir::MirPoint],
+) -> Result<(), TemporarySubregionRejectionReason> {
+    let terminal = rewinds
+        .iter()
+        .map(|point| point.block)
+        .collect::<HashSet<_>>();
+    let block_instructions = blocks
+        .iter()
+        .map(|(block, instructions)| (*block, *instructions))
+        .collect::<HashMap<_, _>>();
+    let mut states = HashMap::from([(entry, BTreeMap::<u32, FineOwnedKind>::new())]);
+    let mut pending = vec![entry];
+    while let Some(block) = pending.pop() {
+        let mut owned = states[&block].clone();
+        let Some(instructions) = block_instructions.get(&block) else {
+            return Err(TemporarySubregionRejectionReason::BuilderOwnershipBarrier);
+        };
+        for instruction in *instructions {
+            match instruction {
+                mir::Instruction::AllocateStringBuilder {
+                    destination: mir::Place::Local(local),
+                    region: mir::AllocationRegion::Temporary,
+                    ..
+                } => {
+                    if owned
+                        .insert(local.0, FineOwnedKind::StringBuilder)
+                        .is_some()
+                    {
+                        return Err(TemporarySubregionRejectionReason::BuilderOwnershipBarrier);
+                    }
+                }
+                mir::Instruction::AllocateList {
+                    destination: mir::Place::Local(local),
+                    region: mir::AllocationRegion::Temporary,
+                    ..
+                } => {
+                    if owned.insert(local.0, FineOwnedKind::List).is_some() {
+                        return Err(TemporarySubregionRejectionReason::BuilderOwnershipBarrier);
+                    }
+                }
+                mir::Instruction::AllocateDictionary {
+                    destination: mir::Place::Local(local),
+                    region: mir::AllocationRegion::Temporary,
+                    ..
+                } => {
+                    if owned.insert(local.0, FineOwnedKind::Dictionary).is_some() {
+                        return Err(TemporarySubregionRejectionReason::BuilderOwnershipBarrier);
+                    }
+                }
+                mir::Instruction::AllocateStringBuilder { .. }
+                | mir::Instruction::AllocateList { .. }
+                | mir::Instruction::AllocateDictionary { .. } => {
+                    return Err(TemporarySubregionRejectionReason::BuilderOwnershipBarrier);
+                }
+                mir::Instruction::StringBuilderAppend { builder, .. }
+                | mir::Instruction::StringBuilderToString { builder, .. } => {
+                    if !receiver_is_fine_owned(builder, FineOwnedKind::StringBuilder, &owned) {
+                        return Err(TemporarySubregionRejectionReason::BuilderOwnershipBarrier);
+                    }
+                }
+                mir::Instruction::ListAdd { list, .. }
+                | mir::Instruction::ListGet { list, .. }
+                | mir::Instruction::ListRemoveAt { list, .. } => {
+                    if !receiver_is_fine_owned(list, FineOwnedKind::List, &owned) {
+                        return Err(TemporarySubregionRejectionReason::BuilderOwnershipBarrier);
+                    }
+                }
+                mir::Instruction::DictionaryAdd { dictionary, .. }
+                | mir::Instruction::DictionarySet { dictionary, .. }
+                | mir::Instruction::DictionaryTryGet { dictionary, .. }
+                | mir::Instruction::DictionaryContainsKey { dictionary, .. }
+                | mir::Instruction::DictionaryRemove { dictionary, .. } => {
+                    if !receiver_is_fine_owned(dictionary, FineOwnedKind::Dictionary, &owned) {
+                        return Err(TemporarySubregionRejectionReason::BuilderOwnershipBarrier);
+                    }
+                }
+                mir::Instruction::Assign { target, value }
+                    if !owned_collection_read(value, &owned)
+                        && (rvalue_mentions_fine_owned(value, &owned)
+                            || matches!(target, mir::Place::Local(local) if owned.contains_key(&local.0))) =>
+                {
+                    return Err(TemporarySubregionRejectionReason::BuilderOwnershipBarrier);
+                }
+                mir::Instruction::Assign {
+                    target: mir::Place::Local(local),
+                    ..
+                } if owned.contains_key(&local.0) => {
+                    return Err(TemporarySubregionRejectionReason::BuilderOwnershipBarrier);
+                }
+                _ => {}
+            }
+        }
+        if terminal.contains(&block) {
+            continue;
+        }
+        for successor in successors.get(&block).into_iter().flatten() {
+            let Some(_) = block_instructions.get(successor) else {
+                return Err(TemporarySubregionRejectionReason::BuilderOwnershipBarrier);
+            };
+            if let Some(existing) = states.get(successor) {
+                if existing != &owned {
+                    return Err(TemporarySubregionRejectionReason::BuilderOwnershipBarrier);
+                }
+            } else {
+                states.insert(*successor, owned.clone());
+                pending.push(*successor);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn receiver_is_fine_owned(
+    operand: &mir::Operand,
+    expected: FineOwnedKind,
+    owned: &BTreeMap<u32, FineOwnedKind>,
+) -> bool {
+    matches!(operand.kind, mir::OperandKind::Copy(mir::Place::Local(local))
+        if owned.get(&local.0) == Some(&expected))
+}
+
+fn owned_collection_read(value: &mir::Rvalue, owned: &BTreeMap<u32, FineOwnedKind>) -> bool {
+    match &value.kind {
+        mir::RvalueKind::ListLength(operand) | mir::RvalueKind::ListVersion(operand) => {
+            receiver_is_fine_owned(operand, FineOwnedKind::List, owned)
+        }
+        mir::RvalueKind::DictionaryLength(operand) => {
+            receiver_is_fine_owned(operand, FineOwnedKind::Dictionary, owned)
+        }
+        _ => false,
+    }
+}
+
+fn rvalue_mentions_fine_owned(value: &mir::Rvalue, owned: &BTreeMap<u32, FineOwnedKind>) -> bool {
+    match &value.kind {
+        mir::RvalueKind::Use(operand)
+        | mir::RvalueKind::Discriminant(operand)
+        | mir::RvalueKind::ArrayLength(operand)
+        | mir::RvalueKind::ListLength(operand)
+        | mir::RvalueKind::DictionaryLength(operand)
+        | mir::RvalueKind::ListVersion(operand)
+        | mir::RvalueKind::StringByteLength(operand)
+        | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Unary { operand, .. } => operand_mentions_owned_builder(operand, owned),
+        mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
+            fields
+                .iter()
+                .any(|field| operand_mentions_owned_builder(&field.value, owned))
+        }
+        mir::RvalueKind::MakeInterface { object, .. } => {
+            operand_mentions_owned_builder(object, owned)
+        }
+        mir::RvalueKind::Binary { left, right, .. }
+        | mir::RvalueKind::Equality { left, right, .. } => {
+            operand_mentions_owned_builder(left, owned)
+                || operand_mentions_owned_builder(right, owned)
+        }
+    }
+}
+
+fn operand_mentions_owned_builder(
+    operand: &mir::Operand,
+    owned: &BTreeMap<u32, FineOwnedKind>,
+) -> bool {
+    matches!(&operand.kind, mir::OperandKind::Copy(place) if place_mentions_owned_builder(place, owned))
+}
+
+fn place_mentions_owned_builder(place: &mir::Place, owned: &BTreeMap<u32, FineOwnedKind>) -> bool {
+    match place {
+        mir::Place::Local(local) => owned.contains_key(&local.0),
+        mir::Place::Symbol(_) => false,
+        mir::Place::Field { base, .. } | mir::Place::EnumField { base, .. } => {
+            place_mentions_owned_builder(base, owned)
+        }
+        mir::Place::Index { array, index, .. } => {
+            operand_mentions_owned_builder(array, owned)
+                || operand_mentions_owned_builder(index, owned)
+        }
+        mir::Place::ObjectField { object, .. } => operand_mentions_owned_builder(object, owned),
+    }
+}
+
 fn immutable_temporary_string_intrinsic_is_executable(
     destination: Option<&mir::Place>,
     intrinsic: mir::Intrinsic,
@@ -821,6 +1276,9 @@ fn immutable_temporary_string_intrinsic_is_executable(
         && matches!(
             intrinsic,
             mir::Intrinsic::StringConcatTemporary
+                | mir::Intrinsic::StringJoinTemporary
+                | mir::Intrinsic::StringSubstringFromTemporary
+                | mir::Intrinsic::StringSubstringRangeTemporary
                 | mir::Intrinsic::StringFromLongTemporary
                 | mir::Intrinsic::StringFromULongTemporary
                 | mir::Intrinsic::StringFromDoubleTemporary
@@ -844,6 +1302,10 @@ fn assign_barrier(
         return Some(TemporarySubregionRejectionReason::UnsupportedInstruction);
     }
     None
+}
+
+fn direct_local_operand(operand: &mir::Operand) -> bool {
+    matches!(operand.kind, mir::OperandKind::Copy(mir::Place::Local(_)))
 }
 
 fn is_execution_safe_rvalue(value: &mir::Rvalue) -> bool {
@@ -1109,6 +1571,7 @@ const fn reason_order(reason: TemporarySubregionRejectionReason) -> u8 {
         TemporarySubregionRejectionReason::ConcurrencyBarrier => 12,
         TemporarySubregionRejectionReason::CollectionBarrier => 13,
         TemporarySubregionRejectionReason::StringBarrier => 14,
-        TemporarySubregionRejectionReason::UnsupportedInstruction => 15,
+        TemporarySubregionRejectionReason::BuilderOwnershipBarrier => 15,
+        TemporarySubregionRejectionReason::UnsupportedInstruction => 16,
     }
 }

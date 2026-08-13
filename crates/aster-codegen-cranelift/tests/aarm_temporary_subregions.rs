@@ -6,6 +6,7 @@ const RUN: mir::SymbolId = mir::SymbolId(1);
 const BUILD: mir::SymbolId = mir::SymbolId(2);
 const BOX_CLASS: mir::SymbolId = mir::SymbolId(100);
 const VALUE_FIELD: mir::SymbolId = mir::SymbolId(101);
+const STRING_BUILDER_CLASS: mir::SymbolId = mir::SymbolId(102);
 const BLOCK: mir::BasicBlockId = mir::BasicBlockId(0);
 
 fn local(id: u32, name: &str, type_: mir::Type) -> mir::Local {
@@ -120,6 +121,61 @@ fn temporary_array(local: u32, length: i32) -> mir::Instruction {
     }
 }
 
+fn temporary_builder(local: u32) -> mir::Instruction {
+    mir::Instruction::AllocateStringBuilder {
+        destination: mir::Place::Local(mir::LocalId(local)),
+        class: STRING_BUILDER_CLASS,
+        region: mir::AllocationRegion::Temporary,
+    }
+}
+
+fn builder_append(local: u32, value: &str) -> mir::Instruction {
+    mir::Instruction::StringBuilderAppend {
+        builder: copy(local, mir::Type::Class(STRING_BUILDER_CLASS)),
+        value: mir::Operand {
+            type_: mir::Type::String,
+            kind: mir::OperandKind::Constant(mir::Constant::String(value.to_owned())),
+        },
+        class: STRING_BUILDER_CLASS,
+    }
+}
+
+fn temporary_list(local: u32) -> mir::Instruction {
+    mir::Instruction::AllocateList {
+        destination: mir::Place::Local(mir::LocalId(local)),
+        element_type: mir::Type::Int,
+        region: mir::AllocationRegion::Temporary,
+    }
+}
+
+fn list_add(local: u32, value: i32) -> mir::Instruction {
+    mir::Instruction::ListAdd {
+        list: copy(local, mir::Type::List(Box::new(mir::Type::Int))),
+        value: integer(value),
+    }
+}
+
+fn temporary_dictionary(local: u32) -> mir::Instruction {
+    mir::Instruction::AllocateDictionary {
+        destination: mir::Place::Local(mir::LocalId(local)),
+        key_type: mir::Type::Int,
+        value_type: mir::Type::Int,
+        region: mir::AllocationRegion::Temporary,
+    }
+}
+
+fn dictionary_set(local: u32, destination: u32, key: i32, value: i32) -> mir::Instruction {
+    mir::Instruction::DictionarySet {
+        destination: mir::Place::Local(mir::LocalId(destination)),
+        dictionary: copy(
+            local,
+            mir::Type::Dictionary(Box::new(mir::Type::Int), Box::new(mir::Type::Int)),
+        ),
+        key: integer(key),
+        value: integer(value),
+    }
+}
+
 fn enter(id: u32) -> mir::Instruction {
     mir::Instruction::TemporarySubregionEnter {
         id: mir::TemporarySubregionId(id),
@@ -163,15 +219,22 @@ fn function(
 fn module(functions: Vec<mir::Function>) -> mir::Module {
     mir::Module {
         structs: Vec::new(),
-        classes: vec![mir::ClassDefinition {
-            symbol: BOX_CLASS,
-            name: "Box".to_owned(),
-            fields: vec![mir::FieldDefinition {
-                symbol: VALUE_FIELD,
-                name: "value".to_owned(),
-                type_: mir::Type::Int,
-            }],
-        }],
+        classes: vec![
+            mir::ClassDefinition {
+                symbol: BOX_CLASS,
+                name: "Box".to_owned(),
+                fields: vec![mir::FieldDefinition {
+                    symbol: VALUE_FIELD,
+                    name: "value".to_owned(),
+                    type_: mir::Type::Int,
+                }],
+            },
+            mir::ClassDefinition {
+                symbol: STRING_BUILDER_CLASS,
+                name: "aster.core::StringBuilder".to_owned(),
+                fields: Vec::new(),
+            },
+        ],
         interfaces: Vec::new(),
         enums: Vec::new(),
         interface_implementations: Vec::new(),
@@ -1495,24 +1558,6 @@ fn public_research_lowering_emits_no_markers_for_proof_barriers() {
         );
     };
 
-    let list_type = mir::Type::List(Box::new(mir::Type::Int));
-    assert_rejected(
-        module(vec![function(
-            RUN,
-            "Run",
-            mir::Visibility::Public,
-            vec![local(0, "list", list_type)],
-            mir::Type::Int,
-            vec![mir::Instruction::AllocateList {
-                destination: mir::Place::Local(mir::LocalId(0)),
-                element_type: mir::Type::Int,
-                region: mir::AllocationRegion::Persistent,
-            }],
-            Some(integer(42)),
-        )]),
-        "collection allocation",
-    );
-
     assert_rejected(
         module(vec![function(
             RUN,
@@ -1753,6 +1798,201 @@ fn immutable_temporary_formatting_reclaims_each_loop_iteration() {
     );
     assert!(lowered_result.1.peak_used_bytes < baseline_result.1.peak_used_bytes);
     assert_eq!(report.subregions_lowered, 1);
+}
+
+#[test]
+fn fine_owned_string_builder_growth_and_persistent_snapshot_execute_safely() {
+    let string = mir::Type::String;
+    let baseline = module(vec![function(
+        RUN,
+        "Run",
+        mir::Visibility::Public,
+        vec![
+            local(0, "builder", mir::Type::Class(STRING_BUILDER_CLASS)),
+            local(1, "snapshot", string.clone()),
+        ],
+        string,
+        vec![
+            temporary_builder(0),
+            builder_append(0, "abcdefghijklmnop"),
+            builder_append(0, "qrstuvwxyz0123456789"),
+            builder_append(0, "ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+            mir::Instruction::StringBuilderToString {
+                destination: mir::Place::Local(mir::LocalId(1)),
+                builder: copy(0, mir::Type::Class(STRING_BUILDER_CLASS)),
+                class: STRING_BUILDER_CLASS,
+                region: mir::AllocationRegion::Persistent,
+            },
+        ],
+        Some(copy(1, mir::Type::String)),
+    )]);
+    assert_eq!(marker_count(&baseline), 0);
+    let baseline_result = execute_with_stats(&baseline, "Run").expect("baseline builder executes");
+
+    let mut lowered = baseline.clone();
+    let report = lower_aarm_temporary_subregions_for_research(&mut lowered)
+        .expect("fine-owned builder lowers");
+    let lowered_result =
+        execute_with_stats(&lowered, "Run").expect("lowered builder snapshot executes");
+
+    assert_eq!(lowered_result.0, baseline_result.0);
+    assert_eq!(
+        lowered_result.1.requested_bytes,
+        baseline_result.1.requested_bytes
+    );
+    assert_eq!(report.subregions_lowered, 1, "{report:#?}");
+    assert_eq!(marker_count(&lowered), 2);
+}
+
+#[test]
+fn fine_owned_list_and_dictionary_growth_execute_safely() {
+    let list_type = mir::Type::List(Box::new(mir::Type::Int));
+    let dictionary_type = mir::Type::Dictionary(Box::new(mir::Type::Int), Box::new(mir::Type::Int));
+    let mut module = module(vec![function(
+        RUN,
+        "Run",
+        mir::Visibility::Public,
+        vec![
+            local(0, "list", list_type),
+            local(1, "dictionary", dictionary_type),
+            local(2, "result", mir::Type::Bool),
+        ],
+        mir::Type::Int,
+        vec![
+            temporary_list(0),
+            list_add(0, 20),
+            list_add(0, 22),
+            temporary_dictionary(1),
+            dictionary_set(1, 2, 1, 42),
+            mir::Instruction::DictionaryContainsKey {
+                destination: mir::Place::Local(mir::LocalId(2)),
+                dictionary: copy(
+                    1,
+                    mir::Type::Dictionary(Box::new(mir::Type::Int), Box::new(mir::Type::Int)),
+                ),
+                key: integer(1),
+            },
+        ],
+        Some(integer(42)),
+    )]);
+    let baseline = execute_with_stats(&module, "Run").expect("collection baseline executes");
+    let report = lower_aarm_temporary_subregions_for_research(&mut module)
+        .expect("fine-owned collections lower");
+    let lowered = execute_with_stats(&module, "Run").expect("fine-owned collections execute");
+
+    assert_eq!(baseline.0, ExecutionValue::Int(42));
+    assert_eq!(lowered.0, baseline.0);
+    assert_eq!(lowered.1.requested_bytes, baseline.1.requested_bytes);
+    assert_eq!(report.subregions_lowered, 2, "{report:#?}");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn fine_owned_hidden_backing_loop_reclaim_is_bounded_and_checksum_stable() {
+    let iterations = std::env::var("ASTER_AARM_HIDDEN_ITERATIONS")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(100_000);
+    let mut run = function(
+        RUN,
+        "Run",
+        mir::Visibility::Public,
+        vec![
+            local(0, "builder", mir::Type::Class(STRING_BUILDER_CLASS)),
+            local(1, "list", mir::Type::List(Box::new(mir::Type::Int))),
+            local(
+                2,
+                "dictionary",
+                mir::Type::Dictionary(Box::new(mir::Type::Int), Box::new(mir::Type::Int)),
+            ),
+            local(3, "mutation", mir::Type::Bool),
+            local(4, "index", mir::Type::Int),
+            local(5, "condition", mir::Type::Bool),
+            local(6, "one", mir::Type::Int),
+        ],
+        mir::Type::Int,
+        Vec::new(),
+        None,
+    );
+    run.blocks = vec![
+        mir::BasicBlock {
+            id: mir::BasicBlockId(0),
+            instructions: vec![
+                assign(mir::Place::Local(mir::LocalId(4)), integer(0)),
+                assign(mir::Place::Local(mir::LocalId(6)), integer(1)),
+            ],
+            terminator: mir::Terminator::Goto(mir::BasicBlockId(1)),
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(1),
+            instructions: vec![less(5, 4, iterations)],
+            terminator: mir::Terminator::Branch {
+                condition: copy(5, mir::Type::Bool),
+                then_block: mir::BasicBlockId(2),
+                else_block: mir::BasicBlockId(3),
+            },
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(2),
+            instructions: vec![
+                temporary_builder(0),
+                builder_append(0, "abcdefghijklmnop-qrstuvwxyz-0123456789"),
+                temporary_list(1),
+                list_add(1, 42),
+                temporary_dictionary(2),
+                dictionary_set(2, 3, 1, 42),
+                add(4, 4, 6),
+            ],
+            terminator: mir::Terminator::Goto(mir::BasicBlockId(1)),
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(3),
+            instructions: Vec::new(),
+            terminator: mir::Terminator::Return(Some(copy(4, mir::Type::Int))),
+        },
+    ];
+    let baseline = module(vec![run]);
+    let baseline_result = execute_with_stats(&baseline, "Run").expect("baseline loop executes");
+    let mut lowered = baseline.clone();
+    let report = lower_aarm_temporary_subregions_for_research(&mut lowered)
+        .expect("fine-owned hidden-backing loop lowers");
+    let lowered_result = execute_with_stats(&lowered, "Run").expect("lowered loop executes");
+
+    assert_eq!(baseline_result.0, ExecutionValue::Int(iterations));
+    assert_eq!(lowered_result.0, baseline_result.0);
+    assert_eq!(
+        lowered_result.1.requested_bytes,
+        baseline_result.1.requested_bytes
+    );
+    assert!(lowered_result.1.peak_used_bytes < baseline_result.1.peak_used_bytes);
+    assert!(lowered_result.1.reserved_bytes <= baseline_result.1.reserved_bytes);
+    assert_eq!(report.subregions_lowered, 1, "{report:#?}");
+    let timing = if cfg!(debug_assertions) {
+        None
+    } else {
+        let median = |module: &mir::Module| {
+            let mut samples = (0..5)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    let result = execute_with_stats(module, "Run").expect("timed loop executes");
+                    assert_eq!(result.0, ExecutionValue::Int(iterations));
+                    started.elapsed().as_secs_f64() * 1_000.0
+                })
+                .collect::<Vec<_>>();
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        };
+        Some((median(&baseline), median(&lowered)))
+    };
+    eprintln!(
+        "hidden-backing-loop iterations={iterations} requested={} baseline_peak={} aarm_peak={} baseline_capacity={} aarm_capacity={} median_ms={timing:?}",
+        baseline_result.1.requested_bytes,
+        baseline_result.1.peak_used_bytes,
+        lowered_result.1.peak_used_bytes,
+        baseline_result.1.reserved_bytes,
+        lowered_result.1.reserved_bytes,
+    );
 }
 
 #[test]

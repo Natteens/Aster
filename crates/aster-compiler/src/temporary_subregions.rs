@@ -261,11 +261,26 @@ fn validated_temporary_allocation_form(instruction: &mir::Instruction) -> bool {
         } | mir::Instruction::AllocateArray {
             region: mir::AllocationRegion::Temporary,
             ..
+        } | mir::Instruction::AllocateStringBuilder {
+            region: mir::AllocationRegion::Temporary,
+            ..
+        } | mir::Instruction::StringBuilderToString {
+            region: mir::AllocationRegion::Temporary,
+            ..
+        } | mir::Instruction::AllocateList {
+            region: mir::AllocationRegion::Temporary,
+            ..
+        } | mir::Instruction::AllocateDictionary {
+            region: mir::AllocationRegion::Temporary,
+            ..
         }
     ) || matches!(
         instruction,
         mir::Instruction::CallIntrinsic {
             intrinsic: mir::Intrinsic::StringConcatTemporary
+                | mir::Intrinsic::StringJoinTemporary
+                | mir::Intrinsic::StringSubstringFromTemporary
+                | mir::Intrinsic::StringSubstringRangeTemporary
                 | mir::Intrinsic::StringFromLongTemporary
                 | mir::Intrinsic::StringFromULongTemporary
                 | mir::Intrinsic::StringFromDoubleTemporary
@@ -2250,6 +2265,279 @@ public int Main() {
             }
         }
 
+        fn builder_allocation(id: u32, region: mir::AllocationRegion) -> mir::Instruction {
+            mir::Instruction::AllocateStringBuilder {
+                destination: mir::Place::Local(mir::LocalId(id)),
+                class: CLASS,
+                region,
+            }
+        }
+
+        fn builder_append(id: u32) -> mir::Instruction {
+            mir::Instruction::StringBuilderAppend {
+                builder: copy(id, mir::Type::Class(CLASS)),
+                value: mir::Operand {
+                    type_: mir::Type::String,
+                    kind: mir::OperandKind::Constant(mir::Constant::String("x".to_owned())),
+                },
+                class: CLASS,
+            }
+        }
+
+        fn builder_to_string(id: u32, destination: u32) -> mir::Instruction {
+            mir::Instruction::StringBuilderToString {
+                destination: mir::Place::Local(mir::LocalId(destination)),
+                builder: copy(id, mir::Type::Class(CLASS)),
+                class: CLASS,
+                region: mir::AllocationRegion::Temporary,
+            }
+        }
+
+        fn builder_provenance(
+            entry: u32,
+            blocks: &[(u32, Vec<mir::Instruction>)],
+            successors: &[(u32, Vec<u32>)],
+            rewinds: &[(u32, usize)],
+        ) -> Result<(), Reason> {
+            let block_refs = blocks
+                .iter()
+                .map(|(block, instructions)| (mir::BasicBlockId(*block), instructions.as_slice()))
+                .collect::<Vec<_>>();
+            let successors = successors
+                .iter()
+                .map(|(block, targets)| {
+                    (
+                        mir::BasicBlockId(*block),
+                        targets.iter().copied().map(mir::BasicBlockId).collect(),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let rewinds = rewinds
+                .iter()
+                .map(|(block, boundary)| mir::MirPoint {
+                    block: mir::BasicBlockId(*block),
+                    instruction_boundary: *boundary,
+                })
+                .collect::<Vec<_>>();
+            validation::validate_builder_provenance(
+                mir::BasicBlockId(entry),
+                &block_refs,
+                &successors,
+                &rewinds,
+            )
+        }
+
+        #[test]
+        fn builder_provenance_straight_line_is_candidate_local_and_direct_local_only() {
+            assert_eq!(
+                builder_provenance(
+                    10,
+                    &[(
+                        10,
+                        vec![
+                            builder_allocation(1, mir::AllocationRegion::Temporary),
+                            builder_append(1),
+                            builder_to_string(1, 2),
+                        ],
+                    )],
+                    &[(10, Vec::new())],
+                    &[(10, 3)],
+                ),
+                Ok(())
+            );
+
+            for instructions in [
+                vec![builder_append(1)],
+                vec![
+                    builder_allocation(1, mir::AllocationRegion::Persistent),
+                    builder_append(1),
+                ],
+                vec![
+                    builder_allocation(1, mir::AllocationRegion::Temporary),
+                    mir::Instruction::Assign {
+                        target: mir::Place::Local(mir::LocalId(2)),
+                        value: mir::Rvalue {
+                            type_: mir::Type::Class(CLASS),
+                            kind: mir::RvalueKind::Use(copy(1, mir::Type::Class(CLASS))),
+                        },
+                    },
+                ],
+                vec![
+                    builder_allocation(1, mir::AllocationRegion::Temporary),
+                    builder_allocation(1, mir::AllocationRegion::Temporary),
+                ],
+            ] {
+                assert_eq!(
+                    builder_provenance(10, &[(10, instructions)], &[(10, Vec::new())], &[(10, 2)],),
+                    Err(Reason::BuilderOwnershipBarrier)
+                );
+            }
+
+            let non_local_append = mir::Instruction::StringBuilderAppend {
+                builder: mir::Operand {
+                    type_: mir::Type::Class(CLASS),
+                    kind: mir::OperandKind::Copy(mir::Place::ObjectField {
+                        object: Box::new(copy(9, mir::Type::Class(CLASS))),
+                        field: mir::SymbolId(901),
+                    }),
+                },
+                value: mir::Operand {
+                    type_: mir::Type::String,
+                    kind: mir::OperandKind::Constant(mir::Constant::String("x".to_owned())),
+                },
+                class: CLASS,
+            };
+            assert_eq!(
+                builder_provenance(
+                    10,
+                    &[(
+                        10,
+                        vec![
+                            builder_allocation(1, mir::AllocationRegion::Temporary),
+                            non_local_append,
+                        ],
+                    )],
+                    &[(10, Vec::new())],
+                    &[(10, 2)],
+                ),
+                Err(Reason::BuilderOwnershipBarrier)
+            );
+        }
+
+        #[test]
+        fn builder_provenance_acyclic_joins_require_identical_owned_sets() {
+            let valid = builder_provenance(
+                10,
+                &[
+                    (
+                        10,
+                        vec![builder_allocation(1, mir::AllocationRegion::Temporary)],
+                    ),
+                    (11, vec![builder_append(1)]),
+                    (12, vec![unrelated()]),
+                    (13, vec![builder_append(1), builder_to_string(1, 2)]),
+                ],
+                &[
+                    (10, vec![11, 12]),
+                    (11, vec![13]),
+                    (12, vec![13]),
+                    (13, vec![]),
+                ],
+                &[(13, 2)],
+            );
+            assert_eq!(valid, Ok(()));
+
+            let same_builder_on_both_arms = builder_provenance(
+                10,
+                &[
+                    (
+                        10,
+                        vec![builder_allocation(1, mir::AllocationRegion::Temporary)],
+                    ),
+                    (11, vec![builder_append(1)]),
+                    (12, vec![builder_append(1)]),
+                    (13, vec![builder_append(1)]),
+                ],
+                &[
+                    (10, vec![11, 12]),
+                    (11, vec![13]),
+                    (12, vec![13]),
+                    (13, vec![]),
+                ],
+                &[(13, 1)],
+            );
+            assert_eq!(same_builder_on_both_arms, Ok(()));
+
+            let mismatch = builder_provenance(
+                10,
+                &[
+                    (10, vec![]),
+                    (
+                        11,
+                        vec![builder_allocation(1, mir::AllocationRegion::Temporary)],
+                    ),
+                    (12, vec![unrelated()]),
+                    (13, vec![builder_append(1)]),
+                ],
+                &[
+                    (10, vec![11, 12]),
+                    (11, vec![13]),
+                    (12, vec![13]),
+                    (13, vec![]),
+                ],
+                &[(13, 1)],
+            );
+            assert_eq!(mismatch, Err(Reason::BuilderOwnershipBarrier));
+        }
+
+        #[test]
+        fn builder_provenance_treats_each_loop_path_as_one_iteration_domain() {
+            let iteration = builder_provenance(
+                20,
+                &[
+                    (
+                        20,
+                        vec![builder_allocation(1, mir::AllocationRegion::Temporary)],
+                    ),
+                    (21, vec![builder_append(1)]),
+                    (22, vec![builder_append(1)]),
+                    (23, vec![builder_append(1)]),
+                ],
+                &[
+                    (20, vec![21, 22]),
+                    (21, vec![23]),
+                    (22, vec![]),
+                    (23, vec![]),
+                ],
+                &[(22, 1), (23, 1)],
+            );
+            assert_eq!(
+                iteration,
+                Ok(()),
+                "continue/break/latch rewinds are terminal"
+            );
+
+            assert_eq!(
+                builder_provenance(
+                    20,
+                    &[(20, vec![builder_append(1)])],
+                    &[(20, Vec::new())],
+                    &[(20, 1)],
+                ),
+                Err(Reason::BuilderOwnershipBarrier),
+                "loop re-entry never inherits a previous iteration's ownership"
+            );
+
+            let multiple_latches = builder_provenance(
+                20,
+                &[
+                    (
+                        20,
+                        vec![builder_allocation(1, mir::AllocationRegion::Temporary)],
+                    ),
+                    (21, vec![builder_append(1)]),
+                    (22, vec![builder_append(1)]),
+                ],
+                &[(20, vec![21, 22]), (21, vec![]), (22, vec![])],
+                &[(21, 1), (22, 1)],
+            );
+            assert_eq!(multiple_latches, Ok(()));
+
+            let nested_leaf = builder_provenance(
+                30,
+                &[(
+                    30,
+                    vec![
+                        builder_allocation(1, mir::AllocationRegion::Temporary),
+                        builder_append(1),
+                    ],
+                )],
+                &[(30, Vec::new())],
+                &[(30, 2)],
+            );
+            assert_eq!(nested_leaf, Ok(()));
+        }
+
         #[test]
         fn straight_line_object_and_array_candidates_validate() {
             let (object_module, object_analysis) = prepare_research(end_function(
@@ -2782,20 +3070,18 @@ public int Main() {
         }
 
         #[test]
-        fn collection_builder_candidates_are_deferred_but_immutable_strings_validate() {
+        fn fine_owned_collections_builders_and_immutable_strings_validate() {
             let list_type = mir::Type::List(Box::new(mir::Type::Int));
             let list = mir::Instruction::AllocateList {
                 destination: mir::Place::Local(mir::LocalId(1)),
                 element_type: mir::Type::Int,
                 region: mir::AllocationRegion::Temporary,
             };
-            assert_eq!(
-                reason(&validate_raw(
-                    end_function(vec![list], vec![local(1, list_type)]),
-                    vec![candidate(0, 0, 1, vec![0])]
-                )),
-                Reason::CollectionBarrier
+            let list_report = validate_raw(
+                end_function(vec![list], vec![local(1, list_type)]),
+                vec![candidate(0, 0, 1, vec![0])],
             );
+            assert_eq!(list_report.validated.len(), 1, "{list_report:#?}");
 
             let dictionary_type =
                 mir::Type::Dictionary(Box::new(mir::Type::Int), Box::new(mir::Type::Int));
@@ -2805,12 +3091,14 @@ public int Main() {
                 value_type: mir::Type::Int,
                 region: mir::AllocationRegion::Temporary,
             };
+            let dictionary_report = validate_raw(
+                end_function(vec![dictionary], vec![local(1, dictionary_type)]),
+                vec![candidate(0, 0, 1, vec![0])],
+            );
             assert_eq!(
-                reason(&validate_raw(
-                    end_function(vec![dictionary], vec![local(1, dictionary_type)]),
-                    vec![candidate(0, 0, 1, vec![0])]
-                )),
-                Reason::CollectionBarrier
+                dictionary_report.validated.len(),
+                1,
+                "{dictionary_report:#?}"
             );
 
             let builder = mir::Instruction::AllocateStringBuilder {
@@ -2818,13 +3106,12 @@ public int Main() {
                 class: CLASS,
                 region: mir::AllocationRegion::Temporary,
             };
-            assert_eq!(
-                reason(&validate_raw(
-                    end_function(vec![builder], vec![object_local(1)]),
-                    vec![candidate(0, 0, 1, vec![0])]
-                )),
-                Reason::CollectionBarrier
+            let builder_report = validate_raw(
+                end_function(vec![builder], vec![object_local(1)]),
+                vec![candidate(0, 0, 1, vec![0])],
             );
+            assert_eq!(builder_report.validated.len(), 1, "{builder_report:#?}");
+            assert!(builder_report.rejected.is_empty());
 
             let string = mir::Instruction::CallIntrinsic {
                 destination: Some(mir::Place::Local(mir::LocalId(1))),
@@ -2848,19 +3135,17 @@ public int Main() {
                 arguments: vec![copy(2, mir::Type::Array(Box::new(mir::Type::String)))],
                 return_type: mir::Type::String,
             };
-            assert_eq!(
-                reason(&validate_raw(
-                    end_function(
-                        vec![join],
-                        vec![
-                            local(1, mir::Type::String),
-                            local(2, mir::Type::Array(Box::new(mir::Type::String))),
-                        ],
-                    ),
-                    vec![candidate(0, 0, 1, vec![0])]
-                )),
-                Reason::StringBarrier
+            let join_report = validate_raw(
+                end_function(
+                    vec![join],
+                    vec![
+                        local(1, mir::Type::String),
+                        local(2, mir::Type::Array(Box::new(mir::Type::String))),
+                    ],
+                ),
+                vec![candidate(0, 0, 1, vec![0])],
             );
+            assert_eq!(join_report.validated.len(), 1, "{join_report:#?}");
 
             let to_string = mir::Instruction::StringBuilderToString {
                 destination: mir::Place::Local(mir::LocalId(1)),
@@ -2876,7 +3161,7 @@ public int Main() {
                     ),
                     vec![candidate(0, 0, 1, vec![0])]
                 )),
-                Reason::StringBarrier
+                Reason::BuilderOwnershipBarrier
             );
         }
 
@@ -2956,7 +3241,7 @@ public int Main() {
                 ),
                 vec![candidate(0, 1, 4, vec![1])],
             );
-            assert_eq!(reason(&report), Reason::CollectionBarrier);
+            assert_eq!(reason(&report), Reason::BuilderOwnershipBarrier);
 
             let dictionary_type =
                 mir::Type::Dictionary(Box::new(mir::Type::Int), Box::new(mir::Type::Int));
@@ -3003,7 +3288,7 @@ public int Main() {
                     ),
                     vec![candidate(0, 1, 4, vec![1])],
                 );
-                assert_eq!(reason(&report), Reason::CollectionBarrier);
+                assert_eq!(reason(&report), Reason::BuilderOwnershipBarrier);
             }
 
             let append = mir::Instruction::StringBuilderAppend {
@@ -3030,11 +3315,11 @@ public int Main() {
                 ),
                 vec![candidate(0, 1, 4, vec![1])],
             );
-            assert_eq!(reason(&report), Reason::StringBarrier);
+            assert_eq!(reason(&report), Reason::BuilderOwnershipBarrier);
         }
 
         #[test]
-        fn collection_and_string_rvalues_inside_span_are_rejected() {
+        fn precheckpoint_collection_reads_and_string_rvalues_inside_span_are_rejected() {
             let list_type = mir::Type::List(Box::new(mir::Type::Int));
             let dictionary_type =
                 mir::Type::Dictionary(Box::new(mir::Type::Int), Box::new(mir::Type::Int));

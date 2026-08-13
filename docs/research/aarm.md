@@ -1224,3 +1224,49 @@ Before an AARM phase can change production memory behavior it must provide:
 
 Performance claims require repeated same-machine measurements. Noise is not an improvement, and an
 observed regression must be redesigned before the relevant phase is accepted.
+
+## AARM-5F hidden-backing ownership
+
+The research lowering now carries one deterministic, direct-local provenance
+state for hidden-backing Temporary values. A `StringBuilder`, `List`, or
+`Dictionary` is fine-owned only when its header is allocated as Temporary
+after the matching FineEnter. CFG joins require identical ownership maps and
+FineExit discards the map, so loop iterations begin with no inherited owner.
+Aliases, pre-checkpoint headers, calls, interfaces, concurrency boundaries,
+and unsupported collection snapshots remain fail-closed.
+
+Within that subset, StringBuilder Append/growth and independent Temporary or
+Persistent ToString snapshots may use fine reclaim. The admitted List forms
+are Allocate, Add, Get, and RemoveAt; the admitted Dictionary forms are
+Allocate, Add, Set, TryGet, ContainsKey, and Remove. Builder/list/dictionary
+backing is not source-visible; growth keeps current and obsolete buffers in
+the header's Temporary arena, and the single rewind reclaims the complete
+owned family. Reference containment keeps the existing escape/liveness
+conservatism. ListLength/ListVersion/DictionaryLength assignments and
+DictionaryEntries remain excluded from executable fine regions.
+
+The same immutable-string path also admits the self-contained Temporary Join,
+Substring(start), and Substring(start,length) producers. Console and filesystem
+host operations remain excluded.
+
+Normal ASTER compilation does not invoke this research lowering: production
+FineEnter/FineExit emission remains disabled pending the AARM-6 policy review.
+
+Release-mode Windows evidence for a mixed builder/List/Dictionary loop (five
+timed repeats, median after the untimed correctness executions) was:
+
+| Iterations | Requested | Baseline peak / capacity | AARM peak / capacity | Baseline / AARM median |
+| ---: | ---: | ---: | ---: | ---: |
+| 100K | 46.4 MB | 46.4 MB / 46.5 MB | 464 B / 4 KiB | 498 ms / 28 ms |
+| 1M | 464 MB | 464 MB / 464.8 MB | 464 B / 4 KiB | 47.0 s / 273 ms |
+
+This is a favorable allocation-heavy workload, not a universal speed claim.
+Tiny-allocation measurements still show that checkpoint overhead can matter;
+no profitability threshold or production default is selected here.
+
+AARM-5E is complete for the current research scope: straight-line and acyclic
+CFGs, early exits, simple loops, break/continue, multiple latches, and nested
+leaf-loop reclaim are implemented. Simultaneous outer-and-inner fine reclaim
+and a nested fine-mark stack remain deliberately deferred because leaf reclaim
+already bounds the dominant inner-loop working set and current profiling does
+not justify the added checkpoint and runtime-state complexity.
