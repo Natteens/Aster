@@ -10,6 +10,12 @@ description = "Execution runtime boundary and ABI for JIT-compiled Aster program
 [features]
 aarm-telemetry = []
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59.0", features = [
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+] }
+
 [lints.rust]
 unsafe_code = "deny"
 

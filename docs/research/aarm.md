@@ -464,8 +464,28 @@ Neither active-page bump allocation nor inactive-page reuse touches the backend.
 Virtual-reserve/backing separation is **not** implemented. The fallback backend means
 `MemoryStats.reserved_bytes`, AARM `arena_capacity_bytes`, and governor current capacity retain
 their existing meaning: retained logical page capacity backed by the current host allocator. They
-are not OS virtual-reservation or committed-backing metrics. Windows `VirtualAlloc`, Linux `mmap`,
-and purge/decommit remain later AARM work.
+are not OS virtual-reservation or committed-backing metrics. Linux `mmap` and automatic
+purge/decommit remain later AARM work.
+
+## AARM-3B Windows virtual-memory PageBackend
+
+On Windows, AARM-3B selects `WindowsVirtualPageBackend` as the one production page backend.
+Fresh pages use `VirtualAlloc` with `MEM_RESERVE | MEM_COMMIT` and `PAGE_READWRITE`; their
+reservation is released once by `VirtualFree(base, 0, MEM_RELEASE)` through the existing backing
+RAII owner. Non-Windows targets continue to use `SystemAllocatorPageBackend`.
+
+The Windows backend preserves ASTER page semantics. A fresh page is committed and zeroed before
+publication, its base remains stable until release, and its logical capacity remains the exact
+ASTER request even when Windows internally rounds virtual-memory operations. Rewind does not
+decommit, release a reservation, or release a governor grant: inactive pages remain committed and
+reusable after the existing reclaimed-byte zeroing.
+
+The backend also contains tested low-level `MEM_DECOMMIT` and fixed-address `MEM_COMMIT`
+mechanics for future work. Decommit retains the reservation; recommit must return the original
+base and exposes zeroed bytes. Those primitives are not connected to ordinary arena lifecycle in
+this slice. `reserved_bytes` and `arena_capacity_bytes` still mean logical retained page capacity,
+not Windows virtual reservation or committed/backed bytes. VM reserve/backing telemetry, automatic
+arena decommit, purge policy, and the Linux `mmap` backend are not implemented.
 
 ## Measurement invariants
 
@@ -562,7 +582,7 @@ AARM-1 observability
 -> AARM-2C2 Auto governor budget policy
 -> AARM-2C3 explicit reproducible governor budget override
 -> AARM-3A PageBackend abstraction with system allocator fallback
--> AARM-3B Windows virtual-memory PageBackend
+-> AARM-3B Windows VirtualAlloc PageBackend
 -> AARM-3C Linux virtual-memory PageBackend
 -> AARM-3D page-state and reserve/backing telemetry
 -> AARM-3E integration

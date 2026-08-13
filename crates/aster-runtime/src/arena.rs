@@ -19,6 +19,17 @@ use std::{
 
 use crate::memory_governor::{GovernorReservation, MemoryGovernor, MemoryGovernorTelemetry};
 
+#[cfg(windows)]
+use std::{ffi::c_void, mem::MaybeUninit};
+#[cfg(windows)]
+use windows_sys::Win32::System::{
+    Memory::{
+        MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        VirtualFree,
+    },
+    SystemInformation::{GetSystemInfo, SYSTEM_INFO},
+};
+
 /// Default page capacity in bytes.
 pub(crate) const DEFAULT_PAGE_SIZE: usize = 64 * 1024;
 
@@ -44,21 +55,23 @@ fn next_arena_id() -> u64 {
 /// mechanics are a runtime concern, not an arena allocation policy.
 struct PageBacking {
     base: *mut u8,
-    layout: Layout,
+    logical_capacity: usize,
+    #[cfg_attr(windows, allow(dead_code))]
+    #[cfg(windows)]
+    allocation_size: usize,
+    system_layout: Option<Layout>,
 }
 
 impl PageBacking {
     fn capacity(&self) -> usize {
-        self.layout.size()
+        self.logical_capacity
     }
 }
 
 /// Runtime-private mechanism for the stable zeroed backing of one arena page.
 ///
-/// A successful allocation returns an exact-capacity, aligned, writable, zeroed
-/// backing whose address is stable until this object releases it. AARM-3A has
-/// one implementation only; later platform backends may replace that mechanism
-/// without changing page, governor, or arena semantics.
+/// A successful allocation returns an exact-logical-capacity, aligned, writable,
+/// zeroed backing whose address is stable until this object releases it.
 trait PageBackend {
     fn allocate_zeroed(
         &self,
@@ -67,10 +80,16 @@ trait PageBackend {
     ) -> Result<PageBacking, ArenaAllocError>;
 
     fn release(&self, backing: PageBacking);
+
+    #[cfg(test)]
+    fn is_windows_virtual(&self) -> bool {
+        false
+    }
 }
 
 /// Current fallback backend: the exact system allocator mechanics previously
 /// owned directly by [`Page`].
+#[cfg_attr(windows, allow(dead_code))]
 struct SystemAllocatorPageBackend;
 
 impl PageBackend for SystemAllocatorPageBackend {
@@ -87,20 +106,164 @@ impl PageBackend for SystemAllocatorPageBackend {
         if base.is_null() {
             return Err(ArenaAllocError::OutOfMemory);
         }
-        Ok(PageBacking { base, layout })
+        Ok(PageBacking {
+            base,
+            logical_capacity: capacity,
+            #[cfg(windows)]
+            allocation_size: capacity,
+            system_layout: Some(layout),
+        })
     }
 
     fn release(&self, backing: PageBacking) {
+        let layout = backing
+            .system_layout
+            .expect("system allocator backing has its allocation layout");
         // SAFETY: this backend created `backing.base` with exactly
-        // `backing.layout`; ownership is transferred here exactly once.
+        // `layout`; ownership is transferred here exactly once.
         #[allow(unsafe_code)]
         unsafe {
-            dealloc(backing.base, backing.layout);
+            dealloc(backing.base, layout);
         }
     }
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 static SYSTEM_ALLOCATOR_PAGE_BACKEND: SystemAllocatorPageBackend = SystemAllocatorPageBackend;
+
+#[cfg(windows)]
+/// Windows native virtual-memory backing for one stable arena page.
+struct WindowsVirtualPageBackend;
+
+#[cfg(windows)]
+impl WindowsVirtualPageBackend {
+    fn allocation_size(capacity: usize) -> Result<usize, ArenaAllocError> {
+        let page_size = windows_page_size()?;
+        capacity
+            .checked_add(page_size - 1)
+            .map(|value| value / page_size * page_size)
+            .ok_or(ArenaAllocError::AddressSpace)
+    }
+
+    #[allow(dead_code)]
+    fn decommit(backing: &PageBacking) -> Result<(), ArenaAllocError> {
+        debug_assert!(backing.system_layout.is_none());
+        if virtual_free(backing.base, backing.allocation_size, MEM_DECOMMIT) {
+            Ok(())
+        } else {
+            Err(ArenaAllocError::OutOfMemory)
+        }
+    }
+
+    #[allow(dead_code)]
+    fn recommit(backing: &PageBacking) -> Result<(), ArenaAllocError> {
+        debug_assert!(backing.system_layout.is_none());
+        let committed = virtual_alloc(
+            backing.base.cast::<c_void>(),
+            backing.allocation_size,
+            MEM_COMMIT,
+        );
+        if committed.is_null() {
+            return Err(ArenaAllocError::OutOfMemory);
+        }
+        if committed.cast::<u8>() != backing.base {
+            return Err(ArenaAllocError::AddressSpace);
+        }
+        Ok(())
+    }
+
+    fn release_backing(backing: &PageBacking) -> bool {
+        debug_assert!(backing.system_layout.is_none());
+        virtual_free(backing.base, 0, MEM_RELEASE)
+    }
+}
+
+#[cfg(windows)]
+impl PageBackend for WindowsVirtualPageBackend {
+    fn allocate_zeroed(
+        &self,
+        capacity: usize,
+        alignment: usize,
+    ) -> Result<PageBacking, ArenaAllocError> {
+        let allocation_size = Self::allocation_size(capacity)?;
+        let base = virtual_alloc(std::ptr::null(), capacity, MEM_RESERVE | MEM_COMMIT);
+        if base.is_null() {
+            return Err(ArenaAllocError::OutOfMemory);
+        }
+        if base as usize % alignment != 0 {
+            let released = virtual_free(base.cast::<u8>(), 0, MEM_RELEASE);
+            debug_assert!(released, "misaligned Windows allocation must release");
+            return Err(ArenaAllocError::AddressSpace);
+        }
+        Ok(PageBacking {
+            base: base.cast::<u8>(),
+            logical_capacity: capacity,
+            allocation_size,
+            system_layout: None,
+        })
+    }
+
+    fn release(&self, backing: PageBacking) {
+        let released = Self::release_backing(&backing);
+        debug_assert!(released, "Windows virtual page release must succeed");
+    }
+
+    #[cfg(test)]
+    fn is_windows_virtual(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(windows)]
+fn windows_page_size() -> Result<usize, ArenaAllocError> {
+    let mut information = MaybeUninit::<SYSTEM_INFO>::zeroed();
+    // SAFETY: GetSystemInfo initializes the supplied SYSTEM_INFO storage.
+    #[allow(unsafe_code)]
+    unsafe {
+        GetSystemInfo(information.as_mut_ptr());
+    }
+    // SAFETY: GetSystemInfo initialized `information` above.
+    #[allow(unsafe_code)]
+    let page_size = unsafe { information.assume_init() }.dwPageSize as usize;
+    if page_size == 0 || !page_size.is_power_of_two() {
+        return Err(ArenaAllocError::AddressSpace);
+    }
+    Ok(page_size)
+}
+
+#[cfg(windows)]
+fn virtual_alloc(address: *const c_void, size: usize, allocation_type: u32) -> *mut c_void {
+    // SAFETY: arguments are supplied from a checked allocation contract and no
+    // pointer is retained by this wrapper.
+    #[allow(unsafe_code)]
+    unsafe {
+        VirtualAlloc(address, size, allocation_type, PAGE_READWRITE)
+    }
+}
+
+#[cfg(windows)]
+fn virtual_free(address: *mut u8, size: usize, free_type: u32) -> bool {
+    // SAFETY: callers pass the original allocation base and the exact release
+    // contract for either decommit or reservation release.
+    #[allow(unsafe_code)]
+    unsafe {
+        VirtualFree(address.cast::<c_void>(), size, free_type) != 0
+    }
+}
+
+#[cfg(windows)]
+static WINDOWS_VIRTUAL_PAGE_BACKEND: WindowsVirtualPageBackend = WindowsVirtualPageBackend;
+
+fn default_page_backend() -> &'static dyn PageBackend {
+    #[cfg(windows)]
+    {
+        &WINDOWS_VIRTUAL_PAGE_BACKEND
+    }
+    #[cfg(not(windows))]
+    {
+        &SYSTEM_ALLOCATOR_PAGE_BACKEND
+    }
+}
 
 /// RAII owner that routes release through the same backend that allocated it.
 struct BackendPageBacking {
@@ -309,7 +472,7 @@ impl PagedArena {
     pub(crate) fn new() -> Self {
         PagedArena {
             pages: Vec::new(),
-            backend: &SYSTEM_ALLOCATOR_PAGE_BACKEND,
+            backend: default_page_backend(),
             governor: None,
             active_pages: 0,
             used_bytes: 0,
@@ -825,6 +988,73 @@ mod tests {
         drop(backing);
         assert_eq!(backend.allocation_calls.load(Ordering::Relaxed), 1);
         assert_eq!(backend.release_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_default_backend_is_virtual_memory_backed() {
+        let arena = PagedArena::new();
+        assert!(arena.backend.is_windows_virtual());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_virtual_backing_decommits_recommits_at_its_original_zeroed_address() {
+        let capacity = DEFAULT_PAGE_SIZE + 1;
+        let backing = WINDOWS_VIRTUAL_PAGE_BACKEND
+            .allocate_zeroed(capacity, MAX_ALIGN)
+            .expect("Windows virtual allocation succeeds");
+        assert_eq!(backing.capacity(), capacity);
+        assert!(backing.allocation_size >= capacity);
+        assert_eq!(backing.base as usize % MAX_ALIGN, 0);
+        // SAFETY: `backing` owns a writable committed allocation of `capacity` bytes.
+        #[allow(unsafe_code)]
+        unsafe {
+            let bytes = std::slice::from_raw_parts_mut(backing.base, capacity);
+            assert!(bytes.iter().all(|&byte| byte == 0));
+            bytes.fill(0xA5);
+        }
+
+        WindowsVirtualPageBackend::decommit(&backing).expect("decommit retains the reservation");
+        // Do not dereference `backing.base` while it is decommitted.
+        WindowsVirtualPageBackend::recommit(&backing)
+            .expect("recommit restores the original reservation");
+        // SAFETY: recommit restored the same base as committed writable memory.
+        #[allow(unsafe_code)]
+        let bytes = unsafe { std::slice::from_raw_parts(backing.base, capacity) };
+        assert!(bytes.iter().all(|&byte| byte == 0));
+        assert!(WindowsVirtualPageBackend::release_backing(&backing));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_virtual_backing_raii_drop_releases_its_reservation() {
+        let backing =
+            BackendPageBacking::allocate(&WINDOWS_VIRTUAL_PAGE_BACKEND, MIN_PAGE_SIZE, MAX_ALIGN)
+                .expect("Windows virtual allocation succeeds");
+        let base = backing.base();
+        drop(backing);
+
+        let reacquired = virtual_alloc(
+            base.cast::<c_void>(),
+            MIN_PAGE_SIZE,
+            MEM_RESERVE | MEM_COMMIT,
+        );
+        assert_eq!(reacquired.cast::<u8>(), base);
+        assert!(virtual_free(reacquired.cast::<u8>(), 0, MEM_RELEASE));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_default_arena_preserves_exact_oversized_logical_capacity() {
+        let mut arena = PagedArena::new();
+        let capacity = DEFAULT_PAGE_SIZE + 1;
+        let pointer = arena.alloc(capacity, MAX_ALIGN);
+        assert_eq!(arena.metrics().reserved_bytes, capacity);
+        // SAFETY: `pointer` is a live zeroed allocation of `capacity` bytes.
+        #[allow(unsafe_code)]
+        let bytes = unsafe { std::slice::from_raw_parts(pointer, capacity) };
+        assert!(bytes.iter().all(|&byte| byte == 0));
     }
 
     #[test]
