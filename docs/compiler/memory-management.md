@@ -65,6 +65,22 @@ the AARM-5A report without recomputing escape or liveness. Candidate metadata is
 a rewind-safety claim; Cranelift rejects a non-empty list until later validation and runtime phases
 exist. The shipped one-checkpoint-per-function behavior and runtime ABI remain unchanged.
 
+### AARM-5C research validation
+
+The research branch now has a separate compiler-owned validation artifact for the first deliberately
+narrow execution-ready subset. One explicit research orchestration obtains AARM-5A facts, creates
+AARM-5B candidates, and validates both against the same immutable MIR snapshot. The validator
+requires a single straight-line block, one rewind, exact reference death at that rewind, disjoint
+intervals, and exact accounting for every Temporary dynamic allocation between checkpoint and
+rewind. Only object and array sites are currently eligible.
+
+Calls, Task/async/Parallel boundaries, collection and builder operations, and dynamic strings remain
+barriers. In particular, a dead owning `List`, `Dictionary`, or `StringBuilder` reference is not
+proof that all backing growth in the same Temporary arena is safe to rewind. The validated artifact
+is still research evidence only: no checkpoint or rewind instruction is emitted, Cranelift remains
+fail-closed for non-empty candidate metadata, and shipped execution still uses one Temporary scope
+per function.
+
 ## Collections and strings
 
 An array header and its element buffer always use the same arena. Rewinding

@@ -2,7 +2,7 @@
 //!
 //! Candidate metadata is deliberately non-executable. The normal compiler
 //! pipeline never invokes this module, and the execution backend rejects every
-//! non-empty candidate list until later AARM validation and runtime work exist.
+//! non-empty candidate list until later runtime checkpoint integration exists.
 
 #![cfg_attr(not(test), allow(dead_code))]
 
@@ -12,26 +12,43 @@ use aster_mir as mir;
 
 use crate::{escape_analysis, lifetime_analysis::LifetimeAnalysisReport};
 
-/// Run the explicit research-only AARM-5A -> AARM-5B orchestration and replace
-/// every function's candidate metadata. Keeping the immutable analysis and
-/// report-consuming planner inside one operation prevents stale MIR pairing.
-pub(super) fn analyze_and_populate_candidate_subregions(module: &mut mir::Module) {
+mod validation;
+
+use validation::TemporarySubregionValidationReport;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TemporarySubregionResearchAnalysis {
+    lifetime: LifetimeAnalysisReport,
+    validation: TemporarySubregionValidationReport,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FunctionCandidatePlan {
+    function: mir::SymbolId,
+    candidates: Vec<mir::TemporarySubregionCandidate>,
+}
+
+/// Run the explicit research-only AARM-5A -> AARM-5B -> AARM-5C orchestration.
+///
+/// The lifetime report, candidate plans, and validation all observe the same
+/// immutable executable MIR snapshot. Candidate metadata is attached only
+/// after validation, so no independently pairable stale-report API exists.
+fn analyze_plan_and_validate_candidate_subregions(
+    module: &mut mir::Module,
+) -> TemporarySubregionResearchAnalysis {
     for function in &mut module.functions {
         function.temporary_subregion_candidates.clear();
     }
-    let lifetime = crate::lifetime_analysis::analyze(module);
-    if !report_matches_module(module, &lifetime) {
-        return;
+    let analysis = validation::analyze_plan_validate_exact_snapshot(module);
+
+    for (function, plan) in module.functions.iter_mut().zip(analysis.plans) {
+        debug_assert_eq!(function.symbol, plan.function);
+        function.temporary_subregion_candidates = plan.candidates;
     }
 
-    let plans = module
-        .functions
-        .iter()
-        .map(|function| (function.symbol, plan_function(function, &lifetime)))
-        .collect::<HashMap<_, _>>();
-    for function in &mut module.functions {
-        function.temporary_subregion_candidates =
-            plans.get(&function.symbol).cloned().unwrap_or_default();
+    TemporarySubregionResearchAnalysis {
+        lifetime: analysis.lifetime,
+        validation: analysis.validation,
     }
 }
 
@@ -240,27 +257,31 @@ fn function_contains_concurrency_boundary(function: &mir::Function) -> bool {
         .blocks
         .iter()
         .flat_map(|block| &block.instructions)
-        .any(|instruction| {
-            matches!(
-                instruction,
-                mir::Instruction::CallIntrinsic {
-                    intrinsic: mir::Intrinsic::TaskRun
-                        | mir::Intrinsic::TaskWait
-                        | mir::Intrinsic::AsyncSpawn
-                        | mir::Intrinsic::AsyncState
-                        | mir::Intrinsic::AsyncSetState
-                        | mir::Intrinsic::AsyncStoreSlot
-                        | mir::Intrinsic::AsyncLoadSlot
-                        | mir::Intrinsic::AsyncSpawnInner
-                        | mir::Intrinsic::AsyncAwaitResult
-                        | mir::Intrinsic::AsyncSetResult
-                        | mir::Intrinsic::ParallelFor
-                        | mir::Intrinsic::ParallelForEach
-                        | mir::Intrinsic::ParallelReduce,
-                    ..
-                }
-            )
+        .any(|instruction| match instruction {
+            mir::Instruction::CallIntrinsic { intrinsic, .. } => {
+                is_concurrency_intrinsic(*intrinsic)
+            }
+            _ => false,
         })
+}
+
+fn is_concurrency_intrinsic(intrinsic: mir::Intrinsic) -> bool {
+    matches!(
+        intrinsic,
+        mir::Intrinsic::TaskRun
+            | mir::Intrinsic::TaskWait
+            | mir::Intrinsic::AsyncSpawn
+            | mir::Intrinsic::AsyncState
+            | mir::Intrinsic::AsyncSetState
+            | mir::Intrinsic::AsyncStoreSlot
+            | mir::Intrinsic::AsyncLoadSlot
+            | mir::Intrinsic::AsyncSpawnInner
+            | mir::Intrinsic::AsyncAwaitResult
+            | mir::Intrinsic::AsyncSetResult
+            | mir::Intrinsic::ParallelFor
+            | mir::Intrinsic::ParallelForEach
+            | mir::Intrinsic::ParallelReduce
+    )
 }
 
 fn validate_simple_candidate_plan(
@@ -443,11 +464,17 @@ mod tests {
         }
     }
 
-    fn prepare(mut module: mir::Module) -> (mir::Module, LifetimeAnalysisReport) {
+    fn prepare_research(
+        mut module: mir::Module,
+    ) -> (mir::Module, TemporarySubregionResearchAnalysis) {
         escape_analysis::assign_allocation_regions(&mut module);
-        let lifetime = crate::lifetime_analysis::analyze(&module);
-        analyze_and_populate_candidate_subregions(&mut module);
-        (module, lifetime)
+        let analysis = analyze_plan_and_validate_candidate_subregions(&mut module);
+        (module, analysis)
+    }
+
+    fn prepare(module: mir::Module) -> (mir::Module, LifetimeAnalysisReport) {
+        let (module, analysis) = prepare_research(module);
+        (module, analysis.lifetime)
     }
 
     fn single_block_plan(
@@ -716,14 +743,14 @@ mod tests {
             vec![object_local(1), object_local(2)],
         )]);
         escape_analysis::assign_allocation_regions(&mut module);
-        analyze_and_populate_candidate_subregions(&mut module);
+        analyze_plan_and_validate_candidate_subregions(&mut module);
         let expected = module.functions[0].temporary_subregion_candidates.clone();
 
-        analyze_and_populate_candidate_subregions(&mut module);
+        analyze_plan_and_validate_candidate_subregions(&mut module);
         assert_eq!(module.functions[0].temporary_subregion_candidates, expected);
 
         module.functions[0].temporary_subregion_candidates.clear();
-        analyze_and_populate_candidate_subregions(&mut module);
+        analyze_plan_and_validate_candidate_subregions(&mut module);
         assert_eq!(module.functions[0].temporary_subregion_candidates, expected);
     }
 
@@ -856,7 +883,7 @@ mod tests {
             vec![point(2)]
         );
         module.functions[0].blocks[0].instructions.swap(1, 2);
-        analyze_and_populate_candidate_subregions(&mut module);
+        analyze_plan_and_validate_candidate_subregions(&mut module);
         assert_eq!(
             module.functions[0].temporary_subregion_candidates,
             vec![mir::TemporarySubregionCandidate {
@@ -904,5 +931,816 @@ public int Main() {
                 .iter()
                 .all(|function| function.temporary_subregion_candidates.is_empty())
         );
+    }
+
+    mod temporary_subregion_validation {
+        use super::*;
+        use crate::temporary_subregions::validation::{
+            self, TemporarySubregionRejectionReason as Reason, TemporarySubregionValidationReport,
+        };
+
+        fn candidate(
+            id: u32,
+            checkpoint: usize,
+            rewind: usize,
+            allocations: Vec<usize>,
+        ) -> mir::TemporarySubregionCandidate {
+            mir::TemporarySubregionCandidate {
+                id: mir::TemporarySubregionId(id),
+                checkpoint: point(checkpoint),
+                rewinds: vec![point(rewind)],
+                allocations: allocations.into_iter().map(site).collect(),
+            }
+        }
+
+        fn validate_raw(
+            mut module: mir::Module,
+            candidates: impl IntoIterator<Item = mir::TemporarySubregionCandidate>,
+        ) -> TemporarySubregionValidationReport {
+            escape_analysis::assign_allocation_regions(&mut module);
+            let lifetime = crate::lifetime_analysis::analyze(&module);
+            let candidates = candidates.into_iter().collect::<Vec<_>>();
+            validate_with_report(&module, &lifetime, &candidates)
+        }
+
+        fn validate_with_report(
+            module: &mir::Module,
+            lifetime: &LifetimeAnalysisReport,
+            candidates: &[mir::TemporarySubregionCandidate],
+        ) -> TemporarySubregionValidationReport {
+            let plans = module
+                .functions
+                .iter()
+                .map(|function| FunctionCandidatePlan {
+                    function: function.symbol,
+                    candidates: if function.symbol == FUNCTION {
+                        candidates.to_vec()
+                    } else {
+                        Vec::new()
+                    },
+                })
+                .collect::<Vec<_>>();
+            validation::validate_for_test(module, lifetime, &plans)
+        }
+
+        fn reason(report: &TemporarySubregionValidationReport) -> Reason {
+            assert!(report.validated.is_empty());
+            assert_eq!(report.rejected.len(), 1);
+            report.rejected[0].reason
+        }
+
+        fn end_function(
+            instructions: Vec<mir::Instruction>,
+            locals: Vec<mir::Local>,
+        ) -> mir::Module {
+            module(vec![function(
+                FUNCTION,
+                BLOCK.0,
+                vec![block(BLOCK.0, instructions, mir::Terminator::End)],
+                locals,
+            )])
+        }
+
+        fn temporary_array(id: u32) -> mir::Instruction {
+            mir::Instruction::AllocateArray {
+                destination: mir::Place::Local(mir::LocalId(id)),
+                element_type: mir::Type::Int,
+                length: mir::Operand {
+                    type_: mir::Type::Int,
+                    kind: mir::OperandKind::Constant(mir::Constant::Integer("4".to_owned())),
+                },
+                requires_default: true,
+                region: mir::AllocationRegion::Temporary,
+            }
+        }
+
+        fn direct_call() -> mir::Instruction {
+            mir::Instruction::Call {
+                destination: None,
+                function: OTHER_FUNCTION,
+                arguments: Vec::new(),
+                return_type: mir::Type::Void,
+            }
+        }
+
+        fn interface_call() -> mir::Instruction {
+            mir::Instruction::CallInterface {
+                destination: None,
+                receiver: copy(2, mir::Type::Class(CLASS)),
+                method: mir::SymbolId(777),
+                arguments: Vec::new(),
+                return_type: mir::Type::Void,
+            }
+        }
+
+        #[test]
+        fn straight_line_object_and_array_candidates_validate() {
+            let (object_module, object_analysis) = prepare_research(end_function(
+                vec![allocate_object(1), observe_object(1), unrelated()],
+                vec![object_local(1)],
+            ));
+            assert_eq!(
+                object_analysis.validation.validated,
+                vec![validation::ValidatedTemporarySubregion {
+                    function: FUNCTION,
+                    id: mir::TemporarySubregionId(0),
+                    checkpoint: point(0),
+                    rewind: point(2),
+                    allocations: vec![site(0)],
+                }]
+            );
+            assert!(object_analysis.validation.rejected.is_empty());
+            assert_eq!(object_analysis.validation.validated_allocation_count(), 1);
+            assert_eq!(
+                object_module.functions[0]
+                    .temporary_subregion_candidates
+                    .len(),
+                1
+            );
+
+            let (_, immediate_object) = prepare_research(end_function(
+                vec![allocate_object(1)],
+                vec![object_local(1)],
+            ));
+            assert_eq!(immediate_object.validation.validated.len(), 1);
+            assert_eq!(
+                immediate_object.validation.validated[0].checkpoint,
+                point(0)
+            );
+            assert_eq!(immediate_object.validation.validated[0].rewind, point(1));
+
+            let (array_module, array_analysis) = prepare_research(end_function(
+                vec![temporary_array(1)],
+                vec![local(1, mir::Type::Array(Box::new(mir::Type::Int)))],
+            ));
+            assert_eq!(array_analysis.validation.validated.len(), 1);
+            assert_eq!(array_analysis.validation.validated[0].rewind, point(1));
+            assert_eq!(
+                array_analysis.validation.validated[0].allocations,
+                vec![site(0)]
+            );
+            assert_eq!(
+                array_module.functions[0].temporary_subregion_candidates[0].rewinds,
+                vec![point(1)]
+            );
+        }
+
+        #[test]
+        fn older_live_and_persistent_allocations_do_not_block_inner_rewind() {
+            let (older_live, analysis) = prepare_research(end_function(
+                vec![
+                    allocate_object(1),
+                    allocate_object(2),
+                    observe_object(2),
+                    observe_object(1),
+                ],
+                vec![object_local(1), object_local(2)],
+            ));
+            assert_eq!(analysis.validation.validated.len(), 1);
+            assert_eq!(analysis.validation.validated[0].checkpoint, point(1));
+            assert_eq!(analysis.validation.validated[0].rewind, point(3));
+            assert_eq!(analysis.validation.validated[0].allocations, vec![site(1)]);
+            assert_eq!(
+                older_live.functions[0].temporary_subregion_candidates[0].allocations,
+                vec![site(1)]
+            );
+
+            let persistent_between = function(
+                FUNCTION,
+                BLOCK.0,
+                vec![block(
+                    BLOCK.0,
+                    vec![allocate_object(1), allocate_object(2), observe_object(1)],
+                    mir::Terminator::Return(Some(copy(2, mir::Type::Class(CLASS)))),
+                )],
+                vec![object_local(1), object_local(2)],
+            );
+            let (_, analysis) = prepare_research(module(vec![persistent_between]));
+            assert_eq!(analysis.validation.validated.len(), 1);
+            assert_eq!(analysis.validation.validated[0].allocations, vec![site(0)]);
+            assert_eq!(analysis.validation.validated[0].rewind, point(3));
+        }
+
+        #[test]
+        fn later_allocations_are_outside_rewind_and_complete_multi_site_spans_validate() {
+            let module = end_function(
+                vec![
+                    temporary_object(1),
+                    observe_object(1),
+                    temporary_object(2),
+                    observe_object(2),
+                ],
+                vec![object_local(1), object_local(2)],
+            );
+            let earlier = validate_raw(module.clone(), vec![candidate(0, 0, 2, vec![0])]);
+            assert_eq!(earlier.validated.len(), 1);
+            assert_eq!(earlier.validated[0].allocations, vec![site(0)]);
+            assert_eq!(earlier.validated[0].rewind, point(2));
+
+            let combined = validate_raw(module, vec![candidate(0, 0, 4, vec![0, 2])]);
+            assert_eq!(combined.validated.len(), 1);
+            assert_eq!(combined.validated_allocation_count(), 2);
+            assert_eq!(combined.validated[0].allocations, vec![site(0), site(2)]);
+        }
+
+        #[test]
+        fn sequential_candidates_validate_deterministically_and_idempotently() {
+            let mut module = end_function(
+                vec![
+                    allocate_object(1),
+                    observe_object(1),
+                    allocate_object(2),
+                    observe_object(2),
+                ],
+                vec![object_local(1), object_local(2)],
+            );
+            escape_analysis::assign_allocation_regions(&mut module);
+            let first = analyze_plan_and_validate_candidate_subregions(&mut module);
+            let candidates = module.functions[0].temporary_subregion_candidates.clone();
+            let second = analyze_plan_and_validate_candidate_subregions(&mut module);
+
+            assert_eq!(first, second);
+            assert_eq!(
+                module.functions[0].temporary_subregion_candidates,
+                candidates
+            );
+            assert_eq!(first.validation.validated.len(), 2);
+            assert_eq!(first.validation.validated_allocation_count(), 2);
+            assert_eq!(first.validation.validated[0].checkpoint, point(0));
+            assert_eq!(first.validation.validated[1].checkpoint, point(2));
+            assert!(first.validation.rejected.is_empty());
+        }
+
+        #[test]
+        fn unaccounted_younger_temporary_and_non_exact_death_are_rejected() {
+            let module = end_function(
+                vec![
+                    temporary_object(1),
+                    temporary_object(2),
+                    observe_object(1),
+                    observe_object(2),
+                ],
+                vec![object_local(1), object_local(2)],
+            );
+            let report = validate_raw(module, vec![candidate(0, 0, 3, vec![0])]);
+            assert_eq!(reason(&report), Reason::UnaccountedTemporaryAllocation);
+
+            let mut module = end_function(
+                vec![temporary_object(1), observe_object(1), unrelated()],
+                vec![object_local(1)],
+            );
+            escape_analysis::assign_allocation_regions(&mut module);
+            let mut lifetime = crate::lifetime_analysis::analyze(&module);
+            lifetime.proofs[0]
+                .dead_after
+                .retain(|location| *location == point(2));
+            let report = validate_with_report(&module, &lifetime, &[candidate(0, 0, 3, vec![0])]);
+            assert_eq!(reason(&report), Reason::MissingReferenceDeathProof);
+        }
+
+        #[test]
+        fn allocation_on_the_older_final_use_instruction_cannot_validate_older_only() {
+            let allocate_older = mir::Instruction::CallIntrinsic {
+                destination: Some(mir::Place::Local(mir::LocalId(1))),
+                intrinsic: mir::Intrinsic::StringFromLongTemporary,
+                arguments: vec![mir::Operand {
+                    type_: mir::Type::Long,
+                    kind: mir::OperandKind::Constant(mir::Constant::Integer("1".to_owned())),
+                }],
+                return_type: mir::Type::String,
+            };
+            let allocate_younger = mir::Instruction::CallIntrinsic {
+                destination: Some(mir::Place::Local(mir::LocalId(2))),
+                intrinsic: mir::Intrinsic::StringConcatTemporary,
+                arguments: vec![
+                    copy(1, mir::Type::String),
+                    mir::Operand {
+                        type_: mir::Type::String,
+                        kind: mir::OperandKind::Constant(mir::Constant::String("x".to_owned())),
+                    },
+                ],
+                return_type: mir::Type::String,
+            };
+            let report = validate_raw(
+                end_function(
+                    vec![allocate_older, allocate_younger],
+                    vec![local(1, mir::Type::String), local(2, mir::Type::String)],
+                ),
+                vec![candidate(0, 0, 2, vec![0])],
+            );
+            assert!(report.validated.is_empty());
+            assert!(matches!(
+                report.rejected[0].reason,
+                Reason::StringBarrier | Reason::UnaccountedTemporaryAllocation
+            ));
+        }
+
+        #[test]
+        fn crossing_nested_and_duplicate_intervals_reject_every_participant() {
+            let module = end_function(
+                vec![
+                    temporary_object(1),
+                    observe_object(1),
+                    unrelated(),
+                    unrelated(),
+                    temporary_object(2),
+                    observe_object(2),
+                ],
+                vec![object_local(1), object_local(2)],
+            );
+            let crossing = vec![candidate(0, 0, 4, vec![0]), candidate(1, 2, 6, vec![4])];
+            let report = validate_raw(module.clone(), crossing.clone());
+            assert!(report.validated.is_empty());
+            assert_eq!(report.rejected.len(), 2);
+            assert!(
+                report
+                    .rejected
+                    .iter()
+                    .all(|rejected| rejected.reason == Reason::OverlappingSubregion)
+            );
+            let mut reversed = crossing;
+            reversed.reverse();
+            assert_eq!(report, validate_raw(module.clone(), reversed));
+
+            let nested = vec![candidate(0, 0, 6, vec![0, 4]), candidate(1, 2, 6, vec![4])];
+            let report = validate_raw(module.clone(), nested);
+            assert!(report.validated.is_empty());
+            assert_eq!(report.rejected.len(), 2);
+            assert!(
+                report
+                    .rejected
+                    .iter()
+                    .all(|rejected| rejected.reason == Reason::OverlappingSubregion)
+            );
+
+            let duplicate = vec![candidate(0, 0, 4, vec![0]), candidate(1, 0, 4, vec![0])];
+            let report = validate_raw(module, duplicate);
+            assert!(report.validated.is_empty());
+            assert_eq!(report.rejected.len(), 2);
+            assert!(
+                report
+                    .rejected
+                    .iter()
+                    .all(|rejected| rejected.reason == Reason::OverlappingSubregion)
+            );
+        }
+
+        #[test]
+        fn malformed_points_sites_regions_and_ids_are_rejected_without_repair() {
+            let base_module = end_function(
+                vec![temporary_object(1), observe_object(1)],
+                vec![object_local(1)],
+            );
+
+            assert_eq!(
+                reason(&validate_raw(
+                    base_module.clone(),
+                    vec![candidate(0, 0, 3, vec![0])]
+                )),
+                Reason::MalformedPoint
+            );
+
+            let mut unknown_block = candidate(0, 0, 2, vec![0]);
+            unknown_block.checkpoint.block = mir::BasicBlockId(999);
+            assert_eq!(
+                reason(&validate_raw(base_module.clone(), vec![unknown_block])),
+                Reason::MalformedPoint
+            );
+
+            assert_eq!(
+                reason(&validate_raw(
+                    base_module.clone(),
+                    vec![candidate(0, 0, 2, vec![1])]
+                )),
+                Reason::MalformedAllocationSite
+            );
+
+            let mut wrong_function = candidate(0, 0, 2, vec![0]);
+            wrong_function.allocations[0].function = OTHER_FUNCTION;
+            assert_eq!(
+                reason(&validate_raw(base_module.clone(), vec![wrong_function])),
+                Reason::WrongFunction
+            );
+
+            let mut duplicate_site = candidate(0, 0, 2, vec![0]);
+            duplicate_site.allocations.push(site(0));
+            assert_eq!(
+                reason(&validate_raw(base_module.clone(), vec![duplicate_site])),
+                Reason::DuplicateAllocationSite
+            );
+
+            let duplicate_ids = vec![candidate(0, 0, 2, vec![0]), candidate(0, 0, 2, vec![0])];
+            let report = validate_raw(base_module, duplicate_ids);
+            assert_eq!(report.rejected.len(), 2);
+            assert!(
+                report
+                    .rejected
+                    .iter()
+                    .all(|rejected| rejected.reason == Reason::DuplicateId)
+            );
+
+            let returned = function(
+                FUNCTION,
+                BLOCK.0,
+                vec![block(
+                    BLOCK.0,
+                    vec![allocate_object(1)],
+                    mir::Terminator::Return(Some(copy(1, mir::Type::Class(CLASS)))),
+                )],
+                vec![object_local(1)],
+            );
+            assert_eq!(
+                reason(&validate_raw(
+                    module(vec![returned]),
+                    vec![candidate(0, 0, 1, vec![0])]
+                )),
+                Reason::PersistentAllocation
+            );
+        }
+
+        #[test]
+        fn mismatched_allocation_snapshot_is_rejected_as_stale_and_candidates_are_not_mutated() {
+            let mut module = end_function(
+                vec![temporary_object(1), observe_object(1)],
+                vec![object_local(1)],
+            );
+            escape_analysis::assign_allocation_regions(&mut module);
+            let lifetime = crate::lifetime_analysis::analyze(&module);
+            let candidates = vec![candidate(0, 0, 2, vec![0])];
+            let expected_candidates = candidates.clone();
+
+            if let mir::Instruction::AllocateObject { region, .. } =
+                &mut module.functions[0].blocks[0].instructions[0]
+            {
+                *region = mir::AllocationRegion::Persistent;
+            }
+            let report = validate_with_report(&module, &lifetime, &candidates);
+            assert_eq!(reason(&report), Reason::StaleAnalysis);
+            assert_eq!(candidates, expected_candidates);
+        }
+
+        #[test]
+        fn branches_loops_early_returns_and_multiple_rewinds_are_unsupported() {
+            let branch = function(
+                FUNCTION,
+                BLOCK.0,
+                vec![block(
+                    BLOCK.0,
+                    vec![temporary_object(1)],
+                    mir::Terminator::Branch {
+                        condition: mir::Operand {
+                            type_: mir::Type::Bool,
+                            kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                        },
+                        then_block: BLOCK,
+                        else_block: BLOCK,
+                    },
+                )],
+                vec![object_local(1)],
+            );
+            assert_eq!(
+                reason(&validate_raw(
+                    module(vec![branch]),
+                    vec![candidate(0, 0, 1, vec![0])]
+                )),
+                Reason::UnsupportedControlFlow
+            );
+
+            let loop_function = function(
+                FUNCTION,
+                BLOCK.0,
+                vec![block(
+                    BLOCK.0,
+                    vec![temporary_object(1)],
+                    mir::Terminator::Goto(BLOCK),
+                )],
+                vec![object_local(1)],
+            );
+            assert_eq!(
+                reason(&validate_raw(
+                    module(vec![loop_function]),
+                    vec![candidate(0, 0, 1, vec![0])]
+                )),
+                Reason::UnsupportedControlFlow
+            );
+
+            let early_return = function(
+                FUNCTION,
+                BLOCK.0,
+                vec![
+                    block(
+                        BLOCK.0,
+                        vec![temporary_object(1)],
+                        mir::Terminator::Goto(mir::BasicBlockId(20)),
+                    ),
+                    block(20, Vec::new(), mir::Terminator::Return(None)),
+                ],
+                vec![object_local(1)],
+            );
+            assert_eq!(
+                reason(&validate_raw(
+                    module(vec![early_return]),
+                    vec![candidate(0, 0, 1, vec![0])]
+                )),
+                Reason::UnsupportedControlFlow
+            );
+
+            let mut multiple_rewinds = candidate(0, 0, 2, vec![0]);
+            multiple_rewinds.rewinds.push(point(2));
+            assert_eq!(
+                reason(&validate_raw(
+                    end_function(
+                        vec![temporary_object(1), observe_object(1)],
+                        vec![object_local(1)]
+                    ),
+                    vec![multiple_rewinds]
+                )),
+                Reason::UnsupportedControlFlow
+            );
+        }
+
+        #[test]
+        fn direct_interface_and_intrinsic_calls_inside_span_are_barriers() {
+            for call in [direct_call(), interface_call()] {
+                let report = validate_raw(
+                    end_function(
+                        vec![temporary_object(1), call, observe_object(1)],
+                        vec![object_local(1), object_local(2)],
+                    ),
+                    vec![candidate(0, 0, 3, vec![0])],
+                );
+                assert_eq!(reason(&report), Reason::CallBarrier);
+            }
+
+            let intrinsic = mir::Instruction::CallIntrinsic {
+                destination: None,
+                intrinsic: mir::Intrinsic::Log,
+                arguments: Vec::new(),
+                return_type: mir::Type::Void,
+            };
+            let report = validate_raw(
+                end_function(
+                    vec![temporary_object(1), intrinsic, observe_object(1)],
+                    vec![object_local(1)],
+                ),
+                vec![candidate(0, 0, 3, vec![0])],
+            );
+            assert_eq!(reason(&report), Reason::CallBarrier);
+
+            let outside = validate_raw(
+                end_function(
+                    vec![direct_call(), temporary_object(1), observe_object(1)],
+                    vec![object_local(1)],
+                ),
+                vec![candidate(0, 1, 3, vec![1])],
+            );
+            assert_eq!(outside.validated.len(), 1);
+            assert!(outside.rejected.is_empty());
+        }
+
+        #[test]
+        fn collection_builder_and_dynamic_string_candidates_are_deferred() {
+            let list_type = mir::Type::List(Box::new(mir::Type::Int));
+            let list = mir::Instruction::AllocateList {
+                destination: mir::Place::Local(mir::LocalId(1)),
+                element_type: mir::Type::Int,
+                region: mir::AllocationRegion::Temporary,
+            };
+            assert_eq!(
+                reason(&validate_raw(
+                    end_function(vec![list], vec![local(1, list_type)]),
+                    vec![candidate(0, 0, 1, vec![0])]
+                )),
+                Reason::CollectionBarrier
+            );
+
+            let dictionary_type =
+                mir::Type::Dictionary(Box::new(mir::Type::Int), Box::new(mir::Type::Int));
+            let dictionary = mir::Instruction::AllocateDictionary {
+                destination: mir::Place::Local(mir::LocalId(1)),
+                key_type: mir::Type::Int,
+                value_type: mir::Type::Int,
+                region: mir::AllocationRegion::Temporary,
+            };
+            assert_eq!(
+                reason(&validate_raw(
+                    end_function(vec![dictionary], vec![local(1, dictionary_type)]),
+                    vec![candidate(0, 0, 1, vec![0])]
+                )),
+                Reason::CollectionBarrier
+            );
+
+            let builder = mir::Instruction::AllocateStringBuilder {
+                destination: mir::Place::Local(mir::LocalId(1)),
+                class: CLASS,
+                region: mir::AllocationRegion::Temporary,
+            };
+            assert_eq!(
+                reason(&validate_raw(
+                    end_function(vec![builder], vec![object_local(1)]),
+                    vec![candidate(0, 0, 1, vec![0])]
+                )),
+                Reason::CollectionBarrier
+            );
+
+            let string = mir::Instruction::CallIntrinsic {
+                destination: Some(mir::Place::Local(mir::LocalId(1))),
+                intrinsic: mir::Intrinsic::StringFromLongTemporary,
+                arguments: vec![mir::Operand {
+                    type_: mir::Type::Long,
+                    kind: mir::OperandKind::Constant(mir::Constant::Integer("7".to_owned())),
+                }],
+                return_type: mir::Type::String,
+            };
+            assert_eq!(
+                reason(&validate_raw(
+                    end_function(vec![string], vec![local(1, mir::Type::String)]),
+                    vec![candidate(0, 0, 1, vec![0])]
+                )),
+                Reason::StringBarrier
+            );
+
+            let to_string = mir::Instruction::StringBuilderToString {
+                destination: mir::Place::Local(mir::LocalId(1)),
+                builder: copy(2, mir::Type::Class(CLASS)),
+                class: CLASS,
+                region: mir::AllocationRegion::Temporary,
+            };
+            assert_eq!(
+                reason(&validate_raw(
+                    end_function(
+                        vec![to_string],
+                        vec![local(1, mir::Type::String), object_local(2)]
+                    ),
+                    vec![candidate(0, 0, 1, vec![0])]
+                )),
+                Reason::StringBarrier
+            );
+        }
+
+        #[test]
+        fn hidden_collection_and_builder_backing_growth_inside_span_is_rejected() {
+            let list_type = mir::Type::List(Box::new(mir::Type::Int));
+            let list_add = mir::Instruction::ListAdd {
+                list: copy(1, list_type.clone()),
+                value: mir::Operand {
+                    type_: mir::Type::Int,
+                    kind: mir::OperandKind::Constant(mir::Constant::Integer("1".to_owned())),
+                },
+            };
+            let report = validate_raw(
+                end_function(
+                    vec![
+                        mir::Instruction::AllocateList {
+                            destination: mir::Place::Local(mir::LocalId(1)),
+                            element_type: mir::Type::Int,
+                            region: mir::AllocationRegion::Temporary,
+                        },
+                        temporary_object(2),
+                        list_add,
+                        observe_object(2),
+                    ],
+                    vec![local(1, list_type), object_local(2)],
+                ),
+                vec![candidate(0, 1, 4, vec![1])],
+            );
+            assert_eq!(reason(&report), Reason::CollectionBarrier);
+
+            let dictionary_type =
+                mir::Type::Dictionary(Box::new(mir::Type::Int), Box::new(mir::Type::Int));
+            for mutation in [
+                mir::Instruction::DictionaryAdd {
+                    destination: mir::Place::Local(SINK),
+                    dictionary: copy(1, dictionary_type.clone()),
+                    key: mir::Operand {
+                        type_: mir::Type::Int,
+                        kind: mir::OperandKind::Constant(mir::Constant::Integer("1".to_owned())),
+                    },
+                    value: mir::Operand {
+                        type_: mir::Type::Int,
+                        kind: mir::OperandKind::Constant(mir::Constant::Integer("2".to_owned())),
+                    },
+                },
+                mir::Instruction::DictionarySet {
+                    destination: mir::Place::Local(SINK),
+                    dictionary: copy(1, dictionary_type.clone()),
+                    key: mir::Operand {
+                        type_: mir::Type::Int,
+                        kind: mir::OperandKind::Constant(mir::Constant::Integer("1".to_owned())),
+                    },
+                    value: mir::Operand {
+                        type_: mir::Type::Int,
+                        kind: mir::OperandKind::Constant(mir::Constant::Integer("3".to_owned())),
+                    },
+                },
+            ] {
+                let report = validate_raw(
+                    end_function(
+                        vec![
+                            mir::Instruction::AllocateDictionary {
+                                destination: mir::Place::Local(mir::LocalId(1)),
+                                key_type: mir::Type::Int,
+                                value_type: mir::Type::Int,
+                                region: mir::AllocationRegion::Temporary,
+                            },
+                            temporary_object(2),
+                            mutation,
+                            observe_object(2),
+                        ],
+                        vec![local(1, dictionary_type.clone()), object_local(2)],
+                    ),
+                    vec![candidate(0, 1, 4, vec![1])],
+                );
+                assert_eq!(reason(&report), Reason::CollectionBarrier);
+            }
+
+            let append = mir::Instruction::StringBuilderAppend {
+                builder: copy(1, mir::Type::Class(CLASS)),
+                value: mir::Operand {
+                    type_: mir::Type::String,
+                    kind: mir::OperandKind::Constant(mir::Constant::String("x".to_owned())),
+                },
+                class: CLASS,
+            };
+            let report = validate_raw(
+                end_function(
+                    vec![
+                        mir::Instruction::AllocateStringBuilder {
+                            destination: mir::Place::Local(mir::LocalId(1)),
+                            class: CLASS,
+                            region: mir::AllocationRegion::Temporary,
+                        },
+                        temporary_object(2),
+                        append,
+                        observe_object(2),
+                    ],
+                    vec![object_local(1), object_local(2)],
+                ),
+                vec![candidate(0, 1, 4, vec![1])],
+            );
+            assert_eq!(reason(&report), Reason::StringBarrier);
+        }
+
+        #[test]
+        fn every_task_async_and_parallel_intrinsic_is_a_function_barrier() {
+            let intrinsics = [
+                mir::Intrinsic::TaskRun,
+                mir::Intrinsic::TaskWait,
+                mir::Intrinsic::AsyncSpawn,
+                mir::Intrinsic::AsyncState,
+                mir::Intrinsic::AsyncSetState,
+                mir::Intrinsic::AsyncStoreSlot,
+                mir::Intrinsic::AsyncLoadSlot,
+                mir::Intrinsic::AsyncSpawnInner,
+                mir::Intrinsic::AsyncAwaitResult,
+                mir::Intrinsic::AsyncSetResult,
+                mir::Intrinsic::ParallelFor,
+                mir::Intrinsic::ParallelForEach,
+                mir::Intrinsic::ParallelReduce,
+            ];
+            for intrinsic in intrinsics {
+                let boundary = mir::Instruction::CallIntrinsic {
+                    destination: None,
+                    intrinsic,
+                    arguments: Vec::new(),
+                    return_type: mir::Type::Void,
+                };
+                let report = validate_raw(
+                    end_function(
+                        vec![temporary_object(1), observe_object(1), boundary],
+                        vec![object_local(1)],
+                    ),
+                    vec![candidate(0, 0, 2, vec![0])],
+                );
+                assert_eq!(reason(&report), Reason::ConcurrencyBarrier, "{intrinsic:?}");
+            }
+        }
+
+        #[test]
+        fn exact_orchestration_refreshes_liveness_and_same_local_is_never_resurrected() {
+            let mut module = end_function(
+                vec![allocate_object(1), observe_object(1), unrelated()],
+                vec![object_local(1)],
+            );
+            escape_analysis::assign_allocation_regions(&mut module);
+            let first = analyze_plan_and_validate_candidate_subregions(&mut module);
+            assert_eq!(first.validation.validated[0].rewind, point(2));
+
+            module.functions[0].blocks[0].instructions.swap(1, 2);
+            let second = analyze_plan_and_validate_candidate_subregions(&mut module);
+            assert_eq!(second.validation.validated[0].rewind, point(3));
+
+            let (_, ambiguous) = prepare_research(end_function(
+                vec![
+                    allocate_object(1),
+                    observe_object(1),
+                    allocate_object(1),
+                    observe_object(1),
+                ],
+                vec![object_local(1)],
+            ));
+            assert!(ambiguous.validation.validated.is_empty());
+            assert!(ambiguous.validation.rejected.is_empty());
+        }
     }
 }

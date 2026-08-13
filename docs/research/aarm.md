@@ -786,10 +786,72 @@ change to the existing function-level Temporary checkpoint.
 normal candidate plan: empty
 simple straight-line research planner: implemented
 branch/loop/multi-path placement: not implemented
-candidate execution validation: not implemented
+conservative 5C proof validation: implemented, not executable
 runtime checkpoint ABI: not implemented
 early arena rewind: not implemented
 generated ASTER behavior changed: NO
+```
+
+## AARM-5C conservative Temporary subregion validation
+
+AARM-5C keeps reference death, candidate placement, and rewind validation as three distinct
+concepts. One research-only orchestration analyzes the exact immutable MIR snapshot once with
+AARM-5A, plans AARM-5B candidates from that report, validates those exact local plans, and only
+then attaches the descriptive candidate metadata to MIR. The validator does not rerun escape,
+alias, or liveness analysis, and there is no separately pairable MIR/report API through which a
+stale report could be presented. Normal compilation invokes none of this work.
+
+Validated results remain compiler-owned proof artifacts rather than a second mutable authority in
+`mir::Function`. The deterministic validation report contains accepted subregions and rejected
+candidates with a compact reason. Validation does not mutate candidates. A validated artifact is
+still not executable: the MIR contains no checkpoint/rewind instruction, Cranelift continues to
+reject every non-empty candidate list, and the runtime ABI and current function-level Temporary
+scope are unchanged.
+
+The initial accepted subset is intentionally narrow:
+
+- exactly one basic block entered directly and ending in `Return` or `End`;
+- one same-block rewind point per candidate, with precise MIR boundary checks;
+- `AllocateObject` and `AllocateArray` Temporary sites only;
+- an exact AARM-5A reference-death proof for every listed allocation at the chosen rewind;
+- exact equality between the listed sites and every Temporary dynamic allocation in the half-open
+  checkpoint-to-rewind instruction span;
+- pairwise-disjoint validated intervals, with crossing, nested, and duplicate intervals rejected
+  symmetrically.
+
+The complete-span equality is the LIFO safety barrier. If A is allocated, then younger Temporary B
+is allocated before A's proposed rewind, an A-only candidate is rejected even when A is already
+reference-dead. This also covers B being allocated by the same instruction that performs A's final
+use. A Temporary value allocated before the checkpoint may remain live because rewinding to the
+newer checkpoint cannot cross its allocation. Persistent allocations in the interval are not
+counted as Temporary arena ownership and do not by themselves block validation; allocations at or
+after the rewind boundary have not yet occurred and are outside that rewind.
+
+For the first future execution slice, direct and interface calls inside the interval are barriers,
+as are runtime intrinsic calls. Task, async, and Parallel boundaries reject the function's
+candidates. List, Dictionary, StringBuilder, dynamic-string, and aggregate-producing intrinsic
+allocations remain deferred. All collection, builder, and string operations are conservatively
+barriers in the initial subset; growth-capable operations are the hidden-allocation safety reason
+this cannot yet be relaxed even when their owning header predates the checkpoint. These
+restrictions are deliberate conservatism, not new escape rules or source diagnostics.
+
+Early reuse could eventually reduce later fresh page growth while retaining already-governed arena
+capacity, but AARM-5C executes nothing. It does not change allocation ordering, side effects,
+MemoryGovernor limits, local execution ceilings, allocation-failure behavior, generated code, or
+runtime memory behavior. A future fine checkpoint also must not masquerade as a new semantic
+function scope: collection `birth_scope_depth` and promotion behavior remain hard AARM-5D/5F
+integration constraints.
+
+```text
+candidate -> conservative validation -> compiler-owned validated proof
+straight-line/single-block only: YES
+disjoint only: YES
+complete Temporary-span accounting: YES
+collection/string execution eligibility: NO
+Task/async/Parallel boundaries: REJECTED
+validated proof executed: NO
+runtime checkpoint ABI: NOT IMPLEMENTED
+early arena rewind: NOT IMPLEMENTED
 ```
 
 ## Measurement invariants
