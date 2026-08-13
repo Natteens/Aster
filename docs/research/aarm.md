@@ -1,13 +1,15 @@
 # Adaptive Region Memory (AARM)
 
-> **AARM status:** EXPERIMENTAL
-> **Production memory behavior:** UNCHANGED
+> **AARM status:** PRODUCTION V1 ENABLED FOR A CONSERVATIVE SUBSET
+> **Production memory behavior:** SELECTIVE ITERATION-LOCAL FINE RECLAIM
 > **Development branch:** `research/aarm`
 
-AARM is a staged research program for measuring and, only after separate evidence gates, evolving
-ASTER's region memory system. The current implementation remains the production authority. Nothing
-in this note should be read as a shipped governor, virtual-memory backend, purge policy, or finer
-lifetime model.
+AARM is a staged program for measuring and evolving ASTER's region memory system behind separate
+evidence gates. Normal compilation now enables the reviewed ProductionV1 fine-reclaim subset
+described in the AARM-6 section; other safe or ambiguous candidates retain ordinary function
+lifetime. Earlier phase sections intentionally preserve the state at each milestone, so statements
+that normal compilation did not yet invoke a phase are historical snapshots rather than current
+production truth.
 
 ## Current allocator architecture
 
@@ -1249,8 +1251,9 @@ The same immutable-string path also admits the self-contained Temporary Join,
 Substring(start), and Substring(start,length) producers. Console and filesystem
 host operations remain excluded.
 
-Normal ASTER compilation does not invoke this research lowering: production
-FineEnter/FineExit emission remains disabled pending the AARM-6 policy review.
+At the AARM-5F milestone, normal ASTER compilation did not yet invoke this
+lowering. AARM-6 subsequently enabled the reviewed ProductionV1 subset through
+the same safety authority, as documented below.
 
 Release-mode Windows evidence for a mixed builder/List/Dictionary loop (five
 timed repeats, median after the untimed correctness executions) was:
@@ -1262,7 +1265,8 @@ timed repeats, median after the untimed correctness executions) was:
 
 This is a favorable allocation-heavy workload, not a universal speed claim.
 Tiny-allocation measurements still show that checkpoint overhead can matter;
-no profitability threshold or production default is selected here.
+no profitability threshold or production default had been selected at this
+milestone.
 
 AARM-5E is complete for the current research scope: straight-line and acyclic
 CFGs, early exits, simple loops, break/continue, multiple latches, and nested
