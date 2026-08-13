@@ -1266,6 +1266,16 @@ mod tests {
         release_calls: AtomicUsize,
     }
 
+    #[cfg(feature = "aarm-telemetry")]
+    struct CountingVmPageBackend {
+        fail_discard: bool,
+        fail_restore: bool,
+        allocation_calls: AtomicUsize,
+        release_calls: AtomicUsize,
+        discard_calls: AtomicUsize,
+        restore_calls: AtomicUsize,
+    }
+
     struct RestoreFailingPageBackend;
 
     struct DiscardFailingPageBackend;
@@ -1338,6 +1348,20 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "aarm-telemetry")]
+    impl CountingVmPageBackend {
+        fn new(fail_discard: bool, fail_restore: bool) -> Self {
+            Self {
+                fail_discard,
+                fail_restore,
+                allocation_calls: AtomicUsize::new(0),
+                release_calls: AtomicUsize::new(0),
+                discard_calls: AtomicUsize::new(0),
+                restore_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
     impl PageBackend for CountingPageBackend {
         fn allocate_zeroed(
             &self,
@@ -1357,8 +1381,58 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "aarm-telemetry")]
+    impl PageBackend for CountingVmPageBackend {
+        fn allocate_zeroed(
+            &self,
+            capacity: usize,
+            alignment: usize,
+        ) -> Result<PageBacking, ArenaAllocError> {
+            self.allocation_calls.fetch_add(1, Ordering::Relaxed);
+            let mut backing = SYSTEM_ALLOCATOR_PAGE_BACKEND.allocate_zeroed(capacity, alignment)?;
+            backing.vm_allocation_size = Some(capacity);
+            Ok(backing)
+        }
+
+        fn release(&self, backing: PageBacking) {
+            self.release_calls.fetch_add(1, Ordering::Relaxed);
+            SYSTEM_ALLOCATOR_PAGE_BACKEND.release(backing);
+        }
+
+        fn discard(&self, _backing: &mut PageBacking) -> Result<(), ArenaAllocError> {
+            self.discard_calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail_discard {
+                Err(ArenaAllocError::OutOfMemory)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn prepare_for_reuse(&self, _backing: &mut PageBacking) -> Result<(), ArenaAllocError> {
+            self.restore_calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail_restore {
+                Err(ArenaAllocError::OutOfMemory)
+            } else {
+                Ok(())
+            }
+        }
+
+        #[cfg(feature = "aarm-telemetry")]
+        fn has_known_virtual_extent(&self) -> bool {
+            true
+        }
+    }
+
     fn test_backend(fail_allocations: bool) -> &'static CountingPageBackend {
         Box::leak(Box::new(CountingPageBackend::new(fail_allocations)))
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    fn test_vm_backend(fail_discard: bool, fail_restore: bool) -> &'static CountingVmPageBackend {
+        Box::leak(Box::new(CountingVmPageBackend::new(
+            fail_discard,
+            fail_restore,
+        )))
     }
 
     #[test]
@@ -1382,10 +1456,12 @@ mod tests {
         let used_before = arena.used_bytes;
         let capacity_before = arena.reserved_bytes;
         let governor_before = governor.telemetry();
-        assert_eq!(
-            arena.try_alloc(1, 1, MIN_PAGE_SIZE),
-            Err(ArenaAllocError::OutOfMemory)
-        );
+        for _ in 0..64 {
+            assert_eq!(
+                arena.try_alloc(1, 1, MIN_PAGE_SIZE),
+                Err(ArenaAllocError::OutOfMemory)
+            );
+        }
         assert_eq!(arena.active_pages, 0);
         assert_eq!(arena.used_bytes, used_before);
         assert_eq!(arena.reserved_bytes, capacity_before);
@@ -1402,10 +1478,12 @@ mod tests {
             .expect("fresh page allocation succeeds");
         arena.rewind(mark);
 
-        assert_eq!(
-            arena.discard_inactive_page_for_test(0),
-            Err(ArenaAllocError::OutOfMemory)
-        );
+        for _ in 0..64 {
+            assert_eq!(
+                arena.discard_inactive_page_for_test(0),
+                Err(ArenaAllocError::OutOfMemory)
+            );
+        }
         assert_eq!(arena.pages[0].backing_state(), PageBackingState::Retained);
         assert_eq!(arena.metrics().reserved_bytes, MIN_PAGE_SIZE);
     }
@@ -1435,6 +1513,265 @@ mod tests {
         assert_eq!(discarded.backing_retained_bytes, Some(0));
         assert_eq!(discarded.backing_discarded_bytes, Some(MIN_PAGE_SIZE));
         assert_eq!(discarded.peak_backing_retained_bytes, Some(MIN_PAGE_SIZE));
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    #[test]
+    fn mixed_inactive_vm_pages_restore_in_best_fit_order_and_release_once() {
+        let backend = test_vm_backend(false, false);
+        let total_capacity = MIN_PAGE_SIZE + (MIN_PAGE_SIZE * 2) + (MIN_PAGE_SIZE * 4);
+        let governor = Arc::new(MemoryGovernor::new(total_capacity));
+
+        {
+            let mut arena =
+                PagedArena::with_backend_and_memory_governor(backend, Arc::clone(&governor));
+            let mark = arena.mark();
+            let small = arena
+                .try_alloc(MIN_PAGE_SIZE, 1, total_capacity)
+                .expect("small page allocation succeeds");
+            let medium = arena
+                .try_alloc(MIN_PAGE_SIZE * 2, 1, total_capacity)
+                .expect("medium page allocation succeeds");
+            let large = arena
+                .try_alloc(MIN_PAGE_SIZE * 4, 1, total_capacity)
+                .expect("large page allocation succeeds");
+            arena.rewind(mark);
+            assert_eq!(arena.page_count(), 3);
+
+            assert_eq!(
+                arena
+                    .discard_inactive_page_for_test(0)
+                    .expect("small inactive page discards"),
+                small
+            );
+            assert_eq!(
+                arena
+                    .discard_inactive_page_for_test(2)
+                    .expect("large inactive page discards"),
+                large
+            );
+            let discarded = arena.telemetry_snapshot().expect("telemetry is enabled");
+            assert_eq!(discarded.virtual_extent_bytes, Some(total_capacity));
+            assert_eq!(discarded.backing_retained_bytes, Some(MIN_PAGE_SIZE * 2));
+            assert_eq!(
+                discarded.backing_discarded_bytes,
+                Some(MIN_PAGE_SIZE + (MIN_PAGE_SIZE * 4))
+            );
+
+            let allocation_calls = backend.allocation_calls.load(Ordering::Relaxed);
+            let grants = governor.telemetry().grant_events;
+            let reuse_mark = arena.mark();
+            let reused_small = arena
+                .try_alloc(MIN_PAGE_SIZE, 1, total_capacity)
+                .expect("smallest sufficient page restores first");
+            let reused_medium = arena
+                .try_alloc(MIN_PAGE_SIZE * 2, 1, total_capacity)
+                .expect("retained medium page reuses directly");
+            let reused_large = arena
+                .try_alloc(MIN_PAGE_SIZE * 4, 1, total_capacity)
+                .expect("discarded large page restores last");
+            assert_eq!(reused_small, small);
+            assert_eq!(reused_medium, medium);
+            assert_eq!(reused_large, large);
+            assert_eq!(
+                backend.allocation_calls.load(Ordering::Relaxed),
+                allocation_calls
+            );
+            assert_eq!(backend.restore_calls.load(Ordering::Relaxed), 2);
+            assert_eq!(governor.telemetry().grant_events, grants);
+            // SAFETY: every reused page was rewound before the test-only discard.
+            #[allow(unsafe_code)]
+            unsafe {
+                assert!(
+                    std::slice::from_raw_parts(reused_small, MIN_PAGE_SIZE)
+                        .iter()
+                        .all(|&byte| byte == 0)
+                );
+                assert!(
+                    std::slice::from_raw_parts(reused_medium, MIN_PAGE_SIZE * 2)
+                        .iter()
+                        .all(|&byte| byte == 0)
+                );
+                assert!(
+                    std::slice::from_raw_parts(reused_large, MIN_PAGE_SIZE * 4)
+                        .iter()
+                        .all(|&byte| byte == 0)
+                );
+            }
+
+            arena.rewind(reuse_mark);
+            arena
+                .discard_inactive_page_for_test(1)
+                .expect("mixed teardown keeps one discarded page");
+            let mixed = arena.telemetry_snapshot().expect("telemetry is enabled");
+            assert_eq!(mixed.virtual_extent_bytes, Some(total_capacity));
+            assert_eq!(mixed.backing_retained_bytes, Some(MIN_PAGE_SIZE * 5));
+            assert_eq!(mixed.backing_discarded_bytes, Some(MIN_PAGE_SIZE * 2));
+            assert_eq!(mixed.peak_backing_retained_bytes, Some(total_capacity));
+        }
+
+        let telemetry = governor.telemetry();
+        assert_eq!(backend.allocation_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(backend.release_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(telemetry.current_capacity_bytes, 0);
+        assert_eq!(telemetry.grant_events, telemetry.release_events);
+        assert_eq!(
+            telemetry.granted_bytes_cumulative,
+            telemetry.released_bytes_cumulative
+        );
+    }
+
+    #[cfg(all(feature = "aarm-telemetry", any(windows, target_os = "linux")))]
+    #[test]
+    fn native_vm_backing_repeated_discard_reuse_preserves_accounting_and_address() {
+        const TRANSITIONS: usize = 256;
+
+        let governor = Arc::new(MemoryGovernor::new(MIN_PAGE_SIZE));
+        let mut arena = PagedArena::with_memory_governor(Arc::clone(&governor));
+        let mark = arena.mark();
+        let base = arena
+            .try_alloc(64, 8, MIN_PAGE_SIZE)
+            .expect("fresh native VM page allocation succeeds");
+        arena.rewind(mark);
+        let initial = arena.telemetry_snapshot().expect("telemetry is enabled");
+        let virtual_extent = initial
+            .virtual_extent_bytes
+            .expect("native VM backend reports an extent");
+        assert_eq!(initial.backing_retained_bytes, Some(virtual_extent));
+        assert_eq!(initial.backing_discarded_bytes, Some(0));
+
+        for _ in 0..TRANSITIONS {
+            assert_eq!(
+                arena
+                    .discard_inactive_page_for_test(0)
+                    .expect("fully inactive native page discards"),
+                base
+            );
+            let discarded = arena.telemetry_snapshot().expect("telemetry is enabled");
+            assert_eq!(discarded.virtual_extent_bytes, Some(virtual_extent));
+            assert_eq!(discarded.backing_retained_bytes, Some(0));
+            assert_eq!(discarded.backing_discarded_bytes, Some(virtual_extent));
+            assert_eq!(discarded.peak_backing_retained_bytes, Some(virtual_extent));
+
+            let reuse_mark = arena.mark();
+            let reused = arena
+                .try_alloc(64, 8, MIN_PAGE_SIZE)
+                .expect("discarded native page restores before publication");
+            assert_eq!(reused, base);
+            // SAFETY: the restore path made the page retained before allocation.
+            #[allow(unsafe_code)]
+            let bytes = unsafe { std::slice::from_raw_parts(reused, 64) };
+            assert!(bytes.iter().all(|&byte| byte == 0));
+            let retained = arena.telemetry_snapshot().expect("telemetry is enabled");
+            assert_eq!(retained.virtual_extent_bytes, Some(virtual_extent));
+            assert_eq!(retained.backing_retained_bytes, Some(virtual_extent));
+            assert_eq!(retained.backing_discarded_bytes, Some(0));
+            assert_eq!(retained.peak_backing_retained_bytes, Some(virtual_extent));
+            assert_eq!(
+                governor.telemetry().current_capacity_bytes,
+                MIN_PAGE_SIZE as u64
+            );
+            arena.rewind(reuse_mark);
+        }
+
+        let before_drop = governor.telemetry();
+        assert_eq!(before_drop.current_capacity_bytes, MIN_PAGE_SIZE as u64);
+        assert_eq!(before_drop.grant_events, 1);
+        drop(arena);
+        let after_drop = governor.telemetry();
+        assert_eq!(after_drop.current_capacity_bytes, 0);
+        assert_eq!(after_drop.grant_events, after_drop.release_events);
+        assert_eq!(
+            after_drop.granted_bytes_cumulative,
+            after_drop.released_bytes_cumulative
+        );
+    }
+
+    #[cfg(all(feature = "aarm-telemetry", any(windows, target_os = "linux")))]
+    #[test]
+    fn native_vm_regular_and_oversized_pages_preserve_exact_logical_capacity() {
+        let page_sizes = [
+            MIN_PAGE_SIZE,
+            MIN_PAGE_SIZE * 2,
+            MIN_PAGE_SIZE * 4,
+            MIN_PAGE_SIZE * 8,
+            DEFAULT_PAGE_SIZE,
+            DEFAULT_PAGE_SIZE + 1,
+            96 * 1024,
+            (128 * 1024) + 7,
+        ];
+        let logical_capacity = page_sizes.iter().sum();
+        let governor = Arc::new(MemoryGovernor::new(logical_capacity));
+        let mut arena = PagedArena::with_memory_governor(Arc::clone(&governor));
+        let mark = arena.mark();
+        let bases = page_sizes
+            .into_iter()
+            .map(|size| {
+                arena
+                    .try_alloc(size, 1, logical_capacity)
+                    .expect("native VM page allocation succeeds")
+            })
+            .collect::<Vec<_>>();
+        arena.rewind(mark);
+
+        let retained = arena.telemetry_snapshot().expect("telemetry is enabled");
+        let virtual_extent = retained
+            .virtual_extent_bytes
+            .expect("native VM backend reports its extents");
+        assert_eq!(retained.capacity_bytes, logical_capacity);
+        assert!(virtual_extent >= logical_capacity);
+        assert_eq!(retained.backing_retained_bytes, Some(virtual_extent));
+        assert_eq!(retained.backing_discarded_bytes, Some(0));
+        assert_eq!(
+            governor.telemetry().current_capacity_bytes,
+            logical_capacity as u64
+        );
+
+        for (index, base) in bases.iter().copied().enumerate() {
+            assert_eq!(
+                arena
+                    .discard_inactive_page_for_test(index)
+                    .expect("fully inactive native page discards"),
+                base
+            );
+        }
+        let discarded = arena.telemetry_snapshot().expect("telemetry is enabled");
+        assert_eq!(discarded.capacity_bytes, logical_capacity);
+        assert_eq!(discarded.virtual_extent_bytes, Some(virtual_extent));
+        assert_eq!(discarded.backing_retained_bytes, Some(0));
+        assert_eq!(discarded.backing_discarded_bytes, Some(virtual_extent));
+        assert_eq!(discarded.peak_backing_retained_bytes, Some(virtual_extent));
+
+        for (index, size) in page_sizes.into_iter().enumerate() {
+            let reuse_mark = arena.mark();
+            let reused = arena
+                .try_alloc(size, 1, logical_capacity)
+                .expect("discarded native page restores at its original address");
+            assert_eq!(reused, bases[index]);
+            // SAFETY: the page restored before reuse and `size` is its exact logical capacity.
+            #[allow(unsafe_code)]
+            let bytes = unsafe { std::slice::from_raw_parts(reused, size) };
+            assert!(bytes.iter().all(|&byte| byte == 0));
+            arena.rewind(reuse_mark);
+        }
+
+        let restored = arena.telemetry_snapshot().expect("telemetry is enabled");
+        assert_eq!(restored.capacity_bytes, logical_capacity);
+        assert_eq!(restored.virtual_extent_bytes, Some(virtual_extent));
+        assert_eq!(restored.backing_retained_bytes, Some(virtual_extent));
+        assert_eq!(restored.backing_discarded_bytes, Some(0));
+        assert_eq!(restored.peak_backing_retained_bytes, Some(virtual_extent));
+        let before_drop = governor.telemetry();
+        assert_eq!(before_drop.grant_events, page_sizes.len() as u64);
+        assert_eq!(before_drop.current_capacity_bytes, logical_capacity as u64);
+        drop(arena);
+        let after_drop = governor.telemetry();
+        assert_eq!(after_drop.current_capacity_bytes, 0);
+        assert_eq!(after_drop.grant_events, after_drop.release_events);
+        assert_eq!(
+            after_drop.granted_bytes_cumulative,
+            after_drop.released_bytes_cumulative
+        );
     }
 
     #[cfg(feature = "aarm-telemetry")]

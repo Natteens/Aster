@@ -549,6 +549,20 @@ The research matrix schema is **10**. It serializes the four optional backing fi
 `null`, retains process RSS as a separate whole-process observation, and does not add backing state
 or VM work to active-page allocation or inactive retained-page reuse.
 
+## AARM-3E PageBackend integration and hardening
+
+AARM-3E closes the AARM-3 infrastructure validation pass without changing production allocation
+policy. Deterministic stress coverage exercises retained/discarded transitions, exact logical
+governor charging, regular geometric pages, modest oversized pages, best-fit inactive reuse,
+restore/discard failure atomicity, mixed retained/discarded teardown, and telemetry identities.
+The tests keep the critical boundary explicit: discarded pages are restored at their original base
+and return to **Retained** before publication, while a failed restore leaves the page inactive and
+discarded without a replacement backing allocation or a new governor grant.
+
+This validates PageBackend infrastructure only. Ordinary rewind still zeroes reclaimed bytes and
+retains all inactive backing. AARM-4 owns every production decision about automatic discard,
+purge eligibility, delay, hysteresis, and pressure response.
+
 ## Measurement invariants
 
 Every snapshot must satisfy:
@@ -596,7 +610,7 @@ and worker payloads are live when the platform supports it.
 
 `aarm_memory_matrix` is release-only and supports `small`, `medium`, and manual `large` scales. Its
 workloads cover tiny allocations, long-scope temporary retention, helper-scoped control, temporary
-burst and rewind, repeated burst/reuse, persistent retention, and isolated 1/4/16-context worker
+burst and rewind, repeated burst/reuse, persistent retention, and isolated 1/2/4/8/16-context worker
 shapes. AARM-2A extends it with paired governed/control tiny-allocation and page-growth cases,
 manually governed 1/4/16-context aggregates, shared-limit denial, and teardown/reuse. Default burst
 sizes are measured in tens of MiB or less; `large` must be selected explicitly. AARM-2B1 adds
@@ -651,7 +665,7 @@ AARM-1 observability
 -> AARM-3B Windows VirtualAlloc PageBackend
 -> AARM-3C Linux virtual-memory PageBackend
 -> AARM-3D page-state and reserve/backing telemetry
--> AARM-3E integration
+-> AARM-3E integration and hardening
 -> AARM-4 delayed purge/hysteresis
 -> AARM-5 MIR lifetime refinement
 -> AARM-6 integration/production decision

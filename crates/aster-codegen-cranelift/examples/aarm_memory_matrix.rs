@@ -147,7 +147,7 @@ fn run_matrix_with_budget(
         results.push(direct_burst_case(scale, 1));
         results.push(direct_burst_case(scale, 4));
         results.push(persistent_control_case(scale));
-        for workers in [1, 4, 16] {
+        for workers in [1, 2, 4, 8, 16] {
             results.push(worker_context_case(scale, workers));
         }
         results.push(direct_tiny_allocation_case(scale, false));

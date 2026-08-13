@@ -20,7 +20,7 @@ fn small_results() -> &'static [CaseResult] {
 #[test]
 fn small_matrix_covers_required_workload_shapes() {
     let results = small_results();
-    assert_eq!(results.len(), 117);
+    assert_eq!(results.len(), 119);
     for workload in [
         "tiny_allocations",
         "long_scope_temporary",
@@ -88,7 +88,7 @@ fn small_matrix_covers_required_workload_shapes() {
         .filter(|result| result.workload == "worker_contexts")
         .map(|result| result.workers.expect("worker result has a count"))
         .collect::<Vec<_>>();
-    assert_eq!(worker_counts, [1, 4, 16]);
+    assert_eq!(worker_counts, [1, 2, 4, 8, 16]);
 }
 
 #[test]
@@ -184,6 +184,19 @@ fn every_region_and_total_obey_allocator_invariants() {
                 region.page_count,
                 region.active_page_count + region.inactive_page_count
             );
+            match (
+                region.virtual_extent_bytes,
+                region.backing_retained_bytes,
+                region.backing_discarded_bytes,
+                region.peak_backing_retained_bytes,
+            ) {
+                (Some(virtual_extent), Some(retained), Some(discarded), Some(peak_retained)) => {
+                    assert_eq!(retained.checked_add(discarded), Some(virtual_extent));
+                    assert!(peak_retained >= retained);
+                }
+                (None, None, None, None) => {}
+                values => panic!("partial VM backing telemetry is invalid: {values:?}"),
+            }
         }
         assert_eq!(
             telemetry.total.live_used_bytes,
@@ -214,13 +227,6 @@ fn every_region_and_total_obey_allocator_invariants() {
                 telemetry.persistent.backing_discarded_bytes,
             )
         );
-        if let (Some(virtual_extent), Some(retained), Some(discarded)) = (
-            telemetry.total.virtual_extent_bytes,
-            telemetry.total.backing_retained_bytes,
-            telemetry.total.backing_discarded_bytes,
-        ) {
-            assert_eq!(virtual_extent, retained + discarded);
-        }
         if let Some(governor) = telemetry.governor {
             assert!(governor.current_capacity_bytes <= governor.hard_limit_bytes);
             assert!(governor.peak_capacity_bytes >= governor.current_capacity_bytes);
@@ -444,7 +450,7 @@ fn structured_output_contains_no_future_aarm_claims() {
     assert!(!json.contains("virtual_reserved_bytes"));
     assert!(!json.contains("committed_backing_bytes"));
     assert!(!json.contains("purge_events"));
-    assert_eq!(json.matches("\"workload\":").count(), 117);
+    assert_eq!(json.matches("\"workload\":").count(), 119);
 
     let explicit = aster_codegen_cranelift::resolve_aarm_explicit_budget(64 * 1024 * 1024)
         .expect("explicit budget resolves");
