@@ -31,6 +31,48 @@ pub struct AarmTemporarySubregionLoweringReport {
     pub exit_instructions_inserted: usize,
 }
 
+/// Deterministic, backend-neutral cost signals for one proven-safe AARM
+/// subregion. These are research evidence only; normal compilation does not
+/// consult them and automatic production lowering remains disabled.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AarmTemporarySubregionCostEstimate {
+    pub function: mir::SymbolId,
+    pub id: mir::TemporarySubregionId,
+    pub allocation_count: usize,
+    pub static_rewind_count: usize,
+    pub known_minimum_requested_bytes: u64,
+    pub has_unknown_sized_allocation: bool,
+    pub has_hidden_backing_owner: bool,
+}
+
+/// A pair of adjacent validated regions that can be represented by one
+/// checkpoint without weakening either lifetime proof. This is research-only
+/// input to profitability work; it does not mutate MIR.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AarmTemporarySubregionCoalescingOpportunity {
+    pub function: mir::SymbolId,
+    pub first: mir::TemporarySubregionId,
+    pub second: mir::TemporarySubregionId,
+    pub combined_allocation_count: usize,
+    pub eliminated_checkpoint_pairs: usize,
+}
+
+/// Research-only profitability selector applied after the complete AARM
+/// safety proof. Normal compilation never invokes either policy.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AarmTemporarySubregionProfitabilityPolicy {
+    /// Lower every proven-safe candidate. This preserves the raw research
+    /// behavior used by the AARM engineering and safety matrices.
+    AllSafe,
+    /// Lower only natural-loop candidates containing a fine-owned
+    /// `StringBuilder`, `List`, or `Dictionary` mutation that can grow hidden
+    /// backing storage. One-shot acyclic regions stay on function lifetime.
+    HiddenBackingGrowthLoop,
+}
+
 /// Controlled failure from the experimental AARM-5D MIR transformation.
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,6 +123,21 @@ struct FunctionCandidatePlan {
 pub fn lower_aarm_temporary_subregions_for_research(
     module: &mut mir::Module,
 ) -> Result<AarmTemporarySubregionLoweringReport, AarmTemporarySubregionLoweringError> {
+    lower_aarm_temporary_subregions_with_policy_for_research(
+        module,
+        AarmTemporarySubregionProfitabilityPolicy::AllSafe,
+    )
+}
+
+/// Opt in to AARM research lowering with a post-safety profitability policy.
+///
+/// The policy can only remove already-validated candidates. It cannot create
+/// candidates, weaken lifetime proof, or change backend/runtime authority.
+#[doc(hidden)]
+pub fn lower_aarm_temporary_subregions_with_policy_for_research(
+    module: &mut mir::Module,
+    policy: AarmTemporarySubregionProfitabilityPolicy,
+) -> Result<AarmTemporarySubregionLoweringReport, AarmTemporarySubregionLoweringError> {
     let mut analyzed = module.clone();
     if analyzed
         .functions
@@ -92,10 +149,299 @@ pub fn lower_aarm_temporary_subregions_for_research(
         ));
     }
     escape_analysis::assign_allocation_regions(&mut analyzed);
-    let analysis = analyze_plan_and_validate_candidate_subregions(&mut analyzed);
+    let mut analysis = analyze_plan_and_validate_candidate_subregions(&mut analyzed);
+    if policy == AarmTemporarySubregionProfitabilityPolicy::HiddenBackingGrowthLoop {
+        analysis.validation.validated.retain(|subregion| {
+            analyzed
+                .functions
+                .iter()
+                .find(|function| function.symbol == subregion.function)
+                .is_some_and(|function| {
+                    candidate_is_natural_loop(function, subregion)
+                        && candidate_contains_hidden_backing_growth(function, subregion)
+                })
+        });
+    }
     let (lowered, report) = lower_validated_exact_snapshot(&analyzed, &analysis.validation)?;
     *module = lowered;
     Ok(report)
+}
+
+fn candidate_is_natural_loop(
+    function: &mir::Function,
+    subregion: &validation::ValidatedTemporarySubregion,
+) -> bool {
+    subregion.checkpoint.instruction_boundary == 0
+        && natural_loops(function)
+            .iter()
+            .any(|loop_cfg| loop_cfg.body_entry == subregion.checkpoint.block)
+}
+
+fn candidate_contains_hidden_backing_growth(
+    function: &mir::Function,
+    subregion: &validation::ValidatedTemporarySubregion,
+) -> bool {
+    let Some((blocks, successors, _, _)) = cfg_parts(function) else {
+        return false;
+    };
+    let terminal_boundaries = subregion.rewinds.iter().fold(
+        HashMap::<mir::BasicBlockId, usize>::new(),
+        |mut boundaries, rewind| {
+            boundaries
+                .entry(rewind.block)
+                .and_modify(|boundary| *boundary = (*boundary).min(rewind.instruction_boundary))
+                .or_insert(rewind.instruction_boundary);
+            boundaries
+        },
+    );
+    let mut seen = HashSet::new();
+    let mut pending = vec![subregion.checkpoint.block];
+    while let Some(block_id) = pending.pop() {
+        if !seen.insert(block_id) {
+            continue;
+        }
+        let block = &function.blocks[blocks[&block_id]];
+        let start = if block_id == subregion.checkpoint.block {
+            subregion.checkpoint.instruction_boundary
+        } else {
+            0
+        };
+        let end = terminal_boundaries
+            .get(&block_id)
+            .copied()
+            .unwrap_or(block.instructions.len());
+        if start > end || end > block.instructions.len() {
+            return false;
+        }
+        if block.instructions[start..end]
+            .iter()
+            .any(hidden_backing_growth_instruction)
+        {
+            return true;
+        }
+        if terminal_boundaries.contains_key(&block_id) {
+            continue;
+        }
+        pending.extend(successors[&block_id].iter().rev().copied());
+    }
+    false
+}
+
+fn hidden_backing_growth_instruction(instruction: &mir::Instruction) -> bool {
+    matches!(
+        instruction,
+        mir::Instruction::StringBuilderAppend { .. }
+            | mir::Instruction::ListAdd { .. }
+            | mir::Instruction::DictionaryAdd { .. }
+            | mir::Instruction::DictionarySet { .. }
+    )
+}
+
+/// Analyze proven-safe AARM opportunities without enabling or lowering them.
+///
+/// This deliberately separates the existing safety authority from future
+/// profitability policy. Estimates use only exact MIR facts and never reject
+/// a safe candidate or authorize an unsafe one.
+#[doc(hidden)]
+pub fn estimate_aarm_temporary_subregion_costs_for_research(
+    module: &mir::Module,
+) -> Result<Vec<AarmTemporarySubregionCostEstimate>, AarmTemporarySubregionLoweringError> {
+    let mut analyzed = module.clone();
+    if analyzed
+        .functions
+        .iter()
+        .any(function_contains_executable_subregion_instruction)
+    {
+        return Err(AarmTemporarySubregionLoweringError::new(
+            "AARM cost estimation requires untransformed MIR",
+        ));
+    }
+    escape_analysis::assign_allocation_regions(&mut analyzed);
+    let analysis = validation::analyze_plan_validate_exact_snapshot(&analyzed);
+    analysis
+        .validation
+        .validated
+        .iter()
+        .map(|subregion| estimate_validated_subregion_cost(&analyzed, subregion))
+        .collect()
+}
+
+/// Find the deliberately narrow adjacent-region coalescing subset.
+///
+/// Both regions must be straight-line, the first rewind must be exactly the
+/// second checkpoint, and every first-region allocation must have an exact
+/// 5A death proof at the later rewind. No transformation is applied because
+/// the bounded peak-memory tradeoff remains a production-policy decision.
+#[doc(hidden)]
+pub fn estimate_aarm_coalescing_opportunities_for_research(
+    module: &mir::Module,
+) -> Result<Vec<AarmTemporarySubregionCoalescingOpportunity>, AarmTemporarySubregionLoweringError> {
+    let mut analyzed = module.clone();
+    if analyzed
+        .functions
+        .iter()
+        .any(function_contains_executable_subregion_instruction)
+    {
+        return Err(AarmTemporarySubregionLoweringError::new(
+            "AARM coalescing estimation requires untransformed MIR",
+        ));
+    }
+    escape_analysis::assign_allocation_regions(&mut analyzed);
+    let analysis = validation::analyze_plan_validate_exact_snapshot(&analyzed);
+    let proofs = analysis
+        .lifetime
+        .proofs
+        .iter()
+        .map(|proof| (proof.site, proof))
+        .collect::<HashMap<_, _>>();
+    let mut opportunities = Vec::new();
+    for pair in analysis.validation.validated.windows(2) {
+        let [first, second] = pair else {
+            continue;
+        };
+        let ([first_rewind], [second_rewind]) =
+            (first.rewinds.as_slice(), second.rewinds.as_slice())
+        else {
+            continue;
+        };
+        if first.function != second.function
+            || *first_rewind != second.checkpoint
+            || first.checkpoint.block != first_rewind.block
+            || second.checkpoint.block != second_rewind.block
+            || first
+                .allocations
+                .iter()
+                .any(|site| site.block != first_rewind.block)
+            || second
+                .allocations
+                .iter()
+                .any(|site| site.block != second_rewind.block)
+            || first.allocations.iter().any(|site| {
+                proofs
+                    .get(site)
+                    .is_none_or(|proof| !proof.dead_after.contains(second_rewind))
+            })
+        {
+            continue;
+        }
+        opportunities.push(AarmTemporarySubregionCoalescingOpportunity {
+            function: first.function,
+            first: first.id,
+            second: second.id,
+            combined_allocation_count: first.allocations.len() + second.allocations.len(),
+            eliminated_checkpoint_pairs: 1,
+        });
+    }
+    Ok(opportunities)
+}
+
+fn estimate_validated_subregion_cost(
+    module: &mir::Module,
+    subregion: &validation::ValidatedTemporarySubregion,
+) -> Result<AarmTemporarySubregionCostEstimate, AarmTemporarySubregionLoweringError> {
+    let function = module
+        .functions
+        .iter()
+        .find(|function| function.symbol == subregion.function)
+        .ok_or_else(|| {
+            AarmTemporarySubregionLoweringError::new(
+                "validated AARM cost candidate references an unknown function",
+            )
+        })?;
+    let mut known_minimum_requested_bytes = 0_u64;
+    let mut has_unknown_sized_allocation = false;
+    let mut has_hidden_backing_owner = false;
+    for site in &subregion.allocations {
+        let instruction = function
+            .blocks
+            .iter()
+            .find(|block| block.id == site.block)
+            .and_then(|block| block.instructions.get(site.instruction_index))
+            .ok_or_else(|| {
+                AarmTemporarySubregionLoweringError::new(
+                    "validated AARM cost candidate no longer matches its MIR snapshot",
+                )
+            })?;
+        match instruction_cost_signal(instruction) {
+            AllocationCostSignal::Known(bytes) => {
+                known_minimum_requested_bytes = known_minimum_requested_bytes
+                    .checked_add(bytes)
+                    .ok_or_else(|| {
+                        AarmTemporarySubregionLoweringError::new(
+                            "AARM cost estimate exceeds the addressable range",
+                        )
+                    })?;
+            }
+            AllocationCostSignal::Unknown => has_unknown_sized_allocation = true,
+            AllocationCostSignal::HiddenBacking => {
+                has_unknown_sized_allocation = true;
+                has_hidden_backing_owner = true;
+            }
+        }
+    }
+    Ok(AarmTemporarySubregionCostEstimate {
+        function: subregion.function,
+        id: subregion.id,
+        allocation_count: subregion.allocations.len(),
+        static_rewind_count: subregion.rewinds.len(),
+        known_minimum_requested_bytes,
+        has_unknown_sized_allocation,
+        has_hidden_backing_owner,
+    })
+}
+
+enum AllocationCostSignal {
+    Known(u64),
+    Unknown,
+    HiddenBacking,
+}
+
+fn instruction_cost_signal(instruction: &mir::Instruction) -> AllocationCostSignal {
+    match instruction {
+        mir::Instruction::AllocateArray {
+            element_type,
+            length,
+            ..
+        } => constant_nonnegative_integer(length)
+            .and_then(|length| {
+                mir_type_minimum_size(element_type).and_then(|size| length.checked_mul(size))
+            })
+            .map_or(AllocationCostSignal::Unknown, AllocationCostSignal::Known),
+        mir::Instruction::AllocateStringBuilder { .. }
+        | mir::Instruction::AllocateList { .. }
+        | mir::Instruction::AllocateDictionary { .. } => AllocationCostSignal::HiddenBacking,
+        mir::Instruction::StringBuilderToString { .. } | mir::Instruction::CallIntrinsic { .. } => {
+            AllocationCostSignal::Unknown
+        }
+        _ => AllocationCostSignal::Unknown,
+    }
+}
+
+fn constant_nonnegative_integer(operand: &mir::Operand) -> Option<u64> {
+    let mir::OperandKind::Constant(mir::Constant::Integer(value)) = &operand.kind else {
+        return None;
+    };
+    value.parse::<u64>().ok()
+}
+
+fn mir_type_minimum_size(type_: &mir::Type) -> Option<u64> {
+    match type_ {
+        mir::Type::Bool | mir::Type::SByte | mir::Type::Byte => Some(1),
+        mir::Type::Short | mir::Type::UShort | mir::Type::Char => Some(2),
+        mir::Type::Int | mir::Type::UInt | mir::Type::Float => Some(4),
+        mir::Type::Long
+        | mir::Type::ULong
+        | mir::Type::Double
+        | mir::Type::String
+        | mir::Type::Class(_)
+        | mir::Type::Interface(_)
+        | mir::Type::Array(_)
+        | mir::Type::List(_)
+        | mir::Type::Dictionary(_, _)
+        | mir::Type::Task(_) => Some(8),
+        mir::Type::Decimal => Some(16),
+        mir::Type::Void | mir::Type::User(_) | mir::Type::Enum(_) | mir::Type::Unknown => None,
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2163,6 +2509,339 @@ public int Main() {
                 .iter()
                 .all(|function| function.temporary_subregion_candidates.is_empty())
         );
+    }
+
+    #[test]
+    fn research_cost_estimates_separate_safety_from_profitability() {
+        let object_module = module(vec![function(
+            FUNCTION,
+            BLOCK.0,
+            vec![block(
+                BLOCK.0,
+                vec![temporary_object(1), observe_object(1), unrelated()],
+                mir::Terminator::End,
+            )],
+            vec![object_local(1)],
+        )]);
+        let object = estimate_aarm_temporary_subregion_costs_for_research(&object_module)
+            .expect("safe object candidate is costed");
+        assert_eq!(object.len(), 1);
+        assert_eq!(object[0].allocation_count, 1);
+        assert_eq!(object[0].static_rewind_count, 1);
+        assert_eq!(object[0].known_minimum_requested_bytes, 0);
+        assert!(object[0].has_unknown_sized_allocation);
+        assert!(!object[0].has_hidden_backing_owner);
+
+        let array_module = module(vec![function(
+            FUNCTION,
+            BLOCK.0,
+            vec![block(
+                BLOCK.0,
+                vec![mir::Instruction::AllocateArray {
+                    destination: mir::Place::Local(mir::LocalId(1)),
+                    element_type: mir::Type::Int,
+                    length: mir::Operand {
+                        type_: mir::Type::Int,
+                        kind: mir::OperandKind::Constant(mir::Constant::Integer("8".to_owned())),
+                    },
+                    requires_default: false,
+                    region: mir::AllocationRegion::Temporary,
+                }],
+                mir::Terminator::End,
+            )],
+            vec![local(1, mir::Type::Array(Box::new(mir::Type::Int)))],
+        )]);
+        let array = estimate_aarm_temporary_subregion_costs_for_research(&array_module)
+            .expect("constant array candidate is costed");
+        assert_eq!(array[0].known_minimum_requested_bytes, 32);
+        assert!(!array[0].has_unknown_sized_allocation);
+
+        let hidden = module(vec![function(
+            FUNCTION,
+            BLOCK.0,
+            vec![block(
+                BLOCK.0,
+                vec![mir::Instruction::AllocateStringBuilder {
+                    destination: mir::Place::Local(mir::LocalId(1)),
+                    class: CLASS,
+                    region: mir::AllocationRegion::Temporary,
+                }],
+                mir::Terminator::End,
+            )],
+            vec![object_local(1)],
+        )]);
+        let hidden = estimate_aarm_temporary_subregion_costs_for_research(&hidden)
+            .expect("safe hidden-backing candidate is costed");
+        assert_eq!(hidden.len(), 1);
+        assert!(hidden[0].has_unknown_sized_allocation);
+        assert!(hidden[0].has_hidden_backing_owner);
+
+        assert!(
+            object_module
+                .functions
+                .iter()
+                .all(|function| function.temporary_subregion_candidates.is_empty()),
+            "cost estimation must not publish or execute candidate metadata"
+        );
+    }
+
+    #[test]
+    fn research_coalescing_requires_adjacent_exact_lifetime_proofs() {
+        let sequential = module(vec![function(
+            FUNCTION,
+            BLOCK.0,
+            vec![block(
+                BLOCK.0,
+                vec![
+                    temporary_object(1),
+                    observe_object(1),
+                    temporary_object(2),
+                    observe_object(2),
+                ],
+                mir::Terminator::End,
+            )],
+            vec![object_local(1), object_local(2)],
+        )]);
+        let opportunities = estimate_aarm_coalescing_opportunities_for_research(&sequential)
+            .expect("adjacent safe regions can be analyzed");
+        assert_eq!(
+            opportunities,
+            vec![AarmTemporarySubregionCoalescingOpportunity {
+                function: FUNCTION,
+                first: mir::TemporarySubregionId(0),
+                second: mir::TemporarySubregionId(1),
+                combined_allocation_count: 2,
+                eliminated_checkpoint_pairs: 1,
+            }]
+        );
+
+        let separated = module(vec![function(
+            FUNCTION,
+            BLOCK.0,
+            vec![block(
+                BLOCK.0,
+                vec![
+                    temporary_object(1),
+                    observe_object(1),
+                    unrelated(),
+                    temporary_object(2),
+                    observe_object(2),
+                ],
+                mir::Terminator::End,
+            )],
+            vec![object_local(1), object_local(2)],
+        )]);
+        assert!(
+            estimate_aarm_coalescing_opportunities_for_research(&separated)
+                .expect("non-adjacent safe regions can be analyzed")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn hidden_backing_loop_policy_declines_tiny_and_acyclic_work() {
+        let mut tiny = module(vec![function(
+            FUNCTION,
+            BLOCK.0,
+            vec![block(
+                BLOCK.0,
+                vec![temporary_object(1), observe_object(1)],
+                mir::Terminator::End,
+            )],
+            vec![object_local(1)],
+        )]);
+        let tiny_report = lower_aarm_temporary_subregions_with_policy_for_research(
+            &mut tiny,
+            AarmTemporarySubregionProfitabilityPolicy::HiddenBackingGrowthLoop,
+        )
+        .expect("tiny safe work can be declined");
+        assert_eq!(tiny_report.subregions_lowered, 0);
+        assert!(
+            tiny.functions[0].blocks[0]
+                .instructions
+                .iter()
+                .all(|instruction| !matches!(
+                    instruction,
+                    mir::Instruction::TemporarySubregionEnter { .. }
+                        | mir::Instruction::TemporarySubregionExit { .. }
+                ))
+        );
+
+        let builder_instructions = vec![
+            mir::Instruction::AllocateStringBuilder {
+                destination: mir::Place::Local(mir::LocalId(1)),
+                class: CLASS,
+                region: mir::AllocationRegion::Temporary,
+            },
+            mir::Instruction::StringBuilderAppend {
+                builder: copy(1, mir::Type::Class(CLASS)),
+                value: mir::Operand {
+                    type_: mir::Type::String,
+                    kind: mir::OperandKind::Constant(mir::Constant::String("growth".to_owned())),
+                },
+                class: CLASS,
+            },
+        ];
+        let builder_function = || {
+            function(
+                FUNCTION,
+                BLOCK.0,
+                vec![block(
+                    BLOCK.0,
+                    builder_instructions.clone(),
+                    mir::Terminator::End,
+                )],
+                vec![object_local(1)],
+            )
+        };
+        let mut raw = module(vec![builder_function()]);
+        let raw_report = lower_aarm_temporary_subregions_for_research(&mut raw)
+            .expect("raw AARM lowers safe builder growth");
+        assert_eq!(raw_report.subregions_lowered, 1);
+
+        let mut selected = module(vec![builder_function()]);
+        let selected_report = lower_aarm_temporary_subregions_with_policy_for_research(
+            &mut selected,
+            AarmTemporarySubregionProfitabilityPolicy::HiddenBackingGrowthLoop,
+        )
+        .expect("one-shot hidden-backing work can be declined");
+        assert_eq!(selected_report.subregions_lowered, 0);
+
+        let mut header_only = module(vec![function(
+            FUNCTION,
+            BLOCK.0,
+            vec![block(
+                BLOCK.0,
+                vec![builder_instructions[0].clone()],
+                mir::Terminator::End,
+            )],
+            vec![object_local(1)],
+        )]);
+        let header_only_report = lower_aarm_temporary_subregions_with_policy_for_research(
+            &mut header_only,
+            AarmTemporarySubregionProfitabilityPolicy::HiddenBackingGrowthLoop,
+        )
+        .expect("an owner without a growth operation is declined");
+        assert_eq!(header_only_report.subregions_lowered, 0);
+    }
+
+    #[test]
+    fn hidden_backing_loop_policy_selects_proven_iteration_growth() {
+        let builder_allocation = mir::Instruction::AllocateStringBuilder {
+            destination: mir::Place::Local(mir::LocalId(1)),
+            class: CLASS,
+            region: mir::AllocationRegion::Temporary,
+        };
+        let builder_append = mir::Instruction::StringBuilderAppend {
+            builder: copy(1, mir::Type::Class(CLASS)),
+            value: mir::Operand {
+                type_: mir::Type::String,
+                kind: mir::OperandKind::Constant(mir::Constant::String("growth".to_owned())),
+            },
+            class: CLASS,
+        };
+        let loop_function = || {
+            function(
+                FUNCTION,
+                BLOCK.0,
+                vec![
+                    block(
+                        BLOCK.0,
+                        Vec::new(),
+                        mir::Terminator::Branch {
+                            condition: mir::Operand {
+                                type_: mir::Type::Bool,
+                                kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                            },
+                            then_block: mir::BasicBlockId(20),
+                            else_block: mir::BasicBlockId(40),
+                        },
+                    ),
+                    block(
+                        20,
+                        vec![
+                            temporary_object(2),
+                            observe_object(2),
+                            builder_allocation.clone(),
+                            builder_append.clone(),
+                        ],
+                        mir::Terminator::Goto(mir::BasicBlockId(30)),
+                    ),
+                    block(30, vec![unrelated()], mir::Terminator::Goto(BLOCK)),
+                    block(40, Vec::new(), mir::Terminator::End),
+                ],
+                vec![object_local(1), object_local(2)],
+            )
+        };
+        let mut raw = module(vec![loop_function()]);
+        let raw_report = lower_aarm_temporary_subregions_for_research(&mut raw)
+            .expect("raw AARM lowers safe loop growth");
+        assert_eq!(raw_report.subregions_lowered, 1);
+
+        let mut selected = module(vec![loop_function()]);
+        let selected_report = lower_aarm_temporary_subregions_with_policy_for_research(
+            &mut selected,
+            AarmTemporarySubregionProfitabilityPolicy::HiddenBackingGrowthLoop,
+        )
+        .expect("hidden-backing loop selector lowers proven growth");
+        assert_eq!(selected_report.subregions_lowered, 1);
+        assert_eq!(selected, raw);
+    }
+
+    #[test]
+    fn profitability_growth_classifier_is_deliberately_narrow() {
+        let list = mir::Operand {
+            type_: mir::Type::List(Box::new(mir::Type::Int)),
+            kind: mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(1))),
+        };
+        let dictionary = mir::Operand {
+            type_: mir::Type::Dictionary(Box::new(mir::Type::Int), Box::new(mir::Type::Int)),
+            kind: mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(2))),
+        };
+        let growth = [
+            mir::Instruction::StringBuilderAppend {
+                builder: copy(3, mir::Type::Class(CLASS)),
+                value: mir::Operand {
+                    type_: mir::Type::String,
+                    kind: mir::OperandKind::Constant(mir::Constant::String("x".to_owned())),
+                },
+                class: CLASS,
+            },
+            mir::Instruction::ListAdd {
+                list,
+                value: mir::Operand {
+                    type_: mir::Type::Int,
+                    kind: mir::OperandKind::Constant(mir::Constant::Integer("1".to_owned())),
+                },
+            },
+            mir::Instruction::DictionaryAdd {
+                destination: mir::Place::Local(SINK),
+                dictionary: dictionary.clone(),
+                key: mir::Operand {
+                    type_: mir::Type::Int,
+                    kind: mir::OperandKind::Constant(mir::Constant::Integer("1".to_owned())),
+                },
+                value: mir::Operand {
+                    type_: mir::Type::Int,
+                    kind: mir::OperandKind::Constant(mir::Constant::Integer("2".to_owned())),
+                },
+            },
+            mir::Instruction::DictionarySet {
+                destination: mir::Place::Local(SINK),
+                dictionary,
+                key: mir::Operand {
+                    type_: mir::Type::Int,
+                    kind: mir::OperandKind::Constant(mir::Constant::Integer("1".to_owned())),
+                },
+                value: mir::Operand {
+                    type_: mir::Type::Int,
+                    kind: mir::OperandKind::Constant(mir::Constant::Integer("3".to_owned())),
+                },
+            },
+        ];
+        assert!(growth.iter().all(hidden_backing_growth_instruction));
+        assert!(!hidden_backing_growth_instruction(&temporary_object(4)));
+        assert!(!hidden_backing_growth_instruction(&unrelated()));
     }
 
     mod temporary_subregion_validation {

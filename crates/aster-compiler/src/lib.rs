@@ -33,8 +33,12 @@ pub use project::{
 pub use standard_library::StandardLibrary;
 #[doc(hidden)]
 pub use temporary_subregions::{
+    AarmTemporarySubregionCoalescingOpportunity, AarmTemporarySubregionCostEstimate,
     AarmTemporarySubregionLoweringError, AarmTemporarySubregionLoweringReport,
+    AarmTemporarySubregionProfitabilityPolicy, estimate_aarm_coalescing_opportunities_for_research,
+    estimate_aarm_temporary_subregion_costs_for_research,
     lower_aarm_temporary_subregions_for_research,
+    lower_aarm_temporary_subregions_with_policy_for_research,
 };
 
 /// Compile a project using a custom standard library (e.g. loaded from an

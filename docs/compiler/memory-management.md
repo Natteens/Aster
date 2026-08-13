@@ -244,3 +244,20 @@ when its direct-local header is allocated after FineEnter and the existing
 escape/liveness proof shows the value dead on every FineExit path. Alias,
 pre-checkpoint, call, collection-snapshot, and concurrency shapes remain
 conservative.
+
+Production profitability is a separate decision from this safety proof. The
+research API can report deterministic candidate cost signals and exact
+adjacent coalescing opportunities without mutating MIR, but normal compilation
+does not consult them. Measurements show that tiny iteration checkpoints can
+cost more CPU than function-lifetime retention while hidden-backing loops can
+improve both time and memory substantially, so automatic production lowering
+remains disabled pending a reviewed workload-level policy.
+
+The current production-policy prototype is also research-only. It applies the
+unchanged safety proof first, then retains only natural-loop candidates that
+contain a fine-owned potentially-growing StringBuilder Append, List Add, or
+Dictionary Add/Set. Safe object, array, and immutable-string allocations share
+that checkpoint when they are already part of the selected candidate. Fixed-
+allocation-only loops and acyclic candidates remain on function lifetime. This
+is a deterministic compiler filter, not a runtime heuristic; it adds no
+allocation-path check and is not enabled by ordinary compilation.

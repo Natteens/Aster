@@ -1270,3 +1270,97 @@ leaf-loop reclaim are implemented. Simultaneous outer-and-inner fine reclaim
 and a nested fine-mark stack remain deliberately deferred because leaf reclaim
 already bounds the dominant inner-loop working set and current profiling does
 not justify the added checkpoint and runtime-state complexity.
+
+## AARM-6 production-performance research
+
+Automatic production lowering remains disabled. The compiler now exposes
+research-only, non-mutating cost evidence after the existing safety pipeline:
+allocation count, static rewind count, known constant array payload bytes,
+unknown-sized allocation presence, and hidden-backing owner presence. A
+separate research query identifies only adjacent straight-line candidates for
+which the earlier allocations have exact 5A death proofs at the later rewind.
+It does not coalesce them: the bounded peak-memory increase is a profitability
+decision, not a lifetime decision.
+
+Release measurements on Windows isolated the private checkpoint ABI at one
+million repetitions (seven samples, median):
+
+| Component | Telemetry off | Telemetry on |
+| --- | ---: | ---: |
+| Empty direct mark + rewind | 8.11 ns | 9.49 ns |
+| Empty FineEnter + FineExit ABI pair | 16.21 ns | 16.43 ns |
+| Same-page pair with a 32-byte allocation and zeroing | 32.17 ns | 34.84 ns |
+| Pair spanning an 8 KiB allocation | 173.20 ns | 153.20 ns |
+
+The common same-page allocator path already restores one cursor directly and
+zeros exactly the reclaimed range. No page walk occurs when the mark remains
+on the active page. Empty ABI dispatch is therefore the largest fixed part of
+a tiny checkpoint, while reclaimed-byte zeroing dominates larger regions.
+Zeroing remains required because reused arena storage must not expose stale
+data. No allocator fast-path, ABI, zeroing, or governor change was justified.
+
+The tiny-loop benchmark demonstrates why safety alone cannot select the
+production policy. At one million iterations, a four-byte object changed from
+11.57 ms and 8.0 MB peak to 45.79 ms and 4 bytes peak; a 32-byte array changed
+from 49.27 ms and 48.0 MB peak to 45.78 ms and 48 bytes peak; a small dynamic
+string changed from 119.13 ms and 16.0 MB peak to 137.30 ms and 10 bytes peak.
+Adding four or sixteen scalar operations per iteration did not hide the tiny
+object checkpoint cost (10.98/12.84 ms baseline versus 44.34/45.93 ms AARM).
+Checksums, source-requested bytes, and allocation counts matched.
+
+By contrast, the allocation-heavy builder/List/Dictionary workload retained
+the earlier approximately 18x speedup at 100K and 172x at 1M while holding the
+Temporary peak to 464 bytes. This distribution rules out unconditional safe
+lowering and does not support a single byte threshold: object size is not
+always statically known, hidden backing can grow dynamically, and array/string
+results cross over differently. Loop batching would require a new bounded
+multi-iteration lifetime proof; allocation elimination would require a typed
+scalar-replacement pass. Neither was introduced as incidental policy work.
+
+Application-style measurements support one deliberately narrow v1 selector,
+still exposed only through the research API. After the complete safety proof,
+it lowers a candidate only when the candidate is an iteration-local natural
+loop and contains a fine-owned StringBuilder Append, List Add, or Dictionary
+Add/Set. Those are the current MIR mutations that can grow hidden backing. The
+whole validated candidate is kept, so already-safe objects, arrays, and
+immutable strings in the same region share the checkpoint. Header allocation
+alone, read-only collection work, one-shot acyclic regions, and fixed-only
+object/array/string loops are declined. Normal ASTER compilation still never
+invokes the selector.
+
+The Windows release application matrix used five measured executions after a
+warmup at 100K iterations. Requested bytes, allocation counts, and checksums
+were identical in all three modes:
+
+| Workload | Baseline | Raw AARM | Selector | Baseline peak | Raw/selector peak | Selector |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Compute, 64 scalar ops/object | 5.43 ms | 7.31 ms | 5.55 ms | 800 KB | 4 B / 800 KB | decline |
+| Compute, 8 scalar ops/object | 3.89 ms | 5.54 ms | 3.85 ms | 800 KB | 4 B / 800 KB | decline |
+| Compute, 1 scalar op/object | 3.38 ms | 5.40 ms | 3.33 ms | 800 KB | 4 B / 800 KB | decline |
+| Entity object + small array | 21.73 ms | 8.66 ms | 21.15 ms | 5.60 MB | 56 B / 5.60 MB | decline |
+| Strings + growing builder | 310.81 ms | 55.14 ms | 54.52 ms | 24.0 MB | 237 B / 237 B | select |
+| List + Dictionary processing | 1416.08 ms | 109.55 ms | 109.42 ms | 116.8 MB | 1168 B / 1168 B | select |
+| Nested mixed allocation loop | 1099.15 ms | 82.69 ms | 82.40 ms | 62.4 MB | 624 B / 624 B | select leaf |
+| Frame-like repeated work | 1108.91 ms | 78.18 ms | 78.52 ms | 62.4 MB | 624 B / 624 B | select |
+| One-shot acyclic hidden backing | 1.38 ms | 1.60 ms | 1.45 ms | 624 B | 440 B / 624 B | decline |
+
+This policy avoids all dynamic fine regions in the compute/object cases and
+preserves the raw AARM region exactly in selected cases. It therefore retains
+the earlier 18x/172x hidden-backing benefit structurally rather than adding a
+second checkpoint around mixed fixed allocations. The entity result confirms
+that array opportunities remain: a short 1K version was slower with raw AARM,
+while the 100K form was much faster. Without a static trip-count authority,
+that scale dependence does not justify an array-only production rule yet.
+String-only loops remain similarly deferred because the one-million small
+string case regressed.
+
+The selector reuses the validated candidate and deterministic natural-loop
+topology. Its only additional work is one loop classification and one bounded
+candidate-region instruction scan; complete research lowering measured roughly
+0.14--0.68 ms in this matrix, with the filter itself below run-to-run noise.
+There is no runtime profiling, mutable global policy, allocation fast-path
+branch, or backend-specific analysis. Adjacent straight-region coalescing
+remains a non-mutating research query: loop planning already groups mixed work
+under one checkpoint, while the measured one-shot acyclic case provided no
+reason to extend lifetime or mutate MIR. Multi-iteration batching remains
+deferred because it would require a new bounded lifetime proof.

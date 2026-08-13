@@ -7815,6 +7815,109 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual release-only AARM checkpoint cost measurement"]
+    fn benchmark_fine_checkpoint_cost_components() {
+        use std::hint::black_box;
+
+        #[allow(clippy::cast_precision_loss)]
+        fn median_ns(mut samples: Vec<u128>, iterations: usize) -> f64 {
+            samples.sort_unstable();
+            samples[samples.len() / 2] as f64 / iterations as f64
+        }
+
+        fn measure(samples: usize, mut run: impl FnMut()) -> Vec<u128> {
+            (0..samples)
+                .map(|_| {
+                    let started = Instant::now();
+                    run();
+                    started.elapsed().as_nanos()
+                })
+                .collect()
+        }
+
+        const SAMPLES: usize = 7;
+        let iterations = std::env::var("ASTER_AARM_CHECKPOINT_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1_000_000);
+        let multi_page_iterations = (iterations / 1_000).max(1_000);
+
+        let baseline = median_ns(
+            measure(SAMPLES, || {
+                for index in 0..iterations {
+                    black_box(index);
+                }
+            }),
+            iterations,
+        );
+
+        let mut direct = ExecutionContext::new();
+        direct.enter_temporary_scope();
+        let direct_mark_rewind = median_ns(
+            measure(SAMPLES, || {
+                for _ in 0..iterations {
+                    let mark = direct.mark_temporary();
+                    direct.rewind_temporary(mark);
+                }
+            }),
+            iterations,
+        );
+        direct.leave_temporary_scope();
+
+        let mut abi = ExecutionContext::new();
+        let abi_pointer = &raw mut abi;
+        aster_rt_temporary_scope_enter(abi_pointer);
+        let abi_empty = median_ns(
+            measure(SAMPLES, || {
+                for _ in 0..iterations {
+                    aster_rt_temporary_subregion_enter(black_box(abi_pointer));
+                    aster_rt_temporary_subregion_exit(black_box(abi_pointer));
+                }
+            }),
+            iterations,
+        );
+        aster_rt_temporary_scope_leave(abi_pointer);
+
+        let mut same_page = ExecutionContext::new();
+        let same_page_pointer = &raw mut same_page;
+        aster_rt_temporary_scope_enter(same_page_pointer);
+        let same_page_32 = median_ns(
+            measure(SAMPLES, || {
+                for _ in 0..iterations {
+                    aster_rt_temporary_subregion_enter(same_page_pointer);
+                    black_box(aster_rt_object_new_temporary(same_page_pointer, 32));
+                    aster_rt_temporary_subregion_exit(same_page_pointer);
+                }
+            }),
+            iterations,
+        );
+        aster_rt_temporary_scope_leave(same_page_pointer);
+
+        let mut multi_page = ExecutionContext::new();
+        let multi_page_pointer = &raw mut multi_page;
+        aster_rt_temporary_scope_enter(multi_page_pointer);
+        let multi_page_8192 = median_ns(
+            measure(SAMPLES, || {
+                for _ in 0..multi_page_iterations {
+                    aster_rt_temporary_subregion_enter(multi_page_pointer);
+                    black_box(aster_rt_object_new_temporary(
+                        multi_page_pointer,
+                        i32::try_from(MIN_PAGE_SIZE * 2).expect("benchmark size fits i32"),
+                    ));
+                    aster_rt_temporary_subregion_exit(multi_page_pointer);
+                }
+            }),
+            multi_page_iterations,
+        );
+        aster_rt_temporary_scope_leave(multi_page_pointer);
+
+        println!(
+            "AARM checkpoint ns/iteration: baseline={baseline:.2} direct_mark_rewind={direct_mark_rewind:.2} abi_empty={abi_empty:.2} same_page_32={same_page_32:.2} multi_page_8192={multi_page_8192:.2} telemetry={}",
+            cfg!(feature = "aarm-telemetry")
+        );
+    }
+
+    #[test]
     fn fine_subregion_error_cleanup_preserves_first_error() {
         let mut preexisting = ExecutionContext::new();
         let pointer = &raw mut preexisting;
