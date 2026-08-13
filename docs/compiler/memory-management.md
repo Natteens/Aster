@@ -83,12 +83,14 @@ per function.
 
 ### AARM-5D research execution
 
-The explicit AARM research path can now transform only AARM-5C-validated, straight-line object and
-array subregions into backend-neutral `TemporarySubregionEnter` and `TemporarySubregionExit` MIR
-instructions. The transformation consumes the validated artifact from the exact immutable MIR
-snapshot, rebuilds instruction streams from original boundaries, and clears candidate metadata so
-the explicit instructions are the sole execution authority. Cranelift validates the frozen
-single-block, disjoint subset before mapping the pair to a private runtime checkpoint ABI.
+The explicit AARM research path can transform only AARM-5C-validated object and array subregions
+into backend-neutral `TemporarySubregionEnter` and `TemporarySubregionExit` MIR instructions. Its
+current experimental subset includes entry-reachable acyclic branches, joins, and early returns:
+one FineEnter may have several compiler-authorized, mutually-exclusive FineExit sites with the same
+ID. The transformation consumes the validated artifact from the exact immutable MIR snapshot,
+rebuilds instruction streams from original boundaries, and clears candidate metadata so the
+explicit instructions are the sole execution authority. Cranelift validates the same acyclic
+fine-state flow before mapping the pair to a private runtime checkpoint ABI.
 
 Fine exit rewinds the existing Temporary `PagedArena`: live used bytes fall to the checkpoint,
 reclaimed bytes retain the existing zeroing guarantee, and retained pages remain owned for reuse.
@@ -98,8 +100,8 @@ span runs fine cleanup before ordinary function cleanup.
 
 Ordinary `compile` does not run AARM-5A/5B/5C/5D orchestration and emits no fine instructions.
 Normal ASTER execution therefore still reclaims Temporary storage only at function-scope exit.
-Branching, loops, early returns, calls, concurrency, collections, builders, and dynamic strings
-remain outside the executable research subset; this is not production/default behavior.
+Loops/backedges, calls, concurrency, collections, builders, and dynamic strings remain outside the
+executable research subset; this is not production/default behavior.
 
 ## Collections and strings
 

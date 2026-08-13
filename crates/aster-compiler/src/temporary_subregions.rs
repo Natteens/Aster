@@ -118,22 +118,32 @@ fn lower_validated_exact_snapshot(
             .collect::<Vec<_>>();
 
         if !subregions.is_empty() {
-            let [block] = function.blocks.as_mut_slice() else {
-                return Err(AarmTemporarySubregionLoweringError::new(
-                    "validated AARM subregion no longer has one basic block",
-                ));
-            };
-            let original = &block.instructions;
-            let mut previous_rewind = None;
+            let mut blocks = HashMap::new();
+            for (index, block) in function.blocks.iter().enumerate() {
+                if blocks.insert(block.id, index).is_some() {
+                    return Err(AarmTemporarySubregionLoweringError::new(
+                        "validated AARM subregion no longer has unique basic blocks",
+                    ));
+                }
+            }
             let mut ids = HashSet::new();
             for subregion in &subregions {
-                if subregion.checkpoint.block != block.id
-                    || subregion.rewind.block != block.id
-                    || subregion.checkpoint.instruction_boundary
-                        >= subregion.rewind.instruction_boundary
-                    || subregion.rewind.instruction_boundary > original.len()
-                    || previous_rewind
-                        .is_some_and(|rewind| rewind > subregion.checkpoint.instruction_boundary)
+                let Some(&checkpoint_index) = blocks.get(&subregion.checkpoint.block) else {
+                    return Err(AarmTemporarySubregionLoweringError::new(
+                        "validated AARM subregion no longer matches its MIR snapshot",
+                    ));
+                };
+                if subregion.checkpoint.instruction_boundary
+                    > function.blocks[checkpoint_index].instructions.len()
+                    || subregion.rewinds.is_empty()
+                    || subregion.rewinds.first() != Some(&subregion.rewind)
+                    || subregion.rewinds.iter().any(|rewind| {
+                        blocks.get(&rewind.block).is_none_or(|index| {
+                            let block = &function.blocks[*index];
+                            rewind.instruction_boundary == 0
+                                || rewind.instruction_boundary > block.instructions.len()
+                        })
+                    })
                     || !ids.insert(subregion.id)
                     || !function
                         .temporary_subregion_candidates
@@ -141,16 +151,19 @@ fn lower_validated_exact_snapshot(
                         .any(|candidate| {
                             candidate.id == subregion.id
                                 && candidate.checkpoint == subregion.checkpoint
-                                && candidate.rewinds.as_slice() == [subregion.rewind]
+                                && candidate.rewinds == subregion.rewinds
                                 && candidate.allocations == subregion.allocations
                         })
                     || subregion.allocations.iter().any(|site| {
                         site.function != function.symbol
-                            || site.block != block.id
-                            || site.instruction_index < subregion.checkpoint.instruction_boundary
-                            || site.instruction_index >= subregion.rewind.instruction_boundary
+                            || blocks.get(&site.block).is_none_or(|index| {
+                                let block = &function.blocks[*index];
+                                site.instruction_index >= block.instructions.len()
+                            })
                             || !matches!(
-                                original.get(site.instruction_index),
+                                function.blocks[blocks[&site.block]]
+                                    .instructions
+                                    .get(site.instruction_index),
                                 Some(
                                     mir::Instruction::AllocateObject {
                                         region: mir::AllocationRegion::Temporary,
@@ -167,40 +180,72 @@ fn lower_validated_exact_snapshot(
                         "validated AARM subregion no longer matches its MIR snapshot",
                     ));
                 }
-                previous_rewind = Some(subregion.rewind.instruction_boundary);
             }
 
-            let inserted = subregions.len().checked_mul(2).ok_or_else(|| {
+            let exits = subregions
+                .iter()
+                .try_fold(0_usize, |count, subregion| {
+                    count.checked_add(subregion.rewinds.len())
+                })
+                .ok_or_else(|| {
+                    AarmTemporarySubregionLoweringError::new(
+                        "AARM subregion instruction count exceeds the addressable range",
+                    )
+                })?;
+            let _inserted = subregions.len().checked_add(exits).ok_or_else(|| {
                 AarmTemporarySubregionLoweringError::new(
                     "AARM subregion instruction count exceeds the addressable range",
                 )
             })?;
-            let capacity = original.len().checked_add(inserted).ok_or_else(|| {
-                AarmTemporarySubregionLoweringError::new(
-                    "AARM subregion instruction count exceeds the addressable range",
-                )
-            })?;
-            let mut instructions = Vec::with_capacity(capacity);
-            for boundary in 0..=original.len() {
-                for subregion in &subregions {
-                    if subregion.rewind.instruction_boundary == boundary {
-                        instructions
-                            .push(mir::Instruction::TemporarySubregionExit { id: subregion.id });
-                        report.exit_instructions_inserted += 1;
+            for block in &mut function.blocks {
+                let original = &block.instructions;
+                let additional = subregions
+                    .iter()
+                    .filter(|subregion| subregion.checkpoint.block == block.id)
+                    .count()
+                    + subregions
+                        .iter()
+                        .map(|subregion| {
+                            subregion
+                                .rewinds
+                                .iter()
+                                .filter(|rewind| rewind.block == block.id)
+                                .count()
+                        })
+                        .sum::<usize>();
+                let capacity = original.len().checked_add(additional).ok_or_else(|| {
+                    AarmTemporarySubregionLoweringError::new(
+                        "AARM subregion instruction count exceeds the addressable range",
+                    )
+                })?;
+                let mut instructions = Vec::with_capacity(capacity);
+                for boundary in 0..=original.len() {
+                    for subregion in &subregions {
+                        if subregion.rewinds.iter().any(|rewind| {
+                            rewind.block == block.id && rewind.instruction_boundary == boundary
+                        }) {
+                            instructions.push(mir::Instruction::TemporarySubregionExit {
+                                id: subregion.id,
+                            });
+                            report.exit_instructions_inserted += 1;
+                        }
+                    }
+                    for subregion in &subregions {
+                        if subregion.checkpoint.block == block.id
+                            && subregion.checkpoint.instruction_boundary == boundary
+                        {
+                            instructions.push(mir::Instruction::TemporarySubregionEnter {
+                                id: subregion.id,
+                            });
+                            report.enter_instructions_inserted += 1;
+                        }
+                    }
+                    if let Some(instruction) = original.get(boundary) {
+                        instructions.push(instruction.clone());
                     }
                 }
-                for subregion in &subregions {
-                    if subregion.checkpoint.instruction_boundary == boundary {
-                        instructions
-                            .push(mir::Instruction::TemporarySubregionEnter { id: subregion.id });
-                        report.enter_instructions_inserted += 1;
-                    }
-                }
-                if let Some(instruction) = original.get(boundary) {
-                    instructions.push(instruction.clone());
-                }
+                block.instructions = instructions;
             }
-            block.instructions = instructions;
             report.subregions_lowered += subregions.len();
         }
         function.temporary_subregion_candidates.clear();
@@ -208,7 +253,7 @@ fn lower_validated_exact_snapshot(
 
     if report.subregions_lowered != report.validated_subregions_received
         || report.enter_instructions_inserted != report.subregions_lowered
-        || report.exit_instructions_inserted != report.subregions_lowered
+        || report.exit_instructions_inserted < report.subregions_lowered
     {
         return Err(AarmTemporarySubregionLoweringError::new(
             "validated AARM subregion references an unknown function",
@@ -358,6 +403,9 @@ fn plan_function(
     function: &mir::Function,
     lifetime: &LifetimeAnalysisReport,
 ) -> Vec<mir::TemporarySubregionCandidate> {
+    if function.blocks.len() != 1 {
+        return plan_acyclic_cfg_function(function, lifetime);
+    }
     let [block] = function.blocks.as_slice() else {
         return Vec::new();
     };
@@ -441,6 +489,401 @@ fn plan_function(
     } else {
         Vec::new()
     }
+}
+
+/// The deliberately small AARM-5E1 CFG model.  It only represents the
+/// entry-reachable, acyclic portion of a function; malformed or cyclic CFGs
+/// return `None` and are withheld from research planning.
+#[derive(Clone, Debug)]
+pub(super) struct AcyclicCfg {
+    pub(super) blocks: HashMap<mir::BasicBlockId, usize>,
+    pub(super) successors: HashMap<mir::BasicBlockId, Vec<mir::BasicBlockId>>,
+    pub(super) reachable: HashSet<mir::BasicBlockId>,
+    pub(super) topological: Vec<mir::BasicBlockId>,
+    dominators: HashMap<mir::BasicBlockId, HashSet<mir::BasicBlockId>>,
+    postdominators: HashMap<mir::BasicBlockId, HashSet<Option<mir::BasicBlockId>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImmediatePostdominator {
+    Block(mir::BasicBlockId),
+    FunctionExit,
+}
+
+impl AcyclicCfg {
+    fn block<'a>(&self, function: &'a mir::Function, id: mir::BasicBlockId) -> &'a mir::BasicBlock {
+        &function.blocks[self.blocks[&id]]
+    }
+
+    pub(super) fn dominates(&self, dominator: mir::BasicBlockId, block: mir::BasicBlockId) -> bool {
+        self.dominators
+            .get(&block)
+            .is_some_and(|set| set.contains(&dominator))
+    }
+
+    pub(super) fn reachable_from(&self, start: mir::BasicBlockId) -> HashSet<mir::BasicBlockId> {
+        let mut reached = HashSet::new();
+        let mut pending = vec![start];
+        while let Some(block) = pending.pop() {
+            if !self.reachable.contains(&block) || !reached.insert(block) {
+                continue;
+            }
+            pending.extend(self.successors[&block].iter().copied());
+        }
+        reached
+    }
+
+    pub(super) fn reachable_until(
+        &self,
+        start: mir::BasicBlockId,
+        stop: Option<mir::BasicBlockId>,
+    ) -> HashSet<mir::BasicBlockId> {
+        let mut reached = HashSet::new();
+        let mut pending = vec![start];
+        while let Some(block) = pending.pop() {
+            if Some(block) == stop || !self.reachable.contains(&block) || !reached.insert(block) {
+                continue;
+            }
+            pending.extend(self.successors[&block].iter().copied());
+        }
+        reached
+    }
+
+    fn immediate_postdominator(&self, block: mir::BasicBlockId) -> Option<ImmediatePostdominator> {
+        let postdominators = self.postdominators.get(&block)?;
+        let mut candidates = postdominators
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != Some(block))
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|candidate| candidate.map_or(u32::MAX, |id| id.0));
+        candidates
+            .into_iter()
+            .find_map(|candidate| match candidate {
+                None if postdominators.len() == 2 => Some(ImmediatePostdominator::FunctionExit),
+                Some(candidate) => postdominators
+                    .iter()
+                    .copied()
+                    .filter(|other| *other != Some(candidate) && *other != Some(block))
+                    .all(|other| self.postdominators[&candidate].contains(&other))
+                    .then_some(ImmediatePostdominator::Block(candidate)),
+                None => None,
+            })
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+pub(super) fn acyclic_cfg(function: &mir::Function) -> Option<AcyclicCfg> {
+    let mut blocks = HashMap::new();
+    for (index, block) in function.blocks.iter().enumerate() {
+        if blocks.insert(block.id, index).is_some() {
+            return None;
+        }
+    }
+    if !blocks.contains_key(&function.entry) {
+        return None;
+    }
+    let mut successors = HashMap::new();
+    for block in &function.blocks {
+        let targets = match block.terminator {
+            mir::Terminator::Goto(target) => vec![target],
+            mir::Terminator::Branch {
+                then_block,
+                else_block,
+                ..
+            } => vec![then_block, else_block],
+            mir::Terminator::Return(_) | mir::Terminator::End => Vec::new(),
+            mir::Terminator::Unreachable => return None,
+        };
+        if targets.iter().any(|target| !blocks.contains_key(target)) {
+            return None;
+        }
+        successors.insert(block.id, targets);
+    }
+    let mut reachable = HashSet::new();
+    let mut pending = vec![function.entry];
+    while let Some(block) = pending.pop() {
+        if !reachable.insert(block) {
+            continue;
+        }
+        pending.extend(successors[&block].iter().copied());
+    }
+    let mut incoming = HashMap::<mir::BasicBlockId, usize>::new();
+    for block in &reachable {
+        incoming.insert(*block, 0);
+    }
+    for block in &reachable {
+        for successor in &successors[block] {
+            if reachable.contains(successor) {
+                *incoming.get_mut(successor).expect("reachable successor") += 1;
+            }
+        }
+    }
+    let mut ready = incoming
+        .iter()
+        .filter_map(|(block, count)| (*count == 0).then_some(*block))
+        .collect::<Vec<_>>();
+    ready.sort_unstable_by_key(|block| block.0);
+    let mut topological = Vec::with_capacity(reachable.len());
+    while let Some(block) = ready.pop() {
+        topological.push(block);
+        for successor in &successors[&block] {
+            if !reachable.contains(successor) {
+                continue;
+            }
+            let count = incoming.get_mut(successor).expect("reachable successor");
+            *count -= 1;
+            if *count == 0 {
+                ready.push(*successor);
+            }
+        }
+        ready.sort_unstable_by_key(|block| std::cmp::Reverse(block.0));
+    }
+    if topological.len() != reachable.len() {
+        return None;
+    }
+
+    let all = reachable.clone();
+    let mut predecessors = HashMap::<mir::BasicBlockId, Vec<mir::BasicBlockId>>::new();
+    for block in &reachable {
+        predecessors.insert(*block, Vec::new());
+    }
+    for block in &reachable {
+        for successor in &successors[block] {
+            if reachable.contains(successor) {
+                predecessors
+                    .get_mut(successor)
+                    .expect("reachable successor")
+                    .push(*block);
+            }
+        }
+    }
+    let mut dominators = reachable
+        .iter()
+        .map(|block| {
+            (
+                *block,
+                if *block == function.entry {
+                    HashSet::from([*block])
+                } else {
+                    all.clone()
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    loop {
+        let mut changed = false;
+        for block in &topological {
+            if *block == function.entry {
+                continue;
+            }
+            let preds = &predecessors[block];
+            let mut next = preds
+                .iter()
+                .map(|pred| dominators[pred].clone())
+                .reduce(|left, right| left.intersection(&right).copied().collect())
+                .unwrap_or_default();
+            next.insert(*block);
+            if next != dominators[block] {
+                dominators.insert(*block, next);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let virtual_exit = None;
+    let mut postdominators = reachable
+        .iter()
+        .map(|block| (*block, HashSet::from([Some(*block), virtual_exit])))
+        .collect::<HashMap<_, _>>();
+    loop {
+        let mut changed = false;
+        for block in topological.iter().rev() {
+            let next_nodes = if successors[block].is_empty() {
+                vec![virtual_exit]
+            } else {
+                successors[block].iter().copied().map(Some).collect()
+            };
+            let mut next = next_nodes
+                .iter()
+                .map(|successor| {
+                    successor
+                        .and_then(|id| postdominators.get(&id).cloned())
+                        .unwrap_or_else(|| HashSet::from([virtual_exit]))
+                })
+                .reduce(|left, right| left.intersection(&right).copied().collect())
+                .unwrap_or_else(|| HashSet::from([virtual_exit]));
+            next.insert(Some(*block));
+            if next != postdominators[block] {
+                postdominators.insert(*block, next);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Some(AcyclicCfg {
+        blocks,
+        successors,
+        reachable,
+        topological,
+        dominators,
+        postdominators,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn plan_acyclic_cfg_function(
+    function: &mir::Function,
+    lifetime: &LifetimeAnalysisReport,
+) -> Vec<mir::TemporarySubregionCandidate> {
+    if function_contains_concurrency_boundary(function)
+        || function_contains_executable_subregion_instruction(function)
+    {
+        return Vec::new();
+    }
+    let Some(cfg) = acyclic_cfg(function) else {
+        return Vec::new();
+    };
+    let proofs = lifetime
+        .proofs
+        .iter()
+        .filter(|proof| {
+            proof.site.function == function.symbol
+                && proof.region == mir::AllocationRegion::Temporary
+        })
+        .map(|proof| (proof.site, proof))
+        .collect::<HashMap<_, _>>();
+    let mut candidates = Vec::new();
+    for checkpoint_block in &cfg.topological {
+        let Some(join) = cfg.immediate_postdominator(*checkpoint_block) else {
+            continue;
+        };
+        let stop = match join {
+            ImmediatePostdominator::Block(block) => Some(block),
+            ImmediatePostdominator::FunctionExit => None,
+        };
+        let region = cfg.reachable_until(*checkpoint_block, stop);
+        let rewinds = match join {
+            ImmediatePostdominator::Block(join) => region
+                .iter()
+                .filter(|block| cfg.successors[block].contains(&join))
+                .map(|block| mir::MirPoint {
+                    block: *block,
+                    instruction_boundary: cfg.block(function, *block).instructions.len(),
+                })
+                .collect::<Vec<_>>(),
+            ImmediatePostdominator::FunctionExit => region
+                .iter()
+                .filter(|block| {
+                    matches!(
+                        cfg.block(function, **block).terminator,
+                        mir::Terminator::Return(_) | mir::Terminator::End
+                    )
+                })
+                .map(|block| mir::MirPoint {
+                    block: *block,
+                    instruction_boundary: cfg.block(function, *block).instructions.len(),
+                })
+                .collect::<Vec<_>>(),
+        };
+        if rewinds.is_empty() || rewinds.iter().any(|point| point.instruction_boundary == 0) {
+            continue;
+        }
+        let mut rewinds = rewinds;
+        rewinds.sort_unstable_by_key(|point| (point.block.0, point.instruction_boundary));
+        let mut allocations = region
+            .iter()
+            .flat_map(|block| {
+                cfg.block(function, *block)
+                    .instructions
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(instruction_index, instruction)| {
+                        (escape_analysis::dynamic_allocation_region(instruction)
+                            == Some(mir::AllocationRegion::Temporary))
+                        .then_some(mir::MirAllocationSite {
+                            function: function.symbol,
+                            block: *block,
+                            instruction_index,
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+        allocations.sort_unstable_by_key(|site| (site.block.0, site.instruction_index));
+        if allocations.is_empty()
+            || allocations
+                .iter()
+                .any(|site| !cfg.dominates(*checkpoint_block, site.block))
+        {
+            continue;
+        }
+        let proof_ok = allocations.iter().all(|site| {
+            let Some(proof) = proofs.get(site) else {
+                return false;
+            };
+            let reachable_from_site = cfg.reachable_from(site.block);
+            let exits = rewinds
+                .iter()
+                .filter(|point| reachable_from_site.contains(&point.block))
+                .collect::<Vec<_>>();
+            !exits.is_empty()
+                && exits
+                    .into_iter()
+                    .all(|point| proof.dead_after.contains(point))
+        });
+        if !proof_ok {
+            continue;
+        }
+        candidates.push(mir::TemporarySubregionCandidate {
+            id: mir::TemporarySubregionId(0),
+            checkpoint: mir::MirPoint {
+                block: *checkpoint_block,
+                instruction_boundary: 0,
+            },
+            rewinds,
+            allocations,
+        });
+    }
+    candidates.sort_unstable_by_key(|candidate| {
+        (
+            candidate.checkpoint.block.0,
+            candidate
+                .rewinds
+                .first()
+                .map(|point| (point.block.0, point.instruction_boundary)),
+            candidate.allocations.len(),
+        )
+    });
+    let mut used_blocks = HashSet::new();
+    let mut selected = Vec::new();
+    for candidate in candidates {
+        let join = cfg
+            .immediate_postdominator(candidate.checkpoint.block)
+            .and_then(|join| match join {
+                ImmediatePostdominator::Block(block) => Some(block),
+                ImmediatePostdominator::FunctionExit => None,
+            });
+        let region = cfg.reachable_until(candidate.checkpoint.block, join);
+        // The rewinds leave the region before their successor/join.  This is
+        // a conservative block-level disjointness test; it intentionally
+        // withholds ambiguous/nested candidates rather than nesting marks.
+        if region.iter().any(|block| used_blocks.contains(block)) {
+            continue;
+        }
+        used_blocks.extend(region);
+        selected.push(candidate);
+    }
+    for (index, candidate) in selected.iter_mut().enumerate() {
+        let Ok(id) = u32::try_from(index) else {
+            return Vec::new();
+        };
+        candidate.id = mir::TemporarySubregionId(id);
+    }
+    selected
 }
 
 fn function_contains_executable_subregion_instruction(function: &mir::Function) -> bool {
@@ -1251,6 +1694,7 @@ public int Main() {
                     id: mir::TemporarySubregionId(0),
                     checkpoint: point(0),
                     rewind: point(2),
+                    rewinds: vec![point(2)],
                     allocations: vec![site(0)],
                 }]
             );
@@ -1649,7 +2093,7 @@ public int Main() {
         }
 
         #[test]
-        fn branches_loops_early_returns_and_multiple_rewinds_are_unsupported() {
+        fn cycles_and_malformed_multiple_rewinds_are_unsupported() {
             let branch = function(
                 FUNCTION,
                 BLOCK.0,
@@ -1706,13 +2150,14 @@ public int Main() {
                 ],
                 vec![object_local(1)],
             );
-            assert_eq!(
-                reason(&validate_raw(
-                    module(vec![early_return]),
-                    vec![candidate(0, 0, 1, vec![0])]
-                )),
-                Reason::UnsupportedControlFlow
+            // AARM-5E1 now accepts the acyclic fallthrough-to-Return shape
+            // when the rewind is the proven predecessor boundary.
+            let report = validate_raw(
+                module(vec![early_return]),
+                vec![candidate(0, 0, 1, vec![0])],
             );
+            assert_eq!(report.validated.len(), 1);
+            assert!(report.rejected.is_empty());
 
             let mut multiple_rewinds = candidate(0, 0, 2, vec![0]);
             multiple_rewinds.rewinds.push(point(2));
@@ -2402,5 +2847,60 @@ public int Main() {
                 })
             })
         }));
+    }
+
+    #[test]
+    fn acyclic_diamond_plans_one_mark_with_mutually_exclusive_exits() {
+        let mut module = module(vec![function(
+            FUNCTION,
+            BLOCK.0,
+            vec![
+                block(
+                    BLOCK.0,
+                    Vec::new(),
+                    mir::Terminator::Branch {
+                        condition: mir::Operand {
+                            type_: mir::Type::Bool,
+                            kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                        },
+                        then_block: mir::BasicBlockId(20),
+                        else_block: mir::BasicBlockId(30),
+                    },
+                ),
+                block(
+                    20,
+                    vec![allocate_object(1), observe_object(1)],
+                    mir::Terminator::Goto(mir::BasicBlockId(40)),
+                ),
+                block(
+                    30,
+                    vec![allocate_object(2), observe_object(2)],
+                    mir::Terminator::Goto(mir::BasicBlockId(40)),
+                ),
+                block(40, vec![unrelated()], mir::Terminator::End),
+            ],
+            vec![object_local(1), object_local(2)],
+        )]);
+
+        let report = lower_aarm_temporary_subregions_for_research(&mut module)
+            .expect("acyclic diamond lowering succeeds");
+        assert_eq!(report.subregions_lowered, 1);
+        assert_eq!(report.enter_instructions_inserted, 1);
+        assert_eq!(report.exit_instructions_inserted, 2);
+        let blocks = &module.functions[0].blocks;
+        assert!(matches!(
+            blocks[0].instructions.first(),
+            Some(mir::Instruction::TemporarySubregionEnter {
+                id: mir::TemporarySubregionId(0)
+            })
+        ));
+        for block in [&blocks[1], &blocks[2]] {
+            assert!(matches!(
+                block.instructions.last(),
+                Some(mir::Instruction::TemporarySubregionExit {
+                    id: mir::TemporarySubregionId(0)
+                })
+            ));
+        }
     }
 }

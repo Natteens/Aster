@@ -1,7 +1,7 @@
 use super::{
     BackendError, Codegen, FuncId, FunctionBuilder, FunctionBuilderContext, FunctionState, HashMap,
-    InstBuilder, MemFlags, Module, StackSlotData, StackSlotKind, is_aggregate, mir, module_error,
-    types,
+    HashSet, InstBuilder, MemFlags, Module, StackSlotData, StackSlotKind, is_aggregate, mir,
+    module_error, types,
 };
 
 impl Codegen {
@@ -41,6 +41,10 @@ impl Codegen {
         let runtime_failure = builder.create_block();
         let fine_runtime_failure =
             function_contains_temporary_subregions(function).then(|| builder.create_block());
+        let fine_active_instructions = fine_runtime_failure
+            .is_some()
+            .then(|| fine_active_instruction_positions(function))
+            .transpose()?;
         let mut state = FunctionState {
             slots: HashMap::new(),
             execution_context: None,
@@ -113,19 +117,16 @@ impl Codegen {
                 );
                 builder.ins().call(function_ref, &[context]);
             }
-            for instruction in &block.instructions {
-                if matches!(instruction, mir::Instruction::TemporarySubregionExit { .. }) {
-                    state.runtime_failure = runtime_failure;
-                }
+            for (instruction_index, instruction) in block.instructions.iter().enumerate() {
+                state.runtime_failure = if fine_active_instructions
+                    .as_ref()
+                    .is_some_and(|positions| positions.contains(&(block.id, instruction_index)))
+                {
+                    fine_runtime_failure.expect("fine failure block exists")
+                } else {
+                    runtime_failure
+                };
                 self.translate_instruction(builder, instruction, function_ids, &state)?;
-                if matches!(
-                    instruction,
-                    mir::Instruction::TemporarySubregionEnter { .. }
-                ) {
-                    state.runtime_failure = fine_runtime_failure.ok_or_else(|| {
-                        BackendError::new("temporary subregion is missing its failure cleanup")
-                    })?;
-                }
             }
             self.translate_terminator(builder, &block.terminator, &blocks, &state)?;
         }
@@ -468,4 +469,68 @@ fn function_contains_temporary_subregions(function: &mir::Function) -> bool {
                     | mir::Instruction::TemporarySubregionExit { .. }
             )
         })
+}
+
+/// The backend validator has already established that executable subregions
+/// form an acyclic, balanced CFG.  Reconstruct the active state per original
+/// instruction so a generated allocation-failure edge uses the fine cleanup
+/// block on every branch, rather than relying on source/block Vec order.
+fn fine_active_instruction_positions(
+    function: &mir::Function,
+) -> Result<HashSet<(mir::BasicBlockId, usize)>, BackendError> {
+    let mut blocks = HashMap::new();
+    for (index, block) in function.blocks.iter().enumerate() {
+        if blocks.insert(block.id, index).is_some() {
+            return Err(BackendError::new(
+                "duplicate executable temporary-subregion block",
+            ));
+        }
+    }
+    let mut successors = HashMap::new();
+    for block in &function.blocks {
+        let targets = match block.terminator {
+            mir::Terminator::Goto(target) => vec![target],
+            mir::Terminator::Branch {
+                then_block,
+                else_block,
+                ..
+            } => vec![then_block, else_block],
+            mir::Terminator::Return(_) | mir::Terminator::End => Vec::new(),
+            mir::Terminator::Unreachable => {
+                return Err(BackendError::new(
+                    "unreachable executable temporary subregion",
+                ));
+            }
+        };
+        successors.insert(block.id, targets);
+    }
+    let mut state = HashMap::from([(function.entry, None)]);
+    let mut pending = vec![function.entry];
+    let mut positions = HashSet::new();
+    while let Some(block_id) = pending.pop() {
+        let mut active = state[&block_id];
+        let block = &function.blocks[blocks[&block_id]];
+        for (index, instruction) in block.instructions.iter().enumerate() {
+            match instruction {
+                mir::Instruction::TemporarySubregionEnter { id } => active = Some(*id),
+                mir::Instruction::TemporarySubregionExit { .. } => active = None,
+                _ if active.is_some() => {
+                    positions.insert((block_id, index));
+                }
+                _ => {}
+            }
+        }
+        for successor in &successors[&block_id] {
+            if let Some(previous) = state.insert(*successor, active) {
+                if previous != active {
+                    return Err(BackendError::new(
+                        "inconsistent executable temporary-subregion state",
+                    ));
+                }
+            } else {
+                pending.push(*successor);
+            }
+        }
+    }
+    Ok(positions)
 }

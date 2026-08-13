@@ -909,95 +909,207 @@ fn validate_executable_temporary_subregions(function: &mir::Function) -> Result<
         return Ok(());
     }
 
-    let [block] = function.blocks.as_slice() else {
-        return Err(unsupported(
-            &function.name,
-            "multi-block executable AARM temporary subregions",
-        ));
-    };
-    if function.entry != block.id
-        || !matches!(
-            block.terminator,
-            mir::Terminator::Return(_) | mir::Terminator::End
-        )
+    if function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .any(|instruction| {
+            matches!(
+                instruction,
+                mir::Instruction::CallIntrinsic { intrinsic, .. }
+                    if is_temporary_subregion_concurrency_intrinsic(*intrinsic)
+            )
+        })
     {
-        return Err(unsupported(
-            &function.name,
-            "branching executable AARM temporary subregions",
-        ));
-    }
-    if block.instructions.iter().any(|instruction| {
-        matches!(
-            instruction,
-            mir::Instruction::CallIntrinsic { intrinsic, .. }
-                if is_temporary_subregion_concurrency_intrinsic(*intrinsic)
-        )
-    }) {
         return Err(unsupported(
             &function.name,
             "concurrency in an executable AARM temporary subregion function",
         ));
     }
 
-    let mut active = None;
-    let mut entered = HashSet::new();
-    let mut active_temporary_allocations = 0_usize;
-    for instruction in &block.instructions {
-        match instruction {
-            mir::Instruction::TemporarySubregionEnter { id } => {
-                if active.is_some() || !entered.insert(*id) {
-                    return Err(unsupported(
-                        &function.name,
-                        "nested or duplicate executable AARM temporary subregion enter",
-                    ));
-                }
-                active = Some(*id);
-                active_temporary_allocations = 0;
-            }
-            mir::Instruction::TemporarySubregionExit { id } => {
-                if active != Some(*id) {
-                    return Err(unsupported(
-                        &function.name,
-                        "unmatched executable AARM temporary subregion exit",
-                    ));
-                }
-                if active_temporary_allocations == 0 {
-                    return Err(unsupported(
-                        &function.name,
-                        "executable AARM temporary subregion without a Temporary allocation",
-                    ));
-                }
-                active = None;
-            }
-            instruction if active.is_some() => {
-                if matches!(
-                    instruction,
-                    mir::Instruction::AllocateObject {
-                        region: mir::AllocationRegion::Temporary,
-                        ..
-                    } | mir::Instruction::AllocateArray {
-                        region: mir::AllocationRegion::Temporary,
-                        ..
-                    }
-                ) {
-                    active_temporary_allocations = active_temporary_allocations
-                        .checked_add(1)
-                        .ok_or_else(|| BackendError::new("too many Temporary allocations"))?;
-                }
-                if !temporary_subregion_instruction_is_executable(instruction) {
-                    return Err(unsupported(
-                        &function.name,
-                        "instruction inside an executable AARM temporary subregion",
-                    ));
-                }
-            }
-            _ => {}
+    validate_executable_temporary_subregion_cfg(function)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum FineState {
+    Inactive,
+    Active(mir::TemporarySubregionId),
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_executable_temporary_subregion_cfg(
+    function: &mir::Function,
+) -> Result<(), BackendError> {
+    let mut blocks = HashMap::new();
+    for (index, block) in function.blocks.iter().enumerate() {
+        if blocks.insert(block.id, index).is_some() {
+            return Err(unsupported(
+                &function.name,
+                "duplicate basic blocks in executable AARM temporary subregions",
+            ));
         }
     }
-    if active.is_some() {
+    if !blocks.contains_key(&function.entry) {
         return Err(unsupported(
             &function.name,
-            "executable AARM temporary subregion without an exit",
+            "missing executable AARM temporary subregion entry",
+        ));
+    }
+    let successors = function
+        .blocks
+        .iter()
+        .map(|block| {
+            let successors = match block.terminator {
+                mir::Terminator::Goto(target) => vec![target],
+                mir::Terminator::Branch {
+                    then_block,
+                    else_block,
+                    ..
+                } => vec![then_block, else_block],
+                mir::Terminator::Return(_) | mir::Terminator::End => Vec::new(),
+                mir::Terminator::Unreachable => return None,
+            };
+            successors
+                .iter()
+                .all(|target| blocks.contains_key(target))
+                .then_some((block.id, successors))
+        })
+        .collect::<Option<HashMap<_, _>>>()
+        .ok_or_else(|| {
+            unsupported(
+                &function.name,
+                "malformed executable AARM temporary subregion CFG",
+            )
+        })?;
+    let mut incoming = HashMap::new();
+    let mut reachable = HashSet::new();
+    let mut pending = vec![function.entry];
+    while let Some(block) = pending.pop() {
+        if !reachable.insert(block) {
+            continue;
+        }
+        pending.extend(successors[&block].iter().copied());
+    }
+    if reachable.len() != blocks.len() {
+        return Err(unsupported(
+            &function.name,
+            "unreachable executable AARM temporary subregion block",
+        ));
+    }
+    for block in &reachable {
+        incoming.insert(*block, 0_usize);
+    }
+    for block in &reachable {
+        for successor in &successors[block] {
+            if reachable.contains(successor) {
+                *incoming.get_mut(successor).expect("reachable successor") += 1;
+            }
+        }
+    }
+    let mut ready = incoming
+        .iter()
+        .filter_map(|(block, incoming)| (*incoming == 0).then_some(*block))
+        .collect::<Vec<_>>();
+    ready.sort_unstable_by_key(|block| std::cmp::Reverse(block.0));
+    let mut order = Vec::new();
+    while let Some(block) = ready.pop() {
+        order.push(block);
+        for successor in &successors[&block] {
+            if !reachable.contains(successor) {
+                continue;
+            }
+            let count = incoming.get_mut(successor).expect("reachable successor");
+            *count -= 1;
+            if *count == 0 {
+                ready.push(*successor);
+            }
+        }
+        ready.sort_unstable_by_key(|block| std::cmp::Reverse(block.0));
+    }
+    if order.len() != reachable.len() {
+        return Err(unsupported(
+            &function.name,
+            "cyclic executable AARM temporary subregions",
+        ));
+    }
+
+    let mut state = HashMap::from([(function.entry, FineState::Inactive)]);
+    let mut entered = HashSet::new();
+    let mut allocations = HashSet::new();
+    for block_id in order {
+        let mut current = state[&block_id];
+        let block = &function.blocks[blocks[&block_id]];
+        for instruction in &block.instructions {
+            match instruction {
+                mir::Instruction::TemporarySubregionEnter { id } => {
+                    if current != FineState::Inactive || !entered.insert(*id) {
+                        return Err(unsupported(
+                            &function.name,
+                            "nested or duplicate executable AARM temporary subregion enter",
+                        ));
+                    }
+                    current = FineState::Active(*id);
+                }
+                mir::Instruction::TemporarySubregionExit { id } => {
+                    if current != FineState::Active(*id) {
+                        return Err(unsupported(
+                            &function.name,
+                            "unmatched executable AARM temporary subregion exit",
+                        ));
+                    }
+                    current = FineState::Inactive;
+                }
+                instruction if current != FineState::Inactive => {
+                    if matches!(
+                        instruction,
+                        mir::Instruction::AllocateObject {
+                            region: mir::AllocationRegion::Temporary,
+                            ..
+                        } | mir::Instruction::AllocateArray {
+                            region: mir::AllocationRegion::Temporary,
+                            ..
+                        }
+                    ) {
+                        allocations.insert(current);
+                    }
+                    if !temporary_subregion_instruction_is_executable(instruction) {
+                        return Err(unsupported(
+                            &function.name,
+                            "instruction inside an executable AARM temporary subregion",
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if matches!(
+            block.terminator,
+            mir::Terminator::Return(_) | mir::Terminator::End
+        ) && current != FineState::Inactive
+        {
+            return Err(unsupported(
+                &function.name,
+                "Return or End with an active executable AARM temporary subregion",
+            ));
+        }
+        for successor in &successors[&block_id] {
+            if let Some(existing) = state.insert(*successor, current) {
+                if existing != current {
+                    return Err(unsupported(
+                        &function.name,
+                        "inconsistent executable AARM temporary subregion state at CFG join",
+                    ));
+                }
+            }
+        }
+    }
+    if entered
+        .iter()
+        .any(|id| !allocations.contains(&FineState::Active(*id)))
+    {
+        return Err(unsupported(
+            &function.name,
+            "executable AARM temporary subregion without a Temporary allocation",
         ));
     }
     Ok(())
@@ -3635,6 +3747,100 @@ mod tests {
                 .message()
                 .contains("does not yet support AARM temporary subregion candidates")
         );
+    }
+
+    fn executable_subregion_diamond(missing_else_exit: bool) -> mir::Module {
+        let array = mir::LocalId(0);
+        let allocate = || mir::Instruction::AllocateArray {
+            destination: mir::Place::Local(array),
+            element_type: mir::Type::Int,
+            length: mir::Operand {
+                type_: mir::Type::Int,
+                kind: mir::OperandKind::Constant(mir::Constant::Integer("1".to_owned())),
+            },
+            requires_default: false,
+            region: mir::AllocationRegion::Temporary,
+        };
+        mir::Module {
+            structs: Vec::new(),
+            classes: Vec::new(),
+            interfaces: Vec::new(),
+            enums: Vec::new(),
+            interface_implementations: Vec::new(),
+            functions: vec![mir::Function {
+                constructor: false,
+                symbol: mir::SymbolId(77),
+                owner: None,
+                name: "FineDiamond".to_owned(),
+                visibility: mir::Visibility::Public,
+                parameters: Vec::new(),
+                locals: vec![mir::Local {
+                    id: array,
+                    symbol: None,
+                    name: "array".to_owned(),
+                    type_: mir::Type::Array(Box::new(mir::Type::Int)),
+                    mutable: true,
+                    temporary: true,
+                }],
+                return_type: mir::Type::Void,
+                entry: mir::BasicBlockId(0),
+                temporary_subregion_candidates: Vec::new(),
+                blocks: vec![
+                    mir::BasicBlock {
+                        id: mir::BasicBlockId(0),
+                        instructions: vec![mir::Instruction::TemporarySubregionEnter {
+                            id: mir::TemporarySubregionId(0),
+                        }],
+                        terminator: mir::Terminator::Branch {
+                            condition: mir::Operand {
+                                type_: mir::Type::Bool,
+                                kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                            },
+                            then_block: mir::BasicBlockId(1),
+                            else_block: mir::BasicBlockId(2),
+                        },
+                    },
+                    mir::BasicBlock {
+                        id: mir::BasicBlockId(1),
+                        instructions: vec![
+                            allocate(),
+                            mir::Instruction::TemporarySubregionExit {
+                                id: mir::TemporarySubregionId(0),
+                            },
+                        ],
+                        terminator: mir::Terminator::Goto(mir::BasicBlockId(3)),
+                    },
+                    mir::BasicBlock {
+                        id: mir::BasicBlockId(2),
+                        instructions: if missing_else_exit {
+                            vec![allocate()]
+                        } else {
+                            vec![
+                                allocate(),
+                                mir::Instruction::TemporarySubregionExit {
+                                    id: mir::TemporarySubregionId(0),
+                                },
+                            ]
+                        },
+                        terminator: mir::Terminator::Goto(mir::BasicBlockId(3)),
+                    },
+                    mir::BasicBlock {
+                        id: mir::BasicBlockId(3),
+                        instructions: Vec::new(),
+                        terminator: mir::Terminator::Return(None),
+                    },
+                ],
+            }],
+        }
+    }
+
+    #[test]
+    fn executable_acyclic_diamond_requires_a_balanced_exit_on_every_path() {
+        validate_module(&executable_subregion_diamond(false))
+            .expect("balanced mutually-exclusive fine exits are valid");
+        let error = validate_module(&executable_subregion_diamond(true))
+            .expect_err("a branch which bypasses its fine exit must fail closed");
+        assert!(error.message().contains("inconsistent") || error.message().contains("active"));
     }
 
     #[test]

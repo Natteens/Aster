@@ -219,6 +219,219 @@ fn explicit_research_lowering_executes_array_reads_without_changing_default_comp
 }
 
 #[test]
+fn acyclic_diamond_executes_both_paths_with_one_dynamic_fine_exit() {
+    for (condition, expected) in [(true, 7), (false, 9)] {
+        let mut run = function(
+            RUN,
+            "Run",
+            mir::Visibility::Public,
+            vec![
+                local(0, "then_values", mir::Type::Array(Box::new(mir::Type::Int))),
+                local(1, "else_values", mir::Type::Array(Box::new(mir::Type::Int))),
+                local(2, "result", mir::Type::Int),
+            ],
+            mir::Type::Int,
+            Vec::new(),
+            Some(copy(2, mir::Type::Int)),
+        );
+        run.blocks = vec![
+            mir::BasicBlock {
+                id: mir::BasicBlockId(0),
+                instructions: Vec::new(),
+                terminator: mir::Terminator::Branch {
+                    condition: mir::Operand {
+                        type_: mir::Type::Bool,
+                        kind: mir::OperandKind::Constant(mir::Constant::Boolean(condition)),
+                    },
+                    then_block: mir::BasicBlockId(1),
+                    else_block: mir::BasicBlockId(2),
+                },
+            },
+            mir::BasicBlock {
+                id: mir::BasicBlockId(1),
+                instructions: vec![
+                    temporary_array(0, 8),
+                    assign(mir::Place::Local(mir::LocalId(2)), integer(7)),
+                ],
+                terminator: mir::Terminator::Goto(mir::BasicBlockId(3)),
+            },
+            mir::BasicBlock {
+                id: mir::BasicBlockId(2),
+                instructions: vec![
+                    temporary_array(1, 8),
+                    assign(mir::Place::Local(mir::LocalId(2)), integer(9)),
+                ],
+                terminator: mir::Terminator::Goto(mir::BasicBlockId(3)),
+            },
+            mir::BasicBlock {
+                id: mir::BasicBlockId(3),
+                instructions: Vec::new(),
+                terminator: mir::Terminator::Return(Some(copy(2, mir::Type::Int))),
+            },
+        ];
+        let baseline = module(vec![run]);
+        let baseline_result =
+            execute_with_stats(&baseline, "Run").expect("baseline diamond executes");
+        let mut lowered = baseline.clone();
+        let report = lower_aarm_temporary_subregions_for_research(&mut lowered)
+            .expect("acyclic diamond lowers");
+        assert_eq!(report.subregions_lowered, 1);
+        assert_eq!(report.enter_instructions_inserted, 1);
+        assert_eq!(report.exit_instructions_inserted, 2);
+        assert_eq!(marker_count(&lowered), 3);
+        let lowered_result = execute_with_stats(&lowered, "Run").expect("lowered diamond executes");
+        assert_eq!(baseline_result.0, ExecutionValue::Int(expected));
+        assert_eq!(lowered_result.0, baseline_result.0);
+    }
+}
+
+#[test]
+fn acyclic_early_returns_exit_the_active_fine_mark_on_each_path() {
+    for (condition, expected) in [(true, 11), (false, 13)] {
+        let mut run = function(
+            RUN,
+            "Run",
+            mir::Visibility::Public,
+            vec![
+                local(0, "then_values", mir::Type::Array(Box::new(mir::Type::Int))),
+                local(1, "else_values", mir::Type::Array(Box::new(mir::Type::Int))),
+            ],
+            mir::Type::Int,
+            Vec::new(),
+            None,
+        );
+        run.blocks = vec![
+            mir::BasicBlock {
+                id: mir::BasicBlockId(0),
+                instructions: Vec::new(),
+                terminator: mir::Terminator::Branch {
+                    condition: mir::Operand {
+                        type_: mir::Type::Bool,
+                        kind: mir::OperandKind::Constant(mir::Constant::Boolean(condition)),
+                    },
+                    then_block: mir::BasicBlockId(1),
+                    else_block: mir::BasicBlockId(2),
+                },
+            },
+            mir::BasicBlock {
+                id: mir::BasicBlockId(1),
+                instructions: vec![temporary_array(0, 8)],
+                terminator: mir::Terminator::Return(Some(integer(11))),
+            },
+            mir::BasicBlock {
+                id: mir::BasicBlockId(2),
+                instructions: vec![temporary_array(1, 8)],
+                terminator: mir::Terminator::Return(Some(integer(13))),
+            },
+        ];
+        let baseline = module(vec![run]);
+        let baseline_result =
+            execute_with_stats(&baseline, "Run").expect("baseline early return executes");
+        let mut lowered = baseline.clone();
+        let report = lower_aarm_temporary_subregions_for_research(&mut lowered)
+            .expect("early-return CFG lowers");
+        assert_eq!(
+            (
+                report.enter_instructions_inserted,
+                report.exit_instructions_inserted
+            ),
+            (1, 2)
+        );
+        let lowered_result =
+            execute_with_stats(&lowered, "Run").expect("lowered early return executes");
+        assert_eq!(baseline_result.0, ExecutionValue::Int(expected));
+        assert_eq!(lowered_result.0, baseline_result.0);
+    }
+}
+
+#[test]
+fn sequential_acyclic_diamonds_lower_to_disjoint_fine_regions() {
+    let mut run = function(
+        RUN,
+        "Run",
+        mir::Visibility::Public,
+        vec![
+            local(0, "a", mir::Type::Array(Box::new(mir::Type::Int))),
+            local(1, "b", mir::Type::Array(Box::new(mir::Type::Int))),
+            local(2, "c", mir::Type::Array(Box::new(mir::Type::Int))),
+            local(3, "d", mir::Type::Array(Box::new(mir::Type::Int))),
+        ],
+        mir::Type::Int,
+        Vec::new(),
+        Some(integer(42)),
+    );
+    run.blocks = vec![
+        mir::BasicBlock {
+            id: mir::BasicBlockId(0),
+            instructions: Vec::new(),
+            terminator: mir::Terminator::Branch {
+                condition: mir::Operand {
+                    type_: mir::Type::Bool,
+                    kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                },
+                then_block: mir::BasicBlockId(1),
+                else_block: mir::BasicBlockId(2),
+            },
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(1),
+            instructions: vec![temporary_array(0, 32)],
+            terminator: mir::Terminator::Goto(mir::BasicBlockId(3)),
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(2),
+            instructions: vec![temporary_array(1, 32)],
+            terminator: mir::Terminator::Goto(mir::BasicBlockId(3)),
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(3),
+            instructions: Vec::new(),
+            terminator: mir::Terminator::Branch {
+                condition: mir::Operand {
+                    type_: mir::Type::Bool,
+                    kind: mir::OperandKind::Constant(mir::Constant::Boolean(false)),
+                },
+                then_block: mir::BasicBlockId(4),
+                else_block: mir::BasicBlockId(5),
+            },
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(4),
+            instructions: vec![temporary_array(2, 32)],
+            terminator: mir::Terminator::Goto(mir::BasicBlockId(6)),
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(5),
+            instructions: vec![temporary_array(3, 32)],
+            terminator: mir::Terminator::Goto(mir::BasicBlockId(6)),
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(6),
+            instructions: Vec::new(),
+            terminator: mir::Terminator::Return(Some(integer(42))),
+        },
+    ];
+    let baseline = module(vec![run]);
+    let baseline_result = execute_with_stats(&baseline, "Run").expect("baseline executes");
+    let mut lowered = baseline.clone();
+    let report = lower_aarm_temporary_subregions_for_research(&mut lowered)
+        .expect("sequential diamonds lower");
+    assert_eq!(report.subregions_lowered, 2);
+    assert_eq!(
+        (
+            report.enter_instructions_inserted,
+            report.exit_instructions_inserted
+        ),
+        (2, 4)
+    );
+    let lowered_result =
+        execute_with_stats(&lowered, "Run").expect("lowered sequential diamonds execute");
+    assert_eq!(baseline_result.0, ExecutionValue::Int(42));
+    assert_eq!(lowered_result.0, baseline_result.0);
+    assert!(lowered_result.1.peak_used_bytes < baseline_result.1.peak_used_bytes);
+}
+
+#[test]
 fn immediate_death_object_subregion_executes_without_a_stale_read() {
     let mut module = module(vec![function(
         RUN,
@@ -859,16 +1072,8 @@ fn malformed_executable_subregions_fail_closed_before_codegen() {
     });
     cases.push(multi_block);
 
-    let mut different_blocks = valid();
-    different_blocks.functions[0].blocks[0].instructions.pop();
-    different_blocks.functions[0].blocks[0].terminator =
-        mir::Terminator::Goto(mir::BasicBlockId(1));
-    different_blocks.functions[0].blocks.push(mir::BasicBlock {
-        id: mir::BasicBlockId(1),
-        instructions: vec![exit(0)],
-        terminator: mir::Terminator::Return(Some(integer(42))),
-    });
-    cases.push(different_blocks);
+    // A balanced Exit in a successor block is a valid AARM-5E1 shape, so it
+    // intentionally is no longer listed among malformed single-block cases.
 
     let mut branch_around_exit = valid();
     branch_around_exit.functions[0].blocks[0].instructions.pop();

@@ -905,6 +905,41 @@ logical capacity/governor released at fine exit: NO
 function-level fallback scope retained: YES
 ```
 
+## AARM-5E1 acyclic CFG Temporary subregions
+
+AARM-5E1 extends the same exact research chain across entry-reachable acyclic control flow. The
+planner uses deterministic dominance for the checkpoint and deterministic post-dominance for the
+nearest common join. It prefers one common logical subregion with a single checkpoint and one
+rewind before every predecessor edge into that join. If the virtual function exit is the only
+post-dominator, it emits the minimal mutually-exclusive rewind set before reachable `Return` or
+`End` terminators. Each static exit carries the same subregion ID; one dynamic invocation executes
+exactly one of them.
+
+CFG span accounting includes every Temporary allocation reachable after the checkpoint and before
+an authorized exit on every branch. A listed allocation must be dominated by that checkpoint and
+must have an exact AARM-5A reference-death point at each reachable rewind. Older Temporary values
+remain outside the finer checkpoint; Persistent branch allocations remain valid because the rewind
+touches only the Temporary arena. The validator withholds candidates whenever this path-complete
+proof is unavailable.
+
+Cranelift independently propagates `FineInactive | FineActive(id)` through the acyclic MIR CFG.
+All incoming states at a join must agree, every `Return`/`End` must be inactive, and cycles,
+unreachable executable-marker functions, nesting, mismatched exits, and path bypasses fail closed.
+Generated allocation-failure edges use the same active-state map, so a failure on either branch
+executes fine cleanup before the outer function cleanup. Runtime remains CFG-blind and still owns
+at most one active fine mark.
+
+```text
+acyclic branches/joins/early returns: IMPLEMENTED (research-only)
+common join preference: YES
+path-specific mutually-exclusive exits: YES
+exactly-one dynamic rewind: REQUIRED
+loops/backedges: REJECTED
+nested fine marks: REJECTED
+calls/concurrency/collections/strings: REJECTED
+normal compiler invokes AARM-5E1: NO
+```
+
 ## Measurement invariants
 
 Every snapshot must satisfy:

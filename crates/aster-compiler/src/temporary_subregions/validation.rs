@@ -26,7 +26,10 @@ pub(super) struct ValidatedTemporarySubregion {
     pub function: mir::SymbolId,
     pub id: mir::TemporarySubregionId,
     pub checkpoint: mir::MirPoint,
+    /// First rewind retained for AARM-5D test compatibility. AARM-5E1 uses
+    /// the complete `rewinds` set below.
     pub rewind: mir::MirPoint,
+    pub rewinds: Vec<mir::MirPoint>,
     pub allocations: Vec<mir::MirAllocationSite>,
 }
 
@@ -136,7 +139,7 @@ fn validate_exact_snapshot(
 
     for (function, plan) in module.functions.iter().zip(plans) {
         let duplicate_ids = duplicate_candidate_ids(&plan.candidates);
-        let supported_function = supported_function_block(function);
+        let supported_function = supported_function(function);
         let has_concurrency = super::function_contains_concurrency_boundary(function);
 
         for candidate in &plan.candidates {
@@ -146,7 +149,11 @@ fn validate_exact_snapshot(
                 reason,
             };
 
-            if supported_function.is_none() || candidate.rewinds.len() != 1 {
+            if supported_function.is_none()
+                || candidate.rewinds.is_empty()
+                || matches!(&supported_function, Some(SupportedFunction::Straight(_)))
+                    && candidate.rewinds.len() != 1
+            {
                 report.rejected.push(rejected(
                     TemporarySubregionRejectionReason::UnsupportedControlFlow,
                 ));
@@ -159,8 +166,13 @@ fn validate_exact_snapshot(
                 continue;
             }
 
-            let block = supported_function.expect("checked above");
-            match validate_candidate(function, block, candidate, &proofs, has_concurrency) {
+            match validate_candidate(
+                function,
+                supported_function.as_ref().expect("checked above"),
+                candidate,
+                &proofs,
+                has_concurrency,
+            ) {
                 Ok(validated) => provisional.push(ProvisionalSubregion {
                     validated,
                     candidate: candidate.clone(),
@@ -259,25 +271,36 @@ fn duplicate_candidate_ids(
     duplicates
 }
 
-fn supported_function_block(function: &mir::Function) -> Option<&mir::BasicBlock> {
-    let [block] = function.blocks.as_slice() else {
-        return None;
-    };
-    (function.entry == block.id
-        && matches!(
-            block.terminator,
-            mir::Terminator::Return(_) | mir::Terminator::End
-        ))
-    .then_some(block)
+enum SupportedFunction<'a> {
+    Straight(&'a mir::BasicBlock),
+    Acyclic(Box<super::AcyclicCfg>),
+}
+
+fn supported_function(function: &mir::Function) -> Option<SupportedFunction<'_>> {
+    if let [block] = function.blocks.as_slice() {
+        return (function.entry == block.id
+            && matches!(
+                block.terminator,
+                mir::Terminator::Return(_) | mir::Terminator::End
+            ))
+        .then_some(SupportedFunction::Straight(block));
+    }
+    super::acyclic_cfg(function).map(|cfg| SupportedFunction::Acyclic(Box::new(cfg)))
 }
 
 fn validate_candidate(
     function: &mir::Function,
-    block: &mir::BasicBlock,
+    supported: &SupportedFunction<'_>,
     candidate: &mir::TemporarySubregionCandidate,
     proofs: &HashMap<mir::MirAllocationSite, &crate::lifetime_analysis::AllocationLifetimeProof>,
     has_concurrency: bool,
 ) -> Result<ValidatedTemporarySubregion, TemporarySubregionRejectionReason> {
+    if let SupportedFunction::Acyclic(cfg) = supported {
+        return validate_cfg_candidate(function, cfg, candidate, proofs, has_concurrency);
+    }
+    let SupportedFunction::Straight(block) = supported else {
+        unreachable!()
+    };
     let rewind = candidate.rewinds[0];
     if candidate.checkpoint.block != block.id
         || rewind.block != block.id
@@ -373,6 +396,145 @@ fn validate_candidate(
         id: candidate.id,
         checkpoint: candidate.checkpoint,
         rewind,
+        rewinds: vec![rewind],
+        allocations: candidate.allocations.clone(),
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_cfg_candidate(
+    function: &mir::Function,
+    cfg: &super::AcyclicCfg,
+    candidate: &mir::TemporarySubregionCandidate,
+    proofs: &HashMap<mir::MirAllocationSite, &crate::lifetime_analysis::AllocationLifetimeProof>,
+    has_concurrency: bool,
+) -> Result<ValidatedTemporarySubregion, TemporarySubregionRejectionReason> {
+    if candidate.checkpoint.instruction_boundary != 0
+        || !cfg.reachable.contains(&candidate.checkpoint.block)
+        || candidate.rewinds.iter().any(|rewind| {
+            !cfg.reachable.contains(&rewind.block)
+                || cfg.block(function, rewind.block).instructions.len()
+                    != rewind.instruction_boundary
+                || rewind.instruction_boundary == 0
+        })
+    {
+        return Err(TemporarySubregionRejectionReason::MalformedPoint);
+    }
+    let Some(join) = cfg.immediate_postdominator(candidate.checkpoint.block) else {
+        return Err(TemporarySubregionRejectionReason::UnsupportedControlFlow);
+    };
+    let stop = match join {
+        super::ImmediatePostdominator::Block(block) => Some(block),
+        super::ImmediatePostdominator::FunctionExit => None,
+    };
+    let region = cfg.reachable_until(candidate.checkpoint.block, stop);
+    let mut expected_rewinds = match join {
+        super::ImmediatePostdominator::Block(join) => region
+            .iter()
+            .filter(|block| cfg.successors[block].contains(&join))
+            .map(|block| mir::MirPoint {
+                block: *block,
+                instruction_boundary: cfg.block(function, *block).instructions.len(),
+            })
+            .collect::<Vec<_>>(),
+        super::ImmediatePostdominator::FunctionExit => region
+            .iter()
+            .filter(|block| {
+                matches!(
+                    cfg.block(function, **block).terminator,
+                    mir::Terminator::Return(_) | mir::Terminator::End
+                )
+            })
+            .map(|block| mir::MirPoint {
+                block: *block,
+                instruction_boundary: cfg.block(function, *block).instructions.len(),
+            })
+            .collect::<Vec<_>>(),
+    };
+    expected_rewinds.sort_unstable_by_key(|point| (point.block.0, point.instruction_boundary));
+    if candidate.rewinds != expected_rewinds || candidate.allocations.is_empty() {
+        return Err(TemporarySubregionRejectionReason::MalformedAllocationSite);
+    }
+    if has_concurrency {
+        return Err(TemporarySubregionRejectionReason::ConcurrencyBarrier);
+    }
+
+    let mut expected_sites = Vec::new();
+    for block in &cfg.topological {
+        if !region.contains(block) {
+            continue;
+        }
+        let block_ref = cfg.block(function, *block);
+        if let Some(reason) = span_barrier(&block_ref.instructions) {
+            return Err(reason);
+        }
+        for (instruction_index, instruction) in block_ref.instructions.iter().enumerate() {
+            if escape_analysis::dynamic_allocation_region(instruction)
+                == Some(mir::AllocationRegion::Temporary)
+            {
+                expected_sites.push(mir::MirAllocationSite {
+                    function: function.symbol,
+                    block: *block,
+                    instruction_index,
+                });
+            }
+        }
+    }
+    expected_sites.sort_unstable_by_key(|site| (site.block.0, site.instruction_index));
+    if candidate.allocations != expected_sites {
+        return Err(TemporarySubregionRejectionReason::UnaccountedTemporaryAllocation);
+    }
+    for site in &candidate.allocations {
+        if site.function != function.symbol
+            || !cfg.dominates(candidate.checkpoint.block, site.block)
+        {
+            return Err(TemporarySubregionRejectionReason::WrongFunction);
+        }
+        let Some(instruction) = cfg
+            .block(function, site.block)
+            .instructions
+            .get(site.instruction_index)
+        else {
+            return Err(TemporarySubregionRejectionReason::MalformedAllocationSite);
+        };
+        if escape_analysis::dynamic_allocation_region(instruction)
+            != Some(mir::AllocationRegion::Temporary)
+        {
+            return Err(TemporarySubregionRejectionReason::PersistentAllocation);
+        }
+        if allocation_form_barrier(instruction).is_some()
+            || !matches!(
+                instruction,
+                mir::Instruction::AllocateObject { .. } | mir::Instruction::AllocateArray { .. }
+            )
+        {
+            return Err(allocation_form_barrier(instruction)
+                .unwrap_or(TemporarySubregionRejectionReason::MalformedAllocationSite));
+        }
+        let Some(proof) = proofs.get(site) else {
+            return Err(TemporarySubregionRejectionReason::MissingReferenceDeathProof);
+        };
+        let reachable_from_site = cfg.reachable_from(site.block);
+        let exits = candidate
+            .rewinds
+            .iter()
+            .filter(|rewind| reachable_from_site.contains(&rewind.block))
+            .collect::<Vec<_>>();
+        if exits.is_empty()
+            || proof.region != mir::AllocationRegion::Temporary
+            || exits
+                .into_iter()
+                .any(|rewind| !proof.dead_after.contains(rewind))
+        {
+            return Err(TemporarySubregionRejectionReason::MissingReferenceDeathProof);
+        }
+    }
+    Ok(ValidatedTemporarySubregion {
+        function: function.symbol,
+        id: candidate.id,
+        checkpoint: candidate.checkpoint,
+        rewind: candidate.rewinds[0],
+        rewinds: candidate.rewinds.clone(),
         allocations: candidate.allocations.clone(),
     })
 }
@@ -639,9 +801,20 @@ fn intervals_overlap(
     right: &ValidatedTemporarySubregion,
 ) -> bool {
     left.function == right.function
-        && left.checkpoint.block == right.checkpoint.block
-        && left.checkpoint.instruction_boundary < right.rewind.instruction_boundary
-        && right.checkpoint.instruction_boundary < left.rewind.instruction_boundary
+        && if left.rewinds.len() == 1
+            && right.rewinds.len() == 1
+            && left.checkpoint.block == right.checkpoint.block
+            && left.rewinds[0].block == right.rewinds[0].block
+        {
+            left.checkpoint.instruction_boundary < right.rewinds[0].instruction_boundary
+                && right.checkpoint.instruction_boundary < left.rewinds[0].instruction_boundary
+        } else {
+            left.checkpoint == right.checkpoint
+                || left
+                    .allocations
+                    .iter()
+                    .any(|site| right.allocations.contains(site))
+        }
 }
 
 fn compare_site(left: &mir::MirAllocationSite, right: &mir::MirAllocationSite) -> Ordering {
@@ -694,7 +867,7 @@ fn compare_validated(
         .0
         .cmp(&right.function.0)
         .then_with(|| compare_point(&left.checkpoint, &right.checkpoint))
-        .then_with(|| compare_point(&left.rewind, &right.rewind))
+        .then_with(|| compare_points(&left.rewinds, &right.rewinds))
         .then_with(|| compare_sites(&left.allocations, &right.allocations))
         .then_with(|| left.id.0.cmp(&right.id.0))
 }
