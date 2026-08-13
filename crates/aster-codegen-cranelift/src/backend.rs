@@ -171,12 +171,31 @@ fn analyze_calls(
 }
 
 fn instruction_can_fail_without_calling_aster(instruction: &mir::Instruction) -> bool {
-    !matches!(
-        instruction,
+    match instruction {
         mir::Instruction::Assign { .. }
-            | mir::Instruction::Call { .. }
-            | mir::Instruction::CallInterface { .. }
-    )
+        | mir::Instruction::Call { .. }
+        | mir::Instruction::CallInterface { .. } => false,
+        mir::Instruction::TemporarySubregionEnter { .. }
+        | mir::Instruction::TemporarySubregionExit { .. }
+        | mir::Instruction::CallIntrinsic { .. }
+        | mir::Instruction::AllocateArray { .. }
+        | mir::Instruction::AllocateObject { .. }
+        | mir::Instruction::AllocateList { .. }
+        | mir::Instruction::AllocateDictionary { .. }
+        | mir::Instruction::AllocateStringBuilder { .. }
+        | mir::Instruction::StringBuilderAppend { .. }
+        | mir::Instruction::StringBuilderToString { .. }
+        | mir::Instruction::DictionaryAdd { .. }
+        | mir::Instruction::DictionarySet { .. }
+        | mir::Instruction::DictionaryTryGet { .. }
+        | mir::Instruction::DictionaryContainsKey { .. }
+        | mir::Instruction::DictionaryRemove { .. }
+        | mir::Instruction::DictionaryEntries { .. }
+        | mir::Instruction::ListAdd { .. }
+        | mir::Instruction::ListGet { .. }
+        | mir::Instruction::ListRemoveAt { .. }
+        | mir::Instruction::StringDecodeNext { .. } => true,
+    }
 }
 
 pub(super) fn module_error(error: impl fmt::Debug + fmt::Display) -> BackendError {

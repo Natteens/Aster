@@ -854,6 +854,57 @@ runtime checkpoint ABI: NOT IMPLEMENTED
 early arena rewind: NOT IMPLEMENTED
 ```
 
+## AARM-5D executable Temporary subregions
+
+AARM-5D adds one explicit, research-only path from the exact AARM-5C proof snapshot to real early
+Temporary reclaim:
+
+```text
+existing escape regions
+-> AARM-5A reference-death facts
+-> AARM-5B candidates
+-> AARM-5C validated subregions
+-> backend-neutral TemporarySubregionEnter / TemporarySubregionExit
+-> private runtime fine checkpoint / rewind
+```
+
+The transformation builds every new instruction stream from the original immutable boundaries and
+publishes the transformed MIR only after the complete module succeeds. At an adjacent boundary it
+emits the older exit before the next enter. Candidate metadata is cleared before backend validation,
+so it cannot become a second execution authority. Existing executable markers at the research
+entry are rejected rather than trusted. Escape and liveness analysis are not rerun after insertion.
+
+Cranelift performs structural validation, not escape or liveness inference. The initial executable
+subset remains one directly entered block ending in `Return` or `End`, disjoint non-nested pairs,
+one rewind per ID, and Temporary object/array allocations whose complete span was validated by
+AARM-5C. Calls, runtime intrinsics, concurrency, collection/builder/string operations, and
+unsupported assignment shapes remain rejected. Object-field and checked array-element access are
+supported within the validated object/array subset; controlled array-access errors still execute
+the explicit fine exit before ordinary function cleanup.
+
+The runtime stores at most one fine mark separately from the semantic function-scope mark stack.
+Fine enter requires an enclosing function Temporary scope. Fine exit rewinds the same
+`PagedArena`, preserves stable older pointers and zero-on-reuse, and does not release logical page
+capacity or governor ownership. Allocation failure takes a dedicated generated cleanup edge that
+rewinds the fine mark before leaving the outer function scope. Malformed enter/exit ordering is a
+controlled runtime or backend validation failure, never a raw mark crossing the ABI.
+
+This machinery is disabled by default. Ordinary compilation emits no fine instructions and retains
+the shipped function-level Temporary lifetime. No source syntax, language-level checkpoint API,
+production policy, loop/branch placement, collection/string proof, or concurrency behavior is
+introduced.
+
+```text
+validated 5C subset -> explicit MIR -> private runtime rewind: IMPLEMENTED
+normal compiler invokes AARM-5D: NO
+single-block straight-line only: YES
+object/array only: YES
+nested/crossing fine subregions: NO
+calls/concurrency/collections/strings: REJECTED
+logical capacity/governor released at fine exit: NO
+function-level fallback scope retained: YES
+```
+
 ## Measurement invariants
 
 Every snapshot must satisfy:

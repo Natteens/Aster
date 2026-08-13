@@ -31,6 +31,11 @@ pub use project::{
     compile_project, fetch_dependencies,
 };
 pub use standard_library::StandardLibrary;
+#[doc(hidden)]
+pub use temporary_subregions::{
+    AarmTemporarySubregionLoweringError, AarmTemporarySubregionLoweringReport,
+    lower_aarm_temporary_subregions_for_research,
+};
 
 /// Compile a project using a custom standard library (e.g. loaded from an
 /// installed location via [`StandardLibrary::from_path`]).

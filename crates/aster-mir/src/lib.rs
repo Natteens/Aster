@@ -172,6 +172,20 @@ pub enum AllocationRegion {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Instruction {
+    /// Enter one compiler-authorized fine-grained Temporary arena subregion.
+    ///
+    /// This instruction is backend-neutral and has no local uses, local
+    /// definitions, allocation, or escape effect. Only the experimental AARM
+    /// compiler orchestration may insert it after validating the exact MIR
+    /// snapshot being transformed.
+    TemporarySubregionEnter {
+        id: TemporarySubregionId,
+    },
+    /// Exit the matching compiler-authorized fine-grained Temporary arena
+    /// subregion and rewind its Temporary arena checkpoint.
+    TemporarySubregionExit {
+        id: TemporarySubregionId,
+    },
     Assign {
         target: Place,
         value: Rvalue,

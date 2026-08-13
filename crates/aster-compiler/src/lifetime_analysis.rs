@@ -425,6 +425,8 @@ fn instruction_access(
 ) -> Option<Access> {
     let mut access = Access::empty(locals.len());
     match instruction {
+        mir::Instruction::TemporarySubregionEnter { .. }
+        | mir::Instruction::TemporarySubregionExit { .. } => {}
         mir::Instruction::Assign { target, value } => {
             read_rvalue(value, locals, &mut access.uses)?;
             write_place(target, true, locals, &mut access)?;

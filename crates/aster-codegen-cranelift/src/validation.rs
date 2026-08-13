@@ -593,6 +593,7 @@ fn validate_function(
             "AARM temporary subregion candidates",
         ));
     }
+    validate_executable_temporary_subregions(function)?;
     if function
         .owner
         .is_some_and(|owner| !classes.contains(&owner))
@@ -671,6 +672,8 @@ fn validate_instruction(
     implementations: &HashSet<(mir::SymbolId, mir::SymbolId)>,
 ) -> Result<(), BackendError> {
     match instruction {
+        mir::Instruction::TemporarySubregionEnter { .. }
+        | mir::Instruction::TemporarySubregionExit { .. } => Ok(()),
         mir::Instruction::Assign { target, value } => {
             validate_assign(target, value, function_name, locals, implementations)
         }
@@ -887,6 +890,300 @@ fn validate_instruction(
             locals,
         ),
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_executable_temporary_subregions(function: &mir::Function) -> Result<(), BackendError> {
+    let contains_subregion = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .any(|instruction| {
+            matches!(
+                instruction,
+                mir::Instruction::TemporarySubregionEnter { .. }
+                    | mir::Instruction::TemporarySubregionExit { .. }
+            )
+        });
+    if !contains_subregion {
+        return Ok(());
+    }
+
+    let [block] = function.blocks.as_slice() else {
+        return Err(unsupported(
+            &function.name,
+            "multi-block executable AARM temporary subregions",
+        ));
+    };
+    if function.entry != block.id
+        || !matches!(
+            block.terminator,
+            mir::Terminator::Return(_) | mir::Terminator::End
+        )
+    {
+        return Err(unsupported(
+            &function.name,
+            "branching executable AARM temporary subregions",
+        ));
+    }
+    if block.instructions.iter().any(|instruction| {
+        matches!(
+            instruction,
+            mir::Instruction::CallIntrinsic { intrinsic, .. }
+                if is_temporary_subregion_concurrency_intrinsic(*intrinsic)
+        )
+    }) {
+        return Err(unsupported(
+            &function.name,
+            "concurrency in an executable AARM temporary subregion function",
+        ));
+    }
+
+    let mut active = None;
+    let mut entered = HashSet::new();
+    let mut active_temporary_allocations = 0_usize;
+    for instruction in &block.instructions {
+        match instruction {
+            mir::Instruction::TemporarySubregionEnter { id } => {
+                if active.is_some() || !entered.insert(*id) {
+                    return Err(unsupported(
+                        &function.name,
+                        "nested or duplicate executable AARM temporary subregion enter",
+                    ));
+                }
+                active = Some(*id);
+                active_temporary_allocations = 0;
+            }
+            mir::Instruction::TemporarySubregionExit { id } => {
+                if active != Some(*id) {
+                    return Err(unsupported(
+                        &function.name,
+                        "unmatched executable AARM temporary subregion exit",
+                    ));
+                }
+                if active_temporary_allocations == 0 {
+                    return Err(unsupported(
+                        &function.name,
+                        "executable AARM temporary subregion without a Temporary allocation",
+                    ));
+                }
+                active = None;
+            }
+            instruction if active.is_some() => {
+                if matches!(
+                    instruction,
+                    mir::Instruction::AllocateObject {
+                        region: mir::AllocationRegion::Temporary,
+                        ..
+                    } | mir::Instruction::AllocateArray {
+                        region: mir::AllocationRegion::Temporary,
+                        ..
+                    }
+                ) {
+                    active_temporary_allocations = active_temporary_allocations
+                        .checked_add(1)
+                        .ok_or_else(|| BackendError::new("too many Temporary allocations"))?;
+                }
+                if !temporary_subregion_instruction_is_executable(instruction) {
+                    return Err(unsupported(
+                        &function.name,
+                        "instruction inside an executable AARM temporary subregion",
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    if active.is_some() {
+        return Err(unsupported(
+            &function.name,
+            "executable AARM temporary subregion without an exit",
+        ));
+    }
+    Ok(())
+}
+
+fn temporary_subregion_instruction_is_executable(instruction: &mir::Instruction) -> bool {
+    match instruction {
+        mir::Instruction::Assign { target, value } => {
+            temporary_subregion_place_is_executable(target)
+                && temporary_subregion_rvalue_is_executable(value)
+        }
+        mir::Instruction::AllocateArray {
+            destination,
+            element_type,
+            length,
+            ..
+        } => {
+            matches!(destination, mir::Place::Local(_))
+                && temporary_subregion_type_is_executable(element_type)
+                && temporary_subregion_operand_is_executable(length)
+        }
+        mir::Instruction::AllocateObject { destination, .. } => {
+            matches!(destination, mir::Place::Local(_))
+        }
+        mir::Instruction::TemporarySubregionEnter { .. }
+        | mir::Instruction::TemporarySubregionExit { .. }
+        | mir::Instruction::Call { .. }
+        | mir::Instruction::CallInterface { .. }
+        | mir::Instruction::CallIntrinsic { .. }
+        | mir::Instruction::AllocateList { .. }
+        | mir::Instruction::AllocateDictionary { .. }
+        | mir::Instruction::AllocateStringBuilder { .. }
+        | mir::Instruction::StringBuilderAppend { .. }
+        | mir::Instruction::StringBuilderToString { .. }
+        | mir::Instruction::DictionaryAdd { .. }
+        | mir::Instruction::DictionarySet { .. }
+        | mir::Instruction::DictionaryTryGet { .. }
+        | mir::Instruction::DictionaryContainsKey { .. }
+        | mir::Instruction::DictionaryRemove { .. }
+        | mir::Instruction::DictionaryEntries { .. }
+        | mir::Instruction::ListAdd { .. }
+        | mir::Instruction::ListGet { .. }
+        | mir::Instruction::ListRemoveAt { .. }
+        | mir::Instruction::StringDecodeNext { .. } => false,
+    }
+}
+
+fn temporary_subregion_rvalue_is_executable(value: &mir::Rvalue) -> bool {
+    if !temporary_subregion_type_is_executable(&value.type_) {
+        return false;
+    }
+    match &value.kind {
+        mir::RvalueKind::Use(operand)
+        | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Unary { operand, .. } => {
+            temporary_subregion_operand_is_executable(operand)
+        }
+        mir::RvalueKind::Binary {
+            left,
+            operator,
+            right,
+        } => {
+            !matches!(
+                operator,
+                mir::BinaryOperator::Divide | mir::BinaryOperator::Remainder
+            ) && temporary_subregion_operand_is_executable(left)
+                && temporary_subregion_operand_is_executable(right)
+        }
+        mir::RvalueKind::Equality { left, right, .. } => {
+            temporary_subregion_equality_type_is_executable(&left.type_)
+                && temporary_subregion_operand_is_executable(left)
+                && temporary_subregion_operand_is_executable(right)
+        }
+        mir::RvalueKind::ArrayLength(operand) => {
+            matches!(operand.type_, mir::Type::Array(_))
+                && temporary_subregion_operand_is_executable(operand)
+        }
+        mir::RvalueKind::Aggregate(_)
+        | mir::RvalueKind::EnumConstruct { .. }
+        | mir::RvalueKind::Discriminant(_)
+        | mir::RvalueKind::ListLength(_)
+        | mir::RvalueKind::DictionaryLength(_)
+        | mir::RvalueKind::ListVersion(_)
+        | mir::RvalueKind::StringByteLength(_)
+        | mir::RvalueKind::MakeInterface { .. } => false,
+    }
+}
+
+fn temporary_subregion_operand_is_executable(operand: &mir::Operand) -> bool {
+    temporary_subregion_type_is_executable(&operand.type_)
+        && match &operand.kind {
+            mir::OperandKind::Constant(mir::Constant::String(_)) => false,
+            mir::OperandKind::Constant(_) | mir::OperandKind::Function(_) => true,
+            mir::OperandKind::Copy(place) => temporary_subregion_place_is_executable(place),
+        }
+}
+
+fn temporary_subregion_place_is_executable(place: &mir::Place) -> bool {
+    match place {
+        mir::Place::Local(_) => true,
+        mir::Place::Index {
+            array,
+            index,
+            element_type,
+        } => {
+            matches!(
+                &array.type_,
+                mir::Type::Array(array_element) if array_element.as_ref() == element_type
+            ) && temporary_subregion_type_is_executable(element_type)
+                && temporary_subregion_operand_is_executable(array)
+                && temporary_subregion_operand_is_executable(index)
+        }
+        mir::Place::ObjectField { object, .. } => {
+            matches!(object.type_, mir::Type::Class(_))
+                && temporary_subregion_operand_is_executable(object)
+        }
+        mir::Place::Symbol(_) | mir::Place::Field { .. } | mir::Place::EnumField { .. } => false,
+    }
+}
+
+fn temporary_subregion_type_is_executable(type_: &mir::Type) -> bool {
+    match type_ {
+        mir::Type::Array(element) => temporary_subregion_type_is_executable(element),
+        mir::Type::Bool
+        | mir::Type::SByte
+        | mir::Type::Byte
+        | mir::Type::Short
+        | mir::Type::UShort
+        | mir::Type::Int
+        | mir::Type::UInt
+        | mir::Type::Long
+        | mir::Type::ULong
+        | mir::Type::Float
+        | mir::Type::Double
+        | mir::Type::Char
+        | mir::Type::Class(_) => true,
+        mir::Type::String
+        | mir::Type::User(_)
+        | mir::Type::Interface(_)
+        | mir::Type::Enum(_)
+        | mir::Type::Task(_)
+        | mir::Type::List(_)
+        | mir::Type::Dictionary(_, _)
+        | mir::Type::Void
+        | mir::Type::Decimal
+        | mir::Type::Unknown => false,
+    }
+}
+
+fn temporary_subregion_equality_type_is_executable(type_: &mir::Type) -> bool {
+    matches!(
+        type_,
+        mir::Type::Bool
+            | mir::Type::SByte
+            | mir::Type::Byte
+            | mir::Type::Short
+            | mir::Type::UShort
+            | mir::Type::Int
+            | mir::Type::UInt
+            | mir::Type::Long
+            | mir::Type::ULong
+            | mir::Type::Float
+            | mir::Type::Double
+            | mir::Type::Char
+            | mir::Type::Class(_)
+            | mir::Type::Array(_)
+    )
+}
+
+fn is_temporary_subregion_concurrency_intrinsic(intrinsic: mir::Intrinsic) -> bool {
+    matches!(
+        intrinsic,
+        mir::Intrinsic::TaskRun
+            | mir::Intrinsic::TaskWait
+            | mir::Intrinsic::AsyncSpawn
+            | mir::Intrinsic::AsyncState
+            | mir::Intrinsic::AsyncSetState
+            | mir::Intrinsic::AsyncStoreSlot
+            | mir::Intrinsic::AsyncLoadSlot
+            | mir::Intrinsic::AsyncSpawnInner
+            | mir::Intrinsic::AsyncAwaitResult
+            | mir::Intrinsic::AsyncSetResult
+            | mir::Intrinsic::ParallelFor
+            | mir::Intrinsic::ParallelForEach
+            | mir::Intrinsic::ParallelReduce
+    )
 }
 
 fn declared_local_type<'a>(

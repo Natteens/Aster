@@ -47,6 +47,7 @@ pub(super) enum TemporarySubregionRejectionReason {
     ConcurrencyBarrier,
     CollectionBarrier,
     StringBarrier,
+    UnsupportedInstruction,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -396,6 +397,10 @@ fn allocation_form_barrier(
 fn span_barrier(instructions: &[mir::Instruction]) -> Option<TemporarySubregionRejectionReason> {
     for instruction in instructions {
         let reason = match instruction {
+            mir::Instruction::TemporarySubregionEnter { .. }
+            | mir::Instruction::TemporarySubregionExit { .. } => {
+                Some(TemporarySubregionRejectionReason::UnsupportedControlFlow)
+            }
             mir::Instruction::Call { .. } | mir::Instruction::CallInterface { .. } => {
                 Some(TemporarySubregionRejectionReason::CallBarrier)
             }
@@ -427,15 +432,206 @@ fn span_barrier(instructions: &[mir::Instruction]) -> Option<TemporarySubregionR
             | mir::Instruction::StringDecodeNext { .. } => {
                 Some(TemporarySubregionRejectionReason::StringBarrier)
             }
-            mir::Instruction::Assign { .. }
-            | mir::Instruction::AllocateArray { .. }
-            | mir::Instruction::AllocateObject { .. } => None,
+            mir::Instruction::Assign { target, value } => assign_barrier(target, value),
+            mir::Instruction::AllocateArray {
+                destination,
+                element_type,
+                length,
+                ..
+            } if matches!(destination, mir::Place::Local(_))
+                && is_execution_safe_type(element_type)
+                && is_execution_safe_operand(length) =>
+            {
+                None
+            }
+            mir::Instruction::AllocateObject {
+                destination: mir::Place::Local(_),
+                ..
+            } => None,
+            mir::Instruction::AllocateArray { .. } | mir::Instruction::AllocateObject { .. } => {
+                Some(TemporarySubregionRejectionReason::UnsupportedInstruction)
+            }
         };
         if reason.is_some() {
             return reason;
         }
     }
     None
+}
+
+fn assign_barrier(
+    target: &mir::Place,
+    value: &mir::Rvalue,
+) -> Option<TemporarySubregionRejectionReason> {
+    if rvalue_contains_type(value, is_collection_type) {
+        return Some(TemporarySubregionRejectionReason::CollectionBarrier);
+    }
+    if rvalue_contains_type(value, is_string_type) {
+        return Some(TemporarySubregionRejectionReason::StringBarrier);
+    }
+    if !is_execution_safe_place(target) || !is_execution_safe_rvalue(value) {
+        return Some(TemporarySubregionRejectionReason::UnsupportedInstruction);
+    }
+    None
+}
+
+fn is_execution_safe_rvalue(value: &mir::Rvalue) -> bool {
+    if !is_execution_safe_type(&value.type_) {
+        return false;
+    }
+    match &value.kind {
+        mir::RvalueKind::Use(operand)
+        | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Unary { operand, .. } => is_execution_safe_operand(operand),
+        mir::RvalueKind::Binary {
+            left,
+            operator,
+            right,
+        } => {
+            !matches!(
+                operator,
+                mir::BinaryOperator::Divide | mir::BinaryOperator::Remainder
+            ) && is_execution_safe_operand(left)
+                && is_execution_safe_operand(right)
+        }
+        mir::RvalueKind::Equality { left, right, .. } => {
+            is_execution_safe_equality_type(&left.type_)
+                && is_execution_safe_operand(left)
+                && is_execution_safe_operand(right)
+        }
+        mir::RvalueKind::ArrayLength(array) => {
+            matches!(array.type_, mir::Type::Array(_)) && is_execution_safe_operand(array)
+        }
+        mir::RvalueKind::Aggregate(_)
+        | mir::RvalueKind::EnumConstruct { .. }
+        | mir::RvalueKind::Discriminant(_)
+        | mir::RvalueKind::ListLength(_)
+        | mir::RvalueKind::DictionaryLength(_)
+        | mir::RvalueKind::ListVersion(_)
+        | mir::RvalueKind::StringByteLength(_)
+        | mir::RvalueKind::MakeInterface { .. } => false,
+    }
+}
+
+fn is_execution_safe_operand(operand: &mir::Operand) -> bool {
+    if !is_execution_safe_type(&operand.type_) {
+        return false;
+    }
+    match &operand.kind {
+        mir::OperandKind::Constant(mir::Constant::String(_)) => false,
+        mir::OperandKind::Constant(_) | mir::OperandKind::Function(_) => true,
+        mir::OperandKind::Copy(place) => is_execution_safe_place(place),
+    }
+}
+
+fn is_execution_safe_place(place: &mir::Place) -> bool {
+    match place {
+        mir::Place::Local(_) => true,
+        mir::Place::ObjectField { object, .. } => {
+            matches!(object.type_, mir::Type::Class(_)) && is_execution_safe_operand(object)
+        }
+        mir::Place::Index {
+            array,
+            index,
+            element_type,
+        } => {
+            matches!(
+                &array.type_,
+                mir::Type::Array(array_element) if array_element.as_ref() == element_type
+            ) && is_execution_safe_type(element_type)
+                && is_execution_safe_operand(array)
+                && is_execution_safe_operand(index)
+        }
+        mir::Place::Symbol(_) | mir::Place::Field { .. } | mir::Place::EnumField { .. } => false,
+    }
+}
+
+fn is_execution_safe_type(type_: &mir::Type) -> bool {
+    match type_ {
+        mir::Type::String
+        | mir::Type::User(_)
+        | mir::Type::Interface(_)
+        | mir::Type::Enum(_)
+        | mir::Type::Task(_)
+        | mir::Type::List(_)
+        | mir::Type::Dictionary(_, _)
+        | mir::Type::Void
+        | mir::Type::Decimal
+        | mir::Type::Unknown => false,
+        mir::Type::Array(element) => is_execution_safe_type(element),
+        mir::Type::Bool
+        | mir::Type::SByte
+        | mir::Type::Byte
+        | mir::Type::Short
+        | mir::Type::UShort
+        | mir::Type::Int
+        | mir::Type::UInt
+        | mir::Type::Long
+        | mir::Type::ULong
+        | mir::Type::Float
+        | mir::Type::Double
+        | mir::Type::Char
+        | mir::Type::Class(_) => true,
+    }
+}
+
+fn is_execution_safe_equality_type(type_: &mir::Type) -> bool {
+    matches!(
+        type_,
+        mir::Type::Bool
+            | mir::Type::SByte
+            | mir::Type::Byte
+            | mir::Type::Short
+            | mir::Type::UShort
+            | mir::Type::Int
+            | mir::Type::UInt
+            | mir::Type::Long
+            | mir::Type::ULong
+            | mir::Type::Float
+            | mir::Type::Double
+            | mir::Type::Char
+            | mir::Type::Class(_)
+            | mir::Type::Array(_)
+    )
+}
+
+fn rvalue_contains_type(value: &mir::Rvalue, predicate: fn(&mir::Type) -> bool) -> bool {
+    predicate(&value.type_)
+        || match &value.kind {
+            mir::RvalueKind::Use(operand)
+            | mir::RvalueKind::Discriminant(operand)
+            | mir::RvalueKind::ArrayLength(operand)
+            | mir::RvalueKind::ListLength(operand)
+            | mir::RvalueKind::DictionaryLength(operand)
+            | mir::RvalueKind::ListVersion(operand)
+            | mir::RvalueKind::StringByteLength(operand)
+            | mir::RvalueKind::Cast(operand)
+            | mir::RvalueKind::Unary { operand, .. } => predicate(&operand.type_),
+            mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
+                fields.iter().any(|field| predicate(&field.value.type_))
+            }
+            mir::RvalueKind::MakeInterface { object, .. } => predicate(&object.type_),
+            mir::RvalueKind::Binary { left, right, .. }
+            | mir::RvalueKind::Equality { left, right, .. } => {
+                predicate(&left.type_) || predicate(&right.type_)
+            }
+        }
+}
+
+fn is_collection_type(type_: &mir::Type) -> bool {
+    match type_ {
+        mir::Type::List(_) | mir::Type::Dictionary(_, _) => true,
+        mir::Type::Array(element) => is_collection_type(element),
+        _ => false,
+    }
+}
+
+fn is_string_type(type_: &mir::Type) -> bool {
+    match type_ {
+        mir::Type::String => true,
+        mir::Type::Array(element) => is_string_type(element),
+        _ => false,
+    }
 }
 
 fn intervals_overlap(
@@ -531,5 +727,6 @@ const fn reason_order(reason: TemporarySubregionRejectionReason) -> u8 {
         TemporarySubregionRejectionReason::ConcurrencyBarrier => 12,
         TemporarySubregionRejectionReason::CollectionBarrier => 13,
         TemporarySubregionRejectionReason::StringBarrier => 14,
+        TemporarySubregionRejectionReason::UnsupportedInstruction => 15,
     }
 }

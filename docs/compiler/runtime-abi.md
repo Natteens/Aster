@@ -24,6 +24,7 @@ Representative export groups:
 | `aster_rt_object_*` | Class-object storage |
 | `aster_rt_io_*` | Terminal and host-managed filesystem operations |
 | `aster_rt_temporary_scope_*` | Temporary-arena checkpoints |
+| `aster_rt_temporary_subregion_*` | Private experimental compiler-authorized fine Temporary checkpoints |
 | arithmetic/domain-error exports | Controlled runtime failures without exceptions or unwind |
 
 Log levels: `0` = normal, `1` = warning, `2` = error. Any other value is reported as a
@@ -76,6 +77,13 @@ never alias builder storage.
   enter a nested temporary scope on function entry and leave it on every normal `Return` or `End`.
   Leaving rewinds only the innermost checkpoint; allocations made by callers before a nested call
   remain valid.
+- The explicit AARM research path can additionally place a private
+  `aster_rt_temporary_subregion_enter`/`exit` pair inside that outer function scope. The fine pair
+  checkpoints and rewinds the same Temporary arena, but is tracked separately and does not change
+  semantic function-scope depth. At most one fine subregion may be active per execution context in
+  the initial straight-line implementation. Generated failure cleanup exits an active fine
+  subregion before it leaves the outer function scope. These symbols are compiler/runtime
+  machinery, not ASTER source methods or a public FFI feature.
 - Temporary allocation is valid only while such a scope is active. The runtime reports a
   controlled error for unmatched scope exits or temporary allocation without a scope.
 - The backend identifies functions that can participate in direct, mutual, or interface-dispatched
@@ -119,7 +127,8 @@ Cranelift maps those enum variants to registry entries; it never recognizes `Str
 `ExecutionContext::with_stats` enables cumulative allocation counts together with current and peak
 arena usage. The CLI exposes the same snapshot through `aster run <FILE> --memory-stats`.
 
-`used_bytes` can decrease when a temporary scope rewinds. `reserved_bytes` does not decrease during
+`used_bytes` can decrease when a function Temporary scope or compiler-authorized experimental fine
+subregion rewinds. `reserved_bytes` does not decrease during
 the invocation because pages remain owned by the context and are reused. Allocation counts,
 `requested_bytes`, and peak values are cumulative. Array accounting includes its element buffer in
 `requested_bytes`; the separate header and any alignment padding appear only in used/reserved

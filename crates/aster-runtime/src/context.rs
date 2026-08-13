@@ -544,6 +544,12 @@ pub(crate) struct TemporaryArenaMark(ArenaMark);
 pub struct ExecutionContext {
     arena: PagedArena,
     temporary_arena: PagedArena,
+    /// Compiler-authorized fine-grained checkpoint nested inside the current
+    /// semantic function Temporary scope. This is deliberately separate from
+    /// `temporary_scopes`: collection and builder promotion uses that vector's
+    /// length as semantic function-scope depth, and a fine checkpoint must not
+    /// change it.
+    fine_temporary_subregion: Option<TemporaryArenaMark>,
     temporary_scopes: Vec<TemporaryArenaMark>,
     allocation_limit_bytes: usize,
     allocation_limit_kind: AllocationLimitKind,
@@ -634,6 +640,7 @@ impl ExecutionContext {
         Self {
             arena,
             temporary_arena,
+            fine_temporary_subregion: None,
             temporary_scopes: Vec::new(),
             allocation_limit_bytes,
             allocation_limit_kind: AllocationLimitKind::Execution,
@@ -1032,15 +1039,53 @@ impl ExecutionContext {
     }
 
     fn enter_temporary_scope(&mut self) {
+        if self.fine_temporary_subregion.is_some() {
+            self.fail("temporary scope enter cannot occur while a temporary subregion is active");
+            return;
+        }
         let mark = self.mark_temporary();
         self.temporary_scopes.push(mark);
     }
 
     fn leave_temporary_scope(&mut self) {
+        if self.fine_temporary_subregion.is_some() {
+            self.fail("temporary scope leave cannot occur while a temporary subregion is active");
+            return;
+        }
         let Some(mark) = self.temporary_scopes.pop() else {
             self.fail("temporary scope leave has no matching enter");
             return;
         };
+        self.rewind_temporary(mark);
+    }
+
+    fn enter_temporary_subregion(&mut self) {
+        // A prior controlled failure will take generated code to its existing
+        // function cleanup. Do not create a fine mark that cleanup would then
+        // have to discover dynamically.
+        if self.error.is_some() {
+            return;
+        }
+        if self.temporary_scopes.is_empty() {
+            self.fail("temporary subregion enter requires an active temporary scope");
+            return;
+        }
+        if self.fine_temporary_subregion.is_some() {
+            self.fail("temporary subregion enter has an active subregion");
+            return;
+        }
+
+        self.fine_temporary_subregion = Some(self.mark_temporary());
+    }
+
+    fn leave_temporary_subregion(&mut self) {
+        let Some(mark) = self.fine_temporary_subregion.take() else {
+            self.fail("temporary subregion exit has no matching enter");
+            return;
+        };
+
+        // Cleanup must run even when an allocation inside the subregion has
+        // already recorded the first runtime error.
         self.rewind_temporary(mark);
     }
 
@@ -2971,6 +3016,39 @@ pub extern "C" fn aster_rt_temporary_scope_leave(context: *mut ExecutionContext)
     #[allow(unsafe_code)]
     let context = unsafe { &mut *context };
     context.leave_temporary_scope();
+}
+
+/// Enter one compiler-authorized fine-grained Temporary subregion.
+///
+/// This private JIT ABI does not alter semantic function Temporary-scope
+/// depth. Malformed ordering is reported through [`ExecutionContext::fail`].
+#[doc(hidden)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub(crate) extern "C" fn aster_rt_temporary_subregion_enter(context: *mut ExecutionContext) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: generated functions receive the live host-owned context as their
+    // hidden first parameter, and invocation cannot outlive that context.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    context.enter_temporary_subregion();
+}
+
+/// Rewind the active compiler-authorized fine-grained Temporary subregion.
+///
+/// Cleanup deliberately remains effective after an earlier controlled error.
+#[doc(hidden)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub(crate) extern "C" fn aster_rt_temporary_subregion_exit(context: *mut ExecutionContext) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: generated functions receive the live host-owned context as their
+    // hidden first parameter, and invocation cannot outlive that context.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    context.leave_temporary_subregion();
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -7673,6 +7751,171 @@ mod tests {
         aster_rt_temporary_scope_leave(pointer);
         assert_eq!(context.memory_stats().used_bytes, 0);
         assert_eq!(context.memory_stats().object_allocations, 2);
+    }
+
+    #[test]
+    fn fine_temporary_subregion_rewinds_without_changing_function_scope_depth() {
+        let mut context = ExecutionContext::with_stats();
+        let pointer = &raw mut context;
+
+        aster_rt_temporary_scope_enter(pointer);
+        let outer = aster_rt_object_new_temporary(pointer, 8);
+        assert!(!outer.is_null());
+        // SAFETY: `outer` points to eight live bytes owned by the enclosing
+        // function Temporary scope.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::write(outer.cast::<u64>(), 42);
+        }
+        assert_eq!(context.temporary_scopes.len(), 1);
+
+        aster_rt_temporary_subregion_enter(pointer);
+        assert_eq!(context.temporary_scopes.len(), 1);
+        assert!(context.fine_temporary_subregion.is_some());
+        let list = context.allocate_list_in_region(4, 4, 1, ListRegion::Temporary);
+        let dictionary = context.allocate_dictionary_in_region(
+            DictionaryKeyKind::Int,
+            4,
+            4,
+            1,
+            4,
+            4,
+            2,
+            ListRegion::Temporary,
+        );
+        let builder = context.allocate_string_builder_in_region(ListRegion::Temporary);
+        assert!(!list.is_null());
+        assert!(!dictionary.is_null());
+        assert!(!builder.is_null());
+        // SAFETY: all three headers are live, context-owned allocations. The
+        // test reads only their initialized private semantic-depth fields.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!((*list).birth_scope_depth, 1);
+            assert_eq!((*dictionary).birth_scope_depth, 1);
+            assert_eq!((*builder).birth_scope_depth, 1);
+        }
+        let inner = aster_rt_object_new_temporary(pointer, 32);
+        assert!(!inner.is_null());
+        assert!(context.memory_stats().used_bytes > 40);
+
+        aster_rt_temporary_subregion_exit(pointer);
+        assert_eq!(context.temporary_scopes.len(), 1);
+        assert!(context.fine_temporary_subregion.is_none());
+        assert_eq!(context.memory_stats().used_bytes, 8);
+        // SAFETY: fine rewind returns only to the newer subregion mark, so the
+        // enclosing function-scope allocation remains live and unmoved.
+        #[allow(unsafe_code)]
+        let value = unsafe { std::ptr::read(outer.cast::<u64>()) };
+        assert_eq!(value, 42);
+
+        aster_rt_temporary_scope_leave(pointer);
+        assert_eq!(context.memory_stats().used_bytes, 0);
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    fn fine_subregion_error_cleanup_preserves_first_error() {
+        let mut preexisting = ExecutionContext::new();
+        let pointer = &raw mut preexisting;
+        aster_rt_temporary_scope_enter(pointer);
+        preexisting.fail("earlier failure");
+        aster_rt_temporary_subregion_enter(pointer);
+        assert!(preexisting.fine_temporary_subregion.is_none());
+        aster_rt_temporary_scope_leave(pointer);
+        assert_eq!(preexisting.take_error().as_deref(), Some("earlier failure"));
+
+        let mut active = ExecutionContext::with_stats();
+        let pointer = &raw mut active;
+        aster_rt_temporary_scope_enter(pointer);
+        aster_rt_temporary_subregion_enter(pointer);
+        assert!(!aster_rt_object_new_temporary(pointer, 32).is_null());
+        active.fail("allocation failed");
+
+        // Fine cleanup must still rewind while first-error-wins is active.
+        aster_rt_temporary_subregion_exit(pointer);
+        assert!(active.fine_temporary_subregion.is_none());
+        assert_eq!(active.memory_stats().used_bytes, 0);
+        aster_rt_temporary_scope_leave(pointer);
+        assert_eq!(active.take_error().as_deref(), Some("allocation failed"));
+    }
+
+    #[test]
+    fn malformed_fine_subregion_ordering_is_controlled() {
+        let mut context = ExecutionContext::new();
+        let pointer = &raw mut context;
+
+        aster_rt_temporary_subregion_enter(pointer);
+        assert_eq!(
+            context.take_error().as_deref(),
+            Some("temporary subregion enter requires an active temporary scope")
+        );
+        assert!(context.fine_temporary_subregion.is_none());
+
+        aster_rt_temporary_subregion_exit(pointer);
+        assert_eq!(
+            context.take_error().as_deref(),
+            Some("temporary subregion exit has no matching enter")
+        );
+
+        aster_rt_temporary_scope_enter(pointer);
+        aster_rt_temporary_subregion_enter(pointer);
+        aster_rt_temporary_subregion_enter(pointer);
+        assert_eq!(
+            context.take_error().as_deref(),
+            Some("temporary subregion enter has an active subregion")
+        );
+        assert_eq!(context.temporary_scopes.len(), 1);
+        assert!(context.fine_temporary_subregion.is_some());
+
+        aster_rt_temporary_subregion_exit(pointer);
+        aster_rt_temporary_scope_leave(pointer);
+        assert!(context.temporary_scopes.is_empty());
+        assert!(context.fine_temporary_subregion.is_none());
+
+        aster_rt_temporary_subregion_exit(pointer);
+        assert_eq!(
+            context.take_error().as_deref(),
+            Some("temporary subregion exit has no matching enter")
+        );
+        assert!(context.temporary_scopes.is_empty());
+        assert!(context.fine_temporary_subregion.is_none());
+
+        aster_rt_temporary_subregion_enter(std::ptr::null_mut());
+        aster_rt_temporary_subregion_exit(std::ptr::null_mut());
+    }
+
+    #[test]
+    fn function_scope_transitions_cannot_cross_an_active_fine_subregion() {
+        let mut enter = ExecutionContext::new();
+        let pointer = &raw mut enter;
+        aster_rt_temporary_scope_enter(pointer);
+        aster_rt_temporary_subregion_enter(pointer);
+        aster_rt_temporary_scope_enter(pointer);
+        assert_eq!(
+            enter.take_error().as_deref(),
+            Some("temporary scope enter cannot occur while a temporary subregion is active")
+        );
+        assert_eq!(enter.temporary_scopes.len(), 1);
+        assert!(enter.fine_temporary_subregion.is_some());
+        aster_rt_temporary_subregion_exit(pointer);
+        aster_rt_temporary_scope_leave(pointer);
+
+        let mut leave = ExecutionContext::new();
+        let pointer = &raw mut leave;
+        aster_rt_temporary_scope_enter(pointer);
+        aster_rt_temporary_subregion_enter(pointer);
+        aster_rt_temporary_scope_leave(pointer);
+        assert_eq!(
+            leave.take_error().as_deref(),
+            Some("temporary scope leave cannot occur while a temporary subregion is active")
+        );
+        assert_eq!(leave.temporary_scopes.len(), 1);
+        assert!(leave.fine_temporary_subregion.is_some());
+        aster_rt_temporary_subregion_exit(pointer);
+        aster_rt_temporary_scope_leave(pointer);
+        assert!(leave.temporary_scopes.is_empty());
+        assert!(leave.fine_temporary_subregion.is_none());
     }
 
     #[test]

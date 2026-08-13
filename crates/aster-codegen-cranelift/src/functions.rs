@@ -26,6 +26,7 @@ impl Codegen {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn translate_function(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
@@ -38,6 +39,8 @@ impl Codegen {
             .map(|block| (block.id, builder.create_block()))
             .collect::<HashMap<_, _>>();
         let runtime_failure = builder.create_block();
+        let fine_runtime_failure =
+            function_contains_temporary_subregions(function).then(|| builder.create_block());
         let mut state = FunctionState {
             slots: HashMap::new(),
             execution_context: None,
@@ -111,9 +114,25 @@ impl Codegen {
                 builder.ins().call(function_ref, &[context]);
             }
             for instruction in &block.instructions {
+                if matches!(instruction, mir::Instruction::TemporarySubregionExit { .. }) {
+                    state.runtime_failure = runtime_failure;
+                }
                 self.translate_instruction(builder, instruction, function_ids, &state)?;
+                if matches!(
+                    instruction,
+                    mir::Instruction::TemporarySubregionEnter { .. }
+                ) {
+                    state.runtime_failure = fine_runtime_failure.ok_or_else(|| {
+                        BackendError::new("temporary subregion is missing its failure cleanup")
+                    })?;
+                }
             }
             self.translate_terminator(builder, &block.terminator, &blocks, &state)?;
+        }
+        if let Some(fine_runtime_failure) = fine_runtime_failure {
+            builder.switch_to_block(fine_runtime_failure);
+            self.leave_temporary_subregion(builder, &state)?;
+            builder.ins().jump(runtime_failure, &[]);
         }
         builder.switch_to_block(runtime_failure);
         self.leave_function(builder, &state)?;
@@ -169,6 +188,21 @@ impl Codegen {
         state: &FunctionState,
     ) -> Result<(), BackendError> {
         match instruction {
+            mir::Instruction::TemporarySubregionEnter { .. } => {
+                let context = state.execution_context.ok_or_else(|| {
+                    BackendError::new("temporary subregion is missing its ExecutionContext")
+                })?;
+                let function_ref = self.jit.declare_func_in_func(
+                    self.runtime_ids["aster_rt_temporary_subregion_enter"],
+                    builder.func,
+                );
+                builder.ins().call(function_ref, &[context]);
+                self.continue_if_runtime_ok(builder, state)
+            }
+            mir::Instruction::TemporarySubregionExit { .. } => {
+                self.leave_temporary_subregion(builder, state)?;
+                self.continue_if_runtime_ok(builder, state)
+            }
             mir::Instruction::Assign { target, value } => {
                 self.assign_rvalue(builder, target, value, state)
             }
@@ -385,7 +419,9 @@ fn function_uses_temporary_allocations(function: &mir::Function) -> bool {
         .iter()
         .flat_map(|block| &block.instructions)
         .any(|instruction| match instruction {
-            mir::Instruction::AllocateObject {
+            mir::Instruction::TemporarySubregionEnter { .. }
+            | mir::Instruction::TemporarySubregionExit { .. }
+            | mir::Instruction::AllocateObject {
                 region: mir::AllocationRegion::Temporary,
                 ..
             }
@@ -417,5 +453,19 @@ fn function_uses_temporary_allocations(function: &mir::Function) -> bool {
                 intrinsic.allocation_region() == Some(mir::AllocationRegion::Temporary)
             }
             _ => false,
+        })
+}
+
+fn function_contains_temporary_subregions(function: &mir::Function) -> bool {
+    function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .any(|instruction| {
+            matches!(
+                instruction,
+                mir::Instruction::TemporarySubregionEnter { .. }
+                    | mir::Instruction::TemporarySubregionExit { .. }
+            )
         })
 }

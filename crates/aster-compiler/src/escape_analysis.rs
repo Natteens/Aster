@@ -711,7 +711,9 @@ fn instruction_escape(
         | mir::Instruction::DictionaryEntries { .. }
         | mir::Instruction::ListGet { .. }
         | mir::Instruction::ListRemoveAt { .. }
-        | mir::Instruction::StringDecodeNext { .. } => None,
+        | mir::Instruction::StringDecodeNext { .. }
+        | mir::Instruction::TemporarySubregionEnter { .. }
+        | mir::Instruction::TemporarySubregionExit { .. } => None,
         // Storing a reference into a list's buffer is an aggregate store,
         // exactly like `Assign{target: Field/Index, value: Use(alias)}`
         // (`assignment_escape` above): conservatively persistent, regardless

@@ -177,6 +177,24 @@ impl PreparedProgram {
         }
     }
 
+    /// Test-only machine-code seam that invokes a finalized entry against a
+    /// caller-owned context. Keeping the context alive after the call lets
+    /// failure-path tests prove generated fine and outer cleanup ran before
+    /// host teardown, rather than accidentally passing because `Drop` freed
+    /// the arena later.
+    #[cfg(test)]
+    fn invoke_with_test_context(
+        &self,
+        symbol: mir::SymbolId,
+        context: &mut aster_runtime::ExecutionContext,
+    ) -> Result<ExecutionValue, BackendError> {
+        let (pointer, return_type) = self
+            .entries
+            .get(&symbol)
+            .ok_or_else(|| BackendError::new(format!("symbol {symbol:?} was not prepared")))?;
+        invoke_finalized(*pointer, return_type, context)
+    }
+
     /// Invoke one plain `Task.Run` target in its own fresh context. Governed
     /// jobs receive the frozen task-domain ceiling; ordinary and awaited
     /// async-inner jobs retain the existing ungoverned path.
@@ -1076,6 +1094,71 @@ mod tests {
     use cranelift_codegen::settings::OptLevel;
     use cranelift_module::Module;
 
+    const FINE_RUN: mir::SymbolId = mir::SymbolId(90_001);
+    const FINE_CLASS: mir::SymbolId = mir::SymbolId(90_002);
+    const FINE_BLOCK: mir::BasicBlockId = mir::BasicBlockId(0);
+
+    fn fine_local(id: u32, type_: mir::Type) -> mir::Local {
+        mir::Local {
+            id: mir::LocalId(id),
+            symbol: None,
+            name: format!("fine_{id}"),
+            type_,
+            mutable: true,
+            temporary: true,
+        }
+    }
+
+    fn fine_integer(value: i32) -> mir::Operand {
+        mir::Operand {
+            type_: mir::Type::Int,
+            kind: mir::OperandKind::Constant(mir::Constant::Integer(value.to_string())),
+        }
+    }
+
+    fn fine_module(locals: Vec<mir::Local>, instructions: Vec<mir::Instruction>) -> mir::Module {
+        mir::Module {
+            structs: Vec::new(),
+            classes: vec![mir::ClassDefinition {
+                symbol: FINE_CLASS,
+                name: "FineBox".to_owned(),
+                fields: Vec::new(),
+            }],
+            interfaces: Vec::new(),
+            enums: Vec::new(),
+            interface_implementations: Vec::new(),
+            functions: vec![mir::Function {
+                constructor: false,
+                symbol: FINE_RUN,
+                owner: None,
+                name: "FineRun".to_owned(),
+                visibility: mir::Visibility::Public,
+                parameters: Vec::new(),
+                locals,
+                return_type: mir::Type::Int,
+                entry: FINE_BLOCK,
+                blocks: vec![mir::BasicBlock {
+                    id: FINE_BLOCK,
+                    instructions,
+                    terminator: mir::Terminator::Return(Some(fine_integer(42))),
+                }],
+                temporary_subregion_candidates: Vec::new(),
+            }],
+        }
+    }
+
+    fn fine_enter() -> mir::Instruction {
+        mir::Instruction::TemporarySubregionEnter {
+            id: mir::TemporarySubregionId(0),
+        }
+    }
+
+    fn fine_exit() -> mir::Instruction {
+        mir::Instruction::TemporarySubregionExit {
+            id: mir::TemporarySubregionId(0),
+        }
+    }
+
     #[test]
     fn jit_uses_cranelift_speed_optimizations() {
         let module = JITModule::new(jit_builder().expect("native JIT builder"));
@@ -1154,6 +1237,197 @@ mod tests {
             // nothing from a previous invocation can accumulate here.
             assert_eq!(stats.used_bytes, 0);
         }
+    }
+
+    #[test]
+    fn generated_object_allocation_failure_runs_fine_cleanup_before_host_teardown() {
+        let array_type = mir::Type::Array(Box::new(mir::Type::Int));
+        let mut module = fine_module(
+            vec![
+                fine_local(0, mir::Type::Class(FINE_CLASS)),
+                fine_local(1, array_type),
+            ],
+            vec![
+                fine_enter(),
+                mir::Instruction::AllocateArray {
+                    destination: mir::Place::Local(mir::LocalId(1)),
+                    element_type: mir::Type::Int,
+                    length: fine_integer(1),
+                    requires_default: true,
+                    region: mir::AllocationRegion::Temporary,
+                },
+                mir::Instruction::AllocateObject {
+                    destination: mir::Place::Local(mir::LocalId(0)),
+                    class: FINE_CLASS,
+                    region: mir::AllocationRegion::Temporary,
+                },
+                fine_exit(),
+            ],
+        );
+        module.classes[0].fields = (0..2_000)
+            .map(|index| mir::FieldDefinition {
+                symbol: mir::SymbolId(100_000 + index),
+                name: format!("field_{index}"),
+                type_: mir::Type::Long,
+            })
+            .collect();
+        crate::validate(&module).expect("object failure MIR is valid");
+        let prepared = PreparedProgram::prepare(&module).expect("object failure MIR finalizes");
+        let governor = Arc::new(aster_runtime::MemoryGovernor::new(
+            aster_runtime::ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES,
+        ));
+        let mut context =
+            aster_runtime::ExecutionContext::with_memory_governor(Arc::clone(&governor));
+
+        let _ = prepared
+            .invoke_with_test_context(FINE_RUN, &mut context)
+            .expect("controlled runtime failure returns a neutral ABI result");
+
+        assert!(
+            context
+                .take_error()
+                .expect("allocation failure is preserved")
+                .contains("shared execution memory budget")
+        );
+        assert_eq!(context.memory_stats().used_bytes, 0);
+        let before_drop = governor.telemetry();
+        assert_eq!(
+            before_drop.current_capacity_bytes,
+            u64::try_from(aster_runtime::ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES)
+                .expect("page capacity fits telemetry")
+        );
+        assert_eq!(before_drop.grant_events, 1);
+        assert_eq!(before_drop.release_events, 0);
+        drop(context);
+        let after_drop = governor.telemetry();
+        assert_eq!(after_drop.current_capacity_bytes, 0);
+        assert_eq!(after_drop.release_events, 1);
+    }
+
+    #[test]
+    fn generated_array_allocation_failure_runs_fine_cleanup_before_host_teardown() {
+        let array_type = mir::Type::Array(Box::new(mir::Type::Int));
+        let module = fine_module(
+            vec![
+                fine_local(0, mir::Type::Class(FINE_CLASS)),
+                fine_local(1, array_type),
+            ],
+            vec![
+                fine_enter(),
+                mir::Instruction::AllocateObject {
+                    destination: mir::Place::Local(mir::LocalId(0)),
+                    class: FINE_CLASS,
+                    region: mir::AllocationRegion::Temporary,
+                },
+                mir::Instruction::AllocateArray {
+                    destination: mir::Place::Local(mir::LocalId(1)),
+                    element_type: mir::Type::Int,
+                    length: fine_integer(100_000),
+                    requires_default: true,
+                    region: mir::AllocationRegion::Temporary,
+                },
+                fine_exit(),
+            ],
+        );
+        crate::validate(&module).expect("array failure MIR is valid");
+        let prepared = PreparedProgram::prepare(&module).expect("array failure MIR finalizes");
+        let governor = Arc::new(aster_runtime::MemoryGovernor::new(
+            aster_runtime::ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES,
+        ));
+        let mut context =
+            aster_runtime::ExecutionContext::with_memory_governor(Arc::clone(&governor));
+
+        let _ = prepared
+            .invoke_with_test_context(FINE_RUN, &mut context)
+            .expect("controlled runtime failure returns a neutral ABI result");
+
+        assert!(
+            context
+                .take_error()
+                .expect("allocation failure is preserved")
+                .contains("shared execution memory budget")
+        );
+        assert_eq!(context.memory_stats().used_bytes, 0);
+        let before_drop = governor.telemetry();
+        assert_eq!(
+            before_drop.current_capacity_bytes,
+            u64::try_from(aster_runtime::ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES)
+                .expect("page capacity fits telemetry")
+        );
+        assert_eq!(before_drop.grant_events, 1);
+        assert_eq!(before_drop.release_events, 0);
+        drop(context);
+        let after_drop = governor.telemetry();
+        assert_eq!(after_drop.current_capacity_bytes, 0);
+        assert_eq!(after_drop.release_events, 1);
+    }
+
+    #[test]
+    fn generated_array_bounds_failure_runs_fine_cleanup_before_host_teardown() {
+        let array_type = mir::Type::Array(Box::new(mir::Type::Int));
+        let array = mir::Operand {
+            type_: array_type.clone(),
+            kind: mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(0))),
+        };
+        let module = fine_module(
+            vec![fine_local(0, array_type), fine_local(1, mir::Type::Int)],
+            vec![
+                fine_enter(),
+                mir::Instruction::AllocateArray {
+                    destination: mir::Place::Local(mir::LocalId(0)),
+                    element_type: mir::Type::Int,
+                    length: fine_integer(1),
+                    requires_default: true,
+                    region: mir::AllocationRegion::Temporary,
+                },
+                mir::Instruction::Assign {
+                    target: mir::Place::Local(mir::LocalId(1)),
+                    value: mir::Rvalue {
+                        type_: mir::Type::Int,
+                        kind: mir::RvalueKind::Use(mir::Operand {
+                            type_: mir::Type::Int,
+                            kind: mir::OperandKind::Copy(mir::Place::Index {
+                                array: Box::new(array),
+                                index: Box::new(fine_integer(5)),
+                                element_type: mir::Type::Int,
+                            }),
+                        }),
+                    },
+                },
+                fine_exit(),
+            ],
+        );
+        crate::validate(&module).expect("array bounds failure MIR is valid");
+        let prepared = PreparedProgram::prepare(&module).expect("array bounds MIR finalizes");
+        let governor = Arc::new(aster_runtime::MemoryGovernor::new(
+            aster_runtime::ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES,
+        ));
+        let mut context =
+            aster_runtime::ExecutionContext::with_memory_governor(Arc::clone(&governor));
+
+        let _ = prepared
+            .invoke_with_test_context(FINE_RUN, &mut context)
+            .expect("controlled runtime failure returns a neutral ABI result");
+
+        assert!(
+            context
+                .take_error()
+                .expect("bounds failure is preserved")
+                .contains("array index 5")
+        );
+        assert_eq!(context.memory_stats().used_bytes, 0);
+        let before_drop = governor.telemetry();
+        assert_eq!(
+            before_drop.current_capacity_bytes,
+            u64::try_from(aster_runtime::ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES)
+                .expect("page capacity fits telemetry")
+        );
+        assert_eq!(before_drop.grant_events, 1);
+        assert_eq!(before_drop.release_events, 0);
+        drop(context);
+        let after_drop = governor.telemetry();
+        assert_eq!(after_drop.current_capacity_bytes, 0);
+        assert_eq!(after_drop.release_events, 1);
     }
 
     #[test]

@@ -81,4 +81,20 @@ impl Codegen {
         }
         Ok(())
     }
+
+    pub(super) fn leave_temporary_subregion(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new("temporary subregion is missing its ExecutionContext")
+        })?;
+        let function_ref = self.jit.declare_func_in_func(
+            self.runtime_ids["aster_rt_temporary_subregion_exit"],
+            builder.func,
+        );
+        builder.ins().call(function_ref, &[context]);
+        Ok(())
+    }
 }

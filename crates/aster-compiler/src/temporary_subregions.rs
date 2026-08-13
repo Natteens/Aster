@@ -2,11 +2,16 @@
 //!
 //! Candidate metadata is deliberately non-executable. The normal compiler
 //! pipeline never invokes this module, and the execution backend rejects every
-//! non-empty candidate list until later runtime checkpoint integration exists.
+//! non-empty candidate list. Only the explicit research lowering below can
+//! replace validated candidates with executable checkpoint instructions.
 
 #![cfg_attr(not(test), allow(dead_code))]
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    fmt,
+};
 
 use aster_mir as mir;
 
@@ -15,6 +20,42 @@ use crate::{escape_analysis, lifetime_analysis::LifetimeAnalysisReport};
 mod validation;
 
 use validation::TemporarySubregionValidationReport;
+
+/// Deterministic evidence from the experimental AARM-5D MIR transformation.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AarmTemporarySubregionLoweringReport {
+    pub validated_subregions_received: usize,
+    pub subregions_lowered: usize,
+    pub enter_instructions_inserted: usize,
+    pub exit_instructions_inserted: usize,
+}
+
+/// Controlled failure from the experimental AARM-5D MIR transformation.
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AarmTemporarySubregionLoweringError {
+    message: &'static str,
+}
+
+impl AarmTemporarySubregionLoweringError {
+    const fn new(message: &'static str) -> Self {
+        Self { message }
+    }
+
+    #[must_use]
+    pub const fn message(&self) -> &'static str {
+        self.message
+    }
+}
+
+impl fmt::Display for AarmTemporarySubregionLoweringError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl Error for AarmTemporarySubregionLoweringError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TemporarySubregionResearchAnalysis {
@@ -26,6 +67,155 @@ struct TemporarySubregionResearchAnalysis {
 struct FunctionCandidatePlan {
     function: mir::SymbolId,
     candidates: Vec<mir::TemporarySubregionCandidate>,
+}
+
+/// Opt in to the exact AARM-5A -> 5B -> 5C -> 5D research pipeline.
+///
+/// Ordinary [`crate::compile`] never calls this function. The transformation
+/// operates on a clone, derives validation from that exact immutable MIR
+/// snapshot, builds every transformed instruction stream before publication,
+/// and replaces `module` only after the complete transformation succeeds.
+/// Candidate metadata is cleared from the executable result so explicit MIR
+/// instructions are its only subregion execution authority.
+#[doc(hidden)]
+pub fn lower_aarm_temporary_subregions_for_research(
+    module: &mut mir::Module,
+) -> Result<AarmTemporarySubregionLoweringReport, AarmTemporarySubregionLoweringError> {
+    let mut analyzed = module.clone();
+    if analyzed
+        .functions
+        .iter()
+        .any(function_contains_executable_subregion_instruction)
+    {
+        return Err(AarmTemporarySubregionLoweringError::new(
+            "AARM executable subregion lowering requires untransformed MIR",
+        ));
+    }
+    escape_analysis::assign_allocation_regions(&mut analyzed);
+    let analysis = analyze_plan_and_validate_candidate_subregions(&mut analyzed);
+    let (lowered, report) = lower_validated_exact_snapshot(&analyzed, &analysis.validation)?;
+    *module = lowered;
+    Ok(report)
+}
+
+#[allow(clippy::too_many_lines)]
+fn lower_validated_exact_snapshot(
+    module: &mir::Module,
+    validation: &TemporarySubregionValidationReport,
+) -> Result<(mir::Module, AarmTemporarySubregionLoweringReport), AarmTemporarySubregionLoweringError>
+{
+    let mut lowered = module.clone();
+    let mut report = AarmTemporarySubregionLoweringReport {
+        validated_subregions_received: validation.validated.len(),
+        ..AarmTemporarySubregionLoweringReport::default()
+    };
+
+    for function in &mut lowered.functions {
+        let subregions = validation
+            .validated
+            .iter()
+            .filter(|subregion| subregion.function == function.symbol)
+            .collect::<Vec<_>>();
+
+        if !subregions.is_empty() {
+            let [block] = function.blocks.as_mut_slice() else {
+                return Err(AarmTemporarySubregionLoweringError::new(
+                    "validated AARM subregion no longer has one basic block",
+                ));
+            };
+            let original = &block.instructions;
+            let mut previous_rewind = None;
+            let mut ids = HashSet::new();
+            for subregion in &subregions {
+                if subregion.checkpoint.block != block.id
+                    || subregion.rewind.block != block.id
+                    || subregion.checkpoint.instruction_boundary
+                        >= subregion.rewind.instruction_boundary
+                    || subregion.rewind.instruction_boundary > original.len()
+                    || previous_rewind
+                        .is_some_and(|rewind| rewind > subregion.checkpoint.instruction_boundary)
+                    || !ids.insert(subregion.id)
+                    || !function
+                        .temporary_subregion_candidates
+                        .iter()
+                        .any(|candidate| {
+                            candidate.id == subregion.id
+                                && candidate.checkpoint == subregion.checkpoint
+                                && candidate.rewinds.as_slice() == [subregion.rewind]
+                                && candidate.allocations == subregion.allocations
+                        })
+                    || subregion.allocations.iter().any(|site| {
+                        site.function != function.symbol
+                            || site.block != block.id
+                            || site.instruction_index < subregion.checkpoint.instruction_boundary
+                            || site.instruction_index >= subregion.rewind.instruction_boundary
+                            || !matches!(
+                                original.get(site.instruction_index),
+                                Some(
+                                    mir::Instruction::AllocateObject {
+                                        region: mir::AllocationRegion::Temporary,
+                                        ..
+                                    } | mir::Instruction::AllocateArray {
+                                        region: mir::AllocationRegion::Temporary,
+                                        ..
+                                    }
+                                )
+                            )
+                    })
+                {
+                    return Err(AarmTemporarySubregionLoweringError::new(
+                        "validated AARM subregion no longer matches its MIR snapshot",
+                    ));
+                }
+                previous_rewind = Some(subregion.rewind.instruction_boundary);
+            }
+
+            let inserted = subregions.len().checked_mul(2).ok_or_else(|| {
+                AarmTemporarySubregionLoweringError::new(
+                    "AARM subregion instruction count exceeds the addressable range",
+                )
+            })?;
+            let capacity = original.len().checked_add(inserted).ok_or_else(|| {
+                AarmTemporarySubregionLoweringError::new(
+                    "AARM subregion instruction count exceeds the addressable range",
+                )
+            })?;
+            let mut instructions = Vec::with_capacity(capacity);
+            for boundary in 0..=original.len() {
+                for subregion in &subregions {
+                    if subregion.rewind.instruction_boundary == boundary {
+                        instructions
+                            .push(mir::Instruction::TemporarySubregionExit { id: subregion.id });
+                        report.exit_instructions_inserted += 1;
+                    }
+                }
+                for subregion in &subregions {
+                    if subregion.checkpoint.instruction_boundary == boundary {
+                        instructions
+                            .push(mir::Instruction::TemporarySubregionEnter { id: subregion.id });
+                        report.enter_instructions_inserted += 1;
+                    }
+                }
+                if let Some(instruction) = original.get(boundary) {
+                    instructions.push(instruction.clone());
+                }
+            }
+            block.instructions = instructions;
+            report.subregions_lowered += subregions.len();
+        }
+        function.temporary_subregion_candidates.clear();
+    }
+
+    if report.subregions_lowered != report.validated_subregions_received
+        || report.enter_instructions_inserted != report.subregions_lowered
+        || report.exit_instructions_inserted != report.subregions_lowered
+    {
+        return Err(AarmTemporarySubregionLoweringError::new(
+            "validated AARM subregion references an unknown function",
+        ));
+    }
+
+    Ok((lowered, report))
 }
 
 /// Run the explicit research-only AARM-5A -> AARM-5B -> AARM-5C orchestration.
@@ -177,6 +367,7 @@ fn plan_function(
             mir::Terminator::Return(_) | mir::Terminator::End
         )
         || function_contains_concurrency_boundary(function)
+        || function_contains_executable_subregion_instruction(function)
     {
         return Vec::new();
     }
@@ -250,6 +441,20 @@ fn plan_function(
     } else {
         Vec::new()
     }
+}
+
+fn function_contains_executable_subregion_instruction(function: &mir::Function) -> bool {
+    function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .any(|instruction| {
+            matches!(
+                instruction,
+                mir::Instruction::TemporarySubregionEnter { .. }
+                    | mir::Instruction::TemporarySubregionExit { .. }
+            )
+        })
 }
 
 fn function_contains_concurrency_boundary(function: &mir::Function) -> bool {
@@ -1199,6 +1404,70 @@ public int Main() {
         }
 
         #[test]
+        fn rejected_younger_and_live_alias_artifacts_never_reach_5d_lowering() {
+            let assert_not_lowered = |mut module: mir::Module,
+                                      candidate: mir::TemporarySubregionCandidate,
+                                      expected: Reason| {
+                escape_analysis::assign_allocation_regions(&mut module);
+                let lifetime = crate::lifetime_analysis::analyze(&module);
+                let validation =
+                    validate_with_report(&module, &lifetime, std::slice::from_ref(&candidate));
+                assert_eq!(reason(&validation), expected);
+
+                module.functions[0].temporary_subregion_candidates = vec![candidate];
+                let (lowered, report) = lower_validated_exact_snapshot(&module, &validation)
+                    .expect("an empty validated set lowers without executable markers");
+                assert_eq!(report, AarmTemporarySubregionLoweringReport::default());
+                assert!(
+                    lowered.functions[0]
+                        .temporary_subregion_candidates
+                        .is_empty(),
+                    "rejected candidate metadata is cleared"
+                );
+                assert!(lowered.functions[0].blocks[0].instructions.iter().all(
+                    |instruction| !matches!(
+                        instruction,
+                        mir::Instruction::TemporarySubregionEnter { .. }
+                            | mir::Instruction::TemporarySubregionExit { .. }
+                    )
+                ));
+            };
+
+            assert_not_lowered(
+                end_function(
+                    vec![
+                        temporary_object(1),
+                        temporary_object(2),
+                        observe_object(1),
+                        observe_object(2),
+                    ],
+                    vec![object_local(1), object_local(2)],
+                ),
+                candidate(0, 0, 3, vec![0]),
+                Reason::UnaccountedTemporaryAllocation,
+            );
+
+            assert_not_lowered(
+                end_function(
+                    vec![
+                        temporary_object(1),
+                        mir::Instruction::Assign {
+                            target: mir::Place::Local(mir::LocalId(2)),
+                            value: mir::Rvalue {
+                                type_: mir::Type::Class(CLASS),
+                                kind: mir::RvalueKind::Use(copy(1, mir::Type::Class(CLASS))),
+                            },
+                        },
+                        observe_object(2),
+                    ],
+                    vec![object_local(1), object_local(2)],
+                ),
+                candidate(0, 0, 2, vec![0]),
+                Reason::MissingReferenceDeathProof,
+            );
+        }
+
+        #[test]
         fn allocation_on_the_older_final_use_instruction_cannot_validate_older_only() {
             let allocate_older = mir::Instruction::CallIntrinsic {
                 destination: Some(mir::Place::Local(mir::LocalId(1))),
@@ -1682,6 +1951,218 @@ public int Main() {
         }
 
         #[test]
+        fn collection_and_string_rvalues_inside_span_are_rejected() {
+            let list_type = mir::Type::List(Box::new(mir::Type::Int));
+            let dictionary_type =
+                mir::Type::Dictionary(Box::new(mir::Type::Int), Box::new(mir::Type::Int));
+            for value in [
+                mir::Rvalue {
+                    type_: mir::Type::Int,
+                    kind: mir::RvalueKind::ListLength(copy(1, list_type.clone())),
+                },
+                mir::Rvalue {
+                    type_: mir::Type::Int,
+                    kind: mir::RvalueKind::ListVersion(copy(1, list_type.clone())),
+                },
+                mir::Rvalue {
+                    type_: mir::Type::Int,
+                    kind: mir::RvalueKind::DictionaryLength(copy(1, dictionary_type.clone())),
+                },
+            ] {
+                let report = validate_raw(
+                    end_function(
+                        vec![
+                            temporary_object(2),
+                            mir::Instruction::Assign {
+                                target: mir::Place::Local(SINK),
+                                value,
+                            },
+                            observe_object(2),
+                        ],
+                        vec![local(1, list_type.clone()), object_local(2)],
+                    ),
+                    vec![candidate(0, 0, 3, vec![0])],
+                );
+                assert_eq!(reason(&report), Reason::CollectionBarrier);
+            }
+
+            for value in [
+                mir::Rvalue {
+                    type_: mir::Type::Int,
+                    kind: mir::RvalueKind::StringByteLength(copy(1, mir::Type::String)),
+                },
+                mir::Rvalue {
+                    type_: mir::Type::Bool,
+                    kind: mir::RvalueKind::Equality {
+                        left: copy(1, mir::Type::String),
+                        right: copy(1, mir::Type::String),
+                        negated: false,
+                    },
+                },
+            ] {
+                let report = validate_raw(
+                    end_function(
+                        vec![
+                            temporary_object(2),
+                            mir::Instruction::Assign {
+                                target: mir::Place::Local(SINK),
+                                value,
+                            },
+                            observe_object(2),
+                        ],
+                        vec![local(1, mir::Type::String), object_local(2)],
+                    ),
+                    vec![candidate(0, 0, 3, vec![0])],
+                );
+                assert_eq!(reason(&report), Reason::StringBarrier);
+            }
+        }
+
+        #[test]
+        fn object_fields_array_indexes_and_array_length_are_execution_safe() {
+            let object = copy(1, mir::Type::Class(CLASS));
+            let object_field = mir::Place::ObjectField {
+                object: Box::new(object.clone()),
+                field: mir::SymbolId(777),
+            };
+            let object_report = validate_raw(
+                end_function(
+                    vec![
+                        temporary_object(1),
+                        mir::Instruction::Assign {
+                            target: object_field.clone(),
+                            value: mir::Rvalue {
+                                type_: mir::Type::Int,
+                                kind: mir::RvalueKind::Use(mir::Operand {
+                                    type_: mir::Type::Int,
+                                    kind: mir::OperandKind::Constant(mir::Constant::Integer(
+                                        "7".into(),
+                                    )),
+                                }),
+                            },
+                        },
+                        mir::Instruction::Assign {
+                            target: mir::Place::Local(mir::LocalId(3)),
+                            value: mir::Rvalue {
+                                type_: mir::Type::Int,
+                                kind: mir::RvalueKind::Use(mir::Operand {
+                                    type_: mir::Type::Int,
+                                    kind: mir::OperandKind::Copy(object_field),
+                                }),
+                            },
+                        },
+                        observe_object(1),
+                    ],
+                    vec![object_local(1), local(3, mir::Type::Int)],
+                ),
+                vec![candidate(0, 0, 4, vec![0])],
+            );
+            assert_eq!(object_report.validated.len(), 1);
+            assert!(object_report.rejected.is_empty());
+
+            let array_type = mir::Type::Array(Box::new(mir::Type::Int));
+            let array = copy(1, array_type.clone());
+            let index = mir::Operand {
+                type_: mir::Type::Int,
+                kind: mir::OperandKind::Constant(mir::Constant::Integer("0".into())),
+            };
+            let array_index = mir::Place::Index {
+                array: Box::new(array.clone()),
+                index: Box::new(index),
+                element_type: mir::Type::Int,
+            };
+            let array_report = validate_raw(
+                end_function(
+                    vec![
+                        temporary_array(1),
+                        mir::Instruction::Assign {
+                            target: array_index.clone(),
+                            value: mir::Rvalue {
+                                type_: mir::Type::Int,
+                                kind: mir::RvalueKind::Use(mir::Operand {
+                                    type_: mir::Type::Int,
+                                    kind: mir::OperandKind::Constant(mir::Constant::Integer(
+                                        "11".into(),
+                                    )),
+                                }),
+                            },
+                        },
+                        mir::Instruction::Assign {
+                            target: mir::Place::Local(mir::LocalId(3)),
+                            value: mir::Rvalue {
+                                type_: mir::Type::Int,
+                                kind: mir::RvalueKind::Use(mir::Operand {
+                                    type_: mir::Type::Int,
+                                    kind: mir::OperandKind::Copy(array_index),
+                                }),
+                            },
+                        },
+                        mir::Instruction::Assign {
+                            target: mir::Place::Local(mir::LocalId(4)),
+                            value: mir::Rvalue {
+                                type_: mir::Type::Int,
+                                kind: mir::RvalueKind::ArrayLength(array),
+                            },
+                        },
+                    ],
+                    vec![
+                        local(1, array_type),
+                        local(3, mir::Type::Int),
+                        local(4, mir::Type::Int),
+                    ],
+                ),
+                vec![candidate(0, 0, 4, vec![0])],
+            );
+            assert_eq!(array_report.validated.len(), 1);
+            assert!(array_report.rejected.is_empty());
+        }
+
+        #[test]
+        fn execution_unsafe_assign_forms_are_rejected_before_5d() {
+            let divide = mir::Instruction::Assign {
+                target: mir::Place::Local(SINK),
+                value: mir::Rvalue {
+                    type_: mir::Type::Int,
+                    kind: mir::RvalueKind::Binary {
+                        left: mir::Operand {
+                            type_: mir::Type::Int,
+                            kind: mir::OperandKind::Constant(mir::Constant::Integer("8".into())),
+                        },
+                        operator: mir::BinaryOperator::Divide,
+                        right: mir::Operand {
+                            type_: mir::Type::Int,
+                            kind: mir::OperandKind::Constant(mir::Constant::Integer("2".into())),
+                        },
+                    },
+                },
+            };
+            let nonlocal_target = mir::Instruction::Assign {
+                target: mir::Place::Field {
+                    base: Box::new(mir::Place::Local(SINK)),
+                    field: mir::SymbolId(777),
+                },
+                value: mir::Rvalue {
+                    type_: mir::Type::Bool,
+                    kind: mir::RvalueKind::Use(mir::Operand {
+                        type_: mir::Type::Bool,
+                        kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                    }),
+                },
+            };
+
+            for instruction in [divide, nonlocal_target] {
+                let report = validate_raw(
+                    end_function(
+                        vec![temporary_object(2), instruction, observe_object(2)],
+                        vec![object_local(2)],
+                    ),
+                    vec![candidate(0, 0, 3, vec![0])],
+                );
+                assert_eq!(reason(&report), Reason::UnsupportedInstruction);
+            }
+        }
+
+        #[test]
         fn every_task_async_and_parallel_intrinsic_is_a_function_barrier() {
             let intrinsics = [
                 mir::Intrinsic::TaskRun,
@@ -1742,5 +2223,184 @@ public int Main() {
             assert!(ambiguous.validation.validated.is_empty());
             assert!(ambiguous.validation.rejected.is_empty());
         }
+    }
+
+    #[test]
+    fn research_lowering_inserts_sequential_boundaries_atomically_and_clears_candidates() {
+        let mut module = module(vec![function(
+            FUNCTION,
+            BLOCK.0,
+            vec![block(
+                BLOCK.0,
+                vec![
+                    allocate_object(1),
+                    observe_object(1),
+                    allocate_object(2),
+                    observe_object(2),
+                ],
+                mir::Terminator::End,
+            )],
+            vec![object_local(1), object_local(2)],
+        )]);
+
+        let report = lower_aarm_temporary_subregions_for_research(&mut module)
+            .expect("validated sequential subregions lower");
+
+        assert_eq!(
+            report,
+            AarmTemporarySubregionLoweringReport {
+                validated_subregions_received: 2,
+                subregions_lowered: 2,
+                enter_instructions_inserted: 2,
+                exit_instructions_inserted: 2,
+            }
+        );
+        let instructions = &module.functions[0].blocks[0].instructions;
+        assert!(matches!(
+            instructions[0],
+            mir::Instruction::TemporarySubregionEnter {
+                id: mir::TemporarySubregionId(0)
+            }
+        ));
+        assert!(matches!(
+            instructions[1],
+            mir::Instruction::AllocateObject { .. }
+        ));
+        assert!(matches!(instructions[2], mir::Instruction::Assign { .. }));
+        assert!(matches!(
+            instructions[3],
+            mir::Instruction::TemporarySubregionExit {
+                id: mir::TemporarySubregionId(0)
+            }
+        ));
+        assert!(matches!(
+            instructions[4],
+            mir::Instruction::TemporarySubregionEnter {
+                id: mir::TemporarySubregionId(1)
+            }
+        ));
+        assert!(matches!(
+            instructions[5],
+            mir::Instruction::AllocateObject { .. }
+        ));
+        assert!(matches!(instructions[6], mir::Instruction::Assign { .. }));
+        assert!(matches!(
+            instructions[7],
+            mir::Instruction::TemporarySubregionExit {
+                id: mir::TemporarySubregionId(1)
+            }
+        ));
+        assert!(
+            module.functions[0]
+                .temporary_subregion_candidates
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rejected_candidate_never_becomes_executable() {
+        let intrinsic = mir::Instruction::CallIntrinsic {
+            destination: None,
+            intrinsic: mir::Intrinsic::Log,
+            arguments: Vec::new(),
+            return_type: mir::Type::Void,
+        };
+        let mut module = module(vec![function(
+            FUNCTION,
+            BLOCK.0,
+            vec![block(
+                BLOCK.0,
+                vec![allocate_object(1), intrinsic, observe_object(1)],
+                mir::Terminator::End,
+            )],
+            vec![object_local(1)],
+        )]);
+
+        let report = lower_aarm_temporary_subregions_for_research(&mut module)
+            .expect("rejected research candidates are safely omitted");
+        assert_eq!(report.subregions_lowered, 0);
+        assert!(
+            module.functions[0]
+                .temporary_subregion_candidates
+                .is_empty()
+        );
+        assert!(
+            module.functions[0].blocks[0]
+                .instructions
+                .iter()
+                .all(|instruction| {
+                    !matches!(
+                        instruction,
+                        mir::Instruction::TemporarySubregionEnter { .. }
+                            | mir::Instruction::TemporarySubregionExit { .. }
+                    )
+                })
+        );
+    }
+
+    #[test]
+    fn preexisting_executable_marker_is_rejected_atomically() {
+        let mut module = module(vec![function(
+            FUNCTION,
+            BLOCK.0,
+            vec![block(
+                BLOCK.0,
+                vec![mir::Instruction::TemporarySubregionEnter {
+                    id: mir::TemporarySubregionId(7),
+                }],
+                mir::Terminator::End,
+            )],
+            Vec::new(),
+        )]);
+        let before = module.clone();
+
+        let error = lower_aarm_temporary_subregions_for_research(&mut module)
+            .expect_err("preexisting executable authority must be rejected");
+
+        assert_eq!(
+            error.message(),
+            "AARM executable subregion lowering requires untransformed MIR"
+        );
+        assert_eq!(module, before);
+    }
+
+    #[test]
+    fn stale_validated_artifact_leaves_the_complete_module_unchanged() {
+        let mut module = module(vec![function(
+            FUNCTION,
+            BLOCK.0,
+            vec![block(
+                BLOCK.0,
+                vec![allocate_object(1), observe_object(1)],
+                mir::Terminator::End,
+            )],
+            vec![object_local(1)],
+        )]);
+        escape_analysis::assign_allocation_regions(&mut module);
+        let mut analysis = analyze_plan_and_validate_candidate_subregions(&mut module);
+        analysis.validation.validated[0].rewind.instruction_boundary = usize::MAX;
+        let before = module.clone();
+
+        let result = lower_validated_exact_snapshot(&module, &analysis.validation);
+
+        assert!(result.is_err());
+        assert_eq!(module, before);
+    }
+
+    #[test]
+    fn ordinary_compile_emits_no_executable_subregion_instructions() {
+        let source = "public class Box { public int value; } public int Run() { Box box = new Box(); box.value = 7; return box.value; }";
+        let compilation = crate::compile(source).expect("ordinary compilation succeeds");
+        assert!(compilation.mir.functions.iter().all(|function| {
+            function.blocks.iter().all(|block| {
+                block.instructions.iter().all(|instruction| {
+                    !matches!(
+                        instruction,
+                        mir::Instruction::TemporarySubregionEnter { .. }
+                            | mir::Instruction::TemporarySubregionExit { .. }
+                    )
+                })
+            })
+        }));
     }
 }

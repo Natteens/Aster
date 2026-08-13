@@ -16,7 +16,8 @@ use crate::context::{
     aster_rt_list_version_mismatch, aster_rt_string_builder_append, aster_rt_string_builder_new,
     aster_rt_string_builder_new_temporary, aster_rt_string_builder_to_string,
     aster_rt_string_builder_to_string_temporary, aster_rt_temporary_scope_enter,
-    aster_rt_temporary_scope_leave,
+    aster_rt_temporary_scope_leave, aster_rt_temporary_subregion_enter,
+    aster_rt_temporary_subregion_exit,
 };
 use crate::filesystem::{
     aster_rt_io_list_files, aster_rt_io_list_files_temporary, aster_rt_io_read_all_text,
@@ -136,6 +137,22 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
         RuntimeFunction {
             name: "aster_rt_temporary_scope_leave",
             address: aster_rt_temporary_scope_leave as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_temporary_subregion_enter",
+            address: aster_rt_temporary_subregion_enter as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_temporary_subregion_exit",
+            address: aster_rt_temporary_subregion_exit as *const u8,
             signature: RuntimeSignature {
                 parameters: &[RuntimeType::Pointer],
                 result: None,
@@ -1191,6 +1208,8 @@ mod tests {
         for name in [
             "aster_rt_temporary_scope_enter",
             "aster_rt_temporary_scope_leave",
+            "aster_rt_temporary_subregion_enter",
+            "aster_rt_temporary_subregion_exit",
         ] {
             let function = functions
                 .iter()
