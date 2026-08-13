@@ -715,6 +715,9 @@ pub(crate) struct AarmDelayedPurgePolicy {
     pub inactive_delay: Duration,
     pub repurge_cooldown: Duration,
     pub sweep_interval: Duration,
+    /// Maximum exact logical capacity of otherwise-purgeable regular pages
+    /// protected during Normal maintenance.
+    pub regular_hot_cache_bytes: usize,
 }
 
 /// Caller-owned advisory pressure for one maintenance invocation.
@@ -747,6 +750,8 @@ pub(crate) struct DelayedPurgeReport {
     pub eligible: usize,
     pub deferred_inactive_delay: usize,
     pub deferred_hysteresis: usize,
+    pub deferred_hot_cache: usize,
+    pub hot_cache_protected_logical_bytes: usize,
     pub pressure_bypassed_inactive_delay: usize,
     pub pressure_bypassed_hysteresis: usize,
     pub discarded: usize,
@@ -963,6 +968,11 @@ impl PagedArena {
             state.last_sweep_at = now;
         }
         let policy = state.policy;
+        let mut regular_hot_cache_remaining = if pressure == AarmMemoryPressure::Normal {
+            policy.regular_hot_cache_bytes
+        } else {
+            0
+        };
 
         assert!(
             self.pages[self.active_pages..]
@@ -1006,6 +1016,19 @@ impl PagedArena {
                             continue;
                         }
                     }
+                    let capacity = page.capacity();
+                    if pressure == AarmMemoryPressure::Normal
+                        && capacity <= DEFAULT_PAGE_SIZE
+                        && capacity <= regular_hot_cache_remaining
+                    {
+                        regular_hot_cache_remaining -= capacity;
+                        report.deferred_hot_cache += 1;
+                        report.hot_cache_protected_logical_bytes = report
+                            .hot_cache_protected_logical_bytes
+                            .checked_add(capacity)
+                            .expect("hot-cache protected logical bytes must fit policy budget");
+                        continue;
+                    }
 
                     report.eligible += 1;
                     if page.backing.discard().is_ok() {
@@ -1024,9 +1047,11 @@ impl PagedArena {
                 + report.unsupported
                 + report.deferred_inactive_delay
                 + report.deferred_hysteresis
+                + report.deferred_hot_cache
                 + report.eligible
         );
         debug_assert_eq!(report.eligible, report.discarded + report.failed);
+        debug_assert!(report.hot_cache_protected_logical_bytes <= policy.regular_hot_cache_bytes);
         report
     }
 
@@ -1836,6 +1861,19 @@ mod tests {
             inactive_delay: Duration::from_millis(inactive_delay_ms),
             repurge_cooldown: Duration::from_millis(repurge_cooldown_ms),
             sweep_interval: Duration::from_millis(sweep_interval_ms),
+            regular_hot_cache_bytes: 0,
+        }
+    }
+
+    fn delayed_policy_with_hot_cache(
+        inactive_delay_ms: u64,
+        repurge_cooldown_ms: u64,
+        sweep_interval_ms: u64,
+        regular_hot_cache_bytes: usize,
+    ) -> AarmDelayedPurgePolicy {
+        AarmDelayedPurgePolicy {
+            regular_hot_cache_bytes,
+            ..delayed_policy(inactive_delay_ms, repurge_cooldown_ms, sweep_interval_ms)
         }
     }
 
@@ -2266,6 +2304,7 @@ mod tests {
                 + report.unsupported
                 + report.deferred_inactive_delay
                 + report.deferred_hysteresis
+                + report.deferred_hot_cache
                 + report.eligible
         );
         assert_eq!(arena.active_page_count(), 1);
@@ -2329,6 +2368,300 @@ mod tests {
 
         drop(first);
         drop(second);
+        let after = governor.telemetry();
+        assert_eq!(after.current_capacity_bytes, 0);
+        assert_eq!(after.grant_events, after.release_events);
+        assert_eq!(
+            after.granted_bytes_cumulative,
+            after.released_bytes_cumulative
+        );
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    #[test]
+    fn normal_hot_cache_protects_regular_pages_in_arena_order_within_exact_budget() {
+        let backend = test_vm_backend(false, false);
+        let mut arena = PagedArena::with_backend(backend);
+        let t0 = Instant::now();
+        arena.enable_delayed_purge(
+            delayed_policy_with_hot_cache(100, 0, 0, DEFAULT_PAGE_SIZE),
+            t0,
+        );
+        let root = arena.mark();
+        let capacities = [
+            MIN_PAGE_SIZE,
+            MIN_PAGE_SIZE * 2,
+            MIN_PAGE_SIZE * 4,
+            MIN_PAGE_SIZE * 8,
+            DEFAULT_PAGE_SIZE,
+            DEFAULT_PAGE_SIZE + 1,
+        ];
+        for capacity in capacities {
+            arena.alloc_at(capacity, 1, t0);
+        }
+        arena.rewind_at(root, t0);
+
+        let report = arena.maintain_delayed_purge(t0 + Duration::from_millis(100));
+        let protected = MIN_PAGE_SIZE * (1 + 2 + 4 + 8);
+        assert_eq!(
+            report,
+            DelayedPurgeReport {
+                sweep_performed: true,
+                examined: capacities.len(),
+                eligible: 2,
+                deferred_hot_cache: 4,
+                hot_cache_protected_logical_bytes: protected,
+                discarded: 2,
+                ..DelayedPurgeReport::default()
+            }
+        );
+        assert!(report.hot_cache_protected_logical_bytes <= DEFAULT_PAGE_SIZE);
+        for page in &arena.pages[..4] {
+            assert_eq!(page.backing_state(), PageBackingState::Retained);
+        }
+        assert_eq!(arena.pages[4].capacity(), DEFAULT_PAGE_SIZE);
+        assert_eq!(arena.pages[4].backing_state(), PageBackingState::Discarded);
+        assert!(arena.pages[5].capacity() > DEFAULT_PAGE_SIZE);
+        assert_eq!(arena.pages[5].backing_state(), PageBackingState::Discarded);
+        assert_eq!(backend.discard_calls.load(Ordering::Relaxed), 2);
+
+        let telemetry = arena.telemetry_snapshot().expect("telemetry is enabled");
+        assert_eq!(telemetry.backing_retained_bytes, Some(protected));
+        assert_eq!(
+            telemetry.backing_discarded_bytes,
+            Some(DEFAULT_PAGE_SIZE + DEFAULT_PAGE_SIZE + 1)
+        );
+        assert_eq!(
+            telemetry.virtual_extent_bytes,
+            Some(protected + DEFAULT_PAGE_SIZE + DEFAULT_PAGE_SIZE + 1)
+        );
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    #[test]
+    fn hot_cache_overflow_and_oversized_reuse_plateau_for_256_cycles() {
+        const CYCLES: usize = 256;
+        let backend = test_vm_backend(false, false);
+        let t0 = Instant::now();
+        let capacities = [
+            MIN_PAGE_SIZE,
+            MIN_PAGE_SIZE * 2,
+            MIN_PAGE_SIZE * 4,
+            MIN_PAGE_SIZE * 8,
+            DEFAULT_PAGE_SIZE,
+            DEFAULT_PAGE_SIZE + 1,
+        ];
+        let protected = MIN_PAGE_SIZE * (1 + 2 + 4 + 8);
+        let total_capacity = capacities.iter().sum::<usize>();
+        let mut initial_bases = Vec::with_capacity(capacities.len());
+
+        {
+            let mut arena = PagedArena::with_backend(backend);
+            arena.enable_delayed_purge(
+                delayed_policy_with_hot_cache(1, 0, 0, DEFAULT_PAGE_SIZE),
+                t0,
+            );
+            for cycle in 0..CYCLES {
+                let now = t0 + Duration::from_millis((cycle as u64) * 2);
+                let mark = arena.mark();
+                for (index, capacity) in capacities.iter().copied().enumerate() {
+                    let pointer = arena.alloc_at(capacity, 1, now);
+                    if cycle == 0 {
+                        initial_bases.push(pointer);
+                    } else {
+                        assert_eq!(pointer, initial_bases[index]);
+                    }
+                    // SAFETY: `pointer` denotes the live allocation above.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        pointer.write(0xA5);
+                    }
+                }
+                arena.rewind_at(mark, now);
+                let report = arena.maintain_delayed_purge(now + Duration::from_millis(1));
+                assert_eq!(report.deferred_hot_cache, 4);
+                assert_eq!(report.hot_cache_protected_logical_bytes, protected);
+                assert_eq!(report.discarded, 2);
+                assert_eq!(arena.reserved_bytes, total_capacity);
+                let telemetry = arena.telemetry_snapshot().expect("telemetry is enabled");
+                assert_eq!(telemetry.virtual_extent_bytes, Some(total_capacity));
+                assert_eq!(telemetry.backing_retained_bytes, Some(protected));
+                assert_eq!(
+                    telemetry.backing_discarded_bytes,
+                    Some(total_capacity - protected)
+                );
+            }
+            assert_eq!(
+                backend.allocation_calls.load(Ordering::Relaxed),
+                capacities.len()
+            );
+            assert_eq!(backend.discard_calls.load(Ordering::Relaxed), CYCLES * 2);
+            assert_eq!(
+                backend.restore_calls.load(Ordering::Relaxed),
+                (CYCLES - 1) * 2
+            );
+        }
+        assert_eq!(
+            backend.release_calls.load(Ordering::Relaxed),
+            capacities.len()
+        );
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    #[test]
+    fn zero_and_large_hot_cache_budgets_preserve_old_behavior_and_exclude_oversized_pages() {
+        let t0 = Instant::now();
+        let zero_backend = test_vm_backend(false, false);
+        let mut zero = PagedArena::with_backend(zero_backend);
+        zero.enable_delayed_purge(delayed_policy_with_hot_cache(100, 0, 0, 0), t0);
+        let zero_mark = zero.mark();
+        zero.alloc_at(MIN_PAGE_SIZE, 1, t0);
+        zero.rewind_at(zero_mark, t0);
+        assert_eq!(
+            zero.maintain_delayed_purge(t0 + Duration::from_millis(100)),
+            DelayedPurgeReport {
+                sweep_performed: true,
+                examined: 1,
+                eligible: 1,
+                discarded: 1,
+                ..DelayedPurgeReport::default()
+            }
+        );
+
+        let exact_backend = test_vm_backend(false, false);
+        let mut exact = PagedArena::with_backend(exact_backend);
+        exact.enable_delayed_purge(
+            delayed_policy_with_hot_cache(100, 0, 0, DEFAULT_PAGE_SIZE),
+            t0,
+        );
+        let exact_mark = exact.mark();
+        exact.alloc_at(DEFAULT_PAGE_SIZE, 1, t0);
+        exact.rewind_at(exact_mark, t0);
+        let exact_report = exact.maintain_delayed_purge(t0 + Duration::from_millis(100));
+        assert_eq!(exact_report.deferred_hot_cache, 1);
+        assert_eq!(
+            exact_report.hot_cache_protected_logical_bytes,
+            DEFAULT_PAGE_SIZE
+        );
+        assert_eq!(exact_report.discarded, 0);
+        assert_eq!(exact_backend.discard_calls.load(Ordering::Relaxed), 0);
+
+        let large_backend = test_vm_backend(false, false);
+        let mut large = PagedArena::with_backend(large_backend);
+        large.enable_delayed_purge(delayed_policy_with_hot_cache(100, 0, 0, usize::MAX), t0);
+        let large_mark = large.mark();
+        large.alloc_at(MIN_PAGE_SIZE, 1, t0);
+        large.alloc_at(DEFAULT_PAGE_SIZE + 1, 1, t0);
+        large.rewind_at(large_mark, t0);
+        let report = large.maintain_delayed_purge(t0 + Duration::from_millis(100));
+        assert_eq!(report.deferred_hot_cache, 1);
+        assert_eq!(report.hot_cache_protected_logical_bytes, MIN_PAGE_SIZE);
+        assert_eq!(report.discarded, 1);
+        assert_eq!(large.pages[0].backing_state(), PageBackingState::Retained);
+        assert_eq!(large.pages[1].backing_state(), PageBackingState::Discarded);
+        assert_eq!(large_backend.discard_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    #[test]
+    fn pressure_bypasses_hot_cache_and_immediate_purge_remains_unconditional() {
+        let backend = test_vm_backend(false, false);
+        let mut arena = PagedArena::with_backend(backend);
+        let t0 = Instant::now();
+        arena.enable_delayed_purge(
+            delayed_policy_with_hot_cache(100, 250, 1_000, MIN_PAGE_SIZE),
+            t0,
+        );
+        let root = arena.mark();
+        let original = arena.alloc_at(MIN_PAGE_SIZE, 1, t0);
+        arena.rewind_at(root, t0);
+
+        let normal_at = t0 + Duration::from_secs(1);
+        let normal = arena.maintain_delayed_purge(normal_at);
+        assert_eq!(normal.deferred_hot_cache, 1);
+        assert_eq!(normal.hot_cache_protected_logical_bytes, MIN_PAGE_SIZE);
+        assert_eq!(backend.discard_calls.load(Ordering::Relaxed), 0);
+
+        let elevated =
+            arena.maintain_delayed_purge_under_pressure(normal_at, AarmMemoryPressure::Elevated);
+        assert_eq!(elevated.discarded, 1);
+        assert_eq!(elevated.deferred_hot_cache, 0);
+        let restore_at = normal_at + Duration::from_millis(1);
+        let restored_mark = arena.mark();
+        let restored = arena.alloc_at(MIN_PAGE_SIZE, 1, restore_at);
+        assert_eq!(restored, original);
+        // SAFETY: the restored allocation is live and zero-on-reuse is required.
+        #[allow(unsafe_code)]
+        let restored_byte = unsafe { restored.read() };
+        assert_eq!(restored_byte, 0);
+        arena.rewind_at(restored_mark, restore_at);
+
+        let elevated_again = arena.maintain_delayed_purge_under_pressure(
+            restore_at + Duration::from_millis(1),
+            AarmMemoryPressure::Elevated,
+        );
+        assert_eq!(elevated_again.deferred_hysteresis, 1);
+        assert_eq!(elevated_again.discarded, 0);
+        let critical = arena.maintain_delayed_purge_under_pressure(
+            restore_at + Duration::from_millis(1),
+            AarmMemoryPressure::Critical,
+        );
+        assert_eq!(critical.pressure_bypassed_hysteresis, 1);
+        assert_eq!(critical.discarded, 1);
+
+        let second_restore_at = restore_at + Duration::from_millis(2);
+        let second_mark = arena.mark();
+        assert_eq!(
+            arena.alloc_at(MIN_PAGE_SIZE, 1, second_restore_at),
+            original
+        );
+        arena.rewind_at(second_mark, second_restore_at);
+        assert_eq!(arena.purge_inactive_pages().discarded, 1);
+        assert_eq!(backend.discard_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(backend.restore_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(backend.allocation_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    #[test]
+    fn hot_cache_policy_preserves_shared_governor_authority_and_logical_oom() {
+        let backend = test_vm_backend(false, false);
+        let governor = Arc::new(MemoryGovernor::new(MIN_PAGE_SIZE * 2));
+        let mut cached =
+            PagedArena::with_backend_and_memory_governor(backend, Arc::clone(&governor));
+        let mut uncached =
+            PagedArena::with_backend_and_memory_governor(backend, Arc::clone(&governor));
+        let t0 = Instant::now();
+        cached.enable_delayed_purge(delayed_policy_with_hot_cache(100, 0, 0, MIN_PAGE_SIZE), t0);
+        uncached.enable_delayed_purge(delayed_policy_with_hot_cache(100, 0, 0, 0), t0);
+        for arena in [&mut cached, &mut uncached] {
+            let mark = arena.mark();
+            arena
+                .try_alloc_at(MIN_PAGE_SIZE, 1, usize::MAX, t0)
+                .expect("governed page allocation succeeds");
+            arena.rewind_at(mark, t0);
+        }
+        let before = governor.telemetry();
+        let due = t0 + Duration::from_millis(100);
+        assert_eq!(cached.maintain_delayed_purge(due).deferred_hot_cache, 1);
+        assert_eq!(uncached.maintain_delayed_purge(due).discarded, 1);
+        assert_eq!(governor.telemetry(), before);
+        assert_eq!(
+            cached.try_alloc(MIN_PAGE_SIZE * 2, 1, usize::MAX),
+            Err(ArenaAllocError::SharedLimit {
+                hard_limit_bytes: u64::try_from(MIN_PAGE_SIZE * 2)
+                    .expect("test governor limit fits in u64"),
+            })
+        );
+        let denied = governor.telemetry();
+        assert_eq!(denied.current_capacity_bytes, before.current_capacity_bytes);
+        assert_eq!(denied.hard_limit_bytes, before.hard_limit_bytes);
+        assert_eq!(denied.grant_events, before.grant_events);
+        assert_eq!(denied.release_events, before.release_events);
+        assert_eq!(denied.denial_events, before.denial_events + 1);
+
+        drop(cached);
+        drop(uncached);
         let after = governor.telemetry();
         assert_eq!(after.current_capacity_bytes, 0);
         assert_eq!(after.grant_events, after.release_events);
@@ -2651,7 +2984,10 @@ mod tests {
         let backend = test_backend(false);
         let mut arena = PagedArena::with_backend(backend);
         let t0 = Instant::now();
-        arena.enable_delayed_purge(delayed_policy(1_000, 1_000, 1_000), t0);
+        arena.enable_delayed_purge(
+            delayed_policy_with_hot_cache(1_000, 1_000, 1_000, usize::MAX),
+            t0,
+        );
         let mark = arena.mark();
         arena.alloc_at(MIN_PAGE_SIZE, 1, t0);
         arena.rewind_at(mark, t0);
@@ -2734,6 +3070,48 @@ mod tests {
             assert_eq!(report.discarded == 1, expect_second_purge);
             assert_eq!(report.deferred_hysteresis == 1, !expect_second_purge);
         }
+    }
+
+    #[cfg(all(feature = "aarm-telemetry", any(windows, target_os = "linux")))]
+    #[test]
+    fn normal_hot_cache_excludes_and_restores_oversized_native_backing_in_place() {
+        let capacity = DEFAULT_PAGE_SIZE + 1;
+        let governor = Arc::new(MemoryGovernor::new(capacity));
+        let mut arena = PagedArena::with_memory_governor(Arc::clone(&governor));
+        let t0 = Instant::now();
+        arena.enable_delayed_purge(delayed_policy_with_hot_cache(100, 250, 0, usize::MAX), t0);
+        let first_mark = arena.mark();
+        let original = arena.alloc_at(capacity, 8, t0);
+        // SAFETY: `original` denotes the live oversized allocation.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::write_bytes(original, 0xA5, capacity);
+        }
+        arena.rewind_at(first_mark, t0);
+        let governor_before = governor.telemetry();
+
+        let report = arena.maintain_delayed_purge(t0 + Duration::from_millis(100));
+        assert_eq!(report.deferred_hot_cache, 0);
+        assert_eq!(report.hot_cache_protected_logical_bytes, 0);
+        assert_eq!(report.discarded, 1);
+        assert_eq!(arena.pages[0].backing_state(), PageBackingState::Discarded);
+
+        let restored_at = t0 + Duration::from_millis(101);
+        let second_mark = arena.mark();
+        let restored = arena.alloc_at(capacity, 8, restored_at);
+        assert_eq!(restored, original);
+        // SAFETY: native reuse preparation completed and the allocation is live.
+        #[allow(unsafe_code)]
+        let restored_bytes = unsafe { std::slice::from_raw_parts(restored, capacity) };
+        assert!(restored_bytes.iter().all(|byte| *byte == 0));
+        assert_eq!(governor.telemetry(), governor_before);
+        arena.rewind_at(second_mark, restored_at);
+        assert_eq!(
+            arena
+                .maintain_delayed_purge(restored_at + Duration::from_millis(100))
+                .deferred_hysteresis,
+            1
+        );
     }
 
     #[cfg(all(feature = "aarm-telemetry", any(windows, target_os = "linux")))]
@@ -2897,6 +3275,117 @@ mod tests {
         eprintln!(
             "AARM-4C medians: retained={retained:?} normal_short_gap={delayed_short_gap:?} elevated_purge_reuse={elevated_purge_reuse:?} critical_purge_reuse={critical_purge_reuse:?}"
         );
+    }
+
+    #[cfg(all(feature = "aarm-telemetry", any(windows, target_os = "linux")))]
+    #[test]
+    #[ignore = "manual informational AARM-4D tuning harness"]
+    #[allow(clippy::too_many_lines)]
+    fn benchmark_hot_cache_budget_candidates() {
+        const SAMPLES: usize = 7;
+        const KIB: usize = 1024;
+
+        #[derive(Clone, Copy)]
+        struct Measurement {
+            elapsed: Duration,
+            fresh_backings: u64,
+            discards: usize,
+            restores: usize,
+            logical_capacity: usize,
+            virtual_extent: usize,
+            retained: usize,
+            discarded: usize,
+        }
+
+        fn measure(
+            regular_hot_cache_bytes: usize,
+            allocations: &[usize],
+            cycles: usize,
+        ) -> Measurement {
+            let mut arena = PagedArena::new();
+            let t0 = Instant::now();
+            arena.enable_delayed_purge(
+                delayed_policy_with_hot_cache(1, 0, 0, regular_hot_cache_bytes),
+                t0,
+            );
+            let started = Instant::now();
+            let mut discards = 0usize;
+            let mut restores = 0usize;
+            for cycle in 0..cycles {
+                let now = t0 + Duration::from_millis((cycle as u64) * 2);
+                restores += arena.pages[arena.active_pages..]
+                    .iter()
+                    .filter(|page| page.backing_state() == PageBackingState::Discarded)
+                    .count();
+                let mark = arena.mark();
+                for size in allocations.iter().copied() {
+                    std::hint::black_box(arena.alloc_at(size, 8, now));
+                }
+                arena.rewind_at(mark, now);
+                discards += arena
+                    .maintain_delayed_purge(now + Duration::from_millis(1))
+                    .discarded;
+            }
+            let elapsed = started.elapsed();
+            let telemetry = arena.telemetry_snapshot().expect("telemetry is enabled");
+            Measurement {
+                elapsed,
+                fresh_backings: telemetry.events.fresh_regular_page_allocations
+                    + telemetry.events.fresh_oversized_page_allocations,
+                discards,
+                restores,
+                logical_capacity: telemetry.capacity_bytes,
+                virtual_extent: telemetry
+                    .virtual_extent_bytes
+                    .expect("native VM backend reports extent"),
+                retained: telemetry
+                    .backing_retained_bytes
+                    .expect("native VM backend reports retained backing"),
+                discarded: telemetry
+                    .backing_discarded_bytes
+                    .expect("native VM backend reports discarded backing"),
+            }
+        }
+
+        let workloads = [
+            ("tiny", vec![64; 64], 100usize),
+            ("regular_sustained", vec![KIB; 128], 100),
+            (
+                "burst_idle_burst",
+                vec![4 * KIB, 8 * KIB, 16 * KIB, 32 * KIB, 64 * KIB],
+                100,
+            ),
+            (
+                "mixed_regular",
+                vec![64, 4 * KIB, 16 * KIB, 32 * KIB, 64 * KIB],
+                100,
+            ),
+            (
+                "oversized",
+                vec![DEFAULT_PAGE_SIZE + 1, 256 * KIB, 1024 * KIB],
+                30,
+            ),
+        ];
+        for regular_hot_cache_bytes in [0, 64 * KIB, 256 * KIB, 1024 * KIB] {
+            for (name, allocations, cycles) in &workloads {
+                let mut samples = (0..SAMPLES)
+                    .map(|_| measure(regular_hot_cache_bytes, allocations, *cycles))
+                    .collect::<Vec<_>>();
+                samples.sort_by_key(|sample| sample.elapsed);
+                let median = samples[SAMPLES / 2];
+                eprintln!(
+                    "AARM-4D cache={regular_hot_cache_bytes} workload={name} elapsed={:?} fresh={} discard={} restore={} logical={} virtual={} retained={} discarded={}",
+                    median.elapsed,
+                    median.fresh_backings,
+                    median.discards,
+                    median.restores,
+                    median.logical_capacity,
+                    median.virtual_extent,
+                    median.retained,
+                    median.discarded,
+                );
+            }
+        }
     }
 
     #[cfg(all(feature = "aarm-telemetry", any(windows, target_os = "linux")))]

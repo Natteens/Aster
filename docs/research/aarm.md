@@ -613,7 +613,7 @@ unchanged.
 ```text
 policy default: disabled
 pressure-triggered purge: implemented in AARM-4C as an explicit internal signal
-hot-cache tuning: NOT IMPLEMENTED
+hot-cache tuning: implemented in AARM-4D as explicit research configuration
 production/default timing values: NOT CHOSEN
 ```
 
@@ -650,9 +650,55 @@ pressure level source: explicit research/internal caller
 native automatic pressure source: NOT IMPLEMENTED
 pressure report exposure: runtime-internal only
 matrix schema: 10 (unchanged)
-hot-cache policy: NOT IMPLEMENTED
-oversized special policy: NOT IMPLEMENTED
+hot-cache policy: implemented in AARM-4D for regular inactive pages
+oversized policy: existing delay/hysteresis with no regular-cache protection
 production/default timing values: NOT CHOSEN
+```
+
+## AARM-4D bounded inactive backing cache and oversized policy
+
+AARM-4D extends the opt-in delayed policy with an explicit
+`regular_hot_cache_bytes` research setting. The unit is exact ASTER logical page-capacity bytes,
+not platform-rounded VM extent, RSS, or physical residency. Ordinary ASTER construction still
+leaves delayed maintenance disabled, so it selects no production cache budget or purge timing.
+
+Normal maintenance applies structural eligibility, inactive delay, and restore cooldown first.
+It then visits otherwise-purgeable regular pages (`capacity <= DEFAULT_PAGE_SIZE`) in stable
+inactive arena order, starting at the active-prefix boundary. A page is protected only when its
+entire logical capacity fits the remaining cache budget; protected logical bytes therefore never
+exceed the configured value. This uses the arena order already maintained by deterministic
+best-fit activation and rewind and adds no LRU, sorting, address ordering, or active-allocation
+metadata. Young and cooldown-protected pages do not consume cache budget.
+
+Elevated and Critical pressure bypass the regular cache completely. Elevated still respects
+restore cooldown; Critical still bypasses it. The immediate AARM-4A purge also ignores the cache
+and continues to attempt every structurally eligible backing. Pages larger than
+`DEFAULT_PAGE_SIZE` are dedicated oversized pages: they never consume or receive regular-cache
+protection, but retain the common inactive delay and repurge cooldown. The tuning evidence did not
+justify a separate oversized delay.
+
+One-machine Windows x64 medians for 100 cycles of the regular `4/8/16/32/64 KiB` burst showed the
+following research tradeoff. Counts are cumulative discard/restore operations; retained backing is
+the final VM extent retained by AARM policy.
+
+| Regular cache | Retained backing | Discard / restore | Median |
+| --- | ---: | ---: | ---: |
+| 0 | 0 | 500 / 495 | 5.6603 ms |
+| 64 KiB | 60 KiB | 100 / 99 | 2.8071 ms |
+| 256 KiB | 124 KiB | 0 / 0 | 802.7 us |
+| 1 MiB | 124 KiB | 0 / 0 | 805.9 us |
+
+The same cache candidates did not protect a `64 KiB + 1`, `256 KiB`, and `1 MiB` oversized
+workload: every candidate ended with zero retained backing and 90/87 discard/restore operations.
+Its medians stayed within 12.59-12.89 ms. This supports excluding oversized pages from the regular
+cache and shows that 1 MiB added no benefit over 256 KiB for the representative regular working
+set, but it is not enough evidence to choose a production default. The 64-256 KiB candidates show
+a useful bounded footprint/churn range for later integration research.
+
+```text
+matrix schema: 10 (unchanged)
+production purge timing/default cache budget: NOT CHOSEN
+automatic host pressure threshold: NOT CHOSEN
 ```
 
 ## Measurement invariants
