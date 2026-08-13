@@ -584,7 +584,7 @@ temporary-scope exit, allocation, and context teardown do not invoke it automati
 ```text
 default automatic purge: DISABLED
 delayed purge/hysteresis: implemented only as an opt-in internal policy
-pressure-triggered purge: NOT IMPLEMENTED
+pressure-triggered purge: implemented in AARM-4C as an explicit internal signal
 ```
 
 ## AARM-4B delayed purge with hysteresis
@@ -612,8 +612,46 @@ unchanged.
 
 ```text
 policy default: disabled
-pressure-triggered purge: NOT IMPLEMENTED
+pressure-triggered purge: implemented in AARM-4C as an explicit internal signal
 hot-cache tuning: NOT IMPLEMENTED
+production/default timing values: NOT CHOSEN
+```
+
+## AARM-4C pressure-triggered purge
+
+AARM-4C adds a runtime-private `Normal` / `Elevated` / `Critical` pressure value supplied by the
+caller for one delayed-maintenance invocation. It is an explicit research/internal signal: ASTER
+does not poll the operating system, RSS, free memory, cgroup usage, or a global pressure singleton,
+and it introduces no pressure percentages or thresholds. Pressure is not persisted after the call
+and no monitor or background thread exists.
+
+The three levels alter timing gates only:
+
+- **Normal** preserves AARM-4B's inactive delay, restore cooldown, and sweep interval.
+- **Elevated** bypasses the inactive delay and sweep interval for that call, but preserves restore
+  cooldown anti-thrash protection.
+- **Critical** bypasses the inactive delay, restore cooldown, and sweep interval for that call.
+
+Every level still requires the same AARM-4A structural proof: the page is outside the active
+prefix, has a zero cursor, is Retained, and uses a discard-capable backend. A pressure call performs
+at most one discard attempt per eligible page and continues after a backend failure. A pressure
+scan does not move or partially discard a page, retry within the call, persist the supplied level,
+or change the normal sweep schedule. Calling pressure maintenance while the delayed policy is
+disabled is a no-op; AARM-4A's explicit immediate purge remains a separate operation.
+
+Pressure changes only whole-page backing state. It does not change logical arena capacity, the
+MemoryGovernor hard limit or current charge, the frozen Auto budget, explicit budgets, local
+context ceilings, Parallel/Task/async entitlements, or temporal borrowing. Discard and restore
+therefore produce no governor release or grant. A governor-denied fresh logical page remains denied
+after pressure discards backing that the arena still owns.
+
+```text
+pressure level source: explicit research/internal caller
+native automatic pressure source: NOT IMPLEMENTED
+pressure report exposure: runtime-internal only
+matrix schema: 10 (unchanged)
+hot-cache policy: NOT IMPLEMENTED
+oversized special policy: NOT IMPLEMENTED
 production/default timing values: NOT CHOSEN
 ```
 
