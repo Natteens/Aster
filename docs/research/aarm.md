@@ -1010,6 +1010,33 @@ runtime loop knowledge or new ABI: NO
 normal compiler invokes AARM-5E2B1: NO
 ```
 
+## AARM-5E2B2A nested topology / innermost leaf reclaim
+
+AARM-5E2B2A discovers reducible natural-loop nesting deterministically and
+selects only leaf loops: a loop with no strictly contained child natural loop.
+An outer or middle loop remains ordinary, while an eligible innermost loop may
+use the complete AARM-5E2B1 exit set. This keeps every nested function at one
+runtime fine mark or fewer: the outer header, outer backedges, and control
+after the inner loop are always FineInactive.
+
+The proof boundary stays entirely in compiler and backend CFG analysis. Outer
+Temporary allocations predate the inner checkpoint and survive each inner
+FineExit; inner Temporary allocations must remain reference-dead at every
+reachable inner exit. The result bounds an inner working set only. It does not
+claim that outer-loop allocations are bounded.
+
+```text
+reducible natural-loop nesting: IMPLEMENTED (research-only)
+innermost / leaf-loop reclaim: IMPLEMENTED
+sibling leaf loops: IMPLEMENTED when dynamically disjoint
+three-level nesting: only deepest leaf eligible
+ancestor-loop reclaim in same pass: NOT IMPLEMENTED
+simultaneous outer + inner FineActive state: REJECTED
+irreducible nested CFG: REJECTED
+runtime loop knowledge / nested mark stack / new ABI: NO
+normal compiler invokes AARM-5E2B2A: NO
+```
+
 ## Measurement invariants
 
 Every snapshot must satisfy:

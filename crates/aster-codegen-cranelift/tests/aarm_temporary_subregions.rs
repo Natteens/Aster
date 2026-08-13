@@ -664,6 +664,115 @@ fn early_return_from_a_loop_body_exits_the_active_fine_region() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn nested_outer_temporary_survives_repeated_inner_fine_rewinds() {
+    let mut run = function(
+        RUN,
+        "Run",
+        mir::Visibility::Public,
+        vec![
+            local(0, "outer", mir::Type::Class(BOX_CLASS)),
+            local(1, "inner", mir::Type::Array(Box::new(mir::Type::Int))),
+            local(2, "outer_index", mir::Type::Int),
+            local(3, "inner_index", mir::Type::Int),
+            local(4, "condition", mir::Type::Bool),
+            local(5, "one", mir::Type::Int),
+        ],
+        mir::Type::Int,
+        Vec::new(),
+        None,
+    );
+    run.blocks = vec![
+        mir::BasicBlock {
+            id: mir::BasicBlockId(0),
+            instructions: vec![
+                assign(mir::Place::Local(mir::LocalId(2)), integer(0)),
+                assign(mir::Place::Local(mir::LocalId(5)), integer(1)),
+            ],
+            terminator: mir::Terminator::Goto(mir::BasicBlockId(1)),
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(1),
+            instructions: vec![less(4, 2, 2)],
+            terminator: mir::Terminator::Branch {
+                condition: copy(4, mir::Type::Bool),
+                then_block: mir::BasicBlockId(2),
+                else_block: mir::BasicBlockId(6),
+            },
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(2),
+            instructions: vec![
+                temporary_object(0),
+                assign(mir::Place::Local(mir::LocalId(3)), integer(0)),
+            ],
+            terminator: mir::Terminator::Goto(mir::BasicBlockId(3)),
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(3),
+            instructions: vec![less(4, 3, 3)],
+            terminator: mir::Terminator::Branch {
+                condition: copy(4, mir::Type::Bool),
+                then_block: mir::BasicBlockId(4),
+                else_block: mir::BasicBlockId(5),
+            },
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(4),
+            instructions: vec![temporary_array(1, 128), add(3, 3, 5)],
+            terminator: mir::Terminator::Goto(mir::BasicBlockId(3)),
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(5),
+            instructions: vec![
+                assign(object_field(0), copy(3, mir::Type::Int)),
+                assign(
+                    mir::Place::Local(mir::LocalId(3)),
+                    copy_place(object_field(0), mir::Type::Int),
+                ),
+                add(2, 2, 5),
+            ],
+            terminator: mir::Terminator::Goto(mir::BasicBlockId(1)),
+        },
+        mir::BasicBlock {
+            id: mir::BasicBlockId(6),
+            instructions: Vec::new(),
+            terminator: mir::Terminator::Return(Some(copy(2, mir::Type::Int))),
+        },
+    ];
+    let baseline = module(vec![run]);
+    let baseline_result = execute_with_stats(&baseline, "Run").expect("baseline executes");
+    let mut lowered = baseline.clone();
+    let report = lower_aarm_temporary_subregions_for_research(&mut lowered)
+        .expect("nested leaf loop lowers");
+    assert_eq!(
+        (
+            report.subregions_lowered,
+            report.enter_instructions_inserted,
+            report.exit_instructions_inserted,
+        ),
+        (1, 1, 1)
+    );
+    let lowered_result = execute_with_stats(&lowered, "Run").expect("lowered executes");
+    assert_eq!(baseline_result.0, ExecutionValue::Int(2));
+    assert_eq!(lowered_result.0, baseline_result.0);
+    assert_eq!(
+        lowered_result.1.requested_bytes,
+        baseline_result.1.requested_bytes
+    );
+    assert!(lowered_result.1.peak_used_bytes < baseline_result.1.peak_used_bytes);
+
+    let mut active_inner_backedge = lowered;
+    active_inner_backedge.functions[0].blocks[4]
+        .instructions
+        .retain(|instruction| {
+            !matches!(instruction, mir::Instruction::TemporarySubregionExit { .. })
+        });
+    validate(&active_inner_backedge)
+        .expect_err("an active inner mark cannot reach the inner or outer loop state");
+}
+
+#[test]
 fn simple_natural_object_loop_reclaims_a_bounded_working_set() {
     let mut run = function(
         RUN,

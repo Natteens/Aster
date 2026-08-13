@@ -274,7 +274,7 @@ fn duplicate_candidate_ids(
 enum SupportedFunction<'a> {
     Straight(&'a mir::BasicBlock),
     Acyclic(Box<super::AcyclicCfg>),
-    SimpleLoop(Box<super::SimpleNaturalLoop>),
+    NaturalLoops(Vec<super::SimpleNaturalLoop>),
 }
 
 fn supported_function(function: &mir::Function) -> Option<SupportedFunction<'_>> {
@@ -289,8 +289,8 @@ fn supported_function(function: &mir::Function) -> Option<SupportedFunction<'_>>
     super::acyclic_cfg(function)
         .map(|cfg| SupportedFunction::Acyclic(Box::new(cfg)))
         .or_else(|| {
-            super::simple_natural_loop(function)
-                .map(|loop_cfg| SupportedFunction::SimpleLoop(Box::new(loop_cfg)))
+            let loops = super::natural_loops(function);
+            (!loops.is_empty()).then_some(SupportedFunction::NaturalLoops(loops))
         })
 }
 
@@ -305,7 +305,23 @@ fn validate_candidate(
     if let SupportedFunction::Acyclic(cfg) = supported {
         return validate_cfg_candidate(function, cfg, candidate, proofs, has_concurrency);
     }
-    if let SupportedFunction::SimpleLoop(loop_cfg) = supported {
+    if let SupportedFunction::NaturalLoops(loops) = supported {
+        let Some((loop_index, loop_cfg)) = loops.iter().enumerate().find(|(_, loop_cfg)| {
+            candidate.checkpoint
+                == (mir::MirPoint {
+                    block: loop_cfg.body_entry,
+                    instruction_boundary: 0,
+                })
+        }) else {
+            return Err(TemporarySubregionRejectionReason::UnsupportedControlFlow);
+        };
+        if loops.iter().enumerate().any(|(child_index, child)| {
+            child_index != loop_index
+                && child.body.len() < loop_cfg.body.len()
+                && child.body.is_subset(&loop_cfg.body)
+        }) {
+            return Err(TemporarySubregionRejectionReason::UnsupportedControlFlow);
+        }
         return validate_loop_candidate(function, loop_cfg, candidate, proofs, has_concurrency);
     }
     let SupportedFunction::Straight(block) = supported else {

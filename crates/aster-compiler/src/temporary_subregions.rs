@@ -624,29 +624,17 @@ fn cfg_dominators(
     }
 }
 
-/// Discover the single-header, non-nested natural-loop shape AARM-5E2B1 can
-/// make iteration-local. Several latches may return to the same header and
-/// body blocks may leave the loop, but the body has one entry and becomes
-/// acyclic once those backedges are removed.
+/// Build one natural-loop node set from a common-header backedge set.
 #[allow(clippy::too_many_lines)]
-pub(super) fn simple_natural_loop(function: &mir::Function) -> Option<SimpleNaturalLoop> {
-    let (blocks, successors, predecessors, reachable) = cfg_parts(function)?;
-    let dominators = cfg_dominators(function.entry, &reachable, &predecessors);
-    let mut backedges = successors
-        .iter()
-        .flat_map(|(source, targets)| targets.iter().map(move |target| (*source, *target)))
-        .filter(|(source, target)| dominators[source].contains(target))
-        .collect::<Vec<_>>();
-    backedges.sort_unstable_by_key(|(source, target)| (source.0, target.0));
-    let header = backedges.first().map(|(_, header)| *header)?;
-    backedges
-        .iter()
-        .all(|(_, target)| *target == header)
-        .then_some(())?;
-    let mut latches = backedges
-        .iter()
-        .map(|(latch, _)| *latch)
-        .collect::<Vec<_>>();
+fn natural_loop_from_parts(
+    function: &mir::Function,
+    blocks: HashMap<mir::BasicBlockId, usize>,
+    successors: HashMap<mir::BasicBlockId, Vec<mir::BasicBlockId>>,
+    predecessors: &HashMap<mir::BasicBlockId, Vec<mir::BasicBlockId>>,
+    dominators: HashMap<mir::BasicBlockId, HashSet<mir::BasicBlockId>>,
+    header: mir::BasicBlockId,
+    mut latches: Vec<mir::BasicBlockId>,
+) -> Option<SimpleNaturalLoop> {
     latches.sort_unstable_by_key(|block| block.0);
     latches.dedup();
     if latches.is_empty() || latches.contains(&header) {
@@ -757,39 +745,6 @@ pub(super) fn simple_natural_loop(function: &mir::Function) -> Option<SimpleNatu
         .iter()
         .all(|block| *block == header || exits.contains(block) || reverse.contains(block))
         .then_some(())?;
-    let mut indegree = body
-        .iter()
-        .copied()
-        .map(|block| (block, 0_usize))
-        .collect::<HashMap<_, _>>();
-    for block in &body {
-        for successor in &successors[block] {
-            if body.contains(successor) && !(*successor == header && latches.contains(block)) {
-                *indegree.get_mut(successor)? += 1;
-            }
-        }
-    }
-    let mut ready = indegree
-        .iter()
-        .filter_map(|(block, count)| (*count == 0).then_some(*block))
-        .collect::<Vec<_>>();
-    ready.sort_unstable_by_key(|block| std::cmp::Reverse(block.0));
-    let mut count = 0;
-    while let Some(block) = ready.pop() {
-        count += 1;
-        for successor in &successors[&block] {
-            if !body.contains(successor) || (*successor == header && latches.contains(&block)) {
-                continue;
-            }
-            let degree = indegree.get_mut(successor)?;
-            *degree -= 1;
-            if *degree == 0 {
-                ready.push(*successor);
-            }
-        }
-        ready.sort_unstable_by_key(|block| std::cmp::Reverse(block.0));
-    }
-    (count == body.len()).then_some(())?;
     Some(SimpleNaturalLoop {
         blocks,
         successors,
@@ -800,6 +755,115 @@ pub(super) fn simple_natural_loop(function: &mir::Function) -> Option<SimpleNatu
         body,
         dominators,
     })
+}
+
+/// Discover reducible natural loops in deterministic header order. Ancestor
+/// loops may contain a child cycle; leaf selection below is responsible for
+/// withholding those ancestors from executable fine lowering.
+pub(super) fn natural_loops(function: &mir::Function) -> Vec<SimpleNaturalLoop> {
+    let Some((blocks, successors, predecessors, reachable)) = cfg_parts(function) else {
+        return Vec::new();
+    };
+    let dominators = cfg_dominators(function.entry, &reachable, &predecessors);
+    let backedges = successors
+        .iter()
+        .flat_map(|(source, targets)| targets.iter().map(move |target| (*source, *target)))
+        .filter(|(source, target)| dominators[source].contains(target))
+        .collect::<HashSet<_>>();
+    let mut indegree = reachable
+        .iter()
+        .copied()
+        .map(|block| (block, 0_usize))
+        .collect::<HashMap<_, _>>();
+    for block in &reachable {
+        for successor in &successors[block] {
+            if !backedges.contains(&(*block, *successor)) {
+                *indegree
+                    .get_mut(successor)
+                    .expect("reachable successor is in the CFG") += 1;
+            }
+        }
+    }
+    let mut ready = indegree
+        .iter()
+        .filter_map(|(block, degree)| (*degree == 0).then_some(*block))
+        .collect::<Vec<_>>();
+    ready.sort_unstable_by_key(|block| std::cmp::Reverse(block.0));
+    let mut seen = 0;
+    while let Some(block) = ready.pop() {
+        seen += 1;
+        for successor in &successors[&block] {
+            if backedges.contains(&(block, *successor)) {
+                continue;
+            }
+            let degree = indegree
+                .get_mut(successor)
+                .expect("reachable successor is in the CFG");
+            *degree -= 1;
+            if *degree == 0 {
+                ready.push(*successor);
+            }
+        }
+        ready.sort_unstable_by_key(|block| std::cmp::Reverse(block.0));
+    }
+    if seen != reachable.len() {
+        return Vec::new();
+    }
+    let mut grouped = HashMap::<mir::BasicBlockId, Vec<mir::BasicBlockId>>::new();
+    for (source, target) in backedges {
+        grouped.entry(target).or_default().push(source);
+    }
+    let mut headers = grouped.keys().copied().collect::<Vec<_>>();
+    headers.sort_unstable_by_key(|header| header.0);
+    headers
+        .into_iter()
+        .filter_map(|header| {
+            natural_loop_from_parts(
+                function,
+                blocks.clone(),
+                successors.clone(),
+                &predecessors,
+                dominators.clone(),
+                header,
+                grouped.remove(&header).unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// Return each natural loop's smallest strict containing loop, if any. The
+/// `(body size, header)` ordering makes the parent choice canonical even when
+/// the MIR block vector is permuted.
+fn natural_loop_parents(loops: &[SimpleNaturalLoop]) -> Vec<Option<usize>> {
+    loops
+        .iter()
+        .enumerate()
+        .map(|(child_index, child)| {
+            loops
+                .iter()
+                .enumerate()
+                .filter(|(parent_index, parent)| {
+                    *parent_index != child_index
+                        && child.body.len() < parent.body.len()
+                        && child.body.is_subset(&parent.body)
+                })
+                .min_by_key(|(_, parent)| (parent.body.len(), parent.header.0))
+                .map(|(parent_index, _)| parent_index)
+        })
+        .collect()
+}
+
+/// Select only innermost natural loops. Their bodies contain no strict child
+/// loop, so a B2A checkpoint can never dynamically enclose another checkpoint.
+fn leaf_natural_loops(function: &mir::Function) -> Vec<SimpleNaturalLoop> {
+    let loops = natural_loops(function);
+    let parents = natural_loop_parents(&loops);
+    loops
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !parents.iter().flatten().any(|parent| parent == index))
+        .map(|(_, loop_cfg)| loop_cfg.clone())
+        .collect()
 }
 
 /// The deliberately small AARM-5E1 CFG model.  It only represents the
@@ -1206,9 +1270,30 @@ fn plan_simple_natural_loop_function(
     {
         return Vec::new();
     }
-    let Some(loop_cfg) = simple_natural_loop(function) else {
-        return Vec::new();
-    };
+    let mut candidates = leaf_natural_loops(function)
+        .into_iter()
+        .filter_map(|loop_cfg| plan_one_natural_loop(function, lifetime, &loop_cfg))
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|candidate| {
+        (
+            candidate.checkpoint.block.0,
+            candidate.checkpoint.instruction_boundary,
+        )
+    });
+    for (index, candidate) in candidates.iter_mut().enumerate() {
+        let Ok(id) = u32::try_from(index) else {
+            return Vec::new();
+        };
+        candidate.id = mir::TemporarySubregionId(id);
+    }
+    candidates
+}
+
+fn plan_one_natural_loop(
+    function: &mir::Function,
+    lifetime: &LifetimeAnalysisReport,
+    loop_cfg: &SimpleNaturalLoop,
+) -> Option<mir::TemporarySubregionCandidate> {
     if function.blocks[loop_cfg.blocks[&loop_cfg.header]]
         .instructions
         .iter()
@@ -1217,11 +1302,9 @@ fn plan_simple_natural_loop_function(
                 == Some(mir::AllocationRegion::Temporary)
         })
     {
-        return Vec::new();
+        return None;
     }
-    let Some(rewinds) = simple_loop_rewinds(function, &loop_cfg) else {
-        return Vec::new();
-    };
+    let rewinds = simple_loop_rewinds(function, loop_cfg)?;
     let mut body_blocks = loop_cfg
         .body
         .iter()
@@ -1254,7 +1337,7 @@ fn plan_simple_natural_loop_function(
             .iter()
             .any(|site| !loop_cfg.dominates(loop_cfg.body_entry, site.block))
     {
-        return Vec::new();
+        return None;
     }
     let proofs = lifetime
         .proofs
@@ -1264,21 +1347,21 @@ fn plan_simple_natural_loop_function(
     if allocations.iter().any(|site| {
         proofs.get(site).is_none_or(|proof| {
             proof.region != mir::AllocationRegion::Temporary
-                || simple_loop_reachable_rewinds(&loop_cfg, site.block, &rewinds)
+                || simple_loop_reachable_rewinds(loop_cfg, site.block, &rewinds)
                     .iter()
                     .any(|rewind| !proof.dead_after.contains(rewind))
         })
     }) {
-        return Vec::new();
+        return None;
     }
     let body_instructions = body_blocks
         .iter()
         .flat_map(|block| loop_cfg.block(function, *block).instructions.iter())
         .collect::<Vec<_>>();
     if validation::span_barrier_for_research(&body_instructions).is_some() {
-        return Vec::new();
+        return None;
     }
-    vec![mir::TemporarySubregionCandidate {
+    Some(mir::TemporarySubregionCandidate {
         id: mir::TemporarySubregionId(0),
         checkpoint: mir::MirPoint {
             block: loop_cfg.body_entry,
@@ -1286,7 +1369,7 @@ fn plan_simple_natural_loop_function(
         },
         rewinds,
         allocations,
-    }]
+    })
 }
 
 fn simple_loop_rewinds(
@@ -3607,6 +3690,289 @@ public int Main() {
             vec![object_local(1), object_local(2)],
         );
         let (module, _) = prepare(module(vec![loop_function]));
+        assert!(
+            module.functions[0]
+                .temporary_subregion_candidates
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn nested_function_selects_only_the_innermost_leaf_loop() {
+        let function = function(
+            FUNCTION,
+            BLOCK.0,
+            vec![
+                block(
+                    BLOCK.0,
+                    Vec::new(),
+                    mir::Terminator::Goto(mir::BasicBlockId(20)),
+                ),
+                block(
+                    20,
+                    Vec::new(),
+                    mir::Terminator::Branch {
+                        condition: mir::Operand {
+                            type_: mir::Type::Bool,
+                            kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                        },
+                        then_block: mir::BasicBlockId(30),
+                        else_block: mir::BasicBlockId(90),
+                    },
+                ),
+                block(
+                    30,
+                    vec![temporary_object(1)],
+                    mir::Terminator::Goto(mir::BasicBlockId(40)),
+                ),
+                block(
+                    40,
+                    Vec::new(),
+                    mir::Terminator::Branch {
+                        condition: mir::Operand {
+                            type_: mir::Type::Bool,
+                            kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                        },
+                        then_block: mir::BasicBlockId(50),
+                        else_block: mir::BasicBlockId(70),
+                    },
+                ),
+                block(
+                    50,
+                    vec![temporary_object(2), observe_object(2)],
+                    mir::Terminator::Goto(mir::BasicBlockId(60)),
+                ),
+                block(
+                    60,
+                    vec![unrelated()],
+                    mir::Terminator::Goto(mir::BasicBlockId(40)),
+                ),
+                block(
+                    70,
+                    vec![observe_object(1)],
+                    mir::Terminator::Goto(mir::BasicBlockId(80)),
+                ),
+                block(
+                    80,
+                    vec![unrelated()],
+                    mir::Terminator::Goto(mir::BasicBlockId(20)),
+                ),
+                block(90, Vec::new(), mir::Terminator::End),
+            ],
+            vec![object_local(1), object_local(2)],
+        );
+        let (module, _) = prepare(module(vec![function]));
+        let candidates = &module.functions[0].temporary_subregion_candidates;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].checkpoint.block, mir::BasicBlockId(50));
+        assert_eq!(
+            candidates[0].allocations,
+            vec![mir::MirAllocationSite {
+                function: FUNCTION,
+                block: mir::BasicBlockId(50),
+                instruction_index: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn sibling_inner_loops_receive_disjoint_leaf_candidates() {
+        let function = function(
+            FUNCTION,
+            BLOCK.0,
+            vec![
+                block(
+                    BLOCK.0,
+                    Vec::new(),
+                    mir::Terminator::Goto(mir::BasicBlockId(20)),
+                ),
+                block(
+                    20,
+                    Vec::new(),
+                    mir::Terminator::Branch {
+                        condition: mir::Operand {
+                            type_: mir::Type::Bool,
+                            kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                        },
+                        then_block: mir::BasicBlockId(30),
+                        else_block: mir::BasicBlockId(100),
+                    },
+                ),
+                block(30, Vec::new(), mir::Terminator::Goto(mir::BasicBlockId(40))),
+                block(
+                    40,
+                    Vec::new(),
+                    mir::Terminator::Branch {
+                        condition: mir::Operand {
+                            type_: mir::Type::Bool,
+                            kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                        },
+                        then_block: mir::BasicBlockId(50),
+                        else_block: mir::BasicBlockId(60),
+                    },
+                ),
+                block(
+                    50,
+                    vec![temporary_object(1), observe_object(1)],
+                    mir::Terminator::Goto(mir::BasicBlockId(40)),
+                ),
+                block(60, Vec::new(), mir::Terminator::Goto(mir::BasicBlockId(70))),
+                block(
+                    70,
+                    Vec::new(),
+                    mir::Terminator::Branch {
+                        condition: mir::Operand {
+                            type_: mir::Type::Bool,
+                            kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                        },
+                        then_block: mir::BasicBlockId(80),
+                        else_block: mir::BasicBlockId(90),
+                    },
+                ),
+                block(
+                    80,
+                    vec![temporary_object(2), observe_object(2)],
+                    mir::Terminator::Goto(mir::BasicBlockId(70)),
+                ),
+                block(
+                    90,
+                    vec![unrelated()],
+                    mir::Terminator::Goto(mir::BasicBlockId(95)),
+                ),
+                block(
+                    95,
+                    vec![unrelated()],
+                    mir::Terminator::Goto(mir::BasicBlockId(20)),
+                ),
+                block(100, Vec::new(), mir::Terminator::End),
+            ],
+            vec![object_local(1), object_local(2)],
+        );
+        let (module, _) = prepare(module(vec![function]));
+        let candidates = &module.functions[0].temporary_subregion_candidates;
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.checkpoint.block)
+                .collect::<Vec<_>>(),
+            vec![mir::BasicBlockId(50), mir::BasicBlockId(80)]
+        );
+    }
+
+    #[test]
+    fn three_level_nesting_selects_only_the_deepest_leaf() {
+        let function = function(
+            FUNCTION,
+            BLOCK.0,
+            vec![
+                block(
+                    BLOCK.0,
+                    Vec::new(),
+                    mir::Terminator::Goto(mir::BasicBlockId(20)),
+                ),
+                block(
+                    20,
+                    Vec::new(),
+                    mir::Terminator::Branch {
+                        condition: mir::Operand {
+                            type_: mir::Type::Bool,
+                            kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                        },
+                        then_block: mir::BasicBlockId(30),
+                        else_block: mir::BasicBlockId(110),
+                    },
+                ),
+                block(30, Vec::new(), mir::Terminator::Goto(mir::BasicBlockId(40))),
+                block(
+                    40,
+                    Vec::new(),
+                    mir::Terminator::Branch {
+                        condition: mir::Operand {
+                            type_: mir::Type::Bool,
+                            kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                        },
+                        then_block: mir::BasicBlockId(50),
+                        else_block: mir::BasicBlockId(90),
+                    },
+                ),
+                block(50, Vec::new(), mir::Terminator::Goto(mir::BasicBlockId(60))),
+                block(
+                    60,
+                    Vec::new(),
+                    mir::Terminator::Branch {
+                        condition: mir::Operand {
+                            type_: mir::Type::Bool,
+                            kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                        },
+                        then_block: mir::BasicBlockId(70),
+                        else_block: mir::BasicBlockId(80),
+                    },
+                ),
+                block(
+                    70,
+                    vec![temporary_object(1), observe_object(1)],
+                    mir::Terminator::Goto(mir::BasicBlockId(60)),
+                ),
+                block(
+                    80,
+                    vec![unrelated()],
+                    mir::Terminator::Goto(mir::BasicBlockId(90)),
+                ),
+                block(
+                    90,
+                    vec![unrelated()],
+                    mir::Terminator::Goto(mir::BasicBlockId(100)),
+                ),
+                block(
+                    100,
+                    vec![unrelated()],
+                    mir::Terminator::Goto(mir::BasicBlockId(20)),
+                ),
+                block(110, Vec::new(), mir::Terminator::End),
+            ],
+            vec![object_local(1)],
+        );
+        let (module, _) = prepare(module(vec![function]));
+        let candidates = &module.functions[0].temporary_subregion_candidates;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].checkpoint.block, mir::BasicBlockId(70));
+    }
+
+    #[test]
+    fn irreducible_nested_cycle_is_withheld() {
+        let function = function(
+            FUNCTION,
+            BLOCK.0,
+            vec![
+                block(
+                    BLOCK.0,
+                    Vec::new(),
+                    mir::Terminator::Branch {
+                        condition: mir::Operand {
+                            type_: mir::Type::Bool,
+                            kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                        },
+                        then_block: mir::BasicBlockId(20),
+                        else_block: mir::BasicBlockId(30),
+                    },
+                ),
+                block(20, Vec::new(), mir::Terminator::Goto(mir::BasicBlockId(40))),
+                block(30, Vec::new(), mir::Terminator::Goto(mir::BasicBlockId(50))),
+                block(
+                    40,
+                    vec![temporary_object(1)],
+                    mir::Terminator::Goto(mir::BasicBlockId(50)),
+                ),
+                block(
+                    50,
+                    vec![observe_object(1)],
+                    mir::Terminator::Goto(mir::BasicBlockId(40)),
+                ),
+            ],
+            vec![object_local(1)],
+        );
+        let (module, _) = prepare(module(vec![function]));
         assert!(
             module.functions[0]
                 .temporary_subregion_candidates

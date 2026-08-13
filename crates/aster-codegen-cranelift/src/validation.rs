@@ -995,7 +995,7 @@ fn validate_executable_temporary_subregion_cfg(
             "unreachable executable AARM temporary subregion block",
         ));
     }
-    validate_executable_temporary_subregion_cycles(function, &blocks, &successors, &reachable)?;
+    validate_executable_temporary_subregion_cycles(function, &successors, &reachable)?;
     let mut state = HashMap::from([(function.entry, FineState::Inactive)]);
     let mut entered = HashMap::new();
     let mut allocations = HashSet::new();
@@ -1088,7 +1088,6 @@ fn validate_executable_temporary_subregion_cfg(
 #[allow(clippy::too_many_lines)]
 fn validate_executable_temporary_subregion_cycles(
     function: &mir::Function,
-    blocks: &HashMap<mir::BasicBlockId, usize>,
     successors: &HashMap<mir::BasicBlockId, Vec<mir::BasicBlockId>>,
     reachable: &HashSet<mir::BasicBlockId>,
 ) -> Result<(), BackendError> {
@@ -1147,80 +1146,18 @@ fn validate_executable_temporary_subregion_cycles(
         .filter(|(source, target)| dominators[source].contains(target))
         .collect::<Vec<_>>();
     backedges.sort_unstable_by_key(|(source, target)| (source.0, target.0));
-    if backedges.is_empty() {
-        return Ok(());
-    }
-    let header = backedges[0].1;
-    if backedges
-        .iter()
-        .any(|(latch, target)| *latch == header || *target != header)
-    {
-        return Err(unsupported(
-            &function.name,
-            "unsupported executable AARM temporary-subregion loop headers",
-        ));
-    }
-    let mut latches = backedges
-        .iter()
-        .map(|(latch, _)| *latch)
-        .collect::<Vec<_>>();
-    latches.sort_unstable_by_key(|block| block.0);
-    latches.dedup();
-    let mir::Terminator::Branch {
-        then_block,
-        else_block,
-        ..
-    } = function.blocks[blocks[&header]].terminator
-    else {
-        return Err(unsupported(
-            &function.name,
-            "unsupported executable AARM temporary-subregion loop header",
-        ));
-    };
-    let mut body = HashSet::from([header]);
-    let mut pending = latches.clone();
-    while let Some(block) = pending.pop() {
-        body.insert(block);
-        for predecessor in &predecessors[&block] {
-            if *predecessor != header && body.insert(*predecessor) {
-                pending.push(*predecessor);
-            }
-        }
-    }
-    let header_targets = [then_block, else_block];
-    if header_targets
-        .iter()
-        .filter(|target| body.contains(target))
-        .count()
-        != 1
-        || header_targets
-            .iter()
-            .filter(|target| !body.contains(target))
-            .count()
-            != 1
-        || body.iter().any(|block| {
-            *block != header
-                && predecessors[block]
-                    .iter()
-                    .any(|predecessor| !body.contains(predecessor))
-        })
-    {
-        return Err(unsupported(
-            &function.name,
-            "unsupported executable AARM temporary-subregion loop entry or exit",
-        ));
-    }
-    let mut indegree = body
+    let backedges = backedges.into_iter().collect::<HashSet<_>>();
+    let mut indegree = reachable
         .iter()
         .copied()
         .map(|block| (block, 0_usize))
         .collect::<HashMap<_, _>>();
-    for block in &body {
+    for block in reachable {
         for successor in &successors[block] {
-            if body.contains(successor) && !(*successor == header && latches.contains(block)) {
+            if !backedges.contains(&(*block, *successor)) {
                 *indegree
                     .get_mut(successor)
-                    .expect("loop successor is in the loop") += 1;
+                    .expect("reachable successor is in the CFG") += 1;
             }
         }
     }
@@ -1233,12 +1170,12 @@ fn validate_executable_temporary_subregion_cycles(
     while let Some(block) = ready.pop() {
         visited += 1;
         for successor in &successors[&block] {
-            if !body.contains(successor) || (*successor == header && latches.contains(&block)) {
+            if backedges.contains(&(block, *successor)) {
                 continue;
             }
             let degree = indegree
                 .get_mut(successor)
-                .expect("loop successor is in the loop");
+                .expect("reachable successor is in the CFG");
             *degree -= 1;
             if *degree == 0 {
                 ready.push(*successor);
@@ -1246,10 +1183,10 @@ fn validate_executable_temporary_subregion_cycles(
         }
         ready.sort_unstable_by_key(|block| std::cmp::Reverse(block.0));
     }
-    if visited != body.len() {
+    if visited != reachable.len() {
         return Err(unsupported(
             &function.name,
-            "secondary cycle in an executable AARM temporary subregion",
+            "irreducible executable AARM temporary-subregion CFG",
         ));
     }
     Ok(())

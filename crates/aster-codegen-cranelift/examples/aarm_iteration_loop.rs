@@ -1,4 +1,4 @@
-//! Manual release-only AARM-5E2A iteration-local loop comparison.
+//! Manual release-only AARM iteration-local loop comparison.
 //!
 //! This intentionally uses the exact supported backend-neutral MIR subset:
 //! object/array allocation, scalar loop state, one header, and one latch.
@@ -228,6 +228,85 @@ fn module(iterations: usize, shape: AllocationShape, helper_scoped: bool) -> mir
     }
 }
 
+fn nested_module(
+    outer_iterations: usize,
+    inner_iterations: usize,
+    shape: AllocationShape,
+) -> mir::Module {
+    let run = function(
+        RUN,
+        "Run",
+        vec![
+            local(0, "inner_value", shape.type_()),
+            local(1, "outer_index", mir::Type::Int),
+            local(2, "inner_index", mir::Type::Int),
+            local(3, "condition", mir::Type::Bool),
+        ],
+        mir::Type::Int,
+        vec![
+            mir::BasicBlock {
+                id: mir::BasicBlockId(0),
+                instructions: vec![assign(1, use_integer(0))],
+                terminator: mir::Terminator::Goto(mir::BasicBlockId(1)),
+            },
+            mir::BasicBlock {
+                id: mir::BasicBlockId(1),
+                instructions: vec![less(1, 3, outer_iterations)],
+                terminator: mir::Terminator::Branch {
+                    condition: copy(3, mir::Type::Bool),
+                    then_block: mir::BasicBlockId(2),
+                    else_block: mir::BasicBlockId(6),
+                },
+            },
+            mir::BasicBlock {
+                id: mir::BasicBlockId(2),
+                instructions: vec![assign(2, use_integer(0))],
+                terminator: mir::Terminator::Goto(mir::BasicBlockId(3)),
+            },
+            mir::BasicBlock {
+                id: mir::BasicBlockId(3),
+                instructions: vec![less(2, 3, inner_iterations)],
+                terminator: mir::Terminator::Branch {
+                    condition: copy(3, mir::Type::Bool),
+                    then_block: mir::BasicBlockId(4),
+                    else_block: mir::BasicBlockId(5),
+                },
+            },
+            mir::BasicBlock {
+                id: mir::BasicBlockId(4),
+                instructions: vec![shape.allocation(0), increment(2)],
+                terminator: mir::Terminator::Goto(mir::BasicBlockId(3)),
+            },
+            mir::BasicBlock {
+                id: mir::BasicBlockId(5),
+                instructions: vec![increment(1)],
+                terminator: mir::Terminator::Goto(mir::BasicBlockId(1)),
+            },
+            mir::BasicBlock {
+                id: mir::BasicBlockId(6),
+                instructions: Vec::new(),
+                terminator: mir::Terminator::Return(Some(copy(1, mir::Type::Int))),
+            },
+        ],
+    );
+    mir::Module {
+        structs: Vec::new(),
+        classes: vec![mir::ClassDefinition {
+            symbol: BOX,
+            name: "Box".to_owned(),
+            fields: vec![mir::FieldDefinition {
+                symbol: FIELD,
+                name: "value".to_owned(),
+                type_: mir::Type::Int,
+            }],
+        }],
+        interfaces: Vec::new(),
+        enums: Vec::new(),
+        interface_implementations: Vec::new(),
+        functions: vec![run],
+    }
+}
+
 fn run_case(
     iterations: usize,
     shape: AllocationShape,
@@ -254,6 +333,34 @@ fn run_case(
     (samples[SAMPLES / 2], stats)
 }
 
+fn run_nested_case(
+    outer_iterations: usize,
+    inner_iterations: usize,
+    shape: AllocationShape,
+    iteration_reclaim: bool,
+) -> (f64, MemoryStats) {
+    let mut module = nested_module(outer_iterations, inner_iterations, shape);
+    if iteration_reclaim {
+        let report = lower_aarm_temporary_subregions_for_research(&mut module)
+            .expect("AARM-5E2B2A lowers the nested leaf loop");
+        assert_eq!(report.subregions_lowered, 1);
+    }
+    let expected = ExecutionValue::Int(i32::try_from(outer_iterations).expect("iterations fit"));
+    let (value, stats) = execute_with_stats(&module, "Run").expect("benchmark executes");
+    assert_eq!(value, expected);
+    let mut samples = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        let start = Instant::now();
+        assert_eq!(
+            execute(&module, "Run").expect("benchmark executes"),
+            expected
+        );
+        samples.push(start.elapsed().as_secs_f64() * 1_000.0);
+    }
+    samples.sort_by(f64::total_cmp);
+    (samples[SAMPLES / 2], stats)
+}
+
 fn main() {
     for iterations in [100_000, 1_000_000, 4_000_000] {
         for shape in [AllocationShape::Object, AllocationShape::Array] {
@@ -273,6 +380,19 @@ fn main() {
                     stats.reserved_bytes,
                 );
             }
+        }
+    }
+    for shape in [AllocationShape::Object, AllocationShape::Array] {
+        for (variant, iteration_reclaim) in [("nested-direct", false), ("nested-aarm", true)] {
+            let (median_ms, stats) = run_nested_case(1_000, 1_000, shape, iteration_reclaim);
+            println!(
+                "shape={:<6} variant={variant:<13} outer=1000 inner=1000 allocations={:>8} median_ms={median_ms:>9.3} requested={:>10} peak_used={:>10} capacity={:>10}",
+                shape.name(),
+                stats.total_allocations,
+                stats.requested_bytes,
+                stats.peak_used_bytes,
+                stats.reserved_bytes,
+            );
         }
     }
 }
