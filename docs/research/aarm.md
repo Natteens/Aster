@@ -448,6 +448,25 @@ the resolved hard limit, and address-width handling.
 domains; stable capacity discovery (2C1); frozen Auto (2C2); and this explicit reproducible
 override (2C3). This does not make AARM production-complete: AARM-3 through AARM-6 remain.
 
+## AARM-3A PageBackend abstraction foundation
+
+AARM-3A introduces the runtime-private `PageBackend` seam between `PagedArena` pages and host
+backing allocation. The sole active backend is the system-allocator fallback, which preserves the
+previous exact `Layout` + `alloc_zeroed` + `dealloc` behavior: page capacity is unchanged, fresh
+pages are zeroed and pointer-stable, rewind still zeroes reclaimed bytes, inactive pages remain
+retained for reuse, and page destruction releases the backing once.
+
+`PageBackend` is a host-memory mechanism, not a budget authority. `MemoryGovernor` remains the
+only shared capacity-policy authority, and governor admission still occurs before a fresh backing
+allocation. A failed backend allocation drops its governor reservation without publishing a page.
+Neither active-page bump allocation nor inactive-page reuse touches the backend.
+
+Virtual-reserve/backing separation is **not** implemented. The fallback backend means
+`MemoryStats.reserved_bytes`, AARM `arena_capacity_bytes`, and governor current capacity retain
+their existing meaning: retained logical page capacity backed by the current host allocator. They
+are not OS virtual-reservation or committed-backing metrics. Windows `VirtualAlloc`, Linux `mmap`,
+and purge/decommit remain later AARM work.
+
 ## Measurement invariants
 
 Every snapshot must satisfy:
@@ -542,7 +561,11 @@ AARM-1 observability
 -> AARM-2C1 stable host capacity discovery
 -> AARM-2C2 Auto governor budget policy
 -> AARM-2C3 explicit reproducible governor budget override
--> AARM-3 OS PageBackend
+-> AARM-3A PageBackend abstraction with system allocator fallback
+-> AARM-3B Windows virtual-memory PageBackend
+-> AARM-3C Linux virtual-memory PageBackend
+-> AARM-3D page-state and reserve/backing telemetry
+-> AARM-3E integration
 -> AARM-4 delayed purge/hysteresis
 -> AARM-5 MIR lifetime refinement
 -> AARM-6 integration/production decision

@@ -1,7 +1,7 @@
 //! Paged bump allocator for per-execution memory.
 //!
-//! Each [`PagedArena`] owns a sequence of pages allocated via
-//! [`std::alloc::alloc_zeroed`]. Allocations bump a cursor within the last
+//! Each [`PagedArena`] owns a sequence of pages backed by the runtime-private
+//! [`PageBackend`]. Allocations bump a cursor within the last
 //! active page. Rewound pages remain reserved and can be reused without moving
 //! their backing memory. All pages are released when the arena is dropped.
 //!
@@ -37,10 +37,115 @@ fn next_arena_id() -> u64 {
         .expect("arena id space exhausted")
 }
 
-/// One contiguous page of zeroed memory.
-struct Page {
+/// One stable, zeroed host allocation owned by a [`PageBackend`].
+///
+/// The backing keeps its exact layout so the backend can release it exactly
+/// once when the page drops. It is intentionally private: page allocation
+/// mechanics are a runtime concern, not an arena allocation policy.
+struct PageBacking {
     base: *mut u8,
     layout: Layout,
+}
+
+impl PageBacking {
+    fn capacity(&self) -> usize {
+        self.layout.size()
+    }
+}
+
+/// Runtime-private mechanism for the stable zeroed backing of one arena page.
+///
+/// A successful allocation returns an exact-capacity, aligned, writable, zeroed
+/// backing whose address is stable until this object releases it. AARM-3A has
+/// one implementation only; later platform backends may replace that mechanism
+/// without changing page, governor, or arena semantics.
+trait PageBackend {
+    fn allocate_zeroed(
+        &self,
+        capacity: usize,
+        alignment: usize,
+    ) -> Result<PageBacking, ArenaAllocError>;
+
+    fn release(&self, backing: PageBacking);
+}
+
+/// Current fallback backend: the exact system allocator mechanics previously
+/// owned directly by [`Page`].
+struct SystemAllocatorPageBackend;
+
+impl PageBackend for SystemAllocatorPageBackend {
+    fn allocate_zeroed(
+        &self,
+        capacity: usize,
+        alignment: usize,
+    ) -> Result<PageBacking, ArenaAllocError> {
+        let layout = Layout::from_size_align(capacity, alignment)
+            .map_err(|_| ArenaAllocError::AddressSpace)?;
+        // SAFETY: `layout` has non-zero size and valid alignment.
+        #[allow(unsafe_code)]
+        let base = unsafe { alloc_zeroed(layout) };
+        if base.is_null() {
+            return Err(ArenaAllocError::OutOfMemory);
+        }
+        Ok(PageBacking { base, layout })
+    }
+
+    fn release(&self, backing: PageBacking) {
+        // SAFETY: this backend created `backing.base` with exactly
+        // `backing.layout`; ownership is transferred here exactly once.
+        #[allow(unsafe_code)]
+        unsafe {
+            dealloc(backing.base, backing.layout);
+        }
+    }
+}
+
+static SYSTEM_ALLOCATOR_PAGE_BACKEND: SystemAllocatorPageBackend = SystemAllocatorPageBackend;
+
+/// RAII owner that routes release through the same backend that allocated it.
+struct BackendPageBacking {
+    backend: &'static dyn PageBackend,
+    backing: Option<PageBacking>,
+}
+
+impl BackendPageBacking {
+    fn allocate(
+        backend: &'static dyn PageBackend,
+        capacity: usize,
+        alignment: usize,
+    ) -> Result<Self, ArenaAllocError> {
+        Ok(Self {
+            backend,
+            backing: Some(backend.allocate_zeroed(capacity, alignment)?),
+        })
+    }
+
+    fn base(&self) -> *mut u8 {
+        self.backing
+            .as_ref()
+            .expect("live page backing is present")
+            .base
+    }
+
+    fn capacity(&self) -> usize {
+        self.backing
+            .as_ref()
+            .expect("live page backing is present")
+            .capacity()
+    }
+}
+
+impl Drop for BackendPageBacking {
+    fn drop(&mut self) {
+        if let Some(backing) = self.backing.take() {
+            self.backend.release(backing);
+        }
+    }
+}
+
+/// One contiguous page of zeroed memory.
+struct Page {
+    backing: BackendPageBacking,
     cursor: usize,
     _governor_reservation: Option<GovernorReservation>,
 }
@@ -49,38 +154,26 @@ impl Page {
     fn try_new(
         capacity: usize,
         governor_reservation: Option<GovernorReservation>,
+        backend: &'static dyn PageBackend,
     ) -> Result<Self, ArenaAllocError> {
-        Self::try_new_with_allocator(capacity, governor_reservation, |layout| {
-            // SAFETY: `layout` has non-zero size and valid alignment.
-            #[allow(unsafe_code)]
-            unsafe {
-                alloc_zeroed(layout)
-            }
-        })
+        Self::try_new_with_backend(capacity, governor_reservation, backend)
     }
 
-    fn try_new_with_allocator(
+    fn try_new_with_backend(
         capacity: usize,
         governor_reservation: Option<GovernorReservation>,
-        allocate: impl FnOnce(Layout) -> *mut u8,
+        backend: &'static dyn PageBackend,
     ) -> Result<Self, ArenaAllocError> {
         debug_assert!(capacity > 0);
-        let layout = Layout::from_size_align(capacity, MAX_ALIGN)
-            .map_err(|_| ArenaAllocError::AddressSpace)?;
-        let base = allocate(layout);
-        if base.is_null() {
-            return Err(ArenaAllocError::OutOfMemory);
-        }
         Ok(Page {
-            base,
-            layout,
+            backing: BackendPageBacking::allocate(backend, capacity, MAX_ALIGN)?,
             cursor: 0,
             _governor_reservation: governor_reservation,
         })
     }
 
     fn capacity(&self) -> usize {
-        self.layout.size()
+        self.backing.capacity()
     }
 
     /// Try to place `size` bytes at the given alignment inside this page.
@@ -97,7 +190,7 @@ impl Page {
         // live allocation of at least `capacity` bytes. The resulting pointer
         // stays within the page.
         #[allow(unsafe_code)]
-        let ptr = unsafe { self.base.add(aligned) };
+        let ptr = unsafe { self.backing.base().add(aligned) };
         self.cursor = end;
         Some((ptr, consumed))
     }
@@ -115,22 +208,11 @@ impl Page {
             // inside this live page allocation.
             #[allow(unsafe_code)]
             unsafe {
-                std::ptr::write_bytes(self.base.add(cursor), 0, reclaimed);
+                std::ptr::write_bytes(self.backing.base().add(cursor), 0, reclaimed);
             }
         }
 
         self.cursor = cursor;
-    }
-}
-
-impl Drop for Page {
-    fn drop(&mut self) {
-        // SAFETY: `self.base` was allocated with `alloc_zeroed(self.layout)` and
-        // is freed exactly once here. No other code calls `dealloc` on it.
-        #[allow(unsafe_code)]
-        unsafe {
-            dealloc(self.base, self.layout);
-        }
     }
 }
 
@@ -211,6 +293,7 @@ pub(crate) enum ArenaAllocError {
 /// Paged bump allocator. Owns all pages and frees them on drop.
 pub(crate) struct PagedArena {
     pages: Vec<Page>,
+    backend: &'static dyn PageBackend,
     governor: Option<Arc<MemoryGovernor>>,
     active_pages: usize,
     used_bytes: usize,
@@ -226,6 +309,7 @@ impl PagedArena {
     pub(crate) fn new() -> Self {
         PagedArena {
             pages: Vec::new(),
+            backend: &SYSTEM_ALLOCATOR_PAGE_BACKEND,
             governor: None,
             active_pages: 0,
             used_bytes: 0,
@@ -240,6 +324,26 @@ impl PagedArena {
 
     pub(crate) fn with_memory_governor(governor: Arc<MemoryGovernor>) -> Self {
         Self {
+            governor: Some(governor),
+            ..Self::new()
+        }
+    }
+
+    #[cfg(test)]
+    fn with_backend(backend: &'static dyn PageBackend) -> Self {
+        Self {
+            backend,
+            ..Self::new()
+        }
+    }
+
+    #[cfg(test)]
+    fn with_backend_and_memory_governor(
+        backend: &'static dyn PageBackend,
+        governor: Arc<MemoryGovernor>,
+    ) -> Self {
+        Self {
+            backend,
             governor: Some(governor),
             ..Self::new()
         }
@@ -348,7 +452,7 @@ impl PagedArena {
         } else {
             None
         };
-        let mut page = Page::try_new(capacity, governor_reservation)?;
+        let mut page = Page::try_new(capacity, governor_reservation, self.backend)?;
         let (ptr, consumed) = page
             .try_alloc(size, align)
             .expect("fresh page must satisfy the allocation");
@@ -618,7 +722,46 @@ fn align_up(value: usize, align: usize) -> Option<usize> {
 #[allow(clippy::cast_ptr_alignment, clippy::ptr_as_ptr)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{Arc, atomic::AtomicUsize};
+
+    struct CountingPageBackend {
+        fail_allocations: bool,
+        allocation_calls: AtomicUsize,
+        release_calls: AtomicUsize,
+    }
+
+    impl CountingPageBackend {
+        fn new(fail_allocations: bool) -> Self {
+            Self {
+                fail_allocations,
+                allocation_calls: AtomicUsize::new(0),
+                release_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl PageBackend for CountingPageBackend {
+        fn allocate_zeroed(
+            &self,
+            capacity: usize,
+            alignment: usize,
+        ) -> Result<PageBacking, ArenaAllocError> {
+            self.allocation_calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail_allocations {
+                return Err(ArenaAllocError::OutOfMemory);
+            }
+            SYSTEM_ALLOCATOR_PAGE_BACKEND.allocate_zeroed(capacity, alignment)
+        }
+
+        fn release(&self, backing: PageBacking) {
+            self.release_calls.fetch_add(1, Ordering::Relaxed);
+            SYSTEM_ALLOCATOR_PAGE_BACKEND.release(backing);
+        }
+    }
+
+    fn test_backend(fail_allocations: bool) -> &'static CountingPageBackend {
+        Box::leak(Box::new(CountingPageBackend::new(fail_allocations)))
+    }
 
     #[test]
     fn fallible_allocation_rejects_the_budget_before_reserving_a_page() {
@@ -634,13 +777,17 @@ mod tests {
     #[test]
     fn failed_host_page_allocation_releases_its_governor_grant() {
         let governor = Arc::new(MemoryGovernor::new(MIN_PAGE_SIZE));
-        let reservation = governor
-            .try_acquire(MIN_PAGE_SIZE)
-            .expect("one page fits the governor");
-        let result = Page::try_new_with_allocator(MIN_PAGE_SIZE, Some(reservation), |_| {
-            std::ptr::null_mut()
-        });
+        let backend = test_backend(true);
+        let mut arena =
+            PagedArena::with_backend_and_memory_governor(backend, Arc::clone(&governor));
+        let result = arena.try_alloc(8, 8, usize::MAX);
         assert!(matches!(result, Err(ArenaAllocError::OutOfMemory)));
+        assert_eq!(backend.allocation_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.release_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(arena.page_count(), 0);
+        assert_eq!(arena.active_page_count(), 0);
+        assert_eq!(arena.metrics().used_bytes, 0);
+        assert_eq!(arena.metrics().reserved_bytes, 0);
 
         let telemetry = governor.telemetry();
         assert_eq!(telemetry.current_capacity_bytes, 0);
@@ -659,6 +806,78 @@ mod tests {
         assert!(!ptr.is_null());
         assert_eq!(ptr as usize % 8, 0);
         assert_eq!(arena.page_count(), 1);
+    }
+
+    #[test]
+    fn system_backend_returns_zeroed_aligned_stable_backing_and_releases_it() {
+        let backend = test_backend(false);
+        let backing = BackendPageBacking::allocate(backend, MIN_PAGE_SIZE, MAX_ALIGN)
+            .expect("system-backed page allocation succeeds");
+        assert!(!backing.base().is_null());
+        assert_eq!(backing.capacity(), MIN_PAGE_SIZE);
+        assert_eq!(backing.base() as usize % MAX_ALIGN, 0);
+        let base = backing.base();
+        // SAFETY: `backing` owns a live zeroed allocation of MIN_PAGE_SIZE bytes.
+        #[allow(unsafe_code)]
+        let bytes = unsafe { std::slice::from_raw_parts(base, MIN_PAGE_SIZE) };
+        assert!(bytes.iter().all(|&byte| byte == 0));
+        assert_eq!(backing.base(), base);
+        drop(backing);
+        assert_eq!(backend.allocation_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.release_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn backend_is_used_only_for_fresh_pages_and_releases_each_backing_once() {
+        let backend = test_backend(false);
+        let mut arena = PagedArena::with_backend(backend);
+        let first = arena.alloc(8, 8);
+        arena.alloc(DEFAULT_PAGE_SIZE, 8);
+        arena.alloc(DEFAULT_PAGE_SIZE * 2, 8);
+        arena.alloc(8, 8);
+        let allocations = backend.allocation_calls.load(Ordering::Relaxed);
+        assert_eq!(allocations, 4);
+
+        let second = arena
+            .try_alloc_existing(8, 8)
+            .expect("active allocation is addressable")
+            .expect("current page has capacity");
+        assert_ne!(first, second);
+        assert_eq!(
+            backend.allocation_calls.load(Ordering::Relaxed),
+            allocations
+        );
+        drop(arena);
+        assert_eq!(backend.release_calls.load(Ordering::Relaxed), allocations);
+    }
+
+    #[test]
+    fn inactive_page_reuse_does_not_allocate_backing_or_reacquire_governor_capacity() {
+        let backend = test_backend(false);
+        let governor = Arc::new(MemoryGovernor::new(MIN_PAGE_SIZE));
+        let mut arena =
+            PagedArena::with_backend_and_memory_governor(backend, Arc::clone(&governor));
+        let mark = arena.mark();
+        let first = arena.alloc(64, 8);
+        // SAFETY: this allocation is live until the rewind below.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::write_bytes(first, 0xAB, 64);
+        }
+        arena.rewind(mark);
+        let allocations_before = backend.allocation_calls.load(Ordering::Relaxed);
+        let grants_before = governor.telemetry().grant_events;
+        let reused = arena.alloc(64, 8);
+        assert_eq!(reused, first);
+        assert_eq!(
+            backend.allocation_calls.load(Ordering::Relaxed),
+            allocations_before
+        );
+        assert_eq!(governor.telemetry().grant_events, grants_before);
+        // SAFETY: `reused` is a live allocation whose rewind-reclaimed bytes were zeroed.
+        #[allow(unsafe_code)]
+        let bytes = unsafe { std::slice::from_raw_parts(reused, 64) };
+        assert!(bytes.iter().all(|&byte| byte == 0));
     }
 
     #[test]
@@ -948,7 +1167,8 @@ mod tests {
 
     #[test]
     fn page_base_addresses_stable_across_growth() {
-        let mut arena = PagedArena::new();
+        let backend = test_backend(false);
+        let mut arena = PagedArena::with_backend(backend);
         let mut bases = Vec::new();
         for _ in 0..8 {
             let ptr = arena.alloc(DEFAULT_PAGE_SIZE, 8);
@@ -963,6 +1183,9 @@ mod tests {
             #[allow(unsafe_code)]
             let _ = unsafe { std::ptr::read(base) };
         }
+        let allocations = backend.allocation_calls.load(Ordering::Relaxed);
+        drop(arena);
+        assert_eq!(backend.release_calls.load(Ordering::Relaxed), allocations);
     }
 
     #[test]
