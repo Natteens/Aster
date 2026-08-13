@@ -82,7 +82,8 @@ never alias builder storage.
   checkpoints and rewinds the same Temporary arena, but is tracked separately and does not change
   semantic function-scope depth. At most one fine subregion may be active per execution context in
   the initial acyclic-CFG implementation. One logical fine region may have multiple static,
-  compiler-authorized exit sites, but a dynamic path executes exactly one. Generated failure cleanup exits an active fine
+  compiler-authorized exit sites, but a dynamic path executes exactly one; the same balanced pair
+  may execute repeatedly for compiler-proven loop iterations. Generated failure cleanup exits an active fine
   subregion before it leaves the outer function scope. These symbols are compiler/runtime
   machinery, not ASTER source methods or a public FFI feature.
 - Temporary allocation is valid only while such a scope is active. The runtime reports a

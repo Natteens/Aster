@@ -100,8 +100,11 @@ span runs fine cleanup before ordinary function cleanup.
 
 Ordinary `compile` does not run AARM-5A/5B/5C/5D orchestration and emits no fine instructions.
 Normal ASTER execution therefore still reclaims Temporary storage only at function-scope exit.
-Loops/backedges, calls, concurrency, collections, builders, and dynamic strings remain outside the
-executable research subset; this is not production/default behavior.
+The research subset also includes proven iteration-local object/array work in a simple natural
+loop: a body-entry fine checkpoint and latch rewind can execute once per iteration while retaining
+the same arena capacity for reuse. Loop-carried references, header allocations, break/continue,
+multiple latches, nested loops, calls, concurrency, collections, builders, and dynamic strings
+remain outside the executable research subset; this is not production/default behavior.
 
 ## Collections and strings
 

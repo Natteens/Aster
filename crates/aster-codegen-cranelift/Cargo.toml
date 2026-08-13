@@ -15,6 +15,10 @@ name = "aarm_memory_matrix"
 path = "examples/aarm_memory_matrix.rs"
 required-features = ["aarm-telemetry"]
 
+[[example]]
+name = "aarm_iteration_loop"
+path = "examples/aarm_iteration_loop.rs"
+
 [dependencies]
 aster-mir = { path = "../aster-mir", version = "0.55.0" }
 aster-runtime = { path = "../aster-runtime", version = "0.55.0" }

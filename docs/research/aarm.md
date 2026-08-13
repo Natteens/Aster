@@ -940,6 +940,43 @@ calls/concurrency/collections/strings: REJECTED
 normal compiler invokes AARM-5E1: NO
 ```
 
+## AARM-5E2A simple iteration-local loop reclaim
+
+AARM-5E2A reuses the existing research-only FineEnter/FineExit pair for a
+strict, compiler-proven natural-loop subset. A supported loop has one header,
+one body entry, one latch `Goto(header)`, one backedge, and no secondary
+cycle. The header branches either to the body or the ordinary loop exit, so a
+zero-iteration execution never enters the fine region. The checkpoint is
+inserted at the body entry and the one static rewind is inserted at the latch
+before its backedge; each dynamic iteration therefore executes one balanced
+Enter/Exit pair with the same static ID.
+
+The compiler discovers the loop with deterministic dominators and a natural
+loop reverse walk. It accounts for every Temporary dynamic allocation in the
+iteration body, requires the body entry to dominate every listed site, and
+requires each allocation's AARM-5A reference-death proof at the latch rewind
+point. A reference live across the backedge, in the next header condition, or
+through an alias therefore withholds the candidate. Older Temporary storage is
+outside the per-iteration checkpoint and Persistent allocation remains outside
+the Temporary rewind.
+
+Cranelift uses a deterministic FineInactive/FineActive(id) CFG fixed point.
+The preheader and latch-to-header backedge must agree on FineInactive; Return
+or End likewise require FineInactive. The runtime remains CFG-blind and uses
+the existing private fine ABI repeatedly without changing semantic Temporary
+scope depth, governor ownership, mapping ownership, or ordinary default
+compilation.
+
+```text
+simple single-header/single-latch natural loop: IMPLEMENTED (research-only)
+body DAG branches with a common latch: SUPPORTED
+loop-carried Temporary alias: REJECTED
+header or post-exit Temporary allocation: REJECTED
+break/continue/multiple latches/nested loops: DEFERRED TO AARM-5E2B
+calls/concurrency/collections/strings: REJECTED
+normal compiler invokes AARM-5E2A: NO
+```
+
 ## Measurement invariants
 
 Every snapshot must satisfy:

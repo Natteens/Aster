@@ -274,6 +274,7 @@ fn duplicate_candidate_ids(
 enum SupportedFunction<'a> {
     Straight(&'a mir::BasicBlock),
     Acyclic(Box<super::AcyclicCfg>),
+    SimpleLoop(Box<super::SimpleNaturalLoop>),
 }
 
 fn supported_function(function: &mir::Function) -> Option<SupportedFunction<'_>> {
@@ -285,9 +286,15 @@ fn supported_function(function: &mir::Function) -> Option<SupportedFunction<'_>>
             ))
         .then_some(SupportedFunction::Straight(block));
     }
-    super::acyclic_cfg(function).map(|cfg| SupportedFunction::Acyclic(Box::new(cfg)))
+    super::acyclic_cfg(function)
+        .map(|cfg| SupportedFunction::Acyclic(Box::new(cfg)))
+        .or_else(|| {
+            super::simple_natural_loop(function)
+                .map(|loop_cfg| SupportedFunction::SimpleLoop(Box::new(loop_cfg)))
+        })
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_candidate(
     function: &mir::Function,
     supported: &SupportedFunction<'_>,
@@ -297,6 +304,9 @@ fn validate_candidate(
 ) -> Result<ValidatedTemporarySubregion, TemporarySubregionRejectionReason> {
     if let SupportedFunction::Acyclic(cfg) = supported {
         return validate_cfg_candidate(function, cfg, candidate, proofs, has_concurrency);
+    }
+    if let SupportedFunction::SimpleLoop(loop_cfg) = supported {
+        return validate_loop_candidate(function, loop_cfg, candidate, proofs, has_concurrency);
     }
     let SupportedFunction::Straight(block) = supported else {
         unreachable!()
@@ -398,6 +408,121 @@ fn validate_candidate(
         rewind,
         rewinds: vec![rewind],
         allocations: candidate.allocations.clone(),
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_loop_candidate(
+    function: &mir::Function,
+    loop_cfg: &super::SimpleNaturalLoop,
+    candidate: &mir::TemporarySubregionCandidate,
+    proofs: &HashMap<mir::MirAllocationSite, &crate::lifetime_analysis::AllocationLifetimeProof>,
+    has_concurrency: bool,
+) -> Result<ValidatedTemporarySubregion, TemporarySubregionRejectionReason> {
+    let rewind = mir::MirPoint {
+        block: loop_cfg.latch,
+        instruction_boundary: loop_cfg.block(function, loop_cfg.latch).instructions.len(),
+    };
+    if candidate.checkpoint
+        != (mir::MirPoint {
+            block: loop_cfg.body_entry,
+            instruction_boundary: 0,
+        })
+        || candidate.rewinds.as_slice() != [rewind]
+        || rewind.instruction_boundary == 0
+    {
+        return Err(TemporarySubregionRejectionReason::MalformedPoint);
+    }
+    if has_concurrency
+        || function_contains_temporary_allocation(
+            loop_cfg
+                .block(function, loop_cfg.header)
+                .instructions
+                .as_slice(),
+        )
+    {
+        return Err(if has_concurrency {
+            TemporarySubregionRejectionReason::ConcurrencyBarrier
+        } else {
+            TemporarySubregionRejectionReason::UnaccountedTemporaryAllocation
+        });
+    }
+    let mut body_blocks = loop_cfg
+        .body
+        .iter()
+        .copied()
+        .filter(|block| *block != loop_cfg.header)
+        .collect::<Vec<_>>();
+    body_blocks.sort_unstable_by_key(|block| block.0);
+    let mut expected_sites = Vec::new();
+    for block in &body_blocks {
+        let instructions = &loop_cfg.block(function, *block).instructions;
+        if let Some(reason) = span_barrier(instructions) {
+            return Err(reason);
+        }
+        for (instruction_index, instruction) in instructions.iter().enumerate() {
+            if escape_analysis::dynamic_allocation_region(instruction)
+                == Some(mir::AllocationRegion::Temporary)
+            {
+                expected_sites.push(mir::MirAllocationSite {
+                    function: function.symbol,
+                    block: *block,
+                    instruction_index,
+                });
+            }
+        }
+    }
+    expected_sites.sort_unstable_by_key(|site| (site.block.0, site.instruction_index));
+    if expected_sites.is_empty() || candidate.allocations != expected_sites {
+        return Err(TemporarySubregionRejectionReason::UnaccountedTemporaryAllocation);
+    }
+    for site in &candidate.allocations {
+        if site.function != function.symbol || !loop_cfg.dominates(loop_cfg.body_entry, site.block)
+        {
+            return Err(TemporarySubregionRejectionReason::WrongFunction);
+        }
+        let Some(instruction) = loop_cfg
+            .block(function, site.block)
+            .instructions
+            .get(site.instruction_index)
+        else {
+            return Err(TemporarySubregionRejectionReason::MalformedAllocationSite);
+        };
+        if escape_analysis::dynamic_allocation_region(instruction)
+            != Some(mir::AllocationRegion::Temporary)
+        {
+            return Err(TemporarySubregionRejectionReason::PersistentAllocation);
+        }
+        if allocation_form_barrier(instruction).is_some()
+            || !matches!(
+                instruction,
+                mir::Instruction::AllocateObject { .. } | mir::Instruction::AllocateArray { .. }
+            )
+        {
+            return Err(allocation_form_barrier(instruction)
+                .unwrap_or(TemporarySubregionRejectionReason::MalformedAllocationSite));
+        }
+        let Some(proof) = proofs.get(site) else {
+            return Err(TemporarySubregionRejectionReason::MissingReferenceDeathProof);
+        };
+        if proof.region != mir::AllocationRegion::Temporary || !proof.dead_after.contains(&rewind) {
+            return Err(TemporarySubregionRejectionReason::MissingReferenceDeathProof);
+        }
+    }
+    Ok(ValidatedTemporarySubregion {
+        function: function.symbol,
+        id: candidate.id,
+        checkpoint: candidate.checkpoint,
+        rewind,
+        rewinds: vec![rewind],
+        allocations: candidate.allocations.clone(),
+    })
+}
+
+fn function_contains_temporary_allocation(instructions: &[mir::Instruction]) -> bool {
+    instructions.iter().any(|instruction| {
+        escape_analysis::dynamic_allocation_region(instruction)
+            == Some(mir::AllocationRegion::Temporary)
     })
 }
 
@@ -554,6 +679,18 @@ fn allocation_form_barrier(
         }
         _ => None,
     }
+}
+
+pub(super) fn span_barrier_for_research(
+    instructions: &[&mir::Instruction],
+) -> Option<TemporarySubregionRejectionReason> {
+    for instruction in instructions {
+        let single = std::slice::from_ref(*instruction);
+        if let Some(reason) = span_barrier(single) {
+            return Some(reason);
+        }
+    }
+    None
 }
 
 fn span_barrier(instructions: &[mir::Instruction]) -> Option<TemporarySubregionRejectionReason> {

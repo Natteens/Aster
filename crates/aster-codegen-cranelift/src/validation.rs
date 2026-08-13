@@ -981,7 +981,6 @@ fn validate_executable_temporary_subregion_cfg(
                 "malformed executable AARM temporary subregion CFG",
             )
         })?;
-    let mut incoming = HashMap::new();
     let mut reachable = HashSet::new();
     let mut pending = vec![function.entry];
     while let Some(block) = pending.pop() {
@@ -996,53 +995,22 @@ fn validate_executable_temporary_subregion_cfg(
             "unreachable executable AARM temporary subregion block",
         ));
     }
-    for block in &reachable {
-        incoming.insert(*block, 0_usize);
-    }
-    for block in &reachable {
-        for successor in &successors[block] {
-            if reachable.contains(successor) {
-                *incoming.get_mut(successor).expect("reachable successor") += 1;
-            }
-        }
-    }
-    let mut ready = incoming
-        .iter()
-        .filter_map(|(block, incoming)| (*incoming == 0).then_some(*block))
-        .collect::<Vec<_>>();
-    ready.sort_unstable_by_key(|block| std::cmp::Reverse(block.0));
-    let mut order = Vec::new();
-    while let Some(block) = ready.pop() {
-        order.push(block);
-        for successor in &successors[&block] {
-            if !reachable.contains(successor) {
-                continue;
-            }
-            let count = incoming.get_mut(successor).expect("reachable successor");
-            *count -= 1;
-            if *count == 0 {
-                ready.push(*successor);
-            }
-        }
-        ready.sort_unstable_by_key(|block| std::cmp::Reverse(block.0));
-    }
-    if order.len() != reachable.len() {
-        return Err(unsupported(
-            &function.name,
-            "cyclic executable AARM temporary subregions",
-        ));
-    }
-
+    validate_executable_temporary_subregion_cycles(function, &blocks, &successors, &reachable)?;
     let mut state = HashMap::from([(function.entry, FineState::Inactive)]);
-    let mut entered = HashSet::new();
+    let mut entered = HashMap::new();
     let mut allocations = HashSet::new();
-    for block_id in order {
+    let mut pending = vec![function.entry];
+    while let Some(block_id) = pending.pop() {
         let mut current = state[&block_id];
         let block = &function.blocks[blocks[&block_id]];
-        for instruction in &block.instructions {
+        for (instruction_index, instruction) in block.instructions.iter().enumerate() {
             match instruction {
                 mir::Instruction::TemporarySubregionEnter { id } => {
-                    if current != FineState::Inactive || !entered.insert(*id) {
+                    if current != FineState::Inactive
+                        || entered
+                            .insert(*id, (block_id, instruction_index))
+                            .is_some_and(|previous| previous != (block_id, instruction_index))
+                    {
                         return Err(unsupported(
                             &function.name,
                             "nested or duplicate executable AARM temporary subregion enter",
@@ -1100,16 +1068,188 @@ fn validate_executable_temporary_subregion_cfg(
                         "inconsistent executable AARM temporary subregion state at CFG join",
                     ));
                 }
+            } else {
+                pending.push(*successor);
             }
         }
     }
     if entered
-        .iter()
+        .keys()
         .any(|id| !allocations.contains(&FineState::Active(*id)))
     {
         return Err(unsupported(
             &function.name,
             "executable AARM temporary subregion without a Temporary allocation",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_executable_temporary_subregion_cycles(
+    function: &mir::Function,
+    blocks: &HashMap<mir::BasicBlockId, usize>,
+    successors: &HashMap<mir::BasicBlockId, Vec<mir::BasicBlockId>>,
+    reachable: &HashSet<mir::BasicBlockId>,
+) -> Result<(), BackendError> {
+    let mut predecessors = reachable
+        .iter()
+        .copied()
+        .map(|block| (block, Vec::new()))
+        .collect::<HashMap<_, _>>();
+    for (block, targets) in successors {
+        for target in targets {
+            predecessors
+                .get_mut(target)
+                .expect("validated target")
+                .push(*block);
+        }
+    }
+    let mut order = reachable.iter().copied().collect::<Vec<_>>();
+    order.sort_unstable_by_key(|block| block.0);
+    let mut dominators = order
+        .iter()
+        .map(|block| {
+            (
+                *block,
+                if *block == function.entry {
+                    HashSet::from([*block])
+                } else {
+                    reachable.clone()
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    loop {
+        let mut changed = false;
+        for block in &order {
+            if *block == function.entry {
+                continue;
+            }
+            let mut next = predecessors[block]
+                .iter()
+                .map(|predecessor| dominators[predecessor].clone())
+                .reduce(|left, right| left.intersection(&right).copied().collect())
+                .unwrap_or_default();
+            next.insert(*block);
+            if next != dominators[block] {
+                dominators.insert(*block, next);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut backedges = successors
+        .iter()
+        .flat_map(|(source, targets)| targets.iter().map(move |target| (*source, *target)))
+        .filter(|(source, target)| dominators[source].contains(target))
+        .collect::<Vec<_>>();
+    backedges.sort_unstable_by_key(|(source, target)| (source.0, target.0));
+    if backedges.is_empty() {
+        return Ok(());
+    }
+    let [(latch, header)] = backedges.as_slice() else {
+        return Err(unsupported(
+            &function.name,
+            "multiple executable AARM temporary-subregion loop latches",
+        ));
+    };
+    if latch == header
+        || !matches!(function.blocks[blocks[latch]].terminator, mir::Terminator::Goto(target) if target == *header)
+    {
+        return Err(unsupported(
+            &function.name,
+            "unsupported executable AARM temporary-subregion loop shape",
+        ));
+    }
+    let mir::Terminator::Branch {
+        then_block,
+        else_block,
+        ..
+    } = function.blocks[blocks[header]].terminator
+    else {
+        return Err(unsupported(
+            &function.name,
+            "unsupported executable AARM temporary-subregion loop header",
+        ));
+    };
+    let mut body = HashSet::from([*header, *latch]);
+    let mut pending = vec![*latch];
+    while let Some(block) = pending.pop() {
+        for predecessor in &predecessors[&block] {
+            if *predecessor != *header && body.insert(*predecessor) {
+                pending.push(*predecessor);
+            }
+        }
+    }
+    let header_targets = [then_block, else_block];
+    if header_targets
+        .iter()
+        .filter(|target| body.contains(target))
+        .count()
+        != 1
+        || header_targets
+            .iter()
+            .filter(|target| !body.contains(target))
+            .count()
+            != 1
+        || body.iter().any(|block| {
+            *block != *header
+                && (predecessors[block]
+                    .iter()
+                    .any(|predecessor| !body.contains(predecessor))
+                    || successors[block]
+                        .iter()
+                        .any(|successor| !body.contains(successor)))
+        })
+    {
+        return Err(unsupported(
+            &function.name,
+            "unsupported executable AARM temporary-subregion loop entry or exit",
+        ));
+    }
+    let mut indegree = body
+        .iter()
+        .copied()
+        .map(|block| (block, 0_usize))
+        .collect::<HashMap<_, _>>();
+    for block in &body {
+        for successor in &successors[block] {
+            if body.contains(successor) && !(*block == *latch && *successor == *header) {
+                *indegree
+                    .get_mut(successor)
+                    .expect("loop successor is in the loop") += 1;
+            }
+        }
+    }
+    let mut ready = indegree
+        .iter()
+        .filter_map(|(block, degree)| (*degree == 0).then_some(*block))
+        .collect::<Vec<_>>();
+    ready.sort_unstable_by_key(|block| std::cmp::Reverse(block.0));
+    let mut visited = 0;
+    while let Some(block) = ready.pop() {
+        visited += 1;
+        for successor in &successors[&block] {
+            if !body.contains(successor) || (block == *latch && *successor == *header) {
+                continue;
+            }
+            let degree = indegree
+                .get_mut(successor)
+                .expect("loop successor is in the loop");
+            *degree -= 1;
+            if *degree == 0 {
+                ready.push(*successor);
+            }
+        }
+        ready.sort_unstable_by_key(|block| std::cmp::Reverse(block.0));
+    }
+    if visited != body.len() {
+        return Err(unsupported(
+            &function.name,
+            "secondary cycle in an executable AARM temporary subregion",
         ));
     }
     Ok(())
