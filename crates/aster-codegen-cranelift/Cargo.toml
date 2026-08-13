@@ -20,16 +20,16 @@ name = "aarm_iteration_loop"
 path = "examples/aarm_iteration_loop.rs"
 
 [dependencies]
-aster-mir = { path = "../aster-mir", version = "0.55.0" }
-aster-runtime = { path = "../aster-runtime", version = "0.55.0" }
-aster-types = { path = "../aster-types", version = "0.55.0" }
+aster-mir = { path = "../aster-mir", version = "0.56.0" }
+aster-runtime = { path = "../aster-runtime", version = "0.56.0" }
+aster-types = { path = "../aster-types", version = "0.56.0" }
 cranelift-codegen = "=0.121.2"
 cranelift-frontend = "=0.121.2"
 cranelift-jit = "=0.121.2"
 cranelift-module = "=0.121.2"
 
 [dev-dependencies]
-aster-compiler = { path = "../aster-compiler", version = "0.55.0" }
+aster-compiler = { path = "../aster-compiler", version = "0.56.0" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59.0", features = [
