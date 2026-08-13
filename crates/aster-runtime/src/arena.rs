@@ -81,7 +81,7 @@ trait PageBackend {
 
     fn release(&self, backing: PageBacking);
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     fn is_windows_virtual(&self) -> bool {
         false
     }
@@ -208,7 +208,7 @@ impl PageBackend for WindowsVirtualPageBackend {
         debug_assert!(released, "Windows virtual page release must succeed");
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     fn is_windows_virtual(&self) -> bool {
         true
     }
