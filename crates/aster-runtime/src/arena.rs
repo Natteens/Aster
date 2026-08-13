@@ -15,6 +15,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use crate::memory_governor::{GovernorReservation, MemoryGovernor, MemoryGovernorTelemetry};
@@ -576,6 +577,8 @@ impl Drop for BackendPageBacking {
 struct Page {
     backing: BackendPageBacking,
     cursor: usize,
+    inactive_since: Option<Instant>,
+    last_restore_at: Option<Instant>,
     _governor_reservation: Option<GovernorReservation>,
 }
 
@@ -597,6 +600,8 @@ impl Page {
         Ok(Page {
             backing: BackendPageBacking::allocate(backend, capacity, MAX_ALIGN)?,
             cursor: 0,
+            inactive_since: None,
+            last_restore_at: None,
             _governor_reservation: governor_reservation,
         })
     }
@@ -700,6 +705,42 @@ pub(crate) struct ArenaPurgeReport {
     pub unsupported: usize,
 }
 
+/// Explicit research policy for caller-owned delayed purge maintenance.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "AARM-4B remains an opt-in research policy")
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AarmDelayedPurgePolicy {
+    pub inactive_delay: Duration,
+    pub repurge_cooldown: Duration,
+    pub sweep_interval: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DelayedPurgeState {
+    policy: AarmDelayedPurgePolicy,
+    last_sweep_at: Instant,
+}
+
+/// Deterministic classification of one due delayed-purge sweep.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "AARM-4B remains an opt-in research policy")
+)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DelayedPurgeReport {
+    pub sweep_performed: bool,
+    pub examined: usize,
+    pub eligible: usize,
+    pub deferred_inactive_delay: usize,
+    pub deferred_hysteresis: usize,
+    pub discarded: usize,
+    pub failed: usize,
+    pub already_discarded: usize,
+    pub unsupported: usize,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ArenaEventMetrics {
     pub active_page_fast_path_allocations: u64,
@@ -779,6 +820,7 @@ pub(crate) struct PagedArena {
     arena_id: u64,
     next_mark_id: u64,
     mark_stack: Vec<u64>,
+    delayed_purge: Option<DelayedPurgeState>,
     #[cfg(feature = "aarm-telemetry")]
     telemetry: ArenaTelemetryState,
 }
@@ -795,6 +837,7 @@ impl PagedArena {
             arena_id: next_arena_id(),
             next_mark_id: 1,
             mark_stack: Vec::new(),
+            delayed_purge: None,
             #[cfg(feature = "aarm-telemetry")]
             telemetry: ArenaTelemetryState {
                 peak_backing_retained_bytes: default_page_backend()
@@ -840,6 +883,116 @@ impl PagedArena {
         let mut arena = Self::with_backend(backend);
         arena.governor = Some(governor);
         arena
+    }
+
+    /// Enable caller-owned delayed purge timing from one explicit monotonic
+    /// instant. Existing inactive pages begin aging at `now` conservatively.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "AARM-4B remains an opt-in research policy")
+    )]
+    pub(crate) fn enable_delayed_purge(&mut self, policy: AarmDelayedPurgePolicy, now: Instant) {
+        for (index, page) in self.pages.iter_mut().enumerate() {
+            page.inactive_since = (index >= self.active_pages).then_some(now);
+            page.last_restore_at = None;
+        }
+        self.delayed_purge = Some(DelayedPurgeState {
+            policy,
+            last_sweep_at: now,
+        });
+    }
+
+    /// Disable automatic delayed maintenance without changing backing state.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "AARM-4B remains an opt-in research policy")
+    )]
+    pub(crate) fn disable_delayed_purge(&mut self) {
+        self.delayed_purge = None;
+        for page in &mut self.pages {
+            page.inactive_since = None;
+            page.last_restore_at = None;
+        }
+    }
+
+    /// Evaluate one delayed-purge sweep at a caller-supplied monotonic instant.
+    /// A call before the configured sweep boundary performs no page scan.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "AARM-4B remains an opt-in research policy")
+    )]
+    pub(crate) fn maintain_delayed_purge(&mut self, now: Instant) -> DelayedPurgeReport {
+        let Some(state) = self.delayed_purge.as_mut() else {
+            return DelayedPurgeReport::default();
+        };
+        let Some(since_last_sweep) = now.checked_duration_since(state.last_sweep_at) else {
+            return DelayedPurgeReport::default();
+        };
+        if since_last_sweep < state.policy.sweep_interval {
+            return DelayedPurgeReport::default();
+        }
+        state.last_sweep_at = now;
+        let policy = state.policy;
+
+        assert!(
+            self.pages[self.active_pages..]
+                .iter()
+                .all(|page| page.cursor == 0),
+            "inactive arena page must have zero cursor"
+        );
+
+        let mut report = DelayedPurgeReport {
+            sweep_performed: true,
+            ..DelayedPurgeReport::default()
+        };
+        for page in &mut self.pages[self.active_pages..] {
+            report.examined += 1;
+            match page.backing_state() {
+                PageBackingState::Discarded => report.already_discarded += 1,
+                PageBackingState::Retained if !self.backend.supports_discard() => {
+                    report.unsupported += 1;
+                }
+                PageBackingState::Retained => {
+                    let Some(inactive_age) = page
+                        .inactive_since
+                        .and_then(|inactive_since| now.checked_duration_since(inactive_since))
+                    else {
+                        report.deferred_inactive_delay += 1;
+                        continue;
+                    };
+                    if inactive_age < policy.inactive_delay {
+                        report.deferred_inactive_delay += 1;
+                        continue;
+                    }
+                    if page.last_restore_at.is_some_and(|last_restore_at| {
+                        now.checked_duration_since(last_restore_at)
+                            .is_none_or(|age| age < policy.repurge_cooldown)
+                    }) {
+                        report.deferred_hysteresis += 1;
+                        continue;
+                    }
+
+                    report.eligible += 1;
+                    if page.backing.discard().is_ok() {
+                        report.discarded += 1;
+                    } else {
+                        report.failed += 1;
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "aarm-telemetry")]
+        self.refresh_telemetry_peaks();
+        debug_assert_eq!(
+            report.examined,
+            report.already_discarded
+                + report.unsupported
+                + report.deferred_inactive_delay
+                + report.deferred_hysteresis
+                + report.eligible
+        );
+        debug_assert_eq!(report.eligible, report.discarded + report.failed);
+        report
     }
 
     /// Discard every fully inactive retained backing supported by this arena's
@@ -920,6 +1073,27 @@ impl PagedArena {
         align: usize,
         max_reserved_bytes: usize,
     ) -> Result<*mut u8, ArenaAllocError> {
+        self.try_alloc_internal(size, align, max_reserved_bytes, None)
+    }
+
+    #[cfg(test)]
+    fn try_alloc_at(
+        &mut self,
+        size: usize,
+        align: usize,
+        max_reserved_bytes: usize,
+        now: Instant,
+    ) -> Result<*mut u8, ArenaAllocError> {
+        self.try_alloc_internal(size, align, max_reserved_bytes, Some(now))
+    }
+
+    fn try_alloc_internal(
+        &mut self,
+        size: usize,
+        align: usize,
+        max_reserved_bytes: usize,
+        restore_at: Option<Instant>,
+    ) -> Result<*mut u8, ArenaAllocError> {
         if let Some(pointer) = self.try_alloc_existing(size, align)? {
             return Ok(pointer);
         }
@@ -936,7 +1110,7 @@ impl PagedArena {
             "inactive arena page must have zero cursor"
         );
 
-        if let Some(pointer) = self.try_reuse_inactive_page(size, align)? {
+        if let Some(pointer) = self.try_reuse_inactive_page(size, align, restore_at)? {
             return Ok(pointer);
         }
 
@@ -1010,6 +1184,7 @@ impl PagedArena {
         &mut self,
         size: usize,
         align: usize,
+        restore_at: Option<Instant>,
     ) -> Result<Option<*mut u8>, ArenaAllocError> {
         let reusable_index = self.pages[self.active_pages..]
             .iter()
@@ -1021,7 +1196,12 @@ impl PagedArena {
             return Ok(None);
         };
 
+        let restored = self.pages[index].backing_state() == PageBackingState::Discarded;
         self.pages[index].prepare_for_reuse()?;
+        self.pages[index].inactive_since = None;
+        if restored && self.delayed_purge.is_some() {
+            self.pages[index].last_restore_at = Some(restore_at.unwrap_or_else(Instant::now));
+        }
         self.pages.swap(self.active_pages, index);
         let page = &mut self.pages[self.active_pages];
         #[cfg(feature = "aarm-telemetry")]
@@ -1088,6 +1268,12 @@ impl PagedArena {
             .expect("test arena allocation")
     }
 
+    #[cfg(test)]
+    fn alloc_at(&mut self, size: usize, align: usize, now: Instant) -> *mut u8 {
+        self.try_alloc_at(size, align, usize::MAX, now)
+            .expect("test arena allocation")
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn mark(&mut self) -> ArenaMark {
         let mark_id = self.next_mark_id;
@@ -1117,10 +1303,24 @@ impl PagedArena {
     #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn rewind(&mut self, mark: ArenaMark) {
+        let policy_now = self.delayed_purge.as_ref().map(|_| Instant::now());
+        self.rewind_internal(mark, policy_now);
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::needless_pass_by_value)]
+    fn rewind_at(&mut self, mark: ArenaMark, now: Instant) {
+        let policy_now = self.delayed_purge.as_ref().map(|_| now);
+        self.rewind_internal(mark, policy_now);
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn rewind_internal(&mut self, mark: ArenaMark, policy_now: Option<Instant>) {
         #[cfg(feature = "aarm-telemetry")]
         let used_bytes_before = self.used_bytes;
         #[cfg(feature = "aarm-telemetry")]
         let capacity_bytes_before = self.reserved_bytes;
+        let old_active_pages = self.active_pages;
         let ArenaMark {
             arena_id,
             mark_id,
@@ -1185,6 +1385,12 @@ impl PagedArena {
         self.active_pages = active_pages;
         self.used_bytes = used_bytes;
 
+        if let Some(now) = policy_now {
+            for page in &mut self.pages[active_pages..old_active_pages] {
+                page.inactive_since = Some(now);
+            }
+        }
+
         let removed = self.mark_stack.pop();
 
         assert_eq!(
@@ -1209,6 +1415,10 @@ impl PagedArena {
                 active_page_capacity_bytes_after,
                 inactive_page_capacity_bytes_after,
             });
+        }
+
+        if let Some(now) = policy_now {
+            let _ = self.maintain_delayed_purge(now);
         }
     }
 
@@ -1582,6 +1792,18 @@ mod tests {
         )))
     }
 
+    fn delayed_policy(
+        inactive_delay_ms: u64,
+        repurge_cooldown_ms: u64,
+        sweep_interval_ms: u64,
+    ) -> AarmDelayedPurgePolicy {
+        AarmDelayedPurgePolicy {
+            inactive_delay: Duration::from_millis(inactive_delay_ms),
+            repurge_cooldown: Duration::from_millis(repurge_cooldown_ms),
+            sweep_interval: Duration::from_millis(sweep_interval_ms),
+        }
+    }
+
     #[test]
     fn discarded_inactive_page_restore_failure_is_atomic_and_keeps_governor_capacity() {
         let governor = Arc::new(MemoryGovernor::new(MIN_PAGE_SIZE));
@@ -1725,6 +1947,542 @@ mod tests {
                 already_discarded: 2,
                 ..ArenaPurgeReport::default()
             }
+        );
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    #[test]
+    fn delayed_purge_is_disabled_by_default_and_retained_reuse_stays_vm_free() {
+        let backend = test_vm_backend(false, false);
+        let mut arena = PagedArena::with_backend(backend);
+        let mark = arena.mark();
+        let original = arena.alloc(MIN_PAGE_SIZE, 1);
+        arena.rewind(mark);
+
+        assert_eq!(
+            arena.maintain_delayed_purge(Instant::now() + Duration::from_secs(60)),
+            DelayedPurgeReport::default()
+        );
+        let reused = arena.alloc(MIN_PAGE_SIZE, 1);
+        assert_eq!(reused, original);
+        assert_eq!(backend.allocation_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.discard_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.restore_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    #[test]
+    fn zero_duration_delayed_purge_matches_immediate_whole_page_eligibility() {
+        let backend = test_vm_backend(false, false);
+        let mut arena = PagedArena::with_backend(backend);
+        let t0 = Instant::now();
+        arena.enable_delayed_purge(delayed_policy(0, 0, 0), t0);
+        let mark = arena.mark();
+        arena.alloc(MIN_PAGE_SIZE, 1);
+        arena.rewind_at(mark, t0);
+
+        assert_eq!(arena.pages[0].backing_state(), PageBackingState::Discarded);
+        assert_eq!(backend.discard_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            arena.maintain_delayed_purge(t0),
+            DelayedPurgeReport {
+                sweep_performed: true,
+                examined: 1,
+                already_discarded: 1,
+                ..DelayedPurgeReport::default()
+            }
+        );
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    #[test]
+    fn delayed_purge_uses_inclusive_delay_and_exact_sweep_boundaries() {
+        let backend = test_vm_backend(false, false);
+        let mut arena = PagedArena::with_backend(backend);
+        let t0 = Instant::now();
+        arena.enable_delayed_purge(delayed_policy(100, 0, 100), t0);
+        let mark = arena.mark();
+        arena.alloc(MIN_PAGE_SIZE, 1);
+        arena.rewind_at(mark, t0);
+
+        assert_eq!(
+            arena.maintain_delayed_purge(t0 + Duration::from_millis(99)),
+            DelayedPurgeReport::default()
+        );
+        assert_eq!(backend.discard_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            arena.maintain_delayed_purge(t0 + Duration::from_millis(100)),
+            DelayedPurgeReport {
+                sweep_performed: true,
+                examined: 1,
+                eligible: 1,
+                discarded: 1,
+                ..DelayedPurgeReport::default()
+            }
+        );
+        assert_eq!(backend.discard_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    #[test]
+    fn short_gap_reuse_never_discards_restores_or_grows_backing() {
+        const ROUNDS: usize = 256;
+        let backend = test_vm_backend(false, false);
+        let mut arena = PagedArena::with_backend(backend);
+        let t0 = Instant::now();
+        arena.enable_delayed_purge(delayed_policy(100, 250, 0), t0);
+        let mut expected_base = None;
+
+        for round in 0..ROUNDS {
+            let active_at = t0 + Duration::from_millis((round * 2) as u64);
+            let mark = arena.mark();
+            let base = arena.alloc_at(MIN_PAGE_SIZE, 1, active_at);
+            if let Some(expected) = expected_base {
+                assert_eq!(base, expected);
+            } else {
+                expected_base = Some(base);
+            }
+            arena.rewind_at(mark, active_at + Duration::from_millis(1));
+        }
+
+        assert_eq!(backend.allocation_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(backend.discard_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(backend.restore_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(arena.page_count(), 1);
+        assert_eq!(arena.metrics().reserved_bytes, MIN_PAGE_SIZE);
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    #[test]
+    fn repurge_cooldown_suppresses_churn_until_it_expires() {
+        let backend = test_vm_backend(false, false);
+        let governor = Arc::new(MemoryGovernor::new(MIN_PAGE_SIZE));
+        let mut arena =
+            PagedArena::with_backend_and_memory_governor(backend, Arc::clone(&governor));
+        let t0 = Instant::now();
+        arena.enable_delayed_purge(delayed_policy(100, 250, 0), t0);
+        let first_mark = arena.mark();
+        let original = arena.alloc_at(MIN_PAGE_SIZE, 1, t0);
+        arena.rewind_at(first_mark, t0);
+        let governor_before = governor.telemetry();
+
+        let first_purge = arena.maintain_delayed_purge(t0 + Duration::from_millis(100));
+        assert_eq!(first_purge.discarded, 1);
+        let restore_at = t0 + Duration::from_millis(200);
+        let second_mark = arena.mark();
+        let restored = arena.alloc_at(MIN_PAGE_SIZE, 1, restore_at);
+        assert_eq!(restored, original);
+        arena.rewind_at(second_mark, restore_at);
+
+        let early = arena.maintain_delayed_purge(restore_at + Duration::from_millis(100));
+        assert_eq!(early.deferred_hysteresis, 1);
+        assert_eq!(early.discarded, 0);
+        assert_eq!(backend.discard_calls.load(Ordering::Relaxed), 1);
+
+        let expired = arena.maintain_delayed_purge(restore_at + Duration::from_millis(250));
+        assert_eq!(expired.discarded, 1);
+        assert_eq!(backend.discard_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(backend.restore_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(governor.telemetry(), governor_before);
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    #[test]
+    fn delayed_purge_preserves_existing_inactive_age_across_unrelated_rewinds() {
+        let backend = test_vm_backend(false, false);
+        let mut arena = PagedArena::with_backend(backend);
+        let t0 = Instant::now();
+        arena.enable_delayed_purge(delayed_policy(250, 0, 500), t0);
+
+        let first_mark = arena.mark();
+        arena.alloc_at(MIN_PAGE_SIZE, 1, t0);
+        arena.rewind_at(first_mark, t0);
+
+        let second_mark = arena.mark();
+        arena.alloc_at(MIN_PAGE_SIZE * 2, 1, t0 + Duration::from_millis(300));
+        arena.rewind_at(second_mark, t0 + Duration::from_millis(300));
+
+        let third_mark = arena.mark();
+        arena.alloc_at(MIN_PAGE_SIZE * 4, 1, t0 + Duration::from_millis(480));
+        arena.rewind_at(third_mark, t0 + Duration::from_millis(480));
+
+        assert_eq!(
+            arena
+                .pages
+                .iter()
+                .find(|page| page.capacity() == MIN_PAGE_SIZE)
+                .expect("small page is present")
+                .inactive_since,
+            Some(t0)
+        );
+        assert_eq!(
+            arena
+                .pages
+                .iter()
+                .find(|page| page.capacity() == MIN_PAGE_SIZE * 2)
+                .expect("medium page is present")
+                .inactive_since,
+            Some(t0 + Duration::from_millis(300))
+        );
+        assert_eq!(
+            arena
+                .pages
+                .iter()
+                .find(|page| page.capacity() == MIN_PAGE_SIZE * 4)
+                .expect("large page is present")
+                .inactive_since,
+            Some(t0 + Duration::from_millis(480))
+        );
+
+        let report = arena.maintain_delayed_purge(t0 + Duration::from_millis(500));
+        assert_eq!(report.examined, 3);
+        assert_eq!(report.discarded, 1);
+        assert_eq!(report.deferred_inactive_delay, 2);
+        assert_eq!(
+            arena
+                .pages
+                .iter()
+                .find(|page| page.capacity() == MIN_PAGE_SIZE)
+                .expect("small page is present")
+                .backing_state(),
+            PageBackingState::Discarded
+        );
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    #[test]
+    fn reuse_clears_and_next_rewind_restarts_inactivity_age() {
+        let backend = test_vm_backend(false, false);
+        let mut arena = PagedArena::with_backend(backend);
+        let t0 = Instant::now();
+        arena.enable_delayed_purge(delayed_policy(100, 0, 0), t0);
+        let first_mark = arena.mark();
+        arena.alloc_at(MIN_PAGE_SIZE, 1, t0);
+        arena.rewind_at(first_mark, t0);
+        assert_eq!(arena.pages[0].inactive_since, Some(t0));
+
+        let second_mark = arena.mark();
+        arena.alloc_at(MIN_PAGE_SIZE, 1, t0 + Duration::from_millis(50));
+        assert_eq!(arena.pages[0].inactive_since, None);
+        arena.rewind_at(second_mark, t0 + Duration::from_millis(60));
+        assert_eq!(
+            arena.pages[0].inactive_since,
+            Some(t0 + Duration::from_millis(60))
+        );
+        assert_eq!(
+            arena.maintain_delayed_purge(t0 + Duration::from_millis(100)),
+            DelayedPurgeReport {
+                sweep_performed: true,
+                examined: 1,
+                deferred_inactive_delay: 1,
+                ..DelayedPurgeReport::default()
+            }
+        );
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    #[test]
+    fn delayed_discard_failure_retries_only_on_later_due_sweeps() {
+        let backend = test_vm_backend(true, false);
+        let mut arena = PagedArena::with_backend(backend);
+        let t0 = Instant::now();
+        arena.enable_delayed_purge(delayed_policy(0, 0, 100), t0);
+        let mark = arena.mark();
+        arena.alloc_at(MIN_PAGE_SIZE, 1, t0);
+        arena.rewind_at(mark, t0);
+
+        let failed = arena.maintain_delayed_purge(t0 + Duration::from_millis(100));
+        assert_eq!(failed.eligible, 1);
+        assert_eq!(failed.failed, 1);
+        assert_eq!(arena.pages[0].backing_state(), PageBackingState::Retained);
+        assert_eq!(arena.pages[0].inactive_since, Some(t0));
+        assert_eq!(backend.discard_calls.load(Ordering::Relaxed), 1);
+
+        assert_eq!(
+            arena.maintain_delayed_purge(t0 + Duration::from_millis(150)),
+            DelayedPurgeReport::default()
+        );
+        assert_eq!(backend.discard_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            arena
+                .maintain_delayed_purge(t0 + Duration::from_millis(200))
+                .failed,
+            1
+        );
+        assert_eq!(backend.discard_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn enabling_policy_starts_existing_inactive_age_and_disabling_stops_maintenance() {
+        let mut arena = PagedArena::with_backend(&DISCARD_FAILING_PAGE_BACKEND);
+        let original_mark = arena.mark();
+        arena.alloc(MIN_PAGE_SIZE, 1);
+        arena.rewind(original_mark);
+
+        let enabled_at = Instant::now();
+        arena.enable_delayed_purge(delayed_policy(100, 0, 0), enabled_at);
+        assert_eq!(arena.pages[0].inactive_since, Some(enabled_at));
+        assert_eq!(
+            arena
+                .maintain_delayed_purge(enabled_at + Duration::from_millis(99))
+                .deferred_inactive_delay,
+            1
+        );
+        arena.disable_delayed_purge();
+        assert_eq!(arena.pages[0].inactive_since, None);
+        assert_eq!(
+            arena.maintain_delayed_purge(enabled_at + Duration::from_secs(1)),
+            DelayedPurgeReport::default()
+        );
+        assert_eq!(arena.pages[0].backing_state(), PageBackingState::Retained);
+
+        let reenabled_at = enabled_at + Duration::from_secs(2);
+        arena.enable_delayed_purge(delayed_policy(100, 0, 0), reenabled_at);
+        assert_eq!(arena.pages[0].inactive_since, Some(reenabled_at));
+        assert_eq!(arena.pages[0].last_restore_at, None);
+        assert_eq!(
+            arena
+                .maintain_delayed_purge(reenabled_at + Duration::from_millis(99))
+                .deferred_inactive_delay,
+            1
+        );
+        assert_eq!(arena.pages[0].backing_state(), PageBackingState::Retained);
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    #[test]
+    fn delayed_policy_never_timestamps_or_discards_a_partially_live_active_page() {
+        let backend = test_vm_backend(false, false);
+        let mut arena = PagedArena::with_backend(backend);
+        let t0 = Instant::now();
+        arena.enable_delayed_purge(delayed_policy(0, 0, 0), t0);
+        arena.alloc_at(8, 1, t0);
+        let mark = arena.mark();
+        arena.alloc_at(8, 1, t0);
+        arena.rewind_at(mark, t0 + Duration::from_millis(100));
+
+        assert_eq!(arena.active_page_count(), 1);
+        assert_eq!(arena.pages[0].cursor, 8);
+        assert_eq!(arena.pages[0].inactive_since, None);
+        assert_eq!(arena.pages[0].backing_state(), PageBackingState::Retained);
+        assert_eq!(backend.discard_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn delayed_purge_reports_system_backing_as_unsupported_without_discard() {
+        let backend = test_backend(false);
+        let mut arena = PagedArena::with_backend(backend);
+        let t0 = Instant::now();
+        arena.enable_delayed_purge(delayed_policy(0, 0, 0), t0);
+        let mark = arena.mark();
+        arena.alloc_at(MIN_PAGE_SIZE, 1, t0);
+        arena.rewind_at(mark, t0);
+
+        assert_eq!(
+            arena.maintain_delayed_purge(t0),
+            DelayedPurgeReport {
+                sweep_performed: true,
+                examined: 1,
+                unsupported: 1,
+                ..DelayedPurgeReport::default()
+            }
+        );
+        assert_eq!(arena.pages[0].backing_state(), PageBackingState::Retained);
+        assert_eq!(backend.allocation_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    #[test]
+    fn research_delay_candidates_defer_then_discard_at_the_exact_boundary() {
+        for delay_ms in [0, 10, 100, 250, 1_000] {
+            let backend = test_vm_backend(false, false);
+            let mut arena = PagedArena::with_backend(backend);
+            let t0 = Instant::now();
+            arena.enable_delayed_purge(delayed_policy(delay_ms, 0, 0), t0);
+            let mark = arena.mark();
+            arena.alloc_at(MIN_PAGE_SIZE, 1, t0);
+            arena.rewind_at(mark, t0);
+
+            if delay_ms != 0 {
+                let before = arena
+                    .maintain_delayed_purge(t0 + Duration::from_millis(delay_ms.saturating_sub(1)));
+                assert_eq!(before.deferred_inactive_delay, 1);
+                assert_eq!(before.discarded, 0);
+                assert_eq!(
+                    arena
+                        .maintain_delayed_purge(t0 + Duration::from_millis(delay_ms))
+                        .discarded,
+                    1
+                );
+            }
+            assert_eq!(backend.discard_calls.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[cfg(feature = "aarm-telemetry")]
+    #[test]
+    fn research_cooldown_shapes_suppress_only_unexpired_repurge() {
+        for (cooldown_ms, expect_second_purge) in [(0, true), (100, true), (250, false)] {
+            let backend = test_vm_backend(false, false);
+            let mut arena = PagedArena::with_backend(backend);
+            let t0 = Instant::now();
+            arena.enable_delayed_purge(delayed_policy(100, cooldown_ms, 0), t0);
+            let first_mark = arena.mark();
+            arena.alloc_at(MIN_PAGE_SIZE, 1, t0);
+            arena.rewind_at(first_mark, t0);
+            assert_eq!(
+                arena
+                    .maintain_delayed_purge(t0 + Duration::from_millis(100))
+                    .discarded,
+                1
+            );
+
+            let restored_at = t0 + Duration::from_millis(200);
+            let second_mark = arena.mark();
+            arena.alloc_at(MIN_PAGE_SIZE, 1, restored_at);
+            arena.rewind_at(second_mark, restored_at);
+            let report = arena.maintain_delayed_purge(restored_at + Duration::from_millis(100));
+            assert_eq!(report.discarded == 1, expect_second_purge);
+            assert_eq!(report.deferred_hysteresis == 1, !expect_second_purge);
+        }
+    }
+
+    #[cfg(all(feature = "aarm-telemetry", any(windows, target_os = "linux")))]
+    #[test]
+    fn delayed_policy_purges_and_restores_oversized_native_backing_in_place() {
+        let capacity = DEFAULT_PAGE_SIZE + 1;
+        let governor = Arc::new(MemoryGovernor::new(capacity));
+        let mut arena = PagedArena::with_memory_governor(Arc::clone(&governor));
+        let t0 = Instant::now();
+        arena.enable_delayed_purge(delayed_policy(100, 250, 0), t0);
+        let mark = arena.mark();
+        let original = arena.alloc_at(capacity, MAX_ALIGN, t0);
+        // SAFETY: the returned range is a live `capacity`-byte arena allocation.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::write_bytes(original, 0xA5, capacity);
+        }
+        arena.rewind_at(mark, t0);
+        let retained = arena.telemetry_snapshot().expect("telemetry is enabled");
+        let governor_before = governor.telemetry();
+
+        assert_eq!(
+            arena
+                .maintain_delayed_purge(t0 + Duration::from_millis(100))
+                .discarded,
+            1
+        );
+        let discarded = arena.telemetry_snapshot().expect("telemetry is enabled");
+        assert_eq!(discarded.capacity_bytes, retained.capacity_bytes);
+        assert_eq!(
+            discarded.virtual_extent_bytes,
+            retained.virtual_extent_bytes
+        );
+        assert_eq!(discarded.backing_retained_bytes, Some(0));
+        assert_eq!(
+            discarded.backing_discarded_bytes,
+            discarded.virtual_extent_bytes
+        );
+
+        let second_mark = arena.mark();
+        let restored = arena.alloc_at(capacity, MAX_ALIGN, t0 + Duration::from_millis(200));
+        assert_eq!(restored, original);
+        assert_eq!(arena.page_count(), 1);
+        assert_eq!(arena.metrics().reserved_bytes, capacity);
+        assert_eq!(arena.pages[0].backing_state(), PageBackingState::Retained);
+        // SAFETY: successful reuse preparation made the complete range live again.
+        #[allow(unsafe_code)]
+        let restored_bytes = unsafe { std::slice::from_raw_parts(restored, capacity) };
+        assert!(restored_bytes.iter().all(|byte| *byte == 0));
+        let restored_telemetry = arena.telemetry_snapshot().expect("telemetry is enabled");
+        assert_eq!(
+            restored_telemetry.backing_retained_bytes,
+            restored_telemetry.virtual_extent_bytes
+        );
+        assert_eq!(restored_telemetry.backing_discarded_bytes, Some(0));
+        assert_eq!(
+            restored_telemetry.peak_backing_retained_bytes,
+            retained.peak_backing_retained_bytes
+        );
+        arena.rewind_at(second_mark, t0 + Duration::from_millis(200));
+        assert_eq!(
+            arena
+                .maintain_delayed_purge(t0 + Duration::from_millis(300))
+                .deferred_hysteresis,
+            1
+        );
+        assert_eq!(arena.pages[0].backing_state(), PageBackingState::Retained);
+        assert_eq!(
+            arena
+                .maintain_delayed_purge(t0 + Duration::from_millis(450))
+                .discarded,
+            1
+        );
+        assert_eq!(governor.telemetry(), governor_before);
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    #[ignore = "manual informational AARM-4B timing harness"]
+    fn benchmark_retained_delayed_and_cold_purge_reuse_paths() {
+        const SAMPLES: usize = 9;
+
+        fn median(mut samples: Vec<Duration>) -> Duration {
+            samples.sort_unstable();
+            samples[samples.len() / 2]
+        }
+
+        let retained = median(
+            (0..SAMPLES)
+                .map(|_| {
+                    let mut arena = PagedArena::new();
+                    let started = Instant::now();
+                    for _ in 0..2_000 {
+                        let mark = arena.mark();
+                        std::hint::black_box(arena.alloc(MIN_PAGE_SIZE, 1));
+                        arena.rewind(mark);
+                    }
+                    started.elapsed()
+                })
+                .collect(),
+        );
+        let delayed_short_gap = median(
+            (0..SAMPLES)
+                .map(|_| {
+                    let mut arena = PagedArena::new();
+                    let t0 = Instant::now();
+                    arena.enable_delayed_purge(delayed_policy(100, 250, 10), t0);
+                    let started = Instant::now();
+                    for round in 0..2_000u64 {
+                        let active_at = t0 + Duration::from_micros(round * 2);
+                        let mark = arena.mark();
+                        std::hint::black_box(arena.alloc_at(MIN_PAGE_SIZE, 1, active_at));
+                        arena.rewind_at(mark, active_at + Duration::from_micros(1));
+                    }
+                    started.elapsed()
+                })
+                .collect(),
+        );
+        let cold_purge_reuse = median(
+            (0..SAMPLES)
+                .map(|_| {
+                    let mut arena = PagedArena::new();
+                    let t0 = Instant::now();
+                    arena.enable_delayed_purge(delayed_policy(0, 0, 0), t0);
+                    let started = Instant::now();
+                    for round in 0..200u64 {
+                        let at = t0 + Duration::from_micros(round);
+                        let mark = arena.mark();
+                        std::hint::black_box(arena.alloc_at(MIN_PAGE_SIZE, 1, at));
+                        arena.rewind_at(mark, at);
+                    }
+                    started.elapsed()
+                })
+                .collect(),
+        );
+
+        eprintln!(
+            "AARM-4B medians: retained={retained:?} delayed_short_gap={delayed_short_gap:?} cold_purge_reuse={cold_purge_reuse:?}"
         );
     }
 

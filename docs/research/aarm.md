@@ -582,9 +582,39 @@ It only moves known VM backing extent between retained and discarded telemetry. 
 temporary-scope exit, allocation, and context teardown do not invoke it automatically.
 
 ```text
-automatic purge: NOT IMPLEMENTED
-delay/hysteresis: NOT IMPLEMENTED
+default automatic purge: DISABLED
+delayed purge/hysteresis: implemented only as an opt-in internal policy
 pressure-triggered purge: NOT IMPLEMENTED
+```
+
+## AARM-4B delayed purge with hysteresis
+
+AARM-4B layers an opt-in, runtime-private policy over AARM-4A's whole-page transition. The policy
+is owned by `PagedArena` and is **disabled by default** for ordinary ASTER execution. Enabling it
+requires explicit internal/research configuration of three monotonic durations:
+
+- **inactive delay**: minimum time since a whole page entered the inactive suffix;
+- **repurge cooldown**: minimum time since a discarded page was restored before it may be
+  discarded again;
+- **sweep interval**: minimum time between arena-owned maintenance scans.
+
+Only pages newly moved from the active prefix into the inactive suffix receive a new inactivity
+timestamp. Unrelated rewinds do not reset older inactive pages, and cursor-only rewind within a
+still-active page never makes that page eligible. Retained inactive reuse clears its inactivity
+timestamp without a VM call. A restored page records the restore time only after same-address reuse
+preparation succeeds; the cooldown then protects it until monotonic time naturally expires.
+
+Rewind is a safe maintenance point only when the policy is explicitly enabled: it first completes
+normal rewind state, timestamps newly inactive pages, and then evaluates a due sweep. Research code
+can also invoke maintenance at a supplied `Instant`, which makes boundary and hysteresis tests
+deterministic without sleeps or a background thread. AARM-4A's immediate caller-owned purge remains
+unchanged.
+
+```text
+policy default: disabled
+pressure-triggered purge: NOT IMPLEMENTED
+hot-cache tuning: NOT IMPLEMENTED
+production/default timing values: NOT CHOSEN
 ```
 
 ## Measurement invariants
@@ -669,7 +699,7 @@ AARM-3D does not expose or infer:
 - virtual reservation telemetry for the system allocator fallback;
 - purge or automatic discard events and bytes;
 - adaptive governor quotas, borrows, or host-memory policy;
-- decay, hysteresis, or pressure state.
+- structured delayed-purge timing/counter telemetry or pressure state.
 
 These fields remain absent until an architecture exists that can measure them accurately.
 
@@ -692,6 +722,8 @@ AARM-1 observability
 -> AARM-3E integration and hardening
 -> AARM-4A fully-dead eligibility and controlled purge
 -> AARM-4B delayed purge/hysteresis
+-> AARM-4C pressure-triggered purge
+-> AARM-4D oversized/hot-cache policy and tuning
 -> AARM-5 MIR lifetime refinement
 -> AARM-6 integration/production decision
 ```
