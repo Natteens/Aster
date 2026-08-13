@@ -12,31 +12,16 @@ use aster_mir as mir;
 
 use crate::escape_analysis;
 
-/// Stable identity for one static allocation instruction in a MIR module.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) struct AllocationSite {
-    pub function: mir::SymbolId,
-    pub block: mir::BasicBlockId,
-    pub instruction_index: usize,
-}
-
-/// The program point immediately after `instruction_index` in `block`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) struct MirLocation {
-    pub block: mir::BasicBlockId,
-    pub instruction_index: usize,
-}
-
 /// A conservative reference-death result for one static allocation site.
 ///
 /// Empty `dead_after` means no early reference-death point was proven. Even a
 /// non-empty result is not evidence that the shared LIFO arena can rewind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct AllocationLifetimeProof {
-    pub site: AllocationSite,
+    pub site: mir::MirAllocationSite,
     pub region: mir::AllocationRegion,
     pub aliases: Vec<mir::LocalId>,
-    pub dead_after: Vec<MirLocation>,
+    pub dead_after: Vec<mir::MirPoint>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -76,11 +61,7 @@ pub(super) fn analyze(module: &mir::Module) -> LifetimeAnalysisReport {
     let mut proofs = facts
         .into_iter()
         .map(|fact| {
-            let site = AllocationSite {
-                function: fact.function,
-                block: fact.block,
-                instruction_index: fact.instruction_index,
-            };
+            let site = fact.site;
             let dead_after = if fact.region == mir::AllocationRegion::Temporary
                 && !ambiguous_sites.contains(&site)
             {
@@ -150,14 +131,16 @@ fn duplicate_function_symbols(module: &mir::Module) -> HashSet<mir::SymbolId> {
 /// model can separate the sites.
 fn ambiguous_alias_sites(
     facts: &[escape_analysis::AllocationEscapeFact],
-) -> HashSet<AllocationSite> {
+) -> HashSet<mir::MirAllocationSite> {
     let mut ambiguous = HashSet::new();
     for (index, left) in facts.iter().enumerate() {
         if left.region != mir::AllocationRegion::Temporary {
             continue;
         }
         for right in &facts[index + 1..] {
-            if right.region != mir::AllocationRegion::Temporary || left.function != right.function {
+            if right.region != mir::AllocationRegion::Temporary
+                || left.site.function != right.site.function
+            {
                 continue;
             }
             if left.origin == right.origin
@@ -171,12 +154,8 @@ fn ambiguous_alias_sites(
     ambiguous
 }
 
-fn fact_site(fact: &escape_analysis::AllocationEscapeFact) -> AllocationSite {
-    AllocationSite {
-        function: fact.function,
-        block: fact.block,
-        instruction_index: fact.instruction_index,
-    }
+fn fact_site(fact: &escape_analysis::AllocationEscapeFact) -> mir::MirAllocationSite {
+    fact.site
 }
 
 fn sorted_aliases_intersect(left: &[mir::LocalId], right: &[mir::LocalId]) -> bool {
@@ -336,9 +315,9 @@ impl FunctionLiveness {
 
     fn reference_dead_after(
         &self,
-        site: AllocationSite,
+        site: mir::MirAllocationSite,
         aliases: &[mir::LocalId],
-    ) -> Option<Vec<MirLocation>> {
+    ) -> Option<Vec<mir::MirPoint>> {
         if aliases.is_empty() {
             return None;
         }
@@ -367,14 +346,15 @@ impl FunctionLiveness {
                     .iter()
                     .all(|alias| !live_after.contains(*alias))
                 {
-                    locations.push(MirLocation {
+                    locations.push(mir::MirPoint {
                         block: *block_id,
-                        instruction_index,
+                        instruction_boundary: instruction_index.checked_add(1)?,
                     });
                 }
             }
         }
-        locations.sort_unstable_by_key(|location| (location.block.0, location.instruction_index));
+        locations
+            .sort_unstable_by_key(|location| (location.block.0, location.instruction_boundary));
         Some(locations)
     }
 
@@ -764,6 +744,7 @@ mod tests {
             return_type: mir::Type::Void,
             entry: mir::BasicBlockId(entry),
             blocks,
+            temporary_subregion_candidates: Vec::new(),
         }
     }
 
@@ -844,13 +825,20 @@ mod tests {
             .iter()
             .find(|proof| {
                 proof.site
-                    == AllocationSite {
+                    == mir::MirAllocationSite {
                         function,
                         block: mir::BasicBlockId(block),
                         instruction_index,
                     }
             })
             .expect("allocation proof")
+    }
+
+    fn after(block: u32, instruction_index: usize) -> mir::MirPoint {
+        mir::MirPoint {
+            block: mir::BasicBlockId(block),
+            instruction_boundary: instruction_index + 1,
+        }
     }
 
     fn emitted_region(instruction: &mir::Instruction) -> Option<mir::AllocationRegion> {
@@ -882,14 +870,8 @@ mod tests {
         let proof = proof(&report, FUNCTION, 10, 0);
 
         assert_eq!(proof.region, mir::AllocationRegion::Temporary);
-        assert!(!proof.dead_after.contains(&MirLocation {
-            block: mir::BasicBlockId(10),
-            instruction_index: 0,
-        }));
-        assert!(proof.dead_after.contains(&MirLocation {
-            block: mir::BasicBlockId(10),
-            instruction_index: 1,
-        }));
+        assert!(!proof.dead_after.contains(&after(10, 0)));
+        assert!(proof.dead_after.contains(&after(10, 1)));
         assert!(
             proof
                 .dead_after
@@ -922,13 +904,7 @@ mod tests {
             proof.aliases,
             vec![mir::LocalId(3), mir::LocalId(7), mir::LocalId(11)]
         );
-        assert_eq!(
-            proof.dead_after,
-            vec![MirLocation {
-                block: mir::BasicBlockId(10),
-                instruction_index: 3,
-            }]
-        );
+        assert_eq!(proof.dead_after, vec![after(10, 3)]);
     }
 
     #[test]
@@ -969,14 +945,8 @@ mod tests {
         let report = analyze(&module(vec![function]));
         let proof = proof(&report, FUNCTION, 10, 0);
 
-        assert!(!proof.dead_after.contains(&MirLocation {
-            block: mir::BasicBlockId(10),
-            instruction_index: 0,
-        }));
-        assert!(proof.dead_after.contains(&MirLocation {
-            block: mir::BasicBlockId(20),
-            instruction_index: 0,
-        }));
+        assert!(!proof.dead_after.contains(&after(10, 0)));
+        assert!(proof.dead_after.contains(&after(20, 0)));
     }
 
     #[test]
@@ -1034,10 +1004,7 @@ mod tests {
         assert!(
             proof(&report, FUNCTION, 20, 0)
                 .dead_after
-                .contains(&MirLocation {
-                    block: mir::BasicBlockId(20),
-                    instruction_index: 1,
-                })
+                .contains(&after(20, 1))
         );
     }
 
@@ -1064,14 +1031,8 @@ mod tests {
         let report = analyze(&module(vec![function]));
         let proof = proof(&report, FUNCTION, 10, 0);
 
-        assert!(!proof.dead_after.contains(&MirLocation {
-            block: mir::BasicBlockId(10),
-            instruction_index: 0,
-        }));
-        assert!(proof.dead_after.contains(&MirLocation {
-            block: mir::BasicBlockId(30),
-            instruction_index: 0,
-        }));
+        assert!(!proof.dead_after.contains(&after(10, 0)));
+        assert!(proof.dead_after.contains(&after(30, 0)));
     }
 
     #[test]
@@ -1107,14 +1068,8 @@ mod tests {
         let report = analyze(&module(vec![function]));
         let proof = proof(&report, FUNCTION, 10, 0);
 
-        assert!(!proof.dead_after.contains(&MirLocation {
-            block: mir::BasicBlockId(10),
-            instruction_index: 0,
-        }));
-        assert!(proof.dead_after.contains(&MirLocation {
-            block: mir::BasicBlockId(40),
-            instruction_index: 0,
-        }));
+        assert!(!proof.dead_after.contains(&after(10, 0)));
+        assert!(proof.dead_after.contains(&after(40, 0)));
     }
 
     #[test]
@@ -1190,14 +1145,8 @@ mod tests {
         let report = analyze(&module(vec![function]));
         let proof = proof(&report, FUNCTION, 10, 0);
 
-        assert!(proof.dead_after.contains(&MirLocation {
-            block: mir::BasicBlockId(10),
-            instruction_index: 1,
-        }));
-        assert!(!proof.dead_after.contains(&MirLocation {
-            block: mir::BasicBlockId(10),
-            instruction_index: 2,
-        }));
+        assert!(proof.dead_after.contains(&after(10, 1)));
+        assert!(!proof.dead_after.contains(&after(10, 2)));
     }
 
     #[test]
@@ -1215,26 +1164,19 @@ mod tests {
         let report = analyze(&module(vec![function]));
         let older = proof(&report, FUNCTION, 10, 0);
 
-        assert!(older.dead_after.contains(&MirLocation {
-            block: mir::BasicBlockId(10),
-            instruction_index: 2,
-        }));
-        assert!(older.dead_after.iter().any(|location| {
-            *location
-                == (MirLocation {
-                    block: mir::BasicBlockId(10),
-                    instruction_index: 2,
-                })
-        }));
+        assert!(older.dead_after.contains(&after(10, 2)));
+        assert!(
+            older
+                .dead_after
+                .iter()
+                .any(|location| *location == after(10, 2))
+        );
         // The younger allocation is still live here, so this proof cannot
         // authorize rewinding the shared LIFO arena to the older allocation.
         assert!(
             !proof(&report, FUNCTION, 10, 1)
                 .dead_after
-                .contains(&MirLocation {
-                    block: mir::BasicBlockId(10),
-                    instruction_index: 2,
-                })
+                .contains(&after(10, 2))
         );
     }
 
@@ -1848,20 +1790,20 @@ mod tests {
             let function = module
                 .functions
                 .iter()
-                .find(|function| function.symbol == fact.function)
+                .find(|function| function.symbol == fact.site.function)
                 .expect("fact function");
             let block = function
                 .blocks
                 .iter()
-                .find(|block| block.id == fact.block)
+                .find(|block| block.id == fact.site.block)
                 .expect("fact block");
             assert_eq!(
-                emitted_region(&block.instructions[fact.instruction_index]),
+                emitted_region(&block.instructions[fact.site.instruction_index]),
                 Some(fact.region),
                 "shared fact must match finalized MIR at {:?}/{:?}/{}",
-                fact.function,
-                fact.block,
-                fact.instruction_index
+                fact.site.function,
+                fact.site.block,
+                fact.site.instruction_index
             );
         }
         assert_eq!(report.summary.dynamic_allocation_sites, 8);
@@ -1945,20 +1887,20 @@ mod tests {
                     .mir
                     .functions
                     .iter()
-                    .find(|function| function.symbol == fact.function)
+                    .find(|function| function.symbol == fact.site.function)
                     .expect("fact function");
                 let block = function
                     .blocks
                     .iter()
-                    .find(|block| block.id == fact.block)
+                    .find(|block| block.id == fact.site.block)
                     .expect("fact block");
                 assert_eq!(
-                    emitted_region(&block.instructions[fact.instruction_index]),
+                    emitted_region(&block.instructions[fact.site.instruction_index]),
                     Some(fact.region),
                     "shared fact must match the finalized MIR region at {:?}/{:?}/{}",
-                    fact.function,
-                    fact.block,
-                    fact.instruction_index
+                    fact.site.function,
+                    fact.site.block,
+                    fact.site.instruction_index
                 );
             }
             let first = analyze(&compilation.mir);

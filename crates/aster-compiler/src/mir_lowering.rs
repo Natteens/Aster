@@ -118,6 +118,7 @@ impl FunctionLowerer {
             return_type: function.return_type.clone(),
             entry: mir::BasicBlockId(0),
             blocks,
+            temporary_subregion_candidates: Vec::new(),
         }
     }
 
@@ -154,6 +155,7 @@ impl FunctionLowerer {
             return_type,
             entry: mir::BasicBlockId(0),
             blocks,
+            temporary_subregion_candidates: Vec::new(),
         }
     }
 

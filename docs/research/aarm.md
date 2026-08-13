@@ -718,8 +718,10 @@ LiveOut[B] = union LiveIn[S] for every successor S
 LiveIn[B]  = Use[B] union (LiveOut[B] - Def[B])
 ```
 
-`MirLocation { block, instruction_index }` means the point immediately after that instruction. A
-`Temporary` allocation receives `ReferenceDeadAfter(P)` evidence only when every local in its
+`MirPoint { block, instruction_boundary }` names an exact boundary: boundary zero precedes the
+first instruction, boundary `K` follows instruction `K - 1` and precedes instruction `K`, and the
+block's instruction count names the point immediately before its terminator. A `Temporary`
+allocation receives `ReferenceDeadAfter(P)` evidence only when every local in its
 conservative alias closure is absent from `LiveAfter(P)`, and only at forward-reachable points at
 or after the allocation. `Persistent` sites never receive early-death evidence. Duplicate or
 unknown locals, malformed CFG edges, duplicate block/function identities, and overlapping
@@ -745,6 +747,49 @@ MIR checkpoint instruction: NOT IMPLEMENTED
 runtime reclaim/rewind: NOT IMPLEMENTED
 runtime ABI or generated code changed: NO
 public telemetry schema changed: NO
+```
+
+## AARM-5B backend-neutral Temporary subregion candidates
+
+AARM-5B adds typed, backend-neutral candidate metadata to each MIR function. A candidate identifies
+a deterministic function-local ID, a checkpoint `MirPoint`, one or more future-capable rewind
+points, and the exact `MirAllocationSite` values it would cover. The location and allocation-site
+types live in `aster-mir`; escape, liveness, placement, and validation policy remain in the
+compiler. Normal lowering initializes every function's candidate list empty, so ordinary
+compilation does not invoke AARM-5A lifetime analysis or the AARM-5B planner.
+
+The research-only planner consumes one exact AARM-5A `LifetimeAnalysisReport`. It does not recompute
+escape, aliases, or liveness. Its initial placement gate accepts only a unique, single-block
+function ending in `Return` or `End` and with no Task, async, or Parallel intrinsic boundary. It
+emits deterministic single-allocation, single-rewind candidates whose checkpoint is immediately
+before the allocation and whose rewind is an exact AARM-5A reference-death boundary.
+
+The initial plan is deliberately disjoint. If a younger Temporary allocation appears between an
+older allocation and its proposed rewind, the older candidate is withheld. This rejects unsafe
+crossing intervals and conservatively emits only the inner candidate for a nested lifetime;
+sequential non-overlapping lifetimes receive adjacent candidates numbered `0, 1, ...`. Every actual
+Temporary allocation, including one with unresolved lifetime proof, participates in this LIFO
+blocker check. Persistent sites are never listed.
+
+**Candidate subregion is not a validated rewind.** Reference death is necessary but insufficient
+to authorize LIFO arena reclamation. The representation intentionally carries no `safe` or
+`validated` flag. List, Dictionary, and StringBuilder candidates prove only the owning Temporary
+reference; they do not prove internal backing reclaim. Dominance, path coverage, checkpoint-stack
+validation, collection/string barriers, and dynamic loop-instance safety remain deferred.
+
+Because AARM-5B has no runtime integration, Cranelift fails closed with a controlled validation
+error if any non-empty candidate list reaches the execution backend. It never silently ignores or
+emits candidate metadata. There is no runtime ABI addition, `ArenaMark` change, early rewind, or
+change to the existing function-level Temporary checkpoint.
+
+```text
+normal candidate plan: empty
+simple straight-line research planner: implemented
+branch/loop/multi-path placement: not implemented
+candidate execution validation: not implemented
+runtime checkpoint ABI: not implemented
+early arena rewind: not implemented
+generated ASTER behavior changed: NO
 ```
 
 ## Measurement invariants

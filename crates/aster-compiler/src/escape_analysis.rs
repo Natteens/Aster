@@ -75,9 +75,7 @@ enum EscapeReason {
 /// second escape classification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct AllocationEscapeFact {
-    pub function: mir::SymbolId,
-    pub block: mir::BasicBlockId,
-    pub instruction_index: usize,
+    pub site: mir::MirAllocationSite,
     pub region: mir::AllocationRegion,
     pub origin: Option<mir::LocalId>,
     pub aliases: Vec<mir::LocalId>,
@@ -134,7 +132,13 @@ pub(super) fn assign_allocation_regions(module: &mut mir::Module) {
 /// maintain a second escape model.
 pub(super) fn allocation_escape_facts(module: &mir::Module) -> Vec<AllocationEscapeFact> {
     let mut facts = allocation_escape_facts_in_mir_order(module);
-    facts.sort_by_key(|fact| (fact.function.0, fact.block.0, fact.instruction_index));
+    facts.sort_by_key(|fact| {
+        (
+            fact.site.function.0,
+            fact.site.block.0,
+            fact.site.instruction_index,
+        )
+    });
     facts
 }
 
@@ -168,9 +172,11 @@ fn allocation_escape_facts_in_mir_order(module: &mir::Module) -> Vec<AllocationE
                     EscapeClassification::Persistent(_) => mir::AllocationRegion::Persistent,
                 };
                 facts.push(AllocationEscapeFact {
-                    function: function.symbol,
-                    block: block.id,
-                    instruction_index,
+                    site: mir::MirAllocationSite {
+                        function: function.symbol,
+                        block: block.id,
+                        instruction_index,
+                    },
                     region,
                     origin,
                     aliases,
@@ -349,21 +355,24 @@ fn is_tracked_reference_type(type_: &mir::Type) -> bool {
     )
 }
 
+pub(super) fn dynamic_allocation_region(
+    instruction: &mir::Instruction,
+) -> Option<mir::AllocationRegion> {
+    match instruction {
+        mir::Instruction::AllocateObject { region, .. }
+        | mir::Instruction::AllocateArray { region, .. }
+        | mir::Instruction::AllocateList { region, .. }
+        | mir::Instruction::AllocateDictionary { region, .. }
+        | mir::Instruction::AllocateStringBuilder { region, .. }
+        | mir::Instruction::StringBuilderToString { region, .. }
+        | mir::Instruction::DictionaryEntries { region, .. } => Some(*region),
+        mir::Instruction::CallIntrinsic { intrinsic, .. } => intrinsic.allocation_region(),
+        _ => None,
+    }
+}
+
 fn is_dynamic_allocation(instruction: &mir::Instruction) -> bool {
-    matches!(
-        instruction,
-        mir::Instruction::AllocateObject { .. }
-            | mir::Instruction::AllocateArray { .. }
-            | mir::Instruction::AllocateList { .. }
-            | mir::Instruction::AllocateDictionary { .. }
-            | mir::Instruction::AllocateStringBuilder { .. }
-            | mir::Instruction::StringBuilderToString { .. }
-            | mir::Instruction::DictionaryEntries { .. }
-    ) || matches!(
-        instruction,
-        mir::Instruction::CallIntrinsic { intrinsic, .. }
-            if intrinsic.allocation_region().is_some()
-    )
+    dynamic_allocation_region(instruction).is_some()
 }
 
 fn allocation_destination(instruction: &mir::Instruction) -> Option<&mir::Place> {
@@ -1255,6 +1264,7 @@ mod tests {
                     instructions,
                     terminator,
                 }],
+                temporary_subregion_candidates: Vec::new(),
             }],
         }
     }

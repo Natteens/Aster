@@ -51,6 +51,20 @@ regions or executable MIR, do not insert checkpoints, and do not authorize an ar
 later phase must separately prove LIFO/checkpoint safety, including overlapping allocations and
 dynamic executions of loop sites, before runtime reclamation can change.
 
+### AARM-5B candidate representation
+
+The research branch also defines backend-neutral MIR metadata for candidate nested Temporary
+subregions. `MirPoint` uses instruction boundaries: zero is before the first instruction, `K` is
+after instruction `K - 1` and before instruction `K`, and the instruction count is immediately
+before the terminator. Each candidate records a checkpoint, future-capable rewind points, and exact
+static allocation sites.
+
+Normal lowering leaves this metadata empty and never invokes the research planner. The initial
+planner is restricted to conservative, disjoint, straight-line single-block candidates and consumes
+the AARM-5A report without recomputing escape or liveness. Candidate metadata is not executable or
+a rewind-safety claim; Cranelift rejects a non-empty list until later validation and runtime phases
+exist. The shipped one-checkpoint-per-function behavior and runtime ABI remain unchanged.
+
 ## Collections and strings
 
 An array header and its element buffer always use the same arena. Rewinding

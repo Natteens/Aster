@@ -587,6 +587,12 @@ fn validate_function(
     interface_methods: &InterfaceMethods<'_>,
     implementations: &HashSet<(mir::SymbolId, mir::SymbolId)>,
 ) -> Result<(), BackendError> {
+    if !function.temporary_subregion_candidates.is_empty() {
+        return Err(unsupported(
+            &function.name,
+            "AARM temporary subregion candidates",
+        ));
+    }
     if function
         .owner
         .is_some_and(|owner| !classes.contains(&owner))
@@ -3288,6 +3294,7 @@ mod tests {
                     }],
                     terminator: mir::Terminator::Return(None),
                 }],
+                temporary_subregion_candidates: Vec::new(),
             }],
         }
     }
@@ -3297,6 +3304,40 @@ mod tests {
         let module =
             allocate_list_module(mir::Type::List(Box::new(mir::Type::Int)), mir::Type::Int);
         validate_module(&module).expect("List<int> is a well-formed allocation");
+    }
+
+    #[test]
+    fn rejects_non_executable_aarm_temporary_subregion_candidates() {
+        let mut module =
+            allocate_list_module(mir::Type::List(Box::new(mir::Type::Int)), mir::Type::Int);
+        let mut unreachable = module.functions[0].clone();
+        unreachable.symbol = mir::SymbolId(2);
+        unreachable.name = "UnreachableCandidate".to_owned();
+        unreachable.temporary_subregion_candidates = vec![mir::TemporarySubregionCandidate {
+            id: mir::TemporarySubregionId(0),
+            checkpoint: mir::MirPoint {
+                block: mir::BasicBlockId(0),
+                instruction_boundary: 0,
+            },
+            rewinds: vec![mir::MirPoint {
+                block: mir::BasicBlockId(0),
+                instruction_boundary: 1,
+            }],
+            allocations: vec![mir::MirAllocationSite {
+                function: mir::SymbolId(2),
+                block: mir::BasicBlockId(0),
+                instruction_index: 0,
+            }],
+        }];
+        module.functions.push(unreachable);
+
+        let error = validate_module(&module)
+            .expect_err("AARM-5B candidate metadata must fail closed before code generation");
+        assert!(
+            error
+                .message()
+                .contains("does not yet support AARM temporary subregion candidates")
+        );
     }
 
     #[test]
@@ -3444,6 +3485,7 @@ mod tests {
                 instructions: Vec::new(),
                 terminator: mir::Terminator::Return(None),
             }],
+            temporary_subregion_candidates: Vec::new(),
         };
         let error = validate_invocable_entry(&function, "Main")
             .expect_err("an entry function returning List<T> must be rejected");
@@ -3500,6 +3542,7 @@ mod tests {
                     }],
                     terminator: mir::Terminator::Return(None),
                 }],
+                temporary_subregion_candidates: Vec::new(),
             }],
         }
     }
@@ -3591,6 +3634,7 @@ mod tests {
                     }],
                     terminator: mir::Terminator::Return(None),
                 }],
+                temporary_subregion_candidates: Vec::new(),
             }],
         }
     }
@@ -3734,6 +3778,7 @@ mod tests {
                     }],
                     terminator: mir::Terminator::Return(None),
                 }],
+                temporary_subregion_candidates: Vec::new(),
             }],
         }
     }
@@ -3901,6 +3946,7 @@ mod tests {
                     }],
                     terminator: mir::Terminator::Return(None),
                 }],
+                temporary_subregion_candidates: Vec::new(),
             }],
         }
     }

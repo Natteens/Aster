@@ -15,6 +15,45 @@ pub struct LocalId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BasicBlockId(pub u32);
 
+/// Stable identity for one static allocation instruction in a MIR module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MirAllocationSite {
+    pub function: SymbolId,
+    pub block: BasicBlockId,
+    pub instruction_index: usize,
+}
+
+/// One instruction boundary in a MIR basic block.
+///
+/// In a block containing `N` instructions, boundary `0` is before instruction
+/// zero, boundary `K` is after instruction `K - 1` and before instruction
+/// `K`, and boundary `N` is after the final instruction and immediately before
+/// the terminator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MirPoint {
+    pub block: BasicBlockId,
+    pub instruction_boundary: usize,
+}
+
+/// Deterministic function-local identity for one candidate Temporary arena
+/// subregion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TemporarySubregionId(pub u32);
+
+/// Backend-neutral, non-executable candidate for a future Temporary arena
+/// checkpoint and rewind.
+///
+/// This representation is not proof that a rewind is safe. AARM validation
+/// and runtime integration must establish dominance, LIFO, ownership, and
+/// backing invariants before any backend may execute it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TemporarySubregionCandidate {
+    pub id: TemporarySubregionId,
+    pub checkpoint: MirPoint,
+    pub rewinds: Vec<MirPoint>,
+    pub allocations: Vec<MirAllocationSite>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Module {
     pub structs: Vec<StructDefinition>,
@@ -97,6 +136,10 @@ pub struct Function {
     pub return_type: Type,
     pub entry: BasicBlockId,
     pub blocks: Vec<BasicBlock>,
+    /// Candidate-only AARM metadata. Normal lowering leaves this empty, and
+    /// execution backends reject non-empty candidates until runtime checkpoint
+    /// integration exists.
+    pub temporary_subregion_candidates: Vec<TemporarySubregionCandidate>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

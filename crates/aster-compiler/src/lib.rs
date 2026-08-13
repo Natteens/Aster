@@ -14,6 +14,7 @@ mod primitives;
 mod project;
 mod semantic;
 mod standard_library;
+mod temporary_subregions;
 mod type_names;
 
 use std::path::Path;

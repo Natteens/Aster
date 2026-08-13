@@ -1131,6 +1131,7 @@ fn rejects_invalid_unicode_scalar_returned_as_char() {
                     kind: mir::OperandKind::Copy(mir::Place::Local(char_local)),
                 })),
             }],
+            temporary_subregion_candidates: Vec::new(),
         }],
     };
     let error = execute(&module, "Invalid").unwrap_err().to_string();
