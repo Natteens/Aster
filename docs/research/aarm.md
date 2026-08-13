@@ -1271,10 +1271,9 @@ and a nested fine-mark stack remain deliberately deferred because leaf reclaim
 already bounds the dominant inner-loop working set and current profiling does
 not justify the added checkpoint and runtime-state complexity.
 
-## AARM-6 production-performance research
+## AARM-6 production-performance research and v1 policy
 
-Automatic production lowering remains disabled. The compiler now exposes
-research-only, non-mutating cost evidence after the existing safety pipeline:
+The compiler exposes non-mutating cost evidence after the existing safety pipeline:
 allocation count, static rewind count, known constant array payload bytes,
 unknown-sized allocation presence, and hidden-backing owner presence. A
 separate research query identifies only adjacent straight-line candidates for
@@ -1317,16 +1316,18 @@ results cross over differently. Loop batching would require a new bounded
 multi-iteration lifetime proof; allocation elimination would require a typed
 scalar-replacement pass. Neither was introduced as incidental policy work.
 
-Application-style measurements support one deliberately narrow v1 selector,
-still exposed only through the research API. After the complete safety proof,
+Application-style measurements supported one deliberately narrow v1 selector.
+After the complete safety proof,
 it lowers a candidate only when the candidate is an iteration-local natural
 loop and contains a fine-owned StringBuilder Append, List Add, or Dictionary
 Add/Set. Those are the current MIR mutations that can grow hidden backing. The
 whole validated candidate is kept, so already-safe objects, arrays, and
 immutable strings in the same region share the checkpoint. Header allocation
 alone, read-only collection work, one-shot acyclic regions, and fixed-only
-object/array/string loops are declined. Normal ASTER compilation still never
-invokes the selector.
+object/array/string loops are declined. Normal ASTER compilation now invokes
+this selector automatically after allocation-region assignment. Raw all-safe
+and no-fine modes remain benchmark/test policy choices over the same planner and
+validator, not parallel lifetime authorities.
 
 The Windows release application matrix used five measured executions after a
 warmup at 100K iterations. Requested bytes, allocation counts, and checksums
@@ -1364,3 +1365,8 @@ remains a non-mutating research query: loop planning already groups mixed work
 under one checkpoint, while the measured one-shot acyclic case provided no
 reason to extend lifetime or mutate MIR. Multi-iteration batching remains
 deferred because it would require a new bounded lifetime proof.
+
+Production v1 therefore preserves the existing no-GC/no-RC, stable-pointer
+arena model while automatically bounding the validated hidden-backing loop
+working set. Declined candidates retain ordinary Temporary function lifetime;
+the policy is intentionally conservative and is not a universal speedup claim.

@@ -95,6 +95,7 @@ fn compile_module(
         let hir = hir_lowering::lower(&module, &semantic_model, intrinsic_bindings);
         let mut mir = mir_lowering::lower(&hir);
         escape_analysis::assign_allocation_regions(&mut mir);
+        temporary_subregions::lower_production_aarm_temporary_subregions(&mut mir);
         Ok(Compilation {
             tokens,
             module,

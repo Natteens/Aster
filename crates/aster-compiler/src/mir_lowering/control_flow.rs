@@ -85,16 +85,47 @@ impl FunctionLowerer {
             variable.mutable,
         );
         self.locals.push(local.clone());
-        if let Some(initializer) = &variable.initializer
-            && let Some(value) = self.lower_expression(initializer)
-        {
-            self.assign(
-                mir::Place::Local(local.id),
-                mir::Rvalue {
-                    type_: variable.type_.clone(),
-                    kind: mir::RvalueKind::Use(value),
-                },
-            );
+        let Some(initializer) = &variable.initializer else {
+            return;
+        };
+        match &initializer.kind {
+            hir::ExpressionKind::NewStringBuilder { class_symbol } => {
+                self.instruction(mir::Instruction::AllocateStringBuilder {
+                    destination: mir::Place::Local(local.id),
+                    class: *class_symbol,
+                    region: mir::AllocationRegion::Persistent,
+                });
+            }
+            hir::ExpressionKind::NewList { element_type } => {
+                self.instruction(mir::Instruction::AllocateList {
+                    destination: mir::Place::Local(local.id),
+                    element_type: element_type.clone(),
+                    region: mir::AllocationRegion::Persistent,
+                });
+            }
+            hir::ExpressionKind::NewDictionary {
+                key_type,
+                value_type,
+            } => {
+                self.instruction(mir::Instruction::AllocateDictionary {
+                    destination: mir::Place::Local(local.id),
+                    key_type: key_type.clone(),
+                    value_type: value_type.clone(),
+                    region: mir::AllocationRegion::Persistent,
+                });
+            }
+            _ => {
+                let Some(value) = self.lower_expression(initializer) else {
+                    return;
+                };
+                self.assign(
+                    mir::Place::Local(local.id),
+                    mir::Rvalue {
+                        type_: variable.type_.clone(),
+                        kind: mir::RvalueKind::Use(value),
+                    },
+                );
+            }
         }
     }
 

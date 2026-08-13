@@ -1547,7 +1547,18 @@ fn temporary_subregion_immutable_string_intrinsic_is_executable(
                         && temporary_subregion_operand_is_executable(length))
             }
             mir::Intrinsic::StringFromLongTemporary | mir::Intrinsic::StringFromULongTemporary => {
-                matches!(arguments, [value] if matches!(value.type_, mir::Type::Long | mir::Type::ULong))
+                matches!(arguments, [value]
+                if match intrinsic {
+                    mir::Intrinsic::StringFromLongTemporary => matches!(
+                        value.type_,
+                        mir::Type::SByte | mir::Type::Short | mir::Type::Int | mir::Type::Long
+                    ),
+                    mir::Intrinsic::StringFromULongTemporary => matches!(
+                        value.type_,
+                        mir::Type::Byte | mir::Type::UShort | mir::Type::UInt | mir::Type::ULong
+                    ),
+                    _ => false,
+                })
             }
             mir::Intrinsic::StringFromDoubleTemporary => {
                 matches!(arguments, [value] if value.type_ == mir::Type::Double)

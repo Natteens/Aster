@@ -25,7 +25,7 @@ const SAMPLES: usize = 5;
 enum Mode {
     Baseline,
     Raw,
-    Selector,
+    Production,
 }
 
 impl Mode {
@@ -33,7 +33,7 @@ impl Mode {
         match self {
             Self::Baseline => "baseline",
             Self::Raw => "raw",
-            Self::Selector => "selector",
+            Self::Production => "production",
         }
     }
 }
@@ -697,10 +697,10 @@ fn prepare(workload: &Workload, mode: Mode) -> (mir::Module, usize, u128) {
                 .expect("raw AARM lowering succeeds")
                 .subregions_lowered
         }
-        Mode::Selector => {
+        Mode::Production => {
             lower_aarm_temporary_subregions_with_policy_for_research(
                 &mut module,
-                AarmTemporarySubregionProfitabilityPolicy::HiddenBackingGrowthLoop,
+                AarmTemporarySubregionProfitabilityPolicy::ProductionV1,
             )
             .expect("selector AARM lowering succeeds")
             .subregions_lowered
@@ -766,7 +766,7 @@ fn main() {
         .filter(|workload| workload_selected(workload.name))
     {
         let mut reference = None;
-        for mode in [Mode::Baseline, Mode::Raw, Mode::Selector] {
+        for mode in [Mode::Baseline, Mode::Raw, Mode::Production] {
             let measurement = measure(&workload, mode);
             let logical = (
                 measurement.stats.requested_bytes,

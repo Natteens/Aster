@@ -38,18 +38,17 @@ The analysis is intentionally conservative. Uncertainty selects persistent
 storage. There is no silent fallback in the backend: each MIR region maps to a
 specific runtime ABI function.
 
-### AARM-5A research analysis
+### AARM lifetime analysis
 
-The `research/aarm` branch also production-compiles, but does not normally invoke, an internal MIR
-lifetime analysis. It consumes the existing escape pass's region and flow-insensitive alias facts,
-then solves backwards local liveness to identify instruction points after which every conservative
-alias of an already-Temporary allocation is dead. Malformed CFG/local data and ambiguous
-overlapping allocation sites withhold proof.
+After allocation regions are assigned, normal compilation invokes an internal MIR lifetime
+analysis. It consumes the existing escape pass's region and flow-insensitive alias facts, then
+solves backwards local liveness to identify instruction points after which every conservative alias
+of an already-Temporary allocation is dead. Malformed CFG/local data and ambiguous overlapping
+allocation sites withhold proof.
 
-These results are research-only reference-death facts. They do not change emitted allocation
-regions or executable MIR, do not insert checkpoints, and do not authorize an arena rewind. A
-later phase must separately prove LIFO/checkpoint safety, including overlapping allocations and
-dynamic executions of loop sites, before runtime reclamation can change.
+Reference-death facts alone do not authorize a rewind. The AARM safety planner and validator must
+also prove exact allocation accounting, LIFO checkpoint safety, CFG balance, direct-local
+provenance for hidden-backed owners, and dynamic loop execution boundaries.
 
 ### AARM-5B candidate representation
 
@@ -59,38 +58,34 @@ after instruction `K - 1` and before instruction `K`, and the instruction count 
 before the terminator. Each candidate records a checkpoint, future-capable rewind points, and exact
 static allocation sites.
 
-Normal lowering leaves this metadata empty and never invokes the research planner. The initial
-planner is restricted to conservative, disjoint, straight-line single-block candidates and consumes
-the AARM-5A report without recomputing escape or liveness. Candidate metadata is not executable or
-a rewind-safety claim; Cranelift rejects a non-empty list until later validation and runtime phases
-exist. The shipped one-checkpoint-per-function behavior and runtime ABI remain unchanged.
+Candidate metadata is an intermediate proof representation, not executable authority. The planner
+consumes the lifetime report without recomputing escape or liveness. Compiler validation either
+turns selected candidates into explicit `TemporarySubregionEnter`/`TemporarySubregionExit`
+instructions or leaves ordinary function lifetime unchanged. Candidate metadata is cleared before
+code generation, and Cranelift rejects any non-empty list.
 
-### AARM-5C research validation
+### AARM safety validation
 
-The research branch now has a separate compiler-owned validation artifact for the first deliberately
-narrow execution-ready subset. One explicit research orchestration obtains AARM-5A facts, creates
-AARM-5B candidates, and validates both against the same immutable MIR snapshot. The validator
-requires a single straight-line block, one rewind, exact reference death at that rewind, disjoint
-intervals, and exact accounting for every Temporary dynamic allocation between checkpoint and
-rewind. Only object and array sites are currently eligible.
+One exact-snapshot orchestration obtains lifetime facts, creates candidates, and validates both
+against the same immutable MIR. The validator supports straight-line and acyclic regions and
+iteration-local natural loops, including proven break, continue, multiple-latch, early-exit, and
+nested-leaf shapes. Every reachable Temporary allocation is accounted, every reference has exact
+death proof at its path's rewind, and every dynamic Enter executes exactly one matching Exit.
 
-Calls, Task/async/Parallel boundaries, collection and builder operations, and dynamic strings remain
-barriers. In particular, a dead owning `List`, `Dictionary`, or `StringBuilder` reference is not
-proof that all backing growth in the same Temporary arena is safe to rewind. The validated artifact
-is still research evidence only: no checkpoint or rewind instruction is emitted, Cranelift remains
-fail-closed for non-empty candidate metadata, and shipped execution still uses one Temporary scope
-per function.
+Object, array, self-contained immutable string, and conservative direct-local StringBuilder/List/
+Dictionary families are supported. Hidden backing is authorized only when the header was allocated
+inside the same fine region, exact CFG joins agree on ownership, aliases are withheld, and all
+backing remains arena-owned. Calls, interfaces, Task/async/Parallel regions, pre-checkpoint owners,
+ambiguous aliases, and simultaneous outer-plus-inner fine marks remain barriers.
 
-### AARM-5D research execution
+### AARM execution and production selection
 
-The explicit AARM research path can transform only AARM-5C-validated object and array subregions
-into backend-neutral `TemporarySubregionEnter` and `TemporarySubregionExit` MIR instructions. Its
-current experimental subset includes entry-reachable acyclic branches, joins, and early returns:
-one FineEnter may have several compiler-authorized, mutually-exclusive FineExit sites with the same
-ID. The transformation consumes the validated artifact from the exact immutable MIR snapshot,
-rebuilds instruction streams from original boundaries, and clears candidate metadata so the
-explicit instructions are the sole execution authority. Cranelift validates the same acyclic
-fine-state flow before mapping the pair to a private runtime checkpoint ABI.
+The compiler transforms selected validated subregions into backend-neutral
+`TemporarySubregionEnter` and `TemporarySubregionExit` MIR instructions. It consumes the validation
+artifact from the exact immutable MIR snapshot, builds all transformed blocks before publication,
+and clears candidate metadata so the explicit instructions are the sole execution authority.
+Cranelift independently validates fine-state flow and hidden-owner provenance before mapping the
+pair to the private runtime checkpoint ABI.
 
 Fine exit rewinds the existing Temporary `PagedArena`: live used bytes fall to the checkpoint,
 reclaimed bytes retain the existing zeroing guarantee, and retained pages remain owned for reuse.
@@ -98,13 +93,15 @@ The fine checkpoint is separate from semantic function Temporary-scope depth, so
 builder promotion rules do not observe an extra function scope. Allocation failure inside a fine
 span runs fine cleanup before ordinary function cleanup.
 
-Ordinary `compile` does not run AARM-5A/5B/5C/5D orchestration and emits no fine instructions.
-Normal ASTER execution therefore still reclaims Temporary storage only at function-scope exit.
-The research subset also includes proven iteration-local object/array work in a simple natural
-loop: a body-entry fine checkpoint and latch rewind can execute once per iteration while retaining
-the same arena capacity for reuse. Loop-carried references, header allocations, break/continue,
-multiple latches, nested loops, calls, concurrency, collections, builders, and dynamic strings
-remain outside the executable research subset; this is not production/default behavior.
+Safety and profitability are separate decisions. Normal ASTER compilation automatically selects
+only validated iteration-local natural-loop candidates containing a fine-owned growing
+`StringBuilderAppend`, `ListAdd`, `DictionaryAdd`, or `DictionarySet`. All already-safe object,
+array, immutable-string, and hidden-owner work inside that candidate shares its one checkpoint.
+Fixed-only object/array/string loops, one-shot acyclic candidates, read-only or header-only
+collection work, and ambiguous shapes retain ordinary function lifetime. This conservative v1
+policy is a deterministic compiler choice: there is no source annotation, runtime configuration,
+runtime profitability decision, or per-allocation AARM branch. It does not promise that every
+Temporary is reclaimed early or that every selected workload is universally faster.
 
 ## Collections and strings
 
@@ -234,12 +231,12 @@ share arena references, so either future model must preserve that isolation.
 
 These are runtime/JIT contracts, not backend heuristics. No production RC or
 tracing abstraction exists until the required evidence is demonstrated.
-## Research-only fine reclaim status
+## Fine reclaim status
 
-The explicit AARM research lowering can validate deterministic fine-owned
+The shared AARM lowering can validate deterministic fine-owned
 StringBuilder, List, and Dictionary locals in addition to object, array, and
-self-contained immutable-string allocations. This does not change normal
-compilation or semantic Temporary scope depth. Hidden backing is eligible only
+self-contained immutable-string allocations. It does not change semantic
+Temporary scope depth. Hidden backing is eligible only
 when its direct-local header is allocated after FineEnter and the existing
 escape/liveness proof shows the value dead on every FineExit path. Alias,
 pre-checkpoint, call, collection-snapshot, and concurrency shapes remain
@@ -247,17 +244,17 @@ conservative.
 
 Production profitability is a separate decision from this safety proof. The
 research API can report deterministic candidate cost signals and exact
-adjacent coalescing opportunities without mutating MIR, but normal compilation
-does not consult them. Measurements show that tiny iteration checkpoints can
+adjacent coalescing opportunities without mutating MIR. Measurements show that tiny iteration checkpoints can
 cost more CPU than function-lifetime retention while hidden-backing loops can
-improve both time and memory substantially, so automatic production lowering
-remains disabled pending a reviewed workload-level policy.
+improve both time and memory substantially.
 
-The current production-policy prototype is also research-only. It applies the
+The production v1 policy applies the
 unchanged safety proof first, then retains only natural-loop candidates that
 contain a fine-owned potentially-growing StringBuilder Append, List Add, or
 Dictionary Add/Set. Safe object, array, and immutable-string allocations share
 that checkpoint when they are already part of the selected candidate. Fixed-
 allocation-only loops and acyclic candidates remain on function lifetime. This
 is a deterministic compiler filter, not a runtime heuristic; it adds no
-allocation-path check and is not enabled by ordinary compilation.
+allocation-path check. Normal compilation invokes the same safety authority and
+selector automatically. Research modes for no-fine and all-safe comparisons
+remain thin policy choices over that implementation.

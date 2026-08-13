@@ -1,9 +1,10 @@
-//! Research-only planning for backend-neutral AARM Temporary subregion candidates.
+//! Planning and validation for backend-neutral AARM Temporary subregions.
 //!
-//! Candidate metadata is deliberately non-executable. The normal compiler
-//! pipeline never invokes this module, and the execution backend rejects every
-//! non-empty candidate list. Only the explicit research lowering below can
-//! replace validated candidates with executable checkpoint instructions.
+//! Candidate metadata is deliberately non-executable. The compiler replaces
+//! only validated, profitable candidates with explicit checkpoint instructions,
+//! and the execution backend independently rejects malformed candidate metadata
+//! or executable checkpoint state. Research entry points are thin policy choices
+//! over the same safety planner and validator used by normal compilation.
 
 #![cfg_attr(not(test), allow(dead_code))]
 
@@ -32,8 +33,8 @@ pub struct AarmTemporarySubregionLoweringReport {
 }
 
 /// Deterministic, backend-neutral cost signals for one proven-safe AARM
-/// subregion. These are research evidence only; normal compilation does not
-/// consult them and automatic production lowering remains disabled.
+/// subregion. These remain research evidence; production v1 uses only the
+/// structural hidden-backing mutation rule documented by its policy variant.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AarmTemporarySubregionCostEstimate {
@@ -59,8 +60,7 @@ pub struct AarmTemporarySubregionCoalescingOpportunity {
     pub eliminated_checkpoint_pairs: usize,
 }
 
-/// Research-only profitability selector applied after the complete AARM
-/// safety proof. Normal compilation never invokes either policy.
+/// Profitability selector applied after the complete AARM safety proof.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AarmTemporarySubregionProfitabilityPolicy {
@@ -70,7 +70,7 @@ pub enum AarmTemporarySubregionProfitabilityPolicy {
     /// Lower only natural-loop candidates containing a fine-owned
     /// `StringBuilder`, `List`, or `Dictionary` mutation that can grow hidden
     /// backing storage. One-shot acyclic regions stay on function lifetime.
-    HiddenBackingGrowthLoop,
+    ProductionV1,
 }
 
 /// Controlled failure from the experimental AARM-5D MIR transformation.
@@ -149,8 +149,28 @@ pub fn lower_aarm_temporary_subregions_with_policy_for_research(
         ));
     }
     escape_analysis::assign_allocation_regions(&mut analyzed);
+    lower_assigned_aarm_temporary_subregions(module, analyzed, policy)
+}
+
+/// Apply the production AARM policy after allocation regions are authoritative.
+/// A proof or lowering mismatch conservatively preserves ordinary function
+/// lifetime rather than making compilation fail.
+pub(super) fn lower_production_aarm_temporary_subregions(module: &mut mir::Module) {
+    let analyzed = module.clone();
+    let _ = lower_assigned_aarm_temporary_subregions(
+        module,
+        analyzed,
+        AarmTemporarySubregionProfitabilityPolicy::ProductionV1,
+    );
+}
+
+fn lower_assigned_aarm_temporary_subregions(
+    module: &mut mir::Module,
+    mut analyzed: mir::Module,
+    policy: AarmTemporarySubregionProfitabilityPolicy,
+) -> Result<AarmTemporarySubregionLoweringReport, AarmTemporarySubregionLoweringError> {
     let mut analysis = analyze_plan_and_validate_candidate_subregions(&mut analyzed);
-    if policy == AarmTemporarySubregionProfitabilityPolicy::HiddenBackingGrowthLoop {
+    if policy == AarmTemporarySubregionProfitabilityPolicy::ProductionV1 {
         analysis.validation.validated.retain(|subregion| {
             analyzed
                 .functions
@@ -2652,7 +2672,7 @@ public int Main() {
         )]);
         let tiny_report = lower_aarm_temporary_subregions_with_policy_for_research(
             &mut tiny,
-            AarmTemporarySubregionProfitabilityPolicy::HiddenBackingGrowthLoop,
+            AarmTemporarySubregionProfitabilityPolicy::ProductionV1,
         )
         .expect("tiny safe work can be declined");
         assert_eq!(tiny_report.subregions_lowered, 0);
@@ -2702,7 +2722,7 @@ public int Main() {
         let mut selected = module(vec![builder_function()]);
         let selected_report = lower_aarm_temporary_subregions_with_policy_for_research(
             &mut selected,
-            AarmTemporarySubregionProfitabilityPolicy::HiddenBackingGrowthLoop,
+            AarmTemporarySubregionProfitabilityPolicy::ProductionV1,
         )
         .expect("one-shot hidden-backing work can be declined");
         assert_eq!(selected_report.subregions_lowered, 0);
@@ -2719,7 +2739,7 @@ public int Main() {
         )]);
         let header_only_report = lower_aarm_temporary_subregions_with_policy_for_research(
             &mut header_only,
-            AarmTemporarySubregionProfitabilityPolicy::HiddenBackingGrowthLoop,
+            AarmTemporarySubregionProfitabilityPolicy::ProductionV1,
         )
         .expect("an owner without a growth operation is declined");
         assert_eq!(header_only_report.subregions_lowered, 0);
@@ -2781,7 +2801,7 @@ public int Main() {
         let mut selected = module(vec![loop_function()]);
         let selected_report = lower_aarm_temporary_subregions_with_policy_for_research(
             &mut selected,
-            AarmTemporarySubregionProfitabilityPolicy::HiddenBackingGrowthLoop,
+            AarmTemporarySubregionProfitabilityPolicy::ProductionV1,
         )
         .expect("hidden-backing loop selector lowers proven growth");
         assert_eq!(selected_report.subregions_lowered, 1);

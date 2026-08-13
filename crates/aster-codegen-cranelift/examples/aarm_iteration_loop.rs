@@ -7,7 +7,10 @@
 use std::time::Instant;
 
 use aster_codegen_cranelift::{ExecutionValue, MemoryStats, execute, execute_with_stats};
-use aster_compiler::lower_aarm_temporary_subregions_for_research;
+use aster_compiler::{
+    AarmTemporarySubregionProfitabilityPolicy, lower_aarm_temporary_subregions_for_research,
+    lower_aarm_temporary_subregions_with_policy_for_research,
+};
 use aster_mir as mir;
 
 const RUN: mir::SymbolId = mir::SymbolId(1);
@@ -416,12 +419,20 @@ fn run_case(
     shape: AllocationShape,
     helper_scoped: bool,
     iteration_reclaim: bool,
+    production_selector: bool,
 ) -> (f64, MemoryStats) {
     let mut module = module(iterations, shape, helper_scoped);
     if iteration_reclaim {
         let report = lower_aarm_temporary_subregions_for_research(&mut module)
             .expect("AARM-5E2A lowers the direct loop");
         assert_eq!(report.subregions_lowered, 1);
+    } else if production_selector {
+        let report = lower_aarm_temporary_subregions_with_policy_for_research(
+            &mut module,
+            AarmTemporarySubregionProfitabilityPolicy::ProductionV1,
+        )
+        .expect("production AARM policy analyzes the direct loop");
+        assert_eq!(report.subregions_lowered, 0);
     }
     let expected = ExecutionValue::Int(i32::try_from(iterations).expect("iterations fit in int"));
     let (value, stats) = execute_with_stats(&module, "Run").expect("benchmark executes");
@@ -506,13 +517,19 @@ fn main() {
             AllocationShape::Array,
             AllocationShape::String,
         ] {
-            for (variant, helper_scoped, iteration_reclaim) in [
-                ("direct", false, false),
-                ("helper", true, false),
-                ("aarm", false, true),
+            for (variant, helper_scoped, iteration_reclaim, production_selector) in [
+                ("direct", false, false, false),
+                ("helper", true, false, false),
+                ("aarm", false, true, false),
+                ("production", false, false, true),
             ] {
-                let (median_ms, stats) =
-                    run_case(iterations, shape, helper_scoped, iteration_reclaim);
+                let (median_ms, stats) = run_case(
+                    iterations,
+                    shape,
+                    helper_scoped,
+                    iteration_reclaim,
+                    production_selector,
+                );
                 println!(
                     "shape={:<6} variant={variant:<6} iterations={iterations:<7} median_ms={median_ms:>9.3} allocations={:>8} strings={:>8} requested={:>10} peak_used={:>10} capacity={:>10}",
                     shape.name(),

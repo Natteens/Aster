@@ -2191,7 +2191,7 @@ fn malformed_executable_subregions_fail_closed_before_codegen() {
 }
 
 #[test]
-fn hidden_collection_string_call_and_concurrency_operations_are_rejected() {
+fn hidden_alias_call_and_concurrency_operations_are_rejected() {
     let list_type = mir::Type::List(Box::new(mir::Type::Int));
     let mut module = module(vec![function(
         RUN,
@@ -2266,7 +2266,7 @@ fn hidden_collection_string_call_and_concurrency_operations_are_rejected() {
         arguments: vec![integer(42)],
         return_type: mir::Type::String,
     };
-    validate(&module).expect_err("a dynamic string allocation inside a fine subregion is rejected");
+    validate(&module).expect("a supported signed integer string conversion is executable");
 
     module.functions[0].blocks[0].instructions[2] = mir::Instruction::CallIntrinsic {
         destination: None,
