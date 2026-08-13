@@ -563,6 +563,30 @@ This validates PageBackend infrastructure only. Ordinary rewind still zeroes rec
 retains all inactive backing. AARM-4 owns every production decision about automatic discard,
 purge eligibility, delay, hysteresis, and pressure response.
 
+## AARM-4A fully-dead page eligibility and controlled purge
+
+AARM-4A adds a runtime-private, caller-owned `PagedArena` operation that attempts to discard every
+currently eligible inactive page in deterministic arena order. A page is eligible only when it is
+outside the active prefix, has a zero cursor, is **Retained**, and its selected backend explicitly
+supports discard. The arena owns that liveness decision; the backend only performs the platform
+operation and `PageBacking` records the resulting Retained/Discarded state.
+
+On Windows, controlled purge uses `MEM_DECOMMIT` and preserves the reservation until same-base
+reuse preparation. On Linux it uses `MADV_DONTNEED`; the anonymous mapping remains owned and
+addressable, so no explicit recommit exists. The system-allocator fallback reports backing as
+unsupported and leaves it retained. Individual discard failures leave their page retained and the
+operation continues with later eligible pages; no multi-page transaction or rollback is implied.
+
+Controlled purge does not change logical arena capacity, virtual extent, or MemoryGovernor charges.
+It only moves known VM backing extent between retained and discarded telemetry. Ordinary rewind,
+temporary-scope exit, allocation, and context teardown do not invoke it automatically.
+
+```text
+automatic purge: NOT IMPLEMENTED
+delay/hysteresis: NOT IMPLEMENTED
+pressure-triggered purge: NOT IMPLEMENTED
+```
+
 ## Measurement invariants
 
 Every snapshot must satisfy:
@@ -666,7 +690,8 @@ AARM-1 observability
 -> AARM-3C Linux virtual-memory PageBackend
 -> AARM-3D page-state and reserve/backing telemetry
 -> AARM-3E integration and hardening
--> AARM-4 delayed purge/hysteresis
+-> AARM-4A fully-dead eligibility and controlled purge
+-> AARM-4B delayed purge/hysteresis
 -> AARM-5 MIR lifetime refinement
 -> AARM-6 integration/production decision
 ```

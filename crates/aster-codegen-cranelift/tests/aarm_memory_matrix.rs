@@ -197,6 +197,12 @@ fn every_region_and_total_obey_allocator_invariants() {
                 (None, None, None, None) => {}
                 values => panic!("partial VM backing telemetry is invalid: {values:?}"),
             }
+            if let Some(discarded) = region.backing_discarded_bytes {
+                assert_eq!(
+                    discarded, 0,
+                    "ordinary matrix workloads do not invoke controlled purge"
+                );
+            }
         }
         assert_eq!(
             telemetry.total.live_used_bytes,
