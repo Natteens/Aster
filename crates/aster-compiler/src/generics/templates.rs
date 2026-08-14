@@ -1,6 +1,6 @@
 use super::{
-    DeclarationFacts, DeclarationKind, Diagnostic, HashMap, Item, Member, Module, Monomorphizer,
-    TypeDeclaration, TypeName, TypeParameter,
+    DeclarationFacts, DeclarationKind, Diagnostic, FunctionDeclaration, HashMap, Item, Member,
+    Module, Monomorphizer, TypeDeclaration, TypeName, TypeParameter,
 };
 
 #[derive(Clone)]
@@ -36,14 +36,6 @@ fn not_an_interface(name: &str, description: &str, span: aster_diagnostics::Span
     .with_help("generic constraints accept only interfaces in this subset")
 }
 
-fn unsupported_generic_constraint(name: &str, span: aster_diagnostics::Span) -> Diagnostic {
-    Diagnostic::error(
-        format!("generic interface constraints are not supported yet: `{name}`"),
-        span,
-    )
-    .with_help("constrain the parameter with a non-generic interface")
-}
-
 /// How to describe a constraint that names a built-in type rather than a
 /// declared one. `where T : int` must report that `int` is not an interface,
 /// not that it is unknown.
@@ -67,6 +59,9 @@ impl Monomorphizer {
         let mut returns = HashMap::new();
         let mut fields = HashMap::new();
         let mut methods = HashMap::new();
+        let mut method_signatures: HashMap<(String, String), Vec<Vec<String>>> = HashMap::new();
+        let mut method_templates: HashMap<(String, String), Vec<FunctionDeclaration>> =
+            HashMap::new();
         let mut function_kinds = HashMap::new();
         let mut diagnostics = Vec::new();
         let mut declarations = HashMap::new();
@@ -93,7 +88,7 @@ impl Monomorphizer {
                 name.clone(),
                 DeclarationFacts {
                     kind,
-                    generic: !type_parameters.is_empty(),
+                    arity: type_parameters.len(),
                 },
             );
             if let Item::Class(value) = item
@@ -161,10 +156,22 @@ impl Monomorphizer {
                                 );
                             }
                             Member::Method(method) => {
-                                methods.insert(
-                                    (declaration.name.clone(), method.name.clone()),
-                                    method.return_type.name.clone(),
-                                );
+                                let key = (declaration.name.clone(), method.name.clone());
+                                if method.type_parameters.is_empty() {
+                                    methods.insert(key.clone(), method.return_type.name.clone());
+                                    method_signatures.entry(key).or_default().push(
+                                        method
+                                            .parameters
+                                            .iter()
+                                            .map(|parameter| parameter.type_ref.name.clone())
+                                            .collect(),
+                                    );
+                                } else {
+                                    method_templates
+                                        .entry(key)
+                                        .or_default()
+                                        .push(method.clone());
+                                }
                             }
                             Member::Property(property) => {
                                 fields.insert(
@@ -196,6 +203,11 @@ impl Monomorphizer {
             returns,
             fields,
             methods,
+            method_signatures,
+            method_templates,
+            method_cache: HashMap::new(),
+            method_active: Vec::new(),
+            generated_methods: HashMap::new(),
             cache: HashMap::new(),
             active: Vec::new(),
             generated: Vec::new(),
@@ -218,6 +230,26 @@ impl Monomorphizer {
         for template in self.templates.values() {
             self.validate_type_parameters(&template.type_parameters, &mut reported);
         }
+        for ((owner, _), templates) in &self.method_templates {
+            for method in templates {
+                self.validate_type_parameters(&method.type_parameters, &mut reported);
+                if self
+                    .declarations
+                    .get(owner)
+                    .is_some_and(|facts| facts.kind == DeclarationKind::Interface)
+                {
+                    reported.push(
+                        Diagnostic::error(
+                            "generic interface methods are not implemented",
+                            method.span,
+                        )
+                        .with_help(
+                            "use a generic interface specialization or a generic class/struct method",
+                        ),
+                    );
+                }
+            }
+        }
         for template in self.type_templates.values() {
             let declaration = template.declaration();
             if declaration.is_static {
@@ -232,23 +264,19 @@ impl Monomorphizer {
             self.validate_type_parameters(&declaration.type_parameters, &mut reported);
             for member in &declaration.members {
                 if let Member::Method(method) = member {
-                    if matches!(template, GenericTypeTemplate::Struct(_)) {
-                        reported.push(
-                            Diagnostic::error(
-                                "struct methods are not executable yet, including on generic structs",
-                                method.span,
-                            )
-                            .with_help("keep the generic struct as data and use a namespace function"),
-                        );
-                    }
                     if !method.type_parameters.is_empty() {
-                        reported.push(
-                            Diagnostic::error(
-                                "generic methods are not implemented; methods may use only their owner type parameters",
-                                method.span,
-                            )
-                            .with_help("move the additional type parameters to a namespace function"),
-                        );
+                        self.validate_type_parameters(&method.type_parameters, &mut reported);
+                        if matches!(template, GenericTypeTemplate::Interface(_)) {
+                            reported.push(
+                                Diagnostic::error(
+                                    "generic interface methods are not implemented",
+                                    method.span,
+                                )
+                                .with_help(
+                                    "use a generic interface specialization or a generic class/struct method",
+                                ),
+                            );
+                        }
                     }
                     if method.is_static {
                         reported.push(
@@ -292,8 +320,9 @@ impl Monomorphizer {
         }
     }
 
-    /// Constraint well-formedness for one type parameter. Only non-generic
-    /// nominal interfaces are accepted in the first subset.
+    /// Constraint well-formedness for one type parameter. Constraints remain
+    /// nominal, but may name a correctly closed generic interface and may use
+    /// any type parameter from the declaration in that closed shape.
     fn validate_constraints(&self, parameter: &TypeParameter, reported: &mut Vec<Diagnostic>) {
         let mut seen: Vec<&str> = Vec::new();
         for constraint in &parameter.constraints {
@@ -316,10 +345,6 @@ impl Monomorphizer {
                 );
                 continue;
             };
-            if !type_name.arguments.is_empty() {
-                reported.push(unsupported_generic_constraint(name, constraint.span));
-                continue;
-            }
             if type_name.array {
                 reported.push(not_an_interface(name, "an array type", constraint.span));
                 continue;
@@ -346,8 +371,19 @@ impl Monomorphizer {
                 ));
                 continue;
             }
-            if facts.generic {
-                reported.push(unsupported_generic_constraint(name, constraint.span));
+            if type_name.arguments.len() != facts.arity {
+                reported.push(
+                    Diagnostic::error(
+                        format!(
+                            "generic interface constraint `{}` expects {} type argument(s), found {}",
+                            type_name.base,
+                            facts.arity,
+                            type_name.arguments.len()
+                        ),
+                        constraint.span,
+                    )
+                    .with_help("provide every required type argument in the constraint"),
+                );
             }
         }
     }

@@ -470,13 +470,10 @@ fn parallel_for_each_class_array_is_rejected() {
 
 #[test]
 fn parallel_for_each_decimal_array_is_rejected() {
-    // `decimal` is numeric but has no backend ABI yet, so `decimal[]` must be
-    // rejected the same way a reference-typed array is, not silently accepted
-    // because it is a recognized numeric type.
     assert_error(
         "public void Body(decimal value) { } \
          public int Main() { decimal[] values = [1.5m]; Parallel.ForEach(values, Body); return 0; }",
-        "requires a scalar element type",
+        "`decimal` is reserved but not supported",
     );
 }
 
@@ -677,13 +674,11 @@ fn parallel_reduce_non_transferable_element_is_rejected_enum() {
 
 #[test]
 fn parallel_reduce_decimal_element_is_rejected() {
-    // `decimal` is numeric but not worker-transferable (Lote 6B): it must not
-    // be silently accepted just because it "looks scalar."
     assert_error(
         "public decimal AddValue(decimal accumulator, decimal value) { return accumulator + value; } \
          public decimal AddPartial(decimal left, decimal right) { return left + right; } \
          public decimal Main() { decimal[] values = [1.0m]; return Parallel.Reduce(values, 0.0m, AddValue, AddPartial); }",
-        "requires a scalar element type",
+        "`decimal` is reserved but not supported",
     );
 }
 
@@ -715,7 +710,7 @@ fn parallel_reduce_decimal_identity_is_rejected() {
         "public decimal AddValue(decimal accumulator, int value) { return accumulator; } \
          public decimal AddPartial(decimal left, decimal right) { return left; } \
          public decimal Main() { int[] values = [1]; return Parallel.Reduce(values, 0.0m, AddValue, AddPartial); }",
-        "cannot cross a worker boundary",
+        "`decimal` is reserved but not supported",
     );
 }
 

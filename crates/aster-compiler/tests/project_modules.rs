@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
@@ -399,5 +400,102 @@ fn missing_official_namespace_reports_incomplete_distribution() {
         messages(&root)
             .iter()
             .any(|message| { message.contains("installation is incomplete") })
+    );
+}
+
+#[test]
+fn closed_generic_constraints_preserve_cross_namespace_nominal_identity() {
+    let project = Project::new("constraint-identity");
+    project.write("Aster.toml", "[package]\nname = \"constraint_identity\"\n");
+    project.write(
+        "left/contracts.aster",
+        "namespace left; public interface IBox<T> { T Get(); } public class LeftBox : IBox<int> { public LeftBox() {} public int Get() { return 42; } }",
+    );
+    project.write(
+        "right/contracts.aster",
+        "namespace right; public interface IBox<T> { T Get(); } public T Keep<T>(T value) where T : IBox<int> { return value; }",
+    );
+    let root = project.write(
+        "left/main.aster",
+        "namespace left; using right; public int Run() { Keep(new LeftBox()); return 0; }",
+    );
+    let diagnostics = messages(&root);
+    assert!(
+        diagnostics.iter().any(|message| {
+            message.contains("left::LeftBox` does not satisfy constraint")
+                && message.contains("right::IBox<int>")
+        }),
+        "unexpected diagnostics: {diagnostics:?}"
+    );
+}
+
+#[test]
+fn decimal_in_a_linked_namespace_is_rejected_by_the_shared_pre_ir_gate() {
+    let project = Project::new("linked-decimal");
+    project.write(
+        "money/value.aster",
+        "namespace money; public decimal Amount() { return 1.25m; }",
+    );
+    let root = project.main("using money; public int Run() { return 0; }");
+    assert!(
+        messages(&root)
+            .iter()
+            .any(|message| message.contains("`decimal` is reserved but not supported"))
+    );
+}
+
+#[test]
+fn generic_method_identity_is_distinct_across_linked_namespaces() {
+    let project = Project::new("method-identity");
+    project.write("Aster.toml", "[package]\nname = \"method_identity\"\n");
+    project.write(
+        "left/tools.aster",
+        "namespace left; public class Tools { public Tools() {} public T Identity<T>(T value) { return value; } } public int LeftValue() { return new Tools().Identity<int>(20); }",
+    );
+    project.write(
+        "right/tools.aster",
+        "namespace right; public class Tools { public Tools() {} public T Identity<T>(T value) { return value; } } public int RightValue() { return new Tools().Identity<int>(22); }",
+    );
+    let root = project.write(
+        "left/main.aster",
+        "namespace left; using right; public int Run() { return LeftValue() + RightValue(); }",
+    );
+    let compilation = compile_project(&root).expect("linked generic methods compile");
+    let methods = compilation
+        .compilation
+        .hir
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            aster_compiler::hir::Item::Class(class) => Some(
+                class
+                    .methods
+                    .iter()
+                    .filter(|method| method.name.contains("#method#Identity#"))
+                    .map(move |method| (class.name.clone(), method.name.clone())),
+            ),
+            _ => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(methods.len(), 2, "{methods:#?}");
+    assert_eq!(
+        methods
+            .iter()
+            .map(|(_, method)| method)
+            .collect::<HashSet<_>>()
+            .len(),
+        2,
+        "{methods:#?}"
+    );
+    assert!(
+        methods
+            .iter()
+            .any(|(owner, _)| owner.contains("left::Tools"))
+    );
+    assert!(
+        methods
+            .iter()
+            .any(|(owner, _)| owner.contains("right::Tools"))
     );
 }

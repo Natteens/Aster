@@ -340,16 +340,17 @@ impl Lowerer<'_> {
         if let Some(owner) = owner {
             let owner_symbol = self.types[&owner.name];
             scope.extend(self.members.get(&owner_symbol).cloned().unwrap_or_default());
-            if self.class_types.contains(&owner_symbol) && !function.is_static {
+            if !self.interface_types.contains(&owner_symbol) && !function.is_static {
+                let receiver_type = self.symbol_types[&owner_symbol].clone();
                 let receiver_symbol = self.allocate();
                 self.symbol_types
-                    .insert(receiver_symbol, hir::Type::Class(owner_symbol));
+                    .insert(receiver_symbol, receiver_type.clone());
                 scope.insert("this".to_owned(), receiver_symbol);
                 self.current_receiver = Some(receiver_symbol);
                 receiver = Some(hir::Parameter {
                     symbol: receiver_symbol,
                     name: "this".to_owned(),
-                    type_: hir::Type::Class(owner_symbol),
+                    type_: receiver_type,
                 });
             }
         }

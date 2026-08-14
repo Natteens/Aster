@@ -56,10 +56,18 @@ impl Monomorphizer {
                     );
                 }
                 Member::Method(method) => {
-                    self.methods.insert(
-                        (declaration.name.clone(), method.name.clone()),
-                        method.return_type.name.clone(),
-                    );
+                    let key = (declaration.name.clone(), method.name.clone());
+                    self.methods
+                        .insert(key.clone(), method.return_type.name.clone());
+                    let signature = method
+                        .parameters
+                        .iter()
+                        .map(|parameter| parameter.type_ref.name.clone())
+                        .collect::<Vec<_>>();
+                    let signatures = self.method_signatures.entry(key).or_default();
+                    if !signatures.contains(&signature) {
+                        signatures.push(signature);
+                    }
                 }
                 Member::Property(property) => {
                     self.fields.insert(
@@ -80,23 +88,7 @@ impl Monomorphizer {
         for member in &mut declaration.members {
             match member {
                 Member::Method(function) => {
-                    if !function.type_parameters.is_empty() {
-                        self.diagnostics.push(Diagnostic::error(
-                            "generic methods are not implemented; methods may only use their owner type parameters",
-                            function.span,
-                        ));
-                        continue;
-                    }
-                    let mut environment = field_environment.clone();
-                    if !function.is_static {
-                        environment.insert("this".to_owned(), declaration.name.clone());
-                    }
-                    environment.extend(function.parameters.iter().map(|parameter| {
-                        (parameter.name.clone(), parameter.type_ref.name.clone())
-                    }));
-                    if let Some(body) = &mut function.body {
-                        self.block(body, &mut environment);
-                    }
+                    self.analyze_method(&declaration.name, function, &field_environment);
                 }
                 Member::Field(field) => {
                     if let Some(initializer) = &mut field.initializer {
@@ -114,6 +106,28 @@ impl Monomorphizer {
                     }
                 }
             }
+        }
+    }
+
+    pub(super) fn analyze_method(
+        &mut self,
+        owner: &str,
+        function: &mut FunctionDeclaration,
+        fields: &HashMap<String, String>,
+    ) {
+        let mut environment = fields.clone();
+        environment.insert("#owner".to_owned(), owner.to_owned());
+        if !function.is_static {
+            environment.insert("this".to_owned(), owner.to_owned());
+        }
+        environment.extend(
+            function
+                .parameters
+                .iter()
+                .map(|parameter| (parameter.name.clone(), parameter.type_ref.name.clone())),
+        );
+        if let Some(body) = &mut function.body {
+            self.block(body, &mut environment);
         }
     }
 
@@ -385,6 +399,9 @@ impl Monomorphizer {
         }
     }
 
+    // Call discovery keeps generic free functions, generic methods, built-ins, and ordinary
+    // callable inference in one precedence-ordered routine so no second overload engine emerges.
+    #[allow(clippy::too_many_lines)]
     fn call_expression(
         &mut self,
         callee: &mut Expression,
@@ -405,6 +422,148 @@ impl Monomorphizer {
             if let Some((specialized, return_type)) = result {
                 *name = specialized;
                 return return_type;
+            }
+            return String::new();
+        }
+        let method_request = match &callee.kind {
+            ExpressionKind::Member { object, name } => {
+                Some((self.infer_readonly(object, environment), name.clone()))
+            }
+            ExpressionKind::Name(name) => environment
+                .get("#owner")
+                .map(|owner| (owner.clone(), name.clone())),
+            _ => None,
+        };
+        if let Some((owner, source_name)) = method_request
+            && let Some(templates) = self
+                .method_templates
+                .get(&(owner.clone(), source_name.clone()))
+                .cloned()
+        {
+            let explicit_method_arguments = !type_arguments.is_empty();
+            let ordinary_signatures = self
+                .method_signatures
+                .get(&(owner.clone(), source_name.clone()))
+                .cloned()
+                .unwrap_or_default();
+            let ordinary_exact = ordinary_signatures
+                .iter()
+                .any(|parameters| parameters == &argument_types);
+            let mut candidates = if type_arguments.is_empty() {
+                let inferable = templates
+                    .iter()
+                    .filter(|template| method_inference_possible(template, &argument_types))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let exact = inferable
+                    .iter()
+                    .filter(|template| method_inferred_signature_exact(template, &argument_types))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if exact.is_empty() { inferable } else { exact }
+            } else {
+                let matching_arity = templates
+                    .iter()
+                    .filter(|template| template.type_parameters.len() == type_arguments.len())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let concrete = type_arguments
+                    .iter()
+                    .map(|argument| argument.name.clone())
+                    .collect::<Vec<_>>();
+                let exact = matching_arity
+                    .iter()
+                    .filter(|template| method_signature_exact(template, &concrete, &argument_types))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if exact.is_empty() {
+                    matching_arity
+                } else {
+                    exact
+                }
+            };
+            if candidates.len() > 1 {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!("call to generic method `{owner}.{source_name}` is ambiguous"),
+                        span,
+                    )
+                    .with_help("use a distinct method name or parameter signature"),
+                );
+                type_arguments.clear();
+                return String::new();
+            }
+            if candidates.is_empty() {
+                if type_arguments.is_empty() && !ordinary_signatures.is_empty() {
+                    let callee_type = self.expression(callee, environment);
+                    return match &callee.kind {
+                        ExpressionKind::Member { object, name } => {
+                            let owner = self.infer_readonly(object, environment);
+                            self.methods
+                                .get(&(owner, name.clone()))
+                                .cloned()
+                                .unwrap_or(callee_type)
+                        }
+                        _ => callee_type,
+                    };
+                }
+                if type_arguments.is_empty() {
+                    candidates.push(templates[0].clone());
+                } else {
+                    self.diagnostics.push(Diagnostic::error(
+                        format!(
+                            "generic method `{owner}.{source_name}` has no overload with {} type argument(s)",
+                            type_arguments.len()
+                        ),
+                        span,
+                    ));
+                    type_arguments.clear();
+                    return String::new();
+                }
+            }
+            let result = self.instantiate_method(
+                &owner,
+                &candidates[0],
+                type_arguments,
+                &argument_types,
+                span,
+            );
+            type_arguments.clear();
+            if let Some((specialized, return_type)) = result {
+                let specialized_exact = self
+                    .method_signatures
+                    .get(&(owner.clone(), specialized.clone()))
+                    .is_some_and(|signatures| {
+                        signatures
+                            .iter()
+                            .any(|parameters| parameters == &argument_types)
+                    });
+                if !explicit_method_arguments && ordinary_exact && specialized_exact {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            format!("call to method `{owner}.{source_name}` is ambiguous"),
+                            span,
+                        )
+                        .with_help("provide explicit type arguments to select the generic method"),
+                    );
+                    return String::new();
+                }
+                if explicit_method_arguments || !ordinary_exact || !specialized_exact {
+                    match &mut callee.kind {
+                        ExpressionKind::Member { name, .. } | ExpressionKind::Name(name) => {
+                            *name = specialized;
+                        }
+                        _ => unreachable!("generic method call has a name or member callee"),
+                    }
+                    return return_type;
+                }
+            }
+            if ordinary_exact {
+                return self
+                    .methods
+                    .get(&(owner, source_name))
+                    .cloned()
+                    .unwrap_or_default();
             }
             return String::new();
         }
@@ -493,7 +652,9 @@ impl Monomorphizer {
     ) -> String {
         match &expression.kind {
             ExpressionKind::Name(name) => environment.get(name).cloned().unwrap_or_else(|| {
-                if self.methods.keys().any(|(owner, _)| owner == name) {
+                if self.methods.keys().any(|(owner, _)| owner == name)
+                    || self.method_templates.keys().any(|(owner, _)| owner == name)
+                {
                     name.clone()
                 } else {
                     String::new()
@@ -505,4 +666,69 @@ impl Monomorphizer {
             _ => String::new(),
         }
     }
+}
+
+fn method_inference_possible(template: &FunctionDeclaration, arguments: &[String]) -> bool {
+    infer_method_arguments(template, arguments).is_some()
+}
+
+fn method_inferred_signature_exact(template: &FunctionDeclaration, arguments: &[String]) -> bool {
+    infer_method_arguments(template, arguments)
+        .is_some_and(|concrete| method_signature_exact(template, &concrete, arguments))
+}
+
+fn infer_method_arguments(
+    template: &FunctionDeclaration,
+    arguments: &[String],
+) -> Option<Vec<String>> {
+    let parameters = template
+        .type_parameters
+        .iter()
+        .map(|parameter| parameter.name.clone())
+        .collect::<Vec<_>>();
+    let mut inferred = HashMap::new();
+    let mut diagnostics = Vec::new();
+    for (parameter, actual) in template.parameters.iter().zip(arguments) {
+        super::infer_type(
+            &parameter.type_ref.name,
+            actual,
+            &parameters,
+            &mut inferred,
+            template.span,
+            &mut diagnostics,
+        );
+    }
+    (diagnostics.is_empty()
+        && parameters
+            .iter()
+            .all(|parameter| inferred.contains_key(parameter)))
+    .then(|| {
+        parameters
+            .iter()
+            .map(|parameter| inferred[parameter].clone())
+            .collect()
+    })
+}
+
+fn method_signature_exact(
+    template: &FunctionDeclaration,
+    concrete: &[String],
+    arguments: &[String],
+) -> bool {
+    if template.parameters.len() != arguments.len() {
+        return false;
+    }
+    let parameters = template
+        .type_parameters
+        .iter()
+        .map(|parameter| parameter.name.clone())
+        .collect::<Vec<_>>();
+    let substitutions = super::substitutions(&parameters, concrete);
+    template
+        .parameters
+        .iter()
+        .zip(arguments)
+        .all(|(parameter, argument)| {
+            super::substitute_name(&parameter.type_ref.name, &substitutions) == *argument
+        })
 }

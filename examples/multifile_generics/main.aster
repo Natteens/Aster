@@ -2,5 +2,7 @@ using app;
 
 public int Run()
 {
-    return Choose(false, 10, 42);
+    Pair pair = Pair { left: 20, right: 22 };
+    Tools tools = new Tools();
+    return tools.Identity<int>(Choose(false, 10, pair.Sum()));
 }

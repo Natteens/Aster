@@ -6,7 +6,7 @@ public class Program
     {
         Box<int> box = new Box<int>(40);
         Box<int> same = Identity<Box<int>>(box);
-        IValue<int> score = new Score(2);
+        IValue<int> score = ConstrainedIdentity(new Score(2));
         return Math.Max(same.Get() + score.Get(), 0);
     }
 }

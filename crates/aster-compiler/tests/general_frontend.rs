@@ -492,15 +492,13 @@ fn unsigned_widening_is_implicit_and_sign_changes_are_not() {
 }
 
 #[test]
-fn decimal_is_checked_but_marked_distinct_from_floats() {
-    assert_valid("public decimal Money() { decimal price = 10.50m; return price; }");
-    assert_valid("public decimal Sum(decimal a, decimal b) { return a + b; }");
+fn decimal_is_deliberately_deferred_with_a_precise_diagnostic() {
     assert_error(
-        "public void Test() { decimal d = 1.5d; }",
-        "expected `decimal`, found `double`",
+        "public decimal Money() { decimal price = 10.50m; return price; }",
+        "`decimal` is reserved but not supported",
     );
     assert_error(
-        "public void Test() { double d = 1.5m; }",
-        "expected `double`, found `decimal`",
+        "public decimal Sum(decimal a, decimal b) { return a + b; }",
+        "`decimal` is reserved but not supported",
     );
 }

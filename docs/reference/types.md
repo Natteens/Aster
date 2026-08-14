@@ -1,8 +1,8 @@
 # Primitive types
 
-ASTER uses fixed-width primitive types and keeps their identities through HIR and MIR. Most of the
-surface below is executable today; `decimal` is deliberately different and remains outside the
-current backend-supported subset.
+ASTER uses fixed-width primitive types and keeps their identities through HIR and MIR. `decimal`
+syntax is reserved, but source that uses it is deliberately rejected before specialization and IR
+lowering until its exact contract exists.
 
 **Status:** ✅ executable in the JIT · 🚧 recognized by the frontend but rejected by current public compiler commands
 
@@ -39,14 +39,14 @@ double ratio = 1.0d / 3.0d;
 ```
 
 > [!IMPORTANT]
-> `decimal` is recognized by the lexer, parser, type system, HIR, and MIR, but it is not executable
-> yet. Current public compiler commands validate backend support before succeeding, so `aster check`,
-> `aster dump-hir`, `aster dump-mir`, and `aster run` reject compilation units that require
-> `decimal` with a controlled diagnostic.
+> `decimal` is recognized lexically and syntactically, then rejected by the linked-language surface
+> gate before generic specialization, semantic lowering, HIR, or MIR. Consequently `aster check`,
+> `aster dump-hir`, `aster dump-mir`, and `aster run` all report the same controlled diagnostic.
 
-The frontend representation exists so ASTER can preserve the intended type without pretending that
-its runtime layout, arithmetic, conversions, and ABI are finished. Treat decimal source as a
-negative compiler fixture for now, not as a partially usable runtime feature.
+HIR/MIR keep fail-closed decimal variants for validation compatibility, but successful source
+compilation cannot produce them. Precision, scale, literal rounding, overflow, arithmetic,
+comparison, conversion, formatting, layout, and ABI remain unspecified; ASTER therefore does not
+silently map decimal to binary floating point.
 
 ```aster
 // Recognized syntax, but rejected by current public compilation commands.

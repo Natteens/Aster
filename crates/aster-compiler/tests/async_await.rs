@@ -265,13 +265,10 @@ fn inferred_scalar_local_before_await_is_allowed() {
 
 #[test]
 fn decimal_local_before_await_is_rejected() {
-    // `decimal` is not a reference type (so the reference-local rule alone
-    // would miss it), but it still has no worker-transferable ABI, so it
-    // must not be allowed to persist across the suspension either.
     assert_error(
         "public int Compute() { return 1; } \
          public async Task<int> Calculate() { decimal price = 1.5m; int result = await Task.Run(Compute); return result; }",
-        "a `decimal` local cannot be declared before `await`",
+        "`decimal` is reserved but not supported",
     );
 }
 

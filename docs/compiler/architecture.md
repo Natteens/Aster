@@ -136,8 +136,17 @@ field initializer assignments are inserted at the beginning of constructors in d
 Aggregate equality is explicit MIR: structs compare typed fields recursively, class/array references
 compare pointer identity, and interfaces compare their object word.
 
-The backend rejects unsupported MIR before code generation. `decimal` is preserved by the
-frontend but rejected here until a real decimal runtime exists. The backend does not inspect
+Struct instance methods use the existing aggregate ABI: HIR adds a typed `User(owner)` receiver,
+MIR passes it as the first ordinary operand, and Cranelift copies that aggregate into the callee's
+receiver local. Reference-bearing fields are copied with the same field-wise representation as
+ordinary struct assignment; existing containment and escape proofs keep referenced allocations
+alive independently of the receiver stack copy. Generic methods are specialized before semantic analysis with a structural cache
+key containing the closed owner, method declaration/signature, and method arguments. Neither open
+parameters nor constraint metadata reach HIR.
+
+The backend rejects unsupported MIR before code generation. Decimal source is rejected earlier by
+the post-link language-surface gate because its numeric and ABI contract remains unspecified;
+backend validation still rejects hand-built decimal MIR fail-closed. The backend does not inspect
 AST/HIR, implement inheritance, or generate object files or link executables.
 Public standard-library code reaches this backend as ordinary concrete MIR.
 The one math domain-error bridge is a typed MIR intrinsic; Cranelift does not inspect `Math` names

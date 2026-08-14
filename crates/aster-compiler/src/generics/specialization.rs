@@ -1,8 +1,8 @@
 use super::{
-    AstVisitorMut, Diagnostic, Expression, ExpressionKind, HashMap, Item, Member, Monomorphizer,
-    SwitchCase, SwitchExpressionCase, TypeName, TypeRef, TypeSubstituter, Write, infer_type,
-    substitute_name, substitutions, walk_expression_mut, walk_switch_case_mut,
-    walk_switch_expression_case_mut,
+    AstVisitorMut, Diagnostic, Expression, ExpressionKind, HashMap, Item, Member,
+    MethodSpecializationKey, MethodTemplateKey, Monomorphizer, SwitchCase, SwitchExpressionCase,
+    TypeName, TypeRef, TypeSubstituter, Write, infer_type, substitute_name, substitutions,
+    walk_expression_mut, walk_switch_case_mut, walk_switch_expression_case_mut,
 };
 
 impl Monomorphizer {
@@ -11,7 +11,11 @@ impl Monomorphizer {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn concretize_type_name(&mut self, name: &str, span: aster_diagnostics::Span) -> String {
+    pub(super) fn concretize_type_name(
+        &mut self,
+        name: &str,
+        span: aster_diagnostics::Span,
+    ) -> String {
         let Some(mut type_name) = TypeName::parse(name) else {
             self.diagnostics.push(Diagnostic::error(
                 format!("malformed generic type `{name}`"),
@@ -267,6 +271,7 @@ impl Monomorphizer {
             }
         }
         TypeSubstituter::new(&substitutions).visit_type_declaration_mut(&mut declaration);
+        self.extract_generic_methods(&mut declaration);
         GenericTypeConcretizer::new(self).visit_type_declaration_mut(&mut declaration);
         self.analyze_type_declaration(&mut declaration);
         self.type_active.pop();
@@ -386,6 +391,164 @@ impl Monomorphizer {
         self.function(&mut function);
         self.active.pop();
         self.generated.push(function);
+        Some((specialized, return_type))
+    }
+
+    // Method specialization intentionally mirrors the adjacent free-function specialization
+    // transaction from inference through cache installation and closed-body discovery.
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn instantiate_method(
+        &mut self,
+        owner: &str,
+        template: &aster_syntax::FunctionDeclaration,
+        explicit: &[TypeRef],
+        arguments: &[String],
+        span: aster_diagnostics::Span,
+    ) -> Option<(String, String)> {
+        let parameter_names = template
+            .type_parameters
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect::<Vec<_>>();
+        let display_name = format!("{owner}.{}", template.name);
+        let concrete = if explicit.is_empty() {
+            let mut inferred = HashMap::new();
+            for (parameter, actual) in template.parameters.iter().zip(arguments) {
+                infer_type(
+                    &parameter.type_ref.name,
+                    actual,
+                    &parameter_names,
+                    &mut inferred,
+                    span,
+                    &mut self.diagnostics,
+                );
+            }
+            if let Some(missing) = parameter_names
+                .iter()
+                .find(|parameter| !inferred.contains_key(*parameter))
+            {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "cannot infer type parameter `{missing}` for generic method `{display_name}`"
+                        ),
+                        span,
+                    )
+                    .with_help("provide explicit type arguments"),
+                );
+                return None;
+            }
+            parameter_names
+                .iter()
+                .map(|parameter| inferred[parameter].clone())
+                .collect::<Vec<_>>()
+        } else {
+            if explicit.len() != parameter_names.len() {
+                self.diagnostics.push(Diagnostic::error(
+                    format!(
+                        "generic method `{display_name}` expects {} type argument(s), found {}",
+                        parameter_names.len(),
+                        explicit.len()
+                    ),
+                    span,
+                ));
+                return None;
+            }
+            explicit
+                .iter()
+                .map(|type_| self.concretize_type_name(&type_.name, type_.span))
+                .collect::<Vec<_>>()
+        };
+        if concrete.iter().any(String::is_empty) {
+            self.diagnostics.push(Diagnostic::error(
+                format!("cannot infer concrete types for generic method `{display_name}`"),
+                span,
+            ));
+            return None;
+        }
+        if !self.check_constraints(&template.type_parameters, &concrete, span) {
+            return None;
+        }
+        let template_key = MethodTemplateKey {
+            owner: owner.to_owned(),
+            declaration_start: template.span.start,
+            parameters: template
+                .parameters
+                .iter()
+                .map(|parameter| parameter.type_ref.name.clone())
+                .collect(),
+        };
+        let key = MethodSpecializationKey {
+            template: template_key,
+            arguments: concrete.clone(),
+        };
+        let substitutions = substitutions(&parameter_names, &concrete);
+        if let Some(specialized) = self.method_cache.get(&key) {
+            return Some((
+                specialized.clone(),
+                self.methods
+                    .get(&(owner.to_owned(), specialized.clone()))
+                    .cloned()
+                    .unwrap_or_else(|| substitute_name(&template.return_type.name, &substitutions)),
+            ));
+        }
+        if self
+            .method_active
+            .iter()
+            .any(|active| active.template == key.template && active.arguments != key.arguments)
+        {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "generic method `{display_name}` recursively creates a different specialization"
+                    ),
+                    span,
+                )
+                .with_help("keep recursive generic method calls on the same concrete types"),
+            );
+            return None;
+        }
+        let base = format!("{}#method#{}#{}", owner, template.name, template.span.start);
+        let specialized = specialized_name(&base, &concrete);
+        self.method_cache.insert(key.clone(), specialized.clone());
+        let diagnostics_before = self.diagnostics.len();
+        let mut method = template.clone();
+        method.name.clone_from(&specialized);
+        method.type_parameters.clear();
+        TypeSubstituter::new(&substitutions).visit_function_declaration_mut(&mut method);
+        GenericTypeConcretizer::new(self).visit_function_declaration_mut(&mut method);
+        let return_type = method.return_type.name.clone();
+        let method_key = (owner.to_owned(), specialized.clone());
+        self.methods.insert(method_key.clone(), return_type.clone());
+        self.method_signatures.insert(
+            method_key.clone(),
+            vec![
+                method
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.type_ref.name.clone())
+                    .collect(),
+            ],
+        );
+        let fields = self
+            .fields
+            .iter()
+            .filter(|((field_owner, _), _)| field_owner == owner)
+            .map(|((_, name), type_)| (name.clone(), type_.clone()))
+            .collect::<HashMap<_, _>>();
+        self.method_active.push(key.clone());
+        self.analyze_method(owner, &mut method, &fields);
+        self.method_active.pop();
+        if self.diagnostics.len() != diagnostics_before {
+            self.method_cache.remove(&key);
+            self.methods.remove(&method_key);
+            self.method_signatures.remove(&method_key);
+            return None;
+        }
+        self.generated_methods
+            .entry(owner.to_owned())
+            .or_default()
+            .push(method);
         Some((specialized, return_type))
     }
 }

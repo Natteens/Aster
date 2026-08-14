@@ -72,7 +72,7 @@ fn a_list_of_decimal_is_still_rejected() {
     assert!(
         errors
             .iter()
-            .any(|message| message.contains("`List<decimal>` cannot be used")),
+            .any(|message| message.contains("`decimal` is reserved but not supported")),
         "expected `List<decimal>` to be rejected, got {errors:?}"
     );
 }
@@ -162,7 +162,7 @@ fn a_list_of_decimal_add_is_still_rejected() {
     assert!(
         errors
             .iter()
-            .any(|message| message.contains("`List<decimal>` cannot be used")),
+            .any(|message| message.contains("`decimal` is reserved but not supported")),
         "expected `List<decimal>` to be rejected, got {errors:?}"
     );
 }
@@ -649,7 +649,7 @@ fn get_and_add_still_reject_decimal() {
     assert!(
         errors
             .iter()
-            .any(|message| message.contains("`List<decimal>` cannot be used")),
+            .any(|message| message.contains("`decimal` is reserved but not supported")),
         "expected `List<decimal>` to be rejected, got {errors:?}"
     );
 }
@@ -1096,7 +1096,7 @@ fn remove_at_still_rejects_decimal() {
     assert!(
         errors
             .iter()
-            .any(|message| message.contains("`List<decimal>` cannot be used")),
+            .any(|message| message.contains("`decimal` is reserved but not supported")),
         "expected `List<decimal>` to be rejected, got {errors:?}"
     );
 }

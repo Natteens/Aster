@@ -4,3 +4,24 @@ public T Choose<T>(bool condition, T first, T second)
 {
     return condition ? first : second;
 }
+
+public struct Pair
+{
+    public int left;
+    public int right;
+
+    public int Sum()
+    {
+        return left + right;
+    }
+}
+
+public class Tools
+{
+    public Tools() {}
+
+    public T Identity<T>(T value)
+    {
+        return value;
+    }
+}

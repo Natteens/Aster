@@ -155,28 +155,81 @@ fn non_interface_declaration_kinds_are_each_named() {
 }
 
 #[test]
-fn generic_interface_constraints_are_a_controlled_diagnostic() {
-    let closed = "public interface IBox<T> { T Get(); } \
-         public T Keep<T>(T value) where T : IBox<int> { return value; } public int Run() { return 0; }";
+fn closed_and_self_referential_generic_interface_constraints_are_nominal() {
+    let source = "public interface IBox<T> { T Get(); } \
+         public interface IComparable<T> { int CompareTo(T other); } \
+         public class IntBox : IBox<int>, IComparable<IntBox> { public IntBox() {} public int Get() { return 42; } public int CompareTo(IntBox other) { return 0; } } \
+         public T Closed<T>(T value) where T : IBox<int> { return value; } \
+         public T Self<T>(T value) where T : IComparable<T> { return value; } \
+         public int Run() { IntBox box = Closed(new IntBox()); IntBox same = Self(box); return same.Get(); }";
+    compile(source);
+
+    let wrong_closed = "public interface IBox<T> { T Get(); } \
+         public class TextBox : IBox<string> { public TextBox() {} public string Get() { return \"x\"; } } \
+         public T Keep<T>(T value) where T : IBox<int> { return value; } \
+         public int Run() { Keep(new TextBox()); return 0; }";
     diagnose(
-        closed,
-        "generic interface constraints are not supported yet: `IBox<int>`",
+        wrong_closed,
+        "type argument `TextBox` does not satisfy constraint `T: IBox<int>`",
     );
 
-    // Naming the open template is the same unsupported case.
-    let open = "public interface IBox<T> { T Get(); } \
-         public T Keep<T>(T value) where T : IBox { return value; } public int Run() { return 0; }";
+    let wrong_self = "public interface IComparable<T> { int CompareTo(T other); } \
+         public class Other { public Other() {} } \
+         public class Value : IComparable<Other> { public Value() {} public int CompareTo(Other other) { return 0; } } \
+         public T Keep<T>(T value) where T : IComparable<T> { return value; } \
+         public int Run() { Keep(new Value()); return 0; }";
     diagnose(
-        open,
-        "generic interface constraints are not supported yet: `IBox`",
+        wrong_self,
+        "type argument `Value` does not satisfy constraint `T: IComparable<Value>`",
     );
+}
 
-    let recursive = "public interface IComparable<T> { int CompareTo(T other); } \
-         public T Keep<T>(T value) where T : IComparable<T> { return value; } public int Run() { return 0; }";
-    diagnose(
-        recursive,
-        "generic interface constraints are not supported yet: `IComparable<T>`",
-    );
+#[test]
+fn nested_closed_constraints_and_multiple_specializations_remain_nominal() {
+    let accepted = "public interface IBox<T> { T Get(); } \
+         public interface IMarked<T> { int Mark(); } \
+         public interface IComparable<T> { int CompareTo(T other); } \
+         public class Value : IMarked<IBox<int>>, IComparable<Value> { public Value() {} public int Mark() { return 42; } public int CompareTo(Value other) { return 0; } } \
+         public T Keep<T>(T value) where T : IMarked<IBox<int>>, IComparable<T> { return value; } \
+         public int Run() { return Keep(new Value()).Mark(); }";
+    compile(accepted);
+
+    let rejected = "public interface IBox<T> { T Get(); } \
+         public interface IMarked<T> { int Mark(); } \
+         public interface IComparable<T> { int CompareTo(T other); } \
+         public class Value : IMarked<IBox<string>>, IComparable<Value> { public Value() {} public int Mark() { return 42; } public int CompareTo(Value other) { return 0; } } \
+         public T Keep<T>(T value) where T : IMarked<IBox<int>>, IComparable<T> { return value; } \
+         public int Run() { Keep(new Value()); return 0; }";
+    let diagnostics = aster_compiler::compile(rejected).expect_err("wrong nested specialization");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("does not satisfy constraint `T: IMarked<IBox<int>>`")
+    }));
+    assert!(!diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("does not satisfy constraint `T: IComparable<Value>`")
+    }));
+}
+
+#[test]
+fn open_or_wrong_arity_generic_interface_constraints_are_rejected() {
+    for (constraint, expected) in [
+        (
+            "IBox",
+            "generic interface constraint `IBox` expects 1 type argument(s), found 0",
+        ),
+        (
+            "IBox<int, string>",
+            "generic interface constraint `IBox` expects 1 type argument(s), found 2",
+        ),
+    ] {
+        let source = format!(
+            "public interface IBox<T> {{ T Get(); }} public T Keep<T>(T value) where T : {constraint} {{ return value; }} public int Run() {{ return 0; }}"
+        );
+        diagnose(&source, expected);
+    }
 }
 
 #[test]

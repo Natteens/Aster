@@ -595,11 +595,13 @@ fn validate_function(
         ));
     }
     validate_executable_temporary_subregions(function)?;
-    if function
-        .owner
-        .is_some_and(|owner| !classes.contains(&owner))
-    {
-        return Err(unsupported(&function.name, "struct methods"));
+    if let Some(owner) = function.owner {
+        if !classes.contains(&owner) && !structs.contains(&owner) {
+            return Err(BackendError::new(format!(
+                "function `{}` has an unknown method owner",
+                function.name
+            )));
+        }
     }
     validate_return_type(&function.return_type, &function.name)?;
     for parameter in &function.parameters {
@@ -691,6 +693,7 @@ fn validate_instruction(
             function_name,
             signatures,
             classes,
+            structs,
         ),
         mir::Instruction::CallInterface {
             destination,
@@ -2066,6 +2069,7 @@ fn validate_call(
     function_name: &str,
     signatures: &HashMap<mir::SymbolId, &mir::Function>,
     classes: &HashSet<mir::SymbolId>,
+    structs: &HashSet<mir::SymbolId>,
 ) -> Result<(), BackendError> {
     if let Some(destination) = destination {
         validate_place(destination, function_name)?;
@@ -2080,8 +2084,32 @@ fn validate_call(
             function.0
         ))
     })?;
-    if called.owner.is_some_and(|owner| !classes.contains(&owner)) {
-        return Err(unsupported(function_name, "struct method calls"));
+    if called
+        .owner
+        .is_some_and(|owner| !classes.contains(&owner) && !structs.contains(&owner))
+    {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` calls a method with an unknown owner"
+        )));
+    }
+    if called.return_type != *return_type {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` calls `{}` with return type `{}`, but the declaration returns `{}`",
+            called.name,
+            type_name(return_type),
+            type_name(&called.return_type)
+        )));
+    }
+    if arguments.len() != called.parameters.len()
+        || arguments
+            .iter()
+            .zip(&called.parameters)
+            .any(|(argument, parameter)| argument.type_ != parameter.type_)
+    {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` calls `{}` with an invalid argument signature",
+            called.name
+        )));
     }
     Ok(())
 }

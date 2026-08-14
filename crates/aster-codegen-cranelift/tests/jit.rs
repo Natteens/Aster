@@ -1491,7 +1491,7 @@ fn rejects_decimal_execution_with_a_useful_message() {
         "Money",
     )
     .unwrap_err();
-    assert!(error.contains("`decimal` is checked by the compiler but cannot execute yet"));
+    assert!(error.contains("`decimal` is reserved but not supported"));
 }
 
 #[test]

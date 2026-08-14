@@ -4,7 +4,14 @@ use std::collections::{HashMap, HashSet};
 
 use aster_diagnostics::{Diagnostic, Span};
 use aster_hir::StringOperation;
-use aster_syntax::{Item, Module};
+use aster_syntax::{
+    Expression, ExpressionKind, Item, Literal, Module, SwitchCase, SwitchExpressionCase, TypeRef,
+    visit::{
+        AstVisitorMut, walk_expression_mut, walk_switch_case_mut, walk_switch_expression_case_mut,
+    },
+};
+
+use crate::type_names::TypeName;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AccessorKind {
@@ -193,6 +200,73 @@ pub(super) fn validate(module: &Module) -> (Vec<Diagnostic>, Model) {
     let mut model = Model::default();
     general::validate(module, &mut diagnostics, &mut model);
     (diagnostics, model)
+}
+
+pub(crate) fn validate_deferred_language_surfaces(module: &mut Module) -> Vec<Diagnostic> {
+    let mut validator = DeferredLanguageSurfaceValidator {
+        diagnostics: Vec::new(),
+    };
+    validator.visit_module_mut(module);
+    validator.diagnostics
+}
+
+struct DeferredLanguageSurfaceValidator {
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl AstVisitorMut for DeferredLanguageSurfaceValidator {
+    fn visit_expression_mut(&mut self, expression: &mut Expression) {
+        match &expression.kind {
+            ExpressionKind::Literal(Literal::Decimal(_)) => {
+                self.diagnostics.push(decimal_deferred(expression.span));
+            }
+            ExpressionKind::Name(name) => self.validate_type_name(name, expression.span),
+            ExpressionKind::StructLiteral { type_name, .. }
+            | ExpressionKind::NewObject { type_name, .. } => {
+                self.validate_type_name(type_name, expression.span);
+            }
+            _ => {}
+        }
+        walk_expression_mut(self, expression);
+    }
+
+    fn visit_switch_case_mut(&mut self, case: &mut SwitchCase) {
+        if let Some(owner) = &case.enum_name {
+            self.validate_type_name(owner, case.span);
+        }
+        walk_switch_case_mut(self, case);
+    }
+
+    fn visit_switch_expression_case_mut(&mut self, case: &mut SwitchExpressionCase) {
+        if let Some(owner) = &case.enum_name {
+            self.validate_type_name(owner, case.span);
+        }
+        walk_switch_expression_case_mut(self, case);
+    }
+
+    fn visit_type_ref_mut(&mut self, type_ref: &mut TypeRef) {
+        self.validate_type_name(&type_ref.name, type_ref.span);
+    }
+}
+
+impl DeferredLanguageSurfaceValidator {
+    fn validate_type_name(&mut self, name: &str, span: Span) {
+        if TypeName::parse(name).is_some_and(|type_name| contains_decimal(&type_name)) {
+            self.diagnostics.push(decimal_deferred(span));
+        }
+    }
+}
+
+fn contains_decimal(type_name: &TypeName) -> bool {
+    type_name.base == "decimal" || type_name.arguments.iter().any(contains_decimal)
+}
+
+fn decimal_deferred(span: Span) -> Diagnostic {
+    Diagnostic::error(
+        "`decimal` is reserved but not supported until its exact precision, scale, rounding, overflow, formatting, layout, and ABI contract is specified",
+        span,
+    )
+    .with_help("use an integer in explicit minor units, or `float`/`double` for approximate values")
 }
 
 /// `Task`, `Parallel`, `List`, and `Dictionary` are reserved, intrinsic names

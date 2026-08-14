@@ -127,6 +127,23 @@ fn check_and_dumps_publish_output_only_after_success() {
         assert!(!stdout(&output).is_empty());
     }
 
+    let language = directory.join("language.aster");
+    fs::write(
+        &language,
+        "public struct Pair { public int left; public int right; public int Sum() { return left + right; } } public class Tools { public Tools() {} public T Identity<T>(T value) { return value; } } public class Program { public static int Main() { Pair pair = Pair { left: 20, right: 22 }; return new Tools().Identity<int>(pair.Sum()); } }",
+    )
+    .expect("write complete language source");
+    let language = language.to_str().expect("UTF-8 language source");
+    for command in ["check", "dump-hir", "dump-mir"] {
+        let output = aster(&directory, [command, language]);
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        assert!(stderr(&output).is_empty());
+        assert!(!stdout(&output).is_empty());
+    }
+    let output = aster(&directory, ["run", language]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output).trim(), "42");
+
     let invalid = directory.join("invalid.aster");
     fs::write(&invalid, "public class Program {").expect("write invalid source");
     for command in ["check", "dump-hir", "dump-mir"] {
@@ -138,6 +155,27 @@ fn check_and_dumps_publish_output_only_after_success() {
         assert!(
             stdout(&output).is_empty(),
             "{command} emitted a partial result"
+        );
+        assert_diagnostic_is_controlled(&output);
+    }
+
+    let decimal = directory.join("decimal.aster");
+    fs::write(
+        &decimal,
+        "public class Program { public static decimal Main() { return 1.25m; } }",
+    )
+    .expect("write deferred decimal source");
+    for command in ["check", "dump-hir", "dump-mir", "run"] {
+        let output = aster(
+            &directory,
+            [command, decimal.to_str().expect("UTF-8 decimal source")],
+        );
+        assert_failure(&output);
+        assert!(stdout(&output).is_empty(), "{command} emitted partial IR");
+        assert!(
+            stderr(&output).contains("`decimal` is reserved but not supported"),
+            "unexpected {command} diagnostic: {}",
+            stderr(&output)
         );
         assert_diagnostic_is_controlled(&output);
     }

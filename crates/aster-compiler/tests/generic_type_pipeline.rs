@@ -102,7 +102,7 @@ fn list_diagnostics_are_specific() {
         ),
         (
             "public int Count(List<decimal> value) { return 0; }",
-            "`List<decimal>` cannot be used until `decimal` is executable",
+            "`decimal` is reserved but not supported",
         ),
         ("public class List { }", "cannot be declared as a"),
         (
@@ -233,7 +233,7 @@ fn new_list_constructor_diagnostics_are_specific() {
         ),
         (
             "public int Run() { List<decimal> values = new List<decimal>(); return 0; }",
-            "`List<decimal>` cannot be used until `decimal` is executable",
+            "`decimal` is reserved but not supported",
         ),
     ] {
         let diagnostics = aster_compiler::compile(source).expect_err("invalid `new List<T>()`");

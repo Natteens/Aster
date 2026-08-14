@@ -8,7 +8,8 @@ specializations.
 
 ## ACCEPTED — Syntax and implemented subset
 
-Namespace functions, classes, structs, interfaces, and enums may declare one or more type parameters:
+Namespace functions, class/struct methods, classes, structs, interfaces, and enums may declare one
+or more type parameters:
 
 ```aster
 public T Identity<T>(T value) { return value; }
@@ -47,6 +48,12 @@ Pair<int, string> pair = Pair<int, string> { First: 42, Second: "Aster" };
 
 Function calls retain exact argument inference and may also provide explicit arguments. Expected
 return types do not participate in inference.
+
+Methods reuse those rules. A method specialization is identified structurally by its closed owner,
+declaration and parameter signature, plus ordered method type arguments. The compiler rewrites the
+call to that concrete declaration before semantic analysis; repeated identical requests reuse the
+same declaration. Generic interface methods and constructors with their own type parameters are not
+accepted.
 
 ## ACCEPTED — Type rules
 
@@ -129,10 +136,15 @@ during monomorphization, so no constraint reaches semantic analysis, HIR, MIR, b
 Cranelift, or the runtime, and adding one changes no generated instruction. There is no boxing, no
 erasure, and no new dispatch mechanism.
 
-Rejected in this subset, each with its own diagnostic: generic interface constraints
-(`where T : IBox<int>`, `where T : IComparable<T>`), primitives, classes, structs, enums, unknown
-types, duplicate constraints, a clause naming an unknown type parameter, and a duplicate clause for
-one parameter.
+Closed generic nominal constraints are accepted when their arity is exact and substitution closes
+the identity. This includes `where T : IBox<int>` and `where T : IComparable<T>`. A class satisfies
+only the exact interface specialization it nominally lists; `IBox<string>` never proves
+`IBox<int>`. The same proof runs for generic methods and every other supported generic declaration
+kind.
+
+Rejected in this subset, each with its own diagnostic: bare open generic targets, wrong generic
+arity, primitives, classes, structs, enums, unknown types, duplicate constraints, a clause naming
+an unknown type parameter, and a duplicate clause for one parameter.
 
 Constraints are not required to call members on a type parameter. An unconstrained template that
 uses a member stays legal and is checked against each concrete specialization, exactly as before.
@@ -151,9 +163,8 @@ Recommendation: keep invariance until real library APIs demonstrate a need.
 
 ## Not implemented
 
-Generic methods with their own type parameters, generic constructors, generic interface
-constraints, non-interface constraints (`class`, `struct`, `new()`, numeric), variance, default
-arguments, partially applied types, generic class or interface inheritance, static members on
-generic types, reflection, boxing, runtime type erasure, and executable struct methods remain
-unimplemented. Official `List<T>`, `Dictionary<K,V>`, `Option<T>`, and `Result<T,E>`
+Generic interface methods, generic constructors, non-interface constraints (`class`, `struct`,
+`new()`, numeric), variance, default arguments, partially applied types, generic class or interface
+inheritance, static members on generic owner types, reflection, boxing, and runtime type erasure
+remain unimplemented. Official `List<T>`, `Dictionary<K,V>`, `Option<T>`, and `Result<T,E>`
 specializations use the existing monomorphization pipeline.

@@ -24,7 +24,6 @@ fn hir_preserves_new_numeric_local_types_and_literals() {
             ushort d = 4;
             uint e = 5U;
             ulong f = 6UL;
-            decimal g = 7M;
         }
         ",
     );
@@ -56,7 +55,6 @@ fn hir_preserves_new_numeric_local_types_and_literals() {
             hir::Type::UShort,
             hir::Type::UInt,
             hir::Type::ULong,
-            hir::Type::Decimal,
         ]
     );
     for variable in &variables {
@@ -73,16 +71,12 @@ fn hir_preserves_new_numeric_local_types_and_literals() {
         variables[5].initializer.as_ref().unwrap().kind,
         hir::ExpressionKind::Literal(hir::Literal::Integer(ref value)) if value == "6"
     ));
-    assert!(matches!(
-        variables[6].initializer.as_ref().unwrap().kind,
-        hir::ExpressionKind::Literal(hir::Literal::Decimal(ref value)) if value == "7"
-    ));
 }
 
 #[test]
 fn mir_preserves_new_numeric_local_types_and_constants() {
     let compilation = compile_valid(
-        "public void Values() { sbyte a = 1; byte b = 2; short c = 3; ushort d = 4; uint e = 5U; ulong f = 6UL; decimal g = 7M; }",
+        "public void Values() { sbyte a = 1; byte b = 2; short c = 3; ushort d = 4; uint e = 5U; ulong f = 6UL; }",
     );
     let function = compilation
         .mir
@@ -105,28 +99,33 @@ fn mir_preserves_new_numeric_local_types_and_constants() {
             mir::Type::UShort,
             mir::Type::UInt,
             mir::Type::ULong,
-            mir::Type::Decimal,
         ]
     );
-    assert!(
-        function
-            .blocks
-            .iter()
-            .flat_map(|block| &block.instructions)
-            .any(|instruction| matches!(
-                instruction,
-                mir::Instruction::Assign {
-                    value: mir::Rvalue {
-                        type_: mir::Type::Decimal,
-                        kind: mir::RvalueKind::Use(mir::Operand {
-                            type_: mir::Type::Decimal,
-                            kind: mir::OperandKind::Constant(mir::Constant::Decimal(value)),
-                        }),
-                    },
-                    ..
-                } if value == "7"
-            ))
-    );
+}
+
+#[test]
+fn decimal_is_rejected_before_hir_and_mir_are_built() {
+    for source in [
+        "public decimal Money() { return 1.25m; }",
+        "public int Run() { decimal value = (decimal)1; return 0; }",
+        "public int Run(decimal value) { return 0; }",
+        "public class Money { public decimal value; } public int Run() { return 0; }",
+        "public int Run() { decimal[] values = new decimal[1]; return 0; }",
+        "public int Run() { List<decimal> values = new List<decimal>(); return 0; }",
+        "public int Run() { Dictionary<int,decimal> values = new Dictionary<int,decimal>(); return 0; }",
+        "public class Box<T> { public Box() {} } public int Run() { new Box<decimal>(); return 0; }",
+        "public class Box<T> { public Box() {} } public int Run() { Box<List<decimal>> value = new Box<List<decimal>>(); return 0; }",
+        "public enum Slot<T> { Empty, } public int Run() { Slot<decimal>.Empty; return 0; }",
+        "public class Tools { public Tools() {} public T Keep<T>(T value) { return value; } } public int Run() { new Tools().Keep<decimal>(1); return 0; }",
+        "public interface IBox<T> { T Get(); } public T Keep<T>(T value) where T : IBox<decimal> { return value; } public int Run() { return 0; }",
+    ] {
+        let diagnostics = compile(source).expect_err("decimal surface is deliberately deferred");
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("`decimal` is reserved but not supported")
+        }));
+    }
 }
 
 #[test]

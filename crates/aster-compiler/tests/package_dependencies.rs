@@ -112,6 +112,67 @@ fn a_root_package_calls_a_public_declaration_from_a_path_dependency() {
 }
 
 #[test]
+fn decimal_in_a_path_dependency_is_rejected_before_ir() {
+    let workspace = Workspace::new("dependency-decimal");
+    workspace.application("app", &[("money", "../money")]);
+    workspace.library("money", &[]);
+    workspace.write(
+        "money/money/value.aster",
+        "namespace money; public decimal Amount() { return 1.25m; }",
+    );
+    let root = workspace.write(
+        "app/app/main.aster",
+        "namespace app; using money; public class Program { public static int Main() { return 0; } }",
+    );
+    assert_reports(&root, "`decimal` is reserved but not supported");
+}
+
+#[test]
+fn generic_method_identity_is_distinct_across_package_owners() {
+    let workspace = Workspace::new("package-method-identity");
+    workspace.application("app", &[("math", "../math")]);
+    workspace.library("math", &[]);
+    workspace.write(
+        "math/math/tools.aster",
+        "namespace math; public class Tools { public Tools() {} public T Identity<T>(T value) { return value; } } public int MathValue() { return new Tools().Identity<int>(20); }",
+    );
+    let root = workspace.write(
+        "app/app/main.aster",
+        "namespace app; using math; public class Tools { public Tools() {} public T Identity<T>(T value) { return value; } } public class Program { public static int Main() { return new Tools().Identity<int>(22) + MathValue(); } }",
+    );
+    let project = links(&root);
+    let methods = project
+        .compilation
+        .hir
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            aster_compiler::hir::Item::Class(class) => Some(
+                class
+                    .methods
+                    .iter()
+                    .filter(|method| method.name.contains("#method#Identity#"))
+                    .map(move |method| (class.name.clone(), method.name.clone())),
+            ),
+            _ => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(methods.len(), 2, "{methods:#?}");
+    assert_ne!(methods[0].1, methods[1].1, "{methods:#?}");
+    assert!(
+        methods
+            .iter()
+            .any(|(owner, _)| owner.contains("app::Tools"))
+    );
+    assert!(
+        methods
+            .iter()
+            .any(|(owner, _)| owner.contains("math::Tools"))
+    );
+}
+
+#[test]
 fn a_transitive_dependency_flows_through_the_graph() {
     let workspace = Workspace::new("transitive");
     workspace.application("app", &[("service", "../service")]);

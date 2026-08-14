@@ -20,13 +20,12 @@ casts and overflow behavior. User-defined types and memory management are separa
 | `ulong` | 64 | unsigned | 64-bit masks and identifiers | Cranelift JIT |
 | `float` | 32 | n/a | IEEE 754 binary32 approximation | Cranelift JIT |
 | `double` | 64 | n/a | IEEE 754 binary64 approximation | Cranelift JIT |
-| `decimal` | OPEN QUESTION | n/a | exact base-10 values | represented in frontend IR; public CLI rejects it |
+| `decimal` | OPEN QUESTION | n/a | exact base-10 values | syntax reserved; source use rejected before IR |
 
 > [!IMPORTANT]
-> `decimal` has syntax and typed frontend/IR representation, but it is not part of the current
-> executable subset. Public commands validate backend support before success, so `aster check`,
-> `aster dump-hir`, `aster dump-mir`, and `aster run` reject a compilation unit that requires
-> `decimal` with a controlled diagnostic.
+> `decimal` has reserved keyword and literal syntax but is not part of the current typed or
+> executable source subset. After linking, every decimal type reference, literal, or conversion is
+> rejected before specialization, HIR, and MIR with one controlled language diagnostic.
 
 `bool`, `char`, `string` and `void` remain primitive language types but are not numeric.
 `char` is one Unicode scalar value. `string` is an immutable UTF-8 reference: `+` and `+=`
@@ -47,7 +46,7 @@ An integer without a suffix is `int` when it fits and otherwise `long`. A value 
 | `UL`, `ul`, `LU`, `lu` and mixed-case equivalents | `ulong` |
 | `F` or `f` | `float` |
 | `D` or `d` | `double` |
-| `M` or `m` | `decimal` |
+| `M` or `m` | reserved `decimal` syntax; rejected by the language-surface gate |
 
 A decimal-point literal without a suffix is currently `float`. This differs from C# and is
 kept for compatibility with existing ASTER source. Floating literals that parse as infinity
@@ -61,6 +60,7 @@ uint mask = 4294967295u;
 ulong distance = 18446744073709551615ul;
 float speed = 2.5f;
 double ratio = 0.1d;
+// Reserved syntax; current compilers diagnose this before typed IR.
 decimal price = 19.95m;
 ```
 
@@ -81,8 +81,8 @@ families are:
 - `sbyte`, `byte`, `short` and `ushort` to `float`;
 - integer types up to 32 bits to `double`;
 - `float` to `double`;
-- integers to `decimal` (their mathematical values are preserved by the planned decimal
-  representation, though decimal execution is not available yet).
+- no implicit conversion to `decimal` is currently accepted; the syntax is reserved while its
+  exact representation remains unspecified.
 
 Therefore `byte → short`, `ushort → uint`, `uint → long`, `int → double` and
 `float → double` are valid. Sign changes or conversions such as `int → float`,
@@ -101,10 +101,10 @@ conversions. It never changes sign or loses precision silently.
 | `int` and `float` | `double` |
 | `short` and `float` | `float` |
 | `float` and `double` | `double` |
-| `decimal` and an integer | `decimal` |
+| `decimal` and an integer | reserved; rejected before promotion is applied |
 | `long` and `float` | none; cast required |
 | `ulong` and any signed integer | none; cast required |
-| `decimal` and `float`/`double` | none; cast required |
+| `decimal` and `float`/`double` | reserved; rejected before promotion is applied |
 
 Two equal small integer operands still promote to `int`: `byte + byte` has type `int`.
 Compound assignment is strict. It is accepted only when the promoted operation type is the
@@ -132,9 +132,8 @@ Integer-to-`char` casts currently require a compile-time constant that is a vali
 scalar. This restriction avoids creating an invalid `char` until runtime validation exists.
 Direct casts between `char` and floating-point or decimal types are rejected.
 
-Casts involving `decimal` can be represented in the frontend and typed IR, but no current public
-compiler command accepts a compilation unit that requires decimal. Backend validation rejects it
-before a successful check, dump, or execution.
+Casts involving `decimal` are rejected by the same early language-surface gate. Backend validation
+continues to reject hand-built or adulterated decimal MIR as a fail-closed invariant.
 
 ## ⚠️ Overflow and division
 
@@ -152,12 +151,11 @@ before a successful check, dump, or execution.
 
 ## 🧪 Decimal status
 
-`decimal` is not a disguised `double`. Its keyword, `m` literal, type checking, HIR and MIR
-representation exist so the design can be preserved while the executable contract remains closed.
-Current public compiler commands reject decimal during backend validation instead of changing the
-value's meaning or exposing a partially supported execution path. Constant decimal arithmetic is
-also not implemented; a decimal constant may currently be initialized only by a supported exact
-literal/conversion inside the frontend representation.
+`decimal` is not a disguised `double`. The keyword and `m` literal stay reserved so their intended
+meaning cannot be captured by another feature, but source use is deliberately frozen before typed
+IR. The compiler diagnostic names the missing precision, scale, rounding, overflow, formatting,
+layout, and ABI contract. There is no constant or runtime decimal arithmetic in the accepted
+language subset.
 
 The next executable step is to choose a fixed decimal layout (precision, scale and overflow
 rules), implement arithmetic and conversions in `aster-runtime`, define its ABI, then lower

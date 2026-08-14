@@ -106,6 +106,10 @@ fn compile_module(
     intrinsic_bindings: &std::collections::HashMap<String, hir::Intrinsic>,
     rewrite_loop_string_concat: bool,
 ) -> Result<Compilation, Vec<Diagnostic>> {
+    let deferred_diagnostics = semantic::validate_deferred_language_surfaces(&mut module);
+    if !deferred_diagnostics.is_empty() {
+        return Err(deferred_diagnostics);
+    }
     synthesize_default_constructors(&mut module);
     let generic_diagnostics = generics::monomorphize(&mut module);
     if !generic_diagnostics.is_empty() {

@@ -74,14 +74,28 @@ specializations. Struct layout, class fields, constructor signatures, properties
 tables are calculated from concrete types before HIR and MIR. Expanding recursive definitions that
 can never reach a finite specialization are rejected.
 
-Generic classes, structs, interfaces, and enums accept interface-only `where` constraints, written
-after any interface list and before the body: `class Box<T> : IBox where T : IScored`. The
-constraint is proven when the closed type is requested and erased before HIR. See
-[generics](generics.md).
+Methods may declare type parameters in addition to those on their owner. The owner is specialized
+first, then the method's arguments are inferred or supplied explicitly using the same rules as a
+generic namespace function:
 
-Current limits: no generic interface constraints (`where T : IBox<int>`), no
-`class`/`struct`/`new()`/numeric constraints, no variance, generic methods with additional
-parameters,
-constructors with their own type parameters, generic inheritance, static members on generic types, partial application,
-default type arguments, reflection, boxing, `object`, or generic standard collections. Struct
-methods are not executable yet; generic structs are currently data types with fields and literals.
+```aster
+public class Box<T>
+{
+    public Box(T ignored) {}
+    public U Choose<U>(U value) { return value; }
+}
+
+Box<string> box = new Box<string>("Aster");
+int answer = box.Choose<int>(42);
+```
+
+Generic classes, structs, interfaces, and enums accept nominal interface-only `where` constraints,
+written after any interface list and before the body: `class Box<T> : IBox<int> where T :
+IComparable<T>`. Closed and self-referential generic interface constraints are supported when every
+argument can be structurally substituted. The constraint is proven when the closed type is
+requested and erased before HIR. See [generics](generics.md).
+
+Current limits: no open generic constraint target such as bare `IBox`, no
+`class`/`struct`/`new()`/numeric constraints, no variance, generic interface methods, constructors
+with their own type parameters, generic inheritance, static members on generic owner types, partial
+application, default type arguments, reflection, boxing, or `object`.

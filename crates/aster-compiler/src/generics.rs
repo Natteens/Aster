@@ -51,7 +51,20 @@ impl DeclarationKind {
 #[derive(Clone, Copy)]
 struct DeclarationFacts {
     kind: DeclarationKind,
-    generic: bool,
+    arity: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct MethodTemplateKey {
+    owner: String,
+    declaration_start: usize,
+    parameters: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct MethodSpecializationKey {
+    template: MethodTemplateKey,
+    arguments: Vec<String>,
 }
 
 pub(crate) fn monomorphize(module: &mut Module) -> Vec<Diagnostic> {
@@ -65,6 +78,11 @@ struct Monomorphizer {
     returns: HashMap<String, String>,
     fields: HashMap<(String, String), String>,
     methods: HashMap<(String, String), String>,
+    method_signatures: HashMap<(String, String), Vec<Vec<String>>>,
+    method_templates: HashMap<(String, String), Vec<FunctionDeclaration>>,
+    method_cache: HashMap<MethodSpecializationKey, String>,
+    method_active: Vec<MethodSpecializationKey>,
+    generated_methods: HashMap<String, Vec<FunctionDeclaration>>,
     cache: HashMap<(String, Vec<String>), String>,
     active: Vec<(String, Vec<String>)>,
     generated: Vec<FunctionDeclaration>,
@@ -106,9 +124,16 @@ impl Monomorphizer {
         span: aster_diagnostics::Span,
     ) -> bool {
         let mut satisfied = true;
+        let parameter_names = parameters
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect::<Vec<_>>();
+        let substitutions = substitutions(&parameter_names, concrete);
         for (parameter, argument) in parameters.iter().zip(concrete) {
             for constraint in &parameter.constraints {
-                if self.satisfies(argument, &constraint.name) {
+                let substituted = substitute_name(&constraint.name, &substitutions);
+                let required = self.concretize_type_name(&substituted, span);
+                if self.satisfies(argument, &required) {
                     continue;
                 }
                 satisfied = false;
@@ -116,13 +141,12 @@ impl Monomorphizer {
                     Diagnostic::error(
                         format!(
                             "type argument `{argument}` does not satisfy constraint `{}: {}`",
-                            parameter.name, constraint.name
+                            parameter.name, required
                         ),
                         span,
                     )
                     .with_help(format!(
-                        "pass a class that implements `{}`, or the interface itself",
-                        constraint.name
+                        "pass a class that implements `{required}`, or the interface itself"
                     )),
                 );
             }
@@ -143,6 +167,12 @@ impl Monomorphizer {
                 && !matches!(item, Item::Enum(value) if !value.type_parameters.is_empty())
         });
         for item in &mut module.items {
+            if let Item::Class(declaration)
+            | Item::Struct(declaration)
+            | Item::Interface(declaration) = item
+            {
+                self.extract_generic_methods(declaration);
+            }
             GenericTypeConcretizer::new(&mut self).visit_item_mut(item);
             match item {
                 Item::Function(function) => self.function(function),
@@ -154,11 +184,57 @@ impl Monomorphizer {
                 Item::Enum(_) | Item::Variable(_) => {}
             }
         }
+        self.attach_generated_methods(module);
         module.items.append(&mut self.generated_types);
         module
             .items
             .extend(self.generated.drain(..).map(Item::Function));
         self.diagnostics
+    }
+
+    fn extract_generic_methods(&mut self, declaration: &mut TypeDeclaration) {
+        let owner = declaration.name.clone();
+        for member in &declaration.members {
+            let Member::Method(method) = member else {
+                continue;
+            };
+            if method.type_parameters.is_empty() {
+                continue;
+            }
+            let templates = self
+                .method_templates
+                .entry((owner.clone(), method.name.clone()))
+                .or_default();
+            if !templates.iter().any(|existing| {
+                existing.span.start == method.span.start
+                    && existing
+                        .parameters
+                        .iter()
+                        .map(|parameter| &parameter.type_ref.name)
+                        .eq(method
+                            .parameters
+                            .iter()
+                            .map(|parameter| &parameter.type_ref.name))
+            }) {
+                templates.push(method.clone());
+            }
+        }
+        declaration.members.retain(|member| {
+            !matches!(member, Member::Method(method) if !method.type_parameters.is_empty())
+        });
+    }
+
+    fn attach_generated_methods(&mut self, module: &mut Module) {
+        for item in module.items.iter_mut().chain(&mut self.generated_types) {
+            let (Item::Class(declaration) | Item::Struct(declaration)) = item else {
+                continue;
+            };
+            if let Some(mut methods) = self.generated_methods.remove(&declaration.name) {
+                declaration
+                    .members
+                    .extend(methods.drain(..).map(Member::Method));
+            }
+        }
     }
 
     /// A generic type template named `Task` or `List` is stripped from

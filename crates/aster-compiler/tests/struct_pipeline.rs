@@ -127,3 +127,60 @@ fn rejects_recursive_struct_layout_and_accepts_structural_equality() {
     ))
     .expect("comparable structs support structural equality");
 }
+
+#[test]
+fn struct_methods_lower_with_an_ordinary_by_value_receiver_and_direct_call() {
+    let source = "public struct Position { public int x; public int Read() { return this.x; } } \
+                  public int Run() { Position value = Position { x: 42 }; return value.Read(); }";
+    let compilation = compile(source).expect("executable struct method pipeline");
+    let hir::Item::Struct(definition) = &compilation.hir.items[0] else {
+        panic!("struct definition");
+    };
+    let method = &definition.methods[0];
+    assert_eq!(method.parameters.len(), 1);
+    assert_eq!(method.parameters[0].name, "this");
+    assert_eq!(
+        method.parameters[0].type_,
+        hir::Type::User(definition.symbol)
+    );
+    let caller = compilation
+        .mir
+        .functions
+        .iter()
+        .find(|function| function.name == "Run")
+        .expect("caller MIR");
+    assert!(
+        caller
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .any(
+                |instruction| matches!(instruction, mir::Instruction::Call { arguments, .. }
+            if matches!(arguments.as_slice(), [mir::Operand { type_: mir::Type::User(_), .. }]))
+            )
+    );
+}
+
+#[test]
+fn struct_method_receiver_visibility_and_arguments_are_checked_semantically() {
+    for (source, expected) in [
+        (
+            "public struct Value { private int Hidden() { return 1; } } public int Run() { Value value = Value {}; return value.Hidden(); }",
+            "method `Value.Hidden` is private",
+        ),
+        (
+            "public struct Value { public int Add(int value) { return value; } } public int Run() { Value receiver = Value {}; return receiver.Add(); }",
+            "expected 1 argument(s), found 0",
+        ),
+        (
+            "public struct Value { public int Read() { return 1; } } public int Run() { return 42.Read(); }",
+            "`int` has no method `Read`",
+        ),
+    ] {
+        let diagnostics = messages(source);
+        assert!(
+            diagnostics.iter().any(|message| message.contains(expected)),
+            "missing `{expected}` for `{source}`; diagnostics: {diagnostics:?}"
+        );
+    }
+}

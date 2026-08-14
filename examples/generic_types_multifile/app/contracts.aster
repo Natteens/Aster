@@ -7,3 +7,8 @@ public T Identity<T>(T value)
 {
     return value;
 }
+
+public T ConstrainedIdentity<T>(T value) where T : IValue<int>
+{
+    return value;
+}

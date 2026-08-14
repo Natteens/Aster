@@ -187,9 +187,6 @@ fn a_non_transferable_return_type_is_rejected() {
 
 #[test]
 fn a_decimal_return_type_is_rejected() {
-    // `decimal` is semantically a numeric/scalar type (`Primitive::is_numeric`),
-    // but has no backend ABI yet, so it must not cross a worker boundary
-    // merely because it "looks scalar".
     let errors = compile_errors(
         r"
         public decimal Compute() { return 1.5m; }
@@ -202,8 +199,8 @@ fn a_decimal_return_type_is_rejected() {
     assert!(
         errors
             .iter()
-            .any(|message| message.contains("cross a worker boundary")),
-        "expected the non-transferable-result diagnostic for `decimal`, got {errors:?}"
+            .any(|message| message.contains("`decimal` is reserved but not supported")),
+        "expected the deferred-decimal diagnostic, got {errors:?}"
     );
 }
 
@@ -285,6 +282,57 @@ fn a_struct_return_type_is_rejected() {
             .iter()
             .any(|message| message.contains("cross a worker boundary")),
         "expected the non-transferable-result diagnostic for a struct, got {errors:?}"
+    );
+}
+
+#[test]
+fn a_struct_method_can_produce_an_already_transferable_scalar_result() {
+    let source = r"
+        public struct Point {
+            public int x;
+            public int y;
+            public int Sum() { return x + y; }
+        }
+        public int Compute() {
+            Point point = Point { x: 20, y: 22 };
+            return point.Sum();
+        }
+        public int Main() { return Task.Run(Compute).Wait(); }
+    ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(42)));
+}
+
+#[test]
+fn generic_methods_do_not_disguise_non_transferable_worker_results() {
+    let errors = compile_errors(
+        r#"
+        public class Tools {
+            public Tools() {}
+            public T Identity<T>(T value) { return value; }
+        }
+        public string Compute() { return new Tools().Identity<string>("not transferable"); }
+        public int Main() { Task<string> task = Task.Run(Compute); return 0; }
+        "#,
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("cross a worker boundary")),
+        "expected the non-transferable-result diagnostic, got {errors:?}"
+    );
+
+    let reference_struct = compile_errors(
+        r#"
+        public struct Holder { public string text; public int Length() { return text.Length; } }
+        public Holder Compute() { return Holder { text: "not transferable" }; }
+        public int Main() { Task<Holder> task = Task.Run(Compute); return 0; }
+        "#,
+    );
+    assert!(
+        reference_struct
+            .iter()
+            .any(|message| message.contains("cross a worker boundary")),
+        "expected reference-bearing struct rejection, got {reference_struct:?}"
     );
 }
 
