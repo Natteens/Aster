@@ -274,6 +274,49 @@ fn ordinary_source_declines_fixed_and_string_only_loops() {
 }
 
 #[test]
+fn helper_mutated_collections_do_not_cross_the_production_aarm_call_barrier() {
+    let list = compile(
+        r"
+        public void Grow(List<int> values, int value) { values.Add(value); }
+        public int Run() {
+            int total = 0;
+            for (int i = 0; i < 1000; i++) {
+                List<int> values = new List<int>();
+                Grow(values, i);
+                total += values.Length;
+            }
+            return total;
+        }
+        ",
+    )
+    .expect("scope-free List helper source compiles")
+    .mir;
+    assert_eq!(marker_count(&list), 0);
+    execute(&list, 1000);
+
+    let dictionary = compile(
+        r"
+        public void Grow(Dictionary<int, int> values, int value) {
+            values.Add(value, value + 1);
+        }
+        public int Run() {
+            int total = 0;
+            for (int i = 0; i < 1000; i++) {
+                Dictionary<int, int> values = new Dictionary<int, int>();
+                Grow(values, i);
+                total += values.Length;
+            }
+            return total;
+        }
+        ",
+    )
+    .expect("scope-free Dictionary helper source compiles")
+    .mir;
+    assert_eq!(marker_count(&dictionary), 0);
+    execute(&dictionary, 1000);
+}
+
+#[test]
 fn ordinary_source_selects_only_the_nested_hidden_backing_leaf() {
     let module = project_module(
         r#"

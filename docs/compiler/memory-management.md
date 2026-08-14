@@ -139,7 +139,11 @@ cannot leave a live header pointing at reclaimed element storage.
 
 `List<T>` and `Dictionary<K,V>` headers and their current backing buffers also share one selected
 region. Growth can retain older arena buffers until the containing temporary scope rewinds or the
-execution context is dropped; there is no individual deallocation.
+execution context is dropped; there is no individual deallocation. A direct ASTER helper proven to
+perform only scalar work plus direct `List.Add`, `Dictionary.Add`, or `Dictionary.Set` on a
+caller-owned collection does not create a nested Temporary scope, so that caller header and its
+growth backing can remain Temporary. Helpers with their own dynamic allocation, call, alias, read,
+or other unsupported collection use retain the conservative Persistent promotion.
 
 `StringBuilder` follows the same rule. Its header records the selected region, and its UTF-8 backing
 capacity grows geometrically. Growth inside a deeper helper scope is promoted when necessary so a

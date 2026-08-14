@@ -19,6 +19,11 @@ struct ParameterSummary {
     escapes: bool,
     /// The callee can return this parameter, or one of its local aliases.
     returned: bool,
+    /// The callee is a direct, scope-free mutation helper for this collection
+    /// parameter. Such a helper neither creates a temporary allocation scope
+    /// nor lets the header escape, so a caller-owned Temporary header can keep
+    /// its backing in the caller's arena.
+    scope_free_collection_mutation: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +45,8 @@ impl FunctionSummary {
             let merged = ParameterSummary {
                 escapes: current.escapes || update.escapes,
                 returned: current.returned || update.returned,
+                scope_free_collection_mutation: current.scope_free_collection_mutation
+                    || update.scope_free_collection_mutation,
             };
             changed |= *current != merged;
             *current = merged;
@@ -330,9 +337,122 @@ fn summarize_function(
                 summary.parameters[index].returned = true;
             }
         }
+        summary.parameters[index].scope_free_collection_mutation = !summary.parameters[index]
+            .escapes
+            && !summary.parameters[index].returned
+            && is_scope_free_collection_mutation_helper(function, parameter.id, &parameter.type_);
     }
 
     summary
+}
+
+/// Returns whether `parameter` is used only as the direct receiver of
+/// `List.Add`, `Dictionary.Add`, or `Dictionary.Set` in a helper that cannot
+/// create its own Temporary scope. This is deliberately narrower than general
+/// call-effect analysis: no aliases, calls, intrinsics, dynamic allocations,
+/// reads, removals, or snapshots are admitted.
+///
+/// The runtime uses one LIFO temporary arena. If this predicate holds,
+/// Cranelift emits no temporary-scope enter for the callee, so backing growth
+/// happens at the caller header's existing scope depth and remains valid after
+/// the direct call returns. Every other collection call keeps the existing
+/// Persistent fallback.
+fn is_scope_free_collection_mutation_helper(
+    function: &mir::Function,
+    parameter: mir::LocalId,
+    parameter_type: &mir::Type,
+) -> bool {
+    let is_list = matches!(parameter_type, mir::Type::List(_));
+    let is_dictionary = matches!(parameter_type, mir::Type::Dictionary(_, _));
+    if !is_list && !is_dictionary {
+        return false;
+    }
+
+    let aliases = HashSet::from([parameter]);
+    for block in &function.blocks {
+        if terminator_returns_alias(&block.terminator, &aliases) {
+            return false;
+        }
+        for instruction in &block.instructions {
+            if is_dynamic_allocation(instruction)
+                || matches!(
+                    instruction,
+                    mir::Instruction::TemporarySubregionEnter { .. }
+                        | mir::Instruction::TemporarySubregionExit { .. }
+                        | mir::Instruction::Call { .. }
+                        | mir::Instruction::CallInterface { .. }
+                        | mir::Instruction::CallIntrinsic { .. }
+                )
+            {
+                return false;
+            }
+
+            let allowed_receiver = match instruction {
+                mir::Instruction::ListAdd { list, .. } if is_list => {
+                    is_direct_local(list, parameter)
+                }
+                mir::Instruction::DictionaryAdd { dictionary, .. }
+                | mir::Instruction::DictionarySet { dictionary, .. }
+                    if is_dictionary =>
+                {
+                    is_direct_local(dictionary, parameter)
+                }
+                _ => false,
+            };
+            if allowed_receiver {
+                continue;
+            }
+
+            if instruction_uses_alias(instruction, &aliases) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn is_direct_local(operand: &mir::Operand, local: mir::LocalId) -> bool {
+    matches!(operand.kind, mir::OperandKind::Copy(mir::Place::Local(found)) if found == local)
+}
+
+fn instruction_uses_alias(instruction: &mir::Instruction, aliases: &HashSet<mir::LocalId>) -> bool {
+    match instruction {
+        mir::Instruction::Assign { target, value } => {
+            matches!(target, mir::Place::Local(local) if aliases.contains(local))
+                || rvalue_uses_alias(value, aliases)
+        }
+        mir::Instruction::DictionaryTryGet { dictionary, .. }
+        | mir::Instruction::DictionaryContainsKey { dictionary, .. }
+        | mir::Instruction::DictionaryRemove { dictionary, .. }
+        | mir::Instruction::DictionaryEntries { dictionary, .. }
+        | mir::Instruction::DictionaryAdd { dictionary, .. }
+        | mir::Instruction::DictionarySet { dictionary, .. } => {
+            direct_alias(dictionary, aliases).is_some()
+        }
+        mir::Instruction::ListGet { list, .. } | mir::Instruction::ListRemoveAt { list, .. } => {
+            direct_alias(list, aliases).is_some()
+        }
+        mir::Instruction::StringBuilderAppend { builder, .. }
+        | mir::Instruction::StringBuilderToString { builder, .. } => {
+            direct_alias(builder, aliases).is_some()
+        }
+        mir::Instruction::StringDecodeNext { string, .. } => {
+            direct_alias(string, aliases).is_some()
+        }
+        mir::Instruction::AllocateArray { destination, .. }
+        | mir::Instruction::AllocateObject { destination, .. }
+        | mir::Instruction::AllocateList { destination, .. }
+        | mir::Instruction::AllocateDictionary { destination, .. }
+        | mir::Instruction::AllocateStringBuilder { destination, .. } => {
+            matches!(destination, mir::Place::Local(local) if aliases.contains(local))
+        }
+        mir::Instruction::ListAdd { list, .. } => direct_alias(list, aliases).is_some(),
+        mir::Instruction::TemporarySubregionEnter { .. }
+        | mir::Instruction::TemporarySubregionExit { .. }
+        | mir::Instruction::Call { .. }
+        | mir::Instruction::CallInterface { .. }
+        | mir::Instruction::CallIntrinsic { .. } => false,
+    }
 }
 
 fn is_tracked_reference_type(type_: &mir::Type) -> bool {
@@ -574,17 +694,23 @@ fn instruction_escape(
                     .then_some(EscapeReason::PassedToCall);
             };
 
-            // List<T> and Dictionary<K,V> may allocate or reallocate internal
-            // buffers inside the callee's temporary scope. Without effect
-            // analysis those buffers would be freed on the callee's return
-            // while the header still holds a pointer to them. Promote the
-            // collection to Persistent whenever it crosses a call boundary.
-            if arguments.iter().any(|argument| {
+            // A caller-owned List/Dictionary normally promotes at a call
+            // boundary: backing grown under a nested callee checkpoint could
+            // otherwise be rewound while its surviving header still points to
+            // it. The one exception is a direct helper proven to be scope-free
+            // and to use this exact parameter only for direct Add/Set mutation.
+            // That helper cannot push a Temporary scope, so growth stays at the
+            // caller header's existing arena depth.
+            if arguments.iter().enumerate().any(|(index, argument)| {
                 direct_alias(argument, aliases).is_some()
                     && matches!(
                         argument.type_,
                         mir::Type::List(_) | mir::Type::Dictionary(_, _)
                     )
+                    && !summary
+                        .parameters
+                        .get(index)
+                        .is_some_and(|parameter| parameter.scope_free_collection_mutation)
             }) {
                 return Some(EscapeReason::PassedToCall);
             }
@@ -1003,6 +1129,99 @@ mod tests {
     }
 
     #[test]
+    fn scope_free_list_add_helper_keeps_a_caller_list_temporary() {
+        let source = "public void Grow(List<int> values, int count) { int i = 0; while (i < count) { values.Add(i); i += 1; } } \
+                      public int Run() { List<int> values = new List<int>(); Grow(values, 8); return values.Length; }";
+        assert_eq!(
+            classifications(source, "Run"),
+            vec![EscapeClassification::LocalCandidate]
+        );
+        let (compilation, summaries) = summaries(source);
+        let grow = compilation
+            .mir
+            .functions
+            .iter()
+            .find(|function| function.name == "Grow")
+            .expect("Grow function");
+        assert!(summaries[&grow.symbol].parameters[0].scope_free_collection_mutation);
+    }
+
+    #[test]
+    fn scope_free_dictionary_add_set_helper_keeps_a_caller_dictionary_temporary() {
+        let source = "public void Grow(Dictionary<int, int> values, int count) { int i = 0; while (i < count) { values.Add(i, i); values.Set(i, i + 1); i += 1; } } \
+                      public int Run() { Dictionary<int, int> values = new Dictionary<int, int>(); Grow(values, 8); return values.Length; }";
+        assert_eq!(
+            classifications(source, "Run"),
+            vec![EscapeClassification::LocalCandidate]
+        );
+    }
+
+    #[test]
+    fn collection_helper_with_its_own_temporary_allocation_keeps_persistent_fallback() {
+        let source = "public void Grow(List<int> values, int count) { string marker = \"a\" + \"b\"; int i = 0; while (i < count) { values.Add(i); i += 1; } } \
+                      public int Run() { List<int> values = new List<int>(); Grow(values, 8); return values.Length; }";
+        assert!(
+            classifications(source, "Run").contains(&EscapeClassification::Persistent(
+                EscapeReason::PassedToCall
+            ))
+        );
+    }
+
+    #[test]
+    fn collection_helper_alias_keeps_persistent_fallback() {
+        let source = "public void Grow(List<int> values) { List<int> alias = values; alias.Add(1); } \
+                      public int Run() { List<int> values = new List<int>(); Grow(values); return values.Length; }";
+        assert!(
+            classifications(source, "Run").contains(&EscapeClassification::Persistent(
+                EscapeReason::PassedToCall
+            ))
+        );
+    }
+
+    #[test]
+    fn collection_helper_call_keeps_persistent_fallback() {
+        let source = "public void Tick() {} public void Grow(List<int> values) { Tick(); values.Add(1); } \
+                      public int Run() { List<int> values = new List<int>(); Grow(values); return values.Length; }";
+        assert!(
+            classifications(source, "Run").contains(&EscapeClassification::Persistent(
+                EscapeReason::PassedToCall
+            ))
+        );
+    }
+
+    #[test]
+    fn nested_collection_mutation_helper_keeps_persistent_fallback() {
+        let source = "public void AddOne(Dictionary<int, int> values, int key) { values.Add(key, key); } \
+                      public void Grow(Dictionary<int, int> values) { AddOne(values, 1); values.Add(2, 2); } \
+                      public int Run() { Dictionary<int, int> values = new Dictionary<int, int>(); Grow(values); values.Add(3, 3); return values.Length; }";
+        assert!(
+            classifications(source, "Run").contains(&EscapeClassification::Persistent(
+                EscapeReason::PassedToCall
+            ))
+        );
+    }
+
+    #[test]
+    fn scope_free_helper_does_not_override_a_return_escape() {
+        let source = "public void Grow(List<int> values) { values.Add(1); } \
+                      public List<int> Make() { List<int> values = new List<int>(); Grow(values); return values; }";
+        assert_eq!(
+            list_regions(source, "Make"),
+            vec![mir::AllocationRegion::Persistent]
+        );
+    }
+
+    #[test]
+    fn scope_free_dictionary_helper_does_not_override_a_return_escape() {
+        let source = "public void Grow(Dictionary<int, int> values) { values.Add(1, 1); } \
+                      public Dictionary<int, int> Make() { Dictionary<int, int> values = new Dictionary<int, int>(); Grow(values); return values; }";
+        assert!(
+            classifications(source, "Make")
+                .contains(&EscapeClassification::Persistent(EscapeReason::Returned))
+        );
+    }
+
+    #[test]
     fn transitive_escape_through_known_calls_is_propagated() {
         let source = "public class Box { public Box() {} } public class Holder { public Box value; public Holder(Box initial) { value = initial; } } public void Store(Holder holder, Box value) { holder.value = value; } public void Forward(Holder holder, Box value) { Store(holder, value); } public int Run() { Holder holder = new Holder(new Box()); Box box = new Box(); Forward(holder, box); return 0; }";
         let classifications = classifications(source, "Run");
@@ -1116,6 +1335,7 @@ mod tests {
             super::ParameterSummary {
                 escapes: false,
                 returned: true,
+                scope_free_collection_mutation: false,
             }
         );
         assert_eq!(

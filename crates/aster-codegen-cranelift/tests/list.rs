@@ -1312,11 +1312,9 @@ fn list_local_no_helper_header_and_buffer_are_temporary() {
 }
 
 #[test]
-fn list_passed_to_helper_no_per_call_growth_after_escape_fix() {
-    // List passed to a helper: after the escape analysis fix the header is
-    // Persistent. used_bytes grows on each RunOnce call (each creates a new
-    // Persistent list) but execution must complete without error — bounded
-    // linear growth, not a dangling-pointer crash.
+fn list_passed_to_scope_free_growth_helper_remains_temporary() {
+    // This helper has only scalar work and List.Add, so it creates no
+    // Temporary scope of its own and the caller collection remains Temporary.
     let source = r"
         public void Fill(List<int> values, int v)
         {
@@ -1341,13 +1339,13 @@ fn list_passed_to_helper_no_per_call_growth_after_escape_fix() {
     let module = compile(source).expect("compiles").mir;
     let (result, stats) = execute_with_stats(&module, "Main").expect("executes");
     assert_eq!(result, ExecutionValue::Int(0));
-    let _ = stats;
+    assert_eq!(stats.used_bytes, 0);
 }
 
 #[test]
-fn list_region_is_persistent_when_passed_to_helper() {
-    // Compile-time check: AllocateList in Main must be Persistent when the list
-    // is passed to a helper function.
+fn list_region_is_temporary_for_scope_free_growth_helper() {
+    // Compile-time check: the direct scope-free helper keeps this caller List
+    // Temporary because it cannot introduce a nested Temporary scope.
     let source = r"
         public void Fill(List<int> values, int v)
         {
@@ -1377,8 +1375,77 @@ fn list_region_is_persistent_when_passed_to_helper() {
         .expect("AllocateList in Main");
     assert_eq!(
         region,
-        mir::AllocationRegion::Persistent,
-        "List passed to a helper must be allocated Persistent, got {region:?}"
+        mir::AllocationRegion::Temporary,
+        "List passed to a scope-free helper must remain Temporary, got {region:?}"
+    );
+}
+
+#[test]
+fn list_region_stays_persistent_when_growth_helper_has_a_temporary_allocation() {
+    let source = r#"
+        public void Fill(List<int> values, int v)
+        {
+            string marker = "a" + "b";
+            values.Add(v);
+        }
+        public int Main()
+        {
+            List<int> values = new List<int>();
+            Fill(values, 42);
+            return values.Length;
+        }
+    "#;
+    let module = compile(source).expect("compiles").mir;
+    let main_fn = module
+        .functions
+        .iter()
+        .find(|f| f.name == "Main" && f.owner.is_none())
+        .expect("Main function");
+    let region = main_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .find_map(|i| match i {
+            mir::Instruction::AllocateList { region, .. } => Some(*region),
+            _ => None,
+        })
+        .expect("AllocateList in Main");
+    assert_eq!(region, mir::AllocationRegion::Persistent);
+}
+
+#[cfg(feature = "aarm-telemetry")]
+#[test]
+fn scope_free_list_helper_growth_failure_rewinds_the_caller_temporary_scope() {
+    use std::sync::Arc;
+
+    use aster_codegen_cranelift::execute_with_aarm_parallel_governor;
+    use aster_runtime::{ExecutionContext, MemoryGovernor};
+
+    let source = r"
+        public void Grow(List<int> values)
+        {
+            int i = 0;
+            while (i < 2000) { values.Add(i); i = i + 1; }
+        }
+        public int Main()
+        {
+            List<int> values = new List<int>();
+            Grow(values);
+            return values.Length;
+        }
+    ";
+    let module = compile(source).expect("compiles").mir;
+    let governor = Arc::new(MemoryGovernor::new(
+        ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES,
+    ));
+    let error = execute_with_aarm_parallel_governor(&module, "Main", 1, Arc::clone(&governor))
+        .expect_err("later List backing growth must fail through the governor");
+    assert!(error.message().contains("shared execution memory budget"));
+    assert_eq!(governor.telemetry().current_capacity_bytes, 0);
+    assert_eq!(
+        run(source, "Main"),
+        Ok(ExecutionValue::Int(2000)),
+        "the failed context must not contaminate a later execution"
     );
 }
 

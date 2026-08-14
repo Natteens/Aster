@@ -1135,13 +1135,10 @@ fn dict_fill_helper_post_return_allocs_do_not_corrupt() {
 
 // --- Retention / memory region tests ----------------------------------------
 //
-// After the escape-analysis fix, a Dictionary passed to a helper must be
-// classified Persistent at compile time. Both the header and all internal
-// buffers then live in the permanent arena, and no "header Temporary + buffers
-// Persistent" split can occur. These tests verify:
-//   1. A purely local Dictionary (no helper call) stays Temporary → reclaimed.
-//   2. A Dictionary passed to a helper becomes fully Persistent → no per-call
-//      growth in the permanent arena's used_bytes after the first allocation.
+// A direct helper that performs only scalar work plus Add/Set can preserve the
+// caller's Temporary collection lifetime. Helpers that need a Temporary scope
+// retain the established Persistent fallback so their backing cannot be
+// rewound under a live caller header.
 
 #[test]
 fn dict_local_no_helper_header_and_buffers_are_temporary() {
@@ -1169,27 +1166,21 @@ fn dict_local_no_helper_header_and_buffers_are_temporary() {
 }
 
 #[test]
-fn dict_passed_to_helper_no_per_call_growth_after_escape_fix() {
-    // Dictionary passed to a helper: after the escape analysis fix, the header
-    // is Persistent. The permanent arena grows on the first RunOnce call
-    // (header + buffers allocated), but must NOT grow again on subsequent calls
-    // because the header is reclaimed at RunOnce's scope exit anyway and no
-    // new header is created — each RunOnce creates its own fresh Persistent
-    // Dictionary that lives for the execution lifetime.
+fn dict_passed_to_scope_free_growth_helper_remains_temporary() {
+    // A scope-free Dictionary.Add helper keeps the caller-owned header and
+    // backing Temporary. The loop exercises repeated helper calls.
     //
-    // Key assertion: used_bytes is STABLE after 1000 iterations (no unbounded
-    // accumulation). We verify by running 1 call vs 1000 calls and checking
-    // that both finish with used_bytes == 0 (all headers freed at return).
+    // The final used-byte assertion makes retention, rather than timing, the
+    // deterministic regression condition.
     let source = r#"
-        public void Fill(Dictionary<string, int> values, string key)
+        public void Fill(Dictionary<int, int> values, int key)
         {
-            string k = key + "";
-            values.Add(k, 1);
+            values.Add(key, 1);
         }
         public void RunOnce(int index)
         {
-            Dictionary<string, int> values = new Dictionary<string, int>();
-            Fill(values, index.ToString());
+            Dictionary<int, int> values = new Dictionary<int, int>();
+            Fill(values, index);
         }
         public int Main()
         {
@@ -1205,16 +1196,7 @@ fn dict_passed_to_helper_no_per_call_growth_after_escape_fix() {
     let module = compile(source).expect("compiles").mir;
     let (result, stats) = execute_with_stats(&module, "Main").expect("executes");
     assert_eq!(result, ExecutionValue::Int(0));
-    // With the escape analysis fix: `values` in RunOnce becomes Persistent (passed
-    // to Fill). After the 1000-iteration loop returns, all 1000 Persistent
-    // headers and their buffers are still alive (permanent arena does not shrink
-    // during execution). used_bytes > 0 is expected here because Persistent
-    // allocations are only freed when the ExecutionContext is dropped (after
-    // execute_with_stats returns). The important property is that used_bytes is
-    // BOUNDED — it grows linearly with 1000 calls, not quadratically.
-    // We verify just that execution succeeds and no runtime error occurred.
-    // (Detailed before/after metrics are captured in the report comment below.)
-    let _ = stats;
+    assert_eq!(stats.used_bytes, 0);
 }
 
 #[test]
@@ -1253,6 +1235,75 @@ fn dict_region_is_persistent_when_passed_to_helper() {
         region,
         mir::AllocationRegion::Persistent,
         "Dictionary passed to a helper must be allocated Persistent, got {region:?}"
+    );
+}
+
+#[test]
+fn dict_region_is_temporary_for_scope_free_growth_helper() {
+    let source = r#"
+        public void Fill(Dictionary<int, int> values, int key)
+        {
+            values.Add(key, key + 1);
+            values.Set(key, key + 2);
+        }
+        public int Main()
+        {
+            Dictionary<int, int> values = new Dictionary<int, int>();
+            Fill(values, 1);
+            return values.Length;
+        }
+    "#;
+    let module = compile(source).expect("compiles").mir;
+    let main_fn = module
+        .functions
+        .iter()
+        .find(|f| f.name == "Main" && f.owner.is_none())
+        .expect("Main function");
+    let region = main_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .find_map(|i| match i {
+            mir::Instruction::AllocateDictionary { region, .. } => Some(*region),
+            _ => None,
+        })
+        .expect("AllocateDictionary in Main");
+    assert_eq!(region, mir::AllocationRegion::Temporary);
+}
+
+#[cfg(feature = "aarm-telemetry")]
+#[test]
+fn scope_free_dictionary_helper_growth_failure_rewinds_the_caller_temporary_scope() {
+    use std::sync::Arc;
+
+    use aster_codegen_cranelift::execute_with_aarm_parallel_governor;
+    use aster_runtime::{ExecutionContext, MemoryGovernor};
+
+    let source = r"
+        public void Grow(Dictionary<int, int> values)
+        {
+            int i = 0;
+            while (i < 2000) { values.Add(i, i + 1); i = i + 1; }
+        }
+        public int Main()
+        {
+            Dictionary<int, int> values = new Dictionary<int, int>();
+            Grow(values);
+            return values.Length;
+        }
+    ";
+    let module = compile(source).expect("compiles").mir;
+    let governor = Arc::new(MemoryGovernor::new(
+        ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES,
+    ));
+    let error = execute_with_aarm_parallel_governor(&module, "Main", 1, Arc::clone(&governor))
+        .expect_err("later Dictionary backing growth must fail through the governor");
+    assert!(error.message().contains("shared execution memory budget"));
+    assert_eq!(governor.telemetry().current_capacity_bytes, 0);
+    assert_eq!(
+        run(source),
+        Ok(ExecutionValue::Int(2000)),
+        "the failed context must not contaminate a later execution"
     );
 }
 

@@ -34,6 +34,11 @@ name = "constructor_object_elimination_matrix"
 path = "examples/constructor_object_elimination_matrix.rs"
 required-features = ["aarm-telemetry"]
 
+[[example]]
+name = "helper_collection_retention"
+path = "examples/helper_collection_retention.rs"
+required-features = ["aarm-telemetry"]
+
 [dependencies]
 aster-mir = { path = "../aster-mir", version = "0.56.3" }
 aster-runtime = { path = "../aster-runtime", version = "0.56.3" }
