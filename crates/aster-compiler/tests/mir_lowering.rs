@@ -1,7 +1,8 @@
-use aster_compiler::{compile, mir};
+use aster_compiler::{compile, compile_without_mir_optimizer_for_research, mir};
 
 fn compile_valid(source: &str) -> aster_compiler::Compilation {
-    compile(source).unwrap_or_else(|diagnostics| panic!("expected valid source: {diagnostics:#?}"))
+    compile_without_mir_optimizer_for_research(source)
+        .unwrap_or_else(|diagnostics| panic!("expected valid source: {diagnostics:#?}"))
 }
 
 fn function<'a>(module: &'a mir::Module, name: &str) -> &'a mir::Function {

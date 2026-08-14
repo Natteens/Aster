@@ -1,8 +1,8 @@
 //! Conservative AARM reference-lifetime proofs over finalized MIR.
 //!
-//! This module is production-compiled but is not invoked by the normal
-//! compiler pipeline yet. Its results describe reference death only: they do
-//! not authorize an arena rewind, change executable MIR, or reach the runtime.
+//! The general MIR optimizer and owned-region planner reuse this one CFG
+//! liveness solution. Its reference-death results alone do not authorize an
+//! arena rewind, change executable MIR, or reach the runtime.
 
 #![cfg_attr(not(test), allow(dead_code))]
 
@@ -129,6 +129,26 @@ pub(super) fn reference_liveness(function: &mir::Function) -> ReferenceLiveness 
 }
 
 impl ReferenceLiveness {
+    /// Whether `local` is live immediately after one MIR instruction.
+    ///
+    /// General MIR dead-assignment elimination reuses this exact CFG solution
+    /// instead of maintaining a second local-liveness implementation.
+    pub(super) fn local_is_live_after(
+        &self,
+        block: mir::BasicBlockId,
+        instruction_index: usize,
+        local: mir::LocalId,
+    ) -> Option<bool> {
+        let analysis = self.analysis.as_ref()?;
+        let block = *analysis.block_indices.get(&block)?;
+        let local = *analysis.local_indices.get(&local)?;
+        analysis
+            .instruction_live_after
+            .get(block)?
+            .get(instruction_index)
+            .map(|live| live.contains(local))
+    }
+
     /// Apply the existing MIR liveness authority to a call result. The call
     /// site acts as the definition point; no region classification is inferred.
     pub(super) fn dead_after(

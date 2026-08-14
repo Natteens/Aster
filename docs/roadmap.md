@@ -19,6 +19,8 @@ The current toolchain includes:
 - multifile projects with `Aster.toml` and conventional `Main`;
 - deterministic path dependencies and public HTTPS Git dependencies pinned by `Aster.lock`;
 - restricted `Task<T>`, `await`, and `Parallel` operations with checked worker boundaries;
+- deterministic typed-MIR optimization for CFG cleanup, primitive constants, scalar copies, and dead
+  pure assignments, before escape and ownership analysis;
 - checking, JIT execution, watch mode, installation diagnostics, and HIR/MIR inspection;
 - official Windows x64 and Linux x64 release archives, installers, repair/update/rollback, and
   uninstallers.
@@ -33,7 +35,7 @@ The work before 1.0 is about closing explicit boundaries:
 - finish type-system decisions such as generic constraints and richer pattern handling;
 - apply the documented [pre-1.0 compatibility policy](reference/compatibility.md) as source,
   project, standard-library, CLI, and runtime contracts evolve;
-- measure representative programs before choosing compiler optimizations;
+- extend compiler optimization only where representative structural and runtime evidence justifies it;
 - keep the worker model deterministic and explicit as concurrency support develops;
 - keep package resolution explicit and reproducible as future sources are evaluated.
 

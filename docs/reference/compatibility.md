@@ -32,6 +32,12 @@ hypothetical unoptimized execution. An eliminated or replaced unobservable alloc
 former resource-failure point; observable operations and allocations that still execute retain
 their established ordering and controlled-failure behavior.
 
+The general MIR optimizer follows the same boundary for scalar work. It may fold and remove dead
+primitive assignments only when evaluation is pure and non-failing. Calls, allocations, bounds-checked
+access, integer division/remainder, host operations, Task/Parallel operations, and collection mutation
+remain executable even when their result local is unused. MIR integer folding uses runtime wrapping
+semantics; it does not turn a valid runtime expression into constant-declaration overflow checking.
+
 Compiler-proven last-use reclamation is likewise not a source-semantic change: references keep
 their documented identity, copy, equality, and mutation behavior while live. An owned-region
 rewind occurs only after the complete proven alias closure is dead, does not move live storage, and

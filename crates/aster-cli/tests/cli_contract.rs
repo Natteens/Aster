@@ -110,7 +110,7 @@ fn check_and_dumps_publish_output_only_after_success() {
     let valid = directory.join("valid.aster");
     fs::write(
         &valid,
-        "public class Program { public static int Main() { return 7; } }",
+        "public class Program { public static int Main() { int value = 1 + 2; return value; } }",
     )
     .expect("write valid source");
     let valid = valid.to_str().expect("UTF-8 valid source");
@@ -125,6 +125,11 @@ fn check_and_dumps_publish_output_only_after_success() {
         assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
         assert!(stderr(&output).is_empty());
         assert!(!stdout(&output).is_empty());
+        if command == "dump-mir" {
+            assert!(!stdout(&output).contains("kind: Binary"));
+            assert!(stdout(&output).contains("Integer("));
+            assert!(stdout(&output).contains("\"3\""));
+        }
     }
 
     let language = directory.join("language.aster");

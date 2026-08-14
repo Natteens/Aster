@@ -65,6 +65,17 @@ warnings.
 After validation succeeds, the compiler lowers general-language AST nodes to typed HIR and then lowers
 HIR to control-flow-explicit MIR.
 
+After the narrow loop-concat representation rewrite, one general MIR optimizer simplifies the
+already-typed control and scalar data flow. Its fixed, deterministic cycle propagates exact primitive
+constants and direct scalar copies, folds constant primitive operations, converts known branches to
+jumps, removes unreachable and trampoline blocks, and deletes dead assignments only when their
+right-hand side is pure and cannot fail. Integer folding uses the language's runtime wrapping widths;
+floating-point folding evaluates literal-to-literal IEEE operations without reassociation or
+algebraic identities. Calls, allocations, indexed reads, collection operations, host/worker
+operations, and lifetime instructions are never generic-DCE candidates. Task, async-frame, and
+Parallel intrinsics also stop propagated facts at the worker-transfer boundary. Runtime-intrinsic
+operands remain opaque to the optimizer so intrinsic-specific ABI shapes cannot be rewritten.
+
 Struct literals keep resolved type and field symbols. Nominal class-to-interface conversions are
 explicit in typed HIR, after semantic validation checks every required public method against its
 exact contract. MIR carries interface descriptors, concrete implementation tables, and indirect
@@ -144,9 +155,11 @@ alive independently of the receiver stack copy. Generic methods are specialized 
 key containing the closed owner, method declaration/signature, and method arguments. Neither open
 parameters nor constraint metadata reach HIR.
 
-Memory lowering then runs the safe loop-concat rewrite, escape-region assignment, local-object
-elimination, AARM ProductionV2 Temporary selection, and long-lived owned-region selection in that
-order. The last pass reuses escape aliases and MIR liveness to turn only fresh return-only,
+The complete post-lowering order is the safe loop-concat rewrite, general MIR optimization,
+escape-region assignment, local-object elimination, AARM ProductionV2 Temporary selection, and
+long-lived owned-region selection. This keeps lifetime markers out of the general optimizer while
+giving every escape and ownership proof the final simplified scalar/control shape. The last pass
+reuses escape aliases and MIR liveness to turn only fresh return-only,
 same-block repeated reference families into explicit `OwnedRegionEnter`/`OwnedRegionExit` MIR.
 Function-local region IDs validate marker balance but are erased at the private runtime ABI.
 Cranelift validation also rejects unrelated direct or transitive Persistent effects and
@@ -184,9 +197,10 @@ reruns the same pipeline when the root, manifest, or any loaded dependency chang
 
 ## Deliberate boundaries
 
-Inheritance, interface inheritance/default methods, external packages, MIR optimization, AOT/object
-generation, executable linking, and general shared-memory concurrency remain outside the current
-implementation. Task and parallel APIs deliberately use restricted worker boundaries.
+Inheritance, interface inheritance/default methods, external packages, interprocedural inlining and
+range/loop optimization, AOT/object generation, executable linking, and general shared-memory
+concurrency remain outside the current implementation. Task and parallel APIs deliberately use
+restricted worker boundaries.
 `Main` is only an application entry convention; it does not imply `Start`, `Update`, a loop, or any
 engine lifecycle. ECS is not part of the language or compiler — see `docs/research/ecs.md`.
 

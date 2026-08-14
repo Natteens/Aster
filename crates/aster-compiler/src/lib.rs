@@ -12,6 +12,7 @@ mod lockfile;
 mod loop_string_concat_rewrite;
 mod manifest;
 mod mir_lowering;
+mod mir_optimizer;
 mod owned_regions;
 mod primitives;
 mod project;
@@ -73,7 +74,7 @@ pub struct Compilation {
 ///
 /// Returns positioned diagnostics for lexical, syntactic, or semantic errors.
 pub fn compile(source: &str) -> Result<Compilation, Vec<Diagnostic>> {
-    compile_with_loop_string_concat_rewrite(source, true)
+    compile_with_options(source, true, true)
 }
 
 /// Compile one source file with the loop-carried concat rewrite disabled.
@@ -84,12 +85,24 @@ pub fn compile(source: &str) -> Result<Compilation, Vec<Diagnostic>> {
 pub fn compile_without_loop_string_concat_rewrite_for_research(
     source: &str,
 ) -> Result<Compilation, Vec<Diagnostic>> {
-    compile_with_loop_string_concat_rewrite(source, false)
+    compile_with_options(source, false, true)
 }
 
-fn compile_with_loop_string_concat_rewrite(
+/// Compile one source file with the general MIR optimizer disabled.
+///
+/// This is a benchmark/test seam only; normal ASTER compilation always runs
+/// the fixed backend-neutral optimizer stage.
+#[doc(hidden)]
+pub fn compile_without_mir_optimizer_for_research(
+    source: &str,
+) -> Result<Compilation, Vec<Diagnostic>> {
+    compile_with_options(source, true, false)
+}
+
+fn compile_with_options(
     source: &str,
     rewrite_loop_string_concat: bool,
+    optimize_mir: bool,
 ) -> Result<Compilation, Vec<Diagnostic>> {
     let tokens = lex(source)?;
     let module = parse(tokens.clone())?;
@@ -98,6 +111,7 @@ fn compile_with_loop_string_concat_rewrite(
         module,
         &std::collections::HashMap::new(),
         rewrite_loop_string_concat,
+        optimize_mir,
     )
 }
 
@@ -106,6 +120,7 @@ fn compile_module(
     mut module: Module,
     intrinsic_bindings: &std::collections::HashMap<String, hir::Intrinsic>,
     rewrite_loop_string_concat: bool,
+    optimize_mir: bool,
 ) -> Result<Compilation, Vec<Diagnostic>> {
     let deferred_diagnostics = semantic::validate_deferred_language_surfaces(&mut module);
     if !deferred_diagnostics.is_empty() {
@@ -127,6 +142,9 @@ fn compile_module(
         let mut mir = mir_lowering::lower(&hir);
         if rewrite_loop_string_concat {
             loop_string_concat_rewrite::rewrite(&mut mir);
+        }
+        if optimize_mir {
+            mir_optimizer::optimize(&mut mir);
         }
         escape_analysis::assign_allocation_regions(&mut mir);
         local_object_elimination::eliminate(&mut mir);
