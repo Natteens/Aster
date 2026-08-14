@@ -40,16 +40,16 @@ path = "examples/helper_collection_retention.rs"
 required-features = ["aarm-telemetry"]
 
 [dependencies]
-aster-mir = { path = "../aster-mir", version = "0.56.3" }
-aster-runtime = { path = "../aster-runtime", version = "0.56.3" }
-aster-types = { path = "../aster-types", version = "0.56.3" }
+aster-mir = { path = "../aster-mir", version = "0.56.4" }
+aster-runtime = { path = "../aster-runtime", version = "0.56.4" }
+aster-types = { path = "../aster-types", version = "0.56.4" }
 cranelift-codegen = "=0.121.2"
 cranelift-frontend = "=0.121.2"
 cranelift-jit = "=0.121.2"
 cranelift-module = "=0.121.2"
 
 [dev-dependencies]
-aster-compiler = { path = "../aster-compiler", version = "0.56.3" }
+aster-compiler = { path = "../aster-compiler", version = "0.56.4" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59.0", features = [
