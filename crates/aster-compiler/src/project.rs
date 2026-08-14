@@ -351,7 +351,7 @@ pub(crate) fn compile_project_with_standard_library(
         return Err(loader.finish_diagnostics());
     }
     let intrinsic_bindings = loader.standard_library.intrinsic_bindings();
-    match compile_module(tokens, module, &intrinsic_bindings) {
+    match compile_module(tokens, module, &intrinsic_bindings, true) {
         Ok(compilation) => Ok(ProjectCompilation {
             compilation,
             sources: loader.sources,

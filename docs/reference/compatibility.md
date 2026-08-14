@@ -24,8 +24,13 @@ Parser acceptance by itself is not a language guarantee. Research notes, unsuppo
 compiler-internal Rust APIs, cache layouts, allocation implementation details, and the textual shape
 of HIR/MIR dumps may change without a source-compatibility promise. HIR and MIR remain typed
 compiler contracts internally, but their debug rendering is not a serialized public format.
-A source-level `new` likewise does not promise a physical arena allocation when the compiler proves
-that the allocation's reference identity and storage are unobservable.
+Compiler-proven unobservable intermediate allocations are not a source-level compatibility
+guarantee. The optimizer may eliminate or replace them, including scalar-replaced local objects and
+compiler-replaced string-construction intermediates. Runtime memory statistics and resource-budget
+consumption describe allocations that remain in executable MIR after optimization, not a
+hypothetical unoptimized execution. An eliminated or replaced unobservable allocation loses its
+former resource-failure point; observable operations and allocations that still execute retain
+their established ordering and controlled-failure behavior.
 
 The absence of a diagnostic for an unsupported program is also not a promise that the behavior is
 supported. Unsupported execution must continue to fail before unsafe code generation.

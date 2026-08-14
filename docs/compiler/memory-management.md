@@ -26,7 +26,9 @@ callee cannot invalidate a caller's temporary values.
 
 ## Escape analysis
 
-Escape analysis runs after MIR lowering and before Cranelift validation. It:
+The compiler's memory-related optimization order is typed HIR, typed MIR, the safe loop-concat
+rewrite, escape-region assignment, local-object elimination, AARM ProductionV2 selection, and
+finally Cranelift validation and lowering. Escape analysis remains the lifetime authority. It:
 
 1. tracks local aliases of class, array, list, dictionary, and string references;
 2. builds summaries for direct ASTER calls;
@@ -162,8 +164,9 @@ region determines the lifetime.
 `aster run <FILE> --memory-stats` prints one snapshot after execution.
 
 - `allocations`, `objects`, `arrays`, and `strings` count dynamic runtime allocations that actually
-  execute after compiler optimization. A source-level `new` eliminated because its identity and
-  storage are unobservable contributes no allocation or requested bytes.
+  execute after compiler optimization. An unobservable allocation eliminated or replaced by the
+  compiler contributes no allocation or requested bytes; this includes scalar-replaced local
+  objects and removed loop-concat intermediates.
   Collection and `StringBuilder` headers/backing buffers use the existing object category;
   immutable snapshots use the string category.
 - `requested` is cumulative storage requested by dynamic runtime allocations. It excludes arena
@@ -183,11 +186,14 @@ order while allocating and sizing the final immutable string once. Chains contai
 interpolation, or other effectful expressions retain pairwise concatenation so allocation failure
 and side-effect ordering do not change.
 
-Loop-carried `value = value + part` still allocates one immutable result per iteration and copies its
-accumulated prefix repeatedly. ASTER does not rewrite that expression because aliases, intermediate
-reads, effects, exits, and allocation-failure ordering are observable. Programs can opt into
-amortized O(n) construction with `aster.core.StringBuilder`; the release-only
-`string_construction_matrix` example records both curves without machine-dependent thresholds.
+For one narrow proven shape, the compiler replaces an unobservable loop-carried
+`value = value + part` chain with the existing `StringBuilder` operations and materializes one final
+immutable string. Removed intermediate strings perform no arena allocation, consume no governor
+budget, and do not appear in `MemoryStats`. Aliases, intermediate reads, effects, ambiguous control
+flow, and unsupported final uses retain ordinary pairwise concatenation. This rewrite is independent
+of AARM: its builder lives across loop iterations, so the current shape receives no fine-region
+enter/exit instructions. The release-only `string_construction_matrix` example records pairwise,
+automatic, and explicit-builder curves without machine-dependent thresholds.
 
 A successful temporary-only workload can therefore report many allocations,
 non-zero requested and peak values, `used: 0 bytes`, and non-zero reserved

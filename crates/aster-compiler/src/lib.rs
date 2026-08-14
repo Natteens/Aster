@@ -9,6 +9,7 @@ mod hir_lowering;
 mod lifetime_analysis;
 mod local_object_elimination;
 mod lockfile;
+mod loop_string_concat_rewrite;
 mod manifest;
 mod mir_lowering;
 mod primitives;
@@ -71,15 +72,39 @@ pub struct Compilation {
 ///
 /// Returns positioned diagnostics for lexical, syntactic, or semantic errors.
 pub fn compile(source: &str) -> Result<Compilation, Vec<Diagnostic>> {
+    compile_with_loop_string_concat_rewrite(source, true)
+}
+
+/// Compile one source file with the loop-carried concat rewrite disabled.
+///
+/// This is a benchmark/test seam only; normal ASTER compilation always uses
+/// the optimization when its narrow structural proof succeeds.
+#[doc(hidden)]
+pub fn compile_without_loop_string_concat_rewrite_for_research(
+    source: &str,
+) -> Result<Compilation, Vec<Diagnostic>> {
+    compile_with_loop_string_concat_rewrite(source, false)
+}
+
+fn compile_with_loop_string_concat_rewrite(
+    source: &str,
+    rewrite_loop_string_concat: bool,
+) -> Result<Compilation, Vec<Diagnostic>> {
     let tokens = lex(source)?;
     let module = parse(tokens.clone())?;
-    compile_module(tokens, module, &std::collections::HashMap::new())
+    compile_module(
+        tokens,
+        module,
+        &std::collections::HashMap::new(),
+        rewrite_loop_string_concat,
+    )
 }
 
 fn compile_module(
     tokens: Vec<Token>,
     mut module: Module,
     intrinsic_bindings: &std::collections::HashMap<String, hir::Intrinsic>,
+    rewrite_loop_string_concat: bool,
 ) -> Result<Compilation, Vec<Diagnostic>> {
     synthesize_default_constructors(&mut module);
     let generic_diagnostics = generics::monomorphize(&mut module);
@@ -95,6 +120,9 @@ fn compile_module(
     } else {
         let hir = hir_lowering::lower(&module, &semantic_model, intrinsic_bindings);
         let mut mir = mir_lowering::lower(&hir);
+        if rewrite_loop_string_concat {
+            loop_string_concat_rewrite::rewrite(&mut mir);
+        }
         escape_analysis::assign_allocation_regions(&mut mir);
         local_object_elimination::eliminate(&mut mir);
         temporary_subregions::lower_production_aarm_temporary_subregions(&mut mir);

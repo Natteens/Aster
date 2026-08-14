@@ -39,6 +39,11 @@ name = "helper_collection_retention"
 path = "examples/helper_collection_retention.rs"
 required-features = ["aarm-telemetry"]
 
+[[example]]
+name = "string_construction_matrix"
+path = "examples/string_construction_matrix.rs"
+required-features = ["aarm-telemetry"]
+
 [dependencies]
 aster-mir = { path = "../aster-mir", version = "0.56.4" }
 aster-runtime = { path = "../aster-runtime", version = "0.56.4" }

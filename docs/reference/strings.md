@@ -121,6 +121,13 @@ state, not a shared concurrency primitive, and cannot cross `Task` or `Parallel`
 Static safe `+` chains can still use the compiler's one-allocation join path; effectful and ordinary
 binary concatenation retain their existing evaluation and allocation behavior.
 
+For one narrow, compiler-proven loop shape, ASTER may replace an unobservable
+`value = value + part` chain with this same builder implementation. Ordinary strings remain
+immutable, ordinary binary `+` keeps its language semantics, and the final observable value is an
+ordinary immutable `string`. Removed intermediate allocations are not executed merely to preserve
+their former resource-failure points. Any alias, intermediate read, effectful shape, or ambiguous
+control flow retains normal pairwise concatenation; not every concat loop is rewritten.
+
 ## 🚧 Current limits
 
 There is no general implicit `ToString`, split, replace, regex, nullable string, or direct string
