@@ -102,6 +102,31 @@ fn excessive_recursion_is_a_controlled_cli_failure() {
 #[test]
 fn invalid_utf8_is_a_controlled_cli_failure() {
     let path = temporary_source("invalid-utf8", [0xff, 0xfe, 0xfd]);
-    assert_controlled_failure(&aster("check", &path), "valid UTF-8");
+    let root_output = aster("check", &path);
+    assert_controlled_failure(&root_output, "valid UTF-8");
+    let root_error = String::from_utf8_lossy(&root_output.stderr);
+    assert!(root_error.contains("could not load root source file"));
+    assert!(root_error.contains(path.to_string_lossy().as_ref()));
+    assert!(!root_error.contains("namespace file"));
+    assert!(!root_error.contains("fix the using"));
     remove_source(&path);
+
+    let root = temporary_source(
+        "invalid-namespace-utf8",
+        "using app; public int Run() { return 0; }",
+    );
+    let namespace = root
+        .parent()
+        .expect("temporary root parent")
+        .join("app/bad.aster");
+    fs::create_dir_all(namespace.parent().expect("namespace parent"))
+        .expect("create namespace directory");
+    fs::write(&namespace, [0xff, 0xfe, 0xfd]).expect("write invalid namespace source");
+    let namespace_output = aster("check", &root);
+    assert_controlled_failure(&namespace_output, "valid UTF-8");
+    let namespace_error = String::from_utf8_lossy(&namespace_output.stderr);
+    assert!(namespace_error.contains("could not load namespace file"));
+    assert!(namespace_error.contains("bad.aster"));
+    assert!(namespace_error.contains("fix the using"));
+    remove_source(&root);
 }

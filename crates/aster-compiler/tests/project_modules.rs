@@ -146,6 +146,56 @@ fn diagnostics_keep_their_file_local_span_without_padded_sources() {
 }
 
 #[test]
+fn distinguishes_root_source_decode_from_namespace_source_decode() {
+    let root_project = Project::new("root-invalid-utf8");
+    let root = root_project.root.join("main.aster");
+    fs::write(&root, [0xff, 0xfe, 0xfd]).expect("write invalid root source");
+    let root_diagnostic = compile_project(&root)
+        .expect_err("invalid root source must fail")
+        .into_iter()
+        .next()
+        .expect("root diagnostic");
+    assert_eq!(
+        root_diagnostic.path,
+        fs::canonicalize(&root).expect("canonical root source path")
+    );
+    assert!(
+        root_diagnostic
+            .diagnostic
+            .message
+            .contains("could not load root source file")
+    );
+    assert_eq!(
+        root_diagnostic.diagnostic.help.as_deref(),
+        Some("ensure the input source file is valid UTF-8")
+    );
+
+    let namespace_project = Project::new("namespace-invalid-utf8");
+    let namespace = namespace_project.write("app/bad.aster", "");
+    fs::write(&namespace, [0xff, 0xfe, 0xfd]).expect("write invalid namespace source");
+    let root = namespace_project.main("using app; public int Run() { return 0; }");
+    let namespace_diagnostic = compile_project(&root)
+        .expect_err("invalid namespace source must fail")
+        .into_iter()
+        .next()
+        .expect("namespace diagnostic");
+    assert_eq!(
+        namespace_diagnostic.path,
+        fs::canonicalize(&namespace).expect("canonical namespace source path")
+    );
+    assert!(
+        namespace_diagnostic
+            .diagnostic
+            .message
+            .contains("could not load namespace file")
+    );
+    assert_eq!(
+        namespace_diagnostic.diagnostic.help.as_deref(),
+        Some("create the namespace directory/file or fix the using")
+    );
+}
+
+#[test]
 fn an_empty_namespace_file_links_without_creating_a_symbol_table_clone() {
     let project = Project::new("empty-namespace");
     project.write("app/empty.aster", "namespace app;");

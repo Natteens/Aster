@@ -316,6 +316,7 @@ pub(crate) fn compile_project_with_standard_library(
         resolved_usings: HashMap::new(),
         next_offset: 0,
         diagnostics: Vec::new(),
+        file_load_diagnostics: Vec::new(),
         standard_library,
     };
     let root_namespace = loader
@@ -326,10 +327,11 @@ pub(crate) fn compile_project_with_standard_library(
             .diagnostics
             .iter()
             .any(|value| value.severity == aster_diagnostics::Severity::Error)
+        && loader.file_load_diagnostics.is_empty()
     {
         loader.load_namespace(&root_namespace, ROOT_PACKAGE, None);
     }
-    if !loader.diagnostics.is_empty() {
+    if !loader.diagnostics.is_empty() || !loader.file_load_diagnostics.is_empty() {
         return Err(loader.finish_diagnostics());
     }
     let root_unit = loader.units.iter().find(|unit| unit.root);
@@ -915,6 +917,7 @@ struct Loader {
     resolved_usings: HashMap<(PackageId, String), PackageId>,
     next_offset: usize,
     diagnostics: Vec<Diagnostic>,
+    file_load_diagnostics: Vec<ProjectDiagnostic>,
     standard_library: StandardLibrary,
 }
 
@@ -971,7 +974,16 @@ impl Loader {
             match fs::read_to_string(&path) {
                 Ok(source) => source,
                 Err(error) => {
-                    self.diagnostics.push(
+                    let diagnostic = if root {
+                        Diagnostic::error(
+                            format!(
+                                "could not load root source file `{}`: {error}",
+                                path.display()
+                            ),
+                            Span::default(),
+                        )
+                        .with_help("ensure the input source file is valid UTF-8")
+                    } else {
                         Diagnostic::error(
                             format!(
                                 "could not load namespace file `{}`: {error}",
@@ -979,8 +991,13 @@ impl Loader {
                             ),
                             using_span.unwrap_or_default(),
                         )
-                        .with_help("create the namespace directory/file or fix the using"),
-                    );
+                        .with_help("create the namespace directory/file or fix the using")
+                    };
+                    self.file_load_diagnostics.push(ProjectDiagnostic {
+                        path: path.clone(),
+                        source: String::new(),
+                        diagnostic,
+                    });
                     return None;
                 }
             }
@@ -1303,7 +1320,8 @@ impl Loader {
     }
 
     fn finish_diagnostics(&self) -> Vec<ProjectDiagnostic> {
-        self.diagnostics
+        let mut diagnostics = self
+            .diagnostics
             .iter()
             .cloned()
             .map(|mut diagnostic| {
@@ -1328,7 +1346,9 @@ impl Loader {
                     diagnostic,
                 }
             })
-            .collect()
+            .collect::<Vec<_>>();
+        diagnostics.extend(self.file_load_diagnostics.clone());
+        diagnostics
     }
 }
 
