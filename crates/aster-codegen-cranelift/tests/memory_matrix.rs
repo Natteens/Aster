@@ -94,12 +94,16 @@ fn temporary_cases_reclaim_all_used_bytes() {
 }
 
 #[test]
-fn persistent_cases_retain_used_bytes() {
+fn persistent_cases_follow_owned_or_conservative_lifetime() {
     let report = small_report();
     for result in &report.results {
         if result.region == Region::Persistent {
             let memory = result.memory.as_ref().expect("passing case exposes memory");
-            assert!(memory.used_bytes > 0, "case {}", result.case);
+            if matches!(result.case, "object" | "array" | "string") {
+                assert_eq!(memory.used_bytes, 0, "case {}", result.case);
+            } else {
+                assert!(memory.used_bytes > 0, "case {}", result.case);
+            }
             assert!(
                 memory.peak_used_bytes >= memory.used_bytes,
                 "case {}",

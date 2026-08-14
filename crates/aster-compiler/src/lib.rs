@@ -12,6 +12,7 @@ mod lockfile;
 mod loop_string_concat_rewrite;
 mod manifest;
 mod mir_lowering;
+mod owned_regions;
 mod primitives;
 mod project;
 mod semantic;
@@ -130,6 +131,7 @@ fn compile_module(
         escape_analysis::assign_allocation_regions(&mut mir);
         local_object_elimination::eliminate(&mut mir);
         temporary_subregions::lower_production_aarm_temporary_subregions(&mut mir);
+        owned_regions::lower(&mut mir);
         Ok(Compilation {
             tokens,
             module,

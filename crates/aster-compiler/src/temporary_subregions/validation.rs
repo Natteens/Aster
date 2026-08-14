@@ -1064,6 +1064,10 @@ fn span_barrier(instructions: &[mir::Instruction]) -> Option<TemporarySubregionR
             mir::Instruction::AllocateArray { .. } | mir::Instruction::AllocateObject { .. } => {
                 Some(TemporarySubregionRejectionReason::UnsupportedInstruction)
             }
+            mir::Instruction::OwnedRegionEnter { .. }
+            | mir::Instruction::OwnedRegionExit { .. } => {
+                Some(TemporarySubregionRejectionReason::UnsupportedInstruction)
+            }
         };
         if reason.is_some() {
             return reason;

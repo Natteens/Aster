@@ -97,4 +97,19 @@ impl Codegen {
         builder.ins().call(function_ref, &[context]);
         Ok(())
     }
+
+    pub(super) fn leave_owned_region(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("owned region is missing its ExecutionContext"))?;
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids["aster_rt_owned_region_exit"], builder.func);
+        builder.ins().call(function_ref, &[context]);
+        Ok(())
+    }
 }

@@ -40,6 +40,11 @@ pub struct MirPoint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TemporarySubregionId(pub u32);
 
+/// Deterministic function-local identity for one compiler-proven long-lived
+/// owned region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OwnedRegionId(pub u32);
+
 /// Backend-neutral, non-executable candidate for a future Temporary arena
 /// checkpoint and rewind.
 ///
@@ -172,6 +177,19 @@ pub enum AllocationRegion {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Instruction {
+    /// Begin one compiler-proven slice of the Persistent arena. Persistent
+    /// allocations made by this function or its callees remain pointer-stable
+    /// until the matching [`Instruction::OwnedRegionExit`].
+    OwnedRegionEnter {
+        id: OwnedRegionId,
+    },
+    /// Reclaim the matching Persistent-arena slice. `invalidated` is the
+    /// complete compiler-proven local alias closure for the owned result;
+    /// backend validation rejects a later use before the local is redefined.
+    OwnedRegionExit {
+        id: OwnedRegionId,
+        invalidated: Vec<LocalId>,
+    },
     /// Enter one compiler-authorized fine-grained Temporary arena subregion.
     ///
     /// This instruction is backend-neutral and has no local uses, local

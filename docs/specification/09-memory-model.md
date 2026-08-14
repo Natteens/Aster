@@ -70,8 +70,27 @@ These snippets use placeholder design syntax and are not claims about compiler s
 
 The implemented JIT model uses temporary and persistent `ExecutionContext`
 arenas. A proven local dynamic allocation rewinds with its function scope;
-escaping or uncertain values remain retained until context teardown. This is an
-intentional conservative model, not a claim of per-value reclamation.
+escaping values normally use Persistent storage. The compiler can additionally
+prove one narrow long-lived ownership shape: a fresh return-only reference,
+with a complete local alias closure, used inside one repeated basic block. It
+places that call's Persistent allocation family in a stable owned slice and
+rewinds the slice after the last use. Reassignment therefore bounds common
+returned-and-overwritten array, string, scalar-object, `List`, and `Dictionary`
+workloads without source annotations.
+
+Every producer return path must return the proven fresh family, and the full
+reachable call span must be free of unrelated Persistent or worker effects.
+This also prevents recursive or reentrant ASTER calls from dynamically nesting
+compiler-selected slices. Runtime checkpoints remain context-local and LIFO;
+their function-local MIR IDs are not runtime identities.
+
+This is coarse deterministic region ownership, not per-reference ownership.
+Reference parameters, overlapping allocation families, containment, interface
+conversion, worker transfer, cross-block lifetimes, helper-driven collection
+growth, shared aliases, cyclic graphs, and every incomplete proof retain the
+existing context-owned Persistent behavior. A copied aggregate never implies a
+deep ownership transfer. No address moves while live, and reclamation has no
+destructor or finalizer semantics.
 
 Reference counting and non-moving tracing are deferred. RC needs correct
 accounting for copied structs/enums, collections, interfaces, calls, and
@@ -94,9 +113,11 @@ references, worker-context isolation, and the typed HIR/MIR boundary.
 execution, then evaluate an explicit shared-ownership library type. Do not accept this until
 class ergonomics and cyclic object graphs have representative examples.
 
-This historical proposal is superseded for the current JIT. No long-lived
-reclamation model is accepted until allocation metadata, JIT roots, safe
-points, and representative cyclic graphs have stronger evidence.
+This historical universal-ownership proposal is superseded for the current
+JIT. The accepted compiler-proven owned-region subset does not require runtime
+root discovery or cycle traversal. Broader shared/cyclic reclamation remains
+open until allocation metadata, JIT roots, safe points, and representative
+graphs have stronger evidence.
 
 ### PROPOSED — Class allocation location
 

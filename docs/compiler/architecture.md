@@ -144,6 +144,15 @@ alive independently of the receiver stack copy. Generic methods are specialized 
 key containing the closed owner, method declaration/signature, and method arguments. Neither open
 parameters nor constraint metadata reach HIR.
 
+Memory lowering then runs the safe loop-concat rewrite, escape-region assignment, local-object
+elimination, AARM ProductionV2 Temporary selection, and long-lived owned-region selection in that
+order. The last pass reuses escape aliases and MIR liveness to turn only fresh return-only,
+same-block repeated reference families into explicit `OwnedRegionEnter`/`OwnedRegionExit` MIR.
+Function-local region IDs validate marker balance but are erased at the private runtime ABI.
+Cranelift validation also rejects unrelated direct or transitive Persistent effects and
+invalidated-local use, then mechanically calls the context-owned LIFO checkpoint ABI; it never
+discovers aliases, liveness, ownership, or source patterns.
+
 The backend rejects unsupported MIR before code generation. Decimal source is rejected earlier by
 the post-link language-surface gate because its numeric and ABI contract remains unspecified;
 backend validation still rejects hand-built decimal MIR fail-closed. The backend does not inspect
@@ -182,6 +191,8 @@ implementation. Task and parallel APIs deliberately use restricted worker bounda
 engine lifecycle. ECS is not part of the language or compiler — see `docs/research/ecs.md`.
 
 Arrays and classes use a per-invocation host-owned context. Objects are non-null references with
-identity and live until that invocation ends. Interface values borrow those object references and
+identity and stable addresses. A narrow fresh return-only family may be reclaimed at a
+compiler-proven last use; ambiguous, shared, contained, interface, and cyclic families remain live
+until that invocation ends. Interface values borrow those object references and
 their JIT-owned tables; they cannot outlive the invocation. Inheritance, finalization and a
-long-lived/AOT ownership model remain deliberately undecided.
+general source-visible/AOT ownership model remain deliberately undecided.

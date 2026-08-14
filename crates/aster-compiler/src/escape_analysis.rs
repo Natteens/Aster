@@ -65,7 +65,7 @@ enum EscapeClassification {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EscapeReason {
+pub(super) enum EscapeReason {
     NonLocalDestination,
     Returned,
     Stored,
@@ -86,6 +86,23 @@ pub(super) struct AllocationEscapeFact {
     pub region: mir::AllocationRegion,
     pub origin: Option<mir::LocalId>,
     pub aliases: Vec<mir::LocalId>,
+    pub escape_reason: Option<EscapeReason>,
+}
+
+/// Existing escape authority applied to a local reference produced by a call
+/// rather than by an allocation instruction in the same function.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct LocalReferenceFact {
+    pub aliases: Vec<mir::LocalId>,
+    pub escape_reason: Option<EscapeReason>,
+}
+
+/// One immutable view of the authoritative interprocedural escape summaries.
+/// Long-lived planning constructs it once and reuses it for every candidate
+/// call result in the module.
+pub(super) struct ReferenceFacts<'a> {
+    module: &'a mir::Module,
+    summaries: HashMap<mir::SymbolId, FunctionSummary>,
 }
 
 /// Classify every MIR allocation and apply its storage region.
@@ -174,9 +191,13 @@ fn allocation_escape_facts_in_mir_order(module: &mir::Module) -> Vec<AllocationE
                     };
                 let mut aliases = aliases.into_iter().collect::<Vec<_>>();
                 aliases.sort_unstable_by_key(|local| local.0);
-                let region = match classification {
-                    EscapeClassification::LocalCandidate => mir::AllocationRegion::Temporary,
-                    EscapeClassification::Persistent(_) => mir::AllocationRegion::Persistent,
+                let (region, escape_reason) = match classification {
+                    EscapeClassification::LocalCandidate => {
+                        (mir::AllocationRegion::Temporary, None)
+                    }
+                    EscapeClassification::Persistent(reason) => {
+                        (mir::AllocationRegion::Persistent, Some(reason))
+                    }
                 };
                 facts.push(AllocationEscapeFact {
                     site: mir::MirAllocationSite {
@@ -187,12 +208,48 @@ fn allocation_escape_facts_in_mir_order(module: &mir::Module) -> Vec<AllocationE
                     region,
                     origin,
                     aliases,
+                    escape_reason,
                 });
             }
         }
     }
 
     facts
+}
+
+/// Return the authoritative alias closure and escape result for one local.
+/// Long-lived ownership planning uses this instead of maintaining a second
+/// alias classifier for call results.
+pub(super) fn reference_facts(module: &mir::Module) -> ReferenceFacts<'_> {
+    ReferenceFacts {
+        module,
+        summaries: build_function_summaries(module),
+    }
+}
+
+impl ReferenceFacts<'_> {
+    pub(super) fn local(
+        &self,
+        function_symbol: mir::SymbolId,
+        origin: mir::LocalId,
+    ) -> Option<LocalReferenceFact> {
+        let function = self
+            .module
+            .functions
+            .iter()
+            .find(|function| function.symbol == function_symbol)?;
+        let aliases = collect_aliases(function, origin, &self.summaries);
+        let classification = classify_allocation_with_aliases(function, &aliases, &self.summaries);
+        let mut aliases = aliases.into_iter().collect::<Vec<_>>();
+        aliases.sort_unstable_by_key(|local| local.0);
+        Some(LocalReferenceFact {
+            aliases,
+            escape_reason: match classification {
+                EscapeClassification::LocalCandidate => None,
+                EscapeClassification::Persistent(reason) => Some(reason),
+            },
+        })
+    }
 }
 
 fn build_function_summaries(module: &mir::Module) -> HashMap<mir::SymbolId, FunctionSummary> {
@@ -377,7 +434,9 @@ fn is_scope_free_collection_mutation_helper(
             if is_dynamic_allocation(instruction)
                 || matches!(
                     instruction,
-                    mir::Instruction::TemporarySubregionEnter { .. }
+                    mir::Instruction::OwnedRegionEnter { .. }
+                        | mir::Instruction::OwnedRegionExit { .. }
+                        | mir::Instruction::TemporarySubregionEnter { .. }
                         | mir::Instruction::TemporarySubregionExit { .. }
                         | mir::Instruction::Call { .. }
                         | mir::Instruction::CallInterface { .. }
@@ -447,7 +506,9 @@ fn instruction_uses_alias(instruction: &mir::Instruction, aliases: &HashSet<mir:
             matches!(destination, mir::Place::Local(local) if aliases.contains(local))
         }
         mir::Instruction::ListAdd { list, .. } => direct_alias(list, aliases).is_some(),
-        mir::Instruction::TemporarySubregionEnter { .. }
+        mir::Instruction::OwnedRegionEnter { .. }
+        | mir::Instruction::OwnedRegionExit { .. }
+        | mir::Instruction::TemporarySubregionEnter { .. }
         | mir::Instruction::TemporarySubregionExit { .. }
         | mir::Instruction::Call { .. }
         | mir::Instruction::CallInterface { .. }
@@ -838,6 +899,8 @@ fn instruction_escape(
         | mir::Instruction::ListGet { .. }
         | mir::Instruction::ListRemoveAt { .. }
         | mir::Instruction::StringDecodeNext { .. }
+        | mir::Instruction::OwnedRegionEnter { .. }
+        | mir::Instruction::OwnedRegionExit { .. }
         | mir::Instruction::TemporarySubregionEnter { .. }
         | mir::Instruction::TemporarySubregionExit { .. } => None,
         // Storing a reference into a list's buffer is an aggregate store,

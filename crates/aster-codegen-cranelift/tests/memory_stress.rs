@@ -82,7 +82,7 @@ fn temporary_object_array_and_string_stress_stays_bounded() {
 }
 
 #[test]
-fn returned_object_array_and_string_stress_remains_persistent() {
+fn overlapping_returned_families_fall_back_while_the_final_family_reclaims() {
     let (value, stats) = execute(PERSISTENT_STRESS);
 
     assert_eq!(value, ExecutionValue::Int(420_000));
@@ -92,7 +92,8 @@ fn returned_object_array_and_string_stress_remains_persistent() {
     assert_eq!(stats.string_allocations, 10_000);
     assert!(stats.used_bytes > 64 * 1024);
     assert!(stats.reserved_bytes >= stats.used_bytes);
-    assert_eq!(stats.peak_used_bytes, stats.used_bytes);
+    assert!(stats.peak_used_bytes > stats.used_bytes);
+    assert!(stats.peak_used_bytes - stats.used_bytes < 1024);
 }
 
 #[test]
@@ -202,13 +203,14 @@ fn temporary_list_stress_stays_bounded() {
 }
 
 #[test]
-fn persistent_list_stress_remains_persistent() {
+fn returned_overwritten_list_stress_stays_bounded() {
     let (value, stats) = execute(PERSISTENT_LIST_STRESS);
 
     assert_eq!(value, ExecutionValue::Int(8 * 10_000));
-    assert!(stats.used_bytes > 64 * 1024);
-    assert!(stats.reserved_bytes >= stats.used_bytes);
-    assert_eq!(stats.peak_used_bytes, stats.used_bytes);
+    assert_eq!(stats.used_bytes, 0);
+    assert_eq!(stats.reserved_bytes, 4 * 1024);
+    assert!(stats.peak_used_bytes > 0);
+    assert!(stats.peak_used_bytes < 1024);
 }
 
 #[test]

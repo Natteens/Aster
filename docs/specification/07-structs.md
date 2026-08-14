@@ -104,9 +104,10 @@ public class Counter
 
 `new Counter(10)` allocates a non-null object in the current ExecutionContext and invokes that
 constructor immediately. Assignment, parameters and internal returns copy the reference, not the
-fields. Objects have identity and live until the execution ends. Reference fields must be assigned
-by the constructor on every continuing path; numbers, booleans and entirely zero-safe structs may
-use their zero default. Struct inheritance, finalizers and `null` are not defined.
+fields. Objects keep stable identity while any language-observable alias is live; a narrowly proven
+dead family may be reclaimed earlier by the memory model. Reference fields must be assigned by the
+constructor on every continuing path; numbers, booleans and entirely zero-safe structs may use
+their zero default. Struct inheritance, finalizers and `null` are not defined.
 
 ## Valid design examples
 
@@ -176,7 +177,8 @@ Named literals are implemented. Positional `Point(1.0, 2.0)` is not an implicit 
 
 `new Player(...)` explicitly allocates a non-null class object in the current ExecutionContext and
 invokes its constructor. A plain type call never hides class allocation. Individual destruction,
-`null`, finalizers and long-lived ownership remain outside the current per-execution model.
+`null`, finalizers, and general source-visible ownership remain outside the current per-execution
+model; compiler-proven owned Persistent slices are documented in the memory model.
 
 ### ACCEPTED — Value equality and copying for structs
 

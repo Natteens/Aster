@@ -1363,6 +1363,96 @@ mod tests {
     }
 
     #[test]
+    fn generated_owned_region_allocation_failure_runs_cleanup_before_host_teardown() {
+        let module = compile(
+            "internal int[] Make() { return new int[100000]; } \
+             public int Run() { int total = 0; for (int i = 0; i < 2; i++) { \
+                 int[] value = Make(); total += value[0]; \
+             } return total; }",
+        );
+        assert!(module.functions.iter().any(|function| {
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .any(|instruction| matches!(instruction, mir::Instruction::OwnedRegionEnter { .. }))
+        }));
+        let (prepared, run) = prepare(&module, "Run");
+        let governor = Arc::new(aster_runtime::MemoryGovernor::new(
+            aster_runtime::ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES,
+        ));
+        let mut context =
+            aster_runtime::ExecutionContext::with_memory_governor(Arc::clone(&governor));
+
+        let _ = prepared
+            .invoke_with_test_context(run, &mut context)
+            .expect("controlled owned allocation failure returns a neutral ABI result");
+
+        assert!(
+            context
+                .take_error()
+                .expect("owned allocation failure is preserved")
+                .contains("shared execution memory budget")
+        );
+        assert_eq!(context.memory_stats().used_bytes, 0);
+        assert_eq!(governor.telemetry().current_capacity_bytes, 0);
+    }
+
+    #[test]
+    fn generated_owned_region_runtime_failures_unwind_once_and_allow_context_reuse() {
+        let cases = [
+            (
+                "internal int[] Make() { return [42]; } \
+                 public int Run() { int total = 0; for (int i = 0; i < 2; i++) { \
+                     int[] value = Make(); total += value[2]; \
+                 } return total; }",
+                "array index 2 is outside",
+            ),
+            (
+                "internal int[] Make() { return [42]; } \
+                 public int Run() { int total = 0; int zero = 0; \
+                     for (int i = 0; i < 2; i++) { int[] value = Make(); \
+                         int quotient = 1 / zero; total += value[0] + quotient; \
+                     } return total; }",
+                "integer division by zero",
+            ),
+            (
+                "internal List<int> Make() { List<int> values = new List<int>(); \
+                     values.Add(42); return values; } \
+                 public int Run() { int total = 0; for (int i = 0; i < 2; i++) { \
+                     List<int> values = Make(); total += values.Get(2); \
+                 } return total; }",
+                "List.Get index 2 is out of bounds",
+            ),
+        ];
+
+        for (source, expected_error) in cases {
+            let module = compile(source);
+            assert!(module.functions.iter().any(|function| {
+                function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.instructions)
+                    .any(|instruction| {
+                        matches!(instruction, mir::Instruction::OwnedRegionEnter { .. })
+                    })
+            }));
+            let (prepared, run) = prepare(&module, "Run");
+            let mut context = aster_runtime::ExecutionContext::with_stats();
+            for _ in 0..2 {
+                let _ = prepared
+                    .invoke_with_test_context(run, &mut context)
+                    .expect("controlled owned-region failure returns a neutral ABI result");
+                let error = context
+                    .take_error()
+                    .expect("first runtime error is preserved");
+                assert!(error.contains(expected_error), "unexpected error: {error}");
+                assert_eq!(context.memory_stats().used_bytes, 0);
+            }
+        }
+    }
+
+    #[test]
     fn generated_array_bounds_failure_runs_fine_cleanup_before_host_teardown() {
         let array_type = mir::Type::Array(Box::new(mir::Type::Int));
         let array = mir::Operand {

@@ -114,6 +114,45 @@ pub(super) fn analyze(module: &mir::Module) -> LifetimeAnalysisReport {
     }
 }
 
+/// One immutable view of the existing MIR liveness solution for a function.
+/// The owned-region planner reuses it for every candidate call result.
+pub(super) struct ReferenceLiveness {
+    function: mir::SymbolId,
+    analysis: Option<FunctionLiveness>,
+}
+
+pub(super) fn reference_liveness(function: &mir::Function) -> ReferenceLiveness {
+    ReferenceLiveness {
+        function: function.symbol,
+        analysis: FunctionLiveness::build(function),
+    }
+}
+
+impl ReferenceLiveness {
+    /// Apply the existing MIR liveness authority to a call result. The call
+    /// site acts as the definition point; no region classification is inferred.
+    pub(super) fn dead_after(
+        &self,
+        block: mir::BasicBlockId,
+        instruction_index: usize,
+        aliases: &[mir::LocalId],
+    ) -> Vec<mir::MirPoint> {
+        self.analysis
+            .as_ref()
+            .and_then(|analysis| {
+                analysis.reference_dead_after(
+                    mir::MirAllocationSite {
+                        function: self.function,
+                        block,
+                        instruction_index,
+                    },
+                    aliases,
+                )
+            })
+            .unwrap_or_default()
+    }
+}
+
 fn duplicate_function_symbols(module: &mir::Module) -> HashSet<mir::SymbolId> {
     let mut seen = HashSet::new();
     let mut duplicates = HashSet::new();
@@ -425,7 +464,9 @@ fn instruction_access(
 ) -> Option<Access> {
     let mut access = Access::empty(locals.len());
     match instruction {
-        mir::Instruction::TemporarySubregionEnter { .. }
+        mir::Instruction::OwnedRegionEnter { .. }
+        | mir::Instruction::OwnedRegionExit { .. }
+        | mir::Instruction::TemporarySubregionEnter { .. }
         | mir::Instruction::TemporarySubregionExit { .. } => {}
         mir::Instruction::Assign { target, value } => {
             read_rvalue(value, locals, &mut access.uses)?;

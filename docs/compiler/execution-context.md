@@ -29,11 +29,12 @@ Escape analysis selects a region for compiler-known dynamic allocations; see
 [memory management](memory-management.md). It is not a promise that a future long-lived or AOT
 runtime will use the same policy.
 
-Escaping and uncertain values may remain reserved even after they become
-unreachable during the invocation. That is intentional conservative retention,
-not a per-value leak diagnosis. Every worker execution owns a separate context,
-so its arenas, error state, and retained values cannot be shared with another
-worker or the caller.
+Fresh return-only values in one accepted repeated shape can use a compiler-proven owned Persistent
+slice and rewind after their complete alias closure dies. Other escaping and uncertain values may
+remain reserved even after they become unreachable during the invocation. That is intentional
+conservative retention, not a per-value leak diagnosis. Every worker execution owns a separate
+context, so its arenas, error state, and retained values cannot be shared with another worker or
+the caller.
 
 ## Object ABI
 

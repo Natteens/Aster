@@ -462,7 +462,9 @@ fn instruction_is_legal(instruction: &mir::Instruction, candidate: &Candidate) -
                 && place_is_legal(ok_destination, candidate)
         }
         mir::Instruction::TemporarySubregionEnter { .. }
-        | mir::Instruction::TemporarySubregionExit { .. } => true,
+        | mir::Instruction::TemporarySubregionExit { .. }
+        | mir::Instruction::OwnedRegionEnter { .. }
+        | mir::Instruction::OwnedRegionExit { .. } => true,
     }
 }
 
@@ -783,7 +785,9 @@ fn rewrite_instruction(
             rewrite_place(ok_destination, fields);
         }
         mir::Instruction::TemporarySubregionEnter { .. }
-        | mir::Instruction::TemporarySubregionExit { .. } => {}
+        | mir::Instruction::TemporarySubregionExit { .. }
+        | mir::Instruction::OwnedRegionEnter { .. }
+        | mir::Instruction::OwnedRegionExit { .. } => {}
     }
 }
 

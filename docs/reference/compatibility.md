@@ -32,6 +32,12 @@ hypothetical unoptimized execution. An eliminated or replaced unobservable alloc
 former resource-failure point; observable operations and allocations that still execute retain
 their established ordering and controlled-failure behavior.
 
+Compiler-proven last-use reclamation is likewise not a source-semantic change: references keep
+their documented identity, copy, equality, and mutation behavior while live. An owned-region
+rewind occurs only after the complete proven alias closure is dead, does not move live storage, and
+does not run finalizers. Shared, contained, cyclic, interface, cross-worker, and otherwise uncertain
+shapes retain the conservative execution-context lifetime.
+
 The absence of a diagnostic for an unsupported program is also not a promise that the behavior is
 supported. Unsupported execution must continue to fail before unsafe code generation.
 

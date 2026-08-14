@@ -94,6 +94,35 @@ fn rejects_namespace_that_disagrees_with_its_directory() {
 }
 
 #[test]
+fn cross_file_fresh_returns_receive_owned_region_mir() {
+    let project = Project::new("cross-file-owned-region");
+    project.write(
+        "factory/arrays.aster",
+        "public int[] Make(int value) { return [value]; }",
+    );
+    let root = project.main(
+        "using factory; public int Run() { int total = 0; for (int i = 0; i < 10; i++) { int[] value = Make(i); total += value[0]; } return total; }",
+    );
+    let compilation = compile_project(&root).expect("cross-file ownership project compiles");
+    let markers = compilation
+        .compilation
+        .mir
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            matches!(
+                instruction,
+                aster_compiler::mir::Instruction::OwnedRegionEnter { .. }
+                    | aster_compiler::mir::Instruction::OwnedRegionExit { .. }
+            )
+        })
+        .count();
+    assert_eq!(markers, 2);
+}
+
+#[test]
 fn using_loads_all_direct_files_in_stable_order() {
     let project = Project::new("multi-file");
     project.write(

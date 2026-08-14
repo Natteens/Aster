@@ -27,8 +27,9 @@ callee cannot invalidate a caller's temporary values.
 ## Escape analysis
 
 The compiler's memory-related optimization order is typed HIR, typed MIR, the safe loop-concat
-rewrite, escape-region assignment, local-object elimination, AARM ProductionV2 selection, and
-finally Cranelift validation and lowering. Escape analysis remains the lifetime authority. It:
+rewrite, escape-region assignment, local-object elimination, AARM ProductionV2 selection,
+long-lived owned-region selection, and finally Cranelift validation and lowering. Escape analysis
+remains the lifetime authority. It:
 
 1. tracks local aliases of class, array, list, dictionary, and string references;
 2. builds summaries for direct ASTER calls;
@@ -134,14 +135,58 @@ conservative compiler policy is deterministic: there is no source annotation, ru
 configuration, runtime profitability decision, or per-allocation AARM branch. It does not promise
 that every Temporary is reclaimed early or that every selected workload is universally faster.
 
+### Long-lived owned regions
+
+After AARM has finalized Temporary lifetime operations, the compiler may select a coarse slice of
+the existing Persistent arena for one fresh result returned by a direct ASTER call. Selection
+reuses the escape pass's call summaries and complete local alias closure, then reuses MIR liveness
+for the first boundary where every alias is dead. The initial production shape is deliberately
+narrow:
+
+- the call executes in a cyclic basic block and returns a concrete string, array, class, list, or
+  dictionary reference;
+- the producer takes only scalar parameters, has exactly one return-only Persistent allocation,
+  and every return path returns that allocation's alias family;
+- its full direct-call closure cannot allocate other Persistent storage, dispatch through an
+  interface, grow runtime-owned storage, or cross a worker boundary;
+- the owned span has no overlapping Persistent allocation, runtime collection growth, Temporary
+  subregion, interface call, or concurrency operation; and
+- the complete alias closure dies in that same block before the matching exit.
+
+The compiler emits explicit `OwnedRegionEnter` and `OwnedRegionExit` typed MIR. Exit carries the
+proven invalidated local closure. Region IDs are function-local compile-time identities. Backend
+validation requires balanced, unique, same-block regions, a matching reference-producing call,
+declared reference locals, complete direct-copy aliases, no unrelated direct or transitive
+Persistent effect inside the slice, and no use of an invalidated local before redefinition.
+Cranelift performs no alias or liveness inference: it maps validated operations to the private
+runtime checkpoint ABI and routes controlled failure through owned cleanup before ordinary
+function cleanup.
+
+The runtime checkpoints the Persistent `PagedArena`, so every allocation made by the producer and
+its callees in the selected family keeps a stable address until exit. Rewind zeroes/reuses storage,
+restores live-used accounting, preserves older Persistent values, and keeps existing page/governor
+capacity policy. Requested bytes and allocation counts remain cumulative facts about operations
+that executed. Calls with reachable Persistent ownership effects are a selection barrier, so
+normal generated regions cannot dynamically nest through recursion or reentrant ASTER calls. The
+runtime still keeps context-owned marks on a defensive LIFO stack; function-local IDs never reach
+that stack and identical IDs from different functions or specializations cannot collide. No global
+registry, reference counter, root scan, atomic operation, or per-access check exists.
+
+Any incomplete proof keeps ordinary Persistent lifetime. In particular, dynamically allocated
+reference-bearing class graphs, aggregate/enum containment, interface wrappers, reference
+parameters, overlapping fresh results, CFG-spanning aliases, collection growth through helpers,
+cycles, and worker crossings are not inferred as transfers. This conservative retention is the
+safety behavior, not a fallback collector.
+
 ## Collections and strings
 
 An array header and its element buffer always use the same arena. Rewinding
 cannot leave a live header pointing at reclaimed element storage.
 
 `List<T>` and `Dictionary<K,V>` headers and their current backing buffers also share one selected
-region. Growth can retain older arena buffers until the containing temporary scope rewinds or the
-execution context is dropped; there is no individual deallocation. A direct ASTER helper proven to
+region. Growth can retain older arena buffers until the containing temporary scope rewinds, the
+containing compiler-owned Persistent slice rewinds, or the execution context is dropped; there is
+no individual deallocation. A direct ASTER helper proven to
 perform only scalar work plus direct `List.Add`, `Dictionary.Add`, or `Dictionary.Set` on a
 caller-owned collection does not create a nested Temporary scope, so that caller header and its
 growth backing can remain Temporary. Helpers with their own dynamic allocation, call, alias, read,
@@ -212,6 +257,10 @@ timed samples. It verifies the checksum, the per-category allocation counts, the
 expected region, and the temporary and persistent `used_bytes` invariants, and
 emits a structured JSON document.
 
+The single-family Persistent object, array, and string workloads exercise owned-region rewind and
+finish with zero live used bytes. The overlapping mixed Persistent workload exercises conservative
+fallback and retains live used bytes through context teardown.
+
 ```console
 cargo run --release -p aster-codegen-cranelift --example memory_matrix -- --scale small,medium
 cargo run --release -p aster-codegen-cranelift --example memory_matrix -- --scale small --json
@@ -248,16 +297,18 @@ behavior or the stable `--memory-stats` output.
 
 ## Current boundary
 
-This model is designed for one bounded JIT execution. ASTER does not yet
-provide long-lived ownership, individual deallocation, reference counting, or
-a garbage collector. Pages are released when the `ExecutionContext` is
-dropped. Future ownership work must preserve the explicit MIR region contract
-and controlled runtime boundary.
+This model is designed for one bounded JIT execution. ASTER provides a narrow
+compiler-proven long-lived owned-region mechanism, but no general individual
+deallocation, reference counting, tracing garbage collector, finalizers, or
+source ownership syntax. Arena pages remain owned by the `ExecutionContext`;
+rewound capacity is reused and follows the existing delayed-purge/governor
+policy, while all remaining pages are released when the context is dropped.
 
-An escaping or uncertain allocation can therefore remain reserved after it is
-no longer reachable by source code. This is intentional conservative retention
-for the current execution, not an automatic leak classification. Cycles are
-safe for the same reason: they remain context-owned until teardown.
+An escaping or uncertain allocation outside the accepted proof can therefore
+remain reserved after it is no longer reachable by source code. This is
+intentional conservative retention for the current execution, not an automatic
+leak classification. Cycles are safe for the same reason: they remain
+context-owned until teardown.
 
 Reference counting and non-moving tracing are both deferred. RC would need
 correct accounting for every copied aggregate, collection entry, interface,

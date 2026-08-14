@@ -177,6 +177,8 @@ fn instruction_can_fail_without_calling_aster(instruction: &mir::Instruction) ->
         | mir::Instruction::CallInterface { .. } => false,
         mir::Instruction::TemporarySubregionEnter { .. }
         | mir::Instruction::TemporarySubregionExit { .. }
+        | mir::Instruction::OwnedRegionEnter { .. }
+        | mir::Instruction::OwnedRegionExit { .. }
         | mir::Instruction::CallIntrinsic { .. }
         | mir::Instruction::AllocateArray { .. }
         | mir::Instruction::AllocateObject { .. }

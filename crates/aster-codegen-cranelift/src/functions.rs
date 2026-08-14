@@ -45,6 +45,12 @@ impl Codegen {
             .is_some()
             .then(|| fine_active_instruction_positions(function))
             .transpose()?;
+        let owned_runtime_failure =
+            function_contains_owned_regions(function).then(|| builder.create_block());
+        let owned_active_instructions = owned_runtime_failure
+            .is_some()
+            .then(|| owned_active_instruction_positions(function))
+            .transpose()?;
         let mut state = FunctionState {
             slots: HashMap::new(),
             execution_context: None,
@@ -118,7 +124,12 @@ impl Codegen {
                 builder.ins().call(function_ref, &[context]);
             }
             for (instruction_index, instruction) in block.instructions.iter().enumerate() {
-                state.runtime_failure = if fine_active_instructions
+                state.runtime_failure = if owned_active_instructions
+                    .as_ref()
+                    .is_some_and(|positions| positions.contains(&(block.id, instruction_index)))
+                {
+                    owned_runtime_failure.expect("owned failure block exists")
+                } else if fine_active_instructions
                     .as_ref()
                     .is_some_and(|positions| positions.contains(&(block.id, instruction_index)))
                 {
@@ -133,6 +144,11 @@ impl Codegen {
         if let Some(fine_runtime_failure) = fine_runtime_failure {
             builder.switch_to_block(fine_runtime_failure);
             self.leave_temporary_subregion(builder, &state)?;
+            builder.ins().jump(runtime_failure, &[]);
+        }
+        if let Some(owned_runtime_failure) = owned_runtime_failure {
+            builder.switch_to_block(owned_runtime_failure);
+            self.leave_owned_region(builder, &state)?;
             builder.ins().jump(runtime_failure, &[]);
         }
         builder.switch_to_block(runtime_failure);
@@ -189,6 +205,21 @@ impl Codegen {
         state: &FunctionState,
     ) -> Result<(), BackendError> {
         match instruction {
+            mir::Instruction::OwnedRegionEnter { .. } => {
+                let context = state.execution_context.ok_or_else(|| {
+                    BackendError::new("owned region is missing its ExecutionContext")
+                })?;
+                let function_ref = self.jit.declare_func_in_func(
+                    self.runtime_ids["aster_rt_owned_region_enter"],
+                    builder.func,
+                );
+                builder.ins().call(function_ref, &[context]);
+                self.continue_if_runtime_ok(builder, state)
+            }
+            mir::Instruction::OwnedRegionExit { .. } => {
+                self.leave_owned_region(builder, state)?;
+                self.continue_if_runtime_ok(builder, state)
+            }
             mir::Instruction::TemporarySubregionEnter { .. } => {
                 let context = state.execution_context.ok_or_else(|| {
                     BackendError::new("temporary subregion is missing its ExecutionContext")
@@ -469,6 +500,51 @@ fn function_contains_temporary_subregions(function: &mir::Function) -> bool {
                     | mir::Instruction::TemporarySubregionExit { .. }
             )
         })
+}
+
+fn function_contains_owned_regions(function: &mir::Function) -> bool {
+    function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .any(|instruction| {
+            matches!(
+                instruction,
+                mir::Instruction::OwnedRegionEnter { .. }
+                    | mir::Instruction::OwnedRegionExit { .. }
+            )
+        })
+}
+
+fn owned_active_instruction_positions(
+    function: &mir::Function,
+) -> Result<HashSet<(mir::BasicBlockId, usize)>, BackendError> {
+    let mut positions = HashSet::new();
+    for block in &function.blocks {
+        let mut active = None;
+        for (index, instruction) in block.instructions.iter().enumerate() {
+            match instruction {
+                mir::Instruction::OwnedRegionEnter { id } if active.replace(*id).is_none() => {}
+                mir::Instruction::OwnedRegionExit { id, .. } if active == Some(*id) => {
+                    active = None;
+                }
+                mir::Instruction::OwnedRegionEnter { .. }
+                | mir::Instruction::OwnedRegionExit { .. } => {
+                    return Err(BackendError::new("malformed executable owned region"));
+                }
+                _ if active.is_some() => {
+                    positions.insert((block.id, index));
+                }
+                _ => {}
+            }
+        }
+        if active.is_some() {
+            return Err(BackendError::new(
+                "executable owned region crosses a basic-block boundary",
+            ));
+        }
+    }
+    Ok(positions)
 }
 
 /// The backend validator has already established that executable subregions

@@ -67,6 +67,7 @@ and observable behavior understandable.
 ## Status and open questions
 
 The compiler is experimental and does not promise source or semantic stability before 1.0.
-Platform guarantees, long-lived ownership, unsafe boundaries, concurrency, and AOT distribution
-remain design work. Accepted behavior belongs in reference documentation; unresolved proposals are
-tracked in [Open questions](10-open-questions.md) and future work in the [roadmap](../roadmap.md).
+Platform guarantees, general source-visible ownership, unsafe boundaries, concurrency, and AOT
+distribution remain design work. Accepted behavior belongs in reference documentation; unresolved
+proposals are tracked in [Open questions](10-open-questions.md) and future work in the
+[roadmap](../roadmap.md).

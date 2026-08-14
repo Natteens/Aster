@@ -330,7 +330,7 @@ fn verify_counts(workload: &Workload, iterations: u64, stats: &MemoryStats) -> R
     Ok(())
 }
 
-fn verify_region_invariants(region: Region, stats: &MemoryStats) -> Result<(), String> {
+fn verify_region_invariants(case: &str, region: Region, stats: &MemoryStats) -> Result<(), String> {
     if stats.peak_used_bytes == 0 {
         return Err(String::from("peak used bytes never rose above zero"));
     }
@@ -344,9 +344,16 @@ fn verify_region_invariants(region: Region, stats: &MemoryStats) -> Result<(), S
             }
         }
         Region::Persistent => {
-            if stats.used_bytes == 0 {
+            let owned_return_only = matches!(case, "object" | "array" | "string");
+            if owned_return_only && stats.used_bytes != 0 {
+                return Err(format!(
+                    "owned Persistent workload retained {} used bytes",
+                    stats.used_bytes
+                ));
+            }
+            if !owned_return_only && stats.used_bytes == 0 {
                 return Err(String::from(
-                    "persistent workload unexpectedly retained zero used bytes",
+                    "overlapping Persistent workload unexpectedly retained zero used bytes",
                 ));
             }
             if stats.peak_used_bytes < stats.used_bytes {
@@ -448,7 +455,7 @@ fn run_case(
     if let Err(error) = verify_counts(workload, iterations, &warmup_stats) {
         return make_failure(Some(checksum), Some(warmup_stats), error);
     }
-    if let Err(error) = verify_region_invariants(workload.region, &warmup_stats) {
+    if let Err(error) = verify_region_invariants(workload.case, workload.region, &warmup_stats) {
         return make_failure(Some(checksum), Some(warmup_stats), error);
     }
 

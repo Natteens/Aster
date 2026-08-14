@@ -105,10 +105,12 @@ pub(super) fn validate_module(module: &mir::Module) -> Result<(), BackendError> 
         .collect::<HashSet<_>>();
     let (interface_methods, implementations) =
         validate_interface_metadata(module, &signatures, &classes)?;
+    let owned_effects = owned_region_effects(module, &signatures);
     for function in &module.functions {
         validate_function(
             function,
             &signatures,
+            &owned_effects,
             &classes,
             &structs,
             &interfaces,
@@ -581,6 +583,7 @@ fn validate_interface_metadata<'a>(
 fn validate_function(
     function: &mir::Function,
     signatures: &HashMap<mir::SymbolId, &mir::Function>,
+    owned_effects: &HashMap<mir::SymbolId, bool>,
     classes: &HashSet<mir::SymbolId>,
     structs: &HashSet<mir::SymbolId>,
     interfaces: &HashSet<mir::SymbolId>,
@@ -595,6 +598,7 @@ fn validate_function(
         ));
     }
     validate_executable_temporary_subregions(function)?;
+    validate_executable_owned_regions(function, owned_effects)?;
     if let Some(owner) = function.owner {
         if !classes.contains(&owner) && !structs.contains(&owner) {
             return Err(BackendError::new(format!(
@@ -676,7 +680,9 @@ fn validate_instruction(
 ) -> Result<(), BackendError> {
     match instruction {
         mir::Instruction::TemporarySubregionEnter { .. }
-        | mir::Instruction::TemporarySubregionExit { .. } => Ok(()),
+        | mir::Instruction::TemporarySubregionExit { .. }
+        | mir::Instruction::OwnedRegionEnter { .. }
+        | mir::Instruction::OwnedRegionExit { .. } => Ok(()),
         mir::Instruction::Assign { target, value } => {
             validate_assign(target, value, function_name, locals, implementations)
         }
@@ -897,6 +903,600 @@ fn validate_instruction(
 }
 
 #[allow(clippy::too_many_lines)]
+fn validate_executable_owned_regions(
+    function: &mir::Function,
+    effects: &HashMap<mir::SymbolId, bool>,
+) -> Result<(), BackendError> {
+    let locals = function
+        .parameters
+        .iter()
+        .chain(&function.locals)
+        .map(|local| (local.id, &local.type_))
+        .collect::<HashMap<_, _>>();
+    let mut entered = HashSet::new();
+
+    for block in &function.blocks {
+        let mut active: Option<(mir::OwnedRegionId, HashSet<mir::LocalId>)> = None;
+        for instruction in &block.instructions {
+            match instruction {
+                mir::Instruction::OwnedRegionEnter { id } => {
+                    if active.is_some() || !entered.insert(*id) {
+                        return Err(unsupported(
+                            &function.name,
+                            "nested or duplicate executable owned-region enter",
+                        ));
+                    }
+                    active = Some((*id, HashSet::new()));
+                }
+                mir::Instruction::OwnedRegionExit { id, invalidated } => {
+                    let Some((active_id, produced)) = active.take() else {
+                        return Err(unsupported(
+                            &function.name,
+                            "owned-region exit without a matching enter",
+                        ));
+                    };
+                    let invalidated_set = invalidated.iter().copied().collect::<HashSet<_>>();
+                    if active_id != *id
+                        || invalidated.is_empty()
+                        || invalidated_set.len() != invalidated.len()
+                        || invalidated_set.iter().any(|local| {
+                            locals
+                                .get(local)
+                                .is_none_or(|type_| !owned_region_result_type(type_))
+                        })
+                        || produced.is_empty()
+                        || !produced.is_subset(&invalidated_set)
+                    {
+                        return Err(unsupported(
+                            &function.name,
+                            "mismatched executable owned-region exit",
+                        ));
+                    }
+                }
+                mir::Instruction::TemporarySubregionEnter { .. }
+                | mir::Instruction::TemporarySubregionExit { .. }
+                    if active.is_some() =>
+                {
+                    return Err(unsupported(
+                        &function.name,
+                        "Temporary reclaim inside an executable owned region",
+                    ));
+                }
+                instruction if active.is_some() => {
+                    let (_, aliases) = active.as_mut().expect("owned region is active");
+                    if aliases.is_empty() {
+                        let mir::Instruction::Call {
+                            destination: Some(mir::Place::Local(destination)),
+                            return_type,
+                            ..
+                        } = instruction
+                        else {
+                            return Err(unsupported(
+                                &function.name,
+                                "owned-region checkpoint not followed by its producer call",
+                            ));
+                        };
+                        if !owned_region_result_type(return_type) {
+                            return Err(unsupported(
+                                &function.name,
+                                "owned-region producer with a non-reference result",
+                            ));
+                        }
+                        aliases.insert(*destination);
+                        continue;
+                    }
+                    if owned_region_barrier(instruction, effects) {
+                        return Err(unsupported(
+                            &function.name,
+                            "unrelated Persistent effect inside an executable owned region",
+                        ));
+                    }
+                    if let mir::Instruction::Assign {
+                        target: mir::Place::Local(destination),
+                        value,
+                    } = instruction
+                        && owned_alias_source(value, aliases)
+                    {
+                        aliases.insert(*destination);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if active.is_some() {
+            return Err(unsupported(
+                &function.name,
+                "executable owned region crosses a basic-block boundary",
+            ));
+        }
+    }
+
+    if entered.is_empty() {
+        return Ok(());
+    }
+    validate_owned_region_invalidated_uses(function)
+}
+
+fn owned_region_effects(
+    module: &mir::Module,
+    signatures: &HashMap<mir::SymbolId, &mir::Function>,
+) -> HashMap<mir::SymbolId, bool> {
+    // This is a fail-closed check over the explicit typed MIR contract, not a
+    // second ownership selector: source aliases and last-use stay compiler-owned.
+    let mut effects = module
+        .functions
+        .iter()
+        .map(|function| {
+            let direct = function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .any(|instruction| match instruction {
+                    mir::Instruction::Call { function, .. } => !signatures.contains_key(function),
+                    _ => owned_region_direct_barrier(instruction),
+                });
+            (function.symbol, direct)
+        })
+        .collect::<HashMap<_, _>>();
+
+    loop {
+        let mut changed = false;
+        for function in &module.functions {
+            if effects[&function.symbol] {
+                continue;
+            }
+            let transitive = function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .any(|instruction| {
+                    matches!(instruction,
+                        mir::Instruction::Call { function, .. }
+                            if effects.get(function).copied().unwrap_or(true))
+                });
+            if transitive {
+                effects.insert(function.symbol, true);
+                changed = true;
+            }
+        }
+        if !changed {
+            return effects;
+        }
+    }
+}
+
+fn owned_region_barrier(
+    instruction: &mir::Instruction,
+    effects: &HashMap<mir::SymbolId, bool>,
+) -> bool {
+    match instruction {
+        mir::Instruction::Call { function, .. } => effects.get(function).copied().unwrap_or(true),
+        _ => owned_region_direct_barrier(instruction),
+    }
+}
+
+fn owned_region_direct_barrier(instruction: &mir::Instruction) -> bool {
+    let persistent_allocation = match instruction {
+        mir::Instruction::AllocateObject { region, .. }
+        | mir::Instruction::AllocateArray { region, .. }
+        | mir::Instruction::AllocateList { region, .. }
+        | mir::Instruction::AllocateDictionary { region, .. }
+        | mir::Instruction::AllocateStringBuilder { region, .. }
+        | mir::Instruction::StringBuilderToString { region, .. }
+        | mir::Instruction::DictionaryEntries { region, .. } => {
+            *region == mir::AllocationRegion::Persistent
+        }
+        mir::Instruction::CallIntrinsic { intrinsic, .. } => {
+            intrinsic.allocation_region() == Some(mir::AllocationRegion::Persistent)
+                || is_concurrency_intrinsic(*intrinsic)
+        }
+        _ => false,
+    };
+    persistent_allocation
+        || matches!(
+            instruction,
+            mir::Instruction::CallInterface { .. }
+                | mir::Instruction::ListAdd { .. }
+                | mir::Instruction::DictionaryAdd { .. }
+                | mir::Instruction::DictionarySet { .. }
+                | mir::Instruction::StringBuilderAppend { .. }
+        )
+}
+
+fn owned_alias_source(value: &mir::Rvalue, aliases: &HashSet<mir::LocalId>) -> bool {
+    matches!(
+        &value.kind,
+        mir::RvalueKind::Use(mir::Operand {
+            kind: mir::OperandKind::Copy(mir::Place::Local(local)),
+            ..
+        }) | mir::RvalueKind::Cast(mir::Operand {
+            kind: mir::OperandKind::Copy(mir::Place::Local(local)),
+            ..
+        }) if owned_region_result_type(&value.type_) && aliases.contains(local)
+    )
+}
+
+fn owned_region_result_type(type_: &mir::Type) -> bool {
+    matches!(
+        type_,
+        mir::Type::String
+            | mir::Type::Array(_)
+            | mir::Type::Class(_)
+            | mir::Type::List(_)
+            | mir::Type::Dictionary(_, _)
+    )
+}
+
+fn validate_owned_region_invalidated_uses(function: &mir::Function) -> Result<(), BackendError> {
+    let blocks = function
+        .blocks
+        .iter()
+        .map(|block| (block.id, block))
+        .collect::<HashMap<_, _>>();
+    let mut incoming = HashMap::from([(function.entry, HashSet::<mir::LocalId>::new())]);
+    let mut pending = vec![function.entry];
+    while let Some(block_id) = pending.pop() {
+        let Some(block) = blocks.get(&block_id) else {
+            return Err(unsupported(&function.name, "malformed owned-region CFG"));
+        };
+        let mut invalid = incoming[&block_id].clone();
+        for instruction in &block.instructions {
+            let mut reads = HashSet::new();
+            owned_instruction_reads(instruction, &mut reads);
+            if reads.iter().any(|local| invalid.contains(local)) {
+                return Err(unsupported(
+                    &function.name,
+                    "use of a reclaimed owned-region local before redefinition",
+                ));
+            }
+            let mut definitions = HashSet::new();
+            owned_instruction_definitions(instruction, &mut definitions);
+            invalid.retain(|local| !definitions.contains(local));
+            if let mir::Instruction::OwnedRegionExit { invalidated, .. } = instruction {
+                invalid.extend(invalidated.iter().copied());
+            }
+        }
+        let mut terminator_reads = HashSet::new();
+        match &block.terminator {
+            mir::Terminator::Branch { condition, .. }
+            | mir::Terminator::Return(Some(condition)) => {
+                owned_operand_reads(condition, &mut terminator_reads);
+            }
+            _ => {}
+        }
+        if terminator_reads.iter().any(|local| invalid.contains(local)) {
+            return Err(unsupported(
+                &function.name,
+                "use of a reclaimed owned-region local in a terminator",
+            ));
+        }
+        let successors = match block.terminator {
+            mir::Terminator::Goto(target) => vec![target],
+            mir::Terminator::Branch {
+                then_block,
+                else_block,
+                ..
+            } => vec![then_block, else_block],
+            mir::Terminator::Return(_) | mir::Terminator::End | mir::Terminator::Unreachable => {
+                Vec::new()
+            }
+        };
+        for successor in successors {
+            if !blocks.contains_key(&successor) {
+                return Err(unsupported(&function.name, "malformed owned-region CFG"));
+            }
+            if let Some(state) = incoming.get_mut(&successor) {
+                let old_len = state.len();
+                state.extend(invalid.iter().copied());
+                if state.len() != old_len {
+                    pending.push(successor);
+                }
+            } else {
+                incoming.insert(successor, invalid.clone());
+                pending.push(successor);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn owned_instruction_reads(instruction: &mir::Instruction, reads: &mut HashSet<mir::LocalId>) {
+    match instruction {
+        mir::Instruction::OwnedRegionEnter { .. }
+        | mir::Instruction::OwnedRegionExit { .. }
+        | mir::Instruction::TemporarySubregionEnter { .. }
+        | mir::Instruction::TemporarySubregionExit { .. } => {}
+        mir::Instruction::Assign { target, value } => {
+            if !matches!(target, mir::Place::Local(_)) {
+                owned_place_reads(target, reads);
+            }
+            owned_rvalue_reads(value, reads);
+        }
+        mir::Instruction::Call {
+            destination,
+            arguments,
+            ..
+        }
+        | mir::Instruction::CallIntrinsic {
+            destination,
+            arguments,
+            ..
+        } => {
+            if let Some(destination) = destination
+                && !matches!(destination, mir::Place::Local(_))
+            {
+                owned_place_reads(destination, reads);
+            }
+            for argument in arguments {
+                owned_operand_reads(argument, reads);
+            }
+        }
+        mir::Instruction::CallInterface {
+            destination,
+            receiver,
+            arguments,
+            ..
+        } => {
+            if let Some(destination) = destination
+                && !matches!(destination, mir::Place::Local(_))
+            {
+                owned_place_reads(destination, reads);
+            }
+            owned_operand_reads(receiver, reads);
+            for argument in arguments {
+                owned_operand_reads(argument, reads);
+            }
+        }
+        mir::Instruction::AllocateArray {
+            destination,
+            length,
+            ..
+        } => {
+            if !matches!(destination, mir::Place::Local(_)) {
+                owned_place_reads(destination, reads);
+            }
+            owned_operand_reads(length, reads);
+        }
+        mir::Instruction::AllocateObject { destination, .. }
+        | mir::Instruction::AllocateList { destination, .. }
+        | mir::Instruction::AllocateDictionary { destination, .. }
+        | mir::Instruction::AllocateStringBuilder { destination, .. } => {
+            owned_destination_reads(destination, reads);
+        }
+        mir::Instruction::StringBuilderAppend { builder, value, .. } => {
+            owned_operand_reads(builder, reads);
+            owned_operand_reads(value, reads);
+        }
+        mir::Instruction::StringBuilderToString {
+            destination,
+            builder,
+            ..
+        } => {
+            if !matches!(destination, mir::Place::Local(_)) {
+                owned_place_reads(destination, reads);
+            }
+            owned_operand_reads(builder, reads);
+        }
+        mir::Instruction::DictionaryAdd {
+            destination,
+            dictionary,
+            key,
+            value,
+        }
+        | mir::Instruction::DictionarySet {
+            destination,
+            dictionary,
+            key,
+            value,
+        } => {
+            owned_destination_reads(destination, reads);
+            owned_operand_reads(dictionary, reads);
+            owned_operand_reads(key, reads);
+            owned_operand_reads(value, reads);
+        }
+        mir::Instruction::DictionaryTryGet {
+            destination,
+            dictionary,
+            key,
+            ..
+        }
+        | mir::Instruction::DictionaryContainsKey {
+            destination,
+            dictionary,
+            key,
+        }
+        | mir::Instruction::DictionaryRemove {
+            destination,
+            dictionary,
+            key,
+        } => {
+            owned_destination_reads(destination, reads);
+            owned_operand_reads(dictionary, reads);
+            owned_operand_reads(key, reads);
+        }
+        mir::Instruction::DictionaryEntries {
+            destination,
+            dictionary,
+            ..
+        } => {
+            owned_destination_reads(destination, reads);
+            owned_operand_reads(dictionary, reads);
+        }
+        mir::Instruction::ListAdd { list, value } => {
+            owned_operand_reads(list, reads);
+            owned_operand_reads(value, reads);
+        }
+        mir::Instruction::ListGet {
+            destination,
+            list,
+            index,
+            ..
+        } => {
+            owned_destination_reads(destination, reads);
+            owned_operand_reads(list, reads);
+            owned_operand_reads(index, reads);
+        }
+        mir::Instruction::ListRemoveAt { list, index } => {
+            owned_operand_reads(list, reads);
+            owned_operand_reads(index, reads);
+        }
+        mir::Instruction::StringDecodeNext {
+            string,
+            cursor,
+            char_destination,
+            next_cursor_destination,
+            ok_destination,
+        } => {
+            owned_operand_reads(string, reads);
+            owned_operand_reads(cursor, reads);
+            owned_destination_reads(char_destination, reads);
+            owned_destination_reads(next_cursor_destination, reads);
+            owned_destination_reads(ok_destination, reads);
+        }
+    }
+}
+
+fn owned_instruction_definitions(
+    instruction: &mir::Instruction,
+    definitions: &mut HashSet<mir::LocalId>,
+) {
+    match instruction {
+        mir::Instruction::Assign { target, .. }
+        | mir::Instruction::AllocateArray {
+            destination: target,
+            ..
+        }
+        | mir::Instruction::AllocateObject {
+            destination: target,
+            ..
+        }
+        | mir::Instruction::AllocateList {
+            destination: target,
+            ..
+        }
+        | mir::Instruction::AllocateDictionary {
+            destination: target,
+            ..
+        }
+        | mir::Instruction::AllocateStringBuilder {
+            destination: target,
+            ..
+        }
+        | mir::Instruction::StringBuilderToString {
+            destination: target,
+            ..
+        }
+        | mir::Instruction::DictionaryAdd {
+            destination: target,
+            ..
+        }
+        | mir::Instruction::DictionarySet {
+            destination: target,
+            ..
+        }
+        | mir::Instruction::DictionaryTryGet {
+            destination: target,
+            ..
+        }
+        | mir::Instruction::DictionaryContainsKey {
+            destination: target,
+            ..
+        }
+        | mir::Instruction::DictionaryRemove {
+            destination: target,
+            ..
+        }
+        | mir::Instruction::DictionaryEntries {
+            destination: target,
+            ..
+        }
+        | mir::Instruction::ListGet {
+            destination: target,
+            ..
+        } => owned_place_definition(target, definitions),
+        mir::Instruction::Call { destination, .. }
+        | mir::Instruction::CallInterface { destination, .. }
+        | mir::Instruction::CallIntrinsic { destination, .. } => {
+            if let Some(destination) = destination {
+                owned_place_definition(destination, definitions);
+            }
+        }
+        mir::Instruction::StringDecodeNext {
+            char_destination,
+            next_cursor_destination,
+            ok_destination,
+            ..
+        } => {
+            owned_place_definition(char_destination, definitions);
+            owned_place_definition(next_cursor_destination, definitions);
+            owned_place_definition(ok_destination, definitions);
+        }
+        _ => {}
+    }
+}
+
+fn owned_place_definition(place: &mir::Place, definitions: &mut HashSet<mir::LocalId>) {
+    if let mir::Place::Local(local) = place {
+        definitions.insert(*local);
+    }
+}
+
+fn owned_destination_reads(place: &mir::Place, reads: &mut HashSet<mir::LocalId>) {
+    if !matches!(place, mir::Place::Local(_)) {
+        owned_place_reads(place, reads);
+    }
+}
+
+fn owned_rvalue_reads(value: &mir::Rvalue, reads: &mut HashSet<mir::LocalId>) {
+    match &value.kind {
+        mir::RvalueKind::Use(operand)
+        | mir::RvalueKind::Discriminant(operand)
+        | mir::RvalueKind::ArrayLength(operand)
+        | mir::RvalueKind::ListLength(operand)
+        | mir::RvalueKind::DictionaryLength(operand)
+        | mir::RvalueKind::ListVersion(operand)
+        | mir::RvalueKind::StringByteLength(operand)
+        | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Unary { operand, .. } => owned_operand_reads(operand, reads),
+        mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
+            for field in fields {
+                owned_operand_reads(&field.value, reads);
+            }
+        }
+        mir::RvalueKind::MakeInterface { object, .. } => owned_operand_reads(object, reads),
+        mir::RvalueKind::Binary { left, right, .. }
+        | mir::RvalueKind::Equality { left, right, .. } => {
+            owned_operand_reads(left, reads);
+            owned_operand_reads(right, reads);
+        }
+    }
+}
+
+fn owned_operand_reads(operand: &mir::Operand, reads: &mut HashSet<mir::LocalId>) {
+    if let mir::OperandKind::Copy(place) = &operand.kind {
+        owned_place_reads(place, reads);
+    }
+}
+
+fn owned_place_reads(place: &mir::Place, reads: &mut HashSet<mir::LocalId>) {
+    match place {
+        mir::Place::Local(local) => {
+            reads.insert(*local);
+        }
+        mir::Place::Field { base, .. } | mir::Place::EnumField { base, .. } => {
+            owned_place_reads(base, reads);
+        }
+        mir::Place::Index { array, index, .. } => {
+            owned_operand_reads(array, reads);
+            owned_operand_reads(index, reads);
+        }
+        mir::Place::ObjectField { object, .. } => owned_operand_reads(object, reads),
+        mir::Place::Symbol(_) => {}
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn validate_executable_temporary_subregions(function: &mir::Function) -> Result<(), BackendError> {
     let contains_subregion = function
         .blocks
@@ -921,7 +1521,7 @@ fn validate_executable_temporary_subregions(function: &mir::Function) -> Result<
             matches!(
                 instruction,
                 mir::Instruction::CallIntrinsic { intrinsic, .. }
-                    if is_temporary_subregion_concurrency_intrinsic(*intrinsic)
+                    if is_concurrency_intrinsic(*intrinsic)
             )
         })
     {
@@ -1501,6 +2101,8 @@ fn temporary_subregion_instruction_is_executable(instruction: &mir::Instruction)
         ),
         mir::Instruction::TemporarySubregionEnter { .. }
         | mir::Instruction::TemporarySubregionExit { .. }
+        | mir::Instruction::OwnedRegionEnter { .. }
+        | mir::Instruction::OwnedRegionExit { .. }
         | mir::Instruction::Call { .. }
         | mir::Instruction::CallInterface { .. }
         | mir::Instruction::AllocateList {
@@ -1709,7 +2311,7 @@ fn temporary_subregion_equality_type_is_executable(type_: &mir::Type) -> bool {
     )
 }
 
-fn is_temporary_subregion_concurrency_intrinsic(intrinsic: mir::Intrinsic) -> bool {
+fn is_concurrency_intrinsic(intrinsic: mir::Intrinsic) -> bool {
     matches!(
         intrinsic,
         mir::Intrinsic::TaskRun
@@ -3397,6 +3999,24 @@ fn unsupported(function_name: &str, feature: &str) -> BackendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const OWNED_REGION_SOURCE: &str = r"
+        internal int[] Make(int value) { return [value]; }
+        public int Main() {
+            int total = 0;
+            for (int i = 0; i < 10; i++) {
+                int[] value = Make(i);
+                total += value[0];
+            }
+            return total;
+        }
+    ";
+
+    fn owned_region_module() -> mir::Module {
+        aster_compiler::compile(OWNED_REGION_SOURCE)
+            .expect("owned-region validation source compiles")
+            .mir
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_STRING_BUILDER_ID: AtomicU64 = AtomicU64::new(0);
@@ -4199,6 +4819,287 @@ mod tests {
             "Parallel.Reduce always produces a value; a missing destination is malformed",
         );
         assert!(error.message().contains("malformed ParallelReduce"));
+    }
+
+    #[test]
+    fn compiler_owned_region_mir_is_valid() {
+        validate_module(&owned_region_module()).expect("compiler-owned region is valid");
+    }
+
+    #[test]
+    fn owned_region_rejects_wrong_id_unknown_local_and_double_exit() {
+        let valid = owned_region_module();
+
+        let mut wrong_id = valid.clone();
+        let exit = wrong_id
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|instruction| match instruction {
+                mir::Instruction::OwnedRegionExit { id, .. } => Some(id),
+                _ => None,
+            })
+            .expect("owned exit exists");
+        *exit = mir::OwnedRegionId(u32::MAX);
+        assert!(
+            validate_module(&wrong_id)
+                .expect_err("wrong owned id is rejected")
+                .message()
+                .contains("owned-region exit")
+        );
+
+        let mut unknown_local = valid.clone();
+        let invalidated = unknown_local
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|instruction| match instruction {
+                mir::Instruction::OwnedRegionExit { invalidated, .. } => Some(invalidated),
+                _ => None,
+            })
+            .expect("owned exit exists");
+        invalidated.push(mir::LocalId(u32::MAX));
+        assert!(
+            validate_module(&unknown_local)
+                .expect_err("unknown invalidated local is rejected")
+                .message()
+                .contains("owned-region exit")
+        );
+
+        let mut double_exit = valid;
+        let block = double_exit
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .find(|block| {
+                block.instructions.iter().any(|instruction| {
+                    matches!(instruction, mir::Instruction::OwnedRegionExit { .. })
+                })
+            })
+            .expect("owned block exists");
+        let exit = block
+            .instructions
+            .iter()
+            .find(|instruction| matches!(instruction, mir::Instruction::OwnedRegionExit { .. }))
+            .expect("owned exit exists")
+            .clone();
+        block.instructions.push(exit);
+        assert!(
+            validate_module(&double_exit)
+                .expect_err("double owned exit is rejected")
+                .message()
+                .contains("without a matching enter")
+        );
+    }
+
+    #[test]
+    fn owned_region_rejects_reclaimed_use_and_missing_producer_owner() {
+        let valid = owned_region_module();
+        let mut reclaimed_use = valid.clone();
+        let function = reclaimed_use
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Main")
+            .expect("Main exists");
+        let block = function
+            .blocks
+            .iter_mut()
+            .find(|block| {
+                block.instructions.iter().any(|instruction| {
+                    matches!(instruction, mir::Instruction::OwnedRegionExit { .. })
+                })
+            })
+            .expect("owned block exists");
+        let (exit_index, local) = block
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(index, instruction)| match instruction {
+                mir::Instruction::OwnedRegionExit { invalidated, .. } => {
+                    Some((index, invalidated[0]))
+                }
+                _ => None,
+            })
+            .expect("owned exit exists");
+        let type_ = function
+            .locals
+            .iter()
+            .chain(&function.parameters)
+            .find(|candidate| candidate.id == local)
+            .expect("invalidated local is declared")
+            .type_
+            .clone();
+        block.instructions.insert(
+            exit_index + 1,
+            mir::Instruction::Assign {
+                target: mir::Place::Local(local),
+                value: mir::Rvalue {
+                    type_: type_.clone(),
+                    kind: mir::RvalueKind::Use(mir::Operand {
+                        type_,
+                        kind: mir::OperandKind::Copy(mir::Place::Local(local)),
+                    }),
+                },
+            },
+        );
+        assert!(
+            validate_module(&reclaimed_use)
+                .expect_err("reclaimed local use is rejected")
+                .message()
+                .contains("before redefinition")
+        );
+
+        let mut no_owner = valid;
+        let block = no_owner
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .find(|block| {
+                block.instructions.iter().any(|instruction| {
+                    matches!(instruction, mir::Instruction::OwnedRegionEnter { .. })
+                })
+            })
+            .expect("owned block exists");
+        block.instructions.retain(|instruction| {
+            !matches!(
+                instruction,
+                mir::Instruction::Call {
+                    return_type: mir::Type::Array(_),
+                    ..
+                }
+            )
+        });
+        assert!(
+            validate_module(&no_owner)
+                .expect_err("owned region without producer is rejected")
+                .message()
+                .contains("producer call")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn owned_region_rejects_unrelated_persistent_effects_and_missing_aliases() {
+        let valid = owned_region_module();
+
+        let mut persistent_allocation = valid.clone();
+        let function = persistent_allocation
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Main")
+            .expect("Main exists");
+        let block = function
+            .blocks
+            .iter_mut()
+            .find(|block| {
+                block.instructions.iter().any(|instruction| {
+                    matches!(instruction, mir::Instruction::OwnedRegionExit { .. })
+                })
+            })
+            .expect("owned block exists");
+        let (exit_index, destination) = block
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(index, instruction)| match instruction {
+                mir::Instruction::OwnedRegionExit { invalidated, .. } => {
+                    Some((index, invalidated[0]))
+                }
+                _ => None,
+            })
+            .expect("owned exit exists");
+        block.instructions.insert(
+            exit_index,
+            mir::Instruction::AllocateArray {
+                destination: mir::Place::Local(destination),
+                element_type: mir::Type::Int,
+                length: mir::Operand {
+                    type_: mir::Type::Int,
+                    kind: mir::OperandKind::Constant(mir::Constant::Integer("1".to_owned())),
+                },
+                requires_default: false,
+                region: mir::AllocationRegion::Persistent,
+            },
+        );
+        assert!(
+            validate_module(&persistent_allocation)
+                .expect_err("unrelated Persistent allocation is rejected")
+                .message()
+                .contains("Persistent effect")
+        );
+
+        let mut persistent_call = valid.clone();
+        let make = persistent_call
+            .functions
+            .iter()
+            .find(|function| function.name == "Make")
+            .expect("Make exists")
+            .symbol;
+        let function = persistent_call
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Main")
+            .expect("Main exists");
+        let block = function
+            .blocks
+            .iter_mut()
+            .find(|block| {
+                block.instructions.iter().any(|instruction| {
+                    matches!(instruction, mir::Instruction::OwnedRegionExit { .. })
+                })
+            })
+            .expect("owned block exists");
+        let (exit_index, destination) = block
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(index, instruction)| match instruction {
+                mir::Instruction::OwnedRegionExit { invalidated, .. } => {
+                    Some((index, invalidated[0]))
+                }
+                _ => None,
+            })
+            .expect("owned exit exists");
+        block.instructions.insert(
+            exit_index,
+            mir::Instruction::Call {
+                destination: Some(mir::Place::Local(destination)),
+                function: make,
+                arguments: vec![mir::Operand {
+                    type_: mir::Type::Int,
+                    kind: mir::OperandKind::Constant(mir::Constant::Integer("1".to_owned())),
+                }],
+                return_type: mir::Type::Array(Box::new(mir::Type::Int)),
+            },
+        );
+        assert!(
+            validate_module(&persistent_call)
+                .expect_err("transitive Persistent call is rejected")
+                .message()
+                .contains("Persistent effect")
+        );
+
+        let mut missing_alias = valid;
+        let invalidated = missing_alias
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|instruction| match instruction {
+                mir::Instruction::OwnedRegionExit { invalidated, .. } => Some(invalidated),
+                _ => None,
+            })
+            .expect("owned exit exists");
+        assert!(invalidated.len() > 1);
+        invalidated.remove(0);
+        assert!(
+            validate_module(&missing_alias)
+                .expect_err("missing direct alias is rejected")
+                .message()
+                .contains("owned-region exit")
+        );
     }
 
     /// `AllocateList` has no source syntax yet (List A exposes no

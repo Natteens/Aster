@@ -22,8 +22,11 @@ deterministic checksum.
 | `persistent.aster` | mixed | persistent | object + array + string | 42 |
 
 Temporary workloads keep the value local so escape analysis reclaims it on every
-return. Persistent workloads return the value from a helper, so the conservative
-lifetime rule keeps it until the execution ends.
+return. Persistent workloads return the value from a helper, so their allocation
+instructions remain Persistent. The single object, array, and string cases now
+exercise compiler-proven owned Persistent slices and rewind after each iteration;
+the mixed case has overlapping returned families and intentionally retains the
+conservative context lifetime.
 
 Every workload exposes `RunSmall`, `RunMedium`, and `RunLarge`. The checksum is
 always `per-iteration checksum × iterations`.
@@ -118,7 +121,9 @@ in any of these makes `compare` exit non-zero.
 
 Cross-platform invariants are enforced by the executor, not frozen as numbers:
 temporary cases finish with `used_bytes == 0` and `peak_used_bytes > 0`;
-persistent cases finish with `used_bytes > 0` and `peak_used_bytes >= used_bytes`;
+single-family Persistent cases finish with `used_bytes == 0` after owned-region rewind, while the
+overlapping mixed Persistent case finishes with `used_bytes > 0`; every case keeps
+`peak_used_bytes >= used_bytes`;
 unused categories stay at zero; the five samples must produce identical
 deterministic metrics.
 

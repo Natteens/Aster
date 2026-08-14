@@ -13,7 +13,8 @@ use crate::context::{
     aster_rt_dictionary_remove, aster_rt_dictionary_set, aster_rt_dictionary_try_get,
     aster_rt_has_error, aster_rt_list_add, aster_rt_list_get, aster_rt_list_length,
     aster_rt_list_new, aster_rt_list_new_temporary, aster_rt_list_remove_at, aster_rt_list_version,
-    aster_rt_list_version_mismatch, aster_rt_string_builder_append, aster_rt_string_builder_new,
+    aster_rt_list_version_mismatch, aster_rt_owned_region_enter, aster_rt_owned_region_exit,
+    aster_rt_string_builder_append, aster_rt_string_builder_new,
     aster_rt_string_builder_new_temporary, aster_rt_string_builder_to_string,
     aster_rt_string_builder_to_string_temporary, aster_rt_temporary_scope_enter,
     aster_rt_temporary_scope_leave, aster_rt_temporary_subregion_enter,
@@ -153,6 +154,22 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
         RuntimeFunction {
             name: "aster_rt_temporary_subregion_exit",
             address: aster_rt_temporary_subregion_exit as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_owned_region_enter",
+            address: aster_rt_owned_region_enter as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_owned_region_exit",
+            address: aster_rt_owned_region_exit as *const u8,
             signature: RuntimeSignature {
                 parameters: &[RuntimeType::Pointer],
                 result: None,
@@ -1210,6 +1227,8 @@ mod tests {
             "aster_rt_temporary_scope_leave",
             "aster_rt_temporary_subregion_enter",
             "aster_rt_temporary_subregion_exit",
+            "aster_rt_owned_region_enter",
+            "aster_rt_owned_region_exit",
         ] {
             let function = functions
                 .iter()

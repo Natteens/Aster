@@ -537,6 +537,13 @@ enum AllocationLimitKind {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct TemporaryArenaMark(ArenaMark);
 
+/// Opaque checkpoint for compiler-authorized ownership in the Persistent arena.
+///
+/// Marks are consumed in LIFO order. The runtime executes the compiler's
+/// ownership proof; it never discovers aliases or scans object graphs.
+#[must_use = "owned arena marks must be rewound in LIFO order"]
+struct OwnedArenaMark(ArenaMark);
+
 /// Owns every dynamic allocation made by one JIT invocation.
 /// Persistent allocations live in `arena`; function-local objects, arrays,
 /// and strings can use `temporary_arena`. Both arenas are released in bulk
@@ -551,6 +558,7 @@ pub struct ExecutionContext {
     /// change it.
     fine_temporary_subregion: Option<TemporaryArenaMark>,
     temporary_scopes: Vec<TemporaryArenaMark>,
+    owned_regions: Vec<OwnedArenaMark>,
     allocation_limit_bytes: usize,
     allocation_limit_kind: AllocationLimitKind,
     call_depth: u32,
@@ -642,6 +650,7 @@ impl ExecutionContext {
             temporary_arena,
             fine_temporary_subregion: None,
             temporary_scopes: Vec::new(),
+            owned_regions: Vec::new(),
             allocation_limit_bytes,
             allocation_limit_kind: AllocationLimitKind::Execution,
             call_depth: 0,
@@ -1087,6 +1096,24 @@ impl ExecutionContext {
         // Cleanup must run even when an allocation inside the subregion has
         // already recorded the first runtime error.
         self.rewind_temporary(mark);
+    }
+
+    fn enter_owned_region(&mut self) {
+        // This explicit stack preserves LIFO cleanup for nested generated
+        // calls even after the first controlled error.
+        self.owned_regions.push(OwnedArenaMark(self.arena.mark()));
+    }
+
+    fn leave_owned_region(&mut self) {
+        let Some(mark) = self.owned_regions.pop() else {
+            self.fail("owned region exit has no matching enter");
+            return;
+        };
+
+        // Cleanup remains effective after the first controlled allocation
+        // failure, just like semantic Temporary-scope cleanup.
+        self.arena.rewind(mark.0);
+        self.refresh_memory_usage();
     }
 
     pub(crate) fn allocate_temporary_object(&mut self, size: u32) -> *mut u8 {
@@ -3049,6 +3076,39 @@ pub(crate) extern "C" fn aster_rt_temporary_subregion_exit(context: *mut Executi
     #[allow(unsafe_code)]
     let context = unsafe { &mut *context };
     context.leave_temporary_subregion();
+}
+
+/// Enter one compiler-authorized region over Persistent storage.
+///
+/// This private JIT ABI only records a stable arena checkpoint. Ownership and
+/// last-use proof are complete in MIR before generated code reaches it.
+#[doc(hidden)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub(crate) extern "C" fn aster_rt_owned_region_enter(context: *mut ExecutionContext) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: generated functions receive the live host-owned context as their
+    // hidden first parameter, and invocation cannot outlive that context.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    context.enter_owned_region();
+}
+
+/// Rewind the active compiler-authorized Persistent ownership region.
+///
+/// Cleanup deliberately remains effective after an earlier controlled error.
+#[doc(hidden)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub(crate) extern "C" fn aster_rt_owned_region_exit(context: *mut ExecutionContext) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: generated functions receive the live host-owned context as their
+    // hidden first parameter, and invocation cannot outlive that context.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    context.leave_owned_region();
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -8169,5 +8229,124 @@ mod tests {
                 .take_error()
                 .is_some_and(|error| error.contains("temporary string allocation"))
         );
+    }
+
+    #[test]
+    fn owned_region_rewinds_only_new_persistent_storage_and_reuses_capacity() {
+        let mut context = ExecutionContext::with_stats();
+        let pointer = &raw mut context;
+        let older = context.allocate_object(16);
+        assert!(!older.is_null());
+        let older_used = context.memory_stats().used_bytes;
+
+        aster_rt_owned_region_enter(pointer);
+        let first = context.allocate_object(8 * 1024);
+        assert!(!first.is_null());
+        assert!(context.memory_stats().used_bytes > older_used);
+        aster_rt_owned_region_exit(pointer);
+
+        assert_eq!(context.memory_stats().used_bytes, older_used);
+        let reserved = context.memory_stats().reserved_bytes;
+        aster_rt_owned_region_enter(pointer);
+        assert!(!context.allocate_object(8 * 1024).is_null());
+        aster_rt_owned_region_exit(pointer);
+        assert_eq!(context.memory_stats().used_bytes, older_used);
+        assert_eq!(context.memory_stats().reserved_bytes, reserved);
+    }
+
+    #[test]
+    fn owned_regions_are_nested_and_first_error_wins() {
+        let mut context = ExecutionContext::with_stats();
+        let pointer = &raw mut context;
+        aster_rt_owned_region_enter(pointer);
+        assert_eq!(context.owned_regions.len(), 1);
+        assert!(!context.allocate_object(16).is_null());
+        let outer_used = context.memory_stats().used_bytes;
+        context.fail("first owned-region error");
+
+        aster_rt_owned_region_enter(pointer);
+        assert_eq!(context.owned_regions.len(), 2);
+        assert!(!context.allocate_object(16).is_null());
+        aster_rt_owned_region_exit(pointer);
+        assert_eq!(context.owned_regions.len(), 1);
+        assert_eq!(context.memory_stats().used_bytes, outer_used);
+        aster_rt_owned_region_exit(pointer);
+        assert!(context.owned_regions.is_empty());
+        assert_eq!(context.memory_stats().used_bytes, 0);
+        aster_rt_owned_region_exit(pointer);
+        assert_eq!(
+            context.take_error().as_deref(),
+            Some("first owned-region error")
+        );
+        aster_rt_owned_region_enter(std::ptr::null_mut());
+        aster_rt_owned_region_exit(std::ptr::null_mut());
+    }
+
+    #[test]
+    fn owned_region_stack_and_zeroed_reuse_stay_bounded_across_many_cycles() {
+        let mut context = ExecutionContext::with_stats();
+        let pointer = &raw mut context;
+        let mut first = std::ptr::null_mut();
+        for iteration in 0..10_000 {
+            aster_rt_owned_region_enter(pointer);
+            let allocation = context.allocate_object(64);
+            assert!(!allocation.is_null());
+            if iteration == 0 {
+                first = allocation;
+            } else {
+                assert_eq!(allocation, first);
+            }
+            // SAFETY: `allocation` is a live 64-byte object allocation.
+            #[allow(unsafe_code)]
+            let bytes = unsafe { std::slice::from_raw_parts(allocation, 64) };
+            assert!(bytes.iter().all(|byte| *byte == 0));
+            // SAFETY: the same live allocation is initialized before rewind.
+            #[allow(unsafe_code)]
+            unsafe {
+                std::ptr::write_bytes(allocation, 0xA5, 64);
+            }
+            aster_rt_owned_region_exit(pointer);
+            if iteration % 1_000 == 0 {
+                assert!(context.owned_regions.is_empty());
+                assert_eq!(context.arena.metrics().used_bytes, 0);
+            }
+        }
+
+        assert!(context.owned_regions.is_empty());
+        assert_eq!(context.memory_stats().used_bytes, 0);
+        assert_eq!(context.memory_stats().total_allocations, 10_000);
+        assert!(context.memory_stats().reserved_bytes <= MIN_PAGE_SIZE as u64);
+    }
+
+    #[test]
+    fn owned_region_reuse_obeys_the_shared_governor_and_recovers_after_denial() {
+        let governor = Arc::new(MemoryGovernor::new(MIN_PAGE_SIZE * 3));
+        let mut context = ExecutionContext::with_memory_governor(Arc::clone(&governor));
+        let pointer = &raw mut context;
+        for _ in 0..100 {
+            aster_rt_owned_region_enter(pointer);
+            assert!(
+                !context
+                    .allocate_object(u32::try_from(MIN_PAGE_SIZE * 2).expect("test size fits u32"))
+                    .is_null()
+            );
+            aster_rt_owned_region_exit(pointer);
+        }
+        assert_eq!(context.arena.metrics().used_bytes, 0);
+        assert!(governor.telemetry().current_capacity_bytes <= (MIN_PAGE_SIZE * 3) as u64);
+
+        aster_rt_owned_region_enter(pointer);
+        assert!(
+            context
+                .allocate_object(u32::try_from(MIN_PAGE_SIZE * 4).expect("test size fits u32"))
+                .is_null()
+        );
+        aster_rt_owned_region_exit(pointer);
+        assert!(context.take_error().is_some());
+
+        aster_rt_owned_region_enter(pointer);
+        assert!(!context.allocate_object(16).is_null());
+        aster_rt_owned_region_exit(pointer);
+        assert!(context.take_error().is_none());
     }
 }
