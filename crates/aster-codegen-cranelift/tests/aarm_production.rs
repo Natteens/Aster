@@ -1,6 +1,9 @@
 //! Production AARM selector coverage through the ordinary source compiler.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    fmt::Write as _,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use aster_codegen_cranelift::{ExecutionValue, execute_with_stats};
 use aster_compiler::{compile, compile_project};
@@ -53,6 +56,105 @@ fn execute(module: &mir::Module, expected: i32) {
     let (value, stats) = execute_with_stats(module, "Run").expect("production AARM executes");
     assert_eq!(value, ExecutionValue::Int(expected));
     assert_eq!(stats.used_bytes, 0);
+}
+
+#[test]
+fn ordinary_source_v2_selects_three_guaranteed_arrays() {
+    let source = |array_count: usize| {
+        let arrays = (0..array_count).fold(String::new(), |mut source, index| {
+            write!(source, "int[] value{index} = new int[0];").expect("write array source");
+            source
+        });
+        format!(
+            "public int Run() {{ int total = 0; for (int i = 0; i < 1000; i++) {{ \
+             {arrays} total += 1; }} return total; }}"
+        )
+    };
+
+    let two = compile(&source(2)).expect("two-array source compiles").mir;
+    assert_eq!(marker_count(&two), 0);
+
+    let selected = compile(&source(3))
+        .expect("three-array source compiles")
+        .mir;
+    assert_eq!(
+        marker_count(&selected),
+        2,
+        "normal ASTER selects three arrays"
+    );
+    let (selected_value, selected_stats) =
+        execute_with_stats(&selected, "Run").expect("selected source executes");
+    assert_eq!(selected_value, ExecutionValue::Int(1000));
+    assert_eq!(selected_stats.total_allocations, 3_000);
+    assert!(selected_stats.peak_used_bytes < 4_096);
+}
+
+#[test]
+fn ordinary_source_v2_selects_three_guaranteed_runtime_sized_arrays() {
+    let source = r"
+        public int Run() {
+            int total = 0;
+            for (int i = 0; i < 1000; i++) {
+                int length = i;
+                int[] first = new int[length];
+                int[] second = new int[length];
+                int[] third = new int[length];
+                total += length;
+            }
+            return total;
+        }
+    ";
+
+    let selected = compile(source)
+        .expect("runtime-sized array source compiles")
+        .mir;
+    assert_eq!(
+        marker_count(&selected),
+        2,
+        "normal ASTER selects three runtime-sized arrays"
+    );
+    let (selected_value, selected_stats) =
+        execute_with_stats(&selected, "Run").expect("selected source executes");
+    assert_eq!(selected_value, ExecutionValue::Int(499_500));
+    assert_eq!(selected_stats.total_allocations, 3_000);
+    assert!(selected_stats.peak_used_bytes < 64 * 1024);
+}
+
+#[cfg(feature = "aarm-telemetry")]
+#[test]
+fn research_v2_array_failures_preserve_checkpoint_and_outer_cleanup() {
+    use std::sync::Arc;
+
+    use aster_codegen_cranelift::execute_with_aarm_parallel_governor;
+    use aster_runtime::{ExecutionContext, MemoryGovernor};
+
+    // Each allocation forces the next geometrically larger regular arena page:
+    // 4 KiB, then 8 KiB, then 16 KiB. The three limits therefore make the
+    // controlled failure occur at the first, second, and third array site.
+    let source = r"
+        public int Run() {
+            for (int i = 0; i < 1; i++) {
+                int[] first = new int[1];
+                int[] second = new int[1021];
+                int[] third = new int[2050];
+            }
+            return 1;
+        }
+    ";
+    let module = compile(source)
+        .expect("three-array failure source compiles")
+        .mir;
+    assert_eq!(marker_count(&module), 2);
+
+    let page = ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES;
+    for limit in [1, page, page * 3] {
+        let governor = Arc::new(MemoryGovernor::new(limit));
+        let error = execute_with_aarm_parallel_governor(&module, "Run", 1, Arc::clone(&governor))
+            .expect_err("each configured limit preserves the first controlled allocation error");
+        assert!(error.message().contains("shared execution memory budget"));
+        assert_eq!(governor.telemetry().current_capacity_bytes, 0);
+    }
+    execute(&module, 1);
 }
 
 #[test]
@@ -253,7 +355,7 @@ fn constructor_elimination_composes_with_all_v1_hidden_backing_mutations() {
 #[cfg(feature = "aarm-telemetry")]
 #[test]
 fn automatic_hidden_backing_failures_preserve_controlled_cleanup() {
-    use std::{fmt::Write as _, sync::Arc};
+    use std::sync::Arc;
 
     use aster_codegen_cranelift::execute_with_aarm_parallel_governor;
     use aster_runtime::{ExecutionContext, MemoryGovernor};

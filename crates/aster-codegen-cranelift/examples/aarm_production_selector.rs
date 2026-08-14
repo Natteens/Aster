@@ -1,14 +1,14 @@
 //! Release-only application-style evidence for the experimental AARM production selector.
 //!
-//! The three modes execute identical backend-neutral MIR: ordinary function lifetime,
-//! every safe AARM candidate, and the conservative hidden-backing-growth selector.
-//! This is a manual research harness; timings are informational and never CI assertions.
+//! The four modes execute identical backend-neutral MIR: ordinary function lifetime,
+//! every safe AARM candidate, the production hidden-backing-growth selector, and the
+//! candidate v2 structural array extension. JIT preparation occurs before warmup and
+//! timed execution. This is a manual research harness; timings are informational and
+//! never CI assertions.
 
 use std::time::Instant;
 
-#[cfg(feature = "aarm-telemetry")]
-use aster_codegen_cranelift::execute_with_aarm_telemetry;
-use aster_codegen_cranelift::{ExecutionValue, MemoryStats, execute, execute_with_stats};
+use aster_codegen_cranelift::{ExecutionValue, MemoryStats, PreparedSequentialExecution};
 use aster_compiler::{
     AarmTemporarySubregionProfitabilityPolicy, lower_aarm_temporary_subregions_for_research,
     lower_aarm_temporary_subregions_with_policy_for_research,
@@ -21,11 +21,12 @@ const FIELD: mir::SymbolId = mir::SymbolId(11);
 const BUILDER: mir::SymbolId = mir::SymbolId(12);
 const SAMPLES: usize = 5;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     Baseline,
     Raw,
-    Production,
+    ProductionV1,
+    ProductionV2,
 }
 
 impl Mode {
@@ -33,7 +34,8 @@ impl Mode {
         match self {
             Self::Baseline => "baseline",
             Self::Raw => "raw",
-            Self::Production => "production",
+            Self::ProductionV1 => "production-v1",
+            Self::ProductionV2 => "production-v2",
         }
     }
 }
@@ -199,6 +201,16 @@ fn temporary_array(destination: u32, length: i32) -> mir::Instruction {
     }
 }
 
+fn temporary_array_with_length(destination: u32, length: u32) -> mir::Instruction {
+    mir::Instruction::AllocateArray {
+        destination: mir::Place::Local(mir::LocalId(destination)),
+        element_type: mir::Type::Int,
+        length: copy(length, mir::Type::Int),
+        requires_default: true,
+        region: mir::AllocationRegion::Temporary,
+    }
+}
+
 fn temporary_string(destination: u32) -> mir::Instruction {
     mir::Instruction::CallIntrinsic {
         destination: Some(mir::Place::Local(mir::LocalId(destination))),
@@ -222,6 +234,19 @@ fn temporary_join(destination: u32) -> mir::Instruction {
         destination: Some(mir::Place::Local(mir::LocalId(destination))),
         intrinsic: mir::Intrinsic::StringJoinTemporary,
         arguments: vec![string("a"), string("b"), string("c"), string("d")],
+        return_type: mir::Type::String,
+    }
+}
+
+fn temporary_large_substring(destination: u32, length: i32) -> mir::Instruction {
+    mir::Instruction::CallIntrinsic {
+        destination: Some(mir::Place::Local(mir::LocalId(destination))),
+        intrinsic: mir::Intrinsic::StringSubstringRangeTemporary,
+        arguments: vec![
+            string(&"x".repeat(usize::try_from(length + 1).expect("positive string length"))),
+            integer(0),
+            integer(length),
+        ],
         return_type: mir::Type::String,
     }
 }
@@ -447,6 +472,93 @@ fn entity_workload(iterations: usize) -> Workload {
             ],
         ),
         expected: expected_checksum(iterations, 10),
+    }
+}
+
+fn array_workload(iterations: usize, length: i32, name: &'static str) -> Workload {
+    Workload {
+        name,
+        module: branched_loop_module(
+            iterations,
+            4,
+            vec![local(
+                5,
+                "scratch",
+                mir::Type::Array(Box::new(mir::Type::Int)),
+            )],
+            vec![temporary_array(5, length)],
+        ),
+        expected: expected_checksum(iterations, 4),
+    }
+}
+
+fn multiple_arrays_workload(
+    iterations: usize,
+    count: u32,
+    length: i32,
+    name: &'static str,
+) -> Workload {
+    let locals = (0..count)
+        .map(|index| {
+            local(
+                5 + index,
+                &format!("array_{index}"),
+                mir::Type::Array(Box::new(mir::Type::Int)),
+            )
+        })
+        .collect();
+    let work = (0..count)
+        .map(|index| temporary_array(5 + index, length))
+        .collect();
+    Workload {
+        name,
+        module: branched_loop_module(iterations, 4, locals, work),
+        expected: expected_checksum(iterations, 4),
+    }
+}
+
+fn multiple_dynamic_arrays_workload(
+    iterations: usize,
+    count: u32,
+    length: i32,
+    name: &'static str,
+) -> Workload {
+    let mut locals = vec![local(5, "length", mir::Type::Int)];
+    locals.extend((0..count).map(|index| {
+        local(
+            6 + index,
+            &format!("array_{index}"),
+            mir::Type::Array(Box::new(mir::Type::Int)),
+        )
+    }));
+    let mut module = branched_loop_module(
+        iterations,
+        4,
+        locals,
+        (0..count)
+            .map(|index| temporary_array_with_length(6 + index, 5))
+            .collect(),
+    );
+    module.functions[0].blocks[0]
+        .instructions
+        .push(use_value(5, integer(length)));
+    Workload {
+        name,
+        module,
+        expected: expected_checksum(iterations, 4),
+    }
+}
+
+fn string_workload(
+    iterations: usize,
+    name: &'static str,
+    work: Vec<mir::Instruction>,
+    locals: Vec<mir::Local>,
+) -> Workload {
+    Workload {
+        name,
+        module: branched_loop_module(iterations, 4, locals, work),
+        expected: expected_checksum(iterations, 4),
     }
 }
 
@@ -687,7 +799,7 @@ fn acyclic_workload() -> Workload {
     }
 }
 
-fn prepare(workload: &Workload, mode: Mode) -> (mir::Module, usize, u128) {
+fn prepare_mode(workload: &Workload, mode: Mode) -> (mir::Module, usize, u128) {
     let mut module = workload.module.clone();
     let started = Instant::now();
     let static_regions = match mode {
@@ -697,10 +809,14 @@ fn prepare(workload: &Workload, mode: Mode) -> (mir::Module, usize, u128) {
                 .expect("raw AARM lowering succeeds")
                 .subregions_lowered
         }
-        Mode::Production => {
+        Mode::ProductionV1 | Mode::ProductionV2 => {
             lower_aarm_temporary_subregions_with_policy_for_research(
                 &mut module,
-                AarmTemporarySubregionProfitabilityPolicy::ProductionV1,
+                if mode == Mode::ProductionV1 {
+                    AarmTemporarySubregionProfitabilityPolicy::ProductionV1
+                } else {
+                    AarmTemporarySubregionProfitabilityPolicy::ProductionV2
+                },
             )
             .expect("selector AARM lowering succeeds")
             .subregions_lowered
@@ -710,18 +826,22 @@ fn prepare(workload: &Workload, mode: Mode) -> (mir::Module, usize, u128) {
 }
 
 fn measure(workload: &Workload, mode: Mode) -> Measurement {
-    let (module, static_regions, lowering_micros) = prepare(workload, mode);
+    let (module, static_regions, lowering_micros) = prepare_mode(workload, mode);
+    let prepared = PreparedSequentialExecution::prepare(&module, "Run")
+        .expect("benchmark JIT preparation succeeds");
     assert_eq!(
-        execute(&module, "Run").expect("warmup executes"),
+        prepared.invoke().expect("warmup executes"),
         workload.expected
     );
-    let (value, stats) = execute_with_stats(&module, "Run").expect("stats execution succeeds");
+    let (value, stats) = prepared
+        .invoke_with_stats()
+        .expect("stats execution succeeds");
     assert_eq!(value, workload.expected);
     let mut samples = Vec::with_capacity(SAMPLES);
     for _ in 0..SAMPLES {
         let started = Instant::now();
         assert_eq!(
-            execute(&module, "Run").expect("measured execution succeeds"),
+            prepared.invoke().expect("measured execution succeeds"),
             workload.expected
         );
         samples.push(started.elapsed().as_secs_f64() * 1_000.0);
@@ -729,8 +849,9 @@ fn measure(workload: &Workload, mode: Mode) -> Measurement {
     samples.sort_by(f64::total_cmp);
     #[cfg(feature = "aarm-telemetry")]
     let dynamic_regions = {
-        let (value, telemetry) =
-            execute_with_aarm_telemetry(&module, "Run").expect("telemetry execution succeeds");
+        let (value, telemetry) = prepared
+            .invoke_with_aarm_telemetry()
+            .expect("telemetry execution succeeds");
         assert_eq!(value, workload.expected);
         telemetry.temporary.events.rewind_events.saturating_sub(1)
     };
@@ -751,6 +872,54 @@ fn main() {
         compute_workload(iterations, 64, "compute-rare"),
         compute_workload(iterations, 8, "compute-moderate"),
         compute_workload(iterations, 1, "compute-frequent"),
+        multiple_arrays_workload(iterations, 1, 0, "array-one-empty"),
+        multiple_arrays_workload(iterations, 2, 0, "array-two-empty"),
+        multiple_arrays_workload(iterations, 3, 0, "array-three-empty"),
+        multiple_arrays_workload(iterations, 4, 0, "array-four-empty"),
+        multiple_arrays_workload(iterations, 1, 1, "array-one-small"),
+        multiple_arrays_workload(iterations, 2, 1, "array-two-small"),
+        multiple_arrays_workload(iterations, 3, 1, "array-three-small"),
+        multiple_arrays_workload(iterations, 4, 1, "array-four-small"),
+        array_workload(iterations, 8, "array-medium"),
+        array_workload(iterations, 256, "array-large"),
+        multiple_dynamic_arrays_workload(iterations, 1, 1, "array-one-dynamic-small"),
+        multiple_dynamic_arrays_workload(iterations, 3, 1, "array-three-dynamic-small"),
+        multiple_dynamic_arrays_workload(iterations, 3, 64, "array-three-dynamic-large"),
+        string_workload(
+            iterations,
+            "string-small",
+            vec![temporary_string(5)],
+            vec![local(5, "text", mir::Type::String)],
+        ),
+        string_workload(
+            iterations,
+            "string-large",
+            vec![temporary_large_substring(5, 256)],
+            vec![local(5, "text", mir::Type::String)],
+        ),
+        string_workload(
+            iterations,
+            "string-two-small",
+            vec![temporary_string(5), temporary_string(6)],
+            vec![
+                local(5, "first", mir::Type::String),
+                local(6, "second", mir::Type::String),
+            ],
+        ),
+        string_workload(
+            iterations,
+            "string-multiple",
+            vec![
+                temporary_string(5),
+                temporary_substring(6),
+                temporary_join(7),
+            ],
+            vec![
+                local(5, "formatted", mir::Type::String),
+                local(6, "substring", mir::Type::String),
+                local(7, "joined", mir::Type::String),
+            ],
+        ),
         entity_workload(iterations),
         text_workload(iterations),
         collection_workload(iterations),
@@ -766,7 +935,12 @@ fn main() {
         .filter(|workload| workload_selected(workload.name))
     {
         let mut reference = None;
-        for mode in [Mode::Baseline, Mode::Raw, Mode::Production] {
+        for mode in [
+            Mode::Baseline,
+            Mode::Raw,
+            Mode::ProductionV1,
+            Mode::ProductionV2,
+        ] {
             let measurement = measure(&workload, mode);
             let logical = (
                 measurement.stats.requested_bytes,

@@ -20,6 +20,11 @@ name = "aarm_iteration_loop"
 path = "examples/aarm_iteration_loop.rs"
 
 [[example]]
+name = "aarm_production_selector"
+path = "examples/aarm_production_selector.rs"
+required-features = ["aarm-telemetry"]
+
+[[example]]
 name = "local_object_elimination_matrix"
 path = "examples/local_object_elimination_matrix.rs"
 required-features = ["aarm-telemetry"]

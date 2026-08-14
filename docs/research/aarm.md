@@ -1,11 +1,11 @@
 # Adaptive Region Memory (AARM)
 
-> **AARM status:** PRODUCTION V1 ENABLED FOR A CONSERVATIVE SUBSET
+> **AARM status:** PRODUCTION V2 ENABLED FOR A CONSERVATIVE SUBSET
 > **Production memory behavior:** SELECTIVE ITERATION-LOCAL FINE RECLAIM
 > **Development branch:** `research/aarm`
 
 AARM is a staged program for measuring and evolving ASTER's region memory system behind separate
-evidence gates. Normal compilation now enables the reviewed ProductionV1 fine-reclaim subset
+evidence gates. Normal compilation now enables the reviewed ProductionV2 fine-reclaim subset
 described in the AARM-6 section; other safe or ambiguous candidates retain ordinary function
 lifetime. Earlier phase sections intentionally preserve the state at each milestone, so statements
 that normal compilation did not yet invoke a phase are historical snapshots rather than current
@@ -1252,7 +1252,7 @@ Substring(start), and Substring(start,length) producers. Console and filesystem
 host operations remain excluded.
 
 At the AARM-5F milestone, normal ASTER compilation did not yet invoke this
-lowering. AARM-6 subsequently enabled the reviewed ProductionV1 subset through
+lowering. AARM-6 subsequently enabled the reviewed ProductionV2 subset through
 the same safety authority, as documented below.
 
 Release-mode Windows evidence for a mixed builder/List/Dictionary loop (five
@@ -1374,3 +1374,53 @@ Production v1 therefore preserves the existing no-GC/no-RC, stable-pointer
 arena model while automatically bounding the validated hidden-backing loop
 working set. Declined candidates retain ordinary Temporary function lifetime;
 the policy is intentionally conservative and is not a universal speedup claim.
+
+## Post-v1 profitability research
+
+Issue #48 re-ran the matrix after local-object scalar replacement and moved JIT
+preparation outside every timed sample. ProductionV2 is the normal policy and
+preserves ProductionV1's hidden-backing rule over the same planner and validator.
+It adds one rule: a supported natural-loop candidate
+may be selected when its body-entry block contains at least three validated
+Temporary array allocations before control can branch or rewind. All three
+allocations therefore execute on every entered iteration and share one existing
+checkpoint. The rule uses neither payload size nor a loop-trip estimate.
+
+Five-sample Windows release medians showed why the rule is deliberately this
+narrow:
+
+| Workload | Scale | Baseline | AllSafe / ProductionV2 | Baseline peak | V2 peak |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Three empty arrays | 100K | 41.47 ms | 14.28 / 12.07 ms | 7.20 MB | 68 B |
+| Three one-element arrays | 100K | 42.00 ms | 12.00 / 14.35 ms | 7.20 MB | 68 B |
+| Three empty arrays | 1M | 3097.22 ms | 119.01 / 127.91 ms | 72.0 MB | 68 B |
+| Three one-element arrays | 1M | 3053.79 ms | 126.52 / 119.69 ms | 72.0 MB | 68 B |
+| Strings + growing builder | 1M | 28148.19 ms | 539.66 / 538.51 ms | 240.0 MB | 237 B |
+| One small string | 100K | 12.76 ms | 13.16 / 12.27 ms | 1.60 MB | 1.60 MB |
+| Materialized tiny object | 100K | 2.59 ms | 4.69 / 2.57 ms | 800 KB | 800 KB |
+
+Requested bytes, allocation counts, and checksums matched between modes. The
+two-array case remains declined, while three arrays were already strongly favorable at
+the 100K lower-bound scale and increasingly favorable as the retained function-lifetime
+arena grew. The zero-length case is particularly useful: even it creates a complete
+runtime array allocation with a stable header and at least one element stride of
+requested storage, so three such calls amortize the one checkpoint without relying on
+payload size. The runtime uses one zeroed arena allocation for each header-plus-payload;
+the selector does not inspect its size, element stride, or loop trip count. Three
+runtime-sized arrays are selected under the same rule, including both small and larger
+dynamic-length workloads. Single arrays can also be profitable, especially for larger
+payloads, but a static payload threshold would be a machine-tuned policy and remains
+deliberately out of scope.
+
+String-only work also remains declined. Large or long-running strings can win,
+but one and two small strings regress at short loop scales. Materialized objects
+show the same scale dependence, while scalar-replaceable objects disappear in
+the earlier local-object pass and never reach AARM. The hidden-backed v1 paths
+remain byte-for-byte identical under the candidate v2 filter.
+
+The exact-lifetime coalescing query continues to find adjacent object, array,
+string, and mixed straight-line opportunities. It remains non-mutating: these
+one-shot regions execute too rarely to justify extending lifetimes, and loop
+planning already puts the selected three-array group under one checkpoint.
+Multi-iteration batching is also deferred because it still requires a new
+bounded lifetime proof for loop-carried state and every exit path.

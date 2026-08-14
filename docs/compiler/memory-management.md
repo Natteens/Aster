@@ -118,15 +118,19 @@ The fine checkpoint is separate from semantic function Temporary-scope depth, so
 builder promotion rules do not observe an extra function scope. Allocation failure inside a fine
 span runs fine cleanup before ordinary function cleanup.
 
-Safety and profitability are separate decisions. Normal ASTER compilation automatically selects
-only validated iteration-local natural-loop candidates containing a fine-owned growing
-`StringBuilderAppend`, `ListAdd`, `DictionaryAdd`, or `DictionarySet`. All already-safe object,
-array, immutable-string, and hidden-owner work inside that candidate shares its one checkpoint.
-Fixed-only object/array/string loops, one-shot acyclic candidates, read-only or header-only
-collection work, and ambiguous shapes retain ordinary function lifetime. This conservative v1
-policy is a deterministic compiler choice: there is no source annotation, runtime configuration,
-runtime profitability decision, or per-allocation AARM branch. It does not promise that every
-Temporary is reclaimed early or that every selected workload is universally faster.
+Safety and profitability are separate decisions. ProductionV2 preserves normal
+selection of validated iteration-local natural-loop candidates containing a fine-owned growing
+`StringBuilderAppend`, `ListAdd`, `DictionaryAdd`, or `DictionarySet`, and additionally selects a
+validated natural-loop candidate whose body-entry block contains at least three validated
+`Temporary` `AllocateArray` instructions before any control transfer or same-block rewind. Array
+length, stride, payload, and loop trip count are not profitability predicates; runtime-sized arrays
+are eligible when they meet that same structural rule. All already-safe object, array,
+immutable-string, and hidden-owner work inside a selected candidate shares its one checkpoint.
+One- or two-array loops, fixed-only object/string loops, one-shot acyclic candidates, read-only or
+header-only collection work, and ambiguous shapes retain ordinary function lifetime. This
+conservative compiler policy is deterministic: there is no source annotation, runtime
+configuration, runtime profitability decision, or per-allocation AARM branch. It does not promise
+that every Temporary is reclaimed early or that every selected workload is universally faster.
 
 ## Collections and strings
 

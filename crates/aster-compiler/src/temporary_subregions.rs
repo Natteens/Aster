@@ -71,6 +71,12 @@ pub enum AarmTemporarySubregionProfitabilityPolicy {
     /// `StringBuilder`, `List`, or `Dictionary` mutation that can grow hidden
     /// backing storage. One-shot acyclic regions stay on function lifetime.
     ProductionV1,
+    /// Preserve `ProductionV1` and additionally lower natural-loop candidates
+    /// whose body-entry block performs at least three proven-safe Temporary
+    /// array allocations on every entered iteration. This structural rule
+    /// amortizes one checkpoint across multiple allocator calls without a
+    /// payload-size threshold or trip-count guess.
+    ProductionV2,
 }
 
 /// Controlled failure from the experimental AARM-5D MIR transformation.
@@ -160,7 +166,7 @@ pub(super) fn lower_production_aarm_temporary_subregions(module: &mut mir::Modul
     let _ = lower_assigned_aarm_temporary_subregions(
         module,
         analyzed,
-        AarmTemporarySubregionProfitabilityPolicy::ProductionV1,
+        AarmTemporarySubregionProfitabilityPolicy::ProductionV2,
     );
 }
 
@@ -170,7 +176,11 @@ fn lower_assigned_aarm_temporary_subregions(
     policy: AarmTemporarySubregionProfitabilityPolicy,
 ) -> Result<AarmTemporarySubregionLoweringReport, AarmTemporarySubregionLoweringError> {
     let mut analysis = analyze_plan_and_validate_candidate_subregions(&mut analyzed);
-    if policy == AarmTemporarySubregionProfitabilityPolicy::ProductionV1 {
+    if matches!(
+        policy,
+        AarmTemporarySubregionProfitabilityPolicy::ProductionV1
+            | AarmTemporarySubregionProfitabilityPolicy::ProductionV2
+    ) {
         analysis.validation.validated.retain(|subregion| {
             analyzed
                 .functions
@@ -178,13 +188,59 @@ fn lower_assigned_aarm_temporary_subregions(
                 .find(|function| function.symbol == subregion.function)
                 .is_some_and(|function| {
                     candidate_is_natural_loop(function, subregion)
-                        && candidate_contains_hidden_backing_growth(function, subregion)
+                        && (candidate_contains_hidden_backing_growth(function, subregion)
+                            || (policy == AarmTemporarySubregionProfitabilityPolicy::ProductionV2
+                                && candidate_has_three_guaranteed_array_allocations(
+                                    function, subregion,
+                                )))
                 })
         });
     }
     let (lowered, report) = lower_validated_exact_snapshot(&analyzed, &analysis.validation)?;
     *module = lowered;
     Ok(report)
+}
+
+fn candidate_has_three_guaranteed_array_allocations(
+    function: &mir::Function,
+    subregion: &validation::ValidatedTemporarySubregion,
+) -> bool {
+    let Some(block) = function
+        .blocks
+        .iter()
+        .find(|block| block.id == subregion.checkpoint.block)
+    else {
+        return false;
+    };
+    let end = subregion
+        .rewinds
+        .iter()
+        .filter(|rewind| rewind.block == block.id)
+        .map(|rewind| rewind.instruction_boundary)
+        .min()
+        .unwrap_or(block.instructions.len());
+    if subregion.checkpoint.instruction_boundary > end || end > block.instructions.len() {
+        return false;
+    }
+    let allocation_sites = subregion
+        .allocations
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    block.instructions[subregion.checkpoint.instruction_boundary..end]
+        .iter()
+        .enumerate()
+        .filter(|(offset, instruction)| {
+            matches!(instruction, mir::Instruction::AllocateArray { .. })
+                && allocation_sites.contains(&mir::MirAllocationSite {
+                    function: function.symbol,
+                    block: block.id,
+                    instruction_index: subregion.checkpoint.instruction_boundary + offset,
+                })
+        })
+        .take(3)
+        .count()
+        == 3
 }
 
 fn candidate_is_natural_loop(
@@ -2034,6 +2090,33 @@ mod tests {
         }
     }
 
+    fn temporary_array(id: u32) -> mir::Instruction {
+        mir::Instruction::AllocateArray {
+            destination: mir::Place::Local(mir::LocalId(id)),
+            element_type: mir::Type::Int,
+            length: mir::Operand {
+                type_: mir::Type::Int,
+                kind: mir::OperandKind::Constant(mir::Constant::Integer("1".to_owned())),
+            },
+            requires_default: true,
+            region: mir::AllocationRegion::Temporary,
+        }
+    }
+
+    fn temporary_array_with_length(id: u32, length: u32) -> mir::Instruction {
+        mir::Instruction::AllocateArray {
+            destination: mir::Place::Local(mir::LocalId(id)),
+            element_type: mir::Type::Int,
+            length: copy(length, mir::Type::Int),
+            requires_default: true,
+            region: mir::AllocationRegion::Temporary,
+        }
+    }
+
+    fn array_local(id: u32) -> mir::Local {
+        local(id, mir::Type::Array(Box::new(mir::Type::Int)))
+    }
+
     fn observe_object(id: u32) -> mir::Instruction {
         let operand = copy(id, mir::Type::Class(CLASS));
         mir::Instruction::Assign {
@@ -2656,6 +2739,34 @@ public int Main() {
                 .expect("non-adjacent safe regions can be analyzed")
                 .is_empty()
         );
+
+        let mixed = module(vec![function(
+            FUNCTION,
+            BLOCK.0,
+            vec![block(
+                BLOCK.0,
+                vec![
+                    temporary_array(1),
+                    mir::Instruction::CallIntrinsic {
+                        destination: Some(mir::Place::Local(mir::LocalId(2))),
+                        intrinsic: mir::Intrinsic::StringFromLongTemporary,
+                        arguments: vec![mir::Operand {
+                            type_: mir::Type::Long,
+                            kind: mir::OperandKind::Constant(mir::Constant::Integer(
+                                "1".to_owned(),
+                            )),
+                        }],
+                        return_type: mir::Type::String,
+                    },
+                ],
+                mir::Terminator::End,
+            )],
+            vec![array_local(1), local(2, mir::Type::String)],
+        )]);
+        let mixed = estimate_aarm_coalescing_opportunities_for_research(&mixed)
+            .expect("mixed array/string adjacency can be analyzed");
+        assert_eq!(mixed.len(), 1);
+        assert_eq!(mixed[0].combined_allocation_count, 2);
     }
 
     #[test]
@@ -2806,6 +2917,373 @@ public int Main() {
         .expect("hidden-backing loop selector lowers proven growth");
         assert_eq!(selected_report.subregions_lowered, 1);
         assert_eq!(selected, raw);
+
+        let mut selected_v2 = module(vec![loop_function()]);
+        let selected_v2_report = lower_aarm_temporary_subregions_with_policy_for_research(
+            &mut selected_v2,
+            AarmTemporarySubregionProfitabilityPolicy::ProductionV2,
+        )
+        .expect("v2 preserves hidden-backing loop selection");
+        assert_eq!(selected_v2_report.subregions_lowered, 1);
+        assert_eq!(selected_v2, raw);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn production_v2_selects_only_three_guaranteed_body_entry_arrays() {
+        let loop_function = |array_count: u32| {
+            function(
+                FUNCTION,
+                BLOCK.0,
+                vec![
+                    block(
+                        BLOCK.0,
+                        Vec::new(),
+                        mir::Terminator::Branch {
+                            condition: mir::Operand {
+                                type_: mir::Type::Bool,
+                                kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                            },
+                            then_block: mir::BasicBlockId(20),
+                            else_block: mir::BasicBlockId(40),
+                        },
+                    ),
+                    block(
+                        20,
+                        (0..array_count)
+                            .map(|index| temporary_array(index + 1))
+                            .collect(),
+                        mir::Terminator::Goto(mir::BasicBlockId(30)),
+                    ),
+                    block(30, vec![unrelated()], mir::Terminator::Goto(BLOCK)),
+                    block(40, Vec::new(), mir::Terminator::End),
+                ],
+                (0..array_count)
+                    .map(|index| array_local(index + 1))
+                    .collect(),
+            )
+        };
+
+        let mut two = module(vec![loop_function(2)]);
+        let report = lower_aarm_temporary_subregions_with_policy_for_research(
+            &mut two,
+            AarmTemporarySubregionProfitabilityPolicy::ProductionV2,
+        )
+        .expect("two arrays remain below the structural v2 rule");
+        assert_eq!(report.subregions_lowered, 0);
+
+        let string_loop = function(
+            FUNCTION,
+            BLOCK.0,
+            vec![
+                block(
+                    BLOCK.0,
+                    Vec::new(),
+                    mir::Terminator::Branch {
+                        condition: mir::Operand {
+                            type_: mir::Type::Bool,
+                            kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                        },
+                        then_block: mir::BasicBlockId(20),
+                        else_block: mir::BasicBlockId(40),
+                    },
+                ),
+                block(
+                    20,
+                    vec![mir::Instruction::CallIntrinsic {
+                        destination: Some(mir::Place::Local(mir::LocalId(1))),
+                        intrinsic: mir::Intrinsic::StringFromLongTemporary,
+                        arguments: vec![mir::Operand {
+                            type_: mir::Type::Long,
+                            kind: mir::OperandKind::Constant(mir::Constant::Integer(
+                                "1".to_owned(),
+                            )),
+                        }],
+                        return_type: mir::Type::String,
+                    }],
+                    mir::Terminator::Goto(mir::BasicBlockId(30)),
+                ),
+                block(30, vec![unrelated()], mir::Terminator::Goto(BLOCK)),
+                block(40, Vec::new(), mir::Terminator::End),
+            ],
+            vec![local(1, mir::Type::String)],
+        );
+        let mut string_only = module(vec![string_loop]);
+        let report = lower_aarm_temporary_subregions_with_policy_for_research(
+            &mut string_only,
+            AarmTemporarySubregionProfitabilityPolicy::ProductionV2,
+        )
+        .expect("v2 keeps string-only work on function lifetime");
+        assert_eq!(report.subregions_lowered, 0);
+
+        let mut three_v1 = module(vec![loop_function(3)]);
+        let report = lower_aarm_temporary_subregions_with_policy_for_research(
+            &mut three_v1,
+            AarmTemporarySubregionProfitabilityPolicy::ProductionV1,
+        )
+        .expect("v1 still declines array-only work");
+        assert_eq!(report.subregions_lowered, 0);
+
+        let mut three_v2 = module(vec![loop_function(3)]);
+        let report = lower_aarm_temporary_subregions_with_policy_for_research(
+            &mut three_v2,
+            AarmTemporarySubregionProfitabilityPolicy::ProductionV2,
+        )
+        .expect("v2 selects three guaranteed body-entry arrays");
+        assert_eq!(report.subregions_lowered, 1);
+        assert_eq!(
+            three_v2
+                .functions
+                .iter()
+                .flat_map(|function| &function.blocks)
+                .flat_map(|block| &block.instructions)
+                .filter(|instruction| matches!(
+                    instruction,
+                    mir::Instruction::TemporarySubregionEnter { .. }
+                        | mir::Instruction::TemporarySubregionExit { .. }
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn production_v2_requires_three_validated_arrays_in_the_linear_body_entry_prefix() {
+        let loop_prefix = |body: Vec<mir::Instruction>, trailing_blocks: Vec<mir::BasicBlock>| {
+            let mut blocks = vec![
+                block(
+                    BLOCK.0,
+                    Vec::new(),
+                    mir::Terminator::Branch {
+                        condition: mir::Operand {
+                            type_: mir::Type::Bool,
+                            kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                        },
+                        then_block: mir::BasicBlockId(20),
+                        else_block: mir::BasicBlockId(40),
+                    },
+                ),
+                block(20, body, mir::Terminator::Goto(mir::BasicBlockId(30))),
+            ];
+            blocks.extend(trailing_blocks);
+            blocks.push(block(40, Vec::new(), mir::Terminator::End));
+            function(
+                FUNCTION,
+                BLOCK.0,
+                blocks,
+                vec![
+                    array_local(1),
+                    array_local(2),
+                    array_local(3),
+                    local(4, mir::Type::Int),
+                ],
+            )
+        };
+        let lower = |function| {
+            let mut module = module(vec![function]);
+            let report = lower_aarm_temporary_subregions_with_policy_for_research(
+                &mut module,
+                AarmTemporarySubregionProfitabilityPolicy::ProductionV2,
+            )
+            .expect("v2 candidate analysis completes");
+            report.subregions_lowered
+        };
+
+        let dynamic = loop_prefix(
+            vec![
+                mir::Instruction::Assign {
+                    target: mir::Place::Local(mir::LocalId(4)),
+                    value: mir::Rvalue {
+                        type_: mir::Type::Int,
+                        kind: mir::RvalueKind::Use(mir::Operand {
+                            type_: mir::Type::Int,
+                            kind: mir::OperandKind::Constant(mir::Constant::Integer(
+                                "0".to_owned(),
+                            )),
+                        }),
+                    },
+                },
+                temporary_array_with_length(1, 4),
+                temporary_array_with_length(2, 4),
+                temporary_array_with_length(3, 4),
+            ],
+            vec![block(30, vec![unrelated()], mir::Terminator::Goto(BLOCK))],
+        );
+        assert_eq!(
+            lower(dynamic),
+            1,
+            "dynamic lengths are not a selector predicate"
+        );
+
+        let conditional_third = function(
+            FUNCTION,
+            BLOCK.0,
+            vec![
+                block(
+                    BLOCK.0,
+                    Vec::new(),
+                    mir::Terminator::Branch {
+                        condition: mir::Operand {
+                            type_: mir::Type::Bool,
+                            kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                        },
+                        then_block: mir::BasicBlockId(20),
+                        else_block: mir::BasicBlockId(40),
+                    },
+                ),
+                block(
+                    20,
+                    vec![temporary_array(1), temporary_array(2)],
+                    mir::Terminator::Branch {
+                        condition: mir::Operand {
+                            type_: mir::Type::Bool,
+                            kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                        },
+                        then_block: mir::BasicBlockId(21),
+                        else_block: mir::BasicBlockId(30),
+                    },
+                ),
+                block(
+                    21,
+                    vec![temporary_array(3)],
+                    mir::Terminator::Goto(mir::BasicBlockId(30)),
+                ),
+                block(30, vec![unrelated()], mir::Terminator::Goto(BLOCK)),
+                block(40, Vec::new(), mir::Terminator::End),
+            ],
+            vec![array_local(1), array_local(2), array_local(3)],
+        );
+        assert_eq!(
+            lower(conditional_third),
+            0,
+            "a third array after a path split is not guaranteed at body entry"
+        );
+
+        let split_successors = function(
+            FUNCTION,
+            BLOCK.0,
+            vec![
+                block(
+                    BLOCK.0,
+                    Vec::new(),
+                    mir::Terminator::Branch {
+                        condition: mir::Operand {
+                            type_: mir::Type::Bool,
+                            kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                        },
+                        then_block: mir::BasicBlockId(20),
+                        else_block: mir::BasicBlockId(40),
+                    },
+                ),
+                block(
+                    20,
+                    Vec::new(),
+                    mir::Terminator::Branch {
+                        condition: mir::Operand {
+                            type_: mir::Type::Bool,
+                            kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                        },
+                        then_block: mir::BasicBlockId(21),
+                        else_block: mir::BasicBlockId(22),
+                    },
+                ),
+                block(
+                    21,
+                    vec![temporary_array(1), temporary_array(2)],
+                    mir::Terminator::Goto(mir::BasicBlockId(30)),
+                ),
+                block(
+                    22,
+                    vec![temporary_array(3)],
+                    mir::Terminator::Goto(mir::BasicBlockId(30)),
+                ),
+                block(30, vec![unrelated()], mir::Terminator::Goto(BLOCK)),
+                block(40, Vec::new(), mir::Terminator::End),
+            ],
+            vec![array_local(1), array_local(2), array_local(3)],
+        );
+        assert_eq!(
+            lower(split_successors),
+            0,
+            "arrays in successor blocks are outside the linear body-entry prefix"
+        );
+
+        let after_early_exit = function(
+            FUNCTION,
+            BLOCK.0,
+            vec![
+                block(
+                    BLOCK.0,
+                    Vec::new(),
+                    mir::Terminator::Branch {
+                        condition: mir::Operand {
+                            type_: mir::Type::Bool,
+                            kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                        },
+                        then_block: mir::BasicBlockId(20),
+                        else_block: mir::BasicBlockId(40),
+                    },
+                ),
+                block(
+                    20,
+                    vec![temporary_array(1), temporary_array(2)],
+                    mir::Terminator::Branch {
+                        condition: mir::Operand {
+                            type_: mir::Type::Bool,
+                            kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                        },
+                        then_block: mir::BasicBlockId(40),
+                        else_block: mir::BasicBlockId(21),
+                    },
+                ),
+                block(
+                    21,
+                    vec![temporary_array(3)],
+                    mir::Terminator::Goto(mir::BasicBlockId(30)),
+                ),
+                block(30, vec![unrelated()], mir::Terminator::Goto(BLOCK)),
+                block(40, Vec::new(), mir::Terminator::End),
+            ],
+            vec![array_local(1), array_local(2), array_local(3)],
+        );
+        assert_eq!(
+            lower(after_early_exit),
+            0,
+            "an array after a possible loop exit is not guaranteed"
+        );
+
+        let outside_candidate = function(
+            FUNCTION,
+            BLOCK.0,
+            vec![
+                block(
+                    BLOCK.0,
+                    vec![temporary_array(1)],
+                    mir::Terminator::Branch {
+                        condition: mir::Operand {
+                            type_: mir::Type::Bool,
+                            kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                        },
+                        then_block: mir::BasicBlockId(20),
+                        else_block: mir::BasicBlockId(40),
+                    },
+                ),
+                block(
+                    20,
+                    vec![temporary_array(2), temporary_array(3)],
+                    mir::Terminator::Goto(mir::BasicBlockId(30)),
+                ),
+                block(30, vec![unrelated()], mir::Terminator::Goto(BLOCK)),
+                block(40, Vec::new(), mir::Terminator::End),
+            ],
+            vec![array_local(1), array_local(2), array_local(3)],
+        );
+        assert_eq!(
+            lower(outside_candidate),
+            0,
+            "preheader arrays do not contribute to the body-entry cardinality"
+        );
     }
 
     #[test]
