@@ -849,6 +849,43 @@ fn validate_instruction(
             structs,
             locals,
         ),
+        mir::Instruction::DictionaryClear { dictionary } => {
+            validate_dictionary_clear(dictionary, function_name, locals)
+        }
+        mir::Instruction::DictionaryKeys {
+            destination,
+            dictionary,
+            key_type,
+            ..
+        } => validate_dictionary_snapshot(
+            destination,
+            dictionary,
+            key_type,
+            true,
+            function_name,
+            classes,
+            structs,
+            interfaces,
+            enums,
+            locals,
+        ),
+        mir::Instruction::DictionaryValues {
+            destination,
+            dictionary,
+            value_type,
+            ..
+        } => validate_dictionary_snapshot(
+            destination,
+            dictionary,
+            value_type,
+            false,
+            function_name,
+            classes,
+            structs,
+            interfaces,
+            enums,
+            locals,
+        ),
         mir::Instruction::ListAdd { list, value } => validate_list_add(
             list,
             value,
@@ -883,6 +920,42 @@ fn validate_instruction(
             structs,
             interfaces,
             enums,
+        ),
+        mir::Instruction::ListSet { list, index, value } => validate_list_set(
+            list,
+            index,
+            value,
+            function_name,
+            classes,
+            structs,
+            interfaces,
+            enums,
+            locals,
+        ),
+        mir::Instruction::ListClear { list } => validate_list_clear(
+            list,
+            function_name,
+            classes,
+            structs,
+            interfaces,
+            enums,
+            locals,
+        ),
+        mir::Instruction::ListToArray {
+            destination,
+            list,
+            element_type,
+            ..
+        } => validate_list_to_array(
+            destination,
+            list,
+            element_type,
+            function_name,
+            classes,
+            structs,
+            interfaces,
+            enums,
+            locals,
         ),
         mir::Instruction::StringDecodeNext {
             string,
@@ -1083,7 +1156,10 @@ fn owned_region_direct_barrier(instruction: &mir::Instruction) -> bool {
         | mir::Instruction::AllocateDictionary { region, .. }
         | mir::Instruction::AllocateStringBuilder { region, .. }
         | mir::Instruction::StringBuilderToString { region, .. }
-        | mir::Instruction::DictionaryEntries { region, .. } => {
+        | mir::Instruction::DictionaryEntries { region, .. }
+        | mir::Instruction::DictionaryKeys { region, .. }
+        | mir::Instruction::DictionaryValues { region, .. }
+        | mir::Instruction::ListToArray { region, .. } => {
             *region == mir::AllocationRegion::Persistent
         }
         mir::Instruction::CallIntrinsic { intrinsic, .. } => {
@@ -1319,8 +1395,21 @@ fn owned_instruction_reads(instruction: &mir::Instruction, reads: &mut HashSet<m
             destination,
             dictionary,
             ..
+        }
+        | mir::Instruction::DictionaryKeys {
+            destination,
+            dictionary,
+            ..
+        }
+        | mir::Instruction::DictionaryValues {
+            destination,
+            dictionary,
+            ..
         } => {
             owned_destination_reads(destination, reads);
+            owned_operand_reads(dictionary, reads);
+        }
+        mir::Instruction::DictionaryClear { dictionary } => {
             owned_operand_reads(dictionary, reads);
         }
         mir::Instruction::ListAdd { list, value } => {
@@ -1340,6 +1429,18 @@ fn owned_instruction_reads(instruction: &mir::Instruction, reads: &mut HashSet<m
         mir::Instruction::ListRemoveAt { list, index } => {
             owned_operand_reads(list, reads);
             owned_operand_reads(index, reads);
+        }
+        mir::Instruction::ListSet { list, index, value } => {
+            owned_operand_reads(list, reads);
+            owned_operand_reads(index, reads);
+            owned_operand_reads(value, reads);
+        }
+        mir::Instruction::ListClear { list } => owned_operand_reads(list, reads),
+        mir::Instruction::ListToArray {
+            destination, list, ..
+        } => {
+            owned_destination_reads(destination, reads);
+            owned_operand_reads(list, reads);
         }
         mir::Instruction::StringDecodeNext {
             string,
@@ -1411,7 +1512,19 @@ fn owned_instruction_definitions(
             destination: target,
             ..
         }
+        | mir::Instruction::DictionaryKeys {
+            destination: target,
+            ..
+        }
+        | mir::Instruction::DictionaryValues {
+            destination: target,
+            ..
+        }
         | mir::Instruction::ListGet {
+            destination: target,
+            ..
+        }
+        | mir::Instruction::ListToArray {
             destination: target,
             ..
         } => owned_place_definition(target, definitions),
@@ -2036,6 +2149,14 @@ fn temporary_subregion_instruction_is_executable(instruction: &mir::Instruction)
             matches!(list.kind, mir::OperandKind::Copy(mir::Place::Local(_)))
                 && temporary_subregion_operand_is_executable(index)
         }
+        mir::Instruction::ListSet { list, index, value } => {
+            matches!(list.kind, mir::OperandKind::Copy(mir::Place::Local(_)))
+                && temporary_subregion_operand_is_executable(index)
+                && temporary_subregion_operand_is_executable(value)
+        }
+        mir::Instruction::ListClear { list } => {
+            matches!(list.kind, mir::OperandKind::Copy(mir::Place::Local(_)))
+        }
         mir::Instruction::DictionaryAdd {
             destination,
             dictionary,
@@ -2088,6 +2209,10 @@ fn temporary_subregion_instruction_is_executable(instruction: &mir::Instruction)
                 && temporary_subregion_operand_is_executable(key)
                 && temporary_subregion_type_is_executable(value_type)
         }
+        mir::Instruction::DictionaryClear { dictionary } => matches!(
+            dictionary.kind,
+            mir::OperandKind::Copy(mir::Place::Local(_))
+        ),
         mir::Instruction::CallIntrinsic {
             destination,
             intrinsic,
@@ -2118,6 +2243,9 @@ fn temporary_subregion_instruction_is_executable(instruction: &mir::Instruction)
             ..
         }
         | mir::Instruction::DictionaryEntries { .. }
+        | mir::Instruction::DictionaryKeys { .. }
+        | mir::Instruction::DictionaryValues { .. }
+        | mir::Instruction::ListToArray { .. }
         | mir::Instruction::StringDecodeNext { .. } => false,
     }
 }
@@ -2510,6 +2638,53 @@ fn validate_dictionary_entries(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_dictionary_snapshot(
+    destination: &mir::Place,
+    dictionary: &mir::Operand,
+    component_type: &mir::Type,
+    keys: bool,
+    function_name: &str,
+    classes: &HashSet<mir::SymbolId>,
+    structs: &HashSet<mir::SymbolId>,
+    interfaces: &HashSet<mir::SymbolId>,
+    enums: &HashSet<mir::SymbolId>,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    validate_operand(dictionary, function_name)?;
+    validate_dictionary_operand_locals(dictionary, "Dictionary snapshot", function_name, locals)?;
+    let mir::Type::Dictionary(key_type, value_type) = &dictionary.type_ else {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a Dictionary snapshot receiver that is not `Dictionary<K, V>`"
+        )));
+    };
+    let expected_component = if keys {
+        key_type.as_ref()
+    } else {
+        value_type.as_ref()
+    };
+    if component_type != expected_component {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has Dictionary snapshot metadata incompatible with its receiver"
+        )));
+    }
+    validate_list_element_type(
+        component_type,
+        function_name,
+        classes,
+        structs,
+        interfaces,
+        enums,
+    )?;
+    let declared = declared_local_type(destination, function_name, "Dictionary snapshot", locals)?;
+    if declared != &mir::Type::Array(Box::new(component_type.clone())) {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a Dictionary snapshot destination with the wrong array element type"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_dictionary_operand_locals(
     operand: &mir::Operand,
     operation: &str,
@@ -2741,7 +2916,7 @@ fn validate_call_intrinsic(
 ) -> Result<(), BackendError> {
     if let Some(destination) = destination {
         validate_place(destination, function_name)?;
-        if is_string_method_intrinsic(intrinsic) {
+        if is_string_method_intrinsic(intrinsic) || is_math_intrinsic(intrinsic) {
             let mir::Place::Local(local) = destination else {
                 return Err(BackendError::new(format!(
                     "function `{function_name}` stores {intrinsic:?} into a non-local destination"
@@ -2796,6 +2971,12 @@ fn is_string_method_intrinsic(intrinsic: mir::Intrinsic) -> bool {
             | mir::Intrinsic::StringSubstringFromTemporary
             | mir::Intrinsic::StringSubstringRange
             | mir::Intrinsic::StringSubstringRangeTemporary
+            | mir::Intrinsic::StringTrim
+            | mir::Intrinsic::StringTrimTemporary
+            | mir::Intrinsic::StringReplace
+            | mir::Intrinsic::StringReplaceTemporary
+            | mir::Intrinsic::StringSplit
+            | mir::Intrinsic::StringSplitTemporary
             | mir::Intrinsic::StringTryParseBool
             | mir::Intrinsic::StringTryParseInt
             | mir::Intrinsic::StringTryParseUInt
@@ -2807,6 +2988,16 @@ fn is_string_method_intrinsic(intrinsic: mir::Intrinsic) -> bool {
             | mir::Intrinsic::ConsoleWriteLine
             | mir::Intrinsic::ConsoleReadLine
             | mir::Intrinsic::ConsoleReadLineTemporary
+    )
+}
+
+fn is_math_intrinsic(intrinsic: mir::Intrinsic) -> bool {
+    matches!(
+        intrinsic,
+        mir::Intrinsic::MathUnaryFloat
+            | mir::Intrinsic::MathUnaryDouble
+            | mir::Intrinsic::MathPowFloat
+            | mir::Intrinsic::MathPowDouble
     )
 }
 
@@ -3239,6 +3430,132 @@ fn validate_list_remove_at(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_list_set(
+    list: &mir::Operand,
+    index: &mir::Operand,
+    value: &mir::Operand,
+    function_name: &str,
+    classes: &HashSet<mir::SymbolId>,
+    structs: &HashSet<mir::SymbolId>,
+    interfaces: &HashSet<mir::SymbolId>,
+    enums: &HashSet<mir::SymbolId>,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    validate_list_add(
+        list,
+        value,
+        function_name,
+        classes,
+        structs,
+        interfaces,
+        enums,
+    )?;
+    if index.type_ != mir::Type::Int {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a `ListSet` whose index is not `int`"
+        )));
+    }
+    validate_operand(index, function_name)?;
+    validate_direct_operand_local(list, "ListSet receiver", function_name, locals)?;
+    validate_direct_operand_local(index, "ListSet index", function_name, locals)?;
+    validate_direct_operand_local(value, "ListSet value", function_name, locals)
+}
+
+fn validate_list_clear(
+    list: &mir::Operand,
+    function_name: &str,
+    classes: &HashSet<mir::SymbolId>,
+    structs: &HashSet<mir::SymbolId>,
+    interfaces: &HashSet<mir::SymbolId>,
+    enums: &HashSet<mir::SymbolId>,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    validate_operand(list, function_name)?;
+    let mir::Type::List(element_type) = &list.type_ else {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a `ListClear` whose receiver is not `List<T>`"
+        )));
+    };
+    validate_list_element_type(
+        element_type,
+        function_name,
+        classes,
+        structs,
+        interfaces,
+        enums,
+    )?;
+    validate_direct_operand_local(list, "ListClear receiver", function_name, locals)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_list_to_array(
+    destination: &mir::Place,
+    list: &mir::Operand,
+    element_type: &mir::Type,
+    function_name: &str,
+    classes: &HashSet<mir::SymbolId>,
+    structs: &HashSet<mir::SymbolId>,
+    interfaces: &HashSet<mir::SymbolId>,
+    enums: &HashSet<mir::SymbolId>,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    validate_operand(list, function_name)?;
+    validate_direct_operand_local(list, "ListToArray receiver", function_name, locals)?;
+    let mir::Type::List(receiver_element) = &list.type_ else {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a `ListToArray` whose receiver is not `List<T>`"
+        )));
+    };
+    if receiver_element.as_ref() != element_type {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has `ListToArray` metadata incompatible with its receiver"
+        )));
+    }
+    validate_list_element_type(
+        element_type,
+        function_name,
+        classes,
+        structs,
+        interfaces,
+        enums,
+    )?;
+    let declared = declared_local_type(destination, function_name, "ListToArray", locals)?;
+    if declared != &mir::Type::Array(Box::new(element_type.clone())) {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a `ListToArray` destination with the wrong array element type"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_direct_operand_local(
+    operand: &mir::Operand,
+    operation: &str,
+    function_name: &str,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    let mir::OperandKind::Copy(mir::Place::Local(local)) = &operand.kind else {
+        return Ok(());
+    };
+    if locals.get(local) == Some(&operand.type_) {
+        Ok(())
+    } else {
+        Err(BackendError::new(format!(
+            "function `{function_name}` has a {operation} whose operand type does not match its local"
+        )))
+    }
+}
+
+fn validate_dictionary_clear(
+    dictionary: &mir::Operand,
+    function_name: &str,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+) -> Result<(), BackendError> {
+    validate_operand(dictionary, function_name)?;
+    validate_dictionary_operand_locals(dictionary, "DictionaryClear", function_name, locals)
+}
+
 /// Whether `element_type` is a concrete type `List<T>` may hold: known to
 /// the module (any nominal symbol actually declared), not `void`, not
 /// `decimal` (checked by the compiler but not executable yet — see
@@ -3349,6 +3666,11 @@ fn validate_interface_call(
 }
 
 #[allow(clippy::too_many_lines)]
+// `#[inline(never)]`: this function has a 600-line match that, when inlined
+// into `validate_call_intrinsic`, inflates the combined stack frame beyond
+// Windows' default 1 MB test-thread limit in debug builds. Keeping it as a
+// separate frame has no runtime cost in optimized builds.
+#[inline(never)]
 fn validate_intrinsic_shape(
     destination: Option<&mir::Place>,
     intrinsic: mir::Intrinsic,
@@ -3399,6 +3721,41 @@ fn validate_intrinsic_shape(
             destination.is_some()
                 && return_type == &mir::Type::String
                 && matches!(arguments, [receiver, start, length] if receiver.type_ == mir::Type::String && start.type_ == mir::Type::Int && length.type_ == mir::Type::Int)
+        }
+        mir::Intrinsic::StringTrim | mir::Intrinsic::StringTrimTemporary => {
+            destination.is_some()
+                && return_type == &mir::Type::String
+                && matches!(arguments, [value] if value.type_ == mir::Type::String)
+        }
+        mir::Intrinsic::StringReplace | mir::Intrinsic::StringReplaceTemporary => {
+            destination.is_some()
+                && return_type == &mir::Type::String
+                && matches!(arguments, [value, old_value, new_value] if value.type_ == mir::Type::String && old_value.type_ == mir::Type::String && new_value.type_ == mir::Type::String)
+        }
+        mir::Intrinsic::StringSplit | mir::Intrinsic::StringSplitTemporary => {
+            destination.is_some()
+                && return_type == &mir::Type::Array(Box::new(mir::Type::String))
+                && matches!(arguments, [value, separator] if value.type_ == mir::Type::String && separator.type_ == mir::Type::String)
+        }
+        mir::Intrinsic::MathUnaryFloat => {
+            destination.is_some()
+                && return_type == &mir::Type::Float
+                && matches!(arguments, [value, operation] if value.type_ == mir::Type::Float && is_math_unary_operation(operation))
+        }
+        mir::Intrinsic::MathUnaryDouble => {
+            destination.is_some()
+                && return_type == &mir::Type::Double
+                && matches!(arguments, [value, operation] if value.type_ == mir::Type::Double && is_math_unary_operation(operation))
+        }
+        mir::Intrinsic::MathPowFloat => {
+            destination.is_some()
+                && return_type == &mir::Type::Float
+                && matches!(arguments, [value, exponent] if value.type_ == mir::Type::Float && exponent.type_ == mir::Type::Float)
+        }
+        mir::Intrinsic::MathPowDouble => {
+            destination.is_some()
+                && return_type == &mir::Type::Double
+                && matches!(arguments, [value, exponent] if value.type_ == mir::Type::Double && exponent.type_ == mir::Type::Double)
         }
         mir::Intrinsic::StringFromLong | mir::Intrinsic::StringFromLongTemporary => {
             destination.is_some()
@@ -3680,6 +4037,15 @@ fn validate_intrinsic_shape(
             "function `{function_name}` contains a malformed {intrinsic:?} runtime intrinsic: found ({arguments}) -> {return_type:?}"
         )))
     }
+}
+
+fn is_math_unary_operation(operand: &mir::Operand) -> bool {
+    operand.type_ == mir::Type::Int
+        && matches!(
+            &operand.kind,
+            mir::OperandKind::Constant(mir::Constant::Integer(code))
+                if matches!(code.as_str(), "0" | "1" | "2" | "3" | "4" | "5" | "6")
+        )
 }
 
 fn function_operand_matches(
@@ -4215,6 +4581,215 @@ mod tests {
                 .expect_err("non-string destination must fail")
                 .message()
                 .contains("non-string destination")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn malformed_standard_library_intrinsics_are_rejected_before_codegen() {
+        let id = NEXT_STRING_BUILDER_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "aster-invalid-stdlib-usability-{}-{id}.aster",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+                using aster.collections;
+                using aster.math;
+                using aster.text;
+                public double Root() { return Math.Sqrt(81d); }
+                public int Text() { string[] parts = String.Split("a,b", ","); return parts.Length; }
+                public int ListOps() {
+                    List<int> items = new List<int>();
+                    items.Add(1);
+                    items.Set(0, 2);
+                    int[] snapshot = items.ToArray();
+                    items.Clear();
+                    return snapshot.Length;
+                }
+                public int Main() {
+                    Dictionary<string, int> values = new Dictionary<string, int>();
+                    values.Add("a", 1);
+                    string[] keys = values.Keys();
+                    return keys.Length;
+                }
+            "#,
+        )
+        .expect("write standard-library validation source");
+        let valid = aster_compiler::compile_project(&path)
+            .expect("standard-library validation source compiles")
+            .compilation
+            .mir;
+        std::fs::remove_file(path).expect("remove standard-library validation source");
+        validate_module(&valid).expect("compiler-produced standard-library MIR is valid");
+
+        let mut invalid_math = valid.clone();
+        let operation = invalid_math
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|instruction| match instruction {
+                mir::Instruction::CallIntrinsic {
+                    intrinsic: mir::Intrinsic::MathUnaryDouble,
+                    arguments,
+                    ..
+                } => arguments.get_mut(1),
+                _ => None,
+            })
+            .expect("Math.Sqrt intrinsic");
+        operation.kind = mir::OperandKind::Constant(mir::Constant::Integer("99".to_owned()));
+        let error =
+            validate_module(&invalid_math).expect_err("unknown math unary operation must fail");
+        assert!(
+            error.message().contains("malformed MathUnaryDouble"),
+            "unexpected math validation diagnostic: {}",
+            error.message()
+        );
+
+        let mut invalid_math_destination = valid.clone();
+        let math_function_index = invalid_math_destination
+            .functions
+            .iter()
+            .position(|function| {
+                function.blocks.iter().any(|block| {
+                    block.instructions.iter().any(|instruction| {
+                        matches!(
+                            instruction,
+                            mir::Instruction::CallIntrinsic {
+                                intrinsic: mir::Intrinsic::MathUnaryDouble,
+                                ..
+                            }
+                        )
+                    })
+                })
+            })
+            .expect("math intrinsic wrapper function");
+        let destination_local = invalid_math_destination.functions[math_function_index]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .find_map(|instruction| match instruction {
+                mir::Instruction::CallIntrinsic {
+                    destination: Some(mir::Place::Local(local)),
+                    intrinsic: mir::Intrinsic::MathUnaryDouble,
+                    ..
+                } => Some(*local),
+                _ => None,
+            })
+            .expect("Math.Sqrt destination");
+        invalid_math_destination.functions[math_function_index]
+            .locals
+            .iter_mut()
+            .find(|local| local.id == destination_local)
+            .expect("Math.Sqrt destination local")
+            .type_ = mir::Type::Int;
+        let error = validate_module(&invalid_math_destination)
+            .expect_err("wrong math destination type must fail");
+        assert!(
+            error.message().contains("stores MathUnaryDouble result"),
+            "unexpected math destination diagnostic: {}",
+            error.message()
+        );
+
+        let mut invalid_string = valid.clone();
+        let return_type = invalid_string
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|instruction| match instruction {
+                mir::Instruction::CallIntrinsic {
+                    intrinsic: mir::Intrinsic::StringSplit | mir::Intrinsic::StringSplitTemporary,
+                    return_type,
+                    ..
+                } => Some(return_type),
+                _ => None,
+            })
+            .expect("String.Split intrinsic");
+        *return_type = mir::Type::String;
+        assert!(
+            validate_module(&invalid_string)
+                .expect_err("wrong String.Split return type must fail")
+                .message()
+                .contains("stores StringSplit result")
+        );
+
+        let mut invalid_list_index = valid.clone();
+        let index = invalid_list_index
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|instruction| match instruction {
+                mir::Instruction::ListSet { index, .. } => Some(index),
+                _ => None,
+            })
+            .expect("List.Set instruction");
+        index.type_ = mir::Type::Long;
+        assert!(
+            validate_module(&invalid_list_index)
+                .expect_err("wrong List.Set index type must fail")
+                .message()
+                .contains("ListSet")
+        );
+
+        let mut invalid_list_snapshot = valid.clone();
+        let element_type = invalid_list_snapshot
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|instruction| match instruction {
+                mir::Instruction::ListToArray { element_type, .. } => Some(element_type),
+                _ => None,
+            })
+            .expect("List.ToArray instruction");
+        *element_type = mir::Type::String;
+        assert!(
+            validate_module(&invalid_list_snapshot)
+                .expect_err("wrong List.ToArray element metadata must fail")
+                .message()
+                .contains("ListToArray")
+        );
+
+        let mut invalid_list_receiver = valid.clone();
+        let list = invalid_list_receiver
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|instruction| match instruction {
+                mir::Instruction::ListClear { list } => Some(list),
+                _ => None,
+            })
+            .expect("List.Clear instruction");
+        list.type_ = mir::Type::List(Box::new(mir::Type::String));
+        assert!(
+            validate_module(&invalid_list_receiver)
+                .expect_err("List.Clear local/type disagreement must fail")
+                .message()
+                .contains("operand type does not match its local")
+        );
+
+        let mut invalid_snapshot = valid;
+        let key_type = invalid_snapshot
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|instruction| match instruction {
+                mir::Instruction::DictionaryKeys { key_type, .. } => Some(key_type),
+                _ => None,
+            })
+            .expect("Dictionary.Keys instruction");
+        *key_type = mir::Type::Int;
+        assert!(
+            validate_module(&invalid_snapshot)
+                .expect_err("wrong snapshot component type must fail")
+                .message()
+                .contains("snapshot metadata")
         );
     }
 

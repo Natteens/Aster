@@ -414,6 +414,37 @@ impl Codegen {
                 *region,
                 state,
             ),
+            mir::Instruction::DictionaryClear { dictionary } => {
+                self.translate_dictionary_clear(builder, dictionary, state)
+            }
+            mir::Instruction::DictionaryKeys {
+                destination,
+                dictionary,
+                key_type,
+                region,
+            } => self.translate_dictionary_snapshot(
+                builder,
+                destination,
+                dictionary,
+                key_type,
+                true,
+                *region,
+                state,
+            ),
+            mir::Instruction::DictionaryValues {
+                destination,
+                dictionary,
+                value_type,
+                region,
+            } => self.translate_dictionary_snapshot(
+                builder,
+                destination,
+                dictionary,
+                value_type,
+                false,
+                *region,
+                state,
+            ),
             mir::Instruction::ListAdd { list, value } => {
                 self.translate_list_add(builder, list, value, state)
             }
@@ -426,6 +457,23 @@ impl Codegen {
             mir::Instruction::ListRemoveAt { list, index } => {
                 self.translate_list_remove_at(builder, list, index, state)
             }
+            mir::Instruction::ListSet { list, index, value } => {
+                self.translate_list_set(builder, list, index, value, state)
+            }
+            mir::Instruction::ListClear { list } => self.translate_list_clear(builder, list, state),
+            mir::Instruction::ListToArray {
+                destination,
+                list,
+                element_type,
+                region,
+            } => self.translate_list_to_array(
+                builder,
+                destination,
+                list,
+                element_type,
+                *region,
+                state,
+            ),
             mir::Instruction::StringDecodeNext {
                 string,
                 cursor,

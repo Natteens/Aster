@@ -399,10 +399,6 @@ fn rewrite_instruction_operands(
     }
 
     match instruction {
-        mir::Instruction::OwnedRegionEnter { .. }
-        | mir::Instruction::OwnedRegionExit { .. }
-        | mir::Instruction::TemporarySubregionEnter { .. }
-        | mir::Instruction::TemporarySubregionExit { .. } => {}
         mir::Instruction::Assign { target, value } => {
             place!(target);
             rewrite_rvalue_operands(value, facts, copies, local_indices);
@@ -509,6 +505,18 @@ fn rewrite_instruction_operands(
         } => {
             place!(destination);
             operand!(dictionary);
+        }
+        mir::Instruction::OwnedRegionEnter { .. }
+        | mir::Instruction::OwnedRegionExit { .. }
+        | mir::Instruction::TemporarySubregionEnter { .. }
+        | mir::Instruction::TemporarySubregionExit { .. }
+        | mir::Instruction::DictionaryClear { .. }
+        | mir::Instruction::DictionaryKeys { .. }
+        | mir::Instruction::DictionaryValues { .. }
+        | mir::Instruction::ListSet { .. }
+        | mir::Instruction::ListClear { .. }
+        | mir::Instruction::ListToArray { .. } => {
+            // Lifetime and collection intrinsics stay opaque: no facts cross them.
         }
         mir::Instruction::ListAdd { list, value } => {
             operand!(list);
@@ -1231,6 +1239,13 @@ mod tests {
             mir::Intrinsic::ParallelFor,
             mir::Intrinsic::ParallelForEach,
             mir::Intrinsic::ParallelReduce,
+            mir::Intrinsic::StringTrim,
+            mir::Intrinsic::StringReplace,
+            mir::Intrinsic::StringSplit,
+            mir::Intrinsic::MathUnaryFloat,
+            mir::Intrinsic::MathUnaryDouble,
+            mir::Intrinsic::MathPowFloat,
+            mir::Intrinsic::MathPowDouble,
         ] {
             let mut instruction = mir::Instruction::CallIntrinsic {
                 destination: None,
@@ -1255,5 +1270,50 @@ mod tests {
                 mir::OperandKind::Copy(mir::Place::Local(id)) if id == local
             ));
         }
+    }
+
+    #[test]
+    fn standard_library_collection_operations_are_opaque_fact_barriers() {
+        let scalar = mir::LocalId(0);
+        let list = mir::LocalId(1);
+        let local_indices = HashMap::from([(scalar, 0), (list, 1)]);
+        let facts = vec![
+            ConstantFact::Constant(mir::Operand {
+                type_: mir::Type::Int,
+                kind: mir::OperandKind::Constant(mir::Constant::Integer("7".to_owned())),
+            }),
+            ConstantFact::Overdefined,
+        ];
+        let mut instruction = mir::Instruction::ListSet {
+            list: mir::Operand {
+                type_: mir::Type::List(Box::new(mir::Type::Int)),
+                kind: mir::OperandKind::Copy(mir::Place::Local(list)),
+            },
+            index: mir::Operand {
+                type_: mir::Type::Int,
+                kind: mir::OperandKind::Copy(mir::Place::Local(scalar)),
+            },
+            value: mir::Operand {
+                type_: mir::Type::Int,
+                kind: mir::OperandKind::Copy(mir::Place::Local(scalar)),
+            },
+        };
+        assert!(!rewrite_instruction_operands(
+            &mut instruction,
+            &facts,
+            &HashMap::new(),
+            &local_indices
+        ));
+        let mir::Instruction::ListSet { index, value, .. } = instruction else {
+            unreachable!()
+        };
+        assert!(matches!(
+            index.kind,
+            mir::OperandKind::Copy(mir::Place::Local(id)) if id == scalar
+        ));
+        assert!(matches!(
+            value.kind,
+            mir::OperandKind::Copy(mir::Place::Local(id)) if id == scalar
+        ));
     }
 }

@@ -316,6 +316,21 @@ pub enum Instruction {
         entry_layout: DictionaryEntryLayout,
         region: AllocationRegion,
     },
+    DictionaryClear {
+        dictionary: Operand,
+    },
+    DictionaryKeys {
+        destination: Place,
+        dictionary: Operand,
+        key_type: Type,
+        region: AllocationRegion,
+    },
+    DictionaryValues {
+        destination: Place,
+        dictionary: Operand,
+        value_type: Type,
+        region: AllocationRegion,
+    },
     /// `list.Add(value)`: appends `value` to `list`'s buffer, growing it if
     /// needed. `list`'s type is always `List(element)` for some concrete
     /// `element`, and `value.type_` is always exactly that `element` type;
@@ -344,6 +359,20 @@ pub enum Instruction {
     ListRemoveAt {
         list: Operand,
         index: Operand,
+    },
+    ListSet {
+        list: Operand,
+        index: Operand,
+        value: Operand,
+    },
+    ListClear {
+        list: Operand,
+    },
+    ListToArray {
+        destination: Place,
+        list: Operand,
+        element_type: Type,
+        region: AllocationRegion,
     },
     /// Decodes exactly one Unicode scalar value at byte offset `cursor` in
     /// `string`'s UTF-8 payload: writes the scalar to `char_destination`
@@ -385,6 +414,16 @@ pub enum Intrinsic {
     StringSubstringFromTemporary,
     StringSubstringRange,
     StringSubstringRangeTemporary,
+    StringTrim,
+    StringTrimTemporary,
+    StringReplace,
+    StringReplaceTemporary,
+    StringSplit,
+    StringSplitTemporary,
+    MathUnaryFloat,
+    MathUnaryDouble,
+    MathPowFloat,
+    MathPowDouble,
     /// Convert a signed integer (widened to `long`) to a `string`.
     StringFromLong,
     StringFromLongTemporary,
@@ -527,6 +566,9 @@ impl Intrinsic {
             | Self::StringJoin
             | Self::StringSubstringFrom
             | Self::StringSubstringRange
+            | Self::StringTrim
+            | Self::StringReplace
+            | Self::StringSplit
             | Self::ConsoleReadLine
             | Self::FileReadAllText(_) => Some(AllocationRegion::Persistent),
             Self::StringConcatTemporary
@@ -539,6 +581,9 @@ impl Intrinsic {
             | Self::StringJoinTemporary
             | Self::StringSubstringFromTemporary
             | Self::StringSubstringRangeTemporary
+            | Self::StringTrimTemporary
+            | Self::StringReplaceTemporary
+            | Self::StringSplitTemporary
             | Self::ConsoleReadLineTemporary
             | Self::FileReadAllTextTemporary(_) => Some(AllocationRegion::Temporary),
             Self::Log
@@ -550,6 +595,10 @@ impl Intrinsic {
             | Self::StringStartsWith
             | Self::StringEndsWith
             | Self::StringIndexOf
+            | Self::MathUnaryFloat
+            | Self::MathUnaryDouble
+            | Self::MathPowFloat
+            | Self::MathPowDouble
             | Self::ReportRuntimeError(_)
             | Self::ListVersionMismatch
             | Self::TaskRun
@@ -594,6 +643,7 @@ impl Intrinsic {
 
     /// Return the equivalent dynamic-string intrinsic for `region`.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub const fn with_string_allocation_region(self, region: AllocationRegion) -> Self {
         match (self, region) {
             (Self::StringConcat | Self::StringConcatTemporary, AllocationRegion::Persistent) => {
@@ -669,6 +719,24 @@ impl Intrinsic {
                 Self::StringSubstringRange | Self::StringSubstringRangeTemporary,
                 AllocationRegion::Temporary,
             ) => Self::StringSubstringRangeTemporary,
+            (Self::StringTrim | Self::StringTrimTemporary, AllocationRegion::Persistent) => {
+                Self::StringTrim
+            }
+            (Self::StringTrim | Self::StringTrimTemporary, AllocationRegion::Temporary) => {
+                Self::StringTrimTemporary
+            }
+            (Self::StringReplace | Self::StringReplaceTemporary, AllocationRegion::Persistent) => {
+                Self::StringReplace
+            }
+            (Self::StringReplace | Self::StringReplaceTemporary, AllocationRegion::Temporary) => {
+                Self::StringReplaceTemporary
+            }
+            (Self::StringSplit | Self::StringSplitTemporary, AllocationRegion::Persistent) => {
+                Self::StringSplit
+            }
+            (Self::StringSplit | Self::StringSplitTemporary, AllocationRegion::Temporary) => {
+                Self::StringSplitTemporary
+            }
             (
                 Self::ConsoleReadLine | Self::ConsoleReadLineTemporary,
                 AllocationRegion::Persistent,

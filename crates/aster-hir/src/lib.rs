@@ -56,6 +56,19 @@ pub enum Visibility {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Intrinsic {
     ReportRuntimeError(RuntimeErrorKind),
+    /// Internal UTF-8-aware `aster.text.String` helpers. Their public static
+    /// wrappers remain ordinary standard-library source methods.
+    StringTrim,
+    StringReplace,
+    StringSplit,
+    /// Floating-point math helpers selected by the official `aster.math`
+    /// declarations. The integer operation code is an implementation detail
+    /// carried as the second source argument; the callable identity is fixed
+    /// before HIR and never inferred by a backend.
+    MathUnaryFloat,
+    MathUnaryDouble,
+    MathPowFloat,
+    MathPowDouble,
     /// `aster.io.Write(string)`: emits its argument's UTF-8 bytes verbatim.
     ConsoleWrite,
     /// `aster.io.WriteLine(string)`: like `ConsoleWrite`, plus a trailing LF.
@@ -435,6 +448,18 @@ pub enum ExpressionKind {
         entry_type: Type,
         entry_layout: DictionaryEntryLayout,
     },
+    /// Removes every entry while retaining the dictionary's reusable backing.
+    DictionaryClear {
+        dictionary: Box<Expression>,
+    },
+    DictionaryKeys {
+        dictionary: Box<Expression>,
+        key_type: Type,
+    },
+    DictionaryValues {
+        dictionary: Box<Expression>,
+        value_type: Type,
+    },
     /// Explicit mutation of one official `aster.core.StringBuilder`.
     StringBuilderAppend {
         builder: Box<Expression>,
@@ -465,6 +490,21 @@ pub enum ExpressionKind {
     ListRemoveAt {
         list: Box<Expression>,
         index: Box<Expression>,
+    },
+    /// Replaces one existing element without changing list length or its
+    /// structural foreach version.
+    ListSet {
+        list: Box<Expression>,
+        index: Box<Expression>,
+        value: Box<Expression>,
+    },
+    /// Removes every element while retaining the list's reusable backing.
+    ListClear {
+        list: Box<Expression>,
+    },
+    ListToArray {
+        list: Box<Expression>,
+        element_type: Type,
     },
     Member {
         object: Box<Expression>,

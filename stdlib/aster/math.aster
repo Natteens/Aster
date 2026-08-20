@@ -12,8 +12,45 @@ internal void __ClampInvalidRange()
 {
 }
 
+internal float __MathUnaryFloat(float value, int operation)
+{
+    return value;
+}
+
+internal double __MathUnaryDouble(double value, int operation)
+{
+    return value;
+}
+
+internal float __MathPowFloat(float value, float exponent)
+{
+    return value;
+}
+
+internal double __MathPowDouble(double value, double exponent)
+{
+    return value;
+}
+
 public static class Math
 {
+    public static float Sqrt(float value) { return __MathUnaryFloat(value, 0); }
+    public static double Sqrt(double value) { return __MathUnaryDouble(value, 0); }
+    public static float Floor(float value) { return __MathUnaryFloat(value, 1); }
+    public static double Floor(double value) { return __MathUnaryDouble(value, 1); }
+    public static float Ceil(float value) { return __MathUnaryFloat(value, 2); }
+    public static double Ceil(double value) { return __MathUnaryDouble(value, 2); }
+    public static float Round(float value) { return __MathUnaryFloat(value, 3); }
+    public static double Round(double value) { return __MathUnaryDouble(value, 3); }
+    public static float Sin(float value) { return __MathUnaryFloat(value, 4); }
+    public static double Sin(double value) { return __MathUnaryDouble(value, 4); }
+    public static float Cos(float value) { return __MathUnaryFloat(value, 5); }
+    public static double Cos(double value) { return __MathUnaryDouble(value, 5); }
+    public static float Tan(float value) { return __MathUnaryFloat(value, 6); }
+    public static double Tan(double value) { return __MathUnaryDouble(value, 6); }
+    public static float Pow(float value, float exponent) { return __MathPowFloat(value, exponent); }
+    public static double Pow(double value, double exponent) { return __MathPowDouble(value, exponent); }
+
     public static int Abs(int value)
     {
         if (value == -2147483647 - 1)

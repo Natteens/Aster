@@ -599,6 +599,61 @@ impl Analyzer<'_> {
                             }
                             return Type::Void;
                         }
+                        if name == "Set" {
+                            if arguments.len() != 2 {
+                                self.diagnostics.push(Diagnostic::error(
+                                    format!(
+                                        "`List<T>.Set` expects 2 arguments, found {}",
+                                        arguments.len()
+                                    ),
+                                    span,
+                                ));
+                                return Type::Unknown;
+                            }
+                            if argument_types[0] != Type::Int && argument_types[0] != Type::Unknown
+                            {
+                                self.diagnostics.push(Diagnostic::error(
+                                    format!(
+                                        "`List<T>.Set` requires an `int` index, found `{}`",
+                                        argument_types[0].display()
+                                    ),
+                                    arguments[0].span,
+                                ));
+                                return Type::Unknown;
+                            }
+                            self.require_assignable_value(
+                                element_type,
+                                &argument_types[1],
+                                &arguments[1],
+                            );
+                            return Type::Void;
+                        }
+                        if name == "Clear" {
+                            if !arguments.is_empty() {
+                                self.diagnostics.push(Diagnostic::error(
+                                    format!(
+                                        "`List<T>.Clear` expects 0 arguments, found {}",
+                                        arguments.len()
+                                    ),
+                                    span,
+                                ));
+                                return Type::Unknown;
+                            }
+                            return Type::Void;
+                        }
+                        if name == "ToArray" {
+                            if !arguments.is_empty() {
+                                self.diagnostics.push(Diagnostic::error(
+                                    format!(
+                                        "`List<T>.ToArray` expects 0 arguments, found {}",
+                                        arguments.len()
+                                    ),
+                                    span,
+                                ));
+                                return Type::Unknown;
+                            }
+                            return Type::Array(element_type.clone());
+                        }
                         self.diagnostics.push(Diagnostic::error(
                             format!("list has no member `{name}`"),
                             callee.span,
@@ -609,7 +664,7 @@ impl Analyzer<'_> {
                         let expected_arity = match name.as_str() {
                             "Add" | "Set" => Some(2),
                             "TryGet" | "ContainsKey" | "Remove" => Some(1),
-                            "Entries" => Some(0),
+                            "Entries" | "Clear" | "Keys" | "Values" => Some(0),
                             _ => None,
                         };
                         let Some(expected_arity) = expected_arity else {
@@ -642,6 +697,27 @@ impl Analyzer<'_> {
                                     ResolvedDictionaryOperation::Basic,
                                 );
                                 return Type::Bool;
+                            }
+                            "Clear" => {
+                                self.model.dictionary_operations.insert(
+                                    self.model_key(span),
+                                    ResolvedDictionaryOperation::Basic,
+                                );
+                                return Type::Void;
+                            }
+                            "Keys" => {
+                                self.model.dictionary_operations.insert(
+                                    self.model_key(span),
+                                    ResolvedDictionaryOperation::Basic,
+                                );
+                                return Type::Array(key_type.clone());
+                            }
+                            "Values" => {
+                                self.model.dictionary_operations.insert(
+                                    self.model_key(span),
+                                    ResolvedDictionaryOperation::Basic,
+                                );
+                                return Type::Array(value_type.clone());
                             }
                             "TryGet" => {
                                 let option_name =

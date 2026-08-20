@@ -124,6 +124,17 @@ fn lowers_functions_and_control_flow_to_hir() {
 }
 
 #[test]
+fn lowers_long_binary_chains_without_using_the_host_call_stack() {
+    let comparisons = (0..56)
+        .map(|value| format!("value == {value}"))
+        .collect::<Vec<_>>()
+        .join(" || ");
+    assert_valid(&format!(
+        "public bool Matches(int value) {{ return {comparisons}; }}"
+    ));
+}
+
+#[test]
 fn hir_names_reference_resolved_symbols_and_types() {
     let compilation =
         assert_valid("public int Identity(int value) { int copy = value; return copy; }");

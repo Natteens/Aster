@@ -2,6 +2,48 @@
 
 use crate::ExecutionContext;
 
+/// Execute one fixed unary floating-point operation exposed by
+/// `aster.math.Math`. Operation codes are compiler-private and invalid
+/// adulterated values fail closed to NaN.
+#[must_use]
+pub extern "C" fn aster_rt_math_unary_float(value: f32, operation: i32) -> f32 {
+    match operation {
+        0 => value.sqrt(),
+        1 => value.floor(),
+        2 => value.ceil(),
+        3 => value.round_ties_even(),
+        4 => value.sin(),
+        5 => value.cos(),
+        6 => value.tan(),
+        _ => f32::NAN,
+    }
+}
+
+/// `double` counterpart of [`aster_rt_math_unary_float`].
+#[must_use]
+pub extern "C" fn aster_rt_math_unary_double(value: f64, operation: i32) -> f64 {
+    match operation {
+        0 => value.sqrt(),
+        1 => value.floor(),
+        2 => value.ceil(),
+        3 => value.round_ties_even(),
+        4 => value.sin(),
+        5 => value.cos(),
+        6 => value.tan(),
+        _ => f64::NAN,
+    }
+}
+
+#[must_use]
+pub extern "C" fn aster_rt_math_pow_float(value: f32, exponent: f32) -> f32 {
+    value.powf(exponent)
+}
+
+#[must_use]
+pub extern "C" fn aster_rt_math_pow_double(value: f64, exponent: f64) -> f64 {
+    value.powf(exponent)
+}
+
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn aster_rt_math_domain_error(context: *mut ExecutionContext, code: i32) {
     if context.is_null() {
@@ -41,7 +83,10 @@ pub extern "C" fn aster_rt_integer_arithmetic_error(context: *mut ExecutionConte
 
 #[cfg(test)]
 mod tests {
-    use super::{aster_rt_integer_arithmetic_error, aster_rt_math_domain_error};
+    use super::{
+        aster_rt_integer_arithmetic_error, aster_rt_math_domain_error, aster_rt_math_pow_double,
+        aster_rt_math_pow_float, aster_rt_math_unary_double, aster_rt_math_unary_float,
+    };
     use crate::ExecutionContext;
 
     #[test]
@@ -63,5 +108,76 @@ mod tests {
             aster_rt_integer_arithmetic_error(&raw mut context, code);
             assert_eq!(context.take_error().as_deref(), Some(expected));
         }
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation, clippy::float_cmp)]
+    fn floating_helpers_preserve_ieee_classification_and_ties_to_even() {
+        assert_eq!(
+            aster_rt_math_unary_double(0.0, 0).to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert_eq!(
+            aster_rt_math_unary_double(-0.0, 0).to_bits(),
+            (-0.0_f64).to_bits()
+        );
+        assert_eq!(aster_rt_math_unary_double(f64::INFINITY, 0), f64::INFINITY);
+        assert!(aster_rt_math_unary_double(-1.0, 0).is_nan());
+        assert!(aster_rt_math_unary_double(f64::NAN, 0).is_nan());
+
+        for (value, expected) in [
+            (0.5, 0.0),
+            (1.5, 2.0),
+            (2.5, 2.0),
+            (-0.5, -0.0),
+            (-1.5, -2.0),
+            (-2.5, -2.0),
+        ] {
+            let (value, expected): (f64, f64) = (value, expected);
+            assert_eq!(
+                aster_rt_math_unary_double(value, 3).to_bits(),
+                expected.to_bits()
+            );
+            assert_eq!(
+                aster_rt_math_unary_float(value as f32, 3).to_bits(),
+                (expected as f32).to_bits()
+            );
+        }
+        for operation in [1, 2, 3] {
+            assert!(aster_rt_math_unary_double(f64::NAN, operation).is_nan());
+            assert_eq!(
+                aster_rt_math_unary_double(f64::INFINITY, operation),
+                f64::INFINITY
+            );
+            assert_eq!(
+                aster_rt_math_unary_double(f64::NEG_INFINITY, operation),
+                f64::NEG_INFINITY
+            );
+            assert_eq!(
+                aster_rt_math_unary_double(-0.0, operation).to_bits(),
+                (-0.0_f64).to_bits()
+            );
+        }
+
+        assert_eq!(aster_rt_math_pow_double(-2.0, 3.0), -8.0);
+        assert!(aster_rt_math_pow_double(-2.0, 0.5).is_nan());
+        assert!(aster_rt_math_pow_double(f64::NAN, 2.0).is_nan());
+        assert_eq!(aster_rt_math_pow_double(2.0, -3.0), 0.125);
+        assert_eq!(aster_rt_math_pow_double(f64::INFINITY, -1.0), 0.0);
+        assert_eq!(aster_rt_math_pow_float(-2.0, 3.0), -8.0);
+
+        assert_eq!(
+            aster_rt_math_unary_double(0.0, 4).to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert_eq!(
+            aster_rt_math_unary_double(-0.0, 6).to_bits(),
+            (-0.0_f64).to_bits()
+        );
+        assert_eq!(aster_rt_math_unary_double(0.0, 5), 1.0);
+        assert!(aster_rt_math_unary_double(f64::INFINITY, 4).is_nan());
+        assert!(aster_rt_math_unary_double(f64::INFINITY, 5).is_nan());
+        assert!(aster_rt_math_unary_double(f64::INFINITY, 6).is_nan());
+        assert!((aster_rt_math_unary_double(std::f64::consts::FRAC_PI_2, 4) - 1.0).abs() < 1e-15);
     }
 }

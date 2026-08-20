@@ -1,0 +1,34 @@
+using aster.collections;
+using aster.math;
+using aster.text;
+
+public class Program
+{
+    public static int Main()
+    {
+        string text = String.Trim("  alpha,beta,alpha  ");
+        string[] parts = String.Split(text, ",");
+        string replaced = String.Replace(parts[2], "alpha", "gamma");
+        if (!String.StartsWith(text, "alpha") || !String.Contains(replaced, "gamma"))
+        {
+            return 1;
+        }
+
+        List<int> values = new List<int>();
+        values.Add(1);
+        values.Add(2);
+        values.Set(1, 4);
+        int[] snapshot = values.ToArray();
+
+        Dictionary<string, int> scores = new Dictionary<string, int>();
+        scores.Add("first", snapshot[0]);
+        scores.Add("second", snapshot[1]);
+        string[] keys = scores.Keys();
+        scores.Clear();
+        values.Clear();
+
+        double angle = Math.Sin(0.0);
+        double root = Math.Sqrt(81.0);
+        return keys.Length + (int)root + (int)angle + snapshot[1];
+    }
+}

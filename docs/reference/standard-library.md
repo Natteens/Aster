@@ -13,8 +13,8 @@ intrinsics still resolve through official `aster.*` symbols rather than text or 
 - `aster.core` defines [`Option<T>`, `Result<T, E>`](option-result.md), and the explicit
   incremental [`StringBuilder`](strings.md#incremental-construction).
 - `aster.io` provides [terminal and host-managed filesystem operations](io.md).
-- `aster.math` provides scalar [`Abs`, `Min`, `Max`, and `Clamp`](math.md) overloads.
-- `aster.text` provides immutable-text helpers documented with [strings](strings.md).
+- `aster.math` provides scalar [`Abs`, `Min`, `Max`, `Clamp`, rounding, power, root, and trigonometric](math.md) overloads.
+- `aster.text` provides ordinal immutable-text helpers documented with [strings](strings.md).
 - `aster.collections` defines the official
   [`DictionaryEntry<K, V>` snapshot value](collections.md#dictionaryk-v).
 

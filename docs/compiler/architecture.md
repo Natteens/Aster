@@ -170,9 +170,11 @@ The backend rejects unsupported MIR before code generation. Decimal source is re
 the post-link language-surface gate because its numeric and ABI contract remains unspecified;
 backend validation still rejects hand-built decimal MIR fail-closed. The backend does not inspect
 AST/HIR, implement inheritance, or generate object files or link executables.
-Public standard-library code reaches this backend as ordinary concrete MIR.
-The one math domain-error bridge is a typed MIR intrinsic; Cranelift does not inspect `Math` names
-or standard-library paths.
+Public standard-library code reaches this backend as ordinary concrete MIR. The compact string
+transforms, floating-point math operations, and collection snapshots lower through typed HIR/MIR
+intrinsics with checked runtime ABI calls; Cranelift does not inspect public `Math`, `String`, or
+collection source names or standard-library paths. Those operations remain opaque to the general
+MIR optimizer and retain their allocation/failure ordering.
 
 ### `aster-runtime`
 

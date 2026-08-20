@@ -13,6 +13,7 @@ The current toolchain includes:
 - static nominal types, classes, structs, interfaces, enums, and concrete generic specialization;
 - arrays, `List<T>`, `Dictionary<K, V>`, `Option<T>`, `Result<T, E>`, and compiler-known `foreach`;
 - immutable UTF-8 strings with Unicode-scalar `char`, scalar-counting `Length`, and `foreach` iteration;
+- practical ordinal string helpers, floating-point math helpers, and collection mutation/snapshot APIs;
 - region-based temporary and persistent allocation with conservative escape analysis, AARM fine
   reclaim, and compiler-proven long-lived owned-region reclamation for fresh return-only values;
 - terminal and host-managed filesystem operations;

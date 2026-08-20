@@ -28,6 +28,11 @@ as a value type.
 | `Math.Min(left, right)` | `int`, `long`, `float`, `double` | Smaller operand |
 | `Math.Max(left, right)` | `int`, `long`, `float`, `double` | Larger operand |
 | `Math.Clamp(value, min, max)` | `int`, `long`, `float`, `double` | `value` limited to the inclusive range |
+| `Math.Sqrt(value)` | `float`, `double` | IEEE square root |
+| `Math.Pow(value, exponent)` | `float`, `double` | IEEE exponentiation |
+| `Math.Floor(value)` / `Math.Ceil(value)` | `float`, `double` | IEEE rounding toward negative/positive infinity |
+| `Math.Round(value)` | `float`, `double` | IEEE ties-to-even rounding |
+| `Math.Sin(value)` / `Math.Cos(value)` / `Math.Tan(value)` | `float`, `double` | Trigonometry with radians |
 
 Overloads use ASTER's normal deterministic overload rules. Smaller types may use an existing safe
 widening conversion; the return type is the type of the selected overload. The library does not add
@@ -51,8 +56,17 @@ returns the first `NaN` found in `value`, `min`, then `max`; otherwise it valida
 clamps normally. For numerically equal operands, `Min` and `Max` return the right operand; this also
 determines the sign returned for signed zero.
 
+The `Sqrt`, `Pow`, rounding, and trigonometric overloads use the IEEE operation selected by their
+concrete `float` or `double` overload. They accept and produce `NaN`, signed zero, infinities, and
+subnormal values according to that operation; they do not add a domain-error exception contract.
+Angles for `Sin`, `Cos`, and `Tan` are radians. `Round` uses ties-to-even. Classification, domain,
+ties-to-even, and signed-zero behavior are consistent across supported hosts. The last bits of finite
+`Pow`, `Sin`, `Cos`, and `Tan` results may vary slightly with the platform math implementation, so
+portable code should compare approximate transcendental results with an appropriate tolerance.
+
 ## Not included yet
 
-Trigonometry, `Pow`, `Sqrt`, interpolation, and random numbers are not part of this first API.
+Interpolation and random numbers are not part of this API. `Math` has no `decimal` overloads or
+numeric constants such as `Pi`/`E`; executable decimal semantics remain intentionally undefined.
 `float2`, `float3`, other vectors, matrices, and quaternions are not primitive types. They may
 become value types in a future `aster.math`, after the scalar foundation and ABI are stable.

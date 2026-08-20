@@ -829,7 +829,10 @@ fn allocation_form_barrier(
     instruction: &mir::Instruction,
 ) -> Option<TemporarySubregionRejectionReason> {
     match instruction {
-        mir::Instruction::DictionaryEntries { .. } => {
+        mir::Instruction::DictionaryEntries { .. }
+        | mir::Instruction::DictionaryKeys { .. }
+        | mir::Instruction::DictionaryValues { .. }
+        | mir::Instruction::ListToArray { .. } => {
             Some(TemporarySubregionRejectionReason::CollectionBarrier)
         }
         mir::Instruction::AllocateList {
@@ -929,8 +932,16 @@ fn span_barrier(instructions: &[mir::Instruction]) -> Option<TemporarySubregionR
                     Some(TemporarySubregionRejectionReason::CallBarrier)
                 }
             }
-            mir::Instruction::DictionaryEntries { .. } => {
+            mir::Instruction::DictionaryEntries { .. }
+            | mir::Instruction::DictionaryKeys { .. }
+            | mir::Instruction::DictionaryValues { .. }
+            | mir::Instruction::ListToArray { .. } => {
                 Some(TemporarySubregionRejectionReason::CollectionBarrier)
+            }
+            mir::Instruction::DictionaryClear { dictionary }
+                if direct_local_operand(dictionary) =>
+            {
+                None
             }
             mir::Instruction::AllocateList {
                 destination: mir::Place::Local(_),
@@ -964,6 +975,14 @@ fn span_barrier(instructions: &[mir::Instruction]) -> Option<TemporarySubregionR
             {
                 None
             }
+            mir::Instruction::ListSet { list, index, value }
+                if direct_local_operand(list)
+                    && is_execution_safe_operand(index)
+                    && is_execution_safe_operand(value) =>
+            {
+                None
+            }
+            mir::Instruction::ListClear { list } if direct_local_operand(list) => None,
             mir::Instruction::DictionaryAdd {
                 destination: mir::Place::Local(_),
                 dictionary,
@@ -1010,9 +1029,12 @@ fn span_barrier(instructions: &[mir::Instruction]) -> Option<TemporarySubregionR
             | mir::Instruction::DictionaryTryGet { .. }
             | mir::Instruction::DictionaryContainsKey { .. }
             | mir::Instruction::DictionaryRemove { .. }
+            | mir::Instruction::DictionaryClear { .. }
             | mir::Instruction::ListAdd { .. }
             | mir::Instruction::ListGet { .. }
-            | mir::Instruction::ListRemoveAt { .. } => {
+            | mir::Instruction::ListSet { .. }
+            | mir::Instruction::ListRemoveAt { .. }
+            | mir::Instruction::ListClear { .. } => {
                 Some(TemporarySubregionRejectionReason::CollectionBarrier)
             }
             mir::Instruction::AllocateStringBuilder {

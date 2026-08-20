@@ -1,9 +1,64 @@
 namespace aster.text;
 
+internal string __Trim(string value)
+{
+    return "";
+}
+
+internal string __Replace(string value, string oldValue, string newValue)
+{
+    return "";
+}
+
+internal string[] __Split(string value, string separator)
+{
+    return [value];
+}
+
 public static class String
 {
     public static bool IsEmpty(string value)
     {
         return value.Length == 0;
+    }
+
+    public static bool Contains(string value, string pattern)
+    {
+        return value.Contains(pattern);
+    }
+
+    public static bool StartsWith(string value, string pattern)
+    {
+        return value.StartsWith(pattern);
+    }
+
+    public static bool EndsWith(string value, string pattern)
+    {
+        return value.EndsWith(pattern);
+    }
+
+    public static string Substring(string value, int start)
+    {
+        return value.Substring(start);
+    }
+
+    public static string Substring(string value, int start, int length)
+    {
+        return value.Substring(start, length);
+    }
+
+    public static string Trim(string value)
+    {
+        return __Trim(value);
+    }
+
+    public static string Replace(string value, string oldValue, string newValue)
+    {
+        return __Replace(value, oldValue, newValue);
+    }
+
+    public static string[] Split(string value, string separator)
+    {
+        return __Split(value, separator);
     }
 }

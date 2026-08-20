@@ -193,9 +193,15 @@ fn instruction_can_fail_without_calling_aster(instruction: &mir::Instruction) ->
         | mir::Instruction::DictionaryContainsKey { .. }
         | mir::Instruction::DictionaryRemove { .. }
         | mir::Instruction::DictionaryEntries { .. }
+        | mir::Instruction::DictionaryClear { .. }
+        | mir::Instruction::DictionaryKeys { .. }
+        | mir::Instruction::DictionaryValues { .. }
         | mir::Instruction::ListAdd { .. }
         | mir::Instruction::ListGet { .. }
         | mir::Instruction::ListRemoveAt { .. }
+        | mir::Instruction::ListSet { .. }
+        | mir::Instruction::ListClear { .. }
+        | mir::Instruction::ListToArray { .. }
         | mir::Instruction::StringDecodeNext { .. } => true,
     }
 }

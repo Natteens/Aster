@@ -154,6 +154,29 @@ impl StandardLibrary {
                     "aster.math::__ClampInvalidRange".to_owned(),
                     Intrinsic::ReportRuntimeError(RuntimeErrorKind::MathClampInvalidRange),
                 ),
+                (
+                    "aster.math::__MathUnaryFloat".to_owned(),
+                    Intrinsic::MathUnaryFloat,
+                ),
+                (
+                    "aster.math::__MathUnaryDouble".to_owned(),
+                    Intrinsic::MathUnaryDouble,
+                ),
+                (
+                    "aster.math::__MathPowFloat".to_owned(),
+                    Intrinsic::MathPowFloat,
+                ),
+                (
+                    "aster.math::__MathPowDouble".to_owned(),
+                    Intrinsic::MathPowDouble,
+                ),
+            ]);
+        }
+        if self.modules.contains_key("aster.text") {
+            bindings.extend([
+                ("aster.text::__Trim".to_owned(), Intrinsic::StringTrim),
+                ("aster.text::__Replace".to_owned(), Intrinsic::StringReplace),
+                ("aster.text::__Split".to_owned(), Intrinsic::StringSplit),
             ]);
         }
         if self.modules.contains_key("aster.io") {

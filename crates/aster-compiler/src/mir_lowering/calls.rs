@@ -90,6 +90,7 @@ impl FunctionLowerer {
     /// `void`; `aster.io.ReadLine`, no arguments, an `Option<string>`
     /// destination whose region always starts `Persistent` and is narrowed
     /// by escape analysis exactly like `StringFrom*`/`Substring`.
+    #[allow(clippy::too_many_lines)]
     fn lower_intrinsic_call(
         &mut self,
         intrinsic: hir::Intrinsic,
@@ -129,6 +130,33 @@ impl FunctionLowerer {
                     destination: Some(destination.clone()),
                     intrinsic: mir::Intrinsic::ConsoleReadLine,
                     arguments: Vec::new(),
+                    return_type: return_type.clone(),
+                });
+                Some(mir::Operand {
+                    type_: return_type.clone(),
+                    kind: mir::OperandKind::Copy(destination),
+                })
+            }
+            hir::Intrinsic::StringTrim
+            | hir::Intrinsic::StringReplace
+            | hir::Intrinsic::StringSplit
+            | hir::Intrinsic::MathUnaryFloat
+            | hir::Intrinsic::MathUnaryDouble
+            | hir::Intrinsic::MathPowFloat
+            | hir::Intrinsic::MathPowDouble => {
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| {
+                        self.lower_expression(argument)
+                            .expect("validated intrinsic argument produces a value")
+                    })
+                    .collect();
+                let local = self.new_temporary(return_type.clone());
+                let destination = mir::Place::Local(local);
+                self.instruction(mir::Instruction::CallIntrinsic {
+                    destination: Some(destination.clone()),
+                    intrinsic: lower_intrinsic(intrinsic),
+                    arguments,
                     return_type: return_type.clone(),
                 });
                 Some(mir::Operand {

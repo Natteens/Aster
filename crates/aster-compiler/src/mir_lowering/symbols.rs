@@ -268,10 +268,33 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
             note(max, entry_layout.key_field);
             note(max, entry_layout.value_field);
         }
+        hir::ExpressionKind::DictionaryKeys {
+            dictionary,
+            key_type: _,
+        }
+        | hir::ExpressionKind::DictionaryValues {
+            dictionary,
+            value_type: _,
+        }
+        | hir::ExpressionKind::DictionaryClear { dictionary }
+        | hir::ExpressionKind::ListClear { list: dictionary } => {
+            collect_expression(dictionary, max);
+        }
         hir::ExpressionKind::ListRemoveAt { list, index }
         | hir::ExpressionKind::ListGet { list, index, .. } => {
             collect_expression(list, max);
             collect_expression(index, max);
+        }
+        hir::ExpressionKind::ListSet { list, index, value } => {
+            collect_expression(list, max);
+            collect_expression(index, max);
+            collect_expression(value, max);
+        }
+        hir::ExpressionKind::ListToArray {
+            list,
+            element_type: _,
+        } => {
+            collect_expression(list, max);
         }
         hir::ExpressionKind::Index { array, index } => {
             collect_expression(array, max);

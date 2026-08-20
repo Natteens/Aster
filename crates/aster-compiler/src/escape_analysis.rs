@@ -484,13 +484,19 @@ fn instruction_uses_alias(instruction: &mir::Instruction, aliases: &HashSet<mir:
         | mir::Instruction::DictionaryContainsKey { dictionary, .. }
         | mir::Instruction::DictionaryRemove { dictionary, .. }
         | mir::Instruction::DictionaryEntries { dictionary, .. }
+        | mir::Instruction::DictionaryKeys { dictionary, .. }
+        | mir::Instruction::DictionaryValues { dictionary, .. }
+        | mir::Instruction::DictionaryClear { dictionary }
         | mir::Instruction::DictionaryAdd { dictionary, .. }
         | mir::Instruction::DictionarySet { dictionary, .. } => {
             direct_alias(dictionary, aliases).is_some()
         }
-        mir::Instruction::ListGet { list, .. } | mir::Instruction::ListRemoveAt { list, .. } => {
-            direct_alias(list, aliases).is_some()
-        }
+        mir::Instruction::ListGet { list, .. }
+        | mir::Instruction::ListRemoveAt { list, .. }
+        | mir::Instruction::ListToArray { list, .. }
+        | mir::Instruction::ListSet { list, .. }
+        | mir::Instruction::ListClear { list }
+        | mir::Instruction::ListAdd { list, .. } => direct_alias(list, aliases).is_some(),
         mir::Instruction::StringBuilderAppend { builder, .. }
         | mir::Instruction::StringBuilderToString { builder, .. } => {
             direct_alias(builder, aliases).is_some()
@@ -505,7 +511,6 @@ fn instruction_uses_alias(instruction: &mir::Instruction, aliases: &HashSet<mir:
         | mir::Instruction::AllocateStringBuilder { destination, .. } => {
             matches!(destination, mir::Place::Local(local) if aliases.contains(local))
         }
-        mir::Instruction::ListAdd { list, .. } => direct_alias(list, aliases).is_some(),
         mir::Instruction::OwnedRegionEnter { .. }
         | mir::Instruction::OwnedRegionExit { .. }
         | mir::Instruction::TemporarySubregionEnter { .. }
@@ -546,7 +551,10 @@ pub(super) fn dynamic_allocation_region(
         | mir::Instruction::AllocateDictionary { region, .. }
         | mir::Instruction::AllocateStringBuilder { region, .. }
         | mir::Instruction::StringBuilderToString { region, .. }
-        | mir::Instruction::DictionaryEntries { region, .. } => Some(*region),
+        | mir::Instruction::DictionaryEntries { region, .. }
+        | mir::Instruction::DictionaryKeys { region, .. }
+        | mir::Instruction::DictionaryValues { region, .. }
+        | mir::Instruction::ListToArray { region, .. } => Some(*region),
         mir::Instruction::CallIntrinsic { intrinsic, .. } => intrinsic.allocation_region(),
         _ => None,
     }
@@ -564,7 +572,10 @@ fn allocation_destination(instruction: &mir::Instruction) -> Option<&mir::Place>
         | mir::Instruction::AllocateDictionary { destination, .. }
         | mir::Instruction::AllocateStringBuilder { destination, .. }
         | mir::Instruction::StringBuilderToString { destination, .. }
-        | mir::Instruction::DictionaryEntries { destination, .. } => Some(destination),
+        | mir::Instruction::DictionaryEntries { destination, .. }
+        | mir::Instruction::DictionaryKeys { destination, .. }
+        | mir::Instruction::DictionaryValues { destination, .. }
+        | mir::Instruction::ListToArray { destination, .. } => Some(destination),
         mir::Instruction::CallIntrinsic {
             destination,
             intrinsic,
@@ -595,6 +606,15 @@ fn set_allocation_region(instruction: &mut mir::Instruction, region: mir::Alloca
             region: current, ..
         }
         | mir::Instruction::DictionaryEntries {
+            region: current, ..
+        }
+        | mir::Instruction::DictionaryKeys {
+            region: current, ..
+        }
+        | mir::Instruction::DictionaryValues {
+            region: current, ..
+        }
+        | mir::Instruction::ListToArray {
             region: current, ..
         } => *current = region,
         mir::Instruction::CallIntrinsic { intrinsic, .. }
@@ -847,6 +867,12 @@ fn instruction_escape(
                     | mir::Intrinsic::StringSubstringFromTemporary
                     | mir::Intrinsic::StringSubstringRange
                     | mir::Intrinsic::StringSubstringRangeTemporary
+                    | mir::Intrinsic::StringTrim
+                    | mir::Intrinsic::StringTrimTemporary
+                    | mir::Intrinsic::StringReplace
+                    | mir::Intrinsic::StringReplaceTemporary
+                    | mir::Intrinsic::StringSplit
+                    | mir::Intrinsic::StringSplitTemporary
                     | mir::Intrinsic::StringTryParseBool
                     | mir::Intrinsic::StringTryParseInt
                     | mir::Intrinsic::StringTryParseUInt
@@ -896,8 +922,13 @@ fn instruction_escape(
         | mir::Instruction::DictionaryContainsKey { .. }
         | mir::Instruction::DictionaryRemove { .. }
         | mir::Instruction::DictionaryEntries { .. }
+        | mir::Instruction::DictionaryKeys { .. }
+        | mir::Instruction::DictionaryValues { .. }
+        | mir::Instruction::DictionaryClear { .. }
         | mir::Instruction::ListGet { .. }
         | mir::Instruction::ListRemoveAt { .. }
+        | mir::Instruction::ListToArray { .. }
+        | mir::Instruction::ListClear { .. }
         | mir::Instruction::StringDecodeNext { .. }
         | mir::Instruction::OwnedRegionEnter { .. }
         | mir::Instruction::OwnedRegionExit { .. }
@@ -910,9 +941,11 @@ fn instruction_escape(
         // escape here; `list` itself never does merely by receiving an
         // `Add` (mirrors `ArrayLength`/`ListLength` not forcing their own
         // receiver to escape).
-        mir::Instruction::ListAdd { value, .. } => direct_alias(value, aliases)
-            .is_some()
-            .then_some(EscapeReason::Stored),
+        mir::Instruction::ListAdd { value, .. } | mir::Instruction::ListSet { value, .. } => {
+            direct_alias(value, aliases)
+                .is_some()
+                .then_some(EscapeReason::Stored)
+        }
         mir::Instruction::DictionaryAdd { key, value, .. }
         | mir::Instruction::DictionarySet { key, value, .. } => {
             (direct_alias(key, aliases).is_some() || direct_alias(value, aliases).is_some())
@@ -1721,6 +1754,25 @@ mod tests {
                 ))
                 .count()
                 >= 1,
+            "{classifications:#?}"
+        );
+    }
+
+    #[test]
+    fn a_reference_stored_with_list_set_is_persistent() {
+        let source = "public class Box { public int value; public Box(int value) { this.value = value; } } \
+                       public int Run() { List<Box> values = new List<Box>(); Box first = new Box(1); values.Add(first); \
+                       Box replacement = new Box(2); values.Set(0, replacement); return replacement.value; }";
+        let classifications = classifications(source, "Run");
+        assert_eq!(
+            classifications
+                .iter()
+                .filter(|classification| matches!(
+                    classification,
+                    EscapeClassification::Persistent(EscapeReason::Stored)
+                ))
+                .count(),
+            2,
             "{classifications:#?}"
         );
     }

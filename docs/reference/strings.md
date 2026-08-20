@@ -63,21 +63,45 @@ ASTER does not segment grapheme clusters.
 > diagnostic. ASTER currently exposes scalar traversal through `foreach`, not a random-access scalar
 > API or raw UTF-8 byte indexing.
 
-## Empty strings
+## `aster.text` helpers
 
-The small `aster.text` standard-library namespace provides one helper:
+The `aster.text` standard-library namespace provides ordinal, case-sensitive helpers. They do not
+normalize Unicode or use a culture-sensitive comparison.
 
 ```aster
 using aster.text;
 
-if (String.IsEmpty(message))
+string value = String.Trim("  alpha,beta  ");
+string[] parts = String.Split(value, ",");
+string changed = String.Replace(parts[0], "alpha", "ASTER");
+
+if (String.StartsWith(changed, "ASTER"))
 {
-    WriteLine("Mensagem vazia");
+    WriteLine(changed);
 }
 ```
 
-`String.IsEmpty(value)` is true only when `value.Length == 0`. Use `""` directly when an empty
-value is needed; there is no `String.Empty`.
+| Function | Behavior |
+| --- | --- |
+| `IsEmpty(value)` | True exactly when `value.Length == 0`. |
+| `Contains(value, pattern)` | Ordinal substring search. An empty pattern is true. |
+| `StartsWith(value, pattern)` / `EndsWith(value, pattern)` | Ordinal prefix/suffix search. An empty pattern is true. |
+| `Substring(value, start)` / `Substring(value, start, length)` | Copies complete Unicode scalars at checked scalar offsets. |
+| `Trim(value)` | Removes ASTER's fixed Unicode White_Space scalars from both ends. |
+| `Replace(value, oldValue, newValue)` | Replaces non-overlapping ordinal matches. |
+| `Split(value, separator)` | Produces an array of ordinal segments, preserving empty leading, trailing, and adjacent segments. |
+
+`Substring` rejects a negative or out-of-range scalar start/length with a controlled runtime error.
+`Replace` and `Split` reject an empty pattern/separator with a controlled runtime error. The helpers
+allocate ordinary immutable strings/arrays under the current execution context; callers observe the
+same immutable reference and value semantics as any other string or array. Use `""` directly when
+an empty value is needed; there is no `String.Empty`.
+
+`Trim` recognizes exactly U+0009–U+000D, U+0020, U+0085, U+00A0, U+1680,
+U+2000–U+200A, U+2028, U+2029, U+202F, U+205F, and U+3000. This set is independent
+of operating-system locale and host Unicode-table updates. Zero-width space U+200B is not trimmed.
+`Replace` scans left to right and replaces non-overlapping matches; replacement text is never
+rescanned. `Split` treats the separator literally and preserves every empty segment.
 
 ## 🧠 Immutability and allocation
 
@@ -130,7 +154,7 @@ control flow retains normal pairwise concatenation; not every concat loop is rew
 
 ## 🚧 Current limits
 
-There is no general implicit `ToString`, split, replace, regex, nullable string, or direct string
-indexing. `StringBuilder` does not expose capacity, insertion, replacement, formatting, or implicit
+There is no general implicit `ToString`, regex, nullable string, or direct string indexing.
+`StringBuilder` does not expose capacity, insertion, replacement, formatting, or implicit
 conversion. ASTER exposes neither UTF-8 bytes nor raw string pointers. Interpolation has no format
 specifiers, alignment, culture, or raw/verbatim form.

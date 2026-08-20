@@ -3,7 +3,7 @@
 //! geometric buffer growth (List B2A), and `values.Get(index)` with
 //! value-copy/identity-preserving semantics (List B2B), through the full
 //! pipeline (parser, semantic analysis, HIR, MIR, escape analysis, codegen,
-//! JIT execution). `Set`/`RemoveAt`/the indexer do not exist yet.
+//! JIT execution). The indexer remains intentionally unavailable.
 
 use std::fmt::Write as _;
 
@@ -655,23 +655,19 @@ fn get_and_add_still_reject_decimal() {
 }
 
 #[test]
-fn set_and_the_indexer_remain_unavailable() {
-    for (source, expected) in [
-        (
-            "public int Main() { List<int> values = new List<int>(); values.Add(1); values.Set(0, 2); return 0; }",
-            "no member `Set`",
-        ),
-        (
-            "public int Main() { List<int> values = new List<int>(); values.Add(1); return values[0]; }",
-            "cannot be indexed",
-        ),
-    ] {
-        let errors = compile_errors(source);
-        assert!(
-            errors.iter().any(|message| message.contains(expected)),
-            "expected `{expected}` in {errors:?}"
-        );
-    }
+fn set_is_available_while_the_indexer_remains_unavailable() {
+    let source = "public int Main() { List<int> values = new List<int>(); values.Add(1); values.Set(0, 2); return values.Get(0); }";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(2)));
+
+    let errors = compile_errors(
+        "public int Main() { List<int> values = new List<int>(); values.Add(1); return values[0]; }",
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("cannot be indexed")),
+        "expected the indexer diagnostic in {errors:?}"
+    );
 }
 
 #[test]
@@ -1102,23 +1098,13 @@ fn remove_at_still_rejects_decimal() {
 }
 
 #[test]
-fn set_and_the_indexer_remain_unavailable_after_remove_at() {
-    for (source, expected) in [
-        (
-            "public int Main() { List<int> values = new List<int>(); values.Add(1); values.RemoveAt(0); values.Set(0, 2); return 0; }",
-            "no member `Set`",
-        ),
-        (
-            "public int Main() { List<int> values = new List<int>(); values.Add(1); values.RemoveAt(0); return values[0]; }",
-            "cannot be indexed",
-        ),
-    ] {
-        let errors = compile_errors(source);
-        assert!(
-            errors.iter().any(|message| message.contains(expected)),
-            "expected `{expected}` in {errors:?}"
-        );
-    }
+fn set_after_remove_at_checks_the_current_length() {
+    let source = "public int Main() { List<int> values = new List<int>(); values.Add(1); values.RemoveAt(0); values.Set(0, 2); return 0; }";
+    let error = run(source, "Main").expect_err("Set past the current length must fail");
+    assert!(
+        error.contains("List.Set index 0 is out of bounds for length 0"),
+        "expected the Set bounds error, got {error:?}"
+    );
 }
 
 #[test]

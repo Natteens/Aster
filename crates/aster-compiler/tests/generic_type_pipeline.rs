@@ -177,25 +177,26 @@ fn list_of_int_is_not_assignable_to_list_of_long() {
 }
 
 #[test]
-fn list_has_no_member_operations_beyond_length_add_get_and_remove_at() {
-    for (source, expected) in [
-        (
-            "public int Run(List<int> values) { values.Set(0, 1); return 0; }",
-            "no member `Set`",
-        ),
-        (
-            "public int Run(List<int> values) { return values[0]; }",
-            "cannot be indexed",
-        ),
-    ] {
-        let diagnostics = aster_compiler::compile(source).expect_err("member not yet implemented");
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains(expected)),
-            "missing `{expected}` in {diagnostics:#?}"
-        );
-    }
+fn list_set_is_typed_while_the_indexer_remains_unavailable() {
+    let compilation = aster_compiler::compile(
+        "public int Run(List<int> values) { values.Set(0, 1); return values.Get(0); }",
+    )
+    .expect("List.Set must compile through typed MIR");
+    assert!(
+        format!("{:#?}", compilation.mir).contains("ListSet"),
+        "missing typed ListSet MIR in {:#?}",
+        compilation.mir
+    );
+
+    let diagnostics =
+        aster_compiler::compile("public int Run(List<int> values) { return values[0]; }")
+            .expect_err("the List indexer remains unavailable");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("cannot be indexed")),
+        "missing the List indexer diagnostic in {diagnostics:#?}"
+    );
 }
 
 // --- List B1: `new List<T>()` and `.Length` -----------------------------

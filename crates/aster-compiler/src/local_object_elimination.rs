@@ -431,7 +431,18 @@ fn instruction_is_legal(instruction: &mir::Instruction, candidate: &Candidate) -
             destination,
             dictionary,
             ..
+        }
+        | mir::Instruction::DictionaryKeys {
+            destination,
+            dictionary,
+            ..
+        }
+        | mir::Instruction::DictionaryValues {
+            destination,
+            dictionary,
+            ..
         } => place_is_legal(destination, candidate) && operand_is_legal(dictionary, candidate),
+        mir::Instruction::DictionaryClear { dictionary } => operand_is_legal(dictionary, candidate),
         mir::Instruction::ListAdd { list, value } => {
             operand_is_legal(list, candidate) && operand_is_legal(value, candidate)
         }
@@ -448,6 +459,15 @@ fn instruction_is_legal(instruction: &mir::Instruction, candidate: &Candidate) -
         mir::Instruction::ListRemoveAt { list, index } => {
             operand_is_legal(list, candidate) && operand_is_legal(index, candidate)
         }
+        mir::Instruction::ListSet { list, index, value } => {
+            operand_is_legal(list, candidate)
+                && operand_is_legal(index, candidate)
+                && operand_is_legal(value, candidate)
+        }
+        mir::Instruction::ListClear { list } => operand_is_legal(list, candidate),
+        mir::Instruction::ListToArray {
+            destination, list, ..
+        } => place_is_legal(destination, candidate) && operand_is_legal(list, candidate),
         mir::Instruction::StringDecodeNext {
             string,
             cursor,
@@ -749,10 +769,21 @@ fn rewrite_instruction(
             destination,
             dictionary,
             ..
+        }
+        | mir::Instruction::DictionaryKeys {
+            destination,
+            dictionary,
+            ..
+        }
+        | mir::Instruction::DictionaryValues {
+            destination,
+            dictionary,
+            ..
         } => {
             rewrite_place(destination, fields);
             rewrite_operand(dictionary, fields);
         }
+        mir::Instruction::DictionaryClear { dictionary } => rewrite_operand(dictionary, fields),
         mir::Instruction::ListAdd { list, value } => {
             rewrite_operand(list, fields);
             rewrite_operand(value, fields);
@@ -770,6 +801,18 @@ fn rewrite_instruction(
         mir::Instruction::ListRemoveAt { list, index } => {
             rewrite_operand(list, fields);
             rewrite_operand(index, fields);
+        }
+        mir::Instruction::ListSet { list, index, value } => {
+            rewrite_operand(list, fields);
+            rewrite_operand(index, fields);
+            rewrite_operand(value, fields);
+        }
+        mir::Instruction::ListClear { list } => rewrite_operand(list, fields),
+        mir::Instruction::ListToArray {
+            destination, list, ..
+        } => {
+            rewrite_place(destination, fields);
+            rewrite_operand(list, fields);
         }
         mir::Instruction::StringDecodeNext {
             string,

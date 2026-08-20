@@ -12,7 +12,7 @@
 
 use std::ptr;
 
-use crate::ExecutionContext;
+use crate::{ExecutionContext, aster_rt_array_element};
 
 /// Header preceding the UTF-8 bytes of an ABI string.
 #[repr(C)]
@@ -745,12 +745,251 @@ fn string_substring(
     }
 }
 
+/// Trim ASTER's fixed Unicode `White_Space` set. This is ordinal and
+/// locale-independent; it never consults OS, process culture, or host Unicode
+/// tables.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_trim(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+) -> *const AsterStrHeader {
+    string_trim(context, value, false)
+}
+
+/// Temporary counterpart of [`aster_rt_string_trim`].
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_trim_temporary(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+) -> *const AsterStrHeader {
+    string_trim(context, value, true)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+fn string_trim(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    temporary: bool,
+) -> *const AsterStrHeader {
+    if context.is_null() {
+        return ptr::null();
+    }
+    // SAFETY: generated code supplies a live context and an ABI string.
+    #[allow(unsafe_code)]
+    let (context, value) = unsafe { (&mut *context, view(value)) };
+    let Some(value) = value else {
+        context.fail("String.Trim received an invalid UTF-8 string reference");
+        return ptr::null();
+    };
+    let trimmed = value.trim_matches(is_aster_whitespace);
+    if temporary {
+        context.allocate_temporary_string_parts(&[trimmed])
+    } else {
+        context.allocate_string_parts(&[trimmed])
+    }
+}
+
+/// Replace exact, non-overlapping matches from left to right.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_replace(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    old_value: *const AsterStrHeader,
+    new_value: *const AsterStrHeader,
+) -> *const AsterStrHeader {
+    string_replace(context, value, old_value, new_value, false)
+}
+
+/// Temporary counterpart of [`aster_rt_string_replace`].
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_replace_temporary(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    old_value: *const AsterStrHeader,
+    new_value: *const AsterStrHeader,
+) -> *const AsterStrHeader {
+    string_replace(context, value, old_value, new_value, true)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+fn string_replace(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    old_value: *const AsterStrHeader,
+    new_value: *const AsterStrHeader,
+    temporary: bool,
+) -> *const AsterStrHeader {
+    if context.is_null() {
+        return ptr::null();
+    }
+    // SAFETY: generated code supplies live ABI strings owned by the current
+    // execution or JIT module.
+    #[allow(unsafe_code)]
+    let (context, value, old_value, new_value) =
+        unsafe { (&mut *context, view(value), view(old_value), view(new_value)) };
+    let (Some(value), Some(old_value), Some(new_value)) = (value, old_value, new_value) else {
+        context.fail("String.Replace received an invalid UTF-8 string reference");
+        return ptr::null();
+    };
+    if old_value.is_empty() {
+        context.fail("String.Replace requires a non-empty oldValue");
+        return ptr::null();
+    }
+    let matches = value.match_indices(old_value).count();
+    let Some(removed) = old_value.len().checked_mul(matches) else {
+        context.fail("String.Replace result exceeds the addressable range");
+        return ptr::null();
+    };
+    let Some(added) = new_value.len().checked_mul(matches) else {
+        context.fail("String.Replace result exceeds the addressable range");
+        return ptr::null();
+    };
+    let Some(output_len) = value
+        .len()
+        .checked_sub(removed)
+        .and_then(|length| length.checked_add(added))
+    else {
+        context.fail("String.Replace result exceeds the addressable range");
+        return ptr::null();
+    };
+    let output = context.allocate_string_storage(output_len, temporary);
+    if output.is_null() {
+        return ptr::null();
+    }
+    // SAFETY: the allocated payload has exactly `output_len` writable bytes.
+    #[allow(unsafe_code)]
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(
+            output.cast::<u8>().add(size_of::<AsterStrHeader>()),
+            output_len,
+        )
+    };
+    let mut source_cursor = 0;
+    let mut output_cursor = 0;
+    for (index, _) in value.match_indices(old_value) {
+        let prefix = &value[source_cursor..index];
+        bytes[output_cursor..output_cursor + prefix.len()].copy_from_slice(prefix.as_bytes());
+        output_cursor += prefix.len();
+        bytes[output_cursor..output_cursor + new_value.len()].copy_from_slice(new_value.as_bytes());
+        output_cursor += new_value.len();
+        source_cursor = index + old_value.len();
+    }
+    let suffix = &value[source_cursor..];
+    bytes[output_cursor..].copy_from_slice(suffix.as_bytes());
+    output
+}
+
+/// Split on an exact, non-empty delimiter, preserving empty segments.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_split(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    separator: *const AsterStrHeader,
+) -> *mut crate::context::AsterArray {
+    string_split(context, value, separator, false)
+}
+
+/// Temporary counterpart of [`aster_rt_string_split`].
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_split_temporary(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    separator: *const AsterStrHeader,
+) -> *mut crate::context::AsterArray {
+    string_split(context, value, separator, true)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+fn string_split(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    separator: *const AsterStrHeader,
+    temporary: bool,
+) -> *mut crate::context::AsterArray {
+    if context.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: generated code supplies live ABI strings owned by the current
+    // execution or JIT module.
+    #[allow(unsafe_code)]
+    let (context, value, separator) = unsafe { (&mut *context, view(value), view(separator)) };
+    let (Some(value), Some(separator)) = (value, separator) else {
+        context.fail("String.Split received an invalid UTF-8 string reference");
+        return ptr::null_mut();
+    };
+    if separator.is_empty() {
+        context.fail("String.Split requires a non-empty separator");
+        return ptr::null_mut();
+    }
+    let Some(length) = value.match_indices(separator).count().checked_add(1) else {
+        context.fail("String.Split result exceeds the supported array length");
+        return ptr::null_mut();
+    };
+    let Ok(length) = i32::try_from(length) else {
+        context.fail("String.Split result exceeds the supported array length");
+        return ptr::null_mut();
+    };
+    let element_size = u32::try_from(size_of::<*const AsterStrHeader>()).unwrap_or(8);
+    let output = if temporary {
+        context.allocate_temporary_array(length, element_size)
+    } else {
+        context.allocate_array(length, element_size)
+    };
+    if output.is_null() {
+        return ptr::null_mut();
+    }
+    for (index, segment) in value.split(separator).enumerate() {
+        let item = if temporary {
+            context.allocate_temporary_string_parts(&[segment])
+        } else {
+            context.allocate_string_parts(&[segment])
+        };
+        if item.is_null() {
+            return ptr::null_mut();
+        }
+        let Ok(index) = i32::try_from(index) else {
+            context.fail("String.Split result exceeds the supported array length");
+            return ptr::null_mut();
+        };
+        let destination = aster_rt_array_element(std::ptr::from_mut(context), output, index);
+        if destination.is_null() {
+            return ptr::null_mut();
+        }
+        // SAFETY: the runtime allocated `output` for pointer-sized string
+        // elements and `destination` points at its in-bounds slot.
+        #[allow(unsafe_code)]
+        unsafe {
+            destination
+                .cast::<*const AsterStrHeader>()
+                .write_unaligned(item);
+        };
+    }
+    output
+}
+
 fn scalar_boundary(value: &str, index: usize) -> Option<usize> {
     if index == value.chars().count() {
         Some(value.len())
     } else {
         value.char_indices().nth(index).map(|(byte, _)| byte)
     }
+}
+
+fn is_aster_whitespace(value: char) -> bool {
+    matches!(
+        value,
+        '\u{0009}'..='\u{000d}'
+            | '\u{0020}'
+            | '\u{0085}'
+            | '\u{00a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+    )
 }
 
 fn substring_bounds_error(
@@ -1148,19 +1387,22 @@ pub extern "C" fn aster_rt_string_try_parse_double(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{
         AsterStrHeader, aster_rt_string_concat, aster_rt_string_contains,
         aster_rt_string_ends_with, aster_rt_string_eq, aster_rt_string_from_double,
         aster_rt_string_from_float, aster_rt_string_index_of, aster_rt_string_length,
-        aster_rt_string_starts_with, aster_rt_string_substring_from,
-        aster_rt_string_substring_range, aster_rt_string_substring_range_temporary,
+        aster_rt_string_replace, aster_rt_string_split, aster_rt_string_starts_with,
+        aster_rt_string_substring_from, aster_rt_string_substring_range,
+        aster_rt_string_substring_range_temporary, aster_rt_string_trim,
         aster_rt_string_try_parse_bool, aster_rt_string_try_parse_double,
         aster_rt_string_try_parse_float, aster_rt_string_try_parse_int, encode_str,
         is_valid_float_grammar, view,
     };
     use crate::{
-        ExecutionContext,
-        context::{aster_rt_temporary_scope_enter, aster_rt_temporary_scope_leave},
+        ExecutionContext, MemoryGovernor, aster_rt_array_element, aster_rt_array_length,
+        context::{AsterArray, aster_rt_temporary_scope_enter, aster_rt_temporary_scope_leave},
     };
 
     /// 8-byte-aligned backing store for test strings.
@@ -1178,6 +1420,33 @@ mod tests {
 
     fn pointer(buffer: &[u64]) -> *const AsterStrHeader {
         buffer.as_ptr().cast()
+    }
+
+    fn limited_context() -> ExecutionContext {
+        ExecutionContext::with_memory_budget(
+            Arc::new(MemoryGovernor::new(crate::arena::MIN_PAGE_SIZE * 4)),
+            crate::arena::MIN_PAGE_SIZE,
+        )
+    }
+
+    fn array_strings(context: &mut ExecutionContext, array: *mut AsterArray) -> Vec<String> {
+        let context_pointer = std::ptr::from_mut(context);
+        let length = aster_rt_array_length(context_pointer, array);
+        (0..length)
+            .map(|index| {
+                let slot = aster_rt_array_element(context_pointer, array, index);
+                assert!(!slot.is_null());
+                // SAFETY: Split privately initialized every pointer-sized slot
+                // before publishing the array.
+                #[allow(unsafe_code)]
+                let value = unsafe { slot.cast::<*const AsterStrHeader>().read_unaligned() };
+                // SAFETY: each slot is a live ASTER string in this context.
+                #[allow(unsafe_code)]
+                unsafe { view(value) }
+                    .expect("valid split string")
+                    .to_owned()
+            })
+            .collect()
     }
 
     #[test]
@@ -1325,6 +1594,11 @@ mod tests {
             (4, None, "start 4"),
             (2, Some(2), "start 2, length 2"),
             (i32::MAX, Some(1), "start 2147483647, length 1"),
+            (
+                i32::MAX,
+                Some(i32::MAX),
+                "start 2147483647, length 2147483647",
+            ),
         ] {
             let mut context = ExecutionContext::new();
             let result = match length {
@@ -1342,6 +1616,132 @@ mod tests {
             assert!(error.contains(expected));
             assert!(error.contains("current length 3"));
         }
+    }
+
+    #[test]
+    fn trim_uses_the_fixed_unicode_white_space_set() {
+        let value = aligned("\t\u{00a0}\u{2003}aáβ🙂z\u{3000}\r");
+        let zero_width = aligned("\u{200b}a\u{200b}");
+        let mut context = ExecutionContext::new();
+
+        let trimmed = aster_rt_string_trim(&raw mut context, pointer(&value));
+        // SAFETY: the result is owned by the live context.
+        #[allow(unsafe_code)]
+        let trimmed = unsafe { view(trimmed) };
+        assert_eq!(trimmed, Some("aáβ🙂z"));
+
+        let unchanged = aster_rt_string_trim(&raw mut context, pointer(&zero_width));
+        assert_ne!(unchanged, pointer(&zero_width));
+        // SAFETY: the result is owned by the live context.
+        #[allow(unsafe_code)]
+        let unchanged = unsafe { view(unchanged) };
+        assert_eq!(unchanged, Some("\u{200b}a\u{200b}"));
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    fn replace_is_left_to_right_non_overlapping_and_always_publishes_its_own_string() {
+        let value = aligned("aaaa");
+        let old_value = aligned("aa");
+        let replacement = aligned("aaa");
+        let absent = aligned("z");
+        let mut context = ExecutionContext::new();
+
+        let replaced = aster_rt_string_replace(
+            &raw mut context,
+            pointer(&value),
+            pointer(&old_value),
+            pointer(&replacement),
+        );
+        // SAFETY: the result is owned by the live context.
+        #[allow(unsafe_code)]
+        let replaced = unsafe { view(replaced) };
+        assert_eq!(replaced, Some("aaaaaa"));
+
+        let copied = aster_rt_string_replace(
+            &raw mut context,
+            pointer(&value),
+            pointer(&absent),
+            pointer(&replacement),
+        );
+        assert_ne!(copied, pointer(&value));
+        // SAFETY: the result is owned by the live context.
+        #[allow(unsafe_code)]
+        let copied = unsafe { view(copied) };
+        assert_eq!(copied, Some("aaaa"));
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    fn split_preserves_empty_segments_and_initializes_every_string_slot() {
+        let value = aligned("a,,β🙂,");
+        let separator = aligned(",");
+        let empty = aligned("");
+        let mut context = ExecutionContext::new();
+
+        let parts = aster_rt_string_split(&raw mut context, pointer(&value), pointer(&separator));
+        assert_eq!(array_strings(&mut context, parts), ["a", "", "β🙂", ""]);
+
+        let one_empty =
+            aster_rt_string_split(&raw mut context, pointer(&empty), pointer(&separator));
+        assert_eq!(array_strings(&mut context, one_empty), [""]);
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    fn allocating_text_helpers_fail_controlled_without_invalidating_the_source() {
+        let large_text = "x".repeat(crate::arena::MIN_PAGE_SIZE + 1);
+        let value = aligned(&large_text);
+        let absent = aligned("z");
+        let mut substring_context = limited_context();
+        assert!(
+            aster_rt_string_substring_from(&raw mut substring_context, pointer(&value), 0,)
+                .is_null()
+        );
+        let first_error = substring_context
+            .take_error()
+            .expect("substring allocation denial");
+        assert!(first_error.contains("execution memory limit"));
+
+        let mut replace_context = limited_context();
+        assert!(
+            aster_rt_string_replace(
+                &raw mut replace_context,
+                pointer(&value),
+                pointer(&absent),
+                pointer(&absent),
+            )
+            .is_null()
+        );
+        let empty = aligned("");
+        assert!(
+            aster_rt_string_split(&raw mut replace_context, pointer(&value), pointer(&empty),)
+                .is_null()
+        );
+        let first_error = replace_context
+            .take_error()
+            .expect("replace allocation denial");
+        assert!(first_error.contains("execution memory limit"));
+
+        let many_segments = aligned(&"x,".repeat(10_000));
+        let separator = aligned(",");
+        let mut split_context = limited_context();
+        assert!(
+            aster_rt_string_split(
+                &raw mut split_context,
+                pointer(&many_segments),
+                pointer(&separator),
+            )
+            .is_null()
+        );
+        let first_error = split_context.take_error().expect("split allocation denial");
+        assert!(first_error.contains("execution memory limit"));
+
+        // The source lives outside the denied contexts and remains valid.
+        // SAFETY: `value` is the unchanged aligned test allocation.
+        #[allow(unsafe_code)]
+        let source = unsafe { view(pointer(&value)) };
+        assert_eq!(source, Some(large_text.as_str()));
     }
 
     #[test]

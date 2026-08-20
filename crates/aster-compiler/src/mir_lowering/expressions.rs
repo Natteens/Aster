@@ -257,6 +257,53 @@ impl FunctionLowerer {
                     kind: mir::OperandKind::Copy(place),
                 })
             }
+            hir::ExpressionKind::DictionaryClear { dictionary } => {
+                let dictionary = self
+                    .lower_expression(dictionary)
+                    .expect("validated dictionary produces a value");
+                self.instruction(mir::Instruction::DictionaryClear { dictionary });
+                None
+            }
+            hir::ExpressionKind::DictionaryKeys {
+                dictionary,
+                key_type,
+            } => {
+                let dictionary = self
+                    .lower_expression(dictionary)
+                    .expect("validated dictionary produces a value");
+                let destination = self.new_temporary(expression.type_.clone());
+                let place = mir::Place::Local(destination);
+                self.instruction(mir::Instruction::DictionaryKeys {
+                    destination: place.clone(),
+                    dictionary,
+                    key_type: key_type.clone(),
+                    region: mir::AllocationRegion::Persistent,
+                });
+                Some(mir::Operand {
+                    type_: expression.type_.clone(),
+                    kind: mir::OperandKind::Copy(place),
+                })
+            }
+            hir::ExpressionKind::DictionaryValues {
+                dictionary,
+                value_type,
+            } => {
+                let dictionary = self
+                    .lower_expression(dictionary)
+                    .expect("validated dictionary produces a value");
+                let destination = self.new_temporary(expression.type_.clone());
+                let place = mir::Place::Local(destination);
+                self.instruction(mir::Instruction::DictionaryValues {
+                    destination: place.clone(),
+                    dictionary,
+                    value_type: value_type.clone(),
+                    region: mir::AllocationRegion::Persistent,
+                });
+                Some(mir::Operand {
+                    type_: expression.type_.clone(),
+                    kind: mir::OperandKind::Copy(place),
+                })
+            }
             hir::ExpressionKind::ListAdd { list, value } => {
                 let list = self
                     .lower_expression(list)
@@ -289,6 +336,43 @@ impl FunctionLowerer {
                     .expect("validated index produces a value");
                 self.instruction(mir::Instruction::ListRemoveAt { list, index });
                 None
+            }
+            hir::ExpressionKind::ListSet { list, index, value } => {
+                let list = self
+                    .lower_expression(list)
+                    .expect("validated list produces a value");
+                let index = self
+                    .lower_expression(index)
+                    .expect("validated index produces a value");
+                let value = self
+                    .lower_expression(value)
+                    .expect("validated value produces a value");
+                self.instruction(mir::Instruction::ListSet { list, index, value });
+                None
+            }
+            hir::ExpressionKind::ListClear { list } => {
+                let list = self
+                    .lower_expression(list)
+                    .expect("validated list produces a value");
+                self.instruction(mir::Instruction::ListClear { list });
+                None
+            }
+            hir::ExpressionKind::ListToArray { list, element_type } => {
+                let list = self
+                    .lower_expression(list)
+                    .expect("validated list produces a value");
+                let destination = self.new_temporary(expression.type_.clone());
+                let place = mir::Place::Local(destination);
+                self.instruction(mir::Instruction::ListToArray {
+                    destination: place.clone(),
+                    list,
+                    element_type: element_type.clone(),
+                    region: mir::AllocationRegion::Persistent,
+                });
+                Some(mir::Operand {
+                    type_: expression.type_.clone(),
+                    kind: mir::OperandKind::Copy(place),
+                })
             }
             hir::ExpressionKind::StringLength(value) => {
                 let value = self
@@ -1211,6 +1295,13 @@ pub(super) fn lower_intrinsic(intrinsic: hir::Intrinsic) -> mir::Intrinsic {
         hir::Intrinsic::FileReadAllText(layout) => mir::Intrinsic::FileReadAllText(layout),
         hir::Intrinsic::FileWriteAllText(layout) => mir::Intrinsic::FileWriteAllText(layout),
         hir::Intrinsic::FileListFiles(layout) => mir::Intrinsic::FileListFiles(layout),
+        hir::Intrinsic::StringTrim => mir::Intrinsic::StringTrim,
+        hir::Intrinsic::StringReplace => mir::Intrinsic::StringReplace,
+        hir::Intrinsic::StringSplit => mir::Intrinsic::StringSplit,
+        hir::Intrinsic::MathUnaryFloat => mir::Intrinsic::MathUnaryFloat,
+        hir::Intrinsic::MathUnaryDouble => mir::Intrinsic::MathUnaryDouble,
+        hir::Intrinsic::MathPowFloat => mir::Intrinsic::MathPowFloat,
+        hir::Intrinsic::MathPowDouble => mir::Intrinsic::MathPowDouble,
     }
 }
 

@@ -42,14 +42,21 @@ The complete allocation, initialization, bounds, identity, and iteration rules a
 List<int> values = new List<int>();
 values.Add(10);
 values.Add(20);
+values.Set(1, 25);
 
 int first = values.Get(0);
 values.RemoveAt(0);
+int[] snapshot = values.ToArray();
+values.Clear();
 int count = values.Length;
 ```
 
-`Length` is read-only. `Get` and `RemoveAt` validate the index. Assignment copies the list
-reference, not its elements.
+`Length` is read-only. `Get`, `Set`, and `RemoveAt` validate the index. `Set` replaces one element
+without changing structural iteration version. `Clear` removes every element. `ToArray()` copies
+the active elements into a new fixed-length array; later list mutations cannot change that snapshot.
+Assignment copies the list reference, not its elements. `Clear` preserves the list identity and may
+retain reusable backing capacity; every alias observes the empty list and subsequent `Add` calls
+reuse the same collection normally.
 
 `foreach` captures the list and checks its structural version as it advances. `Add` or `RemoveAt`
 through any alias during iteration fails with a controlled runtime error. The element binding is a
@@ -70,6 +77,9 @@ counts.Set("aster", 2);
 Option<int> count = counts.TryGet("aster");
 bool known = counts.ContainsKey("aster");
 DictionaryEntry<string, int>[] entries = counts.Entries();
+string[] keys = counts.Keys();
+int[] values = counts.Values();
+counts.Clear();
 ```
 
 `Add` returns `false` for an existing key. `Set` inserts or replaces and reports whether it replaced
@@ -80,8 +90,16 @@ Supported key types are `bool`, `char`, the signed and unsigned integer types, a
 keys use ordinal UTF-8 equality without normalization or case folding. Values may be any concrete
 type with an executable layout.
 
-`Dictionary` is not directly iterable. `Entries()` creates an insertion-order snapshot array, which
-can be used with ordinary array `foreach`.
+`Dictionary` is not directly iterable. `Entries()`, `Keys()`, and `Values()` create independent
+insertion-order snapshot arrays, which can be used with ordinary array `foreach`. `Clear()` removes
+all live entries. Neither a snapshot nor a copied collection reference becomes transferable across
+worker boundaries.
+
+Snapshots copy values with ordinary ASTER assignment semantics: primitives and structs are value
+copies, while reference-bearing elements preserve reference identity rather than being deep-cloned.
+The snapshot storage is independent, so clearing or mutating the source collection cannot change its
+length, order, or element slots. `Dictionary.Clear()` preserves dictionary identity and reusable
+backing; newly added entries establish a new insertion order after the clear.
 
 ## Strings
 

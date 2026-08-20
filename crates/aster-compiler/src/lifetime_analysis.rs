@@ -586,9 +586,22 @@ fn instruction_access(
             destination,
             dictionary,
             ..
+        }
+        | mir::Instruction::DictionaryKeys {
+            destination,
+            dictionary,
+            ..
+        }
+        | mir::Instruction::DictionaryValues {
+            destination,
+            dictionary,
+            ..
         } => {
             read_operand(dictionary, locals, &mut access.uses)?;
             write_place(destination, true, locals, &mut access)?;
+        }
+        mir::Instruction::DictionaryClear { dictionary } => {
+            read_operand(dictionary, locals, &mut access.uses)?;
         }
         mir::Instruction::ListAdd { list, value } => {
             read_operand(list, locals, &mut access.uses)?;
@@ -607,6 +620,20 @@ fn instruction_access(
         mir::Instruction::ListRemoveAt { list, index } => {
             read_operand(list, locals, &mut access.uses)?;
             read_operand(index, locals, &mut access.uses)?;
+        }
+        mir::Instruction::ListSet { list, index, value } => {
+            read_operand(list, locals, &mut access.uses)?;
+            read_operand(index, locals, &mut access.uses)?;
+            read_operand(value, locals, &mut access.uses)?;
+        }
+        mir::Instruction::ListClear { list } => {
+            read_operand(list, locals, &mut access.uses)?;
+        }
+        mir::Instruction::ListToArray {
+            destination, list, ..
+        } => {
+            read_operand(list, locals, &mut access.uses)?;
+            write_place(destination, true, locals, &mut access)?;
         }
         mir::Instruction::StringDecodeNext {
             string,
@@ -912,7 +939,10 @@ mod tests {
             | mir::Instruction::AllocateDictionary { region, .. }
             | mir::Instruction::AllocateStringBuilder { region, .. }
             | mir::Instruction::StringBuilderToString { region, .. }
-            | mir::Instruction::DictionaryEntries { region, .. } => Some(*region),
+            | mir::Instruction::DictionaryEntries { region, .. }
+            | mir::Instruction::DictionaryKeys { region, .. }
+            | mir::Instruction::DictionaryValues { region, .. }
+            | mir::Instruction::ListToArray { region, .. } => Some(*region),
             mir::Instruction::CallIntrinsic { intrinsic, .. } => intrinsic.allocation_region(),
             _ => None,
         }

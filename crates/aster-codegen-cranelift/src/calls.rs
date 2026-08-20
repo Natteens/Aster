@@ -214,6 +214,18 @@ impl Codegen {
             mir::Intrinsic::StringSubstringRangeTemporary => {
                 ("aster_rt_string_substring_range_temporary", None, true)
             }
+            mir::Intrinsic::StringTrim => ("aster_rt_string_trim", None, true),
+            mir::Intrinsic::StringTrimTemporary => ("aster_rt_string_trim_temporary", None, true),
+            mir::Intrinsic::StringReplace => ("aster_rt_string_replace", None, true),
+            mir::Intrinsic::StringReplaceTemporary => {
+                ("aster_rt_string_replace_temporary", None, true)
+            }
+            mir::Intrinsic::StringSplit => ("aster_rt_string_split", None, true),
+            mir::Intrinsic::StringSplitTemporary => ("aster_rt_string_split_temporary", None, true),
+            mir::Intrinsic::MathUnaryFloat => ("aster_rt_math_unary_float", None, false),
+            mir::Intrinsic::MathUnaryDouble => ("aster_rt_math_unary_double", None, false),
+            mir::Intrinsic::MathPowFloat => ("aster_rt_math_pow_float", None, false),
+            mir::Intrinsic::MathPowDouble => ("aster_rt_math_pow_double", None, false),
             mir::Intrinsic::StringFromBool => ("aster_rt_string_from_bool", None, true),
             mir::Intrinsic::StringFromBoolTemporary => {
                 ("aster_rt_string_from_bool_temporary", None, true)
@@ -1813,6 +1825,79 @@ impl Codegen {
         self.store_scalar(builder, destination, entries, state)
     }
 
+    pub(super) fn translate_dictionary_clear(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        dictionary: &mir::Operand,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let mir::Type::Dictionary(key_type, value_type) = &dictionary.type_ else {
+            return Err(BackendError::new(
+                "Dictionary.Clear receiver is not Dictionary<K, V>",
+            ));
+        };
+        let dictionary_value = self.translate_operand(builder, dictionary, state)?;
+        let metadata = self.dictionary_runtime_metadata(builder, key_type, value_type)?;
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("Dictionary.Clear is missing its ExecutionContext"))?;
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids["aster_rt_dictionary_clear"], builder.func);
+        let mut arguments = vec![context, dictionary_value];
+        arguments.extend(metadata);
+        builder.ins().call(function_ref, &arguments);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn translate_dictionary_snapshot(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: &mir::Place,
+        dictionary: &mir::Operand,
+        component_type: &mir::Type,
+        keys: bool,
+        region: mir::AllocationRegion,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let mir::Type::Dictionary(key_type, value_type) = &dictionary.type_ else {
+            return Err(BackendError::new(
+                "Dictionary snapshot receiver is not Dictionary<K, V>",
+            ));
+        };
+        if (keys && component_type != key_type.as_ref())
+            || (!keys && component_type != value_type.as_ref())
+        {
+            return Err(BackendError::new(
+                "Dictionary snapshot component type disagrees with receiver",
+            ));
+        }
+        let dictionary_value = self.translate_operand(builder, dictionary, state)?;
+        let metadata = self.dictionary_runtime_metadata(builder, key_type, value_type)?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new("Dictionary snapshot is missing its ExecutionContext")
+        })?;
+        let symbol = if keys {
+            "aster_rt_dictionary_keys"
+        } else {
+            "aster_rt_dictionary_values"
+        };
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids[symbol], builder.func);
+        let mut arguments = vec![context, dictionary_value];
+        arguments.extend(metadata);
+        arguments.push(builder.ins().iconst(
+            types::I8,
+            i64::from(region == mir::AllocationRegion::Temporary),
+        ));
+        let call = builder.ins().call(function_ref, &arguments);
+        let result = builder.inst_results(call)[0];
+        self.continue_if_runtime_ok(builder, state)?;
+        self.store_scalar(builder, destination, result, state)
+    }
+
     /// `list.Add(value)`: materializes `value`'s full representation at a
     /// stable address (an aggregate's address, already produced by
     /// `translate_operand`; otherwise a fresh stack slot holding the
@@ -1895,6 +1980,143 @@ impl Codegen {
             &[context, list_value, size, align, type_key, index_value],
         );
         Ok(())
+    }
+
+    pub(super) fn translate_list_set(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        list: &mir::Operand,
+        index: &mir::Operand,
+        value: &mir::Operand,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let mir::Type::List(element_type) = &list.type_ else {
+            return Err(BackendError::new("List.Set receiver is not List<T>"));
+        };
+        if value.type_ != **element_type {
+            return Err(BackendError::new(
+                "List.Set value does not match its List<T> receiver",
+            ));
+        }
+        let list_value = self.translate_operand(builder, list, state)?;
+        let index_value = self.translate_operand(builder, index, state)?;
+        let layout = self.layouts.type_layout(element_type)?;
+        let source_address = if is_aggregate(element_type) {
+            self.translate_operand(builder, value, state)?
+        } else {
+            let value_ssa = self.translate_operand(builder, value, state)?;
+            let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                layout.size,
+                layout.align_shift,
+            ));
+            builder.ins().stack_store(value_ssa, slot, 0);
+            builder.ins().stack_addr(self.pointer_type, slot, 0)
+        };
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("List.Set is missing its ExecutionContext"))?;
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids["aster_rt_list_set"], builder.func);
+        let size = builder.ins().iconst(types::I32, i64::from(layout.size));
+        let align = builder
+            .ins()
+            .iconst(types::I32, i64::from(1_u32 << layout.align_shift));
+        #[allow(clippy::cast_possible_wrap)]
+        let type_key = builder
+            .ins()
+            .iconst(types::I64, mir::type_key(element_type) as i64);
+        builder.ins().call(
+            function_ref,
+            &[
+                context,
+                list_value,
+                size,
+                align,
+                type_key,
+                index_value,
+                source_address,
+            ],
+        );
+        Ok(())
+    }
+
+    pub(super) fn translate_list_clear(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        list: &mir::Operand,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let mir::Type::List(element_type) = &list.type_ else {
+            return Err(BackendError::new("List.Clear receiver is not List<T>"));
+        };
+        let list_value = self.translate_operand(builder, list, state)?;
+        let layout = self.layouts.type_layout(element_type)?;
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("List.Clear is missing its ExecutionContext"))?;
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids["aster_rt_list_clear"], builder.func);
+        let size = builder.ins().iconst(types::I32, i64::from(layout.size));
+        let align = builder
+            .ins()
+            .iconst(types::I32, i64::from(1_u32 << layout.align_shift));
+        #[allow(clippy::cast_possible_wrap)]
+        let type_key = builder
+            .ins()
+            .iconst(types::I64, mir::type_key(element_type) as i64);
+        builder
+            .ins()
+            .call(function_ref, &[context, list_value, size, align, type_key]);
+        Ok(())
+    }
+
+    pub(super) fn translate_list_to_array(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: &mir::Place,
+        list: &mir::Operand,
+        element_type: &mir::Type,
+        region: mir::AllocationRegion,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let mir::Type::List(receiver_element) = &list.type_ else {
+            return Err(BackendError::new("List.ToArray receiver is not List<T>"));
+        };
+        if receiver_element.as_ref() != element_type {
+            return Err(BackendError::new(
+                "List.ToArray element type disagrees with receiver",
+            ));
+        }
+        let list_value = self.translate_operand(builder, list, state)?;
+        let layout = self.layouts.type_layout(element_type)?;
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("List.ToArray is missing its ExecutionContext"))?;
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids["aster_rt_list_to_array"], builder.func);
+        let size = builder.ins().iconst(types::I32, i64::from(layout.size));
+        let align = builder
+            .ins()
+            .iconst(types::I32, i64::from(1_u32 << layout.align_shift));
+        #[allow(clippy::cast_possible_wrap)]
+        let type_key = builder
+            .ins()
+            .iconst(types::I64, mir::type_key(element_type) as i64);
+        let temporary = builder.ins().iconst(
+            types::I8,
+            i64::from(region == mir::AllocationRegion::Temporary),
+        );
+        let call = builder.ins().call(
+            function_ref,
+            &[context, list_value, size, align, type_key, temporary],
+        );
+        let result = builder.inst_results(call)[0];
+        self.continue_if_runtime_ok(builder, state)?;
+        self.store_scalar(builder, destination, result, state)
     }
 
     /// `list.Get(index)`: writes the copied element into a fresh address —

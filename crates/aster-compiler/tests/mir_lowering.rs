@@ -68,7 +68,10 @@ fn lowers_standard_math_domain_failures_to_a_typed_intrinsic() {
             let aster_compiler::hir::Item::Function(function) = item else {
                 return None;
             };
-            function.intrinsic
+            match function.intrinsic {
+                Some(aster_compiler::hir::Intrinsic::ReportRuntimeError(kind)) => Some(kind),
+                _ => None,
+            }
         })
         .collect::<Vec<_>>();
     assert_eq!(hir_intrinsics.len(), 3);

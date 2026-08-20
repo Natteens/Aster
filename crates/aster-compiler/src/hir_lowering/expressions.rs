@@ -4,6 +4,56 @@ use super::types::{
 use super::{Lowerer, ast, hir};
 
 impl Lowerer<'_> {
+    fn binary_expression(&mut self, expression: &ast::Expression) -> hir::Expression {
+        enum Work<'a> {
+            Visit(&'a ast::Expression),
+            Combine(ast::BinaryOperator),
+        }
+
+        let mut work = vec![Work::Visit(expression)];
+        let mut values = Vec::new();
+        while let Some(task) = work.pop() {
+            match task {
+                Work::Visit(expression) => {
+                    if let ast::ExpressionKind::Binary {
+                        left,
+                        operator,
+                        right,
+                    } = &expression.kind
+                    {
+                        work.push(Work::Combine(*operator));
+                        work.push(Work::Visit(right));
+                        work.push(Work::Visit(left));
+                    } else {
+                        values.push(self.expression(expression));
+                    }
+                }
+                Work::Combine(operator) => {
+                    let mut right = values.pop().expect("binary right operand was lowered");
+                    let mut left = values.pop().expect("binary left operand was lowered");
+                    if left.type_ != right.type_
+                        && let Some(promoted) = promoted(&left.type_, &right.type_)
+                    {
+                        left = convert(left, &promoted);
+                        right = convert(right, &promoted);
+                    }
+                    let type_ = binary_type(operator, &left.type_, &right.type_);
+                    values.push(hir::Expression {
+                        type_,
+                        kind: hir::ExpressionKind::Binary {
+                            left: Box::new(left),
+                            operator: binary(operator),
+                            right: Box::new(right),
+                        },
+                    });
+                }
+            }
+        }
+        let result = values.pop().expect("binary expression produced a value");
+        debug_assert!(values.is_empty());
+        result
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(super) fn expression(&mut self, expression: &ast::Expression) -> hir::Expression {
         let model_key = crate::semantic::ModelNodeKey {
@@ -411,6 +461,54 @@ impl Lowerer<'_> {
                 }
                 if !has_resolved_call
                     && let ast::ExpressionKind::Member { object, name } = &callee.kind
+                    && name == "Set"
+                {
+                    let object = self.expression(object);
+                    if let hir::Type::List(element_type) = object.type_.clone() {
+                        return hir::Expression {
+                            type_: hir::Type::Void,
+                            kind: hir::ExpressionKind::ListSet {
+                                list: Box::new(object),
+                                index: Box::new(self.expression(&arguments[0])),
+                                value: Box::new(convert(
+                                    self.expression(&arguments[1]),
+                                    &element_type,
+                                )),
+                            },
+                        };
+                    }
+                }
+                if !has_resolved_call
+                    && let ast::ExpressionKind::Member { object, name } = &callee.kind
+                    && name == "Clear"
+                {
+                    let object = self.expression(object);
+                    if matches!(object.type_, hir::Type::List(_)) {
+                        return hir::Expression {
+                            type_: hir::Type::Void,
+                            kind: hir::ExpressionKind::ListClear {
+                                list: Box::new(object),
+                            },
+                        };
+                    }
+                }
+                if !has_resolved_call
+                    && let ast::ExpressionKind::Member { object, name } = &callee.kind
+                    && name == "ToArray"
+                {
+                    let object = self.expression(object);
+                    if let hir::Type::List(element_type) = object.type_.clone() {
+                        return hir::Expression {
+                            type_: hir::Type::Array(element_type.clone()),
+                            kind: hir::ExpressionKind::ListToArray {
+                                list: Box::new(object),
+                                element_type: *element_type,
+                            },
+                        };
+                    }
+                }
+                if !has_resolved_call
+                    && let ast::ExpressionKind::Member { object, name } = &callee.kind
                     && name == "Get"
                 {
                     let object = self.expression(object);
@@ -557,6 +655,26 @@ impl Lowerer<'_> {
                                     },
                                 }
                             }
+                            "Clear" => hir::Expression {
+                                type_: hir::Type::Void,
+                                kind: hir::ExpressionKind::DictionaryClear {
+                                    dictionary: Box::new(object),
+                                },
+                            },
+                            "Keys" => hir::Expression {
+                                type_: hir::Type::Array(key_type.clone()),
+                                kind: hir::ExpressionKind::DictionaryKeys {
+                                    dictionary: Box::new(object),
+                                    key_type: *key_type,
+                                },
+                            },
+                            "Values" => hir::Expression {
+                                type_: hir::Type::Array(value_type.clone()),
+                                kind: hir::ExpressionKind::DictionaryValues {
+                                    dictionary: Box::new(object),
+                                    value_type: *value_type,
+                                },
+                            },
                             _ => unreachable!("semantic analysis validated Dictionary method"),
                         };
                     }
@@ -887,29 +1005,7 @@ impl Lowerer<'_> {
                     },
                 }
             }
-            ast::ExpressionKind::Binary {
-                left,
-                operator,
-                right,
-            } => {
-                let mut left = self.expression(left);
-                let mut right = self.expression(right);
-                if left.type_ != right.type_
-                    && let Some(promoted) = promoted(&left.type_, &right.type_)
-                {
-                    left = convert(left, &promoted);
-                    right = convert(right, &promoted);
-                }
-                let type_ = binary_type(*operator, &left.type_, &right.type_);
-                hir::Expression {
-                    type_,
-                    kind: hir::ExpressionKind::Binary {
-                        left: Box::new(left),
-                        operator: binary(*operator),
-                        right: Box::new(right),
-                    },
-                }
-            }
+            ast::ExpressionKind::Binary { .. } => self.binary_expression(expression),
             ast::ExpressionKind::Assignment {
                 target,
                 operator,

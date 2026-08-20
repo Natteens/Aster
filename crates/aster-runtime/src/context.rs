@@ -1403,7 +1403,7 @@ impl ExecutionContext {
         temporary: bool,
     ) -> *const AsterStrHeader {
         if self.error.is_some() || !self.validate_string_builder(builder) {
-            return ptr::null();
+            return ptr::null_mut();
         }
         // SAFETY: the validated header owns `length <= capacity` initialized
         // UTF-8 bytes, formed only by appending validated ASTER strings.
@@ -2449,6 +2449,159 @@ impl ExecutionContext {
         array
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn dictionary_clear(
+        &mut self,
+        dictionary: *mut AsterDictionary,
+        key_kind: DictionaryKeyKind,
+        key_size: u32,
+        key_align: u32,
+        key_type_key: u64,
+        value_size: u32,
+        value_align: u32,
+        value_type_key: u64,
+    ) {
+        if self.error.is_some() {
+            return;
+        }
+        if !self.validate_dictionary_operation(
+            dictionary,
+            key_kind,
+            key_size,
+            key_align,
+            key_type_key,
+            value_size,
+            value_align,
+            value_type_key,
+            "Clear",
+        ) {
+            return;
+        }
+        #[allow(unsafe_code)]
+        let (buckets, entries, bucket_capacity, entry_capacity) = unsafe {
+            (
+                (*dictionary).buckets,
+                (*dictionary).entries,
+                (*dictionary).bucket_capacity,
+                (*dictionary).entry_capacity,
+            )
+        };
+        let Some(layout) = dictionary_entry_layout(key_size, key_align, value_size, value_align)
+        else {
+            self.fail("Dictionary.Clear has invalid entry layout");
+            return;
+        };
+        let Some(entry_bytes) = usize::try_from(entry_capacity)
+            .ok()
+            .and_then(|capacity| capacity.checked_mul(layout.stride))
+        else {
+            self.fail("Dictionary.Clear entry byte count overflow");
+            return;
+        };
+        // SAFETY: validated header capacities precisely bound both backing
+        // buffers. Clearing leaves capacity and allocation ownership intact.
+        #[allow(unsafe_code)]
+        unsafe {
+            for index in 0..bucket_capacity {
+                *buckets.add(usize::try_from(index).unwrap_or(0)) = DICTIONARY_EMPTY_BUCKET;
+            }
+            if entry_bytes > 0 {
+                ptr::write_bytes(entries, 0, entry_bytes);
+            }
+            (*dictionary).length = 0;
+            (*dictionary).entry_count = 0;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dictionary_snapshot_component(
+        &mut self,
+        dictionary: *mut AsterDictionary,
+        key_kind: DictionaryKeyKind,
+        key_size: u32,
+        key_align: u32,
+        key_type_key: u64,
+        value_size: u32,
+        value_align: u32,
+        value_type_key: u64,
+        keys: bool,
+        temporary: bool,
+    ) -> *mut AsterArray {
+        if self.error.is_some() {
+            return ptr::null_mut();
+        }
+        let operation = if keys { "Keys" } else { "Values" };
+        if !self.validate_dictionary_operation(
+            dictionary,
+            key_kind,
+            key_size,
+            key_align,
+            key_type_key,
+            value_size,
+            value_align,
+            value_type_key,
+            operation,
+        ) {
+            return ptr::null_mut();
+        }
+        #[allow(unsafe_code)]
+        let (length, count, entries) = unsafe {
+            (
+                (*dictionary).length,
+                (*dictionary).entry_count,
+                (*dictionary).entries,
+            )
+        };
+        let Some(layout) = dictionary_entry_layout(key_size, key_align, value_size, value_align)
+        else {
+            self.fail(format!("Dictionary.{operation} has invalid entry layout"));
+            return ptr::null_mut();
+        };
+        let (size, offset) = if keys {
+            (key_size, layout.key_offset)
+        } else {
+            (value_size, layout.value_offset)
+        };
+        let output = self.allocate_array_in_region(length, size, temporary);
+        if output.is_null() {
+            return ptr::null_mut();
+        }
+        #[allow(unsafe_code)]
+        let output_data = unsafe { (*output).data };
+        let mut output_index = 0_i32;
+        for index in 0..count {
+            let entry = Self::dictionary_entry_pointer(entries, index, layout)
+                .expect("validated entry index");
+            #[allow(unsafe_code)]
+            if unsafe { Self::dictionary_entry_live(entry) } == 0 {
+                continue;
+            }
+            let Some(destination_offset) = usize::try_from(output_index)
+                .ok()
+                .and_then(|index| index.checked_mul(usize::try_from(size).unwrap_or(0)))
+            else {
+                self.fail(format!("Dictionary.{operation} output offset overflow"));
+                return ptr::null_mut();
+            };
+            #[allow(unsafe_code)]
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    entry.add(offset),
+                    output_data.add(destination_offset),
+                    usize::try_from(size).unwrap_or(0),
+                );
+            }
+            output_index += 1;
+        }
+        if output_index != length {
+            self.fail(format!(
+                "Dictionary.{operation} live-entry count does not match Length"
+            ));
+            return ptr::null_mut();
+        }
+        output
+    }
+
     /// Every invariant a well-formed `AsterList` header must satisfy,
     /// independent of any particular operation. Shared by `Length` and `Add`
     /// so there is exactly one definition of "a valid list header" â€” never
@@ -2786,6 +2939,178 @@ impl ExecutionContext {
         }
     }
 
+    fn list_set(
+        &mut self,
+        list: *mut AsterList,
+        expected_element_size: u32,
+        expected_element_align: u32,
+        expected_element_type_key: u64,
+        index: i32,
+        source: *const u8,
+    ) {
+        if self.error.is_some() {
+            return;
+        }
+        if list.is_null() || source.is_null() {
+            self.fail("List.Set received an invalid list or source value");
+            return;
+        }
+        if !self.validate_list_header(list) {
+            return;
+        }
+        #[allow(unsafe_code)]
+        let (length, element_size, element_align, element_type_key, data) = unsafe {
+            (
+                (*list).length,
+                (*list).element_size,
+                (*list).element_align,
+                (*list).element_type_key,
+                (*list).data,
+            )
+        };
+        if expected_element_size != element_size
+            || expected_element_align != element_align
+            || expected_element_type_key != element_type_key
+        {
+            self.fail("List.Set element metadata does not match its concrete specialization");
+            return;
+        }
+        if index < 0 || index >= length {
+            self.fail(format!(
+                "List.Set index {index} is out of bounds for length {length}"
+            ));
+            return;
+        }
+        let Some(offset) = usize::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_mul(usize::try_from(element_size).unwrap_or(0)))
+        else {
+            self.fail("List.Set index * element size overflow");
+            return;
+        };
+        // SAFETY: validation proved the selected slot and source are valid for
+        // one concrete element representation. Replacing a value is not a
+        // structural change, so the list version intentionally stays stable.
+        #[allow(unsafe_code)]
+        unsafe {
+            ptr::copy_nonoverlapping(
+                source,
+                data.add(offset),
+                usize::try_from(element_size).unwrap_or(0),
+            );
+        }
+    }
+
+    fn list_clear(
+        &mut self,
+        list: *mut AsterList,
+        expected_element_size: u32,
+        expected_element_align: u32,
+        expected_element_type_key: u64,
+    ) {
+        if self.error.is_some() {
+            return;
+        }
+        if list.is_null() {
+            self.fail("List.Clear received a null list");
+            return;
+        }
+        if !self.validate_list_header(list) {
+            return;
+        }
+        #[allow(unsafe_code)]
+        let (length, element_size, element_align, element_type_key, data) = unsafe {
+            (
+                (*list).length,
+                (*list).element_size,
+                (*list).element_align,
+                (*list).element_type_key,
+                (*list).data,
+            )
+        };
+        if expected_element_size != element_size
+            || expected_element_align != element_align
+            || expected_element_type_key != element_type_key
+        {
+            self.fail("List.Clear element metadata does not match its concrete specialization");
+            return;
+        }
+        let Some(bytes) = usize::try_from(length)
+            .ok()
+            .and_then(|length| length.checked_mul(usize::try_from(element_size).unwrap_or(0)))
+        else {
+            self.fail("List.Clear byte count overflow");
+            return;
+        };
+        // SAFETY: `bytes` covers exactly the currently live prefix. Clearing
+        // it releases logical reachability while retaining reusable capacity.
+        #[allow(unsafe_code)]
+        unsafe {
+            if bytes > 0 {
+                ptr::write_bytes(data, 0, bytes);
+            }
+            (*list).length = 0;
+            (*list).version = (*list).version.wrapping_add(1);
+        }
+    }
+
+    fn list_to_array(
+        &mut self,
+        list: *const AsterList,
+        expected_element_size: u32,
+        expected_element_align: u32,
+        expected_element_type_key: u64,
+        temporary: bool,
+    ) -> *mut AsterArray {
+        if self.error.is_some() {
+            return ptr::null_mut();
+        }
+        if list.is_null() {
+            self.fail("List.ToArray received a null list");
+            return ptr::null_mut();
+        }
+        if !self.validate_list_header(list) {
+            return ptr::null_mut();
+        }
+        #[allow(unsafe_code)]
+        let (length, element_size, element_align, element_type_key, data) = unsafe {
+            (
+                (*list).length,
+                (*list).element_size,
+                (*list).element_align,
+                (*list).element_type_key,
+                (*list).data,
+            )
+        };
+        if expected_element_size != element_size
+            || expected_element_align != element_align
+            || expected_element_type_key != element_type_key
+        {
+            self.fail("List.ToArray element metadata does not match its concrete specialization");
+            return ptr::null_mut();
+        }
+        let array = self.allocate_array_in_region(length, element_size, temporary);
+        if array.is_null() {
+            return ptr::null_mut();
+        }
+        let Some(bytes) = usize::try_from(length)
+            .ok()
+            .and_then(|length| length.checked_mul(usize::try_from(element_size).unwrap_or(0)))
+        else {
+            self.fail("List.ToArray byte count overflow");
+            return ptr::null_mut();
+        };
+        if bytes > 0 {
+            // SAFETY: each header was validated and the array allocation has
+            // exactly one slot per source element of the same concrete size.
+            #[allow(unsafe_code)]
+            unsafe {
+                ptr::copy_nonoverlapping(data, (*array).data, bytes);
+            };
+        }
+        array
+    }
+
     /// Computes every checked offset `RemoveAt` needs: the removed slot's
     /// offset, the offset of the first element after it, how many bytes to
     /// shift, the new `length`, and the offset of the slot that falls out of
@@ -2958,16 +3283,44 @@ impl ExecutionContext {
         pointer
     }
 
+    pub(crate) fn allocate_string_storage(
+        &mut self,
+        payload_bytes: usize,
+        temporary: bool,
+    ) -> *mut AsterStrHeader {
+        if temporary && self.temporary_scopes.is_empty() {
+            self.fail("temporary string allocation requires an active temporary scope");
+            return ptr::null_mut();
+        }
+        let Some(total_bytes) = size_of::<usize>().checked_add(payload_bytes) else {
+            self.fail("string allocation exceeds the addressable range");
+            return ptr::null_mut();
+        };
+
+        let Some(pointer) =
+            self.allocate_in_region(total_bytes, align_of::<AsterStrHeader>(), temporary)
+        else {
+            return ptr::null_mut();
+        };
+
+        // SAFETY: `pointer` points to `total_bytes` of zeroed, correctly aligned
+        // memory owned by the selected arena. The caller initializes exactly the
+        // following `payload_bytes` payload bytes before publishing this string.
+        #[allow(unsafe_code)]
+        let bytes = unsafe { std::slice::from_raw_parts_mut(pointer, total_bytes) };
+        bytes[..size_of::<usize>()].copy_from_slice(&payload_bytes.to_ne_bytes());
+        self.record_allocation(AllocationCategory::String, total_bytes);
+        // The arena allocates with `align_of::<AsterStrHeader>()`, so the
+        // pointer is correctly aligned for this cast.
+        #[allow(clippy::cast_ptr_alignment)]
+        pointer.cast::<AsterStrHeader>()
+    }
+
     fn allocate_string_parts_in_region(
         &mut self,
         parts: &[&str],
         temporary: bool,
     ) -> *const AsterStrHeader {
-        if temporary && self.temporary_scopes.is_empty() {
-            self.fail("temporary string allocation requires an active temporary scope");
-            return ptr::null();
-        }
-
         let Some(payload_bytes) = parts
             .iter()
             .try_fold(0_usize, |total, part| total.checked_add(part.len()))
@@ -2975,34 +3328,26 @@ impl ExecutionContext {
             self.fail("string concatenation exceeds the addressable range");
             return ptr::null();
         };
-        let Some(total_bytes) = size_of::<usize>().checked_add(payload_bytes) else {
-            self.fail("string allocation exceeds the addressable range");
+        let pointer = self.allocate_string_storage(payload_bytes, temporary);
+        if pointer.is_null() {
             return ptr::null();
-        };
-
-        let Some(pointer) =
-            self.allocate_in_region(total_bytes, align_of::<AsterStrHeader>(), temporary)
-        else {
-            return ptr::null();
-        };
-
-        // SAFETY: `pointer` points to `total_bytes` of zeroed, correctly aligned
-        // memory owned by the selected arena. No other reference to this region
-        // exists. The slice is consumed before `record_allocation` borrows self.
+        }
+        // SAFETY: `pointer` owns a `payload_bytes` UTF-8 payload allocated by
+        // `allocate_string_storage`; this method fills it exactly once.
         #[allow(unsafe_code)]
-        let bytes = unsafe { std::slice::from_raw_parts_mut(pointer, total_bytes) };
-        bytes[..size_of::<usize>()].copy_from_slice(&payload_bytes.to_ne_bytes());
-        let mut cursor = size_of::<usize>();
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                pointer.cast::<u8>().add(size_of::<AsterStrHeader>()),
+                payload_bytes,
+            )
+        };
+        let mut cursor = 0;
         for part in parts {
             let end = cursor + part.len();
             bytes[cursor..end].copy_from_slice(part.as_bytes());
             cursor = end;
         }
-        self.record_allocation(AllocationCategory::String, total_bytes);
-        // The arena allocates with `align_of::<AsterStrHeader>()`, so the
-        // pointer is correctly aligned for this cast.
-        #[allow(clippy::cast_ptr_alignment)]
-        pointer.cast::<AsterStrHeader>()
+        pointer
     }
 
     pub(crate) fn allocate_string_parts(&mut self, parts: &[&str]) -> *const AsterStrHeader {
@@ -3739,6 +4084,134 @@ pub extern "C" fn aster_rt_dictionary_entries(
     )
 }
 
+#[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_dictionary_clear(
+    context: *mut ExecutionContext,
+    dictionary: *mut AsterDictionary,
+    key_kind: i32,
+    key_size: i32,
+    key_align: i32,
+    key_type_key: i64,
+    value_size: i32,
+    value_align: i32,
+    value_type_key: i64,
+) {
+    if context.is_null() {
+        return;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let Some(key_kind) = DictionaryKeyKind::from_abi(key_kind) else {
+        context.fail("Dictionary.Clear received an invalid key kind");
+        return;
+    };
+    #[allow(clippy::cast_sign_loss)]
+    context.dictionary_clear(
+        dictionary,
+        key_kind,
+        u32::try_from(key_size).unwrap_or(0),
+        u32::try_from(key_align).unwrap_or(0),
+        key_type_key as u64,
+        u32::try_from(value_size).unwrap_or(0),
+        u32::try_from(value_align).unwrap_or(0),
+        value_type_key as u64,
+    );
+}
+
+#[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_dictionary_keys(
+    context: *mut ExecutionContext,
+    dictionary: *mut AsterDictionary,
+    key_kind: i32,
+    key_size: i32,
+    key_align: i32,
+    key_type_key: i64,
+    value_size: i32,
+    value_align: i32,
+    value_type_key: i64,
+    temporary: i8,
+) -> *mut AsterArray {
+    dictionary_snapshot_abi(
+        context,
+        dictionary,
+        key_kind,
+        key_size,
+        key_align,
+        key_type_key,
+        value_size,
+        value_align,
+        value_type_key,
+        true,
+        temporary,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_dictionary_values(
+    context: *mut ExecutionContext,
+    dictionary: *mut AsterDictionary,
+    key_kind: i32,
+    key_size: i32,
+    key_align: i32,
+    key_type_key: i64,
+    value_size: i32,
+    value_align: i32,
+    value_type_key: i64,
+    temporary: i8,
+) -> *mut AsterArray {
+    dictionary_snapshot_abi(
+        context,
+        dictionary,
+        key_kind,
+        key_size,
+        key_align,
+        key_type_key,
+        value_size,
+        value_align,
+        value_type_key,
+        false,
+        temporary,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dictionary_snapshot_abi(
+    context: *mut ExecutionContext,
+    dictionary: *mut AsterDictionary,
+    key_kind: i32,
+    key_size: i32,
+    key_align: i32,
+    key_type_key: i64,
+    value_size: i32,
+    value_align: i32,
+    value_type_key: i64,
+    keys: bool,
+    temporary: i8,
+) -> *mut AsterArray {
+    if context.is_null() {
+        return ptr::null_mut();
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let Some(key_kind) = DictionaryKeyKind::from_abi(key_kind) else {
+        context.fail("Dictionary snapshot received an invalid key kind");
+        return ptr::null_mut();
+    };
+    #[allow(clippy::cast_sign_loss)]
+    context.dictionary_snapshot_component(
+        dictionary,
+        key_kind,
+        u32::try_from(key_size).unwrap_or(0),
+        u32::try_from(key_align).unwrap_or(0),
+        key_type_key as u64,
+        u32::try_from(value_size).unwrap_or(0),
+        u32::try_from(value_align).unwrap_or(0),
+        value_type_key as u64,
+        keys,
+        temporary != 0,
+    )
+}
+
 /// Reads the current structural-modification counter. See `foreach`'s
 /// fail-fast lowering: captured once before the loop, then compared before
 /// every element read. Never exposed as an Aster-level property.
@@ -3855,6 +4328,78 @@ pub extern "C" fn aster_rt_list_remove_at(
     context.list_remove_at(list, size, align, type_key, index);
 }
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_list_set(
+    context: *mut ExecutionContext,
+    list: *mut AsterList,
+    expected_element_size: i32,
+    expected_element_align: i32,
+    expected_element_type_key: i64,
+    index: i32,
+    source_value_address: *const u8,
+) {
+    if context.is_null() {
+        return;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    #[allow(clippy::cast_sign_loss)]
+    context.list_set(
+        list,
+        u32::try_from(expected_element_size).unwrap_or(0),
+        u32::try_from(expected_element_align).unwrap_or(0),
+        expected_element_type_key as u64,
+        index,
+        source_value_address,
+    );
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_list_clear(
+    context: *mut ExecutionContext,
+    list: *mut AsterList,
+    expected_element_size: i32,
+    expected_element_align: i32,
+    expected_element_type_key: i64,
+) {
+    if context.is_null() {
+        return;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    #[allow(clippy::cast_sign_loss)]
+    context.list_clear(
+        list,
+        u32::try_from(expected_element_size).unwrap_or(0),
+        u32::try_from(expected_element_align).unwrap_or(0),
+        expected_element_type_key as u64,
+    );
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_list_to_array(
+    context: *mut ExecutionContext,
+    list: *const AsterList,
+    expected_element_size: i32,
+    expected_element_align: i32,
+    expected_element_type_key: i64,
+    temporary: i8,
+) -> *mut AsterArray {
+    if context.is_null() {
+        return ptr::null_mut();
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    #[allow(clippy::cast_sign_loss)]
+    context.list_to_array(
+        list,
+        u32::try_from(expected_element_size).unwrap_or(0),
+        u32::try_from(expected_element_align).unwrap_or(0),
+        expected_element_type_key as u64,
+        temporary != 0,
+    )
+}
+
 #[cfg(test)]
 #[allow(
     clippy::cast_ptr_alignment,
@@ -3866,6 +4411,140 @@ mod tests {
     use crate::object::{aster_rt_object_new, aster_rt_object_new_temporary};
     use std::collections::BTreeMap;
     use std::time::Instant;
+
+    #[test]
+    fn list_set_clear_and_snapshot_preserve_version_and_storage_contracts() {
+        let mut context = ExecutionContext::with_stats();
+        let list = context.allocate_list_in_region(4, 4, 1, ListRegion::Persistent);
+        for value in [1_i32, 2] {
+            context.list_add(list, 4, 4, 1, (&raw const value).cast());
+        }
+        // SAFETY: the list header was allocated and initialized above.
+        #[allow(unsafe_code)]
+        let version = unsafe { (*list).version };
+        let replacement = 7_i32;
+        context.list_set(list, 4, 4, 1, 1, (&raw const replacement).cast());
+        // SAFETY: Set preserves the live header and does not structurally mutate it.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!((*list).version, version);
+        }
+
+        let snapshot = context.list_to_array(list, 4, 4, 1, false);
+        assert!(!snapshot.is_null());
+        context.list_clear(list, 4, 4, 1);
+        // SAFETY: Clear retains the header/backing, and the snapshot owns an
+        // independent two-element array.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!((*list).length, 0);
+            assert_eq!((*list).version, version.wrapping_add(1));
+            assert_eq!(
+                std::slice::from_raw_parts((*snapshot).data.cast::<i32>(), 2),
+                [1, 7]
+            );
+        }
+        let next = 9_i32;
+        context.list_add(list, 4, 4, 1, (&raw const next).cast());
+        // SAFETY: Add reused or replaced only list backing, never snapshot storage.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!((*list).length, 1);
+            assert_eq!((*snapshot).length, 2);
+            assert_eq!(
+                std::slice::from_raw_parts((*snapshot).data.cast::<i32>(), 2),
+                [1, 7]
+            );
+        }
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    fn collection_snapshot_denial_is_atomic_and_later_mutation_is_suppressed() {
+        let mut source = ExecutionContext::new();
+        let list = source.allocate_list_in_region(4, 4, 1, ListRegion::Persistent);
+        for value in 0_i32..2_000 {
+            source.list_add(list, 4, 4, 1, (&raw const value).cast());
+        }
+        let mut limited = ExecutionContext::with_allocation_limit(MIN_PAGE_SIZE);
+        assert!(limited.list_to_array(list, 4, 4, 1, false).is_null());
+        limited.list_clear(list, 4, 4, 1);
+        // SAFETY: the failed snapshot and suppressed Clear leave the source intact.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!((*list).length, 2_000);
+        }
+        let error = limited.take_error().expect("list snapshot denial");
+        assert!(
+            error.contains("execution memory limit"),
+            "unexpected list snapshot error: {error}"
+        );
+
+        let mut limited = ExecutionContext::new();
+        let dictionary = limited.allocate_dictionary_in_region(
+            DictionaryKeyKind::Int,
+            4,
+            4,
+            2,
+            4,
+            4,
+            3,
+            ListRegion::Persistent,
+        );
+        for key in 0_i32..2_000 {
+            assert_eq!(
+                limited.dictionary_add_or_set(
+                    dictionary,
+                    DictionaryKeyKind::Int,
+                    4,
+                    4,
+                    2,
+                    4,
+                    4,
+                    3,
+                    (&raw const key).cast(),
+                    (&raw const key).cast(),
+                    false,
+                ),
+                1
+            );
+        }
+        limited.allocation_limit_bytes = limited.arena.metrics().reserved_bytes;
+        while !limited.allocate_array(128, 4).is_null() {}
+        assert!(
+            limited
+                .take_error()
+                .is_some_and(|error| error.contains("execution memory limit"))
+        );
+        assert!(
+            limited
+                .dictionary_snapshot_component(
+                    dictionary,
+                    DictionaryKeyKind::Int,
+                    4,
+                    4,
+                    2,
+                    4,
+                    4,
+                    3,
+                    true,
+                    false,
+                )
+                .is_null()
+        );
+        limited.dictionary_clear(dictionary, DictionaryKeyKind::Int, 4, 4, 2, 4, 4, 3);
+        // SAFETY: the failed snapshot and suppressed Clear leave the source intact.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!((*dictionary).length, 2_000);
+        }
+        let error = limited.take_error().expect("dictionary snapshot denial");
+        assert!(
+            error.contains("execution memory limit"),
+            "unexpected dictionary snapshot error: {error}"
+        );
+        assert!(source.take_error().is_none());
+    }
 
     #[test]
     fn execution_budget_rejects_large_requests_without_publishing_storage() {
