@@ -93,6 +93,8 @@ impl Codegen {
                 "aster_async_spawn_inner" => {
                     signature.params.push(AbiParam::new(types::I64)); // handle
                     signature.params.push(AbiParam::new(types::I32)); // inner symbol
+                    signature.params.push(AbiParam::new(pointer)); // copied frame
+                    signature.params.push(AbiParam::new(types::I32)); // frame bytes
                 }
                 "aster_async_await_result" => {
                     signature.params.push(AbiParam::new(types::I64)); // handle
@@ -275,13 +277,32 @@ extern "C" fn aster_async_load_slot(
     }
 }
 
-extern "C" fn aster_async_spawn_inner(context: *mut ExecutionContext, handle: i64, inner: i32) {
+extern "C" fn aster_async_spawn_inner(
+    context: *mut ExecutionContext,
+    handle: i64,
+    inner: i32,
+    payload: *const u8,
+    payload_size: i32,
+) {
     #[allow(unsafe_code)]
     let Some((context, runtime)) = (unsafe { context_and_runtime(context) }) else {
         return;
     };
+    let Ok(payload_size) = usize::try_from(payload_size) else {
+        context.fail("awaited Task.Run received an invalid argument frame size");
+        return;
+    };
+    let payload = match super::worker_pool::TaskPayload::copy_from(payload, payload_size) {
+        Ok(payload) => payload,
+        Err(error) => {
+            report(context, &error);
+            return;
+        }
+    };
     let inner = mir::SymbolId(u32::from_ne_bytes(inner.to_ne_bytes()));
-    if let Err(error) = runtime.async_spawn_inner(TaskHandleId::from_bits(handle), inner) {
+    if let Err(error) =
+        runtime.async_spawn_inner_with_payload(TaskHandleId::from_bits(handle), inner, payload)
+    {
         report(context, &error);
     }
 }

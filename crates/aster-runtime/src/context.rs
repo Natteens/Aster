@@ -6,7 +6,7 @@ use std::mem::{align_of, size_of};
 use std::ptr;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use crate::arena::{
@@ -544,6 +544,30 @@ pub(crate) struct TemporaryArenaMark(ArenaMark);
 #[must_use = "owned arena marks must be rewound in LIFO order"]
 struct OwnedArenaMark(ArenaMark);
 
+/// Private host control shared between one task record and its worker
+/// `ExecutionContext`. It carries no ASTER value or arena pointer and is not
+/// exposed as a source-language atomic API.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct TaskCancellation {
+    requested: AtomicBool,
+}
+
+impl TaskCancellation {
+    #[must_use]
+    pub fn request(&self) -> bool {
+        // Only the publication of `true` carries information. The previous
+        // bit is used solely for idempotence, so the read half of this RMW
+        // needs no acquire ordering; task queries pair with this Release.
+        !self.requested.swap(true, Ordering::Release)
+    }
+
+    #[must_use]
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+}
+
 /// Owns every dynamic allocation made by one JIT invocation.
 /// Persistent allocations live in `arena`; function-local objects, arrays,
 /// and strings can use `temporary_arena`. Both arenas are released in bulk
@@ -572,6 +596,7 @@ pub struct ExecutionContext {
     /// its real type. Absent (`None`) for every sequential invocation that
     /// does not opt in.
     task_runtime: Option<*mut ()>,
+    task_cancellation: Option<Arc<TaskCancellation>>,
     /// Console I/O backend for `aster.io.Write`/`WriteLine`/`ReadLine`.
     /// Owned per-context (never a global or singleton), so independent
     /// contexts never share output or input. Lazily defaults to real
@@ -658,6 +683,7 @@ impl ExecutionContext {
             collect_stats,
             stats: MemoryStats::default(),
             task_runtime: None,
+            task_cancellation: None,
             console: None,
             filesystem: None,
             dictionary_hash_k0,
@@ -878,6 +904,22 @@ impl ExecutionContext {
     #[must_use]
     pub fn task_runtime(&self) -> Option<*mut ()> {
         self.task_runtime
+    }
+
+    /// Attach the private cancellation control for one worker or async step.
+    #[doc(hidden)]
+    pub fn set_task_cancellation(&mut self, cancellation: Arc<TaskCancellation>) {
+        self.task_cancellation = Some(cancellation);
+    }
+
+    /// Observe the current task's cooperative request. Ordinary caller
+    /// contexts have no control record and therefore return false.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_task_cancellation_requested(&self) -> bool {
+        self.task_cancellation
+            .as_ref()
+            .is_some_and(|cancellation| cancellation.is_requested())
     }
 
     /// Inject the console I/O backend this context uses for `aster.io.Write`/
@@ -4411,6 +4453,21 @@ mod tests {
     use crate::object::{aster_rt_object_new, aster_rt_object_new_temporary};
     use std::collections::BTreeMap;
     use std::time::Instant;
+
+    #[test]
+    fn task_cancellation_is_scoped_to_one_explicit_execution_context() {
+        let cancellation = Arc::new(TaskCancellation::default());
+        let mut task_context = ExecutionContext::new();
+        task_context.set_task_cancellation(Arc::clone(&cancellation));
+        let unrelated_context = ExecutionContext::new();
+
+        assert!(!task_context.is_task_cancellation_requested());
+        assert!(!unrelated_context.is_task_cancellation_requested());
+        assert!(cancellation.request());
+        assert!(task_context.is_task_cancellation_requested());
+        assert!(!unrelated_context.is_task_cancellation_requested());
+        assert!(!cancellation.request(), "the request is idempotent");
+    }
 
     #[test]
     fn list_set_clear_and_snapshot_preserve_version_and_storage_contracts() {

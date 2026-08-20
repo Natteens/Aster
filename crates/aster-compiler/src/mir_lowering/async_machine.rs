@@ -69,6 +69,7 @@ pub(super) fn lower(
 struct AsyncPlan<'a> {
     await_index: usize,
     inner_symbol: hir::SymbolId,
+    inner_arguments: Vec<hir::Expression>,
     result_type: hir::Type,
     slots: Vec<(hir::SymbolId, hir::Type)>,
     statements: &'a [hir::Statement],
@@ -81,7 +82,7 @@ impl<'a> AsyncPlan<'a> {
             .iter()
             .position(statement_contains_await)
             .expect("a validated async body contains exactly one await");
-        let (inner_symbol, result_type) = statements[..=await_index]
+        let (inner_symbol, inner_arguments, result_type) = statements[..=await_index]
             .iter()
             .find_map(statement_await)
             .expect("the await statement names an inner Task.Run target");
@@ -97,6 +98,7 @@ impl<'a> AsyncPlan<'a> {
         Self {
             await_index,
             inner_symbol,
+            inner_arguments,
             result_type,
             slots,
             statements,
@@ -213,16 +215,22 @@ fn lower_move_next(
                 return_type: mir::Type::Void,
             });
         }
+        let mut inner_arguments = vec![
+            handle.clone(),
+            mir::Operand {
+                type_: plan.result_type.clone(),
+                kind: mir::OperandKind::Function(plan.inner_symbol),
+            },
+        ];
+        inner_arguments.extend(plan.inner_arguments.iter().map(|argument| {
+            lowerer
+                .lower_expression(argument)
+                .expect("an awaited Task.Run argument produces an operand")
+        }));
         lowerer.instruction(mir::Instruction::CallIntrinsic {
             destination: None,
             intrinsic: mir::Intrinsic::AsyncSpawnInner,
-            arguments: vec![
-                handle.clone(),
-                mir::Operand {
-                    type_: plan.result_type.clone(),
-                    kind: mir::OperandKind::Function(plan.inner_symbol),
-                },
-            ],
+            arguments: inner_arguments,
             return_type: mir::Type::Void,
         });
         lowerer.instruction(mir::Instruction::CallIntrinsic {
@@ -281,7 +289,9 @@ fn statement_contains_await(statement: &hir::Statement) -> bool {
 
 /// The `(inner Task.Run target, awaited scalar result type)` of the single
 /// `await` inside `statement`, if it contains one.
-fn statement_await(statement: &hir::Statement) -> Option<(hir::SymbolId, hir::Type)> {
+fn statement_await(
+    statement: &hir::Statement,
+) -> Option<(hir::SymbolId, Vec<hir::Expression>, hir::Type)> {
     match statement {
         hir::Statement::Variable(variable) => {
             variable.initializer.as_ref().and_then(expression_await)
@@ -292,16 +302,23 @@ fn statement_await(statement: &hir::Statement) -> Option<(hir::SymbolId, hir::Ty
     }
 }
 
-fn expression_await(expression: &hir::Expression) -> Option<(hir::SymbolId, hir::Type)> {
+fn expression_await(
+    expression: &hir::Expression,
+) -> Option<(hir::SymbolId, Vec<hir::Expression>, hir::Type)> {
     match &expression.kind {
         hir::ExpressionKind::Await {
             operand,
             result_type,
         } => {
-            let hir::ExpressionKind::TaskRun { function, .. } = &operand.kind else {
+            let hir::ExpressionKind::TaskRun {
+                function,
+                arguments,
+                ..
+            } = &operand.kind
+            else {
                 return None;
             };
-            Some((*function, (**result_type).clone()))
+            Some((*function, arguments.clone(), (**result_type).clone()))
         }
         hir::ExpressionKind::Convert { operand } | hir::ExpressionKind::Unary { operand, .. } => {
             expression_await(operand)

@@ -665,10 +665,23 @@ impl FunctionLowerer {
             }
             hir::ExpressionKind::TaskRun {
                 function,
+                arguments,
                 return_type,
-            } => Some(self.lower_task_run(*function, return_type, expression.type_.clone())),
+            } => Some(self.lower_task_run(
+                *function,
+                arguments,
+                return_type,
+                expression.type_.clone(),
+            )),
             hir::ExpressionKind::TaskWait { task, result_type } => {
                 Some(self.lower_task_wait(task, result_type))
+            }
+            hir::ExpressionKind::TaskWaitAll { tasks, result_type } => {
+                Some(self.lower_task_wait_all(tasks, result_type))
+            }
+            hir::ExpressionKind::TaskCancel { task } => Some(self.lower_task_cancel(task)),
+            hir::ExpressionKind::TaskCancellationRequested => {
+                Some(self.lower_task_cancellation_requested())
             }
             // Inside a generated async `MoveNext`, the single `await` is
             // lowered to a use of the result the state-1 prologue already
@@ -704,23 +717,30 @@ impl FunctionLowerer {
         }
     }
 
-    /// `aster.core.Task.Run(function)`: `function` is already a resolved,
+    /// `aster.core.Task.Run(function, arguments...)`: `function` is already a resolved,
     /// concrete symbol, carried as an `OperandKind::Function` argument
     /// rather than looked up again by name.
     fn lower_task_run(
         &mut self,
         function: hir::SymbolId,
+        arguments: &[hir::Expression],
         return_type: &hir::Type,
         task_type: hir::Type,
     ) -> mir::Operand {
         let destination = mir::Place::Local(self.new_temporary(task_type.clone()));
+        let mut lowered = Vec::with_capacity(arguments.len() + 1);
+        lowered.push(mir::Operand {
+            type_: return_type.clone(),
+            kind: mir::OperandKind::Function(function),
+        });
+        lowered.extend(arguments.iter().map(|argument| {
+            self.lower_expression(argument)
+                .expect("a Task.Run value argument produces an operand")
+        }));
         self.instruction(mir::Instruction::CallIntrinsic {
             destination: Some(destination.clone()),
             intrinsic: mir::Intrinsic::TaskRun,
-            arguments: vec![mir::Operand {
-                type_: return_type.clone(),
-                kind: mir::OperandKind::Function(function),
-            }],
+            arguments: lowered,
             return_type: task_type.clone(),
         });
         mir::Operand {
@@ -744,6 +764,59 @@ impl FunctionLowerer {
         });
         mir::Operand {
             type_: result_type.clone(),
+            kind: mir::OperandKind::Copy(destination),
+        }
+    }
+
+    fn lower_task_wait_all(
+        &mut self,
+        tasks: &hir::Expression,
+        result_type: &hir::Type,
+    ) -> mir::Operand {
+        let tasks = self
+            .lower_expression(tasks)
+            .expect("a Task.WaitAll array produces an operand");
+        let array_type = hir::Type::Array(Box::new(result_type.clone()));
+        let destination = mir::Place::Local(self.new_temporary(array_type.clone()));
+        self.instruction(mir::Instruction::CallIntrinsic {
+            destination: Some(destination.clone()),
+            intrinsic: mir::Intrinsic::TaskWaitAll,
+            arguments: vec![tasks],
+            return_type: array_type.clone(),
+        });
+        mir::Operand {
+            type_: array_type,
+            kind: mir::OperandKind::Copy(destination),
+        }
+    }
+
+    fn lower_task_cancel(&mut self, task: &hir::Expression) -> mir::Operand {
+        let task = self
+            .lower_expression(task)
+            .expect("a Task<T> value produces an operand");
+        let destination = mir::Place::Local(self.new_temporary(hir::Type::Bool));
+        self.instruction(mir::Instruction::CallIntrinsic {
+            destination: Some(destination.clone()),
+            intrinsic: mir::Intrinsic::TaskCancel,
+            arguments: vec![task],
+            return_type: hir::Type::Bool,
+        });
+        mir::Operand {
+            type_: hir::Type::Bool,
+            kind: mir::OperandKind::Copy(destination),
+        }
+    }
+
+    fn lower_task_cancellation_requested(&mut self) -> mir::Operand {
+        let destination = mir::Place::Local(self.new_temporary(hir::Type::Bool));
+        self.instruction(mir::Instruction::CallIntrinsic {
+            destination: Some(destination.clone()),
+            intrinsic: mir::Intrinsic::TaskCancellationRequested,
+            arguments: Vec::new(),
+            return_type: hir::Type::Bool,
+        });
+        mir::Operand {
+            type_: hir::Type::Bool,
             kind: mir::OperandKind::Copy(destination),
         }
     }

@@ -24,6 +24,7 @@ pub(super) struct PreparedProgram {
     // `JITModule::free_memory`, which `&mut self` cannot do.
     jit: Option<JITModule>,
     entries: HashMap<mir::SymbolId, (*const u8, mir::Type)>,
+    task_entries: HashMap<mir::SymbolId, (*const u8, mir::Type)>,
 }
 
 impl PreparedProgram {
@@ -40,9 +41,17 @@ impl PreparedProgram {
         let jit = JITModule::new(builder);
         let mut codegen = Codegen::new(jit, module)?;
         let function_ids = codegen.declare_functions(module)?;
+        let task_trampoline_ids = codegen.declare_task_trampolines(module)?;
         codegen.define_interface_tables(module, &function_ids)?;
         for function in &module.functions {
             codegen.define_function(function, &function_ids)?;
+            if let Some(trampoline) = task_trampoline_ids.get(&function.symbol) {
+                codegen.define_task_trampoline(
+                    function,
+                    function_ids[&function.symbol],
+                    *trampoline,
+                )?;
+            }
         }
         codegen.jit.finalize_definitions().map_err(module_error)?;
         let entries = module
@@ -54,9 +63,22 @@ impl PreparedProgram {
                 (function.symbol, (pointer, function.return_type.clone()))
             })
             .collect();
+        let task_entries = module
+            .functions
+            .iter()
+            .map(|function| {
+                let id = task_trampoline_ids
+                    .get(&function.symbol)
+                    .copied()
+                    .unwrap_or(function_ids[&function.symbol]);
+                let pointer = codegen.jit.get_finalized_function(id);
+                (function.symbol, (pointer, function.return_type.clone()))
+            })
+            .collect();
         Ok(Self {
             jit: Some(codegen.jit),
             entries,
+            task_entries,
         })
     }
 
@@ -201,6 +223,8 @@ impl PreparedProgram {
     pub(super) fn run_task(
         &self,
         symbol: mir::SymbolId,
+        payload: &super::worker_pool::TaskPayload,
+        cancellation: Arc<aster_runtime::TaskCancellation>,
         collect_stats: bool,
         memory_policy: Option<&super::worker_pool::TaskMemoryPolicy>,
     ) -> (
@@ -209,7 +233,7 @@ impl PreparedProgram {
     ) {
         use super::worker_pool::TaskOutcome;
 
-        let Some((pointer, return_type)) = self.entries.get(&symbol) else {
+        let Some((pointer, return_type)) = self.task_entries.get(&symbol) else {
             return (
                 TaskOutcome::Failed(BackendError::new(format!(
                     "symbol {symbol:?} was not prepared"
@@ -227,7 +251,12 @@ impl PreparedProgram {
             },
             super::worker_pool::TaskMemoryPolicy::context,
         );
-        let value = invoke_finalized(*pointer, return_type, &mut context);
+        context.set_task_cancellation(cancellation);
+        let value = if payload.is_empty() {
+            invoke_finalized(*pointer, return_type, &mut context)
+        } else {
+            invoke_task_finalized(*pointer, return_type, payload.as_ptr(), &mut context)
+        };
         let runtime_error = context.take_error();
         let stats = context.memory_stats().clone();
         let telemetry = context.aarm_memory_telemetry();
@@ -248,11 +277,12 @@ impl PreparedProgram {
     /// the fresh `ExecutionContext` so the step's async intrinsics reach the
     /// runtime. Returns the machine status as an `ExecutionValue::Int`, or the
     /// controlled error the step raised (`context.fail` wins over any status).
-    pub(super) fn invoke_move_next(
+    pub(super) fn invoke_move_next_with_cancellation(
         &self,
         symbol: mir::SymbolId,
         handle: i64,
         task_runtime: *mut (),
+        cancellation: Arc<aster_runtime::TaskCancellation>,
         memory_domain: Option<&super::worker_pool::AsyncMemoryDomain>,
     ) -> (
         Result<(ExecutionValue, super::MemoryStats), BackendError>,
@@ -274,6 +304,7 @@ impl PreparedProgram {
                 )
             });
         context.set_task_runtime(task_runtime);
+        context.set_task_cancellation(cancellation);
         // SAFETY: this symbol was declared and finalized as
         // `(ExecutionContext*, i64) -> i32` (see `mir_lowering::async_machine`
         // and `declarations::signature`); the module stays alive for the call.
@@ -1086,6 +1117,55 @@ fn invoke_finalized(
         _ => unreachable!("entry return type was validated before code generation"),
     };
     Ok(value)
+}
+
+/// Invoke a generated parameterized-task trampoline. Validation guarantees a
+/// scalar transferable result and a copied host payload matching the target
+/// signature; this boundary dispatches only the concrete result ABI.
+#[allow(unsafe_code)]
+fn invoke_task_finalized(
+    pointer: *const u8,
+    return_type: &mir::Type,
+    payload: *const u64,
+    context: &mut aster_runtime::ExecutionContext,
+) -> Result<ExecutionValue, BackendError> {
+    macro_rules! invoke {
+        ($native:ty) => {{
+            // SAFETY: `pointer` names the generated `(context, payload)`
+            // trampoline whose result ABI is selected by `return_type`.
+            let function: extern "C" fn(
+                *mut aster_runtime::ExecutionContext,
+                *const u64,
+            ) -> $native = unsafe { std::mem::transmute(pointer) };
+            function(context, payload)
+        }};
+    }
+    Ok(match return_type {
+        mir::Type::Bool => ExecutionValue::Bool(invoke!(u8) != 0),
+        mir::Type::SByte => ExecutionValue::SByte(invoke!(i8)),
+        mir::Type::Byte => ExecutionValue::Byte(invoke!(u8)),
+        mir::Type::Short => ExecutionValue::Short(invoke!(i16)),
+        mir::Type::UShort => ExecutionValue::UShort(invoke!(u16)),
+        mir::Type::Int => ExecutionValue::Int(invoke!(i32)),
+        mir::Type::UInt => ExecutionValue::UInt(invoke!(u32)),
+        mir::Type::Long => ExecutionValue::Long(invoke!(i64)),
+        mir::Type::ULong => ExecutionValue::ULong(invoke!(u64)),
+        mir::Type::Float => ExecutionValue::float(invoke!(f32)),
+        mir::Type::Double => ExecutionValue::double(invoke!(f64)),
+        mir::Type::Char => {
+            let raw = invoke!(u32);
+            ExecutionValue::Char(char::from_u32(raw).ok_or_else(|| {
+                BackendError::new(format!(
+                    "Task.Run returned invalid Unicode scalar value U+{raw:08X} as `char`"
+                ))
+            })?)
+        }
+        _ => {
+            return Err(BackendError::new(
+                "parameterized Task.Run produced a non-transferable result type",
+            ));
+        }
+    })
 }
 
 #[cfg(test)]

@@ -368,19 +368,57 @@ impl Lowerer<'_> {
                     let resolved = &self.model.task_runs[&model_key];
                     let function = self.callable_symbols[&resolved.function];
                     let return_type = self.callable_results[&function].clone();
+                    let parameter_types = self.callable_parameters[&function].clone();
+                    let arguments = arguments
+                        .iter()
+                        .skip(1)
+                        .zip(parameter_types)
+                        .map(|(argument, target)| convert(self.expression(argument), &target))
+                        .collect();
                     return hir::Expression {
                         type_: hir::Type::Task(Box::new(return_type.clone())),
                         kind: hir::ExpressionKind::TaskRun {
                             function,
+                            arguments,
                             return_type: Box::new(return_type),
                         },
                     };
                 }
+                if is_task_wait_all_callee(callee) {
+                    let tasks = self.expression(&arguments[0]);
+                    let hir::Type::Array(element) = tasks.type_.clone() else {
+                        unreachable!("validated Task.WaitAll has an array operand")
+                    };
+                    let hir::Type::Task(result_type) = *element else {
+                        unreachable!("validated Task.WaitAll has Task<T> elements")
+                    };
+                    return hir::Expression {
+                        type_: hir::Type::Array(result_type.clone()),
+                        kind: hir::ExpressionKind::TaskWaitAll {
+                            tasks: Box::new(tasks),
+                            result_type,
+                        },
+                    };
+                }
+                if is_task_cancellation_requested_callee(callee) {
+                    return hir::Expression {
+                        type_: hir::Type::Bool,
+                        kind: hir::ExpressionKind::TaskCancellationRequested,
+                    };
+                }
                 if let ast::ExpressionKind::Member { object, name } = &callee.kind
-                    && name == "Wait"
+                    && matches!(name.as_str(), "Wait" | "Cancel")
                 {
                     let object = self.expression(object);
                     if let hir::Type::Task(result_type) = object.type_.clone() {
+                        if name == "Cancel" {
+                            return hir::Expression {
+                                type_: hir::Type::Bool,
+                                kind: hir::ExpressionKind::TaskCancel {
+                                    task: Box::new(object),
+                                },
+                            };
+                        }
                         return hir::Expression {
                             type_: (*result_type).clone(),
                             kind: hir::ExpressionKind::TaskWait {
@@ -1129,6 +1167,24 @@ fn is_task_run_callee(callee: &ast::Expression) -> bool {
         &callee.kind,
         ast::ExpressionKind::Member { object, name }
             if name == "Run"
+                && matches!(&object.kind, ast::ExpressionKind::Name(object) if object == "Task")
+    )
+}
+
+fn is_task_wait_all_callee(callee: &ast::Expression) -> bool {
+    matches!(
+        &callee.kind,
+        ast::ExpressionKind::Member { object, name }
+            if name == "WaitAll"
+                && matches!(&object.kind, ast::ExpressionKind::Name(object) if object == "Task")
+    )
+}
+
+fn is_task_cancellation_requested_callee(callee: &ast::Expression) -> bool {
+    matches!(
+        &callee.kind,
+        ast::ExpressionKind::Member { object, name }
+            if name == "IsCancellationRequested"
                 && matches!(&object.kind, ast::ExpressionKind::Name(object) if object == "Task")
     )
 }

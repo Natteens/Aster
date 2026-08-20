@@ -88,6 +88,24 @@ impl Codegen {
                     state,
                 );
             }
+            mir::Intrinsic::TaskWaitAll => {
+                return self.translate_task_wait_all(
+                    builder,
+                    destination,
+                    arguments,
+                    return_type,
+                    state,
+                );
+            }
+            mir::Intrinsic::TaskCancel | mir::Intrinsic::TaskCancellationRequested => {
+                return self.translate_task_control(
+                    builder,
+                    destination,
+                    intrinsic,
+                    arguments,
+                    state,
+                );
+            }
             mir::Intrinsic::StringFromLong
             | mir::Intrinsic::StringFromLongTemporary
             | mir::Intrinsic::StringFromULong
@@ -256,6 +274,9 @@ impl Codegen {
             | mir::Intrinsic::StringJoinTemporary
             | mir::Intrinsic::TaskRun
             | mir::Intrinsic::TaskWait
+            | mir::Intrinsic::TaskWaitAll
+            | mir::Intrinsic::TaskCancel
+            | mir::Intrinsic::TaskCancellationRequested
             | mir::Intrinsic::AsyncSpawn
             | mir::Intrinsic::AsyncState
             | mir::Intrinsic::AsyncSetState
@@ -311,10 +332,9 @@ impl Codegen {
         Ok(())
     }
 
-    /// `aster.core.Task.Run(function)`. `arguments` holds exactly one
-    /// `OperandKind::Function` operand (validated shape), so the target
-    /// symbol is emitted as a compile-time constant, never loaded through
-    /// `translate_operand`.
+    /// `aster.core.Task.Run(function, arguments...)`. Runtime arguments are
+    /// copied into one caller stack frame in source order, and the ABI copies
+    /// that frame into host-owned storage before returning.
     fn translate_task_run(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
@@ -322,33 +342,150 @@ impl Codegen {
         arguments: &[mir::Operand],
         state: &FunctionState,
     ) -> Result<(), BackendError> {
-        let [
-            mir::Operand {
-                kind: mir::OperandKind::Function(symbol),
-                ..
-            },
-        ] = arguments
-        else {
+        let Some((target, arguments)) = arguments.split_first() else {
             return Err(BackendError::new(
-                "Task.Run requires exactly one resolved function argument",
+                "Task.Run requires one resolved function argument",
+            ));
+        };
+        let mir::OperandKind::Function(symbol) = target.kind else {
+            return Err(BackendError::new(
+                "Task.Run requires one resolved function argument",
             ));
         };
         let context = state
             .execution_context
             .ok_or_else(|| BackendError::new("Task.Run requires an execution context"))?;
         let symbol_constant = builder.ins().iconst(types::I32, i64::from(symbol.0));
-        let function_ref = self
-            .jit
-            .declare_func_in_func(self.runtime_ids["aster_task_run"], builder.func);
-        let call = builder
-            .ins()
-            .call(function_ref, &[context, symbol_constant]);
+        let call = if arguments.is_empty() {
+            let function_ref = self
+                .jit
+                .declare_func_in_func(self.runtime_ids["aster_task_run"], builder.func);
+            builder
+                .ins()
+                .call(function_ref, &[context, symbol_constant])
+        } else {
+            let layout = self.layouts.task_argument_layout(
+                &arguments
+                    .iter()
+                    .map(|argument| argument.type_.clone())
+                    .collect::<Vec<_>>(),
+            )?;
+            let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                layout.size,
+                3,
+            ));
+            let frame = builder.ins().stack_addr(self.pointer_type, slot, 0);
+            // Aggregate field copies deliberately skip padding. Initialize the
+            // complete transfer frame so the synchronous host copy never reads
+            // uninitialized alignment gaps as `u64` words.
+            let zero = builder.ins().iconst(types::I64, 0);
+            for offset in (0..layout.size).step_by(8) {
+                builder.ins().store(
+                    MemFlags::new(),
+                    zero,
+                    frame,
+                    i32::try_from(offset).map_err(|_| {
+                        BackendError::new("Task.Run argument offset exceeds the JIT ABI")
+                    })?,
+                );
+            }
+            for (argument, offset) in arguments.iter().zip(layout.offsets) {
+                let destination = builder.ins().iadd_imm(frame, i64::from(offset));
+                let value = self.translate_operand(builder, argument, state)?;
+                if is_aggregate(&argument.type_) {
+                    self.copy_value(builder, &argument.type_, value, destination)?;
+                } else {
+                    builder.ins().store(MemFlags::new(), value, destination, 0);
+                }
+            }
+            let size = builder.ins().iconst(types::I32, i64::from(layout.size));
+            let function_ref = self
+                .jit
+                .declare_func_in_func(self.runtime_ids["aster_task_run_args"], builder.func);
+            builder
+                .ins()
+                .call(function_ref, &[context, symbol_constant, frame, size])
+        };
         if let Some(destination) = destination {
             let result =
                 builder.inst_results(call).first().copied().ok_or_else(|| {
                     BackendError::new("Task.Run did not produce its declared result")
                 })?;
             self.store_scalar(builder, destination, result, state)?;
+        }
+        Ok(())
+    }
+
+    fn translate_task_wait_all(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: Option<&mir::Place>,
+        arguments: &[mir::Operand],
+        return_type: &mir::Type,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let [tasks] = arguments else {
+            return Err(BackendError::new("Task.WaitAll requires one task array"));
+        };
+        let mir::Type::Array(result_type) = return_type else {
+            return Err(BackendError::new("Task.WaitAll requires an array result"));
+        };
+        let symbol = super::task_abi::wait_all_symbol_for(result_type)
+            .ok_or_else(|| BackendError::new("Task.WaitAll result type has no transferable ABI"))?;
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("Task.WaitAll requires an execution context"))?;
+        let tasks = self.translate_operand(builder, tasks, state)?;
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids[symbol], builder.func);
+        let call = builder.ins().call(function_ref, &[context, tasks]);
+        self.continue_if_runtime_ok(builder, state)?;
+        if let Some(destination) = destination {
+            self.store_scalar(builder, destination, builder.inst_results(call)[0], state)?;
+        }
+        Ok(())
+    }
+
+    fn translate_task_control(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: Option<&mir::Place>,
+        intrinsic: mir::Intrinsic,
+        arguments: &[mir::Operand],
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new("Task cancellation operation requires an execution context")
+        })?;
+        let (symbol, values) = match intrinsic {
+            mir::Intrinsic::TaskCancel => {
+                let [task] = arguments else {
+                    return Err(BackendError::new("Task.Cancel requires one task handle"));
+                };
+                (
+                    "aster_task_cancel",
+                    vec![context, self.translate_operand(builder, task, state)?],
+                )
+            }
+            mir::Intrinsic::TaskCancellationRequested => {
+                if !arguments.is_empty() {
+                    return Err(BackendError::new(
+                        "Task.IsCancellationRequested takes no arguments",
+                    ));
+                }
+                ("aster_task_cancellation_requested", vec![context])
+            }
+            _ => unreachable!("only task control intrinsics use this translator"),
+        };
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids[symbol], builder.func);
+        let call = builder.ins().call(function_ref, &values);
+        self.continue_if_runtime_ok(builder, state)?;
+        if let Some(destination) = destination {
+            self.store_scalar(builder, destination, builder.inst_results(call)[0], state)?;
         }
         Ok(())
     }
@@ -462,10 +599,54 @@ impl Codegen {
                 let inner = builder
                     .ins()
                     .iconst(types::I32, function_symbol(&arguments[1])?);
+                let payload_arguments = &arguments[2..];
+                let (frame, size) = if payload_arguments.is_empty() {
+                    (
+                        builder.ins().iconst(self.pointer_type, 0),
+                        builder.ins().iconst(types::I32, 0),
+                    )
+                } else {
+                    let layout = self.layouts.task_argument_layout(
+                        &payload_arguments
+                            .iter()
+                            .map(|argument| argument.type_.clone())
+                            .collect::<Vec<_>>(),
+                    )?;
+                    let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        layout.size,
+                        3,
+                    ));
+                    let frame = builder.ins().stack_addr(self.pointer_type, slot, 0);
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    for offset in (0..layout.size).step_by(8) {
+                        builder.ins().store(
+                            MemFlags::new(),
+                            zero,
+                            frame,
+                            i32::try_from(offset).map_err(|_| {
+                                BackendError::new("Task.Run argument offset exceeds the JIT ABI")
+                            })?,
+                        );
+                    }
+                    for (argument, offset) in payload_arguments.iter().zip(layout.offsets) {
+                        let destination = builder.ins().iadd_imm(frame, i64::from(offset));
+                        let value = self.translate_operand(builder, argument, state)?;
+                        if is_aggregate(&argument.type_) {
+                            self.copy_value(builder, &argument.type_, value, destination)?;
+                        } else {
+                            builder.ins().store(MemFlags::new(), value, destination, 0);
+                        }
+                    }
+                    (
+                        frame,
+                        builder.ins().iconst(types::I32, i64::from(layout.size)),
+                    )
+                };
                 self.call_runtime(
                     builder,
                     "aster_async_spawn_inner",
-                    &[context, handle, inner],
+                    &[context, handle, inner, frame, size],
                 );
             }
             mir::Intrinsic::AsyncAwaitResult => {

@@ -411,6 +411,9 @@ fn concurrency_intrinsic(intrinsic: mir::Intrinsic) -> bool {
         intrinsic,
         mir::Intrinsic::TaskRun
             | mir::Intrinsic::TaskWait
+            | mir::Intrinsic::TaskWaitAll
+            | mir::Intrinsic::TaskCancel
+            | mir::Intrinsic::TaskCancellationRequested
             | mir::Intrinsic::AsyncSpawn
             | mir::Intrinsic::AsyncState
             | mir::Intrinsic::AsyncSetState

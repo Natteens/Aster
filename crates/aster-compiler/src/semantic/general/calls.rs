@@ -1,8 +1,8 @@
 use super::{
-    Analyzer, Callable, Diagnostic, Dispatch, Expression, ExpressionKind, Primitive, ResolvedCall,
-    ResolvedDictionaryOperation, ResolvedEnumCase, ResolvedParallelFor, ResolvedParallelForEach,
-    ResolvedParallelReduce, ResolvedStringBuilderOperation, ResolvedTaskRun, Signature, Span, Type,
-    TypeKind, TypeRef, Visibility, resolve_type_readonly,
+    Analyzer, Callable, Diagnostic, Dispatch, Expression, ExpressionKind, HashSet, Primitive,
+    ResolvedCall, ResolvedDictionaryOperation, ResolvedEnumCase, ResolvedParallelFor,
+    ResolvedParallelForEach, ResolvedParallelReduce, ResolvedStringBuilderOperation,
+    ResolvedTaskRun, Signature, Span, Type, TypeKind, TypeRef, Visibility, resolve_type_readonly,
 };
 use aster_hir::StringOperation;
 
@@ -388,6 +388,21 @@ impl Analyzer<'_> {
         if is_task_run_callee(callee) {
             return self.task_run(arguments, span);
         }
+        if is_task_wait_all_callee(callee) {
+            return self.task_wait_all(arguments, span);
+        }
+        if is_task_cancellation_requested_callee(callee) {
+            if !arguments.is_empty() {
+                self.diagnostics.push(Diagnostic::error(
+                    "`Task.IsCancellationRequested` accepts no arguments",
+                    span,
+                ));
+                for argument in arguments {
+                    self.expression(argument);
+                }
+            }
+            return Type::Bool;
+        }
         if is_parallel_for_callee(callee) {
             return self.parallel_for(arguments, span);
         }
@@ -398,11 +413,11 @@ impl Analyzer<'_> {
             return self.parallel_reduce(arguments, span);
         }
         if let ExpressionKind::Member { object, name } = &callee.kind
-            && name == "Wait"
+            && matches!(name.as_str(), "Wait" | "Cancel")
         {
             let object_type = self.expression(object);
             if let Type::Task(result_type) = object_type {
-                if self.async_state != super::AsyncAnalysisState::OutsideAsync {
+                if name == "Wait" && self.async_state != super::AsyncAnalysisState::OutsideAsync {
                     self.diagnostics.push(
                         Diagnostic::error(
                             "`Wait()` is not supported inside an `async` function in this version",
@@ -413,11 +428,18 @@ impl Analyzer<'_> {
                 }
                 if !arguments.is_empty() {
                     self.diagnostics.push(Diagnostic::error(
-                        "`Task<T>.Wait` accepts no arguments",
+                        format!("`Task<T>.{name}` accepts no arguments"),
                         span,
                     ));
+                    for argument in arguments {
+                        self.expression(argument);
+                    }
                 }
-                return *result_type;
+                return if name == "Wait" {
+                    *result_type
+                } else {
+                    Type::Bool
+                };
             }
         }
         let calls_current_instance = matches!(&callee.kind, ExpressionKind::Name(name) if self.methods.contains_key(name))
@@ -1161,25 +1183,22 @@ impl Analyzer<'_> {
         Type::Void
     }
 
-    /// `aster.core.Task.Run(function)`. `function` must directly name a
-    /// resolvable, zero-parameter free function or static method whose
-    /// result can safely cross a worker boundary; anything else is a
-    /// controlled diagnostic here rather than a later panic.
+    /// `aster.core.Task.Run(function, arguments...)`. The callable is
+    /// resolved from the concrete argument types, while every runtime
+    /// argument remains an ordinary caller-evaluated expression.
     fn task_run(&mut self, arguments: &[Expression], span: Span) -> Type {
-        let [argument] = arguments else {
+        let Some((target, values)) = arguments.split_first() else {
             self.diagnostics.push(Diagnostic::error(
-                format!(
-                    "`Task.Run` expects exactly one function argument, found {}",
-                    arguments.len()
-                ),
+                "`Task.Run` expects a function argument",
                 span,
             ));
-            for argument in arguments {
-                self.expression(argument);
-            }
             return Type::Unknown;
         };
-        let Some(candidate) = self.resolve_task_run_target(argument) else {
+        let value_types = values
+            .iter()
+            .map(|argument| self.expression(argument))
+            .collect::<Vec<_>>();
+        let Some(candidate) = self.resolve_task_run_target(target, &value_types) else {
             return Type::Unknown;
         };
         if !transferable(&candidate.signature.result) {
@@ -1189,13 +1208,29 @@ impl Analyzer<'_> {
                         "`Task<{}>` cannot cross a worker boundary in this version",
                         candidate.signature.result.display()
                     ),
-                    argument.span,
+                    target.span,
                 )
                 .with_help(
                     "Task.Run currently supports only scalar results (bool, char, integers, floats)",
                 ),
             );
             return Type::Unknown;
+        }
+        for (value, type_) in values.iter().zip(&candidate.signature.parameters) {
+            if !self.worker_transferable_layout(type_, &mut HashSet::new()) {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "`{}` cannot cross a worker boundary as a `Task.Run` argument",
+                            type_.display()
+                        ),
+                        value.span,
+                    )
+                    .with_help(
+                        "use a scalar or a finite struct/enum containing only transferable values",
+                    ),
+                );
+            }
         }
         let result_type = candidate.signature.result.clone();
         self.model.task_runs.insert(
@@ -1207,11 +1242,15 @@ impl Analyzer<'_> {
         Type::Task(Box::new(result_type))
     }
 
-    /// Resolve `Task.Run`'s sole argument to the concrete, zero-parameter,
-    /// non-generic free function or static method it directly names.
-    /// Never treats a variable, an instance method, or any other expression
-    /// shape as a function reference.
-    fn resolve_task_run_target(&mut self, argument: &Expression) -> Option<Callable> {
+    /// Resolve `Task.Run`'s target against the concrete runtime argument
+    /// types. The target must directly name a free function or static method;
+    /// variables, instance methods, and other expression shapes never become
+    /// captured or bound callables.
+    fn resolve_task_run_target(
+        &mut self,
+        argument: &Expression,
+        argument_types: &[Type],
+    ) -> Option<Callable> {
         match &argument.kind {
             ExpressionKind::Name(name) => {
                 let mut candidates = self
@@ -1231,7 +1270,7 @@ impl Analyzer<'_> {
                         .filter(|candidate| candidate.is_static)
                         .cloned(),
                 );
-                self.pick_task_run_candidate(name, argument.span, candidates)
+                self.resolve_overload(name, &candidates, argument_types, argument.span)
             }
             ExpressionKind::Member { object, name } => {
                 let ExpressionKind::Name(type_name) = &object.kind else {
@@ -1256,7 +1295,7 @@ impl Analyzer<'_> {
                     .filter(|candidate| candidate.is_static)
                     .cloned()
                     .collect::<Vec<_>>();
-                self.pick_task_run_candidate(name, argument.span, candidates)
+                self.resolve_overload(name, &candidates, argument_types, argument.span)
             }
             _ => {
                 self.diagnostics.push(Diagnostic::error(
@@ -1268,35 +1307,81 @@ impl Analyzer<'_> {
         }
     }
 
-    fn pick_task_run_candidate(
-        &mut self,
-        name: &str,
-        span: Span,
-        candidates: Vec<Callable>,
-    ) -> Option<Callable> {
-        let mut zero_argument = candidates
-            .into_iter()
-            .filter(|candidate| candidate.signature.parameters.is_empty())
-            .collect::<Vec<_>>();
-        match zero_argument.len() {
-            0 => {
-                self.diagnostics.push(Diagnostic::error(
-                    format!(
-                        "no zero-parameter static method or free function named `{name}` is available for `Task.Run`"
-                    ),
-                    span,
-                ));
-                None
+    fn task_wait_all(&mut self, arguments: &[Expression], span: Span) -> Type {
+        let [tasks] = arguments else {
+            self.diagnostics.push(Diagnostic::error(
+                format!(
+                    "`Task.WaitAll` expects exactly one task-array argument, found {}",
+                    arguments.len()
+                ),
+                span,
+            ));
+            for argument in arguments {
+                self.expression(argument);
             }
-            1 => zero_argument.pop(),
-            _ => {
-                self.diagnostics.push(Diagnostic::error(
-                    format!("`Task.Run({name})` is ambiguous among multiple candidates"),
-                    span,
-                ));
-                None
-            }
+            return Type::Unknown;
+        };
+        let type_ = self.expression(tasks);
+        let Type::Array(element) = type_ else {
+            self.diagnostics.push(Diagnostic::error(
+                "`Task.WaitAll` requires a homogeneous `Task<T>[]` array",
+                tasks.span,
+            ));
+            return Type::Unknown;
+        };
+        let Type::Task(result) = *element else {
+            self.diagnostics.push(Diagnostic::error(
+                "`Task.WaitAll` requires a homogeneous `Task<T>[]` array",
+                tasks.span,
+            ));
+            return Type::Unknown;
+        };
+        if !transferable(&result) {
+            self.diagnostics.push(Diagnostic::error(
+                format!(
+                    "`Task.WaitAll` cannot compose `Task<{}>` results",
+                    result.display()
+                ),
+                tasks.span,
+            ));
+            return Type::Unknown;
         }
+        Type::Array(result)
+    }
+
+    /// One semantic worker-transfer authority. Primitive scalars defer to
+    /// `aster-types`; finite structs/enums recurse nominally through their
+    /// already-specialized field layouts. Reference-bearing and recursive
+    /// shapes fail closed.
+    fn worker_transferable_layout(&self, type_: &Type, visiting: &mut HashSet<String>) -> bool {
+        if transferable(type_) {
+            return true;
+        }
+        let (name, is_enum) = match type_ {
+            Type::User(name) => (name, false),
+            Type::Enum(name) => (name, true),
+            _ => return false,
+        };
+        if !visiting.insert(name.clone()) {
+            return false;
+        }
+        let Some(info) = self.context.types.get(name) else {
+            visiting.remove(name);
+            return false;
+        };
+        let result = if is_enum {
+            info.enum_cases.iter().all(|case| {
+                case.fields
+                    .iter()
+                    .all(|(_, field)| self.worker_transferable_layout(field, visiting))
+            })
+        } else {
+            info.fields
+                .values()
+                .all(|field| self.worker_transferable_layout(field, visiting))
+        };
+        visiting.remove(name);
+        result
     }
 
     /// `Parallel.For(start, end, Body)`: `start`/`end` must be `int`,
@@ -1719,6 +1804,24 @@ pub(super) fn is_task_run_callee(callee: &Expression) -> bool {
         &callee.kind,
         ExpressionKind::Member { object, name }
             if name == "Run"
+                && matches!(&object.kind, ExpressionKind::Name(object) if object == "Task")
+    )
+}
+
+pub(super) fn is_task_wait_all_callee(callee: &Expression) -> bool {
+    matches!(
+        &callee.kind,
+        ExpressionKind::Member { object, name }
+            if name == "WaitAll"
+                && matches!(&object.kind, ExpressionKind::Name(object) if object == "Task")
+    )
+}
+
+pub(super) fn is_task_cancellation_requested_callee(callee: &Expression) -> bool {
+    matches!(
+        &callee.kind,
+        ExpressionKind::Member { object, name }
+            if name == "IsCancellationRequested"
                 && matches!(&object.kind, ExpressionKind::Name(object) if object == "Task")
     )
 }

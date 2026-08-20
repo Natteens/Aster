@@ -1588,6 +1588,9 @@ mod tests {
         let intrinsics = [
             mir::Intrinsic::TaskRun,
             mir::Intrinsic::TaskWait,
+            mir::Intrinsic::TaskWaitAll,
+            mir::Intrinsic::TaskCancel,
+            mir::Intrinsic::TaskCancellationRequested,
             mir::Intrinsic::AsyncSpawn,
             mir::Intrinsic::AsyncState,
             mir::Intrinsic::AsyncSetState,
@@ -1626,7 +1629,10 @@ mod tests {
             .collect();
         let report = analyze(&module(functions));
 
-        assert_eq!(report.summary.persistent_sites, intrinsics.len());
+        // Every case contains the explicit object allocation. WaitAll also
+        // owns a caller-context result-array allocation, even in this
+        // intentionally shape-minimal barrier fixture.
+        assert_eq!(report.summary.persistent_sites, intrinsics.len() + 1);
         assert!(report.proofs.iter().all(|proof| {
             proof.region == mir::AllocationRegion::Persistent && proof.dead_after.is_empty()
         }));

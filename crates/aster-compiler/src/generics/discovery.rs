@@ -410,6 +410,24 @@ impl Monomorphizer {
         span: aster_diagnostics::Span,
         environment: &HashMap<String, String>,
     ) -> String {
+        // `Task.Run(Target, values...)` carries a callable request without
+        // syntactically invoking `Target`. Reuse this exact call-discovery
+        // routine on that target and its runtime values so generic inference,
+        // overload selection, constraints, specialization identity, cache
+        // rollback, and concrete name rewriting all remain owned here. The
+        // later semantic Task gate still proves that the resulting callable is
+        // static/free and worker-transferable.
+        if is_task_run_callee(callee)
+            && let Some((target, values)) = arguments.split_first_mut()
+        {
+            let result =
+                self.call_expression(target, &mut Vec::new(), values, target.span, environment);
+            return if result.is_empty() {
+                String::new()
+            } else {
+                format!("Task<{result}>")
+            };
+        }
         let argument_types = arguments
             .iter_mut()
             .map(|argument| self.expression(argument, environment))
@@ -666,6 +684,15 @@ impl Monomorphizer {
             _ => String::new(),
         }
     }
+}
+
+fn is_task_run_callee(callee: &Expression) -> bool {
+    matches!(
+        &callee.kind,
+        ExpressionKind::Member { object, name }
+            if name == "Run"
+                && matches!(&object.kind, ExpressionKind::Name(owner) if owner == "Task")
+    )
 }
 
 fn method_inference_possible(template: &FunctionDeclaration, arguments: &[String]) -> bool {

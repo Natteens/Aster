@@ -26,6 +26,79 @@ impl Codegen {
         Ok(())
     }
 
+    /// Define the fixed `(context, payload) -> scalar` worker entry for one
+    /// parameterized Task.Run target. The wrapper mechanically reconstructs
+    /// concrete ABI arguments from the validated copied frame; it performs
+    /// no transfer or callable inference.
+    pub(super) fn define_task_trampoline(
+        &mut self,
+        function: &mir::Function,
+        function_id: FuncId,
+        trampoline_id: FuncId,
+    ) -> Result<(), BackendError> {
+        let mut context = self.jit.make_context();
+        let mut signature = self.jit.make_signature();
+        signature
+            .params
+            .push(super::AbiParam::new(self.pointer_type));
+        signature
+            .params
+            .push(super::AbiParam::new(self.pointer_type));
+        if function.return_type != mir::Type::Void && !is_aggregate(&function.return_type) {
+            signature.returns.push(super::AbiParam::new(
+                self.clif_value_type(&function.return_type)?,
+            ));
+        }
+        context.func.signature = signature;
+        let mut builder_context = FunctionBuilderContext::new();
+        {
+            let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_context);
+            let entry = builder.create_block();
+            builder.append_block_params_for_function_params(entry);
+            builder.switch_to_block(entry);
+            builder.seal_block(entry);
+            let context_value = builder.block_params(entry)[0];
+            let payload = builder.block_params(entry)[1];
+            let layout = self.layouts.task_argument_layout(
+                &function
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.type_.clone())
+                    .collect::<Vec<_>>(),
+            )?;
+            let mut values = vec![context_value];
+            for (parameter, offset) in function.parameters.iter().zip(layout.offsets) {
+                if is_aggregate(&parameter.type_) {
+                    values.push(builder.ins().iadd_imm(payload, i64::from(offset)));
+                } else {
+                    let type_ = self.clif_value_type(&parameter.type_)?;
+                    values.push(builder.ins().load(
+                        type_,
+                        MemFlags::new(),
+                        payload,
+                        i32::try_from(offset).map_err(|_| {
+                            BackendError::new("Task.Run argument offset exceeds the JIT ABI")
+                        })?,
+                    ));
+                }
+            }
+            let target = self.jit.declare_func_in_func(function_id, builder.func);
+            let call = builder.ins().call(target, &values);
+            if function.return_type == mir::Type::Void || is_aggregate(&function.return_type) {
+                builder.ins().return_(&[]);
+            } else {
+                let result = builder.inst_results(call)[0];
+                builder.ins().return_(&[result]);
+            }
+            builder.finalize();
+        }
+        self.jit
+            .define_function(trampoline_id, &mut context)
+            .map_err(module_error)?;
+        self.jit.clear_context(&mut context);
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     fn translate_function(
         &mut self,

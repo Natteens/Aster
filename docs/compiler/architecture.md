@@ -176,11 +176,27 @@ intrinsics with checked runtime ABI calls; Cranelift does not inspect public `Ma
 collection source names or standard-library paths. Those operations remain opaque to the general
 MIR optimizer and retain their allocation/failure ordering.
 
+Task callables are likewise concrete before HIR. `Task.Run` value arguments are evaluated in the
+caller and lowered as ordinary typed MIR operands after the resolved callable identity. Cranelift
+uses the existing aggregate layout authority to pack a caller frame; the host copies it into a
+worker-owned payload before enqueue, and a generated per-signature trampoline reconstructs the
+callee ABI mechanically. The parameterless form keeps its original direct entry fast path.
+`TaskWaitAll`, `TaskCancel`, and `TaskCancellationRequested` are typed runtime intrinsics and remain
+opaque barriers to the general MIR optimizer. Backend validation checks callable arity/signature,
+closed transferable layouts, homogeneous composition types, and cancellation operand shapes before
+code generation. Task control is per-runtime/per-worker scheduler metadata; no ASTER arena pointer
+or Cranelift type enters the runtime contract.
+
 ### `aster-runtime`
 
 Owns the execution boundary between JIT-compiled ASTER code and host services: the per-run
 `ExecutionContext`, temporary and persistent arenas, immutable UTF-8 strings, arrays, `List<T>`,
-`Dictionary<K,V>`, terminal and filesystem operations, and restricted task/parallel workers.
+`Dictionary<K,V>`, terminal and filesystem operations, and restricted task/parallel workers. Task
+control uses private atomic terminal/request state, worker-owned argument bytes, cached repeatable
+outcomes, and caller-context result-array construction for deterministic `Task.WaitAll`. The
+request/terminal compare-exchange is the cancellation linearization point; the worker publishes its
+completed or failed outcome through the task's completion channel only after fixing that terminal
+state. Async MoveNext contexts receive an `Arc` clone of the same private control on every resume.
 It also owns the central registry of exported runtime functions with backend-neutral signatures.
 The crate depends on no other ASTER crate and exposes no Cranelift types.
 

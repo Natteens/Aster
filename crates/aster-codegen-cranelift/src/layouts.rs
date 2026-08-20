@@ -12,6 +12,12 @@ pub(super) struct TypeLayout {
     pub(super) align_shift: u8,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct TaskArgumentLayout {
+    pub(super) offsets: Vec<u32>,
+    pub(super) size: u32,
+}
+
 pub(super) struct Layouts {
     pub(super) pointer_bytes: u32,
     pub(super) structs: HashMap<mir::SymbolId, mir::StructDefinition>,
@@ -284,6 +290,29 @@ impl Layouts {
         })
     }
 
+    /// Stable, eight-byte-aligned host transfer frame used by Task.Run.
+    /// Each concrete argument keeps its ordinary ASTER size/alignment; the
+    /// frame itself is rounded to a word so the runtime can own it as
+    /// `Vec<u64>` without retaining caller storage.
+    pub(super) fn task_argument_layout(
+        &self,
+        parameters: &[mir::Type],
+    ) -> Result<TaskArgumentLayout, BackendError> {
+        let mut offsets = Vec::with_capacity(parameters.len());
+        let mut size = 0_u32;
+        for parameter in parameters {
+            let layout = self.type_layout(parameter)?;
+            let alignment = 1_u32 << layout.align_shift;
+            size = align_up(size, alignment)?;
+            offsets.push(size);
+            size = size
+                .checked_add(layout.size)
+                .ok_or_else(|| BackendError::new("Task.Run argument frame is too large"))?;
+        }
+        let size = if size == 0 { 0 } else { align_up(size, 8)? };
+        Ok(TaskArgumentLayout { offsets, size })
+    }
+
     pub(super) fn zero_initializable(&self, type_: &mir::Type) -> bool {
         match type_ {
             mir::Type::String
@@ -449,5 +478,22 @@ mod layout_tests {
     fn list_is_never_zero_initializable() {
         let layouts = Layouts::new(&empty_module(), 8).expect("empty module always lays out");
         assert!(!layouts.zero_initializable(&mir::Type::List(Box::new(mir::Type::Int))));
+    }
+
+    #[test]
+    fn task_argument_frames_align_mixed_widths_and_round_to_owned_words() {
+        let layouts = Layouts::new(&empty_module(), 8).expect("empty module always lays out");
+        let layout = layouts
+            .task_argument_layout(&[
+                mir::Type::Byte,
+                mir::Type::Long,
+                mir::Type::Bool,
+                mir::Type::Double,
+            ])
+            .expect("mixed scalar arguments have a finite frame");
+
+        assert_eq!(layout.offsets, vec![0, 8, 16, 24]);
+        assert_eq!(layout.size, 32);
+        assert!(super::align_up(u32::MAX, 8).is_err());
     }
 }

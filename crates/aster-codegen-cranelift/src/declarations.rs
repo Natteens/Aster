@@ -1,6 +1,7 @@
 use super::{
-    AbiParam, BackendError, ClifType, Codegen, FuncId, HashMap, Linkage, Module, Primitive,
-    RuntimeType, Signature, is_aggregate, mir, module_error, primitive, type_name, types,
+    AbiParam, BackendError, ClifType, Codegen, FuncId, HashMap, HashSet, Linkage, Module,
+    Primitive, RuntimeType, Signature, is_aggregate, mir, module_error, primitive, type_name,
+    types,
 };
 
 impl Codegen {
@@ -20,6 +21,59 @@ impl Codegen {
             let id = self
                 .jit
                 .declare_function(&name, linkage, &signature)
+                .map_err(module_error)?;
+            functions.insert(function.symbol, id);
+        }
+        Ok(functions)
+    }
+
+    pub(super) fn declare_task_trampolines(
+        &mut self,
+        mir_module: &mir::Module,
+    ) -> Result<HashMap<mir::SymbolId, FuncId>, BackendError> {
+        let targets = mir_module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| match instruction {
+                mir::Instruction::CallIntrinsic {
+                    intrinsic: mir::Intrinsic::TaskRun,
+                    arguments,
+                    ..
+                } if arguments.len() > 1 => arguments.first(),
+                mir::Instruction::CallIntrinsic {
+                    intrinsic: mir::Intrinsic::AsyncSpawnInner,
+                    arguments,
+                    ..
+                } if arguments.len() > 2 => arguments.get(1),
+                _ => None,
+            })
+            .filter_map(|operand| match operand.kind {
+                mir::OperandKind::Function(symbol) => Some(symbol),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let mut functions = HashMap::new();
+        for function in &mir_module.functions {
+            if !targets.contains(&function.symbol)
+                || function.parameters.is_empty()
+                || super::task_abi::wait_symbol_for(&function.return_type).is_none()
+            {
+                continue;
+            }
+            let mut signature = self.jit.make_signature();
+            signature.params.push(AbiParam::new(self.pointer_type));
+            signature.params.push(AbiParam::new(self.pointer_type));
+            if function.return_type != mir::Type::Void && !is_aggregate(&function.return_type) {
+                signature
+                    .returns
+                    .push(AbiParam::new(self.clif_value_type(&function.return_type)?));
+            }
+            let name = format!("aster_task_entry_{}", function.symbol.0);
+            let id = self
+                .jit
+                .declare_function(&name, Linkage::Local, &signature)
                 .map_err(module_error)?;
             functions.insert(function.symbol, id);
         }

@@ -60,7 +60,7 @@ pub(crate) struct ResolvedPropertyAssignment {
     pub setter: CallableKey,
 }
 
-/// A resolved `aster.core.Task.Run(function)`: the concrete zero-parameter
+/// A resolved `aster.core.Task.Run(function, arguments...)`: the concrete
 /// free function or static method `function` names, resolved once here so
 /// HIR lowering never re-resolves the argument by name.
 #[derive(Clone, Debug, PartialEq, Eq)]

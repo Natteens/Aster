@@ -129,6 +129,7 @@ pub(super) fn validate_module(module: &mir::Module) -> Result<(), BackendError> 
         .iter()
         .map(|definition| (definition.symbol, definition))
         .collect::<HashMap<_, _>>();
+    validate_task_argument_transfer(module, &struct_definitions, &enum_definitions)?;
     for function in &module.functions {
         validate_string_try_parse_targets(function, &enum_definitions)?;
         validate_file_io_result_shapes(function, &enum_definitions, &struct_definitions)?;
@@ -3865,11 +3866,17 @@ fn validate_intrinsic_shape(
             destination.is_some()
                 && matches!(
                     (return_type, arguments),
-                    (mir::Type::Task(result), [argument])
-                        if matches!(argument.kind, mir::OperandKind::Function(_))
-                            && argument.type_ == **result
+                    (mir::Type::Task(result), [function, values @ ..])
+                        if matches!(function.kind, mir::OperandKind::Function(_))
+                            && function.type_ == **result
                             && is_worker_transferable(result)
-                            && function_operand_matches(argument, &[], result, signatures)
+                            && values.iter().all(|value| task_argument_shape(&value.type_))
+                            && function_operand_matches(
+                                function,
+                                &values.iter().map(|value| value.type_.clone()).collect::<Vec<_>>(),
+                                result,
+                                signatures,
+                            )
                 )
         }
         mir::Intrinsic::TaskWait => {
@@ -3882,6 +3889,23 @@ fn validate_intrinsic_shape(
                         mir::Type::Task(inner) if **inner == *return_type
                     )
                 )
+        }
+        mir::Intrinsic::TaskWaitAll => {
+            destination.is_some()
+                && matches!(
+                    (return_type, arguments),
+                    (mir::Type::Array(result), [tasks])
+                        if is_worker_transferable(result)
+                            && tasks.type_ == mir::Type::Array(Box::new(mir::Type::Task(result.clone())))
+                )
+        }
+        mir::Intrinsic::TaskCancel => {
+            destination.is_some()
+                && *return_type == mir::Type::Bool
+                && matches!(arguments, [task] if matches!(task.type_, mir::Type::Task(_)))
+        }
+        mir::Intrinsic::TaskCancellationRequested => {
+            destination.is_some() && *return_type == mir::Type::Bool && arguments.is_empty()
         }
         mir::Intrinsic::AsyncSpawn => {
             destination.is_some()
@@ -3938,10 +3962,16 @@ fn validate_intrinsic_shape(
                 && *return_type == mir::Type::Void
                 && matches!(
                     arguments,
-                    [handle, inner]
+                    [handle, inner, values @ ..]
                         if handle.type_ == mir::Type::Long
                             && matches!(inner.kind, mir::OperandKind::Function(_))
-                            && function_operand_matches(inner, &[], &inner.type_, signatures)
+                            && values.iter().all(|value| task_argument_shape(&value.type_))
+                            && function_operand_matches(
+                                inner,
+                                &values.iter().map(|value| value.type_.clone()).collect::<Vec<_>>(),
+                                &inner.type_,
+                                signatures,
+                            )
                 )
         }
         mir::Intrinsic::AsyncAwaitResult => {
@@ -4296,6 +4326,80 @@ fn validate_place(place: &mir::Place, function_name: &str) -> Result<(), Backend
 /// `aster-types` fact independently).
 fn is_worker_transferable(type_: &mir::Type) -> bool {
     primitive(type_).is_some_and(aster_types::Primitive::is_worker_transferable)
+}
+
+fn task_argument_shape(type_: &mir::Type) -> bool {
+    is_worker_transferable(type_) || matches!(type_, mir::Type::User(_) | mir::Type::Enum(_))
+}
+
+fn validate_task_argument_transfer(
+    module: &mir::Module,
+    structs: &HashMap<mir::SymbolId, &mir::StructDefinition>,
+    enums: &HashMap<mir::SymbolId, &mir::EnumDefinition>,
+) -> Result<(), BackendError> {
+    fn transferable(
+        type_: &mir::Type,
+        structs: &HashMap<mir::SymbolId, &mir::StructDefinition>,
+        enums: &HashMap<mir::SymbolId, &mir::EnumDefinition>,
+        visiting: &mut HashSet<mir::SymbolId>,
+    ) -> bool {
+        if is_worker_transferable(type_) {
+            return true;
+        }
+        let symbol = match type_ {
+            mir::Type::User(symbol) | mir::Type::Enum(symbol) => *symbol,
+            _ => return false,
+        };
+        if !visiting.insert(symbol) {
+            return false;
+        }
+        let result = match type_ {
+            mir::Type::User(_) => structs.get(&symbol).is_some_and(|definition| {
+                definition
+                    .fields
+                    .iter()
+                    .all(|field| transferable(&field.type_, structs, enums, visiting))
+            }),
+            mir::Type::Enum(_) => enums.get(&symbol).is_some_and(|definition| {
+                definition.cases.iter().all(|case| {
+                    case.fields
+                        .iter()
+                        .all(|field| transferable(&field.type_, structs, enums, visiting))
+                })
+            }),
+            _ => false,
+        };
+        visiting.remove(&symbol);
+        result
+    }
+
+    for function in &module.functions {
+        for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+            let mir::Instruction::CallIntrinsic {
+                intrinsic,
+                arguments,
+                ..
+            } = instruction
+            else {
+                continue;
+            };
+            let skip = match intrinsic {
+                mir::Intrinsic::TaskRun => 1,
+                mir::Intrinsic::AsyncSpawnInner => 2,
+                _ => continue,
+            };
+            for argument in arguments.iter().skip(skip) {
+                if !transferable(&argument.type_, structs, enums, &mut HashSet::new()) {
+                    return Err(BackendError::new(format!(
+                        "function `{}` contains a malformed TaskRun with non-transferable argument type `{}`",
+                        function.name,
+                        type_name(&argument.type_)
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether the JIT backend can execute code that produces or consumes
@@ -5077,6 +5181,195 @@ mod tests {
         let error = validate_module(&module)
             .expect_err("a Task.Run result with arena identity must be rejected");
         assert!(error.message().contains("malformed TaskRun"));
+    }
+
+    #[test]
+    fn task_run_rejects_an_argument_that_disagrees_with_the_target_signature() {
+        let mut module = aster_compiler::compile(
+            "public int Add(int value) { return value + 1; } \
+             public int Main() { return Task.Run(Add, 41).Wait(); }",
+        )
+        .expect("source compiles")
+        .mir;
+        let call = module
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find(|instruction| {
+                matches!(
+                    instruction,
+                    mir::Instruction::CallIntrinsic {
+                        intrinsic: mir::Intrinsic::TaskRun,
+                        ..
+                    }
+                )
+            })
+            .expect("TaskRun exists");
+        let mir::Instruction::CallIntrinsic { arguments, .. } = call else {
+            unreachable!();
+        };
+        arguments[1].type_ = mir::Type::Long;
+
+        let error = validate_module(&module)
+            .expect_err("a TaskRun argument with the wrong scalar ABI must be rejected");
+        assert!(error.message().contains("malformed TaskRun"));
+    }
+
+    #[test]
+    fn task_run_rejects_a_reference_bearing_aggregate_argument() {
+        let mut module = aster_compiler::compile(
+            "public class Box { public Box() {} } \
+             public struct Holder { public Box Value; } \
+             public int Consume(Holder value) { return 1; } \
+             public int Compute() { return 1; } \
+             public int Main(Holder input) { return Task.Run(Compute).Wait(); }",
+        )
+        .expect("source compiles")
+        .mir;
+        let consume = module
+            .functions
+            .iter()
+            .find(|function| function.name == "Consume")
+            .expect("Consume is declared")
+            .symbol;
+        let main = module
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Main")
+            .expect("Main is declared");
+        let input = main.parameters[0].clone();
+        let call = main
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+            .find(|instruction| {
+                matches!(
+                    instruction,
+                    mir::Instruction::CallIntrinsic {
+                        intrinsic: mir::Intrinsic::TaskRun,
+                        ..
+                    }
+                )
+            })
+            .expect("TaskRun exists");
+        let mir::Instruction::CallIntrinsic { arguments, .. } = call else {
+            unreachable!();
+        };
+        arguments[0].kind = mir::OperandKind::Function(consume);
+        arguments.push(mir::Operand {
+            type_: input.type_,
+            kind: mir::OperandKind::Copy(mir::Place::Local(input.id)),
+        });
+
+        let error = validate_module(&module)
+            .expect_err("a reference-bearing task argument must be rejected before codegen");
+        assert!(error.message().contains("non-transferable argument type"));
+    }
+
+    #[test]
+    fn task_wait_all_rejects_mismatched_task_and_result_arrays() {
+        let mut module = aster_compiler::compile(
+            "public int Compute() { return 1; } \
+             public int Main() { Task<int>[] tasks = [Task.Run(Compute)]; return Task.WaitAll(tasks)[0]; }",
+        )
+        .expect("source compiles")
+        .mir;
+        let call = module
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find(|instruction| {
+                matches!(
+                    instruction,
+                    mir::Instruction::CallIntrinsic {
+                        intrinsic: mir::Intrinsic::TaskWaitAll,
+                        ..
+                    }
+                )
+            })
+            .expect("TaskWaitAll exists");
+        let mir::Instruction::CallIntrinsic { return_type, .. } = call else {
+            unreachable!();
+        };
+        *return_type = mir::Type::Array(Box::new(mir::Type::Long));
+
+        let error = validate_module(&module)
+            .expect_err("Task<int>[] cannot produce a long[] WaitAll result");
+        assert!(error.message().contains("malformed TaskWaitAll"));
+    }
+
+    #[test]
+    fn task_cancel_rejects_a_non_task_receiver() {
+        let mut module = aster_compiler::compile(
+            "public int Compute() { return 1; } \
+             public bool Main() { Task<int> task = Task.Run(Compute); return task.Cancel(); }",
+        )
+        .expect("source compiles")
+        .mir;
+        let call = module
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find(|instruction| {
+                matches!(
+                    instruction,
+                    mir::Instruction::CallIntrinsic {
+                        intrinsic: mir::Intrinsic::TaskCancel,
+                        ..
+                    }
+                )
+            })
+            .expect("TaskCancel exists");
+        let mir::Instruction::CallIntrinsic { arguments, .. } = call else {
+            unreachable!();
+        };
+        arguments[0] = mir::Operand {
+            type_: mir::Type::Int,
+            kind: mir::OperandKind::Constant(mir::Constant::Integer("0".to_owned())),
+        };
+
+        let error = validate_module(&module)
+            .expect_err("TaskCancel on an int must be rejected before codegen");
+        assert!(error.message().contains("malformed TaskCancel"));
+    }
+
+    #[test]
+    fn task_cancellation_requested_rejects_a_non_bool_result() {
+        let mut module = aster_compiler::compile(
+            "public bool Main() { return Task.IsCancellationRequested(); }",
+        )
+        .expect("source compiles")
+        .mir;
+        let call = module
+            .functions
+            .iter_mut()
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find(|instruction| {
+                matches!(
+                    instruction,
+                    mir::Instruction::CallIntrinsic {
+                        intrinsic: mir::Intrinsic::TaskCancellationRequested,
+                        ..
+                    }
+                )
+            })
+            .expect("TaskCancellationRequested exists");
+        let mir::Instruction::CallIntrinsic { return_type, .. } = call else {
+            unreachable!();
+        };
+        *return_type = mir::Type::Int;
+
+        let error = validate_module(&module)
+            .expect_err("a non-bool cancellation query must fail before codegen");
+        assert!(
+            error
+                .message()
+                .contains("malformed TaskCancellationRequested")
+        );
     }
 
     #[test]

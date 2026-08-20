@@ -454,12 +454,18 @@ pub enum Intrinsic {
     /// unwind, so lowering follows this call with an ordinary `Goto` to the
     /// loop's exit block rather than fabricating a function-level return.
     ListVersionMismatch,
-    /// `aster.core.Task.Run(function)`. The sole argument is always an
-    /// `OperandKind::Function` operand naming the resolved, zero-parameter
-    /// target; `return_type` is that function's return type.
+    /// `aster.core.Task.Run(function, arguments...)`. The first argument is
+    /// always an `OperandKind::Function`; remaining operands are concrete,
+    /// transferable values evaluated by the caller before enqueue.
     TaskRun,
     /// `task.Wait()`. The sole argument is the `Task<T>` operand to join.
     TaskWait,
+    /// `Task.WaitAll(Task<T>[]) -> T[]`; caller-side deterministic join.
+    TaskWaitAll,
+    /// `Task<T>.Cancel() -> bool`; cooperative request against one handle.
+    TaskCancel,
+    /// `Task.IsCancellationRequested() -> bool`; reads active task metadata.
+    TaskCancellationRequested,
     /// Register one async state machine and return its `Task<T>` handle
     /// (a plain `i64`) without running its body. Arguments:
     /// `[Function(move_next_symbol), Constant(frame_slot_count)]`. Emitted
@@ -603,6 +609,9 @@ impl Intrinsic {
             | Self::ListVersionMismatch
             | Self::TaskRun
             | Self::TaskWait
+            | Self::TaskWaitAll
+            | Self::TaskCancel
+            | Self::TaskCancellationRequested
             | Self::AsyncSpawn
             | Self::AsyncState
             | Self::AsyncSetState
@@ -635,7 +644,7 @@ impl Intrinsic {
     #[must_use]
     pub const fn allocation_region(self) -> Option<AllocationRegion> {
         match self {
-            Self::FileListFiles(_) => Some(AllocationRegion::Persistent),
+            Self::FileListFiles(_) | Self::TaskWaitAll => Some(AllocationRegion::Persistent),
             Self::FileListFilesTemporary(_) => Some(AllocationRegion::Temporary),
             _ => self.string_allocation_region(),
         }

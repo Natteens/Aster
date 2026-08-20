@@ -33,7 +33,8 @@ use super::completion_queue::{CompletionQueue, CompletionToken};
 use super::execution::PreparedProgram;
 use super::worker_pool::{
     AsyncInnerPhaseGate, AsyncMemoryDomain, ChunkOutcome, ExecutionPool, JobKind,
-    ParallelMemoryBudget, ReduceChunkOutcome, TaskHandle, TaskMemoryDomain, TaskOutcome,
+    ParallelMemoryBudget, ReduceChunkOutcome, TaskControl, TaskHandle, TaskMemoryDomain,
+    TaskOutcome, TaskPayload,
 };
 use super::{BackendError, ExecutionValue, MemoryStats, mir, scalar};
 
@@ -142,6 +143,7 @@ enum TaskEntry {
 /// values and opaque ids: no arena pointer, no `ExecutionContext`, and no
 /// reference to any Aster object ever lives here.
 struct AsyncTask {
+    control: Arc<TaskControl>,
     move_next: mir::SymbolId,
     state: i32,
     /// Scalar frame, one typed value per slot persisted across the suspension.
@@ -363,10 +365,10 @@ impl TaskRuntime {
 
     // --- plain `Task.Run` / `Wait` (unchanged behavior) -------------------
 
-    /// `Task.Run(function)`: submit one plain task and return its handle.
+    /// `Task.Run(function, arguments...)`: submit one plain task and return its handle.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn run(&mut self, symbol: mir::SymbolId) -> Result<TaskHandleId, BackendError> {
-        self.submit_plain_task(symbol, None)
+        self.submit_plain_task(symbol, TaskPayload::default(), None)
     }
 
     pub(super) fn run_from_context(
@@ -379,22 +381,54 @@ impl TaskRuntime {
         } else {
             None
         };
-        self.submit_plain_task(symbol, memory_domain)
+        self.submit_plain_task(symbol, TaskPayload::default(), memory_domain)
+    }
+
+    pub(super) fn run_with_payload_from_context(
+        &mut self,
+        symbol: mir::SymbolId,
+        payload: TaskPayload,
+        main_context: &mut aster_runtime::ExecutionContext,
+    ) -> Result<TaskHandleId, BackendError> {
+        let memory_domain = if self.task_governor.is_some() {
+            Some(self.activate_task_memory_domain(main_context)?)
+        } else {
+            None
+        };
+        self.submit_plain_task(symbol, payload, memory_domain)
     }
 
     fn submit_plain_task(
         &mut self,
         symbol: mir::SymbolId,
+        payload: TaskPayload,
         memory_domain: Option<Arc<TaskMemoryDomain>>,
     ) -> Result<TaskHandleId, BackendError> {
         self.pool.ensure_workers(self.pending_worker_demand())?;
         let id = self.fresh_id()?;
         let handle = match memory_domain {
-            Some(domain) => self.pool.submit_governed_task(symbol, domain)?,
-            None => self.pool.submit(symbol, false, None)?,
+            Some(domain) => self.pool.submit_governed_task(symbol, payload, domain)?,
+            None => self
+                .pool
+                .submit_with_payload(symbol, payload, false, None)?,
         };
         self.entries.insert(id, TaskEntry::Pending(handle));
         Ok(id)
+    }
+
+    pub(super) fn cancel(&self, id: TaskHandleId) -> Result<bool, BackendError> {
+        if let Some(entry) = self.entries.get(&id) {
+            return Ok(match entry {
+                TaskEntry::Pending(handle) => handle.cancel(),
+                TaskEntry::Resolved(_) => false,
+            });
+        }
+        if let Some(task) = self.async_tasks.get(&id) {
+            return Ok(task.resolved.is_none() && task.control.cancel());
+        }
+        Err(BackendError::new(
+            "Task.Cancel received an unknown task handle",
+        ))
     }
 
     fn activate_task_memory_domain(
@@ -572,6 +606,7 @@ impl TaskRuntime {
         self.async_tasks.insert(
             id,
             AsyncTask {
+                control: Arc::new(TaskControl::new()),
                 move_next,
                 state: 0,
                 frame: vec![None; slot_count],
@@ -677,10 +712,20 @@ impl TaskRuntime {
     /// `AsyncSpawnInner`: submit the awaited `Task.Run` target with a fresh
     /// completion token bound to this async task. Only awaited inners carry a
     /// token; plain tasks and Parallel chunks never do.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn async_spawn_inner(
         &mut self,
         id: TaskHandleId,
         inner: mir::SymbolId,
+    ) -> Result<(), BackendError> {
+        self.async_spawn_inner_with_payload(id, inner, TaskPayload::default())
+    }
+
+    pub(super) fn async_spawn_inner_with_payload(
+        &mut self,
+        id: TaskHandleId,
+        inner: mir::SymbolId,
+        payload: TaskPayload,
     ) -> Result<(), BackendError> {
         let task = self.async_tasks.get(&id).ok_or_else(|| {
             BackendError::new("async inner spawn received an unknown task handle")
@@ -702,13 +747,18 @@ impl TaskRuntime {
                 let phase_gate = AsyncMemoryDomain::new_inner_phase_gate();
                 let handle = self.pool.submit_governed_async_inner(
                     inner,
+                    payload,
                     domain,
                     Arc::clone(&phase_gate),
                     completion,
                 )?;
                 (handle, Some(phase_gate))
             }
-            None => (self.pool.submit(inner, false, Some(completion))?, None),
+            None => (
+                self.pool
+                    .submit_with_payload(inner, payload, false, Some(completion))?,
+                None,
+            ),
         };
         let task = self
             .async_tasks
@@ -867,7 +917,7 @@ impl TaskRuntime {
             }
             // SAFETY: each reborrow inside the loop body is short-lived and
             // never spans `invoke_move_next`.
-            while let Some((move_next, handle)) = unsafe { (*runtime).pop_ready() } {
+            while let Some((move_next, handle, cancellation)) = unsafe { (*runtime).pop_ready() } {
                 // SAFETY: short reborrow ending before the JIT invocation.
                 let memory_domain =
                     unsafe { (*runtime).async_memory_domain.as_ref().map(Arc::clone) };
@@ -876,10 +926,11 @@ impl TaskRuntime {
                     .map(AsyncMemoryDomain::acquire_move_next);
                 // No runtime borrow is held here: the step's ABI callbacks
                 // reborrow `runtime` freshly through the context pointer.
-                let (step, telemetry) = driver.invoke_move_next(
+                let (step, telemetry) = driver.invoke_move_next_with_cancellation(
                     move_next,
                     handle.to_bits(),
                     runtime.cast::<()>(),
+                    cancellation,
                     memory_domain.as_deref(),
                 );
                 if let Some(domain) = &memory_domain {
@@ -933,12 +984,23 @@ impl TaskRuntime {
         Ok(())
     }
 
-    fn pop_ready(&mut self) -> Option<(mir::SymbolId, TaskHandleId)> {
+    fn pop_ready(
+        &mut self,
+    ) -> Option<(
+        mir::SymbolId,
+        TaskHandleId,
+        Arc<aster_runtime::TaskCancellation>,
+    )> {
         while let Some(handle) = self.ready.pop_front() {
-            if let Some(task) = self.async_tasks.get(&handle)
-                && task.resolved.is_none()
-            {
-                return Some((task.move_next, handle));
+            if let Some(task) = self.async_tasks.get_mut(&handle) {
+                if task.resolved.is_some() {
+                    continue;
+                }
+                if !task.control.begin_or_resume() {
+                    task.resolved = Some(Ok(TaskOutcome::Failed(BackendError::cancellation())));
+                    continue;
+                }
+                return Some((task.move_next, handle, task.control.cancellation()));
             }
         }
         None
@@ -951,6 +1013,7 @@ impl TaskRuntime {
 
     fn resolve_error(&mut self, target: TaskHandleId, error: BackendError) {
         if let Some(task) = self.async_tasks.get_mut(&target) {
+            let _ = task.control.finish(TaskOutcome::Failed(error.clone()));
             task.resolved = Some(Err(error));
         }
     }
@@ -997,12 +1060,17 @@ impl TaskRuntime {
             return;
         };
         match step {
-            Err(error) => task.resolved = Some(Err(error)),
+            Err(error) => {
+                let _ = task.control.finish(TaskOutcome::Failed(error.clone()));
+                task.resolved = Some(Err(error));
+            }
             Ok((ExecutionValue::Int(PENDING), _)) => {
                 if task.state != 1 || task.inner.is_none() || task.inner_token.is_none() {
-                    task.resolved = Some(Err(BackendError::new(
+                    let error = BackendError::new(
                         "an async task suspended without a registered awaited operation",
-                    )));
+                    );
+                    let _ = task.control.finish(TaskOutcome::Failed(error.clone()));
+                    task.resolved = Some(Err(error));
                 }
             }
             Ok((ExecutionValue::Int(COMPLETED), _)) => {
@@ -1019,12 +1087,18 @@ impl TaskRuntime {
                         "an async task completed from an invalid state or without producing a result",
                     )),
                 };
-                task.resolved = Some(outcome);
+                task.resolved = Some(match outcome {
+                    Ok(outcome) => Ok(task.control.finish(outcome)),
+                    Err(error) => {
+                        let _ = task.control.finish(TaskOutcome::Failed(error.clone()));
+                        Err(error)
+                    }
+                });
             }
             Ok(_) => {
-                task.resolved = Some(Err(BackendError::new(
-                    "an async MoveNext step returned an invalid status",
-                )));
+                let error = BackendError::new("an async MoveNext step returned an invalid status");
+                let _ = task.control.finish(TaskOutcome::Failed(error.clone()));
+                task.resolved = Some(Err(error));
             }
         }
     }
@@ -1066,6 +1140,7 @@ impl TaskRuntime {
                 self.ready.push_back(handle);
             }
             Ok(TaskOutcome::Failed(error)) | Err(error) => {
+                let _ = task.control.finish(TaskOutcome::Failed(error.clone()));
                 task.resolved = Some(Err(error));
             }
         }
@@ -1603,6 +1678,8 @@ pub(super) fn module_uses_tasks(module: &mir::Module) -> bool {
                     mir::Instruction::CallIntrinsic {
                         intrinsic: mir::Intrinsic::TaskRun
                             | mir::Intrinsic::TaskWait
+                            | mir::Intrinsic::TaskWaitAll
+                            | mir::Intrinsic::TaskCancel
                             | mir::Intrinsic::AsyncSpawn
                             | mir::Intrinsic::AsyncSpawnInner
                             | mir::Intrinsic::ParallelFor
@@ -2158,6 +2235,43 @@ mod tests {
             .wait(id)
             .expect("second wait replays the cached result");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_suspended_async_task_keeps_its_own_cancellation_control_until_resume() {
+        let module = compile("public int Compute() { return 1; }");
+        let move_next = module.functions[0].symbol;
+        let mut runtime = TaskRuntime::new(&Arc::new(module), 1).expect("runtime starts");
+        let id = runtime
+            .async_spawn(move_next, 0)
+            .expect("async task registers");
+        let control = Arc::clone(&runtime.async_tasks[&id].control);
+        let cancellation = control.cancellation();
+
+        assert!(control.begin_or_resume(), "the first async phase starts");
+        runtime.async_tasks.get_mut(&id).expect("task exists").state = 1;
+        assert!(runtime.cancel(id).expect("known async handle cancels"));
+        assert!(cancellation.is_requested());
+
+        runtime.ready.push_back(id);
+        assert!(
+            runtime.pop_ready().is_none(),
+            "a cancelled suspended task must not resume"
+        );
+        let outcome = runtime
+            .resolved_outcome(id)
+            .expect("resume attempt resolves cancellation")
+            .expect("cancellation is a task outcome");
+        assert!(matches!(
+            outcome,
+            TaskOutcome::Failed(error) if error.is_cancellation()
+        ));
+        assert!(!runtime.cancel(id).expect("terminal handle remains known"));
+        assert_eq!(
+            Arc::strong_count(&control),
+            2,
+            "only the task and test own control"
+        );
     }
 
     #[test]

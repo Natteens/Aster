@@ -44,6 +44,12 @@ rewind occurs only after the complete proven alias closure is dead, does not mov
 does not run finalizers. Shared, contained, cyclic, interface, cross-worker, and otherwise uncertain
 shapes retain the conservative execution-context lifetime.
 
+Task argument transfer and composition preserve the same source-level boundary: arguments are
+caller-evaluated value copies, worker results remain scalar, and no reference identity crosses an
+execution context. `Task.WaitAll` orders successful results and selected failures by input index,
+not scheduler completion. Cooperative cancellation changes only the terminal outcome of a task
+whose request was accepted; it does not forcibly stop a worker or introduce hidden polling.
+
 The absence of a diagnostic for an unsupported program is also not a promise that the behavior is
 supported. Unsupported execution must continue to fail before unsafe code generation.
 

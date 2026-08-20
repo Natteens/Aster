@@ -19,7 +19,9 @@ The current toolchain includes:
 - terminal and host-managed filesystem operations;
 - multifile projects with `Aster.toml` and conventional `Main`;
 - deterministic path dependencies and public HTTPS Git dependencies pinned by `Aster.lock`;
-- restricted `Task<T>`, `await`, and `Parallel` operations with checked worker boundaries;
+- restricted `Task<T>`, `await`, and `Parallel` operations with checked worker boundaries,
+  caller-copied transferable Task arguments, deterministic `Task.WaitAll`, and cooperative
+  task-owned cancellation;
 - deterministic typed-MIR optimization for CFG cleanup, primitive constants, scalar copies, and dead
   pure assignments, before escape and ownership analysis;
 - checking, JIT execution, watch mode, installation diagnostics, and HIR/MIR inspection;

@@ -157,6 +157,7 @@ impl fmt::Display for ExecutionValue {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackendError {
     message: String,
+    cancellation: bool,
 }
 
 impl BackendError {
@@ -164,7 +165,19 @@ impl BackendError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            cancellation: false,
         }
+    }
+
+    fn cancellation() -> Self {
+        Self {
+            message: "task was cancelled".to_owned(),
+            cancellation: true,
+        }
+    }
+
+    fn is_cancellation(&self) -> bool {
+        self.cancellation
     }
 
     #[must_use]

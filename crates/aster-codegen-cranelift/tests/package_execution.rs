@@ -135,6 +135,22 @@ fn a_cross_package_generic_specializes_and_executes() {
 }
 
 #[test]
+fn a_parameterized_task_target_from_a_path_dependency_executes() {
+    let workspace = Workspace::new("task-arguments");
+    workspace.application("app", &[("math", "../math")]);
+    workspace.library("math", &[]);
+    workspace.write(
+        "math/math/work.aster",
+        "namespace math; public T Keep<T>(T value) { return value; }",
+    );
+    let root = workspace.write(
+        "app/app/main.aster",
+        "namespace app; using math; public class Program { public static int Main() { Task<int> task = Task.Run(Keep, 42); return task.Wait(); } }",
+    );
+    assert_eq!(run(&root), ExecutionValue::Int(42));
+}
+
+#[test]
 fn a_cross_package_constrained_generic_executes() {
     let workspace = Workspace::new("constraints");
     workspace.application("app", &[("contracts", "../contracts")]);

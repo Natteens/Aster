@@ -130,22 +130,15 @@ fn worker_allocation_budget_failure_propagates_without_host_oom() {
 }
 
 #[test]
-fn a_function_with_parameters_is_rejected() {
-    let errors = compile_errors(
-        r"
-        public int WithArgument(int value) { return value; }
+fn a_function_with_parameters_receives_copied_values() {
+    let source = r"
+        public int Add(int left, int right) { return left + right; }
         public int Main() {
-            Task<int> task = Task.Run(WithArgument);
+            Task<int> task = Task.Run(Add, 20, 22);
             return task.Wait();
         }
-        ",
-    );
-    assert!(
-        errors
-            .iter()
-            .any(|message| message.contains("Task.Run") || message.contains("WithArgument")),
-        "expected a Task.Run diagnostic, got {errors:?}"
-    );
+    ";
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(42)));
 }
 
 #[test]

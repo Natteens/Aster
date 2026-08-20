@@ -165,7 +165,8 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
     match &expression.kind {
         hir::ExpressionKind::Literal(_)
         | hir::ExpressionKind::NewList { .. }
-        | hir::ExpressionKind::NewDictionary { .. } => {}
+        | hir::ExpressionKind::NewDictionary { .. }
+        | hir::ExpressionKind::TaskCancellationRequested => {}
         hir::ExpressionKind::NewStringBuilder { class_symbol } => note(max, *class_symbol),
         hir::ExpressionKind::Symbol(symbol) => note(max, *symbol),
         hir::ExpressionKind::StructLiteral {
@@ -427,8 +428,20 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
                 }
             }
         }
-        hir::ExpressionKind::TaskRun { function, .. } => note(max, *function),
-        hir::ExpressionKind::TaskWait { task, .. } => collect_expression(task, max),
+        hir::ExpressionKind::TaskRun {
+            function,
+            arguments,
+            ..
+        } => {
+            note(max, *function);
+            for argument in arguments {
+                collect_expression(argument, max);
+            }
+        }
+        hir::ExpressionKind::TaskWait { task, .. } | hir::ExpressionKind::TaskCancel { task } => {
+            collect_expression(task, max);
+        }
+        hir::ExpressionKind::TaskWaitAll { tasks, .. } => collect_expression(tasks, max),
         hir::ExpressionKind::Await { operand, .. } => collect_expression(operand, max),
         hir::ExpressionKind::ParallelFor {
             start, end, body, ..

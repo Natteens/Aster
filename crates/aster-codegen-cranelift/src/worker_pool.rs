@@ -8,7 +8,7 @@
 //! No `JITModule` is ever shared between workers or moved after creation.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
@@ -26,6 +26,177 @@ pub(super) struct TaskId(u64);
 pub(super) enum TaskOutcome {
     Completed(ExecutionValue, super::MemoryStats),
     Failed(BackendError),
+}
+
+const TASK_PENDING: u8 = 0;
+const TASK_RUNNING: u8 = 1;
+const TASK_CANCEL_REQUESTED: u8 = 2;
+const TASK_COMPLETED: u8 = 3;
+const TASK_FAILED: u8 = 4;
+const TASK_CANCELLED: u8 = 5;
+
+/// Host-owned argument bytes copied synchronously before Task.Run returns.
+/// Word storage supplies the maximum ABI alignment used by current ASTER
+/// finite value layouts; workers never retain caller memory.
+#[derive(Clone, Debug, Default)]
+pub(super) struct TaskPayload {
+    words: Vec<u64>,
+}
+
+impl TaskPayload {
+    pub(super) fn copy_from(pointer: *const u8, size: usize) -> Result<Self, BackendError> {
+        if size == 0 {
+            return Ok(Self::default());
+        }
+        if pointer.is_null()
+            || size % 8 != 0
+            || (pointer as usize) % std::mem::align_of::<u64>() != 0
+        {
+            return Err(BackendError::new(
+                "Task.Run received an invalid argument frame",
+            ));
+        }
+        let words = size / 8;
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(words)
+            .map_err(|_| BackendError::new("Task.Run could not allocate its argument payload"))?;
+        owned.resize(words, 0);
+        // SAFETY: generated code passes a live stack frame of exactly `size`
+        // bytes and this function copies it before returning to generated code.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::copy_nonoverlapping(pointer, owned.as_mut_ptr().cast::<u8>(), size);
+        }
+        Ok(Self { words: owned })
+    }
+
+    pub(super) fn as_ptr(&self) -> *const u64 {
+        self.words.as_ptr()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+}
+
+/// Race-safe terminal state plus the backend-neutral cancellation flag read
+/// by the worker's `ExecutionContext`. Plain tasks keep this record alive in
+/// both the caller handle and queued/running job until the result is sent;
+/// async tasks keep it in their host-owned `AsyncTask` entry. A fresh context
+/// receives only an `Arc` clone of the opaque flag, never an ASTER pointer.
+pub(super) struct TaskControl {
+    state: AtomicU8,
+    cancellation: Arc<aster_runtime::TaskCancellation>,
+}
+
+impl TaskControl {
+    pub(super) fn new() -> Self {
+        Self {
+            state: AtomicU8::new(TASK_PENDING),
+            cancellation: Arc::new(aster_runtime::TaskCancellation::default()),
+        }
+    }
+
+    pub(super) fn cancellation(&self) -> Arc<aster_runtime::TaskCancellation> {
+        Arc::clone(&self.cancellation)
+    }
+
+    pub(super) fn cancel(&self) -> bool {
+        // The successful CAS is Cancel's linearization point. A completion
+        // that publishes a terminal state first makes this return false; a
+        // request that wins first forces a normal completion to Cancelled.
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if !matches!(state, TASK_PENDING | TASK_RUNNING) {
+                return false;
+            }
+            if self
+                .state
+                .compare_exchange(
+                    state,
+                    TASK_CANCEL_REQUESTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                let _ = self.cancellation.request();
+                return true;
+            }
+        }
+    }
+
+    pub(super) fn begin_or_resume(&self) -> bool {
+        loop {
+            match self.state.load(Ordering::Acquire) {
+                TASK_PENDING => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            TASK_PENDING,
+                            TASK_RUNNING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                TASK_CANCEL_REQUESTED => {
+                    let _ = self.state.compare_exchange(
+                        TASK_CANCEL_REQUESTED,
+                        TASK_CANCELLED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                    return false;
+                }
+                TASK_RUNNING => return true,
+                _ => return false,
+            }
+        }
+    }
+
+    pub(super) fn finish(&self, outcome: TaskOutcome) -> TaskOutcome {
+        match outcome {
+            TaskOutcome::Failed(error) => {
+                self.state.store(
+                    if error.is_cancellation() {
+                        TASK_CANCELLED
+                    } else {
+                        TASK_FAILED
+                    },
+                    Ordering::Release,
+                );
+                TaskOutcome::Failed(error)
+            }
+            TaskOutcome::Completed(value, stats) => loop {
+                match self.state.load(Ordering::Acquire) {
+                    TASK_CANCEL_REQUESTED => {
+                        self.state.store(TASK_CANCELLED, Ordering::Release);
+                        return TaskOutcome::Failed(BackendError::cancellation());
+                    }
+                    TASK_RUNNING => {
+                        if self
+                            .state
+                            .compare_exchange(
+                                TASK_RUNNING,
+                                TASK_COMPLETED,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            return TaskOutcome::Completed(value, stats);
+                        }
+                    }
+                    _ => return TaskOutcome::Failed(BackendError::cancellation()),
+                }
+            },
+        }
+    }
 }
 
 /// The result of one `Parallel` chunk: either it ran every index cleanly, or
@@ -496,9 +667,11 @@ impl Drop for TaskMemoryPermit {
 /// What one job asks a worker to do. Every variant resolves a MIR function by
 /// its concrete symbol; no textual lookup and no per-iteration JIT happen.
 pub(super) enum JobKind {
-    /// One zero-parameter `Task.Run` target.
+    /// One `Task.Run` target plus its caller-copied transfer payload.
     Task {
         symbol: mir::SymbolId,
+        payload: TaskPayload,
+        control: Arc<TaskControl>,
         collect_stats: bool,
         memory_policy: Option<TaskMemoryPolicy>,
     },
@@ -650,6 +823,8 @@ fn run_job(program: &PreparedProgram, kind: JobKind, respond: Respond) {
         (
             JobKind::Task {
                 symbol,
+                payload,
+                control,
                 collect_stats,
                 memory_policy,
             },
@@ -657,6 +832,8 @@ fn run_job(program: &PreparedProgram, kind: JobKind, respond: Respond) {
         ) => run_task_job(
             program,
             symbol,
+            &payload,
+            &control,
             collect_stats,
             memory_policy.as_ref(),
             &reply,
@@ -732,10 +909,16 @@ fn run_job(program: &PreparedProgram, kind: JobKind, respond: Respond) {
 fn run_task_job(
     program: &PreparedProgram,
     symbol: mir::SymbolId,
+    payload: &TaskPayload,
+    control: &Arc<TaskControl>,
     collect_stats: bool,
     memory_policy: Option<&TaskMemoryPolicy>,
     reply: &mpsc::Sender<TaskOutcome>,
 ) {
+    if !control.begin_or_resume() {
+        let _ = reply.send(TaskOutcome::Failed(BackendError::cancellation()));
+        return;
+    }
     let plain_permit = match memory_policy {
         Some(TaskMemoryPolicy::Plain(domain)) => Some(domain.acquire()),
         _ => None,
@@ -747,7 +930,14 @@ fn run_task_job(
         }
         _ => None,
     };
-    let (outcome, telemetry) = program.run_task(symbol, collect_stats, memory_policy);
+    let (outcome, telemetry) = program.run_task(
+        symbol,
+        payload,
+        control.cancellation(),
+        collect_stats,
+        memory_policy,
+    );
+    let outcome = control.finish(outcome);
     if let Some(policy) = memory_policy {
         match policy {
             TaskMemoryPolicy::Plain(domain) => domain.record_outcome(&outcome, telemetry.as_ref()),
@@ -758,6 +948,8 @@ fn run_task_job(
     }
     drop(async_permit);
     drop(plain_permit);
+    // The terminal state is fixed before mpsc publishes the owned outcome;
+    // `recv` is the Wait-side synchronization for result/error contents.
     let _ = reply.send(outcome);
 }
 
@@ -806,6 +998,7 @@ fn worker_loop(
 pub(super) struct TaskHandle {
     id: TaskId,
     receiver: mpsc::Receiver<TaskOutcome>,
+    control: Arc<TaskControl>,
 }
 
 impl TaskHandle {
@@ -828,6 +1021,10 @@ impl TaskHandle {
                 self.id
             ))
         })
+    }
+
+    pub(super) fn cancel(&self) -> bool {
+        self.control.cancel()
     }
 }
 
@@ -987,32 +1184,52 @@ impl ExecutionPool {
     /// next free worker with its own fresh `ExecutionContext`. `completion`,
     /// present only for an awaited async inner, is signalled after the reply.
     /// Fails if the pool has been shut down.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn submit(
         &self,
         symbol: mir::SymbolId,
         collect_stats: bool,
         completion: Option<(Arc<CompletionQueue>, CompletionToken)>,
     ) -> Result<TaskHandle, BackendError> {
-        self.submit_task(symbol, collect_stats, None, completion)
+        self.submit_with_payload(symbol, TaskPayload::default(), collect_stats, completion)
+    }
+
+    pub(super) fn submit_with_payload(
+        &self,
+        symbol: mir::SymbolId,
+        payload: TaskPayload,
+        collect_stats: bool,
+        completion: Option<(Arc<CompletionQueue>, CompletionToken)>,
+    ) -> Result<TaskHandle, BackendError> {
+        self.submit_task(symbol, payload, collect_stats, None, completion)
     }
 
     pub(super) fn submit_governed_task(
         &self,
         symbol: mir::SymbolId,
+        payload: TaskPayload,
         domain: Arc<TaskMemoryDomain>,
     ) -> Result<TaskHandle, BackendError> {
-        self.submit_task(symbol, true, Some(TaskMemoryPolicy::Plain(domain)), None)
+        self.submit_task(
+            symbol,
+            payload,
+            true,
+            Some(TaskMemoryPolicy::Plain(domain)),
+            None,
+        )
     }
 
     pub(super) fn submit_governed_async_inner(
         &self,
         symbol: mir::SymbolId,
+        payload: TaskPayload,
         domain: Arc<AsyncMemoryDomain>,
         phase_gate: Arc<AsyncInnerPhaseGate>,
         completion: (Arc<CompletionQueue>, CompletionToken),
     ) -> Result<TaskHandle, BackendError> {
         self.submit_task(
             symbol,
+            payload,
             true,
             Some(TaskMemoryPolicy::AsyncInner { domain, phase_gate }),
             Some(completion),
@@ -1022,6 +1239,7 @@ impl ExecutionPool {
     fn submit_task(
         &self,
         symbol: mir::SymbolId,
+        payload: TaskPayload,
         collect_stats: bool,
         memory_policy: Option<TaskMemoryPolicy>,
         completion: Option<(Arc<CompletionQueue>, CompletionToken)>,
@@ -1029,6 +1247,7 @@ impl ExecutionPool {
         self.ensure_workers(1)?;
         let id = TaskId(self.next_task_id.fetch_add(1, Ordering::Relaxed));
         let (reply, receiver) = mpsc::channel();
+        let control = Arc::new(TaskControl::new());
         let submitted_domain = match &memory_policy {
             Some(TaskMemoryPolicy::Plain(domain)) => Some(Arc::clone(domain)),
             _ => None,
@@ -1036,6 +1255,8 @@ impl ExecutionPool {
         self.queue.push(Job {
             kind: JobKind::Task {
                 symbol,
+                payload,
+                control: Arc::clone(&control),
                 collect_stats,
                 memory_policy,
             },
@@ -1045,7 +1266,11 @@ impl ExecutionPool {
         if let Some(domain) = submitted_domain {
             domain.record_submission();
         }
-        Ok(TaskHandle { id, receiver })
+        Ok(TaskHandle {
+            id,
+            receiver,
+            control,
+        })
     }
 
     /// Queue one `Parallel` chunk and return the channel its [`ChunkOutcome`]
@@ -1108,7 +1333,11 @@ impl ExecutionPool {
             respond: Respond::Task(reply),
             completion: None,
         })?;
-        Ok(TaskHandle { id, receiver })
+        Ok(TaskHandle {
+            id,
+            receiver,
+            control: Arc::new(TaskControl::new()),
+        })
     }
 
     /// Stop accepting new tasks, let every already-accepted task finish, and
@@ -1160,6 +1389,198 @@ mod tests {
             .recv_timeout(TEST_TIMEOUT)
             .unwrap_or_else(|_| panic!("task {id:?} did not respond before the test timeout"))
             .unwrap_or_else(|error| panic!("task {id:?} channel failed: {error}"))
+    }
+
+    #[test]
+    fn cancellation_control_is_idempotent_and_terminal() {
+        let control = TaskControl::new();
+        assert!(control.cancel());
+        assert!(!control.cancel());
+        assert!(!control.begin_or_resume());
+        assert!(control.cancellation().is_requested());
+    }
+
+    #[test]
+    fn task_payload_is_an_aligned_independent_copy_and_rejects_bad_frames() {
+        let mut source = [11_u64, 22_u64];
+        let payload =
+            TaskPayload::copy_from(source.as_ptr().cast::<u8>(), 16).expect("aligned frame copies");
+        source[0] = 99;
+        assert_eq!(payload.words, vec![11, 22]);
+
+        assert!(TaskPayload::copy_from(std::ptr::null(), 8).is_err());
+        assert!(TaskPayload::copy_from(source.as_ptr().cast::<u8>(), 7).is_err());
+        // No read occurs for a rejected unaligned address.
+        let unaligned = source.as_ptr().cast::<u8>().wrapping_add(1);
+        assert!(TaskPayload::copy_from(unaligned, 8).is_err());
+    }
+
+    #[test]
+    fn running_cancellation_becomes_cancelled_but_failure_wins() {
+        let cancelled = TaskControl::new();
+        assert!(cancelled.begin_or_resume());
+        assert!(cancelled.cancel());
+        let outcome = cancelled.finish(TaskOutcome::Completed(
+            ExecutionValue::Int(42),
+            super::super::MemoryStats::default(),
+        ));
+        assert!(matches!(
+            outcome,
+            TaskOutcome::Failed(error) if error.is_cancellation()
+        ));
+
+        let failed = TaskControl::new();
+        assert!(failed.begin_or_resume());
+        assert!(failed.cancel());
+        let outcome = failed.finish(TaskOutcome::Failed(BackendError::new("real failure")));
+        assert!(matches!(
+            outcome,
+            TaskOutcome::Failed(error) if !error.is_cancellation() && error.message() == "real failure"
+        ));
+        assert!(!failed.cancel());
+    }
+
+    #[test]
+    fn completed_task_rejects_late_cancellation() {
+        let control = TaskControl::new();
+        assert!(control.begin_or_resume());
+        let outcome = control.finish(TaskOutcome::Completed(
+            ExecutionValue::Int(7),
+            super::super::MemoryStats::default(),
+        ));
+        assert!(matches!(outcome, TaskOutcome::Completed(..)));
+        assert!(!control.cancel());
+    }
+
+    #[test]
+    fn completion_and_cancel_races_have_one_consistent_terminal_outcome() {
+        for _ in 0..512 {
+            let control = Arc::new(TaskControl::new());
+            assert!(control.begin_or_resume());
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+
+            let cancel_control = Arc::clone(&control);
+            let cancel_barrier = Arc::clone(&barrier);
+            let cancel = thread::spawn(move || {
+                cancel_barrier.wait();
+                cancel_control.cancel()
+            });
+
+            let finish_control = Arc::clone(&control);
+            let finish_barrier = Arc::clone(&barrier);
+            let finish = thread::spawn(move || {
+                finish_barrier.wait();
+                finish_control.finish(TaskOutcome::Completed(
+                    ExecutionValue::Int(42),
+                    super::super::MemoryStats::default(),
+                ))
+            });
+
+            barrier.wait();
+            let accepted = cancel.join().expect("cancel racer does not panic");
+            let outcome = finish.join().expect("completion racer does not panic");
+            match (accepted, outcome) {
+                (false, TaskOutcome::Completed(ExecutionValue::Int(42), _)) => {
+                    assert_eq!(control.state.load(Ordering::Acquire), TASK_COMPLETED);
+                }
+                (true, TaskOutcome::Failed(error)) if error.is_cancellation() => {
+                    assert_eq!(control.state.load(Ordering::Acquire), TASK_CANCELLED);
+                }
+                combination => panic!("impossible Cancel/completion outcome: {combination:?}"),
+            }
+            assert!(!control.cancel(), "terminal state is immutable");
+        }
+    }
+
+    #[test]
+    fn failure_remains_authoritative_when_cancel_races_it() {
+        for _ in 0..512 {
+            let control = Arc::new(TaskControl::new());
+            assert!(control.begin_or_resume());
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+
+            let cancel_control = Arc::clone(&control);
+            let cancel_barrier = Arc::clone(&barrier);
+            let cancel = thread::spawn(move || {
+                cancel_barrier.wait();
+                cancel_control.cancel()
+            });
+
+            let finish_control = Arc::clone(&control);
+            let finish_barrier = Arc::clone(&barrier);
+            let finish = thread::spawn(move || {
+                finish_barrier.wait();
+                finish_control.finish(TaskOutcome::Failed(BackendError::new("real failure")))
+            });
+
+            barrier.wait();
+            let _accepted = cancel.join().expect("cancel racer does not panic");
+            let outcome = finish.join().expect("failure racer does not panic");
+            assert!(matches!(
+                outcome,
+                TaskOutcome::Failed(error)
+                    if !error.is_cancellation() && error.message() == "real failure"
+            ));
+            assert_eq!(control.state.load(Ordering::Acquire), TASK_FAILED);
+            assert!(!control.cancel(), "failure cannot become cancellation");
+        }
+    }
+
+    #[test]
+    fn a_dequeued_pre_cancelled_job_skips_its_body_and_the_worker_stays_reusable() {
+        let module = compile(
+            "public int FailIfCalled() { int[] values = new int[1]; return values[4]; } \
+             public int Value() { return 42; }",
+        );
+        let fail = module
+            .functions
+            .iter()
+            .find(|function| function.name == "FailIfCalled")
+            .expect("failing function exists")
+            .symbol;
+        let value = module
+            .functions
+            .iter()
+            .find(|function| function.name == "Value")
+            .expect("value function exists")
+            .symbol;
+        let program = PreparedProgram::prepare(&module).expect("program prepares");
+
+        let cancelled = Arc::new(TaskControl::new());
+        assert!(cancelled.cancel());
+        let (cancel_sender, cancel_receiver) = mpsc::channel();
+        run_task_job(
+            &program,
+            fail,
+            &TaskPayload::default(),
+            &cancelled,
+            false,
+            None,
+            &cancel_sender,
+        );
+        let cancelled_outcome = cancel_receiver.recv().expect("cancelled job responds");
+        assert!(matches!(
+            cancelled_outcome,
+            TaskOutcome::Failed(error)
+                if error.is_cancellation() && !error.message().contains("array index")
+        ));
+
+        let fresh = Arc::new(TaskControl::new());
+        let (value_sender, value_receiver) = mpsc::channel();
+        run_task_job(
+            &program,
+            value,
+            &TaskPayload::default(),
+            &fresh,
+            false,
+            None,
+            &value_sender,
+        );
+        assert!(matches!(
+            value_receiver.recv().expect("fresh job responds"),
+            TaskOutcome::Completed(ExecutionValue::Int(42), _)
+        ));
+        assert!(!fresh.cancellation().is_requested());
     }
 
     /// `JobKind` (what a worker actually receives) must stay `Send + 'static`
@@ -1734,6 +2155,7 @@ mod tests {
         let handle = TaskHandle {
             id: TaskId(0),
             receiver,
+            control: Arc::new(TaskControl::new()),
         };
         drop(sender);
 

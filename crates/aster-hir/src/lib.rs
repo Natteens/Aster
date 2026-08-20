@@ -608,14 +608,15 @@ pub enum ExpressionKind {
     InterpolatedString {
         parts: Vec<InterpolatedPart>,
     },
-    /// `aster.core.Task.Run(function)`: spawn a statically resolved,
-    /// zero-parameter free function or static method on the host's
-    /// execution pool. `function` is never a variable, a generic template,
+    /// `aster.core.Task.Run(function, arguments...)`: spawn a statically
+    /// resolved free function or static method on the host's execution pool.
+    /// `function` is never a variable, an open generic template,
     /// or an interface dispatch; semantic analysis resolves it to a concrete
     /// symbol before this node exists. This expression's type is always
     /// `Type::Task(return_type)`.
     TaskRun {
         function: SymbolId,
+        arguments: Vec<Expression>,
         return_type: Box<Type>,
     },
     /// `task.Wait()` on an `aster.core.Task<T>` value: block until the task
@@ -625,6 +626,20 @@ pub enum ExpressionKind {
         task: Box<Expression>,
         result_type: Box<Type>,
     },
+    /// `Task.WaitAll(tasks)`: synchronously wait every homogeneous task and
+    /// construct a fully initialized result array in the caller context.
+    TaskWaitAll {
+        tasks: Box<Expression>,
+        result_type: Box<Type>,
+    },
+    /// `task.Cancel()`: request cooperative cancellation. Returns whether
+    /// this call accepted the task's first pre-terminal request.
+    TaskCancel {
+        task: Box<Expression>,
+    },
+    /// `Task.IsCancellationRequested()`: observe the active task execution
+    /// frame's private cancellation request; false outside such a frame.
+    TaskCancellationRequested,
     /// `await operand` inside an `async` function: `operand` is a `Task<T>`
     /// expression (only `Task.Run(...)` in this version) and this node's type
     /// is the concrete scalar `result_type` (`T`).
