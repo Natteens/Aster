@@ -170,6 +170,15 @@ pub enum RuntimeErrorKind {
     AssertionEqual,
 }
 
+/// Element-slot initialization contract for a source `new T[length]`.
+/// Semantic analysis is the only layer that may produce `Empty`, after
+/// proving the length is constant zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewArrayInitialization {
+    Default,
+    Empty,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Module {
     pub items: Vec<Item>,
@@ -389,6 +398,7 @@ pub enum ExpressionKind {
     NewArray {
         element_type: Type,
         length: Box<Expression>,
+        initialization: NewArrayInitialization,
     },
     /// `new List<T>()`: allocates an empty `List<T>` header (see
     /// `aster_runtime::AsterList`). `element_type` is already concrete.

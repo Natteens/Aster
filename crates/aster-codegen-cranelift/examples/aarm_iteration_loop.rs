@@ -71,7 +71,7 @@ impl AllocationShape {
                 destination: mir::Place::Local(mir::LocalId(local)),
                 element_type: mir::Type::Int,
                 length: integer(8),
-                requires_default: false,
+                initialization: mir::ArrayInitialization::Default,
                 region: mir::AllocationRegion::Temporary,
             },
             Self::String => mir::Instruction::CallIntrinsic {

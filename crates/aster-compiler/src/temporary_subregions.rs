@@ -2102,7 +2102,7 @@ mod tests {
                 type_: mir::Type::Int,
                 kind: mir::OperandKind::Constant(mir::Constant::Integer("1".to_owned())),
             },
-            requires_default: true,
+            initialization: mir::ArrayInitialization::Default,
             region: mir::AllocationRegion::Temporary,
         }
     }
@@ -2112,7 +2112,7 @@ mod tests {
             destination: mir::Place::Local(mir::LocalId(id)),
             element_type: mir::Type::Int,
             length: copy(length, mir::Type::Int),
-            requires_default: true,
+            initialization: mir::ArrayInitialization::Default,
             region: mir::AllocationRegion::Temporary,
         }
     }
@@ -2651,7 +2651,7 @@ public int Main() {
                         type_: mir::Type::Int,
                         kind: mir::OperandKind::Constant(mir::Constant::Integer("8".to_owned())),
                     },
-                    requires_default: false,
+                    initialization: mir::ArrayInitialization::Default,
                     region: mir::AllocationRegion::Temporary,
                 }],
                 mir::Terminator::End,
@@ -3422,7 +3422,7 @@ public int Main() {
                     type_: mir::Type::Int,
                     kind: mir::OperandKind::Constant(mir::Constant::Integer("4".to_owned())),
                 },
-                requires_default: true,
+                initialization: mir::ArrayInitialization::Default,
                 region: mir::AllocationRegion::Temporary,
             }
         }

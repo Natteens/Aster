@@ -802,6 +802,7 @@ fn validate_function(
         }
         validate_terminator(&block.terminator, &function.name, &blocks)?;
     }
+    validate_explicit_array_initialization(function)?;
     Ok(())
 }
 
@@ -876,8 +877,16 @@ fn validate_instruction(
             destination,
             element_type,
             length,
+            initialization,
             ..
-        } => validate_allocate_array(destination, element_type, length, function_name),
+        } => validate_allocate_array(
+            destination,
+            element_type,
+            length,
+            *initialization,
+            function_name,
+            locals,
+        ),
         mir::Instruction::AllocateObject {
             destination, class, ..
         } => validate_allocate_object(destination, *class, function_name, classes),
@@ -2953,11 +2962,253 @@ fn validate_allocate_array(
     destination: &mir::Place,
     element_type: &mir::Type,
     length: &mir::Operand,
+    initialization: mir::ArrayInitialization,
     function_name: &str,
+    locals: &HashMap<mir::LocalId, mir::Type>,
 ) -> Result<(), BackendError> {
     validate_place(destination, function_name)?;
     validate_value_type(element_type, function_name)?;
-    validate_operand(length, function_name)
+    validate_operand(length, function_name)?;
+    let mir::Place::Local(destination_local) = destination else {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` allocates an array into a non-local destination"
+        )));
+    };
+    let declared_destination = locals.get(destination_local).ok_or_else(|| {
+        BackendError::new(format!(
+            "function `{function_name}` allocates an array into an undeclared local"
+        ))
+    })?;
+    let expected_destination = mir::Type::Array(Box::new(element_type.clone()));
+    if *declared_destination != expected_destination {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` allocates `{}` elements into destination `{}`",
+            type_name(element_type),
+            type_name(declared_destination)
+        )));
+    }
+    if length.type_ != mir::Type::Int {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` allocates an array with non-`int` length `{}`",
+            type_name(&length.type_)
+        )));
+    }
+    if initialization == mir::ArrayInitialization::Empty
+        && !matches!(
+            &length.kind,
+            mir::OperandKind::Constant(mir::Constant::Integer(value))
+                if matches!(integer_constant_bits(value, &length.type_), Ok(0))
+        )
+    {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` marks a non-zero or dynamic array allocation as proven empty"
+        )));
+    }
+    Ok(())
+}
+
+fn constant_nonnegative_int(operand: &mir::Operand) -> Option<usize> {
+    let mir::Operand {
+        type_: mir::Type::Int,
+        kind: mir::OperandKind::Constant(mir::Constant::Integer(value)),
+    } = operand
+    else {
+        return None;
+    };
+    usize::try_from(value.parse::<i32>().ok()?).ok()
+}
+
+fn explicit_array_element_assignment(
+    instruction: &mir::Instruction,
+    array_local: mir::LocalId,
+    element_type: &mir::Type,
+) -> Option<usize> {
+    let mir::Instruction::Assign {
+        target:
+            mir::Place::Index {
+                array,
+                index,
+                element_type: target_element,
+            },
+        value,
+    } = instruction
+    else {
+        return None;
+    };
+    if target_element != element_type || value.type_ != *element_type {
+        return None;
+    }
+    if !matches!(
+        array.kind,
+        mir::OperandKind::Copy(mir::Place::Local(local)) if local == array_local
+    ) {
+        return None;
+    }
+    let mut reads = HashSet::new();
+    owned_rvalue_reads(value, &mut reads);
+    if reads.contains(&array_local) {
+        return None;
+    }
+    constant_nonnegative_int(index)
+}
+
+fn merge_explicit_array_state(
+    incoming: &mut HashMap<mir::BasicBlockId, HashSet<usize>>,
+    pending: &mut Vec<mir::BasicBlockId>,
+    block: mir::BasicBlockId,
+    state: &HashSet<usize>,
+) {
+    if let Some(current) = incoming.get_mut(&block) {
+        let merged = current.intersection(state).copied().collect::<HashSet<_>>();
+        if merged != *current {
+            *current = merged;
+            pending.push(block);
+        }
+    } else {
+        incoming.insert(block, state.clone());
+        pending.push(block);
+    }
+}
+
+fn validate_one_explicit_array_initialization(
+    function: &mir::Function,
+    allocation_block: mir::BasicBlockId,
+    allocation_index: usize,
+    array_local: mir::LocalId,
+    element_type: &mir::Type,
+    element_count: usize,
+) -> Result<(), BackendError> {
+    if element_count == 0 {
+        return Ok(());
+    }
+    let blocks = function
+        .blocks
+        .iter()
+        .map(|block| (block.id, block))
+        .collect::<HashMap<_, _>>();
+    let mut incoming = HashMap::new();
+    let mut pending = vec![allocation_block];
+    incoming.insert(allocation_block, HashSet::new());
+    let mut first_visit = true;
+
+    while let Some(block_id) = pending.pop() {
+        let block = blocks.get(&block_id).ok_or_else(|| {
+            BackendError::new(format!(
+                "function `{}` has malformed explicit array initialization CFG",
+                function.name
+            ))
+        })?;
+        let mut initialized = incoming.get(&block_id).cloned().ok_or_else(|| {
+            BackendError::new(format!(
+                "function `{}` has missing explicit array initialization state",
+                function.name
+            ))
+        })?;
+        let start = if first_visit && block_id == allocation_block {
+            first_visit = false;
+            allocation_index + 1
+        } else {
+            0
+        };
+        let mut complete = false;
+        for instruction in block.instructions.iter().skip(start) {
+            if let Some(index) =
+                explicit_array_element_assignment(instruction, array_local, element_type)
+            {
+                if index >= element_count {
+                    return Err(BackendError::new(format!(
+                        "function `{}` initializes explicit array element {index} outside length {element_count}",
+                        function.name
+                    )));
+                }
+                initialized.insert(index);
+                if initialized.len() == element_count {
+                    complete = true;
+                    break;
+                }
+                continue;
+            }
+
+            let mut reads = HashSet::new();
+            owned_instruction_reads(instruction, &mut reads);
+            let mut definitions = HashSet::new();
+            owned_instruction_definitions(instruction, &mut definitions);
+            if reads.contains(&array_local) || definitions.contains(&array_local) {
+                return Err(BackendError::new(format!(
+                    "function `{}` uses or replaces an explicitly initialized array before every element is written",
+                    function.name
+                )));
+            }
+        }
+        if complete {
+            continue;
+        }
+
+        let mut terminator_reads = HashSet::new();
+        match &block.terminator {
+            mir::Terminator::Branch { condition, .. }
+            | mir::Terminator::Return(Some(condition)) => {
+                owned_operand_reads(condition, &mut terminator_reads);
+            }
+            _ => {}
+        }
+        if terminator_reads.contains(&array_local) {
+            return Err(BackendError::new(format!(
+                "function `{}` uses an explicitly initialized array in control flow before every element is written",
+                function.name
+            )));
+        }
+        let successors = match block.terminator {
+            mir::Terminator::Goto(target) => vec![target],
+            mir::Terminator::Branch {
+                then_block,
+                else_block,
+                ..
+            } => vec![then_block, else_block],
+            mir::Terminator::Return(_) | mir::Terminator::End | mir::Terminator::Unreachable => {
+                return Err(BackendError::new(format!(
+                    "function `{}` terminates before every explicit array element is initialized",
+                    function.name
+                )));
+            }
+        };
+        for successor in successors {
+            merge_explicit_array_state(&mut incoming, &mut pending, successor, &initialized);
+        }
+    }
+    Ok(())
+}
+
+fn validate_explicit_array_initialization(function: &mir::Function) -> Result<(), BackendError> {
+    for block in &function.blocks {
+        for (instruction_index, instruction) in block.instructions.iter().enumerate() {
+            let mir::Instruction::AllocateArray {
+                destination: mir::Place::Local(array_local),
+                element_type,
+                length,
+                initialization: mir::ArrayInitialization::Explicit,
+                ..
+            } = instruction
+            else {
+                continue;
+            };
+            let element_count = constant_nonnegative_int(length).ok_or_else(|| {
+                BackendError::new(format!(
+                    "function `{}` has explicit array initialization without a constant non-negative length",
+                    function.name
+                ))
+            })?;
+            validate_one_explicit_array_initialization(
+                function,
+                block.id,
+                instruction_index,
+                *array_local,
+                element_type,
+                element_count,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_assign(
@@ -6039,7 +6290,7 @@ mod tests {
                     type_: mir::Type::Int,
                     kind: mir::OperandKind::Constant(mir::Constant::Integer("1".to_owned())),
                 },
-                requires_default: false,
+                initialization: mir::ArrayInitialization::Default,
                 region: mir::AllocationRegion::Persistent,
             },
         );
@@ -6217,7 +6468,7 @@ mod tests {
                 type_: mir::Type::Int,
                 kind: mir::OperandKind::Constant(mir::Constant::Integer("1".to_owned())),
             },
-            requires_default: false,
+            initialization: mir::ArrayInitialization::Default,
             region: mir::AllocationRegion::Temporary,
         };
         mir::Module {

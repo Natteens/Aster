@@ -38,8 +38,12 @@ Result<string[], IOError> files = ListFiles("data");
 - `ListFiles` returns complete paths for immediate regular-file children, sorted ordinally. It is
   non-recursive and excludes directories, symlinks, and other file types.
 
-Text operations enforce an internal 64 MiB limit. `WriteAllText` returns the number of UTF-8 bytes,
-not Unicode scalars.
+Text operations enforce an internal 64 MiB limit. After successfully opening an ordinary regular
+file, `ReadAllText` uses metadata from that handle to reject a known-oversized file before
+materializing a bounded probe. Opening errors therefore keep their established classification. The
+bounded read remains the final authority, so file growth after metadata and backends without that
+host proof are still capped safely. `WriteAllText` returns the number of UTF-8 bytes, not Unicode
+scalars.
 
 ## Errors
 

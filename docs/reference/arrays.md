@@ -18,9 +18,24 @@ int[] values = new int[3];
 values[1] = 20;
 ```
 
-`new` currently requires an element type with a valid all-zero value. In particular,
-`new string[length]` and zeroed structs containing references are rejected because ASTER does not
-have `null`; use an array literal that initializes every element instead.
+For a positive or runtime-known length, `new` requires an element type with a valid all-zero value.
+In particular, `new string[1]`, `new string[length]`, and zeroed structs containing references are
+rejected because ASTER does not have `null`; use an array literal that initializes every element
+instead.
+
+A length proven to be constant zero is different: `new T[0]` is valid for every otherwise-valid
+element type because it creates no element slots and therefore no invalid default value. The result
+is still an ordinary non-null array object with `Length == 0`, and indexing it fails through normal
+bounds checking. An explicit array variable also supplies the exact type for an empty literal:
+
+```aster
+string[] first = [];
+string[] second = new string[0];
+```
+
+This contextual rule is deliberately limited to explicit variable initializers. A standalone or
+`var`-initialized `[]` still has no element type and is rejected; non-empty literals keep their
+existing element inference and promotion rules.
 
 `values.Length` returns an `int` and cannot be assigned. Indices must be non-negative `int` values.
 Every runtime access is bounds checked; an invalid index makes the CLI report a controlled runtime

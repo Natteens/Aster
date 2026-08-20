@@ -52,7 +52,7 @@ pub const ASTER_ARRAY_DATA_OFFSET: usize = std::mem::offset_of!(AsterArray, data
 pub const ASTER_ARRAY_LENGTH_OFFSET: usize = std::mem::offset_of!(AsterArray, length);
 
 fn array_allocation_layout(length: usize, element_size: usize) -> Option<(usize, usize, usize)> {
-    let payload_bytes = checked_allocation_size(length, element_size)?.max(element_size);
+    let payload_bytes = checked_allocation_size(length, element_size)?;
     let data_offset = checked_align_up(size_of::<AsterArray>(), 8)?;
     let allocation_bytes = data_offset.checked_add(payload_bytes)?;
     Some((payload_bytes, data_offset, allocation_bytes))
@@ -7563,14 +7563,17 @@ mod tests {
     }
 
     #[test]
-    fn zero_length_and_ordinary_arrays_keep_their_allocation_contract() {
+    fn zero_length_arrays_allocate_no_fake_element_storage() {
         let mut context = ExecutionContext::with_stats();
         let empty = context.allocate_array(0, 4);
+        let empty_used = context.memory_stats().used_bytes;
         let ordinary = context.allocate_array(3, 4);
         assert!(!empty.is_null());
         assert!(!ordinary.is_null());
         assert_eq!(context.memory_stats().array_allocations, 2);
-        assert_eq!(context.memory_stats().requested_bytes, 16);
+        assert_eq!(context.memory_stats().requested_bytes, 12);
+        assert!(empty_used >= size_of::<AsterArray>() as u64);
+        assert!(context.memory_stats().used_bytes > empty_used);
         assert!(context.take_error().is_none());
     }
 

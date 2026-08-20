@@ -1,7 +1,7 @@
 use super::{
     Analyzer, Binding, Block, ConstError, ConstValue, Diagnostic, EnumCaseInfo, Expression,
-    HashMap, HashSet, ResolvedEnumCase, Span, Statement, Type, TypeRef, VariableDeclaration,
-    VariableKind, evaluate, resolve_type_readonly,
+    ExpressionKind, HashMap, HashSet, ResolvedEnumCase, Span, Statement, Type, TypeRef,
+    VariableDeclaration, VariableKind, evaluate, resolve_type_readonly,
 };
 
 pub(super) struct ResolvedSwitch<'a> {
@@ -509,13 +509,28 @@ impl Analyzer<'_> {
     }
 
     pub(super) fn variable_binding(&mut self, variable: &VariableDeclaration) -> Option<Binding> {
-        let initializer_type = variable
-            .initializer
-            .as_ref()
-            .map(|value| self.expression(value));
+        let declared_type = match &variable.kind {
+            VariableKind::Explicit(type_ref) | VariableKind::Constant(type_ref) => {
+                Some(self.resolve_local_type(type_ref))
+            }
+            VariableKind::Inferred => None,
+        };
+        let initializer_type = variable.initializer.as_ref().map(|value| {
+            if let (Some(Type::Array(element)), ExpressionKind::ArrayLiteral(elements)) =
+                (&declared_type, &value.kind)
+                && elements.is_empty()
+            {
+                self.model
+                    .contextual_empty_array_elements
+                    .insert(self.model_key(value.span), element.display());
+                Type::Array(element.clone())
+            } else {
+                self.expression(value)
+            }
+        });
         let (type_, mutable) = match &variable.kind {
-            VariableKind::Explicit(type_ref) => {
-                let expected = self.resolve_local_type(type_ref);
+            VariableKind::Explicit(_) => {
+                let expected = declared_type.expect("explicit variable has a declared type");
                 if let (Some(actual), Some(value)) = (&initializer_type, &variable.initializer) {
                     self.require_assignable_value(&expected, actual, value);
                 }
@@ -532,7 +547,7 @@ impl Analyzer<'_> {
                 (type_, true)
             }
             VariableKind::Constant(type_ref) => {
-                let expected = self.resolve_local_type(type_ref);
+                let expected = declared_type.expect("constant has a declared type");
                 let Some(actual) = &initializer_type else {
                     self.diagnostics.push(
                         Diagnostic::error("constants require an initializer", variable.span)

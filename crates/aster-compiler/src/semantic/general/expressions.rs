@@ -552,7 +552,7 @@ impl Analyzer<'_> {
                     "cannot infer the element type of an empty array literal",
                     span,
                 )
-                .with_help("use `new T[0]` for an empty array"),
+                .with_help("use an explicit target such as `string[] values = []`, or `new T[0]`"),
             );
             return Type::Unknown;
         };
@@ -579,7 +579,14 @@ impl Analyzer<'_> {
                     .with_help("convert the length to `int`"),
             );
         }
-        if constant_integer(length).is_some_and(|value| value < 0) {
+        let constant_length = {
+            let resolve = |name: &str| self.binding(name).and_then(|binding| binding.value.clone());
+            evaluate(length, &resolve)
+                .ok()
+                .as_ref()
+                .and_then(integer_value)
+        };
+        if constant_length.is_some_and(|value| value < 0) {
             self.diagnostics.push(Diagnostic::error(
                 "array length cannot be negative",
                 length.span,
@@ -588,7 +595,13 @@ impl Analyzer<'_> {
         if matches!(element, Type::Void | Type::Unknown) {
             return Type::Unknown;
         }
-        if !zero_initializable(&element, self.context, &mut HashSet::new()) {
+        let zero_length = constant_length == Some(0);
+        if zero_length {
+            self.model
+                .zero_length_new_arrays
+                .insert(self.model_key(span));
+        }
+        if !zero_length && !zero_initializable(&element, self.context, &mut HashSet::new()) {
             self.diagnostics.push(
                 Diagnostic::error(
                     format!(

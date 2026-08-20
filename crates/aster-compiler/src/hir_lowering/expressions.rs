@@ -187,7 +187,16 @@ impl Lowerer<'_> {
                     .collect::<Vec<_>>();
                 let element_type = elements
                     .first()
-                    .map_or(hir::Type::Unknown, |value| value.type_.clone());
+                    .map(|value| value.type_.clone())
+                    .or_else(|| {
+                        self.model
+                            .contextual_empty_array_elements
+                            .get(&model_key)
+                            .map(|name| {
+                                self.resolve_type(&ast::TypeRef::new(name, expression.span))
+                            })
+                    })
+                    .unwrap_or(hir::Type::Unknown);
                 for element in &mut elements {
                     *element = convert(element.clone(), &element_type);
                 }
@@ -206,6 +215,11 @@ impl Lowerer<'_> {
                     kind: hir::ExpressionKind::NewArray {
                         element_type,
                         length: Box::new(self.expression(length)),
+                        initialization: if self.model.zero_length_new_arrays.contains(&model_key) {
+                            hir::NewArrayInitialization::Empty
+                        } else {
+                            hir::NewArrayInitialization::Default
+                        },
                     },
                 }
             }

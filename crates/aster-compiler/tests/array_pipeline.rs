@@ -92,6 +92,139 @@ fn array_diagnostics_are_specific() {
 }
 
 #[test]
+fn empty_reference_arrays_use_the_explicit_target_type() {
+    let source = "public interface IValue { int Get(); } \
+                  public class Value : IValue { public Value() {} public int Get() { return 1; } } \
+                  public int Run() { \
+                      string[] strings = []; \
+                      string[] explicitStrings = new string[0]; \
+                      Value[] classes = []; \
+                      Value[] explicitClasses = new Value[0]; \
+                      IValue[] interfaces = []; \
+                      IValue[] explicitInterfaces = new IValue[0]; \
+                      List<string>[] collections = []; \
+                      List<string>[] explicitCollections = new List<string>[0]; \
+                      int[] ints = new int[2]; \
+                      bool[] flags = new bool[2]; \
+                      return strings.Length + explicitStrings.Length + classes.Length + \
+                          explicitClasses.Length + interfaces.Length + explicitInterfaces.Length + \
+                          collections.Length + explicitCollections.Length + ints.Length + flags.Length; \
+                  }";
+    let compilation = aster_compiler::compile(source).expect("empty reference arrays are valid");
+
+    let function = compilation
+        .mir
+        .functions
+        .iter()
+        .find(|function| function.name == "Run")
+        .expect("Run MIR");
+    let allocations = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| {
+            let mir::Instruction::AllocateArray {
+                element_type,
+                length,
+                initialization,
+                ..
+            } = instruction
+            else {
+                return None;
+            };
+            Some((element_type, length, *initialization))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(allocations.len(), 10);
+    assert!(
+        allocations
+            .iter()
+            .take(8)
+            .enumerate()
+            .all(|(index, (_, length, initialization))| {
+                matches!(
+                    &length.kind,
+                    mir::OperandKind::Constant(mir::Constant::Integer(value)) if value == "0"
+                ) && *initialization
+                    == if index % 2 == 0 {
+                        mir::ArrayInitialization::Explicit
+                    } else {
+                        mir::ArrayInitialization::Empty
+                    }
+            })
+    );
+    assert!(
+        allocations
+            .iter()
+            .skip(8)
+            .all(|(_, _, initialization)| { *initialization == mir::ArrayInitialization::Default })
+    );
+    assert!(
+        allocations
+            .iter()
+            .all(|(element, _, _)| **element != mir::Type::Unknown)
+    );
+}
+
+#[test]
+fn compile_time_zero_allows_empty_reference_array_construction() {
+    aster_compiler::compile(
+        "public int Run() { const int Zero = 0; string[] a = new string[1 - 1]; string[] b = new string[Zero]; return a.Length + b.Length; }",
+    )
+    .expect("all proven constant-zero lengths are valid");
+}
+
+#[test]
+fn reference_array_defaults_stay_rejected_without_a_zero_proof() {
+    for source in [
+        "public int Run() { string[] a = new string[1]; return a.Length; }",
+        "public int Run(int length) { string[] a = new string[length]; return a.Length; }",
+        "public int Run() { int length = 0; string[] a = new string[length]; return a.Length; }",
+        "public class Value { public Value() {} } public int Run() { Value[] a = new Value[1]; return a.Length; }",
+        "public interface IValue { int Get(); } public int Run() { IValue[] a = new IValue[1]; return a.Length; }",
+    ] {
+        let diagnostics = aster_compiler::compile(source).expect_err("source must be rejected");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("has no non-null default value"))
+        );
+    }
+}
+
+#[test]
+fn empty_array_literal_without_an_exact_target_stays_an_error() {
+    for source in [
+        "public int Run() { var values = []; return 0; }",
+        "public int Run() { int[] values = [1]; values = []; return 0; }",
+        "public int[] Values() { return []; }",
+        "public void Use(int[] values) {} public int Run() { Use([]); return 0; }",
+    ] {
+        let diagnostics = aster_compiler::compile(source)
+            .expect_err("contextual empty literals stay limited to explicit initializers");
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("cannot infer the element type of an empty array literal")
+        }));
+    }
+}
+
+#[test]
+fn empty_reference_arrays_do_not_bypass_type_based_worker_transfer() {
+    let diagnostics = aster_compiler::compile(
+        "public int Count(string[] values) { return values.Length; } \
+         public int Run() { return Task.Run(Count, new string[0]).Wait(); }",
+    )
+    .expect_err("zero runtime length does not make a reference array transferable");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("cannot cross a worker boundary as a `Task.Run` argument")
+    }));
+}
+
+#[test]
 fn foreach_is_typed_and_lowers_to_existing_array_cfg() {
     let compilation = aster_compiler::compile(
         "public int Run() { int[] values = [1, 2, 3]; int total = 0; foreach (int value in values) { total += value; } return total; }",

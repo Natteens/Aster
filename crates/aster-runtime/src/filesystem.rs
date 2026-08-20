@@ -51,8 +51,10 @@ pub trait FileSystemBackend: Send {
     /// Returning exactly `probe_limit` bytes tells the caller the real
     /// content may exceed the limit, without this backend needing to know
     /// what that limit means -- the caller decides whether that is
-    /// `LimitExceeded`. Returns [`FileSystemError::NotFile`] for a directory
-    /// or other non-regular-file target.
+    /// `LimitExceeded`. An implementation may return `LimitExceeded` early
+    /// when ordinary-file metadata already proves the same threshold was
+    /// reached. Returns [`FileSystemError::NotFile`] for a directory or other
+    /// non-regular-file target.
     ///
     /// # Errors
     ///
@@ -102,19 +104,41 @@ pub struct StdFileSystemBackend {
     _private: (),
 }
 
+fn read_bounded_regular_file<R: io::Read>(
+    reader: R,
+    known_regular_len: Option<u64>,
+    probe_limit: u64,
+) -> Result<Vec<u8>, FileSystemError> {
+    if known_regular_len.is_some_and(|length| length >= probe_limit) {
+        return Err(FileSystemError::LimitExceeded);
+    }
+    let mut buffer = Vec::new();
+    reader
+        .take(probe_limit)
+        .read_to_end(&mut buffer)
+        .map_err(FileSystemError::Io)?;
+    Ok(buffer)
+}
+
 impl FileSystemBackend for StdFileSystemBackend {
     fn read_all(&mut self, path: &str, probe_limit: u64) -> Result<Vec<u8>, FileSystemError> {
-        if let Ok(metadata) = std::fs::metadata(path)
-            && metadata.is_dir()
+        if let Ok(metadata) = std::fs::metadata(path) {
+            if metadata.is_dir() {
+                return Err(FileSystemError::NotFile);
+            }
+        }
+        let file = std::fs::File::open(path).map_err(FileSystemError::Io)?;
+        let opened_metadata = file.metadata().ok();
+        if opened_metadata
+            .as_ref()
+            .is_some_and(std::fs::Metadata::is_dir)
         {
             return Err(FileSystemError::NotFile);
         }
-        let file = std::fs::File::open(path).map_err(FileSystemError::Io)?;
-        let mut buffer = Vec::new();
-        file.take(probe_limit)
-            .read_to_end(&mut buffer)
-            .map_err(FileSystemError::Io)?;
-        Ok(buffer)
+        let known_regular_len = opened_metadata
+            .filter(std::fs::Metadata::is_file)
+            .map(|metadata| metadata.len());
+        read_bounded_regular_file(file, known_regular_len, probe_limit)
     }
 
     fn write_all(&mut self, path: &str, content: &[u8]) -> Result<(), FileSystemError> {
@@ -1058,9 +1082,12 @@ mod tests {
     use super::{
         FailingFileSystemBackend, FileSystemBackend, FileSystemError, MemoryFileSystemBackend,
         PartialWriteFailureFileSystemBackend, StdFileSystemBackend, classify,
+        read_bounded_regular_file,
     };
     use crate::io_error::PortableIoErrorKind;
+    use std::cell::Cell;
     use std::io;
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn unique_temp_path(label: &str) -> std::path::PathBuf {
@@ -1255,18 +1282,55 @@ mod tests {
     }
 
     #[test]
-    fn std_backend_caps_a_real_file_read_at_the_probe_limit() {
+    fn std_backend_preflights_a_regular_file_at_the_probe_limit() {
         let path = unique_temp_path("capped");
         let mut backend = StdFileSystemBackend::default();
         let content = vec![b'y'; 200];
         backend
             .write_all(path.to_str().unwrap(), &content)
             .expect("real write succeeds");
-        let bytes = backend
+        let error = backend
             .read_all(path.to_str().unwrap(), 50)
-            .expect("real read succeeds");
-        assert_eq!(bytes.len(), 50);
+            .expect_err("known oversized regular file is rejected before reading");
+        assert!(matches!(error, FileSystemError::LimitExceeded));
         std::fs::remove_file(&path).ok();
+    }
+
+    struct CountingReader {
+        reads: Rc<Cell<usize>>,
+        bytes: io::Cursor<Vec<u8>>,
+    }
+
+    impl io::Read for CountingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.reads.set(self.reads.get() + 1);
+            self.bytes.read(buffer)
+        }
+    }
+
+    #[test]
+    fn regular_file_preflight_uses_the_probe_threshold_without_reading() {
+        for known_length in [50, 51] {
+            let reads = Rc::new(Cell::new(0));
+            let reader = CountingReader {
+                reads: Rc::clone(&reads),
+                bytes: io::Cursor::new(vec![b'x'; 51]),
+            };
+            let error = read_bounded_regular_file(reader, Some(known_length), 50)
+                .expect_err("metadata at or beyond the probe rejects immediately");
+            assert!(matches!(error, FileSystemError::LimitExceeded));
+            assert_eq!(reads.get(), 0);
+        }
+
+        let reads = Rc::new(Cell::new(0));
+        let reader = CountingReader {
+            reads: Rc::clone(&reads),
+            bytes: io::Cursor::new(vec![b'x'; 49]),
+        };
+        let bytes = read_bounded_regular_file(reader, Some(49), 50)
+            .expect("one byte below the probe remains allowed");
+        assert_eq!(bytes.len(), 49);
+        assert!(reads.get() > 0);
     }
 
     #[test]

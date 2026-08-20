@@ -116,7 +116,7 @@ fn temporary_array(local: u32, length: i32) -> mir::Instruction {
         destination: mir::Place::Local(mir::LocalId(local)),
         element_type: mir::Type::Int,
         length: integer(length),
-        requires_default: true,
+        initialization: mir::ArrayInitialization::Default,
         region: mir::AllocationRegion::Temporary,
     }
 }

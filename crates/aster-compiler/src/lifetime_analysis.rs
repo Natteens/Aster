@@ -1401,7 +1401,7 @@ mod tests {
                             destination: mir::Place::Local(mir::LocalId(1)),
                             element_type: mir::Type::Int,
                             length: constant_bool(false),
-                            requires_default: false,
+                            initialization: mir::ArrayInitialization::Default,
                             region: mir::AllocationRegion::Persistent,
                         },
                         mir::Instruction::CallIntrinsic {
@@ -1817,7 +1817,7 @@ mod tests {
                 destination: mir::Place::Local(mir::LocalId(2)),
                 element_type: mir::Type::Int,
                 length: constant_bool(false),
-                requires_default: false,
+                initialization: mir::ArrayInitialization::Default,
                 region: mir::AllocationRegion::Persistent,
             },
             mir::Instruction::AllocateList {

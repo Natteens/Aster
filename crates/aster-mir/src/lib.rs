@@ -185,6 +185,20 @@ pub enum AllocationRegion {
     Temporary,
 }
 
+/// How one array allocation obtains valid element slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArrayInitialization {
+    /// The runtime creates the language-defined all-zero default for every
+    /// slot. Backend layout validation rejects types without such a default.
+    Default,
+    /// The compiler-generated array-literal sequence assigns every slot
+    /// explicitly before the temporary result is published.
+    Explicit,
+    /// Semantic analysis proved that the allocation has no element slots.
+    /// Backend validation mechanically requires a constant zero length.
+    Empty,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Instruction {
     /// Begin one compiler-proven slice of the Persistent arena. Persistent
@@ -250,7 +264,7 @@ pub enum Instruction {
         destination: Place,
         element_type: Type,
         length: Operand,
-        requires_default: bool,
+        initialization: ArrayInitialization,
         region: AllocationRegion,
     },
     AllocateObject {

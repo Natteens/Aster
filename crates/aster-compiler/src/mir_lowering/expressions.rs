@@ -54,7 +54,10 @@ impl FunctionLowerer {
             hir::ExpressionKind::NewArray {
                 element_type,
                 length,
-            } => Some(self.lower_new_array(&expression.type_, element_type, length)),
+                initialization,
+            } => {
+                Some(self.lower_new_array(&expression.type_, element_type, length, *initialization))
+            }
             hir::ExpressionKind::NewList { element_type } => {
                 Some(self.lower_new_list(&expression.type_, element_type))
             }
@@ -1102,7 +1105,7 @@ impl FunctionLowerer {
             destination: mir::Place::Local(local),
             element_type: (**element_type).clone(),
             length: int_operand(elements.len()),
-            requires_default: false,
+            initialization: mir::ArrayInitialization::Explicit,
             region: mir::AllocationRegion::Persistent,
         });
         for (index, element) in elements.iter().enumerate() {
@@ -1129,6 +1132,7 @@ impl FunctionLowerer {
         type_: &hir::Type,
         element_type: &hir::Type,
         length: &hir::Expression,
+        initialization: hir::NewArrayInitialization,
     ) -> mir::Operand {
         let local = self.new_temporary(type_.clone());
         let length = self
@@ -1138,7 +1142,10 @@ impl FunctionLowerer {
             destination: mir::Place::Local(local),
             element_type: element_type.clone(),
             length,
-            requires_default: true,
+            initialization: match initialization {
+                hir::NewArrayInitialization::Default => mir::ArrayInitialization::Default,
+                hir::NewArrayInitialization::Empty => mir::ArrayInitialization::Empty,
+            },
             region: mir::AllocationRegion::Persistent,
         });
         mir::Operand {

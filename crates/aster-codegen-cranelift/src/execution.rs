@@ -1404,7 +1404,7 @@ mod tests {
                     destination: mir::Place::Local(mir::LocalId(1)),
                     element_type: mir::Type::Int,
                     length: fine_integer(1),
-                    requires_default: true,
+                    initialization: mir::ArrayInitialization::Default,
                     region: mir::AllocationRegion::Temporary,
                 },
                 mir::Instruction::AllocateObject {
@@ -1474,7 +1474,7 @@ mod tests {
                     destination: mir::Place::Local(mir::LocalId(1)),
                     element_type: mir::Type::Int,
                     length: fine_integer(100_000),
-                    requires_default: true,
+                    initialization: mir::ArrayInitialization::Default,
                     region: mir::AllocationRegion::Temporary,
                 },
                 fine_exit(),
@@ -1618,7 +1618,7 @@ mod tests {
                     destination: mir::Place::Local(mir::LocalId(0)),
                     element_type: mir::Type::Int,
                     length: fine_integer(1),
-                    requires_default: true,
+                    initialization: mir::ArrayInitialization::Default,
                     region: mir::AllocationRegion::Temporary,
                 },
                 mir::Instruction::Assign {

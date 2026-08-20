@@ -1,7 +1,7 @@
 use super::{
     BackendError, Codegen, FuncId, FunctionBuilder, FunctionState, HashMap, InstBuilder, MemFlags,
-    Module, StackSlotData, StackSlotKind, Value, cast_value, is_aggregate, mir, scalar_from_bits,
-    scalar_kind, scalar_to_bits, type_name, types,
+    Module, StackSlotData, StackSlotKind, Value, cast_value, integer_constant_bits, is_aggregate,
+    mir, scalar_from_bits, scalar_kind, scalar_to_bits, type_name, types,
 };
 
 /// Every layout fact needed to construct a concrete `Result<T, IOError>`
@@ -1481,15 +1481,28 @@ impl Codegen {
         destination: &mir::Place,
         element_type: &mir::Type,
         length: &mir::Operand,
-        requires_default: bool,
+        initialization: mir::ArrayInitialization,
         region: mir::AllocationRegion,
         state: &FunctionState,
     ) -> Result<(), BackendError> {
-        if requires_default && !self.layouts.zero_initializable(element_type) {
+        if initialization == mir::ArrayInitialization::Default
+            && !self.layouts.zero_initializable(element_type)
+        {
             return Err(BackendError::new(format!(
                 "`new {}[length]` has no safe all-zero default; initialize every element with an array literal",
                 type_name(element_type)
             )));
+        }
+        if initialization == mir::ArrayInitialization::Empty
+            && !matches!(
+                &length.kind,
+                mir::OperandKind::Constant(mir::Constant::Integer(value))
+                    if matches!(integer_constant_bits(value, &length.type_), Ok(0))
+            )
+        {
+            return Err(BackendError::new(
+                "empty array initialization requires a constant zero length",
+            ));
         }
         let symbol = match region {
             mir::AllocationRegion::Persistent => "aster_rt_array_new",

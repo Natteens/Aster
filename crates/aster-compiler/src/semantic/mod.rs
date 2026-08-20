@@ -159,6 +159,14 @@ pub(crate) struct Model {
     /// switch expression. HIR lowering materializes this decision instead of
     /// independently repeating promotion or compatibility rules.
     pub switch_expression_types: HashMap<ModelNodeKey, String>,
+    /// Exact element type supplied by an explicit variable declaration for
+    /// an otherwise untyped empty array literal. This is deliberately narrow:
+    /// ordinary expression inference remains one-way.
+    pub contextual_empty_array_elements: HashMap<ModelNodeKey, String>,
+    /// `new T[length]` sites whose length is proven constant zero by semantic
+    /// constant evaluation. Lowering uses this proof to state that no default
+    /// element slots exist; later layers never repeat source-level reasoning.
+    pub zero_length_new_arrays: HashSet<ModelNodeKey>,
     pub propagations: HashMap<ModelNodeKey, ResolvedPropagation>,
     pub string_operations: HashMap<ModelNodeKey, StringOperation>,
     pub dictionary_operations: HashMap<ModelNodeKey, ResolvedDictionaryOperation>,

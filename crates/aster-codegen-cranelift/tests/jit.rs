@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use aster_codegen_cranelift::{
-    ExecutionValue, MemoryConsoleBackend, PreparedTestProgram, execute, execute_symbol,
+    ExecutionValue, MemoryConsoleBackend, PreparedTestProgram, execute, execute_symbol, validate,
 };
 use aster_compiler::{compile, compile_project};
 use aster_mir as mir;
@@ -648,6 +648,98 @@ fn string_array_literals_are_fully_initialized() {
     let source =
         "public int Run() { string[] names = [\"Aster\", \"Natte\"]; return names.Length; }";
     assert_eq!(run(source, "Run"), Ok(ExecutionValue::Int(2)));
+}
+
+#[test]
+fn explicit_array_initialization_is_proven_across_expression_control_flow() {
+    let source = "public string[] Build(bool first) { \
+                      string[] values = [first ? \"left\" : \"right\", Text()]; \
+                      return values; \
+                  } \
+                  public string Text() { return \"value\"; } \
+                  public int Run() { return Build(true).Length; }";
+    assert_eq!(run(source, "Run"), Ok(ExecutionValue::Int(2)));
+}
+
+#[test]
+fn empty_reference_arrays_are_ordinary_non_null_arrays() {
+    let source = "public interface IValue { int Get(); } \
+                  public class Value : IValue { public Value() {} public int Get() { return 1; } } \
+                  public int Run() { \
+                      string[] inferred = []; \
+                      string[] explicit = new string[0]; \
+                      Value[] classes = []; \
+                      IValue[] interfaces = []; \
+                      return inferred.Length + explicit.Length + classes.Length + interfaces.Length; \
+                  }";
+    assert_eq!(run(source, "Run"), Ok(ExecutionValue::Int(0)));
+
+    let bounds = run(
+        "public int Run() { string[] values = new string[0]; return values[0].Length; }",
+        "Run",
+    )
+    .expect_err("an empty array has no index zero");
+    assert!(bounds.contains("array index 0"), "{bounds}");
+
+    let write_bounds = run(
+        "public int Run() { string[] values = new string[0]; values[0] = \"x\"; return 0; }",
+        "Run",
+    )
+    .expect_err("an empty array cannot expose a writable element slot");
+    assert!(write_bounds.contains("array index 0"), "{write_bounds}");
+}
+
+#[test]
+fn backend_rejects_a_nonzero_array_marked_as_proven_empty() {
+    let mut compilation =
+        compile("public int Run() { string[] values = new string[0]; return values.Length; }")
+            .expect("valid empty reference array");
+    let allocation = compilation
+        .mir
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find(|instruction| {
+            matches!(
+                instruction,
+                mir::Instruction::AllocateArray {
+                    initialization: mir::ArrayInitialization::Empty,
+                    ..
+                }
+            )
+        })
+        .expect("empty allocation exists");
+    let mir::Instruction::AllocateArray { length, .. } = allocation else {
+        unreachable!()
+    };
+    *length = mir::Operand {
+        type_: mir::Type::Int,
+        kind: mir::OperandKind::Constant(mir::Constant::Integer("1".to_owned())),
+    };
+
+    let error = validate(&compilation.mir)
+        .expect_err("malformed non-zero reference slots must fail before code generation");
+    assert!(error.to_string().contains("proven empty"), "{error}");
+
+    let mut explicit_without_elements = compilation.mir.clone();
+    let allocation = explicit_without_elements
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+        .find(|instruction| matches!(instruction, mir::Instruction::AllocateArray { .. }))
+        .expect("array allocation exists");
+    let mir::Instruction::AllocateArray { initialization, .. } = allocation else {
+        unreachable!()
+    };
+    *initialization = mir::ArrayInitialization::Explicit;
+    let error = validate(&explicit_without_elements)
+        .expect_err("explicit initialization metadata requires actual element writes");
+    assert!(
+        error.to_string().contains("before every element"),
+        "{error}"
+    );
 }
 
 #[test]
