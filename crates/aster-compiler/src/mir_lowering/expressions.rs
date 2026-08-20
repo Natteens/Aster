@@ -1386,8 +1386,12 @@ pub(super) fn lower_intrinsic(intrinsic: hir::Intrinsic) -> mir::Intrinsic {
                 hir::RuntimeErrorKind::MathClampInvalidRange => {
                     mir::RuntimeErrorKind::MathClampInvalidRange
                 }
+                hir::RuntimeErrorKind::AssertionTrue => mir::RuntimeErrorKind::AssertionTrue,
+                hir::RuntimeErrorKind::AssertionFalse => mir::RuntimeErrorKind::AssertionFalse,
+                hir::RuntimeErrorKind::AssertionEqual => mir::RuntimeErrorKind::AssertionEqual,
             })
         }
+        hir::Intrinsic::AssertionEqual => mir::Intrinsic::AssertionEqual,
         hir::Intrinsic::ConsoleWrite => mir::Intrinsic::ConsoleWrite,
         hir::Intrinsic::ConsoleWriteLine => mir::Intrinsic::ConsoleWriteLine,
         hir::Intrinsic::ConsoleReadLine => mir::Intrinsic::ConsoleReadLine,

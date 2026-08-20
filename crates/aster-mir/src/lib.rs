@@ -465,6 +465,7 @@ pub enum Intrinsic {
     StringJoin,
     StringJoinTemporary,
     ReportRuntimeError(RuntimeErrorKind),
+    AssertionEqual,
     /// Reports a controlled runtime failure when `foreach` over a `List<T>`
     /// detects the list was structurally modified (`Add`/`RemoveAt`) since
     /// the loop captured its version. Takes no arguments and never has a
@@ -624,6 +625,7 @@ impl Intrinsic {
             | Self::MathPowFloat
             | Self::MathPowDouble
             | Self::ReportRuntimeError(_)
+            | Self::AssertionEqual
             | Self::ListVersionMismatch
             | Self::TaskRun
             | Self::TaskWait
@@ -806,6 +808,9 @@ pub enum RuntimeErrorKind {
     MathAbsIntOverflow,
     MathAbsLongOverflow,
     MathClampInvalidRange,
+    AssertionTrue,
+    AssertionFalse,
+    AssertionEqual,
 }
 
 #[derive(Clone, Debug, PartialEq)]

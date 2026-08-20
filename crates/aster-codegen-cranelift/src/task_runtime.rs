@@ -1227,6 +1227,8 @@ impl TaskRuntime {
             .collect()
     }
 
+    #[allow(clippy::unused_self)]
+    // Telemetry builds record through `self`; keep one API shape across builds.
     fn collect_parallel_chunks(
         &mut self,
         receivers: Vec<std::sync::mpsc::Receiver<ChunkOutcome>>,
@@ -1237,6 +1239,8 @@ impl TaskRuntime {
         collected.result
     }
 
+    #[allow(clippy::unused_self)]
+    // Telemetry builds record through `self`; keep one API shape across builds.
     fn collect_parallel_reduce_chunks(
         &mut self,
         receivers: Vec<std::sync::mpsc::Receiver<ReduceChunkOutcome>>,

@@ -34,7 +34,7 @@ use std::{
 use aster_mir as mir;
 pub use aster_runtime::{
     AarmMemoryTelemetry, ForeignRegistry, ForeignRegistryError, ForeignSignature, ForeignType,
-    MemoryStats,
+    MemoryConsoleBackend, MemoryStats,
 };
 use aster_runtime::{RuntimeType, runtime_functions};
 use aster_types::Primitive;
@@ -197,6 +197,82 @@ impl fmt::Display for BackendError {
 }
 
 impl Error for BackendError {}
+
+/// One validated module prepared once for sequential root-package tests.
+/// Machine code is reused, but every invocation receives an independent
+/// execution context and caller-owned console backend.
+pub struct PreparedTestProgram {
+    program: execution::PreparedProgram,
+    module: std::sync::Arc<mir::Module>,
+    uses_tasks: bool,
+}
+
+impl PreparedTestProgram {
+    /// Validate and compile the complete suite once.
+    ///
+    /// # Errors
+    ///
+    /// Fails before execution for invalid MIR, invalid test descriptors, or
+    /// unresolved required foreign bindings.
+    pub fn prepare(module: &mir::Module, symbols: &[mir::SymbolId]) -> Result<Self, BackendError> {
+        validate_module(module)?;
+        for symbol in symbols {
+            let function = module
+                .functions
+                .iter()
+                .find(|function| function.symbol == *symbol)
+                .ok_or_else(|| {
+                    BackendError::new(format!("test symbol {symbol:?} was not found"))
+                })?;
+            if !function.parameters.is_empty() || function.return_type != mir::Type::Void {
+                return Err(BackendError::new(
+                    "test symbol must be a parameterless void function",
+                ));
+            }
+        }
+        let program = execution::PreparedProgram::prepare(module)?;
+        Ok(Self {
+            program,
+            module: std::sync::Arc::new(module.clone()),
+            uses_tasks: task_runtime::module_uses_tasks(module),
+        })
+    }
+
+    /// Invoke one validated test with a fresh context and scoped host I/O.
+    ///
+    /// # Errors
+    ///
+    /// Runtime failures are returned after the context has been torn down.
+    pub fn invoke(
+        &mut self,
+        symbol: mir::SymbolId,
+        console: Box<dyn aster_runtime::ConsoleBackend>,
+    ) -> Result<(), BackendError> {
+        // A TaskRuntime owns its worker pool and host task records. It is per
+        // test invocation: dropping it after the call joins queued/running
+        // work, so a test that omits `Wait` cannot leak state into the next
+        // fresh execution context.
+        let mut task_runtime = self
+            .uses_tasks
+            .then(|| {
+                let workers =
+                    std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+                task_runtime::TaskRuntime::new(&self.module, workers)
+            })
+            .transpose()?;
+        let task_runtime = task_runtime
+            .as_mut()
+            .map(|runtime| std::ptr::from_mut(runtime).cast::<()>());
+        let (value, _) = self
+            .program
+            .invoke(symbol, false, task_runtime, Some(console), None)?;
+        if value == ExecutionValue::Void {
+            Ok(())
+        } else {
+            Err(BackendError::new("test symbol must return void"))
+        }
+    }
+}
 
 /// Release-benchmark seam that prepares sequential machine code once and
 /// invokes it repeatedly against fresh execution contexts.

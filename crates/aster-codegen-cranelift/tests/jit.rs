@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use aster_codegen_cranelift::{ExecutionValue, execute, execute_symbol};
+use aster_codegen_cranelift::{
+    ExecutionValue, MemoryConsoleBackend, PreparedTestProgram, execute, execute_symbol,
+};
 use aster_compiler::{compile, compile_project};
 use aster_mir as mir;
 
@@ -22,6 +24,169 @@ fn run_project(source: &str, function: &str) -> Result<ExecutionValue, String> {
     std::fs::remove_file(&path).expect("remove temporary Aster project");
     let compilation = compilation?;
     execute(&compilation.compilation.mir, function).map_err(|error| error.to_string())
+}
+
+#[test]
+fn prepared_test_program_invokes_only_valid_void_symbols() {
+    let compilation =
+        compile("test void First() { } public int Value(int input) { return input; }")
+            .expect("test source compiles");
+    let first = compilation
+        .mir
+        .functions
+        .iter()
+        .find(|function| function.name == "First")
+        .expect("test symbol")
+        .symbol;
+    let value = compilation
+        .mir
+        .functions
+        .iter()
+        .find(|function| function.name == "Value")
+        .expect("ordinary symbol")
+        .symbol;
+
+    let mut prepared = PreparedTestProgram::prepare(&compilation.mir, &[first])
+        .expect("valid test descriptor prepares");
+    prepared
+        .invoke(first, Box::new(MemoryConsoleBackend::default()))
+        .expect("void test executes");
+    let Err(error) = PreparedTestProgram::prepare(&compilation.mir, &[value]) else {
+        panic!("parameterized symbol is not a test callable");
+    };
+    assert!(error.message().contains("parameterless void"));
+}
+
+#[test]
+fn assertions_remain_controlled_runtime_failures_outside_the_test_runner() {
+    let error = run_project(
+        "using aster.testing; public int Main() { Assert.False(true); return 0; }",
+        "Main",
+    )
+    .expect_err("ordinary assertion failure is controlled");
+    assert!(
+        error.contains("assertion failed: expected condition to be false"),
+        "{error}"
+    );
+}
+
+#[test]
+fn prepared_test_program_tears_down_task_runtime_between_tests() {
+    let compilation = compile(
+        "public int Compute() { return 42; } \
+         test void UsesTask() { Task<int> task = Task.Run(Compute); int value = task.Wait(); } \
+         test void CleanAfterTask() { }",
+    )
+    .expect("task test source compiles");
+    let symbol = |name: &str| {
+        compilation
+            .mir
+            .functions
+            .iter()
+            .find(|function| function.name == name)
+            .expect("test symbol")
+            .symbol
+    };
+    let uses_task = symbol("UsesTask");
+    let clean = symbol("CleanAfterTask");
+    let mut prepared = PreparedTestProgram::prepare(&compilation.mir, &[uses_task, clean])
+        .expect("task test descriptors prepare");
+
+    prepared
+        .invoke(uses_task, Box::new(MemoryConsoleBackend::default()))
+        .expect("task test executes");
+    prepared
+        .invoke(clean, Box::new(MemoryConsoleBackend::default()))
+        .expect("later test receives a clean execution boundary");
+}
+
+#[test]
+fn prepared_test_program_joins_unwaited_tasks_before_the_next_test() {
+    let compilation = compile(
+        "public int Compute() { return 42; } \
+         test void LeavesTaskRunning() { Task<int> task = Task.Run(Compute); } \
+         test void CleanAfterShutdown() { }",
+    )
+    .expect("unwaited task test source compiles");
+    let symbol = |name: &str| {
+        compilation
+            .mir
+            .functions
+            .iter()
+            .find(|function| function.name == name)
+            .expect("test symbol")
+            .symbol
+    };
+    let leaves_task = symbol("LeavesTaskRunning");
+    let clean = symbol("CleanAfterShutdown");
+    let mut prepared = PreparedTestProgram::prepare(&compilation.mir, &[leaves_task, clean])
+        .expect("test descriptors prepare");
+
+    prepared
+        .invoke(leaves_task, Box::new(MemoryConsoleBackend::default()))
+        .expect("unwaited task invocation returns");
+    prepared
+        .invoke(clean, Box::new(MemoryConsoleBackend::default()))
+        .expect("next test starts after the prior task runtime is torn down");
+}
+
+#[test]
+fn prepared_test_program_tears_down_parallel_workers_between_tests() {
+    let compilation = compile(
+        "public void Body(int index) { } \
+         test void UsesParallel() { Parallel.For(0, 8, Body); } \
+         test void CleanAfterParallel() { }",
+    )
+    .expect("parallel test source compiles");
+    let symbol = |name: &str| {
+        compilation
+            .mir
+            .functions
+            .iter()
+            .find(|function| function.name == name)
+            .expect("test symbol")
+            .symbol
+    };
+    let parallel = symbol("UsesParallel");
+    let clean = symbol("CleanAfterParallel");
+    let mut prepared = PreparedTestProgram::prepare(&compilation.mir, &[parallel, clean])
+        .expect("test descriptors prepare");
+
+    prepared
+        .invoke(parallel, Box::new(MemoryConsoleBackend::default()))
+        .expect("parallel test executes");
+    prepared
+        .invoke(clean, Box::new(MemoryConsoleBackend::default()))
+        .expect("next test receives no parallel worker state");
+}
+
+#[test]
+fn prepared_test_program_reuses_machine_code_for_many_isolated_tests() {
+    let mut source = String::new();
+    for index in 0..1_000 {
+        use std::fmt::Write as _;
+        writeln!(source, "test void Case{index:04}() {{ }}")
+            .expect("writing generated test source cannot fail");
+    }
+    let compilation = compile(&source).expect("generated test suite compiles");
+    let symbols = compilation
+        .mir
+        .functions
+        .iter()
+        .filter(|function| function.name.starts_with("Case"))
+        .map(|function| function.symbol)
+        .collect::<Vec<_>>();
+    assert_eq!(symbols.len(), 1_000);
+
+    let mut prepared =
+        PreparedTestProgram::prepare(&compilation.mir, &symbols).expect("suite prepares once");
+    for _ in 0..2 {
+        for &symbol in &symbols {
+            prepared
+                .invoke(symbol, Box::new(MemoryConsoleBackend::default()))
+                .expect("isolated generated test executes");
+        }
+    }
 }
 
 #[test]

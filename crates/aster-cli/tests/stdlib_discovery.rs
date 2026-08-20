@@ -36,6 +36,7 @@ fn copy_real_stdlib(root: &std::path::Path) {
         "aster/core/core.aster",
         "aster/io/io.aster",
         "aster/collections/collections.aster",
+        "aster/testing/testing.aster",
     ];
     for relative in modules {
         let src = workspace_stdlib.join(relative);

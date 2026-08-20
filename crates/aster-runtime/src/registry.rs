@@ -33,8 +33,9 @@ use crate::io::{
 };
 use crate::log::aster_rt_log;
 use crate::math::{
-    aster_rt_integer_arithmetic_error, aster_rt_math_domain_error, aster_rt_math_pow_double,
-    aster_rt_math_pow_float, aster_rt_math_unary_double, aster_rt_math_unary_float,
+    aster_rt_assert_equal, aster_rt_integer_arithmetic_error, aster_rt_math_domain_error,
+    aster_rt_math_pow_double, aster_rt_math_pow_float, aster_rt_math_unary_double,
+    aster_rt_math_unary_float,
 };
 use crate::object::{aster_rt_object_new, aster_rt_object_new_temporary};
 use crate::string::{
@@ -108,7 +109,7 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             name: "aster_rt_log",
             address: aster_rt_log as *const u8,
             signature: RuntimeSignature {
-                parameters: &[RuntimeType::I32, RuntimeType::Pointer],
+                parameters: &[RuntimeType::Pointer, RuntimeType::I32, RuntimeType::Pointer],
                 result: None,
             },
         },
@@ -1261,6 +1262,18 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             },
         },
         RuntimeFunction {
+            name: "aster_rt_assert_equal",
+            address: aster_rt_assert_equal as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
             name: "aster_rt_math_domain_error",
             address: aster_rt_math_domain_error as *const u8,
             signature: RuntimeSignature {
@@ -1299,7 +1312,7 @@ mod tests {
         let log = functions.iter().find(|f| f.name == "aster_rt_log").unwrap();
         assert_eq!(
             log.signature.parameters,
-            &[RuntimeType::I32, RuntimeType::Pointer]
+            &[RuntimeType::Pointer, RuntimeType::I32, RuntimeType::Pointer]
         );
         assert_eq!(log.signature.result, None);
     }

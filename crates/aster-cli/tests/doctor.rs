@@ -306,6 +306,7 @@ fn copy_real_stdlib(root: &Path) {
         "aster/core/core.aster",
         "aster/io/io.aster",
         "aster/collections/collections.aster",
+        "aster/testing/testing.aster",
     ] {
         let destination = root.join(relative);
         fs::create_dir_all(destination.parent().expect("module parent"))

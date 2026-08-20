@@ -1,0 +1,46 @@
+namespace aster.testing;
+
+internal void __AssertionTrue()
+{
+}
+
+internal void __AssertionEqual(string expected, string actual)
+{
+}
+
+internal void __AssertionFalse()
+{
+}
+
+public static class Assert
+{
+    public static void True(bool condition)
+    {
+        if (!condition)
+        {
+            __AssertionTrue();
+        }
+    }
+
+    public static void False(bool condition)
+    {
+        if (condition)
+        {
+            __AssertionFalse();
+        }
+    }
+
+    public static void Equal(bool expected, bool actual) { if (expected != actual) { __AssertionEqual(expected.ToString(), actual.ToString()); } }
+    public static void Equal(char expected, char actual) { if (expected != actual) { __AssertionEqual(expected.ToString(), actual.ToString()); } }
+    public static void Equal(sbyte expected, sbyte actual) { if (expected != actual) { __AssertionEqual(((int)expected).ToString(), ((int)actual).ToString()); } }
+    public static void Equal(byte expected, byte actual) { if (expected != actual) { __AssertionEqual(((int)expected).ToString(), ((int)actual).ToString()); } }
+    public static void Equal(short expected, short actual) { if (expected != actual) { __AssertionEqual(((int)expected).ToString(), ((int)actual).ToString()); } }
+    public static void Equal(ushort expected, ushort actual) { if (expected != actual) { __AssertionEqual(((int)expected).ToString(), ((int)actual).ToString()); } }
+    public static void Equal(int expected, int actual) { if (expected != actual) { __AssertionEqual(expected.ToString(), actual.ToString()); } }
+    public static void Equal(uint expected, uint actual) { if (expected != actual) { __AssertionEqual(expected.ToString(), actual.ToString()); } }
+    public static void Equal(long expected, long actual) { if (expected != actual) { __AssertionEqual(expected.ToString(), actual.ToString()); } }
+    public static void Equal(ulong expected, ulong actual) { if (expected != actual) { __AssertionEqual(expected.ToString(), actual.ToString()); } }
+    public static void Equal(float expected, float actual) { if (expected != actual) { __AssertionEqual(expected.ToString(), actual.ToString()); } }
+    public static void Equal(double expected, double actual) { if (expected != actual) { __AssertionEqual(expected.ToString(), actual.ToString()); } }
+    public static void Equal(string expected, string actual) { if (expected != actual) { __AssertionEqual(expected, actual); } }
+}

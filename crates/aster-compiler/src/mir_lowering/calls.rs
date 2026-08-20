@@ -111,6 +111,21 @@ impl FunctionLowerer {
                 });
                 None
             }
+            hir::Intrinsic::AssertionEqual => {
+                let expected = self
+                    .lower_expression(&arguments[0])
+                    .expect("validated assertion expected value produces a string");
+                let actual = self
+                    .lower_expression(&arguments[1])
+                    .expect("validated assertion actual value produces a string");
+                self.instruction(mir::Instruction::CallIntrinsic {
+                    destination: None,
+                    intrinsic: lower_intrinsic(intrinsic),
+                    arguments: vec![expected, actual],
+                    return_type: mir::Type::Void,
+                });
+                None
+            }
             hir::Intrinsic::ConsoleWrite | hir::Intrinsic::ConsoleWriteLine => {
                 let value = self
                     .lower_expression(&arguments[0])

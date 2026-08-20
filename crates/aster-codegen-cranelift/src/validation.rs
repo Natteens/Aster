@@ -3958,6 +3958,11 @@ fn validate_intrinsic_shape(
         mir::Intrinsic::ReportRuntimeError(_) | mir::Intrinsic::ListVersionMismatch => {
             destination.is_none() && return_type == &mir::Type::Void && arguments.is_empty()
         }
+        mir::Intrinsic::AssertionEqual => {
+            destination.is_none()
+                && return_type == &mir::Type::Void
+                && matches!(arguments, [expected, actual] if expected.type_ == mir::Type::String && actual.type_ == mir::Type::String)
+        }
         // `string.TryParse*()`: exactly one `string` receiver, aridade zero,
         // and a destination whose type is *some* concrete enum. The deeper
         // check -- that the enum is actually shaped like `Option<T>` for the

@@ -9,6 +9,7 @@ and prints the compiler's typed intermediate representations.
 | `aster doctor` | Diagnose the local toolchain and current project without modifying them. |
 | `aster check [FILE]` | Validate a project or source file without executing it. |
 | `aster run [FILE]` | Compile and run an application. |
+| `aster test` | Compile and run root-package tests. |
 | `aster watch <FILE>` | Recompile and rerun when a loaded project file changes. |
 | `aster dump-hir [FILE]` | Print typed HIR after successful validation. |
 | `aster dump-mir [FILE]` | Print control-flow MIR after successful validation. |
@@ -25,6 +26,9 @@ This means the project commands keep working from nested directories inside the 
 aster check
 aster run
 ```
+
+`aster test` is a package command with no file mode. It finds the nearest manifest and discovers
+only that package's conventional `tests/` sources. See [testing](testing.md).
 
 Passing one source file selects it explicitly:
 

@@ -20,6 +20,7 @@ const CORE_SOURCE: &str = include_str!("../../../stdlib/aster/core/core.aster");
 const IO_SOURCE: &str = include_str!("../../../stdlib/aster/io/io.aster");
 const COLLECTIONS_SOURCE: &str =
     include_str!("../../../stdlib/aster/collections/collections.aster");
+const TESTING_SOURCE: &str = include_str!("../../../stdlib/aster/testing/testing.aster");
 
 /// All stdlib modules with their on-disk paths relative to the stdlib root.
 const STDLIB_MODULES: &[(&str, &str)] = &[
@@ -28,6 +29,7 @@ const STDLIB_MODULES: &[(&str, &str)] = &[
     ("aster.core", "aster/core/core.aster"),
     ("aster.io", "aster/io/io.aster"),
     ("aster.collections", "aster/collections/collections.aster"),
+    ("aster.testing", "aster/testing/testing.aster"),
 ];
 
 /// Namespace of the official core standard library, and the single source of
@@ -87,6 +89,7 @@ impl StandardLibrary {
                 ("aster.core", Cow::Borrowed(CORE_SOURCE)),
                 ("aster.io", Cow::Borrowed(IO_SOURCE)),
                 ("aster.collections", Cow::Borrowed(COLLECTIONS_SOURCE)),
+                ("aster.testing", Cow::Borrowed(TESTING_SOURCE)),
             ]),
         }
     }
@@ -172,6 +175,22 @@ impl StandardLibrary {
                 ),
             ]);
         }
+        if self.modules.contains_key("aster.testing") {
+            bindings.extend([
+                (
+                    "aster.testing::__AssertionTrue".to_owned(),
+                    Intrinsic::ReportRuntimeError(RuntimeErrorKind::AssertionTrue),
+                ),
+                (
+                    "aster.testing::__AssertionEqual".to_owned(),
+                    Intrinsic::AssertionEqual,
+                ),
+                (
+                    "aster.testing::__AssertionFalse".to_owned(),
+                    Intrinsic::ReportRuntimeError(RuntimeErrorKind::AssertionFalse),
+                ),
+            ]);
+        }
         if self.modules.contains_key("aster.text") {
             bindings.extend([
                 ("aster.text::__Trim".to_owned(), Intrinsic::StringTrim),
@@ -217,7 +236,7 @@ impl StandardLibrary {
         }
         if matches!(
             module,
-            "aster.text" | "aster.core" | "aster.io" | "aster.collections"
+            "aster.text" | "aster.core" | "aster.io" | "aster.collections" | "aster.testing"
         ) {
             path.push(
                 module

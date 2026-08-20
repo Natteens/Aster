@@ -4,6 +4,7 @@
 //! and `[error] message` on stderr. Messages have no timestamps. `Log.Error`
 //! never terminates the program; logging is not error handling.
 
+use crate::ExecutionContext;
 use crate::string::{AsterStrHeader, view};
 
 /// Severity accepted across the ABI as an `i32`.
@@ -38,15 +39,28 @@ impl LogLevel {
 
 /// Write one log message. Exported to generated code as `aster_rt_log`.
 ///
-/// Malformed input (unknown level, null pointer, invalid UTF-8) produces a
-/// controlled `[error]` line instead of a panic, because panicking across the
-/// `extern "C"` boundary would abort the process.
+/// Log output uses the execution context's terminal backend, so tests can
+/// capture it alongside ordinary terminal output. Malformed input produces a
+/// controlled diagnostic line instead of a panic, because panicking across
+/// the `extern "C"` boundary would abort the process.
 // Called only from generated code that upholds the ABI contract; marking the
 // symbol `unsafe` would not change the JIT call site.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn aster_rt_log(level: i32, message: *const AsterStrHeader) {
+pub extern "C" fn aster_rt_log(
+    context: *mut ExecutionContext,
+    level: i32,
+    message: *const AsterStrHeader,
+) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: generated code passes its live hidden ExecutionContext.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
     let Some(level) = LogLevel::from_abi(level) else {
-        eprintln!("[error] aster-runtime: invalid log level {level}");
+        let _ = context
+            .console_backend()
+            .write_error(format!("[error] aster-runtime: invalid log level {level}\n").as_bytes());
         return;
     };
     // SAFETY: the pointer originates from JIT string data that stays alive
@@ -54,19 +68,44 @@ pub extern "C" fn aster_rt_log(level: i32, message: *const AsterStrHeader) {
     #[allow(unsafe_code)]
     let text = unsafe { view(message) };
     let Some(text) = text else {
-        eprintln!("[error] aster-runtime: log message is not a valid ABI string");
+        let _ = context
+            .console_backend()
+            .write_error(b"[error] aster-runtime: log message is not a valid ABI string\n");
         return;
     };
-    match level {
-        LogLevel::Log => println!("[log] {text}"),
-        LogLevel::Warning => eprintln!("[warning] {text}"),
-        LogLevel::Error => eprintln!("[error] {text}"),
-    }
+    let line = format!("[{}] {text}\n", level.label());
+    let backend = context.console_backend();
+    let _ = match level {
+        LogLevel::Log => backend
+            .write(line.as_bytes())
+            .and_then(|()| backend.flush()),
+        LogLevel::Warning | LogLevel::Error => backend
+            .write_error(line.as_bytes())
+            .and_then(|()| backend.flush_error()),
+    };
 }
 
 #[cfg(test)]
 mod tests {
-    use super::LogLevel;
+    use super::{LogLevel, aster_rt_log};
+    use crate::string::{AsterStrHeader, encode_str};
+    use crate::{ExecutionContext, MemoryConsoleBackend};
+
+    fn aligned(value: &str) -> Vec<u64> {
+        let bytes = encode_str(value);
+        let mut buffer = vec![0_u64; bytes.len().div_ceil(8)];
+        // SAFETY: u64 slices are validly viewable as bytes.
+        #[allow(unsafe_code)]
+        let target = unsafe {
+            std::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<u8>(), bytes.len())
+        };
+        target.copy_from_slice(&bytes);
+        buffer
+    }
+
+    fn pointer(buffer: &[u64]) -> *const AsterStrHeader {
+        buffer.as_ptr().cast::<AsterStrHeader>()
+    }
 
     #[test]
     fn maps_abi_levels() {
@@ -82,5 +121,18 @@ mod tests {
         assert_eq!(LogLevel::Log.label(), "log");
         assert_eq!(LogLevel::Warning.label(), "warning");
         assert_eq!(LogLevel::Error.label(), "error");
+    }
+
+    #[test]
+    fn logs_use_the_execution_context_console() {
+        let mut context = ExecutionContext::new();
+        let console = MemoryConsoleBackend::default();
+        context.set_console_backend(Box::new(console.clone()));
+        let message = aligned("captured");
+
+        aster_rt_log(&raw mut context, LogLevel::Log as i32, pointer(&message));
+        aster_rt_log(&raw mut context, LogLevel::Error as i32, pointer(&message));
+
+        assert_eq!(console.output(), b"[log] captured\n[error] captured\n");
     }
 }

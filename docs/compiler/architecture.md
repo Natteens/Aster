@@ -235,6 +235,12 @@ or TOML. `--function NAME` preserves explicit root-namespace execution for devel
 compilation commands resolve the root file's transitive usings. `aster watch FILE [--function NAME]`
 reruns the same pipeline when the root, manifest, or any loaded dependency changes
 (`docs/compiler/watch.md`).
+`aster test` uses the same project compiler with the root package's conventional `tests/` source
+tree added before linking. The compiler returns sorted descriptors containing only an ordinary
+concrete symbol and display identity; HIR/MIR bodies remain ordinary functions. The CLI prepares
+the validated main module once and invokes those symbols sequentially with fresh execution contexts
+and scoped console backends. Task-using tests receive a per-test worker runtime so no task or worker
+host state crosses the test boundary.
 
 ## Deliberate boundaries
 

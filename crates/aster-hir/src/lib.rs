@@ -56,6 +56,10 @@ pub enum Visibility {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Intrinsic {
     ReportRuntimeError(RuntimeErrorKind),
+    /// Formats the already-converted expected and actual values into one
+    /// controlled assertion failure. Kept narrow so assertion overloads stay
+    /// ordinary stdlib source.
+    AssertionEqual,
     /// Internal UTF-8-aware `aster.text.String` helpers. Their public static
     /// wrappers remain ordinary standard-library source methods.
     StringTrim,
@@ -161,6 +165,9 @@ pub enum RuntimeErrorKind {
     MathAbsIntOverflow,
     MathAbsLongOverflow,
     MathClampInvalidRange,
+    AssertionTrue,
+    AssertionFalse,
+    AssertionEqual,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -217,6 +224,9 @@ pub struct Field {
 #[allow(clippy::struct_excessive_bools)]
 pub struct Function {
     pub constructor: bool,
+    /// Compiler-only declaration metadata used by project test discovery.
+    /// Test callables lower to ordinary MIR functions.
+    pub is_test: bool,
     pub is_static: bool,
     pub is_async: bool,
     pub is_foreign: bool,

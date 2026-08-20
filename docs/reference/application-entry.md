@@ -66,6 +66,10 @@ a reusable source package with no executable entry. Only the root package suppli
 entry, and a dependency that declares its own `[application]` does not compete for it. See
 [packages and dependencies](packages.md).
 
+`aster test` does not select an application entry: it invokes discovered `test void` functions
+instead. A library package can therefore run its own tests without `[application]` or `Main`; see
+[testing](testing.md).
+
 ASTER does not put a schema, edition, or format-version field in `Aster.toml`. A `schema` field is
 rejected with a controlled migration diagnostic rather than activating alternate semantics.
 

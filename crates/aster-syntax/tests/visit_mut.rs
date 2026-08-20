@@ -212,6 +212,7 @@ fn fixture() -> Module {
     };
     let function = FunctionDeclaration {
         constructor: false,
+        is_test: false,
         is_static: false,
         is_async: false,
         is_foreign: false,
@@ -272,6 +273,7 @@ fn fixture() -> Module {
             }),
             Member::Method(FunctionDeclaration {
                 constructor: true,
+                is_test: false,
                 is_static: false,
                 is_async: false,
                 is_foreign: false,

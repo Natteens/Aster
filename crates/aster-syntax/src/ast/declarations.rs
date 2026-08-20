@@ -92,6 +92,9 @@ pub struct Field {
 #[allow(clippy::struct_excessive_bools)]
 pub struct FunctionDeclaration {
     pub constructor: bool,
+    /// Marks a namespace-level test callable. This is compiler metadata only:
+    /// its body still has ordinary ASTER function semantics.
+    pub is_test: bool,
     pub is_static: bool,
     pub is_async: bool,
     /// Host-provided native declaration. Foreign functions are bodyless,

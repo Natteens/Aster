@@ -17,6 +17,8 @@ intrinsics still resolve through official `aster.*` symbols rather than text or 
 - `aster.text` provides ordinal immutable-text helpers documented with [strings](strings.md).
 - `aster.collections` defines the official
   [`DictionaryEntry<K, V>` snapshot value](collections.md#dictionaryk-v).
+- `aster.testing` provides the compact [`Assert`](testing.md#assertions) surface used by
+  root-package tests.
 
 `List<T>`, `Dictionary<K, V>`, `Task<T>`, and `Parallel` are official nominal surfaces recognized
 by the compiler. Their executable operations are described in

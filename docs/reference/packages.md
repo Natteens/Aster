@@ -3,7 +3,7 @@
 An ASTER package is a directory with an `Aster.toml`. A package declares a name, may declare an
 application entry, and may depend on other packages by local path or public HTTPS Git source.
 
-`aster check`, `run`, `dump-hir`, `dump-mir`, and `watch` never download anything and never contact
+`aster check`, `run`, `test`, `dump-hir`, `dump-mir`, and `watch` never download anything and never contact
 the network. Only `aster fetch` resolves or downloads Git sources.
 
 ## Declaring a package
@@ -22,6 +22,9 @@ any character of the project name that cannot appear in an identifier with `_`.
 
 `[application]` is optional. A package that omits it is a library: it compiles and is checkable
 without providing `Main`.
+
+A library can still use `aster test`: tests in its own `tests/` directory compile with the package
+and do not require an `[application]` entry. Dependency tests are not run by a root package.
 
 ```toml
 [package]

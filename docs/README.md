@@ -35,6 +35,7 @@ work that is not implemented.
   [`aster.math`](reference/math.md), and [logging](reference/logging.md)
 - ⚙️ [Tasks, parallel operations, and worker boundaries](reference/concurrency.md)
 - 🔌 [Minimal native FFI and lexical unsafe boundary](reference/native-ffi.md)
+- 🧪 [Package tests and assertions](reference/testing.md)
 - 🧭 [Compatibility before 1.0](reference/compatibility.md)
 - 📐 [Implemented grammar](compiler/grammar.md)
 

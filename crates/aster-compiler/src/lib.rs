@@ -32,7 +32,7 @@ pub use aster_mir as mir;
 pub use manifest::{find_manifest_path, find_manifest_path_from_directory};
 pub use project::{
     FetchSummary, ProjectCompilation, ProjectDiagnostic, ProjectSource, ProjectSourceOrigin,
-    compile_project, fetch_dependencies,
+    TestDescriptor, compile_project, compile_project_for_tests, fetch_dependencies,
 };
 pub use standard_library::StandardLibrary;
 #[doc(hidden)]
@@ -56,6 +56,21 @@ pub fn compile_project_with_stdlib(
     stdlib: StandardLibrary,
 ) -> Result<ProjectCompilation, Vec<ProjectDiagnostic>> {
     project::compile_project_with_standard_library(path, stdlib)
+}
+
+/// Compile a project and its root-package `tests/` directory with a custom
+/// standard library. This is the CLI test-runner seam; normal commands keep
+/// using [`compile_project_with_stdlib`].
+///
+/// # Errors
+///
+/// Returns sourced diagnostics for project loading, test discovery, or any
+/// compilation failure.
+pub fn compile_project_for_tests_with_stdlib(
+    path: &Path,
+    stdlib: StandardLibrary,
+) -> Result<ProjectCompilation, Vec<ProjectDiagnostic>> {
+    project::compile_project_with_standard_library_for_tests(path, stdlib)
 }
 
 /// Successful output of validation plus HIR and MIR lowering.
@@ -194,6 +209,7 @@ fn synthesize_default_constructors(module: &mut Module) {
         }
         class.members.push(Member::Method(FunctionDeclaration {
             constructor: true,
+            is_test: false,
             is_static: false,
             is_async: false,
             is_foreign: false,

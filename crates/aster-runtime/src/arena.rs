@@ -1489,7 +1489,8 @@ impl PagedArena {
         }
     }
 
-    #[allow(clippy::unnecessary_wraps)]
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
+    // Feature-gated telemetry keeps a stable receiver shape across builds.
     pub(crate) fn telemetry_snapshot(&self) -> Option<ArenaTelemetrySnapshot> {
         #[cfg(not(feature = "aarm-telemetry"))]
         return None;

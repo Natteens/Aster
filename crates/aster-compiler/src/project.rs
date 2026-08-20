@@ -70,6 +70,16 @@ pub struct ProjectCompilation {
     /// manifest-less root. See [`linked_name`] for how this participates in
     /// compiler-internal nominal identity.
     root_package_name: String,
+    tests: Vec<TestDescriptor>,
+}
+
+/// One compiler-discovered root-package test callable. The descriptor is
+/// deliberately outside HIR/MIR: execution still invokes an ordinary concrete
+/// function symbol selected before the backend.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TestDescriptor {
+    pub symbol: aster_hir::SymbolId,
+    pub display_name: String,
 }
 
 impl ProjectCompilation {
@@ -146,6 +156,12 @@ impl ProjectCompilation {
     pub(crate) fn root_package_name(&self) -> &str {
         &self.root_package_name
     }
+
+    /// Root-package tests in deterministic display-name order.
+    #[must_use]
+    pub fn tests(&self) -> &[TestDescriptor] {
+        &self.tests
+    }
 }
 
 /// Index into [`Loader::packages`]. The root package is always index 0.
@@ -172,6 +188,7 @@ struct Package {
 
 #[derive(Clone)]
 struct Unit {
+    path: PathBuf,
     name: String,
     package: PackageId,
     root: bool,
@@ -188,6 +205,20 @@ struct Unit {
 /// semantic failures in any participating compilation unit.
 pub fn compile_project(path: &Path) -> Result<ProjectCompilation, Vec<ProjectDiagnostic>> {
     compile_project_with_standard_library(path, StandardLibrary::embedded())
+}
+
+/// Compile a root package together with its conventional `tests/` sources.
+/// Production commands deliberately use [`compile_project`] instead, so test
+/// files never become implicit application input.
+///
+/// # Errors
+///
+/// Returns sourced diagnostics for file loading, package resolution, syntax,
+/// semantic analysis, or test discovery failures.
+pub fn compile_project_for_tests(
+    path: &Path,
+) -> Result<ProjectCompilation, Vec<ProjectDiagnostic>> {
+    compile_project_with_standard_library_for_tests(path, StandardLibrary::embedded())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -270,6 +301,22 @@ pub(crate) fn compile_project_with_standard_library(
     path: &Path,
     standard_library: StandardLibrary,
 ) -> Result<ProjectCompilation, Vec<ProjectDiagnostic>> {
+    compile_project_with_standard_library_inner(path, standard_library, false)
+}
+
+pub(crate) fn compile_project_with_standard_library_for_tests(
+    path: &Path,
+    standard_library: StandardLibrary,
+) -> Result<ProjectCompilation, Vec<ProjectDiagnostic>> {
+    compile_project_with_standard_library_inner(path, standard_library, true)
+}
+
+#[allow(clippy::too_many_lines)]
+fn compile_project_with_standard_library_inner(
+    path: &Path,
+    standard_library: StandardLibrary,
+    include_tests: bool,
+) -> Result<ProjectCompilation, Vec<ProjectDiagnostic>> {
     let root_path = absolute_path(path).map_err(|message| vec![plain_error(path, message)])?;
     if root_path.extension().and_then(|value| value.to_str()) != Some("aster") {
         return Err(vec![plain_error(
@@ -331,6 +378,17 @@ pub(crate) fn compile_project_with_standard_library(
     {
         loader.load_namespace(&root_namespace, ROOT_PACKAGE, None);
     }
+    let test_files = if include_tests {
+        test_source_files(&project_root)?
+    } else {
+        Vec::new()
+    };
+    let test_file_paths = test_files.iter().cloned().collect::<HashSet<_>>();
+    if include_tests {
+        for file in test_files {
+            loader.load_file(file, ROOT_PACKAGE, false, false, None, None);
+        }
+    }
     if !loader.diagnostics.is_empty() || !loader.file_load_diagnostics.is_empty() {
         return Err(loader.finish_diagnostics());
     }
@@ -346,6 +404,21 @@ pub(crate) fn compile_project_with_standard_library(
         })
         .collect();
     let root_type_names = linked_root_type_names(root_unit, &loader.packages);
+    let mut test_names = std::collections::BTreeSet::new();
+    for unit in loader.units.iter().filter(|unit| {
+        unit.package == ROOT_PACKAGE
+            && !unit.standard_library
+            && test_file_paths.contains(&unit.path)
+    }) {
+        for item in &unit.module.items {
+            let Item::Function(function) = item else {
+                continue;
+            };
+            if function.is_test {
+                test_names.insert(linked_name(unit, &loader.packages, &function.name));
+            }
+        }
+    }
     let (module, tokens, mut link_diagnostics) =
         link(&loader.units, &loader.packages, &loader.resolved_usings);
     if !link_diagnostics.is_empty() {
@@ -354,21 +427,74 @@ pub(crate) fn compile_project_with_standard_library(
     }
     let intrinsic_bindings = loader.standard_library.intrinsic_bindings();
     match compile_module(tokens, module, &intrinsic_bindings, true, true) {
-        Ok(compilation) => Ok(ProjectCompilation {
-            compilation,
-            sources: loader.sources,
-            root_namespace,
-            root_public_functions,
-            root_type_names,
-            manifest_paths,
-            requires_application_entry,
-            root_package_name,
-        }),
+        Ok(compilation) => {
+            let mut tests = compilation
+                .hir
+                .items
+                .iter()
+                .filter_map(|item| {
+                    let aster_hir::Item::Function(function) = item else {
+                        return None;
+                    };
+                    test_names.contains(&function.name).then(|| TestDescriptor {
+                        symbol: function.symbol,
+                        display_name: function.name.replace("::", "."),
+                    })
+                })
+                .collect::<Vec<_>>();
+            tests.sort_by(|left, right| left.display_name.cmp(&right.display_name));
+            Ok(ProjectCompilation {
+                compilation,
+                sources: loader.sources,
+                root_namespace,
+                root_public_functions,
+                root_type_names,
+                manifest_paths,
+                requires_application_entry,
+                root_package_name,
+                tests,
+            })
+        }
         Err(diagnostics) => {
             loader.diagnostics = diagnostics;
             Err(loader.finish_diagnostics())
         }
     }
+}
+
+fn test_source_files(project_root: &Path) -> Result<Vec<PathBuf>, Vec<ProjectDiagnostic>> {
+    fn collect(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), std::io::Error> {
+        let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                collect(&path, files)?;
+            } else if file_type.is_file()
+                && path.extension().and_then(|extension| extension.to_str()) == Some("aster")
+            {
+                files.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    let directory = project_root.join("tests");
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    collect(&directory, &mut files).map_err(|error| {
+        vec![plain_error(
+            &directory,
+            format!("could not discover test sources: {error}"),
+        )]
+    })?;
+    Ok(files)
 }
 
 /// A package-graph failure, reported against the manifest that caused it.
@@ -1093,6 +1219,7 @@ impl Loader {
         self.loaded_files.insert(path.clone());
         let unit_index = self.units.len();
         self.units.push(Unit {
+            path,
             name: namespace.clone(),
             package,
             root,

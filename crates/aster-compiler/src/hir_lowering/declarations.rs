@@ -401,6 +401,7 @@ impl Lowerer<'_> {
             .map(|intrinsic| self.resolve_intrinsic_payload(intrinsic, &return_type));
         hir::Function {
             constructor: function.constructor,
+            is_test: function.is_test,
             is_static: function.is_static,
             is_async: function.is_async,
             is_foreign: function.is_foreign,
@@ -573,6 +574,7 @@ fn accessor_function(
 ) -> ast::FunctionDeclaration {
     ast::FunctionDeclaration {
         constructor: false,
+        is_test: false,
         is_static: false,
         is_async: false,
         is_foreign: false,

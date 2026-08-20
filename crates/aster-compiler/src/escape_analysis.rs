@@ -893,6 +893,7 @@ fn instruction_escape(
                     | mir::Intrinsic::FileListFiles(_)
                     | mir::Intrinsic::FileListFilesTemporary(_)
                     | mir::Intrinsic::ReportRuntimeError(_)
+                    | mir::Intrinsic::AssertionEqual
             );
             (!borrows_only
                 && arguments

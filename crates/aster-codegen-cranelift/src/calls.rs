@@ -211,9 +211,9 @@ impl Codegen {
             _ => {}
         }
         let (symbol, immediate, needs_context) = match intrinsic {
-            mir::Intrinsic::Log => ("aster_rt_log", Some(0_i64), false),
-            mir::Intrinsic::LogWarning => ("aster_rt_log", Some(1), false),
-            mir::Intrinsic::LogError => ("aster_rt_log", Some(2), false),
+            mir::Intrinsic::Log => ("aster_rt_log", Some(0_i64), true),
+            mir::Intrinsic::LogWarning => ("aster_rt_log", Some(1), true),
+            mir::Intrinsic::LogError => ("aster_rt_log", Some(2), true),
             mir::Intrinsic::StringEquals => ("aster_rt_string_eq", None, false),
             mir::Intrinsic::StringConcat => ("aster_rt_string_concat", None, true),
             mir::Intrinsic::StringConcatTemporary => {
@@ -258,9 +258,13 @@ impl Codegen {
                     mir::RuntimeErrorKind::MathAbsIntOverflow => 0,
                     mir::RuntimeErrorKind::MathAbsLongOverflow => 1,
                     mir::RuntimeErrorKind::MathClampInvalidRange => 2,
+                    mir::RuntimeErrorKind::AssertionTrue => 3,
+                    mir::RuntimeErrorKind::AssertionFalse => 4,
+                    mir::RuntimeErrorKind::AssertionEqual => 5,
                 }),
                 true,
             ),
+            mir::Intrinsic::AssertionEqual => ("aster_rt_assert_equal", None, true),
             mir::Intrinsic::ListVersionMismatch => ("aster_rt_list_version_mismatch", None, true),
             mir::Intrinsic::StringFromLong
             | mir::Intrinsic::StringFromLongTemporary

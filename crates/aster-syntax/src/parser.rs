@@ -50,6 +50,7 @@ struct Parser {
 #[allow(clippy::struct_excessive_bools)]
 struct FunctionModifiers {
     visibility: Visibility,
+    is_test: bool,
     is_static: bool,
     is_async: bool,
     is_foreign: bool,
@@ -289,6 +290,29 @@ impl Parser {
         } else {
             false
         };
+        let is_test = self.at_identifier("test")
+            && matches!(
+                self.peek(1).kind,
+                TokenKind::Void
+                    | TokenKind::Identifier(_)
+                    | TokenKind::Bool
+                    | TokenKind::SByte
+                    | TokenKind::Byte
+                    | TokenKind::Short
+                    | TokenKind::UShort
+                    | TokenKind::Int
+                    | TokenKind::UInt
+                    | TokenKind::Long
+                    | TokenKind::ULong
+                    | TokenKind::Float
+                    | TokenKind::Double
+                    | TokenKind::Decimal
+                    | TokenKind::Char
+                    | TokenKind::String
+            );
+        if is_test {
+            self.advance();
+        }
         let is_static = self.take(&TokenKind::Static).is_some();
         let async_token = self.take(&TokenKind::Async);
         let is_async = async_token.is_some();
@@ -348,7 +372,7 @@ impl Parser {
                 self.variable(Some(visibility)).map(Item::Variable)
             }
             _ if self.is_type_start() => {
-                self.typed_module_item(visibility, start, is_async, is_foreign)
+                self.typed_module_item(visibility, start, is_test, is_async, is_foreign)
             }
             _ => None,
         }
@@ -492,6 +516,7 @@ impl Parser {
                 .function_after_name(
                     FunctionModifiers {
                         visibility,
+                        is_test: false,
                         is_static: false,
                         is_async: false,
                         is_foreign: false,
@@ -512,6 +537,7 @@ impl Parser {
             self.function_after_name(
                 FunctionModifiers {
                     visibility,
+                    is_test: false,
                     is_static,
                     is_async,
                     is_foreign: false,
@@ -559,6 +585,7 @@ impl Parser {
         &mut self,
         visibility: Visibility,
         start: usize,
+        is_test: bool,
         is_async: bool,
         is_foreign: bool,
     ) -> Option<Item> {
@@ -568,6 +595,7 @@ impl Parser {
             self.function_after_name(
                 FunctionModifiers {
                     visibility,
+                    is_test,
                     is_static: false,
                     is_async,
                     is_foreign,
@@ -579,6 +607,15 @@ impl Parser {
             )
             .map(Item::Function)
         } else {
+            if is_test {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "`test` applies only to a parameterless void function",
+                        type_ref.span,
+                    )
+                    .with_help("write `test void Name() { ... }`"),
+                );
+            }
             if is_foreign {
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -614,6 +651,7 @@ impl Parser {
     ) -> Option<FunctionDeclaration> {
         let FunctionModifiers {
             visibility,
+            is_test,
             is_static,
             is_async,
             is_foreign,
@@ -634,6 +672,7 @@ impl Parser {
             let end = self.expect(&TokenKind::Semicolon)?.span.end;
             Some(FunctionDeclaration {
                 constructor: false,
+                is_test,
                 is_static,
                 is_async,
                 is_foreign,
@@ -650,6 +689,7 @@ impl Parser {
             let end = body.span.end.max(right_paren.span.end);
             Some(FunctionDeclaration {
                 constructor: false,
+                is_test,
                 is_static,
                 is_async,
                 is_foreign,

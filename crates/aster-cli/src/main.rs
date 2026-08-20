@@ -50,6 +50,7 @@ fn run(mut arguments: impl Iterator<Item = String>) -> CliResult {
         Some(command @ ("check" | "dump-hir" | "dump-mir")) => {
             run_validation_command(command, &mut arguments)
         }
+        Some("test") => run_test_command(&mut arguments),
         Some("run") => run_execute_command(&mut arguments),
         Some("watch") => run_watch_command(&mut arguments),
         Some("--version" | "-V") => {
@@ -240,6 +241,113 @@ fn run_execute_command(arguments: &mut impl Iterator<Item = String>) -> CliResul
     let stdlib = stdlib_discovery::discover().map_err(|()| CliError::Failure)?;
     run_file(&file_name, function_name.as_deref(), memory_stats, &stdlib)
         .map_err(|()| CliError::Failure)
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_test_command(arguments: &mut impl Iterator<Item = String>) -> CliResult {
+    const USAGE: &str = "aster test";
+    if let Some(argument) = arguments.next() {
+        if matches!(argument.as_str(), "--help" | "-h") {
+            reject_extra_argument(arguments, USAGE)?;
+            print_command_help("test");
+            return Ok(());
+        }
+        return Err(usage_error(
+            format!("unexpected argument `{argument}`"),
+            USAGE,
+        ));
+    }
+    let current_directory = env::current_dir().map_err(|error| {
+        eprintln!("error: could not determine current directory: {error}");
+        CliError::Failure
+    })?;
+    let Some(manifest) = aster_compiler::find_manifest_path_from_directory(&current_directory)
+    else {
+        eprintln!("error: no Aster.toml was found");
+        return Err(CliError::Failure);
+    };
+    let root = manifest.parent().ok_or_else(|| {
+        eprintln!("error: Aster.toml has no parent directory");
+        CliError::Failure
+    })?;
+    let source = root.join("app").join("main.aster");
+    if !source.is_file() {
+        eprintln!(
+            "error: `aster test` requires a root source file at `{}`",
+            source.display()
+        );
+        return Err(CliError::Failure);
+    }
+    let stdlib = stdlib_discovery::discover().map_err(|()| CliError::Failure)?;
+    let project = match aster_compiler::compile_project_for_tests_with_stdlib(&source, stdlib) {
+        Ok(project) => project,
+        Err(diagnostics) => {
+            for diagnostic in diagnostics {
+                eprintln!("{}", diagnostic.render());
+            }
+            return Err(CliError::Failure);
+        }
+    };
+    for diagnostic in project_diagnostics(&project) {
+        eprintln!("{}", diagnostic.render());
+    }
+    let symbols = project
+        .tests()
+        .iter()
+        .map(|test| test.symbol)
+        .collect::<Vec<_>>();
+    let mut prepared = match aster_codegen_cranelift::PreparedTestProgram::prepare(
+        &project.compilation.mir,
+        &symbols,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return Err(CliError::Failure);
+        }
+    };
+    print_stdout_line(format_args!("running {} tests", symbols.len()))
+        .map_err(|()| CliError::Failure)?;
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    for test in project.tests() {
+        let console = aster_codegen_cranelift::MemoryConsoleBackend::default();
+        let result = prepared.invoke(test.symbol, Box::new(console.clone()));
+        match result {
+            Ok(()) => {
+                passed += 1;
+                print_stdout_line(format_args!("PASS {}", test.display_name))
+                    .map_err(|()| CliError::Failure)?;
+            }
+            Err(error) => {
+                failed += 1;
+                print_stdout_line(format_args!("FAIL {}", test.display_name))
+                    .map_err(|()| CliError::Failure)?;
+                for line in error.message().lines() {
+                    print_stdout_line(format_args!("  {line}")).map_err(|()| CliError::Failure)?;
+                }
+                let output = console.output();
+                if !output.is_empty() {
+                    print_stdout_line(format_args!("  output:")).map_err(|()| CliError::Failure)?;
+                    for line in String::from_utf8_lossy(&output).lines() {
+                        print_stdout_line(format_args!("    {line}"))
+                            .map_err(|()| CliError::Failure)?;
+                    }
+                }
+            }
+        }
+    }
+    if failed == 0 {
+        print_stdout_line(format_args!("\ntest result: ok. {passed} passed; 0 failed"))
+            .map_err(|()| CliError::Failure)?;
+        Ok(())
+    } else {
+        print_stdout_line(format_args!(
+            "\ntest result: FAILED. {passed} passed; {failed} failed"
+        ))
+        .map_err(|()| CliError::Failure)?;
+        Err(CliError::Failure)
+    }
 }
 
 fn run_watch_command(arguments: &mut impl Iterator<Item = String>) -> CliResult {
@@ -568,7 +676,7 @@ fn print_memory_stats(stats: &aster_codegen_cranelift::MemoryStats) {
 
 fn print_help() {
     println!(
-        "Aster compiler\n\nUsage:\n  aster <command> [arguments]\n\nCommands:\n  new <NAME>       Create a new ASTER project\n  fetch            Fetch and lock Git dependencies\n  doctor           Diagnose the ASTER installation and environment\n  check [FILE]     Check a project or source file\n  run [FILE]       Run a project or source file\n  watch <FILE>     Watch and rerun a source file\n  dump-hir [FILE]  Print HIR\n  dump-mir [FILE]  Print MIR\n\nOptions:\n  -h, --help\n  -V, --version"
+        "Aster compiler\n\nUsage:\n  aster <command> [arguments]\n\nCommands:\n  new <NAME>       Create a new ASTER project\n  fetch            Fetch and lock Git dependencies\n  doctor           Diagnose the ASTER installation and environment\n  check [FILE]     Check a project or source file\n  run [FILE]       Run a project or source file\n  test             Run root-package tests\n  watch <FILE>     Watch and rerun a source file\n  dump-hir [FILE]  Print HIR\n  dump-mir [FILE]  Print MIR\n\nOptions:\n  -h, --help\n  -V, --version"
     );
 }
 
@@ -593,6 +701,10 @@ fn print_command_help(command: &str) {
         "dump-mir" => (
             "aster dump-mir [FILE]",
             "Validate and print control-flow MIR without executing.",
+        ),
+        "test" => (
+            "aster test",
+            "Run parameterless `test void` functions from tests/.",
         ),
         "run" => (
             "aster run [FILE] [--function <NAME>] [--memory-stats]",

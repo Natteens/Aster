@@ -18,6 +18,10 @@ contract for documented, implemented behavior.
 A patch should therefore be conservative. An urgent correctness or safety repair can narrow behavior,
 but it must have regression coverage and documentation when users could observe the difference.
 
+`aster test`, `test void` declarations, and `aster.testing.Assert` are additive CLI and
+standard-library surface. They preserve the existing `0`/`1`/`2` process-status meanings and do
+not alter how production commands load or execute source files.
+
 ## What is not a compatibility promise
 
 Parser acceptance by itself is not a language guarantee. Research notes, unsupported syntax,

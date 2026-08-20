@@ -32,6 +32,25 @@ pub trait ConsoleBackend: Send {
     /// Returns an error if the underlying host write fails.
     fn write(&mut self, bytes: &[u8]) -> io::Result<()>;
 
+    /// Write diagnostic bytes. Simple backends remain single-stream by
+    /// default; the real terminal backend preserves stderr diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying host write fails.
+    fn write_error(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.write(bytes)
+    }
+
+    /// Make prior diagnostic writes visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying host flush fails.
+    fn flush_error(&mut self) -> io::Result<()> {
+        self.flush()
+    }
+
     /// Make prior writes visible to whatever this backend represents.
     ///
     /// # Errors
@@ -57,6 +76,14 @@ pub struct StdConsoleBackend {
 impl ConsoleBackend for StdConsoleBackend {
     fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
         io::stdout().lock().write_all(bytes)
+    }
+
+    fn write_error(&mut self, bytes: &[u8]) -> io::Result<()> {
+        io::stderr().lock().write_all(bytes)
+    }
+
+    fn flush_error(&mut self) -> io::Result<()> {
+        io::stderr().lock().flush()
     }
 
     fn flush(&mut self) -> io::Result<()> {

@@ -890,6 +890,7 @@ fn validate_function_with_initialized_fields(
     model: &mut Model,
     initialized_fields: &HashSet<String>,
 ) {
+    validate_test_function(function, owner, diagnostics);
     if function.is_async && function.body.is_none() {
         diagnostics.push(
             Diagnostic::error("an `async` function must have a body", function.span).with_help(
@@ -978,6 +979,66 @@ fn validate_function_with_initialized_fields(
     diagnostics.append(&mut analyzer.diagnostics);
 }
 
+fn validate_test_function(
+    function: &FunctionDeclaration,
+    owner: Option<&TypeDeclaration>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !function.is_test {
+        return;
+    }
+    if owner.is_some() {
+        diagnostics.push(
+            Diagnostic::error(
+                "test functions must be declared at namespace level",
+                function.span,
+            )
+            .with_help("move the test to a source file outside the type declaration"),
+        );
+    }
+    if function.visibility == Visibility::Public {
+        diagnostics.push(
+            Diagnostic::error("test functions cannot be public", function.span)
+                .with_help("tests are package-owned runner metadata; remove `public`"),
+        );
+    }
+    if function.is_static || function.is_async || function.is_foreign || function.constructor {
+        diagnostics.push(
+            Diagnostic::error(
+                "a test function must be synchronous and ordinary",
+                function.span,
+            )
+            .with_help("write `test void Name() { ... }`"),
+        );
+    }
+    if !function.type_parameters.is_empty() {
+        diagnostics.push(
+            Diagnostic::error("test functions cannot be generic", function.span)
+                .with_help("declare one concrete parameterless test"),
+        );
+    }
+    if !function.parameters.is_empty() {
+        diagnostics.push(
+            Diagnostic::error("test functions cannot declare parameters", function.span)
+                .with_help("write `test void Name() { ... }`"),
+        );
+    }
+    if function.return_type.name != "void" {
+        diagnostics.push(
+            Diagnostic::error(
+                "test functions must return `void`",
+                function.return_type.span,
+            )
+            .with_help("write `test void Name() { ... }`"),
+        );
+    }
+    if function.body.is_none() {
+        diagnostics.push(
+            Diagnostic::error("test functions must have a body", function.span)
+                .with_help("write a block body for the test"),
+        );
+    }
+}
 /// Enforce the restricted first-version `async`/`await` surface and return the
 /// concrete `T` that `return` statements are checked against (the inner type of
 /// the declared `Task<T>`), rather than the declared `Task<T>` itself.
@@ -1444,6 +1505,7 @@ fn validate_property(
     if let Some(getter) = &property.getter {
         let function = FunctionDeclaration {
             constructor: false,
+            is_test: false,
             is_static: false,
             is_async: false,
             is_foreign: false,
@@ -1460,6 +1522,7 @@ fn validate_property(
     if let Some(setter) = &property.setter {
         let function = FunctionDeclaration {
             constructor: false,
+            is_test: false,
             is_static: false,
             is_async: false,
             is_foreign: false,

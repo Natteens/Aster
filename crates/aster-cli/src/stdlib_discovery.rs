@@ -149,6 +149,7 @@ mod tests {
             "aster/core/core.aster",
             "aster/io/io.aster",
             "aster/collections/collections.aster",
+            "aster/testing/testing.aster",
         ];
         for relative in modules {
             let full = root.join(relative);

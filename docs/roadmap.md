@@ -26,6 +26,8 @@ The current toolchain includes:
   task-owned cancellation;
 - deterministic typed-MIR optimization for CFG cleanup, primitive constants, scalar copies, and dead
   pure assignments, before escape and ownership analysis;
+- first-class deterministic root-package tests with `test void`, compact assertions, isolated
+  execution contexts, and CI-friendly output;
 - checking, JIT execution, watch mode, installation diagnostics, and HIR/MIR inspection;
 - official Windows x64 and Linux x64 release archives, installers, repair/update/rollback, and
   uninstallers.

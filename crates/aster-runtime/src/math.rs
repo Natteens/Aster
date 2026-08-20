@@ -1,6 +1,35 @@
 //! Narrow runtime boundary for math-domain and integer-arithmetic failures.
 
-use crate::ExecutionContext;
+use crate::{
+    ExecutionContext,
+    string::{AsterStrHeader, decode_str},
+};
+
+/// Record a structured equality assertion failure without exposing a Rust
+/// panic or an ungoverned ASTER allocation path.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_assert_equal(
+    context: *mut ExecutionContext,
+    expected: *const AsterStrHeader,
+    actual: *const AsterStrHeader,
+) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: generated code supplies live immutable ASTER strings for the
+    // duration of this call. Invalid internal pointers degrade to a controlled
+    // message instead of being dereferenced by the host.
+    #[allow(unsafe_code)]
+    let (expected, actual) = unsafe { (decode_str(expected), decode_str(actual)) };
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    match (expected, actual) {
+        (Some(expected), Some(actual)) => context.fail(format!(
+            "assertion failed: values are not equal\nexpected: {expected}\nactual:   {actual}"
+        )),
+        _ => context.fail("assertion failed: values are not equal"),
+    }
+}
 
 /// Execute one fixed unary floating-point operation exposed by
 /// `aster.math.Math`. Operation codes are compiler-private and invalid
@@ -57,6 +86,9 @@ pub extern "C" fn aster_rt_math_domain_error(context: *mut ExecutionContext, cod
         0 => "Math.Abs cannot represent the magnitude of the minimum int value",
         1 => "Math.Abs cannot represent the magnitude of the minimum long value",
         2 => "Math.Clamp requires min to be less than or equal to max",
+        3 => "assertion failed: expected condition to be true",
+        4 => "assertion failed: expected condition to be false",
+        5 => "assertion failed: values are not equal",
         _ => "unknown runtime error",
     };
     context.fail(message);
