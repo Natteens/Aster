@@ -1,6 +1,6 @@
 use super::{
     BackendError, Codegen, FuncId, FunctionBuilder, FunctionBuilderContext, FunctionState, HashMap,
-    HashSet, InstBuilder, MemFlags, Module, StackSlotData, StackSlotKind, is_aggregate, mir,
+    HashSet, InstBuilder, IntCC, MemFlags, Module, StackSlotData, StackSlotKind, is_aggregate, mir,
     module_error, types,
 };
 
@@ -325,6 +325,19 @@ impl Codegen {
                 function_ids,
                 state,
             ),
+            mir::Instruction::ForeignCall {
+                destination,
+                function,
+                arguments,
+                return_type,
+            } => self.translate_foreign_call(
+                builder,
+                destination.as_ref(),
+                *function,
+                arguments,
+                return_type,
+                state,
+            ),
             call @ mir::Instruction::CallInterface { .. } => {
                 self.translate_interface_call(builder, call, state)
             }
@@ -563,6 +576,124 @@ impl Codegen {
                 state,
             ),
         }
+    }
+
+    fn translate_foreign_call(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: Option<&mir::Place>,
+        function: mir::SymbolId,
+        arguments: &[mir::Operand],
+        return_type: &mir::Type,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let id = *self
+            .foreign_ids
+            .get(&function)
+            .ok_or_else(|| BackendError::new("foreign call references an undeclared binding"))?;
+        let function_ref = self.jit.declare_func_in_func(id, builder.func);
+        let mut values =
+            Vec::with_capacity(arguments.len() + usize::from(*return_type != mir::Type::Void));
+        for argument in arguments {
+            values.push(self.translate_operand(builder, argument, state)?);
+        }
+        let result_slot = if *return_type == mir::Type::Void {
+            None
+        } else {
+            let layout = self.layouts.type_layout(return_type)?;
+            let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                layout.size,
+                layout.align_shift,
+            ));
+            let address = builder.ins().stack_addr(self.pointer_type, slot, 0);
+            let zero = match self.clif_value_type(return_type)? {
+                types::F32 => builder.ins().f32const(0.0),
+                types::F64 => builder.ins().f64const(0.0),
+                type_ => builder.ins().iconst(type_, 0),
+            };
+            builder.ins().store(MemFlags::new(), zero, address, 0);
+            values.push(address);
+            Some((slot, address))
+        };
+        let call = builder.ins().call(function_ref, &values);
+        let status = builder.inst_results(call)[0];
+        let succeeded = builder.ins().icmp_imm(IntCC::Equal, status, 0);
+        let success = builder.create_block();
+        let failure = builder.create_block();
+        builder.ins().brif(succeeded, success, &[], failure, &[]);
+
+        builder.switch_to_block(failure);
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("foreign call is missing its ExecutionContext"))?;
+        let kind = builder.ins().iconst(types::I32, 0);
+        let status = builder.ins().sextend(types::I64, status);
+        let report = self
+            .jit
+            .declare_func_in_func(self.runtime_ids["aster_rt_foreign_error"], builder.func);
+        builder.ins().call(report, &[context, kind, status]);
+        builder.ins().jump(state.runtime_failure, &[]);
+
+        builder.switch_to_block(success);
+        if let (Some(destination), Some((_slot, address))) = (destination, result_slot) {
+            let value = builder.ins().load(
+                self.clif_value_type(return_type)?,
+                MemFlags::new(),
+                address,
+                0,
+            );
+            if *return_type == mir::Type::Bool {
+                let invalid = builder.ins().icmp_imm(IntCC::UnsignedGreaterThan, value, 1);
+                self.validate_foreign_scalar(builder, invalid, value, 1, state)?;
+            } else if *return_type == mir::Type::Char {
+                let too_large =
+                    builder
+                        .ins()
+                        .icmp_imm(IntCC::UnsignedGreaterThan, value, 0x10_FFFF);
+                let surrogate_low =
+                    builder
+                        .ins()
+                        .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, value, 0xD800);
+                let surrogate_high =
+                    builder
+                        .ins()
+                        .icmp_imm(IntCC::UnsignedLessThanOrEqual, value, 0xDFFF);
+                let surrogate = builder.ins().band(surrogate_low, surrogate_high);
+                let invalid = builder.ins().bor(too_large, surrogate);
+                self.validate_foreign_scalar(builder, invalid, value, 2, state)?;
+            }
+            self.store_scalar(builder, destination, value, state)?;
+        }
+        Ok(())
+    }
+
+    fn validate_foreign_scalar(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        invalid: super::Value,
+        value: super::Value,
+        kind: i64,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let valid_block = builder.create_block();
+        let invalid_block = builder.create_block();
+        builder
+            .ins()
+            .brif(invalid, invalid_block, &[], valid_block, &[]);
+        builder.switch_to_block(invalid_block);
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new("foreign result validation is missing its ExecutionContext")
+        })?;
+        let kind = builder.ins().iconst(types::I32, kind);
+        let value = builder.ins().uextend(types::I64, value);
+        let report = self
+            .jit
+            .declare_func_in_func(self.runtime_ids["aster_rt_foreign_error"], builder.func);
+        builder.ins().call(report, &[context, kind, value]);
+        builder.ins().jump(state.runtime_failure, &[]);
+        builder.switch_to_block(valid_block);
+        Ok(())
     }
 }
 

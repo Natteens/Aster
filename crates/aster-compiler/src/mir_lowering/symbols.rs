@@ -150,6 +150,7 @@ fn collect_statement(statement: &hir::Statement, max: &mut u32) {
             }
         }
         hir::Statement::Break | hir::Statement::Continue => {}
+        hir::Statement::Block(block) => collect_block(block, max),
     }
 }
 
@@ -332,6 +333,20 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
                 collect_expression(argument, max);
             }
         }
+        hir::ExpressionKind::ForeignCall {
+            function,
+            arguments,
+        }
+        | hir::ExpressionKind::TaskRun {
+            function,
+            arguments,
+            ..
+        } => {
+            note(max, *function);
+            for argument in arguments {
+                collect_expression(argument, max);
+            }
+        }
         hir::ExpressionKind::PropertyAssignment {
             object,
             getter,
@@ -426,16 +441,6 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
                 if let hir::InterpolatedPart::Expression(expression) = part {
                     collect_expression(expression, max);
                 }
-            }
-        }
-        hir::ExpressionKind::TaskRun {
-            function,
-            arguments,
-            ..
-        } => {
-            note(max, *function);
-            for argument in arguments {
-                collect_expression(argument, max);
             }
         }
         hir::ExpressionKind::TaskWait { task, .. } | hir::ExpressionKind::TaskCancel { task } => {

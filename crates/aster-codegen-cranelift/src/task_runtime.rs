@@ -225,7 +225,19 @@ impl TaskRuntime {
         module: &Arc<mir::Module>,
         worker_count: usize,
     ) -> Result<Self, BackendError> {
-        Self::with_governors(module, worker_count, None, None, None)
+        Self::new_with_foreign_registry(
+            module,
+            worker_count,
+            &Arc::new(aster_runtime::ForeignRegistry::new()),
+        )
+    }
+
+    pub(super) fn new_with_foreign_registry(
+        module: &Arc<mir::Module>,
+        worker_count: usize,
+        foreign_registry: &Arc<aster_runtime::ForeignRegistry>,
+    ) -> Result<Self, BackendError> {
+        Self::with_governors(module, worker_count, None, None, None, foreign_registry)
     }
 
     fn with_governors(
@@ -234,10 +246,15 @@ impl TaskRuntime {
         parallel_governor: Option<Arc<aster_runtime::MemoryGovernor>>,
         task_governor: Option<Arc<aster_runtime::MemoryGovernor>>,
         async_governor: Option<Arc<aster_runtime::MemoryGovernor>>,
+        foreign_registry: &Arc<aster_runtime::ForeignRegistry>,
     ) -> Result<Self, BackendError> {
-        let pool = ExecutionPool::new(Arc::clone(module), worker_count)?;
+        let pool = ExecutionPool::new_with_foreign_registry(
+            Arc::clone(module),
+            worker_count,
+            Arc::clone(foreign_registry),
+        )?;
         let driver = module_uses_async(module)
-            .then(|| PreparedProgram::prepare(module))
+            .then(|| PreparedProgram::prepare_with_foreign_registry(module, foreign_registry))
             .transpose()?;
         let task_worker_count = module_task_call_sites(module).min(worker_count).max(1);
         Ok(Self {
@@ -275,7 +292,14 @@ impl TaskRuntime {
         worker_count: usize,
         governor: Arc<aster_runtime::MemoryGovernor>,
     ) -> Result<Self, BackendError> {
-        Self::with_governors(module, worker_count, Some(governor), None, None)
+        Self::with_governors(
+            module,
+            worker_count,
+            Some(governor),
+            None,
+            None,
+            &Arc::new(aster_runtime::ForeignRegistry::new()),
+        )
     }
 
     #[cfg(feature = "aarm-telemetry")]
@@ -284,7 +308,14 @@ impl TaskRuntime {
         worker_count: usize,
         governor: Arc<aster_runtime::MemoryGovernor>,
     ) -> Result<Self, BackendError> {
-        Self::with_governors(module, worker_count, None, Some(governor), None)
+        Self::with_governors(
+            module,
+            worker_count,
+            None,
+            Some(governor),
+            None,
+            &Arc::new(aster_runtime::ForeignRegistry::new()),
+        )
     }
 
     #[cfg(feature = "aarm-telemetry")]
@@ -293,7 +324,14 @@ impl TaskRuntime {
         worker_count: usize,
         governor: Arc<aster_runtime::MemoryGovernor>,
     ) -> Result<Self, BackendError> {
-        Self::with_governors(module, worker_count, None, None, Some(governor))
+        Self::with_governors(
+            module,
+            worker_count,
+            None,
+            None,
+            Some(governor),
+            &Arc::new(aster_runtime::ForeignRegistry::new()),
+        )
     }
 
     #[cfg(feature = "aarm-telemetry")]

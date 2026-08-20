@@ -15,7 +15,8 @@ namespace-declaration = "namespace" , namespace-name , ";" ;
 using-declaration   = "using" , namespace-name , ";" ;
 namespace-name      = identifier , { "." , identifier } ;
 declaration         = [ visibility ] ,
-                      ( type-declaration | [ "async" ] , function | namespace-variable ) ;
+                      ( type-declaration | foreign-function | [ "async" ] , function
+                      | namespace-variable ) ;
 
 visibility          = "public" | "internal" | "protected" | "private" ;
 
@@ -45,6 +46,8 @@ property-tail       = "{" , accessor , { accessor } , "}" ;
 accessor            = [ visibility ] , ( "get" | "set" ) , block ;
 
 function            = type , identifier , [ type-parameters ] , function-tail ;
+foreign-function    = "unsafe" , "foreign" , type , identifier ,
+                      parameters , ";" ;
 type-parameters     = "<" , identifier , { "," , identifier } , ">" ;
 (* `where` is contextual: it is a clause opener only between a declaration
    header and its body, so it remains usable as an ordinary identifier. The
@@ -66,6 +69,7 @@ constant            = "const" , type , identifier , [ "=" , expression ] , ";" ;
 block               = "{" , { statement } , "}" ;
 statement           = variable-declaration
                     | "return" , [ expression ] , ";"
+                    | unsafe-block
                     | if-statement
                     | while-statement
                     | for-statement
@@ -74,6 +78,7 @@ statement           = variable-declaration
                     | "break" , ";"
                     | "continue" , ";"
                     | expression , ";" ;
+unsafe-block        = "unsafe" , block ;
 
 if-statement        = "if" , "(" , expression , ")" , block ,
                       [ "else" , ( if-statement | block ) ] ;

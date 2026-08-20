@@ -17,6 +17,8 @@ The current toolchain includes:
 - region-based temporary and persistent allocation with conservative escape analysis, AARM fine
   reclaim, and compiler-proven long-lived owned-region reclamation for fresh return-only values;
 - terminal and host-managed filesystem operations;
+- explicit lexical-unsafe calls to host-registered fixed-width scalar C-ABI wrappers, with no
+  dynamic loading or ASTER-reference transfer;
 - multifile projects with `Aster.toml` and conventional `Main`;
 - deterministic path dependencies and public HTTPS Git dependencies pinned by `Aster.lock`;
 - restricted `Task<T>`, `await`, and `Parallel` operations with checked worker boundaries,
@@ -32,8 +34,7 @@ The current toolchain includes:
 
 The work before 1.0 is about closing explicit boundaries:
 
-- extend ownership evidence only where useful shared/CFG-spanning shapes can remain deterministic,
-  and define any safe foreign-function or unsafe-code boundary;
+- extend ownership evidence only where useful shared/CFG-spanning shapes can remain deterministic;
 - improve diagnostics and reference coverage as the executable subset grows;
 - finish type-system decisions such as generic constraints and richer pattern handling;
 - apply the documented [pre-1.0 compatibility policy](reference/compatibility.md) as source,

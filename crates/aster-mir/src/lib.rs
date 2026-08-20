@@ -66,7 +66,17 @@ pub struct Module {
     pub interfaces: Vec<InterfaceDefinition>,
     pub enums: Vec<EnumDefinition>,
     pub interface_implementations: Vec<InterfaceImplementation>,
+    pub foreign_functions: Vec<ForeignFunction>,
     pub functions: Vec<Function>,
+}
+
+/// One concrete, linked host binding required by executable MIR.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ForeignFunction {
+    pub symbol: SymbolId,
+    pub name: String,
+    pub parameters: Vec<Type>,
+    pub return_type: Type,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -209,6 +219,14 @@ pub enum Instruction {
         value: Rvalue,
     },
     Call {
+        destination: Option<Place>,
+        function: SymbolId,
+        arguments: Vec<Operand>,
+        return_type: Type,
+    },
+    /// Opaque, effectful, fallible call through an explicitly registered host
+    /// wrapper. The public ABI is validated before code generation.
+    ForeignCall {
         destination: Option<Place>,
         function: SymbolId,
         arguments: Vec<Operand>,

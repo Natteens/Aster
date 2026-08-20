@@ -222,6 +222,7 @@ impl Monomorphizer {
                     self.block(default, &mut environment.clone());
                 }
             }
+            Statement::Unsafe { body, .. } => self.block(body, &mut environment.clone()),
             Statement::Break(_) | Statement::Continue(_) => {}
         }
     }

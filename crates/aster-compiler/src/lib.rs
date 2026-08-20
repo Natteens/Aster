@@ -196,6 +196,7 @@ fn synthesize_default_constructors(module: &mut Module) {
             constructor: true,
             is_static: false,
             is_async: false,
+            is_foreign: false,
             type_parameters: Vec::new(),
             visibility: Visibility::Public,
             return_type: TypeRef::new("void", class.span),

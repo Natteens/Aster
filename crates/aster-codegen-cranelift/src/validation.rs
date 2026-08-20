@@ -81,6 +81,7 @@ pub(super) fn validate_module(module: &mir::Module) -> Result<(), BackendError> 
             )));
         }
     }
+    validate_foreign_abi(module, &signatures)?;
     let classes = module
         .classes
         .iter()
@@ -140,18 +141,19 @@ pub(super) fn validate_module(module: &mir::Module) -> Result<(), BackendError> 
     Ok(())
 }
 
-/// Console and filesystem I/O are rejected anywhere reachable from a
+/// Console/filesystem I/O and foreign calls are rejected anywhere reachable from a
 /// `Task.Run`/`Parallel.For`/`ForEach`/`Reduce` worker body: output order,
 /// input consumption, and file access would be non-deterministic across
 /// workers, and neither backend is shared or synchronized. Builds the whole
 /// module's direct call graph once (`Instruction::Call` edges), marks every
-/// function whose body directly calls a `Console*`/`File*` I/O intrinsic,
+/// function whose body directly calls a host I/O intrinsic or foreign binding,
 /// then, for every worker entry point found anywhere in the module, walks
 /// the graph from its `Function` operand(s) to see whether an I/O-using
 /// function is reachable.
 fn validate_no_console_io_in_workers(module: &mir::Module) -> Result<(), BackendError> {
     let mut callees: HashMap<mir::SymbolId, Vec<mir::SymbolId>> = HashMap::new();
     let mut io_users: HashSet<mir::SymbolId> = HashSet::new();
+    let mut foreign_users: HashSet<mir::SymbolId> = HashSet::new();
     for function in &module.functions {
         let mut direct = Vec::new();
         for block in &function.blocks {
@@ -175,20 +177,23 @@ fn validate_no_console_io_in_workers(module: &mir::Module) -> Result<(), Backend
                     } => {
                         io_users.insert(function.symbol);
                     }
+                    mir::Instruction::ForeignCall { .. } => {
+                        foreign_users.insert(function.symbol);
+                    }
                     _ => {}
                 }
             }
         }
         callees.insert(function.symbol, direct);
     }
-    let reaches_io = |root: mir::SymbolId| -> bool {
+    let reaches = |root: mir::SymbolId, users: &HashSet<mir::SymbolId>| -> bool {
         let mut visited: HashSet<mir::SymbolId> = HashSet::new();
         let mut stack = vec![root];
         while let Some(symbol) = stack.pop() {
             if !visited.insert(symbol) {
                 continue;
             }
-            if io_users.contains(&symbol) {
+            if users.contains(&symbol) {
                 return true;
             }
             if let Some(direct) = callees.get(&symbol) {
@@ -217,13 +222,148 @@ fn validate_no_console_io_in_workers(module: &mir::Module) -> Result<(), Backend
                 };
                 for argument in arguments {
                     if let mir::OperandKind::Function(target) = argument.kind
-                        && reaches_io(target)
+                        && reaches(target, &foreign_users)
+                    {
+                        return Err(BackendError::new(format!(
+                            "function `{}` uses `{worker_name}` with a worker body that (directly or transitively) performs a foreign call, which is rejected in this version",
+                            function.name
+                        )));
+                    }
+                    if let mir::OperandKind::Function(target) = argument.kind
+                        && reaches(target, &io_users)
                     {
                         return Err(BackendError::new(format!(
                             "function `{}` uses `{worker_name}` with a worker body that (directly or transitively) calls `aster.io.Write`/`WriteLine`/`ReadLine`/`ReadAllText`/`WriteAllText`/`ListFiles`, which is rejected in this version",
                             function.name
                         )));
                     }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn foreign_scalar(type_: &mir::Type, allow_void: bool) -> bool {
+    (allow_void && *type_ == mir::Type::Void)
+        || matches!(
+            type_,
+            mir::Type::Bool
+                | mir::Type::SByte
+                | mir::Type::Byte
+                | mir::Type::Short
+                | mir::Type::UShort
+                | mir::Type::Char
+                | mir::Type::Int
+                | mir::Type::UInt
+                | mir::Type::Long
+                | mir::Type::ULong
+                | mir::Type::Float
+                | mir::Type::Double
+        )
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_foreign_abi(
+    module: &mir::Module,
+    functions: &HashMap<mir::SymbolId, &mir::Function>,
+) -> Result<(), BackendError> {
+    let mut declarations = HashMap::new();
+    let mut binding_signatures = Vec::new();
+    for declaration in &module.foreign_functions {
+        if functions.contains_key(&declaration.symbol)
+            || declarations
+                .insert(declaration.symbol, declaration)
+                .is_some()
+        {
+            return Err(BackendError::new(format!(
+                "duplicate foreign function symbol {:?} in MIR",
+                declaration.symbol
+            )));
+        }
+        if declaration.name.is_empty()
+            || !foreign_scalar(&declaration.return_type, true)
+            || declaration
+                .parameters
+                .iter()
+                .any(|parameter| !foreign_scalar(parameter, false))
+        {
+            return Err(BackendError::new(format!(
+                "foreign declaration `{}` has an invalid scalar ABI signature",
+                declaration.name
+            )));
+        }
+        if binding_signatures.iter().any(
+            |(name, parameters, result): &(&str, &[mir::Type], &mir::Type)| {
+                *name == declaration.name
+                    && *parameters == declaration.parameters
+                    && *result == &declaration.return_type
+            },
+        ) {
+            return Err(BackendError::new(format!(
+                "duplicate foreign binding identity `{}` with the same signature in MIR",
+                declaration.name
+            )));
+        }
+        binding_signatures.push((
+            declaration.name.as_str(),
+            declaration.parameters.as_slice(),
+            &declaration.return_type,
+        ));
+    }
+    for function in &module.functions {
+        let locals = function
+            .parameters
+            .iter()
+            .chain(&function.locals)
+            .map(|local| (local.id, &local.type_))
+            .collect::<HashMap<_, _>>();
+        for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+            let mir::Instruction::ForeignCall {
+                destination,
+                function: target,
+                arguments,
+                return_type,
+            } = instruction
+            else {
+                continue;
+            };
+            let declaration = declarations.get(target).ok_or_else(|| {
+                BackendError::new(format!(
+                    "function `{}` calls undeclared foreign symbol {:?}",
+                    function.name, target
+                ))
+            })?;
+            if return_type != &declaration.return_type
+                || arguments.len() != declaration.parameters.len()
+                || arguments
+                    .iter()
+                    .zip(&declaration.parameters)
+                    .any(|(argument, parameter)| &argument.type_ != parameter)
+            {
+                return Err(BackendError::new(format!(
+                    "function `{}` calls foreign declaration `{}` with an invalid signature",
+                    function.name, declaration.name
+                )));
+            }
+            for argument in arguments {
+                validate_operand(argument, &function.name)?;
+            }
+            match (return_type, destination) {
+                (mir::Type::Void, None) => {}
+                (mir::Type::Void, Some(_)) | (_, None) => {
+                    return Err(BackendError::new(format!(
+                        "function `{}` has an invalid foreign result destination",
+                        function.name
+                    )));
+                }
+                (_, Some(mir::Place::Local(local)))
+                    if locals.get(local).is_some_and(|type_| *type_ == return_type) => {}
+                _ => {
+                    return Err(BackendError::new(format!(
+                        "function `{}` has a foreign result destination with the wrong type",
+                        function.name
+                    )));
                 }
             }
         }
@@ -683,7 +823,8 @@ fn validate_instruction(
         mir::Instruction::TemporarySubregionEnter { .. }
         | mir::Instruction::TemporarySubregionExit { .. }
         | mir::Instruction::OwnedRegionEnter { .. }
-        | mir::Instruction::OwnedRegionExit { .. } => Ok(()),
+        | mir::Instruction::OwnedRegionExit { .. }
+        | mir::Instruction::ForeignCall { .. } => Ok(()),
         mir::Instruction::Assign { target, value } => {
             validate_assign(target, value, function_name, locals, implementations)
         }
@@ -1291,6 +1432,11 @@ fn owned_instruction_reads(instruction: &mir::Instruction, reads: &mut HashSet<m
             owned_rvalue_reads(value, reads);
         }
         mir::Instruction::Call {
+            destination,
+            arguments,
+            ..
+        }
+        | mir::Instruction::ForeignCall {
             destination,
             arguments,
             ..
@@ -2230,6 +2376,7 @@ fn temporary_subregion_instruction_is_executable(instruction: &mir::Instruction)
         | mir::Instruction::OwnedRegionEnter { .. }
         | mir::Instruction::OwnedRegionExit { .. }
         | mir::Instruction::Call { .. }
+        | mir::Instruction::ForeignCall { .. }
         | mir::Instruction::CallInterface { .. }
         | mir::Instruction::AllocateList {
             region: mir::AllocationRegion::Persistent,
@@ -5983,6 +6130,7 @@ mod tests {
             interfaces: Vec::new(),
             enums: Vec::new(),
             interface_implementations: Vec::new(),
+            foreign_functions: Vec::new(),
             functions: vec![mir::Function {
                 constructor: false,
                 symbol: mir::SymbolId(1),
@@ -6073,6 +6221,7 @@ mod tests {
             interfaces: Vec::new(),
             enums: Vec::new(),
             interface_implementations: Vec::new(),
+            foreign_functions: Vec::new(),
             functions: vec![mir::Function {
                 constructor: false,
                 symbol: mir::SymbolId(77),
@@ -6313,6 +6462,7 @@ mod tests {
             interfaces: Vec::new(),
             enums: Vec::new(),
             interface_implementations: Vec::new(),
+            foreign_functions: Vec::new(),
             functions: vec![mir::Function {
                 constructor: false,
                 symbol: mir::SymbolId(1),
@@ -6402,6 +6552,7 @@ mod tests {
             interfaces: Vec::new(),
             enums: Vec::new(),
             interface_implementations: Vec::new(),
+            foreign_functions: Vec::new(),
             functions: vec![mir::Function {
                 constructor: false,
                 symbol: mir::SymbolId(1),
@@ -6537,6 +6688,7 @@ mod tests {
             interfaces: Vec::new(),
             enums: Vec::new(),
             interface_implementations: Vec::new(),
+            foreign_functions: Vec::new(),
             functions: vec![mir::Function {
                 constructor: false,
                 symbol: mir::SymbolId(1),
@@ -6714,6 +6866,7 @@ mod tests {
             interfaces: Vec::new(),
             enums: Vec::new(),
             interface_implementations: Vec::new(),
+            foreign_functions: Vec::new(),
             functions: vec![mir::Function {
                 constructor: false,
                 symbol: mir::SymbolId(1),

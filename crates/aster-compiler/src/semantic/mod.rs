@@ -143,6 +143,9 @@ pub(crate) enum ResolvedPropagation {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Model {
     pub calls: HashMap<ModelNodeKey, ResolvedCall>,
+    /// Call sites resolved to a concrete host-provided foreign declaration.
+    /// HIR consumes this semantic decision; later stages never inspect names.
+    pub foreign_calls: HashSet<ModelNodeKey>,
     pub constructors: HashMap<ModelNodeKey, CallableKey>,
     pub property_reads: HashMap<ModelNodeKey, CallableKey>,
     pub property_assignments: HashMap<ModelNodeKey, ResolvedPropertyAssignment>,

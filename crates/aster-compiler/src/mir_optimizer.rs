@@ -416,12 +416,13 @@ fn rewrite_instruction_operands(
                 operand!(argument);
             }
         }
-        mir::Instruction::CallIntrinsic { destination, .. } => {
+        mir::Instruction::CallIntrinsic { destination, .. }
+        | mir::Instruction::ForeignCall { destination, .. } => {
             if let Some(destination) = destination {
                 place!(destination);
             }
-            // Runtime intrinsics may require a specific operand shape in
-            // addition to its type, so their arguments stay opaque.
+            // Runtime intrinsics and host calls may require exact operand
+            // shapes, so their arguments stay opaque.
         }
         mir::Instruction::CallInterface {
             destination,

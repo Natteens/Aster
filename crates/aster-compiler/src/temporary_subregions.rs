@@ -2062,6 +2062,7 @@ mod tests {
             interfaces: Vec::new(),
             enums: Vec::new(),
             interface_implementations: Vec::new(),
+            foreign_functions: Vec::new(),
             functions,
         }
     }

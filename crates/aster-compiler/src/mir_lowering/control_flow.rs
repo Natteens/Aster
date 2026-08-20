@@ -74,6 +74,7 @@ impl FunctionLowerer {
                     .continue_block;
                 self.terminate_current(mir::Terminator::Goto(target));
             }
+            hir::Statement::Block(block) => self.lower_block(block),
         }
     }
 

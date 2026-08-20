@@ -301,6 +301,7 @@ pub fn walk_statement_mut<V: AstVisitorMut + ?Sized>(visitor: &mut V, statement:
                 visitor.visit_block_mut(default);
             }
         }
+        Statement::Unsafe { body, .. } => visitor.visit_block_mut(body),
         Statement::Expression(expression) => visitor.visit_expression_mut(expression),
         Statement::Break(_) | Statement::Continue(_) => {}
     }

@@ -823,7 +823,16 @@ impl Lowerer<'_> {
                         }
                         argument
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
+                if self.model.foreign_calls.contains(&model_key) {
+                    return hir::Expression {
+                        type_,
+                        kind: hir::ExpressionKind::ForeignCall {
+                            function: symbol,
+                            arguments,
+                        },
+                    };
+                }
                 let callee = match resolved.dispatch {
                     crate::semantic::Dispatch::Direct => hir::Expression {
                         type_: hir::Type::Unknown,

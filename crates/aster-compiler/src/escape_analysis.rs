@@ -516,6 +516,7 @@ fn instruction_uses_alias(instruction: &mir::Instruction, aliases: &HashSet<mir:
         | mir::Instruction::TemporarySubregionEnter { .. }
         | mir::Instruction::TemporarySubregionExit { .. }
         | mir::Instruction::Call { .. }
+        | mir::Instruction::ForeignCall { .. }
         | mir::Instruction::CallInterface { .. }
         | mir::Instruction::CallIntrinsic { .. } => false,
     }
@@ -831,6 +832,10 @@ fn instruction_escape(
                 None
             }
         }
+        mir::Instruction::ForeignCall { arguments, .. } => arguments
+            .iter()
+            .any(|argument| direct_alias(argument, aliases).is_some())
+            .then_some(EscapeReason::PassedToCall),
         mir::Instruction::CallIntrinsic {
             intrinsic,
             arguments,
@@ -1567,6 +1572,7 @@ mod tests {
             interfaces: Vec::new(),
             enums: Vec::new(),
             interface_implementations: Vec::new(),
+            foreign_functions: Vec::new(),
             functions: vec![mir::Function {
                 constructor: false,
                 symbol: mir::SymbolId(1),

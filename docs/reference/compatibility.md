@@ -50,6 +50,13 @@ execution context. `Task.WaitAll` orders successful results and selected failure
 not scheduler completion. Cooperative cancellation changes only the terminal outcome of a task
 whose request was accepted; it does not forcibly stop a worker or introduce hidden polling.
 
+The minimal native FFI is additive and explicitly unsafe. Existing programs do not acquire native
+behavior implicitly. Its source contract is the documented `unsafe foreign` declaration and lexical
+`unsafe` call block; its fixed-width status/out-pointer wrapper is an embedding boundary, not a
+stable standalone ASTER runtime ABI. Foreign calls are observable and fallible, retain evaluation
+order, and are never removed by generic MIR DCE. No ASTER reference or worker-owned value crosses
+this boundary.
+
 The absence of a diagnostic for an unsupported program is also not a promise that the behavior is
 supported. Unsupported execution must continue to fail before unsafe code generation.
 

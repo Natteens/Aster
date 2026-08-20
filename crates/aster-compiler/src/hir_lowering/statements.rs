@@ -139,6 +139,7 @@ impl Lowerer<'_> {
             }
             ast::Statement::Break(_) => hir::Statement::Break,
             ast::Statement::Continue(_) => hir::Statement::Continue,
+            ast::Statement::Unsafe { body, .. } => hir::Statement::Block(self.block(body)),
         })
     }
 

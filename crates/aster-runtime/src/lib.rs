@@ -13,6 +13,7 @@
 mod arena;
 pub mod context;
 pub mod filesystem;
+pub mod foreign;
 pub mod io;
 pub mod io_error;
 pub mod log;
@@ -44,6 +45,7 @@ pub use filesystem::{
     StdFileSystemBackend, aster_rt_io_list_files, aster_rt_io_list_files_temporary,
     aster_rt_io_read_all_text, aster_rt_io_read_all_text_temporary, aster_rt_io_write_all_text,
 };
+pub use foreign::{ForeignRegistry, ForeignRegistryError, ForeignSignature, ForeignType};
 pub use io::{
     ConsoleBackend, FailingConsoleBackend, MemoryConsoleBackend, StdConsoleBackend,
     aster_rt_io_read_line, aster_rt_io_read_line_temporary, aster_rt_io_write,

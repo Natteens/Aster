@@ -47,10 +47,12 @@ struct Parser {
 /// The declaration modifiers already parsed before a function's name, grouped
 /// so `function_after_name` keeps a small argument list.
 #[derive(Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
 struct FunctionModifiers {
     visibility: Visibility,
     is_static: bool,
     is_async: bool,
+    is_foreign: bool,
 }
 
 impl Parser {
@@ -276,6 +278,17 @@ impl Parser {
     fn item(&mut self) -> Option<Item> {
         let start = self.current().span.start;
         let visibility = self.visibility(Visibility::Internal);
+        // Contextual rather than reserved keywords: existing declarations may
+        // still use `unsafe` or `foreign` as ordinary identifiers.
+        let is_foreign = if self.at_identifier("unsafe")
+            && matches!(&self.peek(1).kind, TokenKind::Identifier(name) if name == "foreign")
+        {
+            self.advance();
+            self.advance();
+            true
+        } else {
+            false
+        };
         let is_static = self.take(&TokenKind::Static).is_some();
         let async_token = self.take(&TokenKind::Async);
         let is_async = async_token.is_some();
@@ -301,6 +314,25 @@ impl Parser {
                 .with_help("write `static` before `class`, or remove the modifier"),
             );
         }
+        if is_foreign
+            && matches!(
+                self.current().kind,
+                TokenKind::Class
+                    | TokenKind::Struct
+                    | TokenKind::Interface
+                    | TokenKind::Enum
+                    | TokenKind::Const
+                    | TokenKind::Var
+            )
+        {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "`unsafe foreign` applies only to a top-level function declaration",
+                    self.current().span,
+                )
+                .with_help("declare a concrete bodyless function signature ending in `;`"),
+            );
+        }
         match &self.current().kind {
             TokenKind::Class => self
                 .type_declaration(visibility, start, TypeKind::Class, is_static)
@@ -315,7 +347,9 @@ impl Parser {
             TokenKind::Const | TokenKind::Var => {
                 self.variable(Some(visibility)).map(Item::Variable)
             }
-            _ if self.is_type_start() => self.typed_module_item(visibility, start, is_async),
+            _ if self.is_type_start() => {
+                self.typed_module_item(visibility, start, is_async, is_foreign)
+            }
             _ => None,
         }
     }
@@ -460,6 +494,7 @@ impl Parser {
                         visibility,
                         is_static: false,
                         is_async: false,
+                        is_foreign: false,
                     },
                     TypeRef::new("void", token.span),
                     owner_name.to_owned(),
@@ -479,6 +514,7 @@ impl Parser {
                     visibility,
                     is_static,
                     is_async,
+                    is_foreign: false,
                 },
                 type_ref,
                 name,
@@ -524,6 +560,7 @@ impl Parser {
         visibility: Visibility,
         start: usize,
         is_async: bool,
+        is_foreign: bool,
     ) -> Option<Item> {
         let type_ref = self.type_ref()?;
         let (name, _) = self.identifier()?;
@@ -533,6 +570,7 @@ impl Parser {
                     visibility,
                     is_static: false,
                     is_async,
+                    is_foreign,
                 },
                 type_ref,
                 name,
@@ -541,6 +579,15 @@ impl Parser {
             )
             .map(Item::Function)
         } else {
+            if is_foreign {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "`unsafe foreign` applies only to a top-level function declaration",
+                        type_ref.span,
+                    )
+                    .with_help("declare a concrete bodyless function signature ending in `;`"),
+                );
+            }
             if is_async {
                 self.diagnostics.push(
                     Diagnostic::error("only functions can be `async`", type_ref.span)
@@ -569,6 +616,7 @@ impl Parser {
             visibility,
             is_static,
             is_async,
+            is_foreign,
         } = modifiers;
         let mut type_parameters = self.type_parameters()?;
         self.expect(&TokenKind::LeftParen)?;
@@ -576,12 +624,19 @@ impl Parser {
         let right_paren = self.expect(&TokenKind::RightParen)?;
         // Covers both bodied functions and signature-only interface members.
         self.where_clauses(&mut type_parameters)?;
-        if signature_only {
+        if is_foreign && !type_parameters.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error("foreign functions cannot be generic", self.current().span)
+                    .with_help("declare one concrete foreign signature per host binding"),
+            );
+        }
+        if signature_only || is_foreign {
             let end = self.expect(&TokenKind::Semicolon)?.span.end;
             Some(FunctionDeclaration {
                 constructor: false,
                 is_static,
                 is_async,
+                is_foreign,
                 type_parameters,
                 visibility,
                 return_type,
@@ -597,6 +652,7 @@ impl Parser {
                 constructor: false,
                 is_static,
                 is_async,
+                is_foreign,
                 type_parameters,
                 visibility,
                 return_type,
@@ -840,6 +896,12 @@ impl Parser {
     }
 
     fn statement(&mut self) -> Option<Statement> {
+        if self.at_identifier("unsafe") && self.peek(1).kind == TokenKind::LeftBrace {
+            let start = self.advance().span.start;
+            let body = self.block()?;
+            let span = Span::new(start, body.span.end);
+            return Some(Statement::Unsafe { body, span });
+        }
         if self.at(&TokenKind::If) {
             return self.if_statement();
         }
@@ -2054,6 +2116,10 @@ impl Parser {
 
     fn at(&self, expected: &TokenKind) -> bool {
         discriminant(&self.current().kind) == discriminant(expected)
+    }
+
+    fn at_identifier(&self, expected: &str) -> bool {
+        matches!(&self.current().kind, TokenKind::Identifier(name) if name == expected)
     }
 
     fn current(&self) -> &Token {

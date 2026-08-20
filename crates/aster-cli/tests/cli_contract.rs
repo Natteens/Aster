@@ -149,6 +149,25 @@ fn check_and_dumps_publish_output_only_after_success() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(stdout(&output).trim(), "42");
 
+    let foreign = directory.join("foreign.aster");
+    fs::write(
+        &foreign,
+        "using aster.io; public unsafe foreign int Native(); public class Program { public static int Main() { WriteLine(\"must not run\"); unsafe { return Native(); } } }",
+    )
+    .expect("write foreign source");
+    let foreign = foreign.to_str().expect("UTF-8 foreign source");
+    for command in ["check", "dump-hir", "dump-mir"] {
+        let output = aster(&directory, [command, foreign]);
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        assert!(stderr(&output).is_empty());
+        assert!(!stdout(&output).is_empty());
+    }
+    let output = aster(&directory, ["run", foreign]);
+    assert_failure(&output);
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).contains("missing foreign binding"));
+    assert_diagnostic_is_controlled(&output);
+
     let invalid = directory.join("invalid.aster");
     fs::write(&invalid, "public class Program {").expect("write invalid source");
     for command in ["check", "dump-hir", "dump-mir"] {

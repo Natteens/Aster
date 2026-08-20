@@ -104,9 +104,23 @@ pub(super) fn lower(module: &hir::Module) -> mir::Module {
             .collect::<HashMap<_, _>>(),
     );
     let mut functions = Vec::new();
+    let mut foreign_functions = Vec::new();
     for item in &module.items {
         match item {
             hir::Item::Function(function) => {
+                if function.is_foreign {
+                    foreign_functions.push(mir::ForeignFunction {
+                        symbol: function.symbol,
+                        name: function.name.clone(),
+                        parameters: function
+                            .parameters
+                            .iter()
+                            .map(|parameter| parameter.type_.clone())
+                            .collect(),
+                        return_type: function.return_type.clone(),
+                    });
+                    continue;
+                }
                 push_function(
                     &mut functions,
                     function,
@@ -137,6 +151,7 @@ pub(super) fn lower(module: &hir::Module) -> mir::Module {
         interfaces,
         enums,
         interface_implementations,
+        foreign_functions,
         functions,
     }
 }

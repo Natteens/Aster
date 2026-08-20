@@ -89,10 +89,14 @@ pub struct Field {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct FunctionDeclaration {
     pub constructor: bool,
     pub is_static: bool,
     pub is_async: bool,
+    /// Host-provided native declaration. Foreign functions are bodyless,
+    /// free functions and are executable only from a lexical `unsafe` block.
+    pub is_foreign: bool,
     pub type_parameters: Vec<TypeParameter>,
     pub visibility: Visibility,
     pub return_type: TypeRef,

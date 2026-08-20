@@ -26,6 +26,7 @@ use crate::filesystem::{
     aster_rt_io_list_files, aster_rt_io_list_files_temporary, aster_rt_io_read_all_text,
     aster_rt_io_read_all_text_temporary, aster_rt_io_write_all_text,
 };
+use crate::foreign::aster_rt_foreign_error;
 use crate::io::{
     aster_rt_io_read_line, aster_rt_io_read_line_temporary, aster_rt_io_write,
     aster_rt_io_write_line,
@@ -95,6 +96,14 @@ pub struct RuntimeFunction {
 #[allow(clippy::too_many_lines)]
 pub fn runtime_functions() -> Vec<RuntimeFunction> {
     vec![
+        RuntimeFunction {
+            name: "aster_rt_foreign_error",
+            address: aster_rt_foreign_error as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::I32, RuntimeType::I64],
+                result: None,
+            },
+        },
         RuntimeFunction {
             name: "aster_rt_log",
             address: aster_rt_log as *const u8,

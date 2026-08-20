@@ -60,7 +60,9 @@ Cranelift; the backend has no generic ABI or type-erasure path. See
 The semantic analyzer builds initial type/function/local symbol tables and checks visibility,
 declarations, types, calls, expressions, variables, constants, lexical scopes, loop context,
 all-path returns, worker-transfer boundaries, host-operation restrictions, and unreachable-code
-warnings.
+warnings. Top-level `unsafe foreign` declarations participate in ordinary namespace, visibility,
+overload, and callable identity resolution. A foreign call is accepted only inside a lexical
+`unsafe` block and is rejected from direct or transitive Task/Parallel worker bodies.
 
 After validation succeeds, the compiler lowers general-language AST nodes to typed HIR and then lowers
 HIR to control-flow-explicit MIR.
@@ -98,7 +100,10 @@ and records checked types on expressions. It represents declarations, functions,
 calls, operators, assignments, literals, variables, constants, and typed compiler-known operations
 for collections, host I/O, tasks, and restricted parallel execution.
 
-HIR does not embed MIR, machine instructions, Cranelift integration, or execution.
+HIR represents a resolved foreign call explicitly with its declaration symbol, typed arguments,
+and typed result. The source-only unsafe block has already served its semantic authorization and
+lowers as an ordinary block. HIR does not embed MIR, machine instructions, Cranelift integration,
+or execution.
 
 ### `aster-mir`
 
@@ -110,6 +115,9 @@ fallthrough from `void` functions.
 `if`/`else`, `while`, `for`, and `switch` no longer exist as structured MIR nodes. Their behavior is expressed as
 edges between basic blocks. MIR remains backend-independent: it does not select machine instructions,
 define an ABI, invoke Cranelift, or execute programs.
+
+MIR has a typed foreign-declaration table and an opaque, effectful `ForeignCall` instruction. It
+contains no raw pointer, Cranelift signature, library path, or dynamic symbol name.
 
 MIR functions retain their visibility and optional owning type. This lets a backend enforce entry and
 feature boundaries without consulting HIR or source syntax.
@@ -176,6 +184,17 @@ intrinsics with checked runtime ABI calls; Cranelift does not inspect public `Ma
 collection source names or standard-library paths. Those operations remain opaque to the general
 MIR optimizer and retain their allocation/failure ordering.
 
+Minimal native FFI follows the same typed authority. Before JIT finalization, Cranelift validates
+each foreign declaration/call and resolves its fully linked identity plus exact scalar signature
+against an execution-scoped `aster-runtime` registry. The resolved wrapper is imported once into
+the JIT module. Each call passes fixed-width C-ABI scalars and, for non-void results, one aligned
+hidden out pointer; the wrapper returns an `i32` status. Generated code publishes a result only
+after status zero and bool/char validation. Foreign calls remain opaque effect/failure and lifetime
+barriers to the optimizer and memory passes. Cranelift performs no name heuristic, dynamic loading,
+signature inference, or registry lookup on each executed call. It validates the registered
+descriptor, not the opaque native address itself; the host's explicit unsafe registration owns that
+actual C-ABI and no-unwind assertion.
+
 Task callables are likewise concrete before HIR. `Task.Run` value arguments are evaluated in the
 caller and lowered as ordinary typed MIR operands after the resolved callable identity. Cranelift
 uses the existing aggregate layout authority to pack a caller frame; the host copies it into a
@@ -198,6 +217,10 @@ request/terminal compare-exchange is the cancellation linearization point; the w
 completed or failed outcome through the task's completion channel only after fixing that terminal
 state. Async MoveNext contexts receive an `Arc` clone of the same private control on every resume.
 It also owns the central registry of exported runtime functions with backend-neutral signatures.
+Separately, `ForeignRegistry` is an embedding-host-owned, cloneable value containing only canonical
+declaration names, backend-neutral fixed-width scalar signatures, and opaque wrapper addresses.
+It has no global state, loader, compiler types, or Cranelift types; independent executions may bind
+the same declaration differently.
 The crate depends on no other ASTER crate and exposes no Cranelift types.
 
 ### `aster-cli`

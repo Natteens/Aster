@@ -129,6 +129,12 @@ impl Analyzer<'_> {
                 self.expression(expression);
                 Flow::CONTINUE
             }
+            Statement::Unsafe { body, .. } => {
+                self.unsafe_depth += 1;
+                let flow = self.block(body, true);
+                self.unsafe_depth -= 1;
+                flow
+            }
             Statement::If {
                 condition,
                 then_block,

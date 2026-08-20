@@ -357,6 +357,7 @@ fn instruction_is_legal(instruction: &mir::Instruction, candidate: &Candidate) -
                     .iter()
                     .all(|operand| operand_is_legal(operand, candidate))
         }
+        mir::Instruction::ForeignCall { .. } => false,
         mir::Instruction::CallInterface {
             destination,
             receiver,
@@ -830,7 +831,8 @@ fn rewrite_instruction(
         mir::Instruction::TemporarySubregionEnter { .. }
         | mir::Instruction::TemporarySubregionExit { .. }
         | mir::Instruction::OwnedRegionEnter { .. }
-        | mir::Instruction::OwnedRegionExit { .. } => {}
+        | mir::Instruction::OwnedRegionExit { .. }
+        | mir::Instruction::ForeignCall { .. } => {}
     }
 }
 

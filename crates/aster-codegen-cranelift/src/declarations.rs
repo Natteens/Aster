@@ -5,6 +5,31 @@ use super::{
 };
 
 impl Codegen {
+    pub(super) fn declare_foreign_functions(
+        &mut self,
+        module: &mir::Module,
+    ) -> Result<(), BackendError> {
+        for function in &module.foreign_functions {
+            let mut signature = self.jit.make_signature();
+            for parameter in &function.parameters {
+                signature
+                    .params
+                    .push(AbiParam::new(self.clif_value_type(parameter)?));
+            }
+            if function.return_type != mir::Type::Void {
+                signature.params.push(AbiParam::new(self.pointer_type));
+            }
+            signature.returns.push(AbiParam::new(types::I32));
+            let name = format!("aster_foreign_{}", function.symbol.0);
+            let id = self
+                .jit
+                .declare_function(&name, Linkage::Import, &signature)
+                .map_err(module_error)?;
+            self.foreign_ids.insert(function.symbol, id);
+        }
+        Ok(())
+    }
+
     pub(super) fn declare_functions(
         &mut self,
         mir_module: &mir::Module,

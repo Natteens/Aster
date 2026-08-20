@@ -63,6 +63,7 @@ struct Callable {
     signature: Signature,
     visibility: Visibility,
     is_static: bool,
+    is_foreign: bool,
     key: CallableKey,
 }
 
@@ -157,6 +158,7 @@ struct Analyzer<'a> {
     loop_depth: usize,
     model_context: String,
     async_state: AsyncAnalysisState,
+    unsafe_depth: usize,
 }
 
 impl<'a> Analyzer<'a> {
@@ -205,6 +207,7 @@ impl<'a> Analyzer<'a> {
             loop_depth: 0,
             model_context,
             async_state: AsyncAnalysisState::OutsideAsync,
+            unsafe_depth: 0,
         }
     }
 

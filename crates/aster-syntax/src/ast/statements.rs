@@ -48,6 +48,10 @@ pub enum Statement {
     },
     Break(Span),
     Continue(Span),
+    Unsafe {
+        body: Block,
+        span: Span,
+    },
     Expression(Expression),
 }
 
@@ -62,6 +66,7 @@ impl Statement {
             | Self::For { span, .. }
             | Self::ForEach { span, .. }
             | Self::Switch { span, .. }
+            | Self::Unsafe { span, .. }
             | Self::Break(span)
             | Self::Continue(span) => *span,
             Self::Expression(expression) => expression.span,

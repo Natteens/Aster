@@ -403,6 +403,7 @@ impl Lowerer<'_> {
             constructor: function.constructor,
             is_static: function.is_static,
             is_async: function.is_async,
+            is_foreign: function.is_foreign,
             symbol,
             name: function.name.clone(),
             visibility: visibility(function.visibility),
@@ -574,6 +575,7 @@ fn accessor_function(
         constructor: false,
         is_static: false,
         is_async: false,
+        is_foreign: false,
         type_parameters: Vec::new(),
         visibility: accessor.visibility,
         return_type: if getter {

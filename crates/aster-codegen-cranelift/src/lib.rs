@@ -32,7 +32,10 @@ use std::{
 };
 
 use aster_mir as mir;
-pub use aster_runtime::{AarmMemoryTelemetry, MemoryStats};
+pub use aster_runtime::{
+    AarmMemoryTelemetry, ForeignRegistry, ForeignRegistryError, ForeignSignature, ForeignType,
+    MemoryStats,
+};
 use aster_runtime::{RuntimeType, runtime_functions};
 use aster_types::Primitive;
 use cranelift_codegen::ir::{
@@ -47,7 +50,6 @@ use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, default
 
 use backend::module_error;
 use declarations::runtime_type;
-use execution::execute_resolved;
 #[cfg(feature = "aarm-telemetry")]
 use execution::execute_resolved_with_aarm_async_governor;
 #[cfg(feature = "aarm-telemetry")]
@@ -58,6 +60,7 @@ use execution::execute_resolved_with_aarm_parallel_workers;
 use execution::execute_resolved_with_aarm_task_governor;
 #[cfg(feature = "aarm-telemetry")]
 use execution::execute_resolved_with_aarm_telemetry;
+use execution::{execute_resolved, execute_resolved_with_foreign_registry};
 #[cfg(feature = "aarm-telemetry")]
 #[doc(hidden)]
 pub use host_memory::{
@@ -85,6 +88,7 @@ struct Codegen {
     pointer_type: ClifType,
     string_data: HashMap<String, DataId>,
     runtime_ids: HashMap<&'static str, FuncId>,
+    foreign_ids: HashMap<mir::SymbolId, FuncId>,
     interface_tables: HashMap<(mir::SymbolId, mir::SymbolId), DataId>,
     interface_methods:
         HashMap<mir::SymbolId, (mir::SymbolId, usize, mir::InterfaceMethodDefinition)>,
@@ -280,6 +284,39 @@ pub fn execute(module: &mir::Module, function_name: &str) -> Result<ExecutionVal
     validate_module(module)?;
     let entry = select_entry(module, function_name)?;
     execute_resolved(module, entry, false, None, None).map(|(value, _)| value)
+}
+
+/// Compile and execute with one explicit, execution-scoped native binding
+/// registry. Missing or mismatched bindings fail during JIT preparation,
+/// before any ASTER instruction executes.
+///
+/// # Errors
+///
+/// Returns a controlled validation, binding, compilation, or runtime error.
+pub fn execute_with_foreign_registry(
+    module: &mir::Module,
+    function_name: &str,
+    registry: &ForeignRegistry,
+) -> Result<ExecutionValue, BackendError> {
+    validate_module(module)?;
+    let entry = select_entry(module, function_name)?;
+    execute_resolved_with_foreign_registry(module, entry, registry, false).map(|(value, _)| value)
+}
+
+/// Like [`execute_with_foreign_registry`], but also returns ASTER runtime
+/// allocation metrics. Host-owned allocations remain outside these metrics.
+///
+/// # Errors
+///
+/// Returns a controlled validation, binding, compilation, or runtime error.
+pub fn execute_with_foreign_registry_and_stats(
+    module: &mir::Module,
+    function_name: &str,
+    registry: &ForeignRegistry,
+) -> Result<(ExecutionValue, MemoryStats), BackendError> {
+    validate_module(module)?;
+    let entry = select_entry(module, function_name)?;
+    execute_resolved_with_foreign_registry(module, entry, registry, true)
 }
 
 /// Like [`execute`], but also returns runtime allocation metrics.
@@ -656,6 +693,26 @@ pub fn execute_symbol(
         .ok_or_else(|| BackendError::new(format!("entry symbol {symbol:?} was not found")))?;
     validate_invocable_entry(entry, &entry.name)?;
     execute_resolved(module, entry, false, None, None).map(|(value, _)| value)
+}
+
+/// Symbol-selected counterpart of [`execute_with_foreign_registry`].
+///
+/// # Errors
+///
+/// Returns a controlled entry, validation, binding, compilation, or runtime error.
+pub fn execute_symbol_with_foreign_registry(
+    module: &mir::Module,
+    symbol: mir::SymbolId,
+    registry: &ForeignRegistry,
+) -> Result<ExecutionValue, BackendError> {
+    validate_module(module)?;
+    let entry = module
+        .functions
+        .iter()
+        .find(|function| function.symbol == symbol)
+        .ok_or_else(|| BackendError::new(format!("entry symbol {symbol:?} was not found")))?;
+    validate_invocable_entry(entry, &entry.name)?;
+    execute_resolved_with_foreign_registry(module, entry, registry, false).map(|(value, _)| value)
 }
 
 /// Like [`execute_symbol`], but also returns runtime allocation metrics.

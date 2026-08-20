@@ -271,6 +271,7 @@ fn module(iterations: usize, shape: AllocationShape, helper_scoped: bool) -> mir
         interfaces: Vec::new(),
         enums: Vec::new(),
         interface_implementations: Vec::new(),
+        foreign_functions: Vec::new(),
         functions,
     }
 }
@@ -350,6 +351,7 @@ fn nested_module(
         interfaces: Vec::new(),
         enums: Vec::new(),
         interface_implementations: Vec::new(),
+        foreign_functions: Vec::new(),
         functions: vec![run],
     }
 }
@@ -410,6 +412,7 @@ fn compute_mixed_module(iterations: usize, scalar_operations: usize) -> mir::Mod
         interfaces: Vec::new(),
         enums: Vec::new(),
         interface_implementations: Vec::new(),
+        foreign_functions: Vec::new(),
         functions: vec![run],
     }
 }

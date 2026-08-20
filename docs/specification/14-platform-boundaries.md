@@ -123,9 +123,21 @@ contract. Future ECS research does not gain compiler integration merely by being
 
 ### ACCEPTED — Initial foreign-function boundary
 
-No user-facing FFI syntax is accepted or implemented yet. When ASTER first
-exposes foreign calls, they must be explicitly unsafe and target only
-host-registered C-ABI functions. The initial source-level signature surface is
+ASTER exposes top-level, bodyless foreign declarations through the contextual
+`unsafe foreign` modifier pair:
+
+```aster
+public unsafe foreign int NativeAdd(int left, int right);
+```
+
+Calling one requires a lexical `unsafe` block. The block authorizes only the
+accepted foreign operation; it does not introduce pointers, reference escape,
+or a general unsafe type system. A normal function may contain the block and
+provide an ordinary safe wrapper to its callers. `unsafe` and `foreign` remain
+ordinary identifier spellings outside these grammatical positions.
+
+Foreign calls target only explicitly host-registered C-ABI functions. The
+source-level signature surface is
 `void` plus fixed-width scalars: `bool`/`sbyte`/`byte` (8-bit),
 `short`/`ushort` (16-bit), `char`/`int`/`uint` (32-bit, with `char` a validated
 Unicode scalar), `long`/`ulong` (64-bit), `float` (binary32), and `double`
@@ -146,6 +158,11 @@ ASTER caller receives only scalar values or `void` and never frees foreign
 memory. A non-zero native status must become a controlled ASTER runtime error;
 native panics or unwinds must not cross `extern "C"`.
 
-The exact `unsafe` and foreign-declaration syntax remains deliberately
-undefined. It requires a separate language decision; no backend may infer this
-boundary from textual type names.
+The execution host owns a registry keyed by the fully linked declaration identity and exact
+structural signature. ASTER validates that descriptor against the resolved source declaration, but
+the host's explicit unsafe registration remains responsible for truthfully asserting the actual C
+ABI and no-unwind behavior of an arbitrary supplied address. JIT setup resolves every declaration
+before running user code; a missing or mismatched registration fails deterministically. The registry
+contains supplied wrapper addresses only and performs no dynamic-library loading or operating-system
+symbol lookup. See the
+[native FFI reference](../reference/native-ffi.md) for the exact wrapper contract and exclusions.

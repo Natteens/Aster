@@ -873,6 +873,22 @@ impl Analyzer<'_> {
         };
         let model_key = self.model_key(span);
         let callable_key = callable.key.clone();
+        if callable.is_foreign {
+            if self.unsafe_depth == 0 {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "foreign call `{}` requires an `unsafe` block",
+                            callable_key.name
+                        ),
+                        span,
+                    )
+                    .with_help("wrap only the foreign call in `unsafe { ... }`"),
+                );
+            } else {
+                self.model.foreign_calls.insert(model_key.clone());
+            }
+        }
         if callable_key.owner.as_deref() == Some(crate::standard_library::STRING_BUILDER_NAME) {
             let operation = match callable_key.name.as_str() {
                 "Append" => Some(ResolvedStringBuilderOperation::Append),

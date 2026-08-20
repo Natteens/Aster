@@ -214,10 +214,12 @@ pub struct Field {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Function {
     pub constructor: bool,
     pub is_static: bool,
     pub is_async: bool,
+    pub is_foreign: bool,
     pub symbol: SymbolId,
     pub name: String,
     pub visibility: Visibility,
@@ -283,6 +285,9 @@ pub enum Statement {
     },
     Break,
     Continue,
+    /// A lexical source block whose safety marker has already been consumed
+    /// by semantic analysis.
+    Block(Block),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -512,6 +517,11 @@ pub enum ExpressionKind {
     },
     Call {
         callee: Box<Expression>,
+        arguments: Vec<Expression>,
+    },
+    /// Resolved call to one concrete host-provided declaration.
+    ForeignCall {
+        function: SymbolId,
         arguments: Vec<Expression>,
     },
     PropertyAssignment {

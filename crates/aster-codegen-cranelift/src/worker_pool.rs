@@ -958,10 +958,11 @@ fn run_task_job(
 /// the worker reports the cause and exits without entering the job loop.
 fn worker_loop(
     module: &mir::Module,
+    foreign_registry: &aster_runtime::ForeignRegistry,
     queue: &JobQueue,
     ready: &mpsc::Sender<Result<(), BackendError>>,
 ) {
-    let program = match PreparedProgram::prepare(module) {
+    let program = match PreparedProgram::prepare_with_foreign_registry(module, foreign_registry) {
         Ok(program) => program,
         Err(error) => {
             let _ = ready.send(Err(error));
@@ -1038,6 +1039,7 @@ pub(super) struct ExecutionPool {
     // itself before the pool exists.
     #[allow(dead_code)]
     module: Arc<mir::Module>,
+    foreign_registry: Arc<aster_runtime::ForeignRegistry>,
     queue: Arc<JobQueue>,
     // A mutex so `shutdown` can join every worker from `&self`: `submit` and
     // `shutdown` both need to be callable without consuming the pool, since
@@ -1052,7 +1054,20 @@ impl ExecutionPool {
     /// Validate `module` once. Workers are prepared lazily as concurrency is
     /// actually requested, so one tiny task does not compile the module once
     /// per available CPU before doing useful work.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn new(module: Arc<mir::Module>, worker_count: usize) -> Result<Self, BackendError> {
+        Self::new_with_foreign_registry(
+            module,
+            worker_count,
+            Arc::new(aster_runtime::ForeignRegistry::new()),
+        )
+    }
+
+    pub(super) fn new_with_foreign_registry(
+        module: Arc<mir::Module>,
+        worker_count: usize,
+        foreign_registry: Arc<aster_runtime::ForeignRegistry>,
+    ) -> Result<Self, BackendError> {
         if worker_count == 0 {
             return Err(BackendError::new(
                 "execution pool requires at least one worker",
@@ -1065,6 +1080,7 @@ impl ExecutionPool {
             .map_err(|_| BackendError::new("execution pool worker capacity exceeds host limits"))?;
         Ok(Self {
             module,
+            foreign_registry,
             queue: Arc::new(JobQueue::new()),
             workers: Mutex::new(workers),
             max_workers: worker_count,
@@ -1118,6 +1134,7 @@ impl ExecutionPool {
             .map_err(|_| BackendError::new("worker preparation capacity exceeds host limits"))?;
         for index in workers.len()..target {
             let worker_module = Arc::clone(&self.module);
+            let worker_foreign_registry = Arc::clone(&self.foreign_registry);
             let worker_queue = Arc::clone(&self.queue);
             let panic_queue = Arc::clone(&self.queue);
             let (ready_tx, ready_rx) = mpsc::channel();
@@ -1130,7 +1147,12 @@ impl ExecutionPool {
                         )));
                         return;
                     }
-                    worker_loop(&worker_module, &worker_queue, &ready_tx);
+                    worker_loop(
+                        &worker_module,
+                        &worker_foreign_registry,
+                        &worker_queue,
+                        &ready_tx,
+                    );
                 }));
                 if outcome.is_err() {
                     panic_queue.abort();

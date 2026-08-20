@@ -152,8 +152,10 @@ pub(super) fn collect_declarations(
                     signature: signature(function, context, diagnostics),
                     visibility: function.visibility,
                     is_static: true,
+                    is_foreign: function.is_foreign,
                     key: callable_key(&function.name, function.span.start, None, None),
                 };
+                validate_foreign_declaration(function, &callable.signature, diagnostics);
                 let overloads = context.functions.entry(function.name.clone()).or_default();
                 if overloads
                     .iter()
@@ -293,6 +295,7 @@ fn collect_type_members(
                         signature: signature(method, context, diagnostics),
                         visibility: method.visibility,
                         is_static: false,
+                        is_foreign: false,
                         key: callable_key(
                             &method.name,
                             method.span.start,
@@ -316,6 +319,7 @@ fn collect_type_members(
                     signature: signature(method, context, diagnostics),
                     visibility: method.visibility,
                     is_static: method.is_static,
+                    is_foreign: false,
                     key: callable_key(
                         &method.name,
                         method.span.start,
@@ -395,6 +399,7 @@ fn collect_type_members(
                     },
                     visibility: accessor.visibility,
                     is_static: false,
+                    is_foreign: false,
                     key: callable_key(
                         &property.name,
                         property.span.start,
@@ -409,6 +414,7 @@ fn collect_type_members(
                     },
                     visibility: accessor.visibility,
                     is_static: false,
+                    is_foreign: false,
                     key: callable_key(
                         &property.name,
                         property.span.start,
@@ -659,6 +665,68 @@ fn signature(
     Signature {
         parameters,
         result: resolve_type(&function.return_type, context, diagnostics),
+    }
+}
+
+fn validate_foreign_declaration(
+    function: &FunctionDeclaration,
+    signature: &Signature,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !function.is_foreign {
+        return;
+    }
+    if function.is_async {
+        diagnostics.push(
+            Diagnostic::error("foreign functions cannot be `async`", function.span)
+                .with_help("wrap the foreign call in an ordinary safe function if needed"),
+        );
+    }
+    let supported = |type_: &Type, allow_void: bool| {
+        (allow_void && *type_ == Type::Void)
+            || matches!(
+                type_,
+                Type::Bool
+                    | Type::SByte
+                    | Type::Byte
+                    | Type::Short
+                    | Type::UShort
+                    | Type::Char
+                    | Type::Int
+                    | Type::UInt
+                    | Type::Long
+                    | Type::ULong
+                    | Type::Float
+                    | Type::Double
+            )
+    };
+    if !supported(&signature.result, true) {
+        diagnostics.push(
+            Diagnostic::error(
+                format!(
+                    "foreign function result type `{}` is not supported",
+                    signature.result.display()
+                ),
+                function.return_type.span,
+            )
+            .with_help("use `void` or an ABI-safe scalar type"),
+        );
+    }
+    for (parameter, type_) in function.parameters.iter().zip(&signature.parameters) {
+        if !supported(type_, false) {
+            diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "foreign parameter type `{}` is not supported",
+                        type_.display()
+                    ),
+                    parameter.type_ref.span,
+                )
+                .with_help(
+                    "use an ABI-safe scalar type; references and aggregates cannot cross FFI",
+                ),
+            );
+        }
     }
 }
 
@@ -982,22 +1050,7 @@ fn validate_async_function(
 /// rule runs later, inside the analyzer, where concrete local types are known.
 fn validate_async_body(body: &aster_syntax::Block, diagnostics: &mut Vec<Diagnostic>) {
     for statement in &body.statements {
-        match statement {
-            Statement::If { span, .. }
-            | Statement::While { span, .. }
-            | Statement::For { span, .. }
-            | Statement::ForEach { span, .. }
-            | Statement::Switch { span, .. }
-            | Statement::Break(span)
-            | Statement::Continue(span) => diagnostics.push(
-                Diagnostic::error(
-                    "an `async` function must have linear control flow in this version",
-                    *span,
-                )
-                .with_help("remove `if`, `switch`, and loops from async bodies"),
-            ),
-            Statement::Variable(_) | Statement::Return { .. } | Statement::Expression(_) => {}
-        }
+        validate_async_statement(statement, diagnostics);
     }
     let mut operands = Vec::new();
     for statement in &body.statements {
@@ -1061,6 +1114,30 @@ fn validate_async_body(body: &aster_syntax::Block, diagnostics: &mut Vec<Diagnos
                 .with_help("call `Parallel.For`/`Parallel.ForEach` outside async functions"),
             );
         }
+    }
+}
+
+fn validate_async_statement(statement: &Statement, diagnostics: &mut Vec<Diagnostic>) {
+    match statement {
+        Statement::If { span, .. }
+        | Statement::While { span, .. }
+        | Statement::For { span, .. }
+        | Statement::ForEach { span, .. }
+        | Statement::Switch { span, .. }
+        | Statement::Break(span)
+        | Statement::Continue(span) => diagnostics.push(
+            Diagnostic::error(
+                "an `async` function must have linear control flow in this version",
+                *span,
+            )
+            .with_help("remove `if`, `switch`, and loops from async bodies"),
+        ),
+        Statement::Unsafe { body, .. } => {
+            for statement in &body.statements {
+                validate_async_statement(statement, diagnostics);
+            }
+        }
+        Statement::Variable(_) | Statement::Return { .. } | Statement::Expression(_) => {}
     }
 }
 
@@ -1151,6 +1228,11 @@ pub(super) fn collect_statement_calls<'a>(statement: &'a Statement, out: &mut Ve
                 for statement in &default.statements {
                     collect_statement_calls(statement, out);
                 }
+            }
+        }
+        Statement::Unsafe { body, .. } => {
+            for statement in &body.statements {
+                collect_statement_calls(statement, out);
             }
         }
         Statement::Break(_) | Statement::Continue(_) => {}
@@ -1264,6 +1346,11 @@ fn collect_statement_awaits<'a>(statement: &'a Statement, out: &mut Vec<&'a Expr
         | Statement::Switch { .. }
         | Statement::Break(_)
         | Statement::Continue(_) => {}
+        Statement::Unsafe { body, .. } => {
+            for statement in &body.statements {
+                collect_statement_awaits(statement, out);
+            }
+        }
     }
 }
 
@@ -1359,6 +1446,7 @@ fn validate_property(
             constructor: false,
             is_static: false,
             is_async: false,
+            is_foreign: false,
             type_parameters: Vec::new(),
             visibility: getter.visibility,
             return_type: property.type_ref.clone(),
@@ -1374,6 +1462,7 @@ fn validate_property(
             constructor: false,
             is_static: false,
             is_async: false,
+            is_foreign: false,
             type_parameters: Vec::new(),
             visibility: setter.visibility,
             return_type: TypeRef::new("void", property.type_ref.span),

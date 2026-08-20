@@ -110,9 +110,10 @@ runtime-owned `repr(C)` array header's data pointer and length on the proven in-
 runtime exports target-local offsets for that private ABI, while out-of-bounds access still uses
 the same controlled runtime diagnostic path. This is not a public FFI layout contract.
 
-This private JIT/runtime ABI is not a user FFI surface. The constrained future
-foreign-call contract, including scalar-only values and the requirement for an
-explicit unsafe context, is specified in
+This private JIT/runtime ABI is not the user FFI surface. The implemented minimal foreign-call
+boundary is separate: it accepts only fixed-width scalar C-ABI wrappers supplied through an
+execution-scoped host registry, with a lexical unsafe context and no ASTER runtime layout or
+reference crossing. See [native FFI](../reference/native-ffi.md) and
 [platform boundaries](../specification/14-platform-boundaries.md).
 
 `aster.math` itself is ordinary ASTER source. Its private domain-error declarations carry trusted

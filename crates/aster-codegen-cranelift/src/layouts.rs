@@ -380,6 +380,7 @@ mod layout_tests {
             classes: Vec::new(),
             interfaces: Vec::new(),
             interface_implementations: Vec::new(),
+            foreign_functions: Vec::new(),
             functions: Vec::new(),
         };
         let layouts = Layouts::new(&module, 8).expect("finite layout");
@@ -416,6 +417,7 @@ mod layout_tests {
             }],
             interfaces: Vec::new(),
             interface_implementations: Vec::new(),
+            foreign_functions: Vec::new(),
             functions: Vec::new(),
         };
         let layouts = Layouts::new(&module, 8).expect("class layout");
@@ -431,6 +433,7 @@ mod layout_tests {
             interfaces: Vec::new(),
             enums: Vec::new(),
             interface_implementations: Vec::new(),
+            foreign_functions: Vec::new(),
             functions: Vec::new(),
         }
     }

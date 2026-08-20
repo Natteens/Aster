@@ -911,6 +911,9 @@ fn span_barrier(instructions: &[mir::Instruction]) -> Option<TemporarySubregionR
             mir::Instruction::Call { .. } | mir::Instruction::CallInterface { .. } => {
                 Some(TemporarySubregionRejectionReason::CallBarrier)
             }
+            mir::Instruction::ForeignCall { .. } => {
+                Some(TemporarySubregionRejectionReason::CallBarrier)
+            }
             mir::Instruction::CallIntrinsic {
                 destination,
                 intrinsic,

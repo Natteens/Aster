@@ -32,6 +32,7 @@ impl Codegen {
             pointer_type,
             string_data: HashMap::new(),
             runtime_ids,
+            foreign_ids: HashMap::new(),
             interface_tables: HashMap::new(),
             interface_methods: module
                 .interfaces
@@ -175,7 +176,8 @@ fn instruction_can_fail_without_calling_aster(instruction: &mir::Instruction) ->
         mir::Instruction::Assign { .. }
         | mir::Instruction::Call { .. }
         | mir::Instruction::CallInterface { .. } => false,
-        mir::Instruction::TemporarySubregionEnter { .. }
+        mir::Instruction::ForeignCall { .. }
+        | mir::Instruction::TemporarySubregionEnter { .. }
         | mir::Instruction::TemporarySubregionExit { .. }
         | mir::Instruction::OwnedRegionEnter { .. }
         | mir::Instruction::OwnedRegionExit { .. }

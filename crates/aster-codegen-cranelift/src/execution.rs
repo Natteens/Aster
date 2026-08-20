@@ -8,6 +8,41 @@ use super::{
     mir, module_error, runtime_functions,
 };
 
+fn foreign_signature(
+    function: &mir::ForeignFunction,
+) -> Result<aster_runtime::ForeignSignature, BackendError> {
+    let parameters = function
+        .parameters
+        .iter()
+        .map(foreign_type)
+        .collect::<Result<Vec<_>, _>>()?;
+    aster_runtime::ForeignSignature::new(parameters, foreign_type(&function.return_type)?)
+        .map_err(|error| BackendError::new(error.to_string()))
+}
+
+fn foreign_type(type_: &mir::Type) -> Result<aster_runtime::ForeignType, BackendError> {
+    Ok(match type_ {
+        mir::Type::Void => aster_runtime::ForeignType::Void,
+        mir::Type::Bool => aster_runtime::ForeignType::Bool,
+        mir::Type::SByte => aster_runtime::ForeignType::SByte,
+        mir::Type::Byte => aster_runtime::ForeignType::Byte,
+        mir::Type::Short => aster_runtime::ForeignType::Short,
+        mir::Type::UShort => aster_runtime::ForeignType::UShort,
+        mir::Type::Char => aster_runtime::ForeignType::Char,
+        mir::Type::Int => aster_runtime::ForeignType::Int,
+        mir::Type::UInt => aster_runtime::ForeignType::UInt,
+        mir::Type::Long => aster_runtime::ForeignType::Long,
+        mir::Type::ULong => aster_runtime::ForeignType::ULong,
+        mir::Type::Float => aster_runtime::ForeignType::Float,
+        mir::Type::Double => aster_runtime::ForeignType::Double,
+        other => {
+            return Err(BackendError::new(format!(
+                "foreign ABI does not support MIR type `{other:?}`"
+            )));
+        }
+    })
+}
+
 /// A JIT module compiled and finalized once, ready to invoke any function of
 /// `mir::Module` by its resolved [`mir::SymbolId`] any number of times
 /// without recompiling. Every invocation allocates a brand new
@@ -32,14 +67,30 @@ impl PreparedProgram {
     /// binding every function's resolved symbol to its finalized address and
     /// return type for later invocation.
     pub(super) fn prepare(module: &mir::Module) -> Result<Self, BackendError> {
+        Self::prepare_with_foreign_registry(module, &aster_runtime::ForeignRegistry::new())
+    }
+
+    pub(super) fn prepare_with_foreign_registry(
+        module: &mir::Module,
+        registry: &aster_runtime::ForeignRegistry,
+    ) -> Result<Self, BackendError> {
         let mut builder = jit_builder()?;
         for function in runtime_functions() {
             builder.symbol(function.name, function.address);
         }
         super::task_abi::bind_task_functions(&mut builder);
         super::async_abi::bind_async_functions(&mut builder);
+        for function in &module.foreign_functions {
+            let signature = foreign_signature(function)?;
+            let address = registry
+                .resolve_address(&function.name, &signature)
+                .map_err(|error| BackendError::new(error.to_string()))?;
+            let symbol = format!("aster_foreign_{}", function.symbol.0);
+            builder.symbol(&symbol, address as *const u8);
+        }
         let jit = JITModule::new(builder);
         let mut codegen = Codegen::new(jit, module)?;
+        codegen.declare_foreign_functions(module)?;
         let function_ids = codegen.declare_functions(module)?;
         let task_trampoline_ids = codegen.declare_task_trampolines(module)?;
         codegen.define_interface_tables(module, &function_ids)?;
@@ -838,6 +889,25 @@ pub(super) fn execute_resolved(
     )
 }
 
+pub(super) fn execute_resolved_with_foreign_registry(
+    module: &mir::Module,
+    entry: &mir::Function,
+    registry: &aster_runtime::ForeignRegistry,
+    collect_stats: bool,
+) -> Result<(ExecutionValue, super::MemoryStats), BackendError> {
+    let prepared = PreparedProgram::prepare_with_foreign_registry(module, registry)?;
+    if !module_uses_tasks(module) {
+        return prepared.invoke(entry.symbol, collect_stats, None, None, None);
+    }
+    let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let module = Arc::new(module.clone());
+    let foreign_registry = Arc::new(registry.clone());
+    let mut runtime =
+        TaskRuntime::new_with_foreign_registry(&module, worker_count, &foreign_registry)?;
+    let pointer = std::ptr::from_mut(&mut runtime).cast::<()>();
+    prepared.invoke(entry.symbol, collect_stats, Some(pointer), None, None)
+}
+
 #[cfg(feature = "aarm-telemetry")]
 pub(super) fn execute_resolved_with_aarm_telemetry(
     module: &mir::Module,
@@ -1207,6 +1277,7 @@ mod tests {
             interfaces: Vec::new(),
             enums: Vec::new(),
             interface_implementations: Vec::new(),
+            foreign_functions: Vec::new(),
             functions: vec![mir::Function {
                 constructor: false,
                 symbol: FINE_RUN,

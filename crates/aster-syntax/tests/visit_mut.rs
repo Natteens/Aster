@@ -214,6 +214,7 @@ fn fixture() -> Module {
         constructor: false,
         is_static: false,
         is_async: false,
+        is_foreign: false,
         type_parameters: vec![TypeParameter {
             name: "U".to_owned(),
             span: span(57),
@@ -273,6 +274,7 @@ fn fixture() -> Module {
                 constructor: true,
                 is_static: false,
                 is_async: false,
+                is_foreign: false,
                 type_parameters: Vec::new(),
                 visibility: Visibility::Public,
                 return_type: type_ref("void", 75),

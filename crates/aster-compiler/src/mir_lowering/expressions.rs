@@ -442,6 +442,35 @@ impl FunctionLowerer {
             hir::ExpressionKind::Call { callee, arguments } => {
                 self.lower_call(callee, arguments, &expression.type_)
             }
+            hir::ExpressionKind::ForeignCall {
+                function,
+                arguments,
+            } => {
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| {
+                        self.lower_expression(argument)
+                            .expect("validated foreign arguments produce values")
+                    })
+                    .collect();
+                let destination = if expression.type_ == hir::Type::Void {
+                    None
+                } else {
+                    Some(mir::Place::Local(
+                        self.new_temporary(expression.type_.clone()),
+                    ))
+                };
+                self.instruction(mir::Instruction::ForeignCall {
+                    destination: destination.clone(),
+                    function: *function,
+                    arguments,
+                    return_type: expression.type_.clone(),
+                });
+                destination.map(|place| mir::Operand {
+                    type_: expression.type_.clone(),
+                    kind: mir::OperandKind::Copy(place),
+                })
+            }
             hir::ExpressionKind::PropertyAssignment {
                 object,
                 getter,

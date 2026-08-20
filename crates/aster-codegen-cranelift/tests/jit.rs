@@ -1070,6 +1070,7 @@ fn rejects_invalid_unicode_scalar_returned_as_char() {
         classes: Vec::new(),
         interfaces: Vec::new(),
         interface_implementations: Vec::new(),
+        foreign_functions: Vec::new(),
         functions: vec![mir::Function {
             constructor: false,
             symbol: mir::SymbolId(0),

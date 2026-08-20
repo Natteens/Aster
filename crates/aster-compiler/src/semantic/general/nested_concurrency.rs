@@ -279,6 +279,9 @@ fn direct_use_in_body(body: &Block, context: &str, model: &Model) -> Option<&'st
             context: context.to_owned(),
             span: call.span,
         };
+        if model.foreign_calls.contains(&key) {
+            return Some("a foreign call");
+        }
         if matches!(&callee.kind, aster_syntax::ExpressionKind::Member { name, .. } if name == "Wait")
             && !model.calls.contains_key(&key)
         {
