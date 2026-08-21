@@ -73,6 +73,43 @@ fn the_three_official_signatures_resolve_and_execute() {
 }
 
 #[test]
+fn list_get_failure_stops_before_later_console_output() {
+    let source = "using aster.io;\n\
+        public void Main() {\n\
+            List<int> values = new List<int>();\n\
+            int ignored = values.Get(0);\n\
+            WriteLine(\"must not execute\");\n\
+        }";
+    let (result, output) = run_with_io(source, "Main", "");
+    assert!(result.is_err(), "out-of-bounds List.Get must fail");
+    assert!(
+        output.is_empty(),
+        "runtime failure must stop later user output"
+    );
+}
+
+#[test]
+fn list_mutation_failures_stop_before_later_console_output() {
+    for (operation, source) in [
+        (
+            "Set",
+            "using aster.io; public void Main() { List<int> values = new List<int>(); values.Set(0, 1); WriteLine(\"must not execute\"); }",
+        ),
+        (
+            "RemoveAt",
+            "using aster.io; public void Main() { List<int> values = new List<int>(); values.RemoveAt(0); WriteLine(\"must not execute\"); }",
+        ),
+    ] {
+        let (result, output) = run_with_io(source, "Main", "");
+        assert!(
+            result.is_err(),
+            "{operation} must report its bounds failure"
+        );
+        assert!(output.is_empty(), "{operation} must stop later user output");
+    }
+}
+
+#[test]
 fn extra_or_missing_arguments_are_rejected() {
     let errors = compile_errors(
         "using aster.io;\npublic string Main() { Write(\"a\", \"b\"); return \"x\"; }",

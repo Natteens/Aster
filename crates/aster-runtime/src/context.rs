@@ -2793,6 +2793,9 @@ impl ExecutionContext {
         expected_element_type_key: u64,
         source: *const u8,
     ) {
+        if self.error.is_some() {
+            return;
+        }
         if list.is_null() {
             self.fail("list.Add received a null list");
             return;
@@ -2908,6 +2911,9 @@ impl ExecutionContext {
         index: i32,
         destination: *mut u8,
     ) {
+        if self.error.is_some() {
+            return;
+        }
         if list.is_null() {
             self.fail("list.Get received a null list");
             return;
@@ -3231,6 +3237,9 @@ impl ExecutionContext {
         expected_element_type_key: u64,
         index: i32,
     ) {
+        if self.error.is_some() {
+            return;
+        }
         if list.is_null() {
             self.fail("list.RemoveAt received a null list");
             return;
@@ -3926,7 +3935,7 @@ fn dictionary_add_or_set_abi(
         return 0;
     };
     #[allow(clippy::cast_sign_loss)]
-    context.dictionary_add_or_set(
+    let semantic_result = context.dictionary_add_or_set(
         dictionary,
         key_kind,
         u32::try_from(key_size).unwrap_or(0),
@@ -3938,7 +3947,11 @@ fn dictionary_add_or_set_abi(
         key,
         value,
         replace,
-    )
+    );
+    if context.error.is_some() {
+        return 0;
+    }
+    1 + semantic_result
 }
 
 #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
@@ -4021,7 +4034,7 @@ fn dictionary_contains_or_remove_abi(
         return 0;
     };
     #[allow(clippy::cast_sign_loss)]
-    context.dictionary_contains_or_remove(
+    let semantic_result = context.dictionary_contains_or_remove(
         dictionary,
         key_kind,
         u32::try_from(key_size).unwrap_or(0),
@@ -4032,7 +4045,11 @@ fn dictionary_contains_or_remove_abi(
         value_type_key as u64,
         key,
         remove,
-    )
+    );
+    if context.error.is_some() {
+        return 0;
+    }
+    1 + semantic_result
 }
 
 #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
@@ -4052,15 +4069,15 @@ pub extern "C" fn aster_rt_dictionary_try_get(
     some_tag: i32,
     none_tag: i32,
     payload_offset: i32,
-) {
+) -> i8 {
     if context.is_null() {
-        return;
+        return 0;
     }
     #[allow(unsafe_code)]
     let context = unsafe { &mut *context };
     let Some(key_kind) = DictionaryKeyKind::from_abi(key_kind) else {
         context.fail("Dictionary.TryGet received an invalid key kind");
-        return;
+        return 0;
     };
     #[allow(clippy::cast_sign_loss)]
     context.dictionary_try_get(
@@ -4079,6 +4096,7 @@ pub extern "C" fn aster_rt_dictionary_try_get(
         u32::try_from(none_tag).unwrap_or(0),
         u32::try_from(payload_offset).unwrap_or(u32::MAX),
     );
+    i8::from(context.error.is_none())
 }
 
 #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
@@ -4138,15 +4156,15 @@ pub extern "C" fn aster_rt_dictionary_clear(
     value_size: i32,
     value_align: i32,
     value_type_key: i64,
-) {
+) -> i8 {
     if context.is_null() {
-        return;
+        return 0;
     }
     #[allow(unsafe_code)]
     let context = unsafe { &mut *context };
     let Some(key_kind) = DictionaryKeyKind::from_abi(key_kind) else {
         context.fail("Dictionary.Clear received an invalid key kind");
-        return;
+        return 0;
     };
     #[allow(clippy::cast_sign_loss)]
     context.dictionary_clear(
@@ -4159,6 +4177,7 @@ pub extern "C" fn aster_rt_dictionary_clear(
         u32::try_from(value_align).unwrap_or(0),
         value_type_key as u64,
     );
+    i8::from(context.error.is_none())
 }
 
 #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
@@ -4307,9 +4326,9 @@ pub extern "C" fn aster_rt_list_add(
     expected_element_align: i32,
     expected_element_type_key: i64,
     source_value_address: *const u8,
-) {
+) -> i8 {
     if context.is_null() {
-        return;
+        return 0;
     }
     // SAFETY: generated functions receive the live host-owned context as their
     // hidden first parameter, and invocation cannot outlive that context.
@@ -4322,6 +4341,7 @@ pub extern "C" fn aster_rt_list_add(
     #[allow(clippy::cast_sign_loss)]
     let type_key = expected_element_type_key as u64;
     context.list_add(list, size, align, type_key, source_value_address);
+    i8::from(context.error.is_none())
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -4333,9 +4353,9 @@ pub extern "C" fn aster_rt_list_get(
     expected_element_type_key: i64,
     index: i32,
     destination_address: *mut u8,
-) {
+) -> i8 {
     if context.is_null() {
-        return;
+        return 0;
     }
     // SAFETY: generated functions receive the live host-owned context as their
     // hidden first parameter, and invocation cannot outlive that context.
@@ -4346,6 +4366,7 @@ pub extern "C" fn aster_rt_list_get(
     #[allow(clippy::cast_sign_loss)]
     let type_key = expected_element_type_key as u64;
     context.list_get(list, size, align, type_key, index, destination_address);
+    i8::from(context.error.is_none())
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -4356,9 +4377,9 @@ pub extern "C" fn aster_rt_list_remove_at(
     expected_element_align: i32,
     expected_element_type_key: i64,
     index: i32,
-) {
+) -> i8 {
     if context.is_null() {
-        return;
+        return 0;
     }
     // SAFETY: generated functions receive the live host-owned context as their
     // hidden first parameter, and invocation cannot outlive that context.
@@ -4369,6 +4390,7 @@ pub extern "C" fn aster_rt_list_remove_at(
     #[allow(clippy::cast_sign_loss)]
     let type_key = expected_element_type_key as u64;
     context.list_remove_at(list, size, align, type_key, index);
+    i8::from(context.error.is_none())
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -4380,9 +4402,9 @@ pub extern "C" fn aster_rt_list_set(
     expected_element_type_key: i64,
     index: i32,
     source_value_address: *const u8,
-) {
+) -> i8 {
     if context.is_null() {
-        return;
+        return 0;
     }
     #[allow(unsafe_code)]
     let context = unsafe { &mut *context };
@@ -4395,6 +4417,7 @@ pub extern "C" fn aster_rt_list_set(
         index,
         source_value_address,
     );
+    i8::from(context.error.is_none())
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -4404,9 +4427,9 @@ pub extern "C" fn aster_rt_list_clear(
     expected_element_size: i32,
     expected_element_align: i32,
     expected_element_type_key: i64,
-) {
+) -> i8 {
     if context.is_null() {
-        return;
+        return 0;
     }
     #[allow(unsafe_code)]
     let context = unsafe { &mut *context };
@@ -4417,6 +4440,7 @@ pub extern "C" fn aster_rt_list_clear(
         u32::try_from(expected_element_align).unwrap_or(0),
         expected_element_type_key as u64,
     );
+    i8::from(context.error.is_none())
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -6417,6 +6441,171 @@ mod tests {
             aster_rt_list_length(std::ptr::null_mut(), std::ptr::null()),
             0
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn collection_private_abis_distinguish_failure_from_semantic_outcomes() {
+        let mut context = ExecutionContext::new();
+        let context_pointer = &raw mut context;
+        let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+        let mut list_result = 123_i32;
+        assert_eq!(
+            aster_rt_list_get(
+                context_pointer,
+                list,
+                4,
+                4,
+                1,
+                0,
+                destination(&mut list_result)
+            ),
+            0
+        );
+        assert_eq!(
+            list_result, 123,
+            "failed List.Get must not write its output"
+        );
+        assert!(context.take_error().is_some());
+
+        let dictionary = aster_rt_dictionary_new(
+            context_pointer,
+            DictionaryKeyKind::Int as i32,
+            4,
+            4,
+            2,
+            4,
+            4,
+            3,
+        );
+        let key = 7_i32;
+        let value = 11_i32;
+        assert_eq!(
+            aster_rt_dictionary_add(
+                context_pointer,
+                dictionary,
+                DictionaryKeyKind::Int as i32,
+                4,
+                4,
+                2,
+                4,
+                4,
+                3,
+                source_address(&key),
+                source_address(&value),
+            ),
+            2
+        );
+
+        assert_eq!(
+            aster_rt_dictionary_add(
+                context_pointer,
+                dictionary,
+                DictionaryKeyKind::Int as i32,
+                4,
+                4,
+                2,
+                4,
+                4,
+                3,
+                source_address(&key),
+                source_address(&value),
+            ),
+            1
+        );
+
+        assert_eq!(
+            aster_rt_dictionary_contains_key(
+                context_pointer,
+                dictionary,
+                DictionaryKeyKind::Int as i32,
+                4,
+                4,
+                2,
+                4,
+                4,
+                3,
+                source_address(&key),
+            ),
+            2,
+            "present key is successful semantic true",
+        );
+        let missing = 8_i32;
+        assert_eq!(
+            aster_rt_dictionary_contains_key(
+                context_pointer,
+                dictionary,
+                DictionaryKeyKind::Int as i32,
+                4,
+                4,
+                2,
+                4,
+                4,
+                3,
+                source_address(&missing),
+            ),
+            1,
+            "missing key is successful semantic false",
+        );
+        assert_eq!(
+            aster_rt_dictionary_remove(
+                context_pointer,
+                dictionary,
+                DictionaryKeyKind::Int as i32,
+                4,
+                4,
+                2,
+                4,
+                4,
+                3,
+                source_address(&missing),
+            ),
+            1,
+            "removing a missing key is successful semantic false",
+        );
+        assert_eq!(
+            aster_rt_dictionary_remove(
+                context_pointer,
+                dictionary,
+                DictionaryKeyKind::Int as i32,
+                4,
+                4,
+                2,
+                4,
+                4,
+                3,
+                source_address(&key),
+            ),
+            2,
+            "removing an existing key is successful semantic true",
+        );
+
+        let mut option_bytes = [0xA5_u8; 8];
+        assert_eq!(
+            aster_rt_dictionary_try_get(
+                context_pointer,
+                std::ptr::null_mut(),
+                DictionaryKeyKind::Int as i32,
+                4,
+                4,
+                2,
+                4,
+                4,
+                3,
+                source_address(&key),
+                option_bytes.as_mut_ptr(),
+                8,
+                1,
+                0,
+                4,
+            ),
+            0
+        );
+        assert_eq!(
+            option_bytes, [0xA5; 8],
+            "failed TryGet must not initialize a partial Option output"
+        );
+        assert!(context.take_error().is_some());
     }
 
     #[test]

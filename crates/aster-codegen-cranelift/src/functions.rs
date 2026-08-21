@@ -251,6 +251,32 @@ impl Codegen {
         Ok(())
     }
 
+    pub(super) fn continue_if_runtime_status(
+        builder: &mut FunctionBuilder<'_>,
+        state: &FunctionState,
+        status: cranelift_codegen::ir::Value,
+    ) {
+        let succeeded = builder.ins().icmp_imm(IntCC::Equal, status, 1);
+        let continuation = builder.create_block();
+        builder
+            .ins()
+            .brif(succeeded, continuation, &[], state.runtime_failure, &[]);
+        builder.switch_to_block(continuation);
+    }
+
+    pub(super) fn continue_if_runtime_nonzero_status(
+        builder: &mut FunctionBuilder<'_>,
+        state: &FunctionState,
+        status: cranelift_codegen::ir::Value,
+    ) {
+        let succeeded = builder.ins().icmp_imm(IntCC::NotEqual, status, 0);
+        let continuation = builder.create_block();
+        builder
+            .ins()
+            .brif(succeeded, continuation, &[], state.runtime_failure, &[]);
+        builder.switch_to_block(continuation);
+    }
+
     fn return_after_failed_call_guard(
         &self,
         builder: &mut FunctionBuilder<'_>,

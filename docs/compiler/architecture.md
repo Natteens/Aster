@@ -142,8 +142,13 @@ converts Cranelift's finalized, untyped code pointer into the
 exact signature already checked by the backend. Every function receives a hidden pointer to its
 host-owned ExecutionContext. Array allocation, `Length`, and indexing use the small checked runtime
 ABI. `StringBuilder.Append` returns a private success status so its existing runtime validation and
-first-error result select the next control-flow edge without a second runtime error query. Class
-allocation uses the same context; method and constructor calls are ordinary resolved MIR
+first-error result select the next control-flow edge without a second runtime error query.
+Fallible collection mutation and out-producing ABI calls use the same private control-flow rule:
+generated code branches on a runtime success status before it loads an out destination or publishes
+a semantic collection result.
+Dictionary boolean outcomes use a private tri-state result, so a valid `false` (for example, a
+missing key) is never confused with a runtime failure. Class allocation uses the same context;
+method and constructor calls are ordinary resolved MIR
 calls with an explicit object receiver. An interface value is two pointer-sized words: the non-null
 object reference and a pointer to a read-only method table owned by the JIT module. Interface calls
 load the concrete function from that table and use the checked ASTER calling convention. The backend

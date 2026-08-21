@@ -387,7 +387,7 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
                     RuntimeType::I32,
                     RuntimeType::I32,
                 ],
-                result: None,
+                result: Some(RuntimeType::I8),
             },
         },
         RuntimeFunction {
@@ -427,7 +427,7 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
                     RuntimeType::I32,
                     RuntimeType::I64,
                 ],
-                result: None,
+                result: Some(RuntimeType::I8),
             },
         },
         RuntimeFunction {
@@ -561,7 +561,7 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
                     RuntimeType::I64,
                     RuntimeType::Pointer,
                 ],
-                result: None,
+                result: Some(RuntimeType::I8),
             },
         },
         RuntimeFunction {
@@ -577,7 +577,7 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
                     RuntimeType::I32,
                     RuntimeType::Pointer,
                 ],
-                result: None,
+                result: Some(RuntimeType::I8),
             },
         },
         RuntimeFunction {
@@ -592,7 +592,7 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
                     RuntimeType::I64,
                     RuntimeType::I32,
                 ],
-                result: None,
+                result: Some(RuntimeType::I8),
             },
         },
         RuntimeFunction {
@@ -608,7 +608,7 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
                     RuntimeType::I32,
                     RuntimeType::Pointer,
                 ],
-                result: None,
+                result: Some(RuntimeType::I8),
             },
         },
         RuntimeFunction {
@@ -622,7 +622,7 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
                     RuntimeType::I32,
                     RuntimeType::I64,
                 ],
-                result: None,
+                result: Some(RuntimeType::I8),
             },
         },
         RuntimeFunction {
@@ -1509,5 +1509,47 @@ mod tests {
             ]
         );
         assert_eq!(append.signature.result, Some(RuntimeType::I8));
+    }
+
+    #[test]
+    fn collection_failure_status_signatures_match_the_abi() {
+        let functions = runtime_functions();
+        for (name, parameter_count) in [
+            ("aster_rt_list_add", 6),
+            ("aster_rt_list_get", 7),
+            ("aster_rt_list_remove_at", 6),
+            ("aster_rt_list_set", 7),
+            ("aster_rt_list_clear", 5),
+            ("aster_rt_dictionary_try_get", 15),
+            ("aster_rt_dictionary_clear", 9),
+        ] {
+            let function = functions
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("missing runtime function `{name}`"));
+            assert_eq!(function.signature.result, Some(RuntimeType::I8), "{name}");
+            assert_eq!(
+                function.signature.parameters.len(),
+                parameter_count,
+                "{name}"
+            );
+        }
+        for (name, parameter_count) in [
+            ("aster_rt_dictionary_add", 11),
+            ("aster_rt_dictionary_set", 11),
+            ("aster_rt_dictionary_contains_key", 10),
+            ("aster_rt_dictionary_remove", 10),
+        ] {
+            let function = functions
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("missing runtime function `{name}`"));
+            assert_eq!(function.signature.result, Some(RuntimeType::I8), "{name}");
+            assert_eq!(
+                function.signature.parameters.len(),
+                parameter_count,
+                "{name}"
+            );
+        }
     }
 }

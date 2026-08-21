@@ -327,6 +327,9 @@ impl Codegen {
             values.push(self.translate_operand(builder, argument, state)?);
         }
         let call = builder.ins().call(function_ref, &values);
+        if matches!(intrinsic, mir::Intrinsic::ListVersionMismatch) {
+            self.continue_if_runtime_ok(builder, state)?;
+        }
         if let Some(destination) = destination {
             let result = builder.inst_results(call).first().copied().ok_or_else(|| {
                 BackendError::new("runtime intrinsic did not produce its declared result")
@@ -1818,7 +1821,13 @@ impl Codegen {
         arguments.extend(metadata);
         arguments.extend([key_address, value_address]);
         let call = builder.ins().call(function_ref, &arguments);
-        self.store_scalar(builder, destination, builder.inst_results(call)[0], state)
+        let result = builder.inst_results(call)[0];
+        Self::continue_if_runtime_nonzero_status(builder, state, result);
+        let semantic_true = builder.ins().icmp_imm(IntCC::Equal, result, 2);
+        let true_value = builder.ins().iconst(types::I8, 1);
+        let false_value = builder.ins().iconst(types::I8, 0);
+        let result = builder.ins().select(semantic_true, true_value, false_value);
+        self.store_scalar(builder, destination, result, state)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1854,7 +1863,13 @@ impl Codegen {
         arguments.extend(metadata);
         arguments.push(key_address);
         let call = builder.ins().call(function_ref, &arguments);
-        self.store_scalar(builder, destination, builder.inst_results(call)[0], state)
+        let result = builder.inst_results(call)[0];
+        Self::continue_if_runtime_nonzero_status(builder, state, result);
+        let semantic_true = builder.ins().icmp_imm(IntCC::Equal, result, 2);
+        let true_value = builder.ins().iconst(types::I8, 1);
+        let false_value = builder.ins().iconst(types::I8, 0);
+        let result = builder.ins().select(semantic_true, true_value, false_value);
+        self.store_scalar(builder, destination, result, state)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1908,7 +1923,8 @@ impl Codegen {
                 .iconst(types::I32, i64::from(option_layout.none_tag)),
             builder.ins().iconst(types::I32, i64::from(payload_offset)),
         ]);
-        builder.ins().call(function_ref, &arguments);
+        let call = builder.ins().call(function_ref, &arguments);
+        Self::continue_if_runtime_status(builder, state, builder.inst_results(call)[0]);
         Ok(())
     }
 
@@ -2051,7 +2067,8 @@ impl Codegen {
             .declare_func_in_func(self.runtime_ids["aster_rt_dictionary_clear"], builder.func);
         let mut arguments = vec![context, dictionary_value];
         arguments.extend(metadata);
-        builder.ins().call(function_ref, &arguments);
+        let call = builder.ins().call(function_ref, &arguments);
+        Self::continue_if_runtime_status(builder, state, builder.inst_results(call)[0]);
         Ok(())
     }
 
@@ -2143,10 +2160,11 @@ impl Codegen {
         #[allow(clippy::cast_possible_wrap)]
         let type_key_bits = mir::type_key(&value.type_) as i64;
         let type_key = builder.ins().iconst(types::I64, type_key_bits);
-        builder.ins().call(
+        let call = builder.ins().call(
             function_ref,
             &[context, list_value, size, align, type_key, source_address],
         );
+        Self::continue_if_runtime_status(builder, state, builder.inst_results(call)[0]);
         Ok(())
     }
 
@@ -2180,10 +2198,11 @@ impl Codegen {
         #[allow(clippy::cast_possible_wrap)]
         let type_key_bits = mir::type_key(element_type) as i64;
         let type_key = builder.ins().iconst(types::I64, type_key_bits);
-        builder.ins().call(
+        let call = builder.ins().call(
             function_ref,
             &[context, list_value, size, align, type_key, index_value],
         );
+        Self::continue_if_runtime_status(builder, state, builder.inst_results(call)[0]);
         Ok(())
     }
 
@@ -2232,7 +2251,7 @@ impl Codegen {
         let type_key = builder
             .ins()
             .iconst(types::I64, mir::type_key(element_type) as i64);
-        builder.ins().call(
+        let call = builder.ins().call(
             function_ref,
             &[
                 context,
@@ -2244,6 +2263,7 @@ impl Codegen {
                 source_address,
             ],
         );
+        Self::continue_if_runtime_status(builder, state, builder.inst_results(call)[0]);
         Ok(())
     }
 
@@ -2272,9 +2292,10 @@ impl Codegen {
         let type_key = builder
             .ins()
             .iconst(types::I64, mir::type_key(element_type) as i64);
-        builder
+        let call = builder
             .ins()
             .call(function_ref, &[context, list_value, size, align, type_key]);
+        Self::continue_if_runtime_status(builder, state, builder.inst_results(call)[0]);
         Ok(())
     }
 
@@ -2366,7 +2387,7 @@ impl Codegen {
         #[allow(clippy::cast_possible_wrap)]
         let type_key_bits = mir::type_key(element_type) as i64;
         let type_key = builder.ins().iconst(types::I64, type_key_bits);
-        builder.ins().call(
+        let call = builder.ins().call(
             function_ref,
             &[
                 context,
@@ -2378,6 +2399,7 @@ impl Codegen {
                 write_address,
             ],
         );
+        Self::continue_if_runtime_status(builder, state, builder.inst_results(call)[0]);
         if !is_aggregate(element_type) {
             let value_type = self.clif_value_type(element_type)?;
             let loaded = builder

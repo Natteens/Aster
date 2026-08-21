@@ -60,6 +60,13 @@ returns `I8`: exactly `1` means the append completed with no runtime error; `0` 
 already present or the runtime recorded one. Generated code branches on that result directly; the
 runtime remains the sole authority for validation, growth, allocation, and diagnostics.
 
+Fallible private collection mutations and out-producing `List<T>` and `Dictionary<K,V>` calls return
+an `I8` success status. Generated code branches on that status before loading an out destination such
+as `List.Get` or `TryGet`'s `Option<T>`. Dictionary operations with a source-level boolean result
+use a private tri-state result instead: `0` is runtime failure, `1` is successful `false`, and `2` is
+successful `true`. These statuses are compiler/runtime control flow, not public ASTER values or a
+second diagnostic authority; `ExecutionContext` still owns first-error state.
+
 ## Ownership and lifetime
 
 - String literals live in the data section of the JIT module that compiled them. Dynamic
