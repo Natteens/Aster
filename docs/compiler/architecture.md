@@ -192,6 +192,10 @@ The backend rejects unsupported MIR before code generation. Decimal source is re
 the post-link language-surface gate because its numeric and ABI contract remains unspecified;
 backend validation still rejects hand-built decimal MIR fail-closed. The backend does not inspect
 AST/HIR, implement inheritance, or generate object files or link executables.
+Integer division and remainder preserve their typed MIR operands through validation. The backend
+keeps controlled zero and signed-overflow paths for general operations, while an exact constant
+power-of-two `uint`/`ulong` divisor lowers mechanically to a logical shift or mask. General constant
+division remains Cranelift's target-specific responsibility; MIR contains no magic-number scheme.
 Public standard-library code reaches this backend as ordinary concrete MIR. The compact string
 transforms, floating-point math operations, and collection snapshots lower through typed HIR/MIR
 intrinsics with checked runtime ABI calls; Cranelift does not inspect public `Math`, `String`, or

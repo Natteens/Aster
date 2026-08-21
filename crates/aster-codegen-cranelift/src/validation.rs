@@ -4625,11 +4625,57 @@ fn validate_rvalue(
         | mir::RvalueKind::Unary { operand, .. } => {
             validate_operand_with_proven_bounds(operand, function_name, true)
         }
-        mir::RvalueKind::Binary { left, right, .. }
-        | mir::RvalueKind::Equality { left, right, .. } => {
+        mir::RvalueKind::Binary {
+            left,
+            operator,
+            right,
+        } => {
+            validate_operand_with_proven_bounds(left, function_name, true)?;
+            validate_operand_with_proven_bounds(right, function_name, true)?;
+            if matches!(
+                operator,
+                mir::BinaryOperator::Divide | mir::BinaryOperator::Remainder
+            ) {
+                validate_direct_operand_local(left, "binary operation", function_name, locals)?;
+                validate_direct_operand_local(right, "binary operation", function_name, locals)?;
+            }
+            validate_division_or_remainder_shape(value, *operator, left, right, function_name)
+        }
+        mir::RvalueKind::Equality { left, right, .. } => {
             validate_operand_with_proven_bounds(left, function_name, true)?;
             validate_operand_with_proven_bounds(right, function_name, true)
         }
+    }
+}
+
+fn validate_division_or_remainder_shape(
+    value: &mir::Rvalue,
+    operator: mir::BinaryOperator,
+    left: &mir::Operand,
+    right: &mir::Operand,
+    function_name: &str,
+) -> Result<(), BackendError> {
+    if !matches!(
+        operator,
+        mir::BinaryOperator::Divide | mir::BinaryOperator::Remainder
+    ) {
+        return Ok(());
+    }
+    if left.type_ != right.type_ || value.type_ != left.type_ {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has division or remainder operands and result with mismatched types"
+        )));
+    }
+    let integer = primitive(&left.type_).is_some_and(aster_types::Primitive::is_integer);
+    let supported = integer
+        || (operator == mir::BinaryOperator::Divide
+            && matches!(left.type_, mir::Type::Float | mir::Type::Double));
+    if supported {
+        Ok(())
+    } else {
+        Err(BackendError::new(format!(
+            "function `{function_name}` has division or remainder with an unsupported operand type"
+        )))
     }
 }
 
@@ -4907,6 +4953,42 @@ fn unsupported(function_name: &str, feature: &str) -> BackendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn division_shape_rejects_reference_and_aggregate_operands() {
+        for type_ in [
+            mir::Type::String,
+            mir::Type::Array(Box::new(mir::Type::Int)),
+            mir::Type::User(mir::SymbolId(1)),
+        ] {
+            let left = mir::Operand {
+                type_: type_.clone(),
+                kind: mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(0))),
+            };
+            let right = mir::Operand {
+                type_: type_.clone(),
+                kind: mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(1))),
+            };
+            let value = mir::Rvalue {
+                type_,
+                kind: mir::RvalueKind::Binary {
+                    left: left.clone(),
+                    operator: mir::BinaryOperator::Divide,
+                    right: right.clone(),
+                },
+            };
+
+            let error = validate_division_or_remainder_shape(
+                &value,
+                mir::BinaryOperator::Divide,
+                &left,
+                &right,
+                "Malformed",
+            )
+            .expect_err("reference or aggregate division must be rejected");
+            assert!(error.message().contains("unsupported operand type"));
+        }
+    }
 
     const OWNED_REGION_SOURCE: &str = r"
         internal int[] Make(int value) { return [value]; }

@@ -104,6 +104,7 @@ impl Codegen {
                 right,
             } => {
                 let operand_type = left.type_.clone();
+                let power_of_two_divisor = unsigned_power_of_two_divisor(*operator, right)?;
                 let left = self.translate_operand(builder, left, state)?;
                 let right = self.translate_operand(builder, right, state)?;
                 if matches!(
@@ -116,7 +117,7 @@ impl Codegen {
                         *operator,
                         &operand_type,
                         left,
-                        right,
+                        (right, power_of_two_divisor),
                         state,
                     )
                 } else {
@@ -147,7 +148,7 @@ impl Codegen {
         operator: mir::BinaryOperator,
         operand_type: &mir::Type,
         left: Value,
-        right: Value,
+        right: (Value, Option<u64>),
         state: &FunctionState,
     ) -> Result<Value, BackendError> {
         const DIVISION_BY_ZERO: i64 = 0;
@@ -171,6 +172,23 @@ impl Codegen {
                 ));
             }
         };
+        let (right, power_of_two_divisor) = right;
+        if let Some(divisor) = power_of_two_divisor {
+            return match operator {
+                mir::BinaryOperator::Divide => Ok(builder
+                    .ins()
+                    .ushr_imm(left, i64::from(divisor.trailing_zeros()))),
+                mir::BinaryOperator::Remainder => {
+                    let mask = i64::try_from(divisor - 1).map_err(|_| {
+                        BackendError::new("power-of-two remainder mask exceeds Cranelift immediate")
+                    })?;
+                    Ok(builder.ins().band_imm(left, mask))
+                }
+                _ => Err(BackendError::new(
+                    "power-of-two integer lowering received an invalid operator",
+                )),
+            };
+        }
         let context = state.execution_context.ok_or_else(|| {
             BackendError::new("integer operation is missing its ExecutionContext")
         })?;
@@ -426,6 +444,34 @@ impl Codegen {
         self.string_data.insert(value.to_owned(), id);
         Ok(id)
     }
+}
+
+fn unsigned_power_of_two_divisor(
+    operator: mir::BinaryOperator,
+    operand: &mir::Operand,
+) -> Result<Option<u64>, BackendError> {
+    if !matches!(
+        operator,
+        mir::BinaryOperator::Divide | mir::BinaryOperator::Remainder
+    ) || !matches!(operand.type_, mir::Type::UInt | mir::Type::ULong)
+    {
+        return Ok(None);
+    }
+    let mir::OperandKind::Constant(mir::Constant::Integer(value)) = &operand.kind else {
+        return Ok(None);
+    };
+    let divisor = match operand.type_ {
+        mir::Type::UInt => value.parse::<u32>().map(u64::from),
+        mir::Type::ULong => value.parse::<u64>(),
+        _ => return Ok(None),
+    }
+    .map_err(|_| {
+        BackendError::new(format!(
+            "integer `{value}` is outside `{}` range",
+            type_name(&operand.type_)
+        ))
+    })?;
+    Ok(divisor.is_power_of_two().then_some(divisor))
 }
 
 /// The `scalar` kind tag for `type_`, matching the runtime's [`crate::scalar`]
@@ -787,5 +833,78 @@ fn clif_integer(width: u16) -> Result<ClifType, BackendError> {
         _ => Err(BackendError::new(format!(
             "unsupported integer width `{width}` reached Cranelift"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod integer_division_tests {
+    use super::*;
+
+    fn integer(type_: mir::Type, value: &str) -> mir::Operand {
+        mir::Operand {
+            type_,
+            kind: mir::OperandKind::Constant(mir::Constant::Integer(value.to_owned())),
+        }
+    }
+
+    #[test]
+    fn power_of_two_fast_path_is_exactly_uint_ulong_and_final_mir_constants() {
+        for type_ in [
+            mir::Type::Bool,
+            mir::Type::SByte,
+            mir::Type::Byte,
+            mir::Type::Short,
+            mir::Type::UShort,
+            mir::Type::Int,
+            mir::Type::Long,
+            mir::Type::Char,
+            mir::Type::Float,
+            mir::Type::Double,
+            mir::Type::String,
+            mir::Type::Array(Box::new(mir::Type::Int)),
+        ] {
+            assert_eq!(
+                unsigned_power_of_two_divisor(mir::BinaryOperator::Divide, &integer(type_, "8")),
+                Ok(None)
+            );
+        }
+        for (type_, value, expected) in [
+            (mir::Type::UInt, "0", None),
+            (mir::Type::UInt, "1", Some(1)),
+            (mir::Type::UInt, "8", Some(8)),
+            (mir::Type::UInt, "97", None),
+            (mir::Type::UInt, "2147483648", Some(1_u64 << 31)),
+            (mir::Type::ULong, "0", None),
+            (mir::Type::ULong, "1", Some(1)),
+            (mir::Type::ULong, "256", Some(256)),
+            (mir::Type::ULong, "97", None),
+            (mir::Type::ULong, "9223372036854775808", Some(1_u64 << 63)),
+        ] {
+            let width = if type_ == mir::Type::UInt { 32 } else { 64 };
+            assert_eq!(
+                unsigned_power_of_two_divisor(
+                    mir::BinaryOperator::Remainder,
+                    &integer(type_, value)
+                ),
+                Ok(expected)
+            );
+            if let Some(divisor) = expected {
+                assert!(divisor.trailing_zeros() < width);
+                assert!(i64::try_from(divisor - 1).is_ok());
+            }
+        }
+
+        let local = mir::Operand {
+            type_: mir::Type::UInt,
+            kind: mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(0))),
+        };
+        assert_eq!(
+            unsigned_power_of_two_divisor(mir::BinaryOperator::Divide, &local),
+            Ok(None)
+        );
+        assert_eq!(
+            unsigned_power_of_two_divisor(mir::BinaryOperator::Add, &integer(mir::Type::UInt, "8")),
+            Ok(None)
+        );
     }
 }

@@ -1416,6 +1416,32 @@ fn executes_runtime_integer_division_and_remainder() {
 }
 
 #[test]
+fn preserves_signed_division_and_remainder_sign_rules() {
+    let source = r"
+        public int DividePP() { return 19 / 8; }
+        public int DivideNP() { return -19 / 8; }
+        public int DividePN() { return 19 / -8; }
+        public int DivideNN() { return -19 / -8; }
+        public int RemainderPP() { return 19 % 8; }
+        public int RemainderNP() { return -19 % 8; }
+        public int RemainderPN() { return 19 % -8; }
+        public int RemainderNN() { return -19 % -8; }
+    ";
+    for (function, expected) in [
+        ("DividePP", 2),
+        ("DivideNP", -2),
+        ("DividePN", -2),
+        ("DivideNN", 2),
+        ("RemainderPP", 3),
+        ("RemainderNP", -3),
+        ("RemainderPN", 3),
+        ("RemainderNN", -3),
+    ] {
+        assert_eq!(run(source, function), Ok(ExecutionValue::Int(expected)));
+    }
+}
+
+#[test]
 fn reports_runtime_integer_division_by_zero() {
     let source = r"
         public int Ten() { return 10; }
@@ -1673,6 +1699,256 @@ fn executes_unsigned_division_and_comparison() {
     let source =
         "public ulong Remainder() { ulong x = 18446744073709551615ul; return x % 1000000ul; }";
     assert_eq!(run(source, "Remainder"), Ok(ExecutionValue::ULong(551_615)));
+}
+
+#[test]
+fn executes_unsigned_power_of_two_division_and_remainder() {
+    let source = r"
+        public uint UIntValue() { return 4294967295u; }
+        public uint UIntDivideOne() { return UIntValue() / 1u; }
+        public uint UIntRemainderOne() { return UIntValue() % 1u; }
+        public uint UIntDivide256() { return UIntValue() / 256u; }
+        public uint UIntRemainder256() { return UIntValue() % 256u; }
+        public uint UIntDivideHigh() { return UIntValue() / 2147483648u; }
+        public uint UIntRemainderHigh() { return UIntValue() % 2147483648u; }
+        public ulong ULongValue() { return 18446744073709551615ul; }
+        public ulong ULongDivide256() { return ULongValue() / 256ul; }
+        public ulong ULongRemainder256() { return ULongValue() % 256ul; }
+        public ulong ULongDivideHigh() { return ULongValue() / 9223372036854775808ul; }
+        public ulong ULongRemainderHigh() { return ULongValue() % 9223372036854775808ul; }
+        public int SignedRemainder() { return -19 % 8; }
+        public uint UIntDivideZero() { return UIntValue() / 0u; }
+        public uint UIntRemainderZero() { return UIntValue() % 0u; }
+        public ulong ULongDivideZero() { return ULongValue() / 0ul; }
+        public ulong ULongRemainderZero() { return ULongValue() % 0ul; }
+    ";
+    for (function, expected) in [
+        ("UIntDivideOne", ExecutionValue::UInt(u32::MAX)),
+        ("UIntRemainderOne", ExecutionValue::UInt(0)),
+        ("UIntDivide256", ExecutionValue::UInt(16_777_215)),
+        ("UIntRemainder256", ExecutionValue::UInt(255)),
+        ("UIntDivideHigh", ExecutionValue::UInt(1)),
+        ("UIntRemainderHigh", ExecutionValue::UInt(2_147_483_647)),
+        (
+            "ULongDivide256",
+            ExecutionValue::ULong(72_057_594_037_927_935),
+        ),
+        ("ULongRemainder256", ExecutionValue::ULong(255)),
+        ("ULongDivideHigh", ExecutionValue::ULong(1)),
+        (
+            "ULongRemainderHigh",
+            ExecutionValue::ULong(9_223_372_036_854_775_807),
+        ),
+        ("SignedRemainder", ExecutionValue::Int(-3)),
+    ] {
+        assert_eq!(run(source, function), Ok(expected), "{function}");
+    }
+    for (function, expected) in [
+        ("UIntDivideZero", "integer division by zero"),
+        ("UIntRemainderZero", "integer remainder by zero"),
+        ("ULongDivideZero", "integer division by zero"),
+        ("ULongRemainderZero", "integer remainder by zero"),
+    ] {
+        assert_eq!(
+            run(source, function),
+            Err(format!("Aster runtime error: {expected}")),
+            "{function}"
+        );
+    }
+}
+
+#[test]
+fn power_of_two_division_and_remainder_match_unsigned_arithmetic_differentially() {
+    use std::fmt::Write as _;
+
+    let mut source = "public int Differential() { int failures = 0;".to_owned();
+    for divisor in [1_u32, 2, 4, 8, 16, 256, 1 << 31] {
+        let mut inputs = vec![0, 1, divisor - 1, divisor, u32::MAX, 1 << 31];
+        if divisor < u32::MAX {
+            inputs.push(divisor + 1);
+        }
+        inputs.sort_unstable();
+        inputs.dedup();
+        for input in inputs {
+            writeln!(
+                source,
+                "if ({input}u / {divisor}u != {}u) {{ failures++; }}",
+                input / divisor
+            )
+            .expect("write uint division source");
+            writeln!(
+                source,
+                "if ({input}u % {divisor}u != {}u) {{ failures++; }}",
+                input % divisor
+            )
+            .expect("write uint remainder source");
+        }
+    }
+    for divisor in [1_u64, 2, 4, 8, 16, 256, 1 << 31, 1 << 63] {
+        let mut inputs = vec![0, 1, divisor - 1, divisor, u64::MAX, 1 << 63];
+        if divisor < u64::MAX {
+            inputs.push(divisor + 1);
+        }
+        inputs.sort_unstable();
+        inputs.dedup();
+        for input in inputs {
+            writeln!(
+                source,
+                "if ({input}ul / {divisor}ul != {}ul) {{ failures++; }}",
+                input / divisor
+            )
+            .expect("write ulong division source");
+            writeln!(
+                source,
+                "if ({input}ul % {divisor}ul != {}ul) {{ failures++; }}",
+                input % divisor
+            )
+            .expect("write ulong remainder source");
+        }
+    }
+    source.push_str("return failures; }");
+
+    assert_eq!(run(&source, "Differential"), Ok(ExecutionValue::Int(0)));
+}
+
+#[test]
+fn power_of_two_fast_path_uses_only_final_mir_constants() {
+    let compilation = compile(
+        "const uint Eight = 8u; \
+         public uint Value() { return 123u; } \
+         public uint Divisor() { return 8u; } \
+         public uint Named() { return Value() / Eight; } \
+         public uint Propagated() { uint value = Value(); uint divisor = 8u; return value / divisor; } \
+         public uint Runtime() { uint value = Value(); uint divisor = Divisor(); return value / divisor; }",
+    )
+    .expect("constant provenance source compiles");
+    let right_operand = |function_name: &str| {
+        compilation
+            .mir
+            .functions
+            .iter()
+            .find(|function| function.name == function_name)
+            .expect("function")
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .find_map(|instruction| {
+                let mir::Instruction::Assign { value, .. } = instruction else {
+                    return None;
+                };
+                let mir::RvalueKind::Binary {
+                    operator: mir::BinaryOperator::Divide,
+                    right,
+                    ..
+                } = &value.kind
+                else {
+                    return None;
+                };
+                Some(right)
+            })
+            .expect("division right operand")
+    };
+    for function in ["Named", "Propagated"] {
+        assert!(matches!(
+            &right_operand(function).kind,
+            mir::OperandKind::Constant(mir::Constant::Integer(value)) if value == "8"
+        ));
+    }
+    assert!(matches!(
+        right_operand("Runtime").kind,
+        mir::OperandKind::Copy(mir::Place::Local(_))
+    ));
+}
+
+#[test]
+fn rejects_malformed_integer_division_operand_and_result_types() {
+    let compilation = compile(
+        "public uint UIntDivide(uint left, uint right) { return left / right; } \
+         public ulong ULongDivide(ulong left, ulong right) { return left / right; }",
+    )
+    .expect("integer division source compiles");
+
+    let mutate_division = |module: &mut mir::Module,
+                           function_name: &str,
+                           mutation: &mut dyn FnMut(&mut mir::Rvalue)| {
+        let value = module
+            .functions
+            .iter_mut()
+            .filter(|function| function.name == function_name)
+            .flat_map(|function| &mut function.blocks)
+            .flat_map(|block| &mut block.instructions)
+            .find_map(|instruction| {
+                let mir::Instruction::Assign { value, .. } = instruction else {
+                    return None;
+                };
+                matches!(
+                    &value.kind,
+                    mir::RvalueKind::Binary {
+                        operator: mir::BinaryOperator::Divide,
+                        ..
+                    }
+                )
+                .then_some(value)
+            })
+            .expect("division rvalue");
+        mutation(value);
+    };
+
+    let mut wrong_operand = compilation.mir.clone();
+    mutate_division(&mut wrong_operand, "UIntDivide", &mut |value| {
+        let mir::RvalueKind::Binary { right, .. } = &mut value.kind else {
+            unreachable!("selected division rvalue")
+        };
+        right.type_ = mir::Type::ULong;
+    });
+    let error = validate(&wrong_operand).expect_err("mismatched operand must be rejected");
+    assert!(
+        error
+            .message()
+            .contains("operand type does not match its local")
+    );
+
+    let mut reverse_operand = compilation.mir.clone();
+    mutate_division(&mut reverse_operand, "ULongDivide", &mut |value| {
+        let mir::RvalueKind::Binary { right, .. } = &mut value.kind else {
+            unreachable!("selected division rvalue")
+        };
+        right.type_ = mir::Type::UInt;
+    });
+    let error = validate(&reverse_operand).expect_err("reverse mismatch must be rejected");
+    assert!(
+        error
+            .message()
+            .contains("operand type does not match its local")
+    );
+
+    let mut wrong_result = compilation.mir.clone();
+    mutate_division(&mut wrong_result, "UIntDivide", &mut |value| {
+        value.type_ = mir::Type::ULong;
+    });
+    let error = validate(&wrong_result).expect_err("mismatched result must be rejected");
+    assert!(error.message().contains("assigns a value of type `ulong`"));
+
+    let mut reverse_result = compilation.mir.clone();
+    mutate_division(&mut reverse_result, "ULongDivide", &mut |value| {
+        value.type_ = mir::Type::UInt;
+    });
+    let error = validate(&reverse_result).expect_err("reverse result must be rejected");
+    assert!(error.message().contains("assigns a value of type `uint`"));
+
+    let mut reference_operand = compilation.mir.clone();
+    mutate_division(&mut reference_operand, "UIntDivide", &mut |value| {
+        value.type_ = mir::Type::String;
+        let mir::RvalueKind::Binary { left, right, .. } = &mut value.kind else {
+            unreachable!("selected division rvalue")
+        };
+        left.type_ = mir::Type::String;
+        left.kind = mir::OperandKind::Constant(mir::Constant::String("left".to_owned()));
+        right.type_ = mir::Type::String;
+        right.kind = mir::OperandKind::Constant(mir::Constant::String("right".to_owned()));
+    });
+    let error = validate(&reference_operand).expect_err("reference division must be rejected");
+    assert!(error.message().contains("assigns a value of type `string`"));
 }
 
 #[test]
