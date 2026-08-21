@@ -1,6 +1,7 @@
 //! Public compiler pipeline for Aster.
 
 mod application;
+mod array_loop_optimization;
 mod constexpr;
 mod escape_analysis;
 mod generics;
@@ -89,7 +90,7 @@ pub struct Compilation {
 ///
 /// Returns positioned diagnostics for lexical, syntactic, or semantic errors.
 pub fn compile(source: &str) -> Result<Compilation, Vec<Diagnostic>> {
-    compile_with_options(source, true, true)
+    compile_with_options(source, true, true, true)
 }
 
 /// Compile one source file with the loop-carried concat rewrite disabled.
@@ -100,7 +101,7 @@ pub fn compile(source: &str) -> Result<Compilation, Vec<Diagnostic>> {
 pub fn compile_without_loop_string_concat_rewrite_for_research(
     source: &str,
 ) -> Result<Compilation, Vec<Diagnostic>> {
-    compile_with_options(source, false, true)
+    compile_with_options(source, false, true, true)
 }
 
 /// Compile one source file with the general MIR optimizer disabled.
@@ -111,13 +112,25 @@ pub fn compile_without_loop_string_concat_rewrite_for_research(
 pub fn compile_without_mir_optimizer_for_research(
     source: &str,
 ) -> Result<Compilation, Vec<Diagnostic>> {
-    compile_with_options(source, true, false)
+    compile_with_options(source, true, false, false)
+}
+
+/// Compile one source file with canonical array-loop optimization disabled.
+///
+/// This is a benchmark/test seam only; normal ASTER compilation always runs
+/// the conservative backend-neutral proof pass.
+#[doc(hidden)]
+pub fn compile_without_array_loop_optimization_for_research(
+    source: &str,
+) -> Result<Compilation, Vec<Diagnostic>> {
+    compile_with_options(source, true, true, false)
 }
 
 fn compile_with_options(
     source: &str,
     rewrite_loop_string_concat: bool,
     optimize_mir: bool,
+    optimize_array_loops: bool,
 ) -> Result<Compilation, Vec<Diagnostic>> {
     let tokens = lex(source)?;
     let module = parse(tokens.clone())?;
@@ -127,6 +140,7 @@ fn compile_with_options(
         &std::collections::HashMap::new(),
         rewrite_loop_string_concat,
         optimize_mir,
+        optimize_array_loops,
     )
 }
 
@@ -136,6 +150,7 @@ fn compile_module(
     intrinsic_bindings: &std::collections::HashMap<String, hir::Intrinsic>,
     rewrite_loop_string_concat: bool,
     optimize_mir: bool,
+    optimize_array_loops: bool,
 ) -> Result<Compilation, Vec<Diagnostic>> {
     let deferred_diagnostics = semantic::validate_deferred_language_surfaces(&mut module);
     if !deferred_diagnostics.is_empty() {
@@ -160,6 +175,9 @@ fn compile_module(
         }
         if optimize_mir {
             mir_optimizer::optimize(&mut mir);
+        }
+        if optimize_array_loops {
+            array_loop_optimization::optimize(&mut mir);
         }
         escape_analysis::assign_allocation_regions(&mut mir);
         local_object_elimination::eliminate(&mut mir);

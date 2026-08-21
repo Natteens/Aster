@@ -62,10 +62,13 @@ same fieldwise value-copy rules as stack structs; array variables copy only the 
 
 ## Bounds failures
 
-Every index reaches the checked runtime operation. A negative or too-large index records a readable
-error and returns valid sentinel storage, allowing generated code to finish without dereferencing
-an invalid pointer or unwinding through `extern "C"`. The Rust host checks the context after return
-and reports the first runtime failure instead of the computed value.
+Every ordinary index reaches the checked runtime operation. A negative or too-large index records a
+readable error and returns valid sentinel storage, allowing generated code to finish without
+dereferencing an invalid pointer or unwinding through `extern "C"`. The sole exception is an exact
+canonical-loop access carrying a compiler proof that the backend independently reconstructs from
+final MIR before lowering; unsupported or adulterated shapes remain checked or are rejected. The
+Rust host checks the context after return and reports the first runtime failure instead of the
+computed value.
 
 ## Current limits
 

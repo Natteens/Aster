@@ -44,6 +44,11 @@ name = "string_construction_matrix"
 path = "examples/string_construction_matrix.rs"
 required-features = ["aarm-telemetry"]
 
+[[example]]
+name = "array_loop_matrix"
+path = "examples/array_loop_matrix.rs"
+required-features = ["aarm-telemetry"]
+
 [dependencies]
 aster-mir = { path = "../aster-mir", version = "0.64.1" }
 aster-runtime = { path = "../aster-runtime", version = "0.64.1" }

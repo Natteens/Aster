@@ -464,6 +464,7 @@ fn entity_workload(iterations: usize) -> Workload {
                         array: Box::new(copy(6, mir::Type::Array(Box::new(mir::Type::Int)))),
                         index: Box::new(integer(0)),
                         element_type: mir::Type::Int,
+                        bounds: mir::ArrayBounds::Checked,
                     },
                     value: mir::Rvalue {
                         type_: mir::Type::Int,

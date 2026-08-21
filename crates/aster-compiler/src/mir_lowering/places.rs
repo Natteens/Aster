@@ -209,6 +209,7 @@ impl FunctionLowerer {
                         .expect("validated index produces a value"),
                 ),
                 element_type: expression.type_.clone(),
+                bounds: mir::ArrayBounds::Checked,
             },
             // Any other expression (e.g. a call or `List<T>.Get` result) has
             // no stable memory location of its own. Reads reach this through

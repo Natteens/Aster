@@ -265,6 +265,7 @@ impl DenseSet {
 #[derive(Clone)]
 struct Access {
     uses: DenseSet,
+    writes: DenseSet,
     must_defs: DenseSet,
 }
 
@@ -272,6 +273,7 @@ impl Access {
     fn empty(local_count: usize) -> Self {
         Self {
             uses: DenseSet::empty(local_count),
+            writes: DenseSet::empty(local_count),
             must_defs: DenseSet::empty(local_count),
         }
     }
@@ -657,6 +659,23 @@ fn instruction_access(
     Some(access)
 }
 
+/// Whether `instruction` definitely replaces the complete storage of
+/// `local`. This is the same fail-closed write authority used by MIR
+/// liveness; loop proofs must not maintain a second destination classifier.
+pub(super) fn instruction_defines_direct_local(
+    function: &mir::Function,
+    instruction: &mir::Instruction,
+    local: mir::LocalId,
+) -> bool {
+    let Some(locals) = local_indices(function) else {
+        return false;
+    };
+    let Some(index) = locals.get(&local).copied() else {
+        return false;
+    };
+    instruction_access(instruction, &locals).is_some_and(|access| access.writes.contains(index))
+}
+
 fn terminator_access(
     terminator: &mir::Terminator,
     locals: &HashMap<mir::LocalId, usize>,
@@ -697,6 +716,7 @@ fn write_place(
     match place {
         mir::Place::Local(local) => {
             let index = *locals.get(local)?;
+            access.writes.insert(index);
             if must_define {
                 access.must_defs.insert(index);
             }
@@ -1446,6 +1466,7 @@ mod tests {
                                 )),
                                 index: Box::new(constant_bool(false)),
                                 element_type: mir::Type::Class(CLASS),
+                                bounds: mir::ArrayBounds::Checked,
                             },
                             value: mir::Rvalue {
                                 type_: mir::Type::Class(CLASS),

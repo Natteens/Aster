@@ -1,6 +1,8 @@
 use super::{BackendError, HashMap, HashSet, integer_constant_bits, mir, primitive, type_name};
 use std::collections::BTreeMap;
 
+mod array_bounds;
+
 pub(super) fn select_entry<'a>(
     module: &'a mir::Module,
     function_name: &str,
@@ -802,6 +804,7 @@ fn validate_function(
         }
         validate_terminator(&block.terminator, &function.name, &blocks)?;
     }
+    array_bounds::validate(function)?;
     validate_explicit_array_initialization(function)?;
     Ok(())
 }
@@ -2531,6 +2534,7 @@ fn temporary_subregion_place_is_executable(place: &mir::Place) -> bool {
             array,
             index,
             element_type,
+            ..
         } => {
             matches!(
                 &array.type_,
@@ -3029,6 +3033,7 @@ fn explicit_array_element_assignment(
                 array,
                 index,
                 element_type: target_element,
+                ..
             },
         value,
     } = instruction
@@ -3218,7 +3223,7 @@ fn validate_assign(
     locals: &HashMap<mir::LocalId, mir::Type>,
     implementations: &HashSet<(mir::SymbolId, mir::SymbolId)>,
 ) -> Result<(), BackendError> {
-    validate_place(target, function_name)?;
+    validate_place_with_proven_bounds(target, function_name, true)?;
     if let mir::Place::Local(id) = target {
         let declared = locals.get(id).ok_or_else(|| {
             BackendError::new(format!(
@@ -4525,13 +4530,15 @@ fn validate_rvalue(
     match &value.kind {
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             for field in fields {
-                validate_operand(&field.value, function_name)?;
+                validate_operand_with_proven_bounds(&field.value, function_name, true)?;
             }
             Ok(())
         }
-        mir::RvalueKind::ArrayLength(array) => validate_operand(array, function_name),
+        mir::RvalueKind::ArrayLength(array) => {
+            validate_operand_with_proven_bounds(array, function_name, true)
+        }
         mir::RvalueKind::ListLength(list) => {
-            validate_operand(list, function_name)?;
+            validate_operand_with_proven_bounds(list, function_name, true)?;
             if !matches!(list.type_, mir::Type::List(_)) {
                 return Err(BackendError::new(format!(
                     "function `{function_name}` has a `ListLength` reading a non-`List<T>` receiver"
@@ -4545,7 +4552,7 @@ fn validate_rvalue(
             Ok(())
         }
         mir::RvalueKind::DictionaryLength(dictionary) => {
-            validate_operand(dictionary, function_name)?;
+            validate_operand_with_proven_bounds(dictionary, function_name, true)?;
             validate_dictionary_operand_locals(
                 dictionary,
                 "DictionaryLength",
@@ -4565,7 +4572,7 @@ fn validate_rvalue(
             Ok(())
         }
         mir::RvalueKind::ListVersion(list) => {
-            validate_operand(list, function_name)?;
+            validate_operand_with_proven_bounds(list, function_name, true)?;
             if !matches!(list.type_, mir::Type::List(_)) {
                 return Err(BackendError::new(format!(
                     "function `{function_name}` has a `ListVersion` reading a non-`List<T>` receiver"
@@ -4579,7 +4586,7 @@ fn validate_rvalue(
             Ok(())
         }
         mir::RvalueKind::StringByteLength(operand) => {
-            validate_operand(operand, function_name)?;
+            validate_operand_with_proven_bounds(operand, function_name, true)?;
             if operand.type_ != mir::Type::String {
                 return Err(BackendError::new(format!(
                     "function `{function_name}` has a `StringByteLength` reading a non-`string` receiver"
@@ -4610,16 +4617,18 @@ fn validate_rvalue(
                     "function `{function_name}` contains an invalid class-to-interface conversion"
                 )));
             }
-            validate_operand(object, function_name)
+            validate_operand_with_proven_bounds(object, function_name, true)
         }
         mir::RvalueKind::Discriminant(operand)
         | mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Cast(operand)
-        | mir::RvalueKind::Unary { operand, .. } => validate_operand(operand, function_name),
+        | mir::RvalueKind::Unary { operand, .. } => {
+            validate_operand_with_proven_bounds(operand, function_name, true)
+        }
         mir::RvalueKind::Binary { left, right, .. }
         | mir::RvalueKind::Equality { left, right, .. } => {
-            validate_operand(left, function_name)?;
-            validate_operand(right, function_name)
+            validate_operand_with_proven_bounds(left, function_name, true)?;
+            validate_operand_with_proven_bounds(right, function_name, true)
         }
     }
 }
@@ -4667,6 +4676,14 @@ fn validate_block_target(
 }
 
 fn validate_operand(operand: &mir::Operand, function_name: &str) -> Result<(), BackendError> {
+    validate_operand_with_proven_bounds(operand, function_name, false)
+}
+
+fn validate_operand_with_proven_bounds(
+    operand: &mir::Operand,
+    function_name: &str,
+    allow_proven: bool,
+) -> Result<(), BackendError> {
     validate_value_type(&operand.type_, function_name)?;
     match &operand.kind {
         mir::OperandKind::Constant(mir::Constant::Integer(value)) => integer_constant_bits(
@@ -4682,7 +4699,7 @@ fn validate_operand(operand: &mir::Operand, function_name: &str) -> Result<(), B
         }),
         mir::OperandKind::Constant(_) | mir::OperandKind::Copy(mir::Place::Local(_)) => Ok(()),
         mir::OperandKind::Copy(place @ mir::Place::Index { element_type, .. }) => {
-            validate_place(place, function_name)?;
+            validate_place_with_proven_bounds(place, function_name, allow_proven)?;
             if operand.type_ != *element_type {
                 return Err(BackendError::new(format!(
                     "function `{function_name}` has an array-index read whose result type does not match the indexed place's element type"
@@ -4690,27 +4707,45 @@ fn validate_operand(operand: &mir::Operand, function_name: &str) -> Result<(), B
             }
             Ok(())
         }
-        mir::OperandKind::Copy(place) => validate_place(place, function_name),
+        mir::OperandKind::Copy(place) => {
+            validate_place_with_proven_bounds(place, function_name, allow_proven)
+        }
         mir::OperandKind::Function(_) => Err(unsupported(function_name, "function values")),
     }
 }
 
 fn validate_place(place: &mir::Place, function_name: &str) -> Result<(), BackendError> {
+    validate_place_with_proven_bounds(place, function_name, false)
+}
+
+fn validate_place_with_proven_bounds(
+    place: &mir::Place,
+    function_name: &str,
+    allow_proven: bool,
+) -> Result<(), BackendError> {
     match place {
         mir::Place::Local(_) => Ok(()),
         mir::Place::Field { base, .. } | mir::Place::EnumField { base, .. } => {
-            validate_place(base, function_name)
+            validate_place_with_proven_bounds(base, function_name, allow_proven)
         }
         mir::Place::Index {
             array,
             index,
             element_type,
+            bounds,
         } => {
-            validate_operand(array, function_name)?;
-            validate_operand(index, function_name)?;
+            if matches!(bounds, mir::ArrayBounds::Proven { .. }) && !allow_proven {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` uses proven array bounds outside an assignment"
+                )));
+            }
+            validate_operand_with_proven_bounds(array, function_name, allow_proven)?;
+            validate_operand_with_proven_bounds(index, function_name, allow_proven)?;
             validate_value_type(element_type, function_name)
         }
-        mir::Place::ObjectField { object, .. } => validate_operand(object, function_name),
+        mir::Place::ObjectField { object, .. } => {
+            validate_operand_with_proven_bounds(object, function_name, allow_proven)
+        }
         mir::Place::Symbol(_) => Err(unsupported(
             function_name,
             "module globals, classes, and objects",

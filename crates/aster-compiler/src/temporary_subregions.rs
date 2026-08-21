@@ -4619,6 +4619,7 @@ public int Main() {
                 array: Box::new(array.clone()),
                 index: Box::new(index),
                 element_type: mir::Type::Int,
+                bounds: mir::ArrayBounds::Checked,
             };
             let array_report = validate_raw(
                 end_function(

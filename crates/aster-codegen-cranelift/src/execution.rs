@@ -1631,6 +1631,7 @@ mod tests {
                                 array: Box::new(array),
                                 index: Box::new(fine_integer(5)),
                                 element_type: mir::Type::Int,
+                                bounds: mir::ArrayBounds::Checked,
                             }),
                         }),
                     },

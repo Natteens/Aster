@@ -382,6 +382,7 @@ impl FunctionLowerer {
                             kind: mir::OperandKind::Copy(mir::Place::Local(index_local)),
                         }),
                         element_type: element.type_.clone(),
+                        bounds: mir::ArrayBounds::Checked,
                     }),
                 }),
             },

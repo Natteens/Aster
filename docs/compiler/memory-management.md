@@ -27,8 +27,10 @@ callee cannot invalidate a caller's temporary values.
 ## Escape analysis
 
 The compiler's memory-related optimization order is typed HIR, typed MIR, the safe loop-concat
-rewrite, escape-region assignment, local-object elimination, AARM ProductionV2 selection,
-long-lived owned-region selection, and finally Cranelift validation and lowering. Escape analysis
+rewrite, general scalar/control MIR optimization, canonical array-loop proof, escape-region
+assignment, local-object elimination, AARM ProductionV2 selection, long-lived owned-region
+selection, and finally Cranelift validation and lowering. The array-loop pass changes only scalar
+length/index execution and neither creates nor moves allocations. Escape analysis
 remains the lifetime authority. It:
 
 1. tracks local aliases of class, array, list, dictionary, and string references;

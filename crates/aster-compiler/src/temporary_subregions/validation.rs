@@ -1396,6 +1396,7 @@ fn is_execution_safe_place(place: &mir::Place) -> bool {
             array,
             index,
             element_type,
+            ..
         } => {
             matches!(
                 &array.type_,

@@ -164,15 +164,29 @@ key containing the closed owner, method declaration/signature, and method argume
 parameters nor constraint metadata reach HIR.
 
 The complete post-lowering order is the safe loop-concat rewrite, general MIR optimization,
-escape-region assignment, local-object elimination, AARM ProductionV2 Temporary selection, and
-long-lived owned-region selection. This keeps lifetime markers out of the general optimizer while
-giving every escape and ownership proof the final simplified scalar/control shape. The last pass
+canonical array-loop proof, escape-region assignment, local-object elimination, AARM ProductionV2
+Temporary selection, and long-lived owned-region selection. This keeps lifetime markers out of the
+optimizers while giving every escape and ownership proof the final simplified scalar/control
+shape. The last pass
 reuses escape aliases and MIR liveness to turn only fresh return-only,
 same-block repeated reference families into explicit `OwnedRegionEnter`/`OwnedRegionExit` MIR.
 Function-local region IDs validate marker balance but are erased at the private runtime ABI.
 Cranelift validation also rejects unrelated direct or transitive Persistent effects and
 invalidated-local use, then mechanically calls the context-owned LIFO checkpoint ABI; it never
 discovers aliases, liveness, ownership, or source patterns.
+
+The array-loop pass is deliberately narrower than general range analysis. For an innermost natural
+loop it accepts only the exact ascending MIR induction emitted for `i = 0; i < array.Length; i++`,
+one stable direct array local, one unit-step latch, and accesses using that same direct index local
+in dominated body blocks. It hoists the immutable length read into the unique direct preheader and
+records a typed `ArrayBounds::Proven` contract on only those exact accesses. Non-canonical indices,
+another array or alias local, cached arbitrary limits, additional definitions, ancestor loops,
+early exits, and ambiguous CFGs remain checked. Cranelift independently reconstructs the final MIR
+preheader, length provenance, loop condition, single latch, definitions, dominance, array/index
+operand types, identity, and concrete element type before mechanically omitting an access's
+ordinary bounds branch. Thus later lifetime-marker insertion may preserve a proof only while the
+complete structural contract still validates. The backend does not discover candidates, and
+malformed proof metadata never reaches unchecked address generation.
 
 The backend rejects unsupported MIR before code generation. Decimal source is rejected earlier by
 the post-link language-surface gate because its numeric and ABI contract remains unspecified;
@@ -245,7 +259,8 @@ host state crosses the test boundary.
 ## Deliberate boundaries
 
 Inheritance, interface inheritance/default methods, external packages, interprocedural inlining and
-range/loop optimization, AOT/object generation, executable linking, and general shared-memory
+general range/loop optimization beyond the canonical array subset, AOT/object generation,
+executable linking, and general shared-memory
 concurrency remain outside the current implementation. Task and parallel APIs deliberately use
 restricted worker boundaries.
 `Main` is only an application entry convention; it does not imply `Start`, `Update`, a loop, or any

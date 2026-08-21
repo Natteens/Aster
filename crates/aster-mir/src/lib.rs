@@ -852,6 +852,7 @@ pub enum Place {
         array: Box<Operand>,
         index: Box<Operand>,
         element_type: Type,
+        bounds: ArrayBounds,
     },
     ObjectField {
         object: Box<Operand>,
@@ -862,6 +863,17 @@ pub enum Place {
         case: SymbolId,
         field: SymbolId,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArrayBounds {
+    /// Emit the ordinary controlled lower/upper-bound checks.
+    Checked,
+    /// The compiler's canonical-loop pass proved this exact direct
+    /// array/index pair in the body dominated by `loop_header`. Backends must
+    /// mechanically validate the complete loop contract before omitting any
+    /// check; this marker alone is never trusted.
+    Proven { loop_header: BasicBlockId },
 }
 
 #[derive(Clone, Debug, PartialEq)]

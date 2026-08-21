@@ -50,6 +50,7 @@ fn array_index(local: u32, index: i32) -> mir::Place {
         array: Box::new(copy(local, mir::Type::Array(Box::new(mir::Type::Int)))),
         index: Box::new(integer(index)),
         element_type: mir::Type::Int,
+        bounds: mir::ArrayBounds::Checked,
     }
 }
 

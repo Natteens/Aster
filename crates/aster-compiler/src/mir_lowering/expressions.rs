@@ -1117,6 +1117,7 @@ impl FunctionLowerer {
                     array: Box::new(array.clone()),
                     index: Box::new(int_operand(index)),
                     element_type: (**element_type).clone(),
+                    bounds: mir::ArrayBounds::Checked,
                 },
                 mir::Rvalue {
                     type_: (**element_type).clone(),

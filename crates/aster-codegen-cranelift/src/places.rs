@@ -247,7 +247,8 @@ impl Codegen {
                 array,
                 index,
                 element_type,
-            } => self.array_element_address(builder, array, index, element_type, state),
+                bounds,
+            } => self.array_element_address(builder, array, index, element_type, *bounds, state),
             mir::Place::ObjectField { object, field } => {
                 let object = self.translate_operand(builder, object, state)?;
                 let field =
@@ -272,6 +273,7 @@ impl Codegen {
         array: &mir::Operand,
         index: &mir::Operand,
         element_type: &mir::Type,
+        bounds: mir::ArrayBounds,
         state: &FunctionState,
     ) -> Result<Value, BackendError> {
         let context = state
@@ -283,6 +285,15 @@ impl Codegen {
             .map_err(|_| BackendError::new("array header data offset is too large"))?;
         let array = self.translate_operand(builder, array, state)?;
         let index = self.translate_operand(builder, index, state)?;
+        if matches!(bounds, mir::ArrayBounds::Proven { .. }) {
+            return self.unchecked_array_element_address(
+                builder,
+                array,
+                index,
+                element_type,
+                array_data_offset,
+            );
+        }
         let in_bounds = builder.create_block();
         let out_of_bounds = builder.create_block();
         let join = builder.create_block();
@@ -309,6 +320,27 @@ impl Codegen {
         builder.ins().jump(join, &[address.into()]);
 
         builder.switch_to_block(in_bounds);
+        let address = self.unchecked_array_element_address(
+            builder,
+            array,
+            index,
+            element_type,
+            array_data_offset,
+        )?;
+        builder.ins().jump(join, &[address.into()]);
+
+        builder.switch_to_block(join);
+        Ok(builder.block_params(join)[0])
+    }
+
+    fn unchecked_array_element_address(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        array: Value,
+        index: Value,
+        element_type: &mir::Type,
+        array_data_offset: i32,
+    ) -> Result<Value, BackendError> {
         let data = builder
             .ins()
             .load(self.pointer_type, MemFlags::new(), array, array_data_offset);
@@ -319,11 +351,7 @@ impl Codegen {
         } else {
             builder.ins().imul_imm(index, stride)
         };
-        let address = builder.ins().iadd(data, offset);
-        builder.ins().jump(join, &[address.into()]);
-
-        builder.switch_to_block(join);
-        Ok(builder.block_params(join)[0])
+        Ok(builder.ins().iadd(data, offset))
     }
 
     pub(super) fn store_scalar(

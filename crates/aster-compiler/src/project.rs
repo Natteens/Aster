@@ -426,7 +426,7 @@ fn compile_project_with_standard_library_inner(
         return Err(loader.finish_diagnostics());
     }
     let intrinsic_bindings = loader.standard_library.intrinsic_bindings();
-    match compile_module(tokens, module, &intrinsic_bindings, true, true) {
+    match compile_module(tokens, module, &intrinsic_bindings, true, true, true) {
         Ok(compilation) => {
             let mut tests = compilation
                 .hir
