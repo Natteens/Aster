@@ -141,7 +141,9 @@ workers, and memory scopes are bound from the `aster-runtime` registry. The `uns
 converts Cranelift's finalized, untyped code pointer into the
 exact signature already checked by the backend. Every function receives a hidden pointer to its
 host-owned ExecutionContext. Array allocation, `Length`, and indexing use the small checked runtime
-ABI. Class allocation uses the same context; method and constructor calls are ordinary resolved MIR
+ABI. `StringBuilder.Append` returns a private success status so its existing runtime validation and
+first-error result select the next control-flow edge without a second runtime error query. Class
+allocation uses the same context; method and constructor calls are ordinary resolved MIR
 calls with an explicit object receiver. An interface value is two pointer-sized words: the non-null
 object reference and a pointer to a read-only method table owned by the JIT module. Interface calls
 load the concrete function from that table and use the checked ASTER calling convention. The backend

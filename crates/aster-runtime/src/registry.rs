@@ -514,7 +514,7 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
                     RuntimeType::Pointer,
                     RuntimeType::Pointer,
                 ],
-                result: None,
+                result: Some(RuntimeType::I8),
             },
         },
         RuntimeFunction {
@@ -1491,5 +1491,23 @@ mod tests {
             .expect("missing runtime error query");
         assert_eq!(has_error.signature.parameters, &[RuntimeType::Pointer]);
         assert_eq!(has_error.signature.result, Some(RuntimeType::I8));
+    }
+
+    #[test]
+    fn string_builder_append_signature_matches_the_abi() {
+        let functions = runtime_functions();
+        let append = functions
+            .iter()
+            .find(|function| function.name == "aster_rt_string_builder_append")
+            .expect("missing StringBuilder.Append runtime function");
+        assert_eq!(
+            append.signature.parameters,
+            &[
+                RuntimeType::Pointer,
+                RuntimeType::Pointer,
+                RuntimeType::Pointer,
+            ]
+        );
+        assert_eq!(append.signature.result, Some(RuntimeType::I8));
     }
 }

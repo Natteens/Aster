@@ -55,7 +55,10 @@ Rules:
 length, capacity, allocation region, and temporary-scope birth depth. Capacity starts at zero and
 grows to a checked power of two only when an append does not fit. Input strings are borrowed for one
 append call. `ToString()` allocates and copies an exact-size ordinary string, so immutable strings
-never alias builder storage.
+never alias builder storage. Its private append ABI takes context, builder, and string pointers and
+returns `I8`: exactly `1` means the append completed with no runtime error; `0` means an error was
+already present or the runtime recorded one. Generated code branches on that result directly; the
+runtime remains the sole authority for validation, growth, allocation, and diagnostics.
 
 ## Ownership and lifetime
 

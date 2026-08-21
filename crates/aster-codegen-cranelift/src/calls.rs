@@ -1,7 +1,7 @@
 use super::{
-    BackendError, Codegen, FuncId, FunctionBuilder, FunctionState, HashMap, InstBuilder, MemFlags,
-    Module, StackSlotData, StackSlotKind, Value, cast_value, integer_constant_bits, is_aggregate,
-    mir, scalar_from_bits, scalar_kind, scalar_to_bits, type_name, types,
+    BackendError, Codegen, FuncId, FunctionBuilder, FunctionState, HashMap, InstBuilder, IntCC,
+    MemFlags, Module, StackSlotData, StackSlotKind, Value, cast_value, integer_constant_bits,
+    is_aggregate, mir, scalar_from_bits, scalar_kind, scalar_to_bits, type_name, types,
 };
 
 /// Every layout fact needed to construct a concrete `Result<T, IOError>`
@@ -1629,10 +1629,17 @@ impl Codegen {
         })?;
         let receiver = self.translate_operand(builder, receiver, state)?;
         let value = self.translate_operand(builder, value, state)?;
-        builder
+        let call = builder
             .ins()
             .call(function_ref, &[context, receiver, value]);
-        self.continue_if_runtime_ok(builder, state)
+        let status = builder.inst_results(call)[0];
+        let succeeded = builder.ins().icmp_imm(IntCC::Equal, status, 1);
+        let continuation = builder.create_block();
+        builder
+            .ins()
+            .brif(succeeded, continuation, &[], state.runtime_failure, &[]);
+        builder.switch_to_block(continuation);
+        Ok(())
     }
 
     pub(super) fn translate_string_builder_to_string(

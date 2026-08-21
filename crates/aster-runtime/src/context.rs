@@ -1366,16 +1366,16 @@ impl ExecutionContext {
         &mut self,
         builder: *mut AsterStringBuilder,
         value: *const AsterStrHeader,
-    ) {
+    ) -> bool {
         if self.error.is_some() || !self.validate_string_builder(builder) {
-            return;
+            return false;
         }
         // SAFETY: `value` is an immutable ASTER string owned by this context
         // or the live JIT module and is borrowed only for this call.
         #[allow(unsafe_code)]
         let Some(value) = (unsafe { crate::string::view(value) }) else {
             self.fail("StringBuilder.Append received an invalid UTF-8 string reference");
-            return;
+            return false;
         };
         // SAFETY: validated above.
         #[allow(unsafe_code)]
@@ -1390,7 +1390,7 @@ impl ExecutionContext {
         };
         let Some(required) = old_length.checked_add(value.len()) else {
             self.fail("StringBuilder length overflow while appending");
-            return;
+            return false;
         };
         if required <= old_capacity {
             if !value.is_empty() {
@@ -1402,20 +1402,20 @@ impl ExecutionContext {
                     (*builder).length = required;
                 }
             }
-            return;
+            return true;
         }
         let Some(new_capacity) = string_builder_growth_capacity(required) else {
             self.fail("StringBuilder capacity overflow while growing");
-            return;
+            return false;
         };
         if region == ListRegion::Temporary && self.temporary_scopes.is_empty() {
             self.fail("temporary StringBuilder growth requires an active temporary scope");
-            return;
+            return false;
         }
         let use_temporary = region == ListRegion::Temporary
             && self.temporary_scopes.len() == birth_scope_depth as usize;
         let Some(new_data) = self.allocate_in_region(new_capacity, 1, use_temporary) else {
-            return;
+            return false;
         };
         // SAFETY: the fresh buffer has `new_capacity >= required` bytes.
         // Nothing is published until both copies complete.
@@ -1437,6 +1437,7 @@ impl ExecutionContext {
             (*builder).length = required;
             (*builder).capacity = new_capacity;
         }
+        true
     }
 
     fn string_builder_to_string(
@@ -3684,13 +3685,13 @@ pub extern "C" fn aster_rt_string_builder_append(
     context: *mut ExecutionContext,
     builder: *mut AsterStringBuilder,
     value: *const AsterStrHeader,
-) {
+) -> i8 {
     if context.is_null() {
-        return;
+        return 0;
     }
     #[allow(unsafe_code)]
     let context = unsafe { &mut *context };
-    context.string_builder_append(builder, value);
+    i8::from(context.string_builder_append(builder, value))
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -7611,9 +7612,9 @@ mod tests {
         let b = context.allocate_string_parts(&["b"]);
         let builder = context.allocate_string_builder_in_region(ListRegion::Persistent);
 
-        context.string_builder_append(builder, a);
+        assert!(context.string_builder_append(builder, a));
         let first = context.string_builder_to_string(builder, false);
-        context.string_builder_append(builder, b);
+        assert!(context.string_builder_append(builder, b));
         let second = context.string_builder_to_string(builder, false);
 
         // SAFETY: all pointers remain owned by the live persistent arena.
@@ -7644,6 +7645,66 @@ mod tests {
     }
 
     #[test]
+    fn string_builder_append_reports_its_runtime_status() {
+        assert_eq!(
+            aster_rt_string_builder_append(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            ),
+            0
+        );
+
+        let mut context = ExecutionContext::new();
+        let empty = context.allocate_string_parts(&[""]);
+        let value = context.allocate_string_parts(&["x"]);
+        let builder = context.allocate_string_builder_in_region(ListRegion::Persistent);
+        let context_pointer = &raw mut context;
+
+        assert_eq!(
+            aster_rt_string_builder_append(context_pointer, builder, empty),
+            1
+        );
+        assert_eq!(
+            aster_rt_string_builder_append(context_pointer, builder, value),
+            1
+        );
+        assert!(context.error.is_none());
+        assert_eq!(
+            aster_rt_string_builder_append(context_pointer, builder, std::ptr::null()),
+            0
+        );
+        let first_error = context.error.clone();
+        assert!(
+            first_error
+                .as_deref()
+                .is_some_and(|error| error.contains("invalid UTF-8"))
+        );
+        assert_eq!(
+            aster_rt_string_builder_append(context_pointer, builder, value),
+            0
+        );
+        assert_eq!(context.error, first_error);
+
+        let mut prior_error = ExecutionContext::new();
+        let value = prior_error.allocate_string_parts(&["x"]);
+        let builder = prior_error.allocate_string_builder_in_region(ListRegion::Persistent);
+        prior_error.fail("earlier builder error");
+        assert_eq!(
+            aster_rt_string_builder_append(&raw mut prior_error, builder, value),
+            0
+        );
+        assert_eq!(prior_error.error.as_deref(), Some("earlier builder error"));
+        // SAFETY: the test owns the valid empty header for this context.
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!((*builder).length, 0);
+            assert_eq!((*builder).capacity, 0);
+            assert!((*builder).data.is_null());
+        }
+    }
+
+    #[test]
     fn string_builder_growth_failure_is_atomic_and_first_error_wins() {
         assert!(string_builder_growth_capacity(usize::MAX / 2 + 2).is_none());
 
@@ -7653,7 +7714,7 @@ mod tests {
         let builder = limited.allocate_string_builder_in_region(ListRegion::Persistent);
         assert!(!builder.is_null());
 
-        limited.string_builder_append(builder, large);
+        assert!(!limited.string_builder_append(builder, large));
         assert!(
             limited
                 .take_error()
@@ -7666,7 +7727,7 @@ mod tests {
         assert_eq!(empty, Some(""));
 
         limited.fail("earlier builder failure");
-        limited.string_builder_append(builder, large);
+        assert!(!limited.string_builder_append(builder, large));
         assert_eq!(
             limited.take_error().as_deref(),
             Some("earlier builder failure")
@@ -7687,7 +7748,7 @@ mod tests {
             (*builder).length = usize::MAX;
             (*builder).capacity = usize::MAX;
         }
-        context.string_builder_append(builder, value);
+        assert!(!context.string_builder_append(builder, value));
         assert_eq!(
             context.take_error().as_deref(),
             Some("StringBuilder length overflow while appending")
