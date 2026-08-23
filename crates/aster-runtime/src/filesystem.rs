@@ -72,6 +72,19 @@ pub trait FileSystemBackend: Send {
     /// destination is not a regular file.
     fn write_all(&mut self, path: &str, content: &[u8]) -> Result<(), FileSystemError>;
 
+    /// Append bytes to a regular file, creating it when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified host error or `NotFile` for a wrong-kind target.
+    fn append_all(&mut self, path: &str, content: &[u8]) -> Result<(), FileSystemError> {
+        let _ = (path, content);
+        Err(FileSystemError::Io(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "filesystem backend does not implement append",
+        )))
+    }
+
     /// List direct, regular, non-symlink files below `directory`. The
     /// returned paths must already be full relative to `directory`, valid
     /// UTF-8, ordinally sorted, and entirely validated against both limits.
@@ -94,6 +107,74 @@ pub trait FileSystemBackend: Send {
         Err(FileSystemError::Io(io::Error::new(
             io::ErrorKind::Unsupported,
             "filesystem backend does not implement directory enumeration",
+        )))
+    }
+
+    /// List direct non-symlink directory children in ordinal order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified host error or `LimitExceeded`; never a partial list.
+    fn list_directories(
+        &mut self,
+        _directory: &str,
+        _max_entries: usize,
+        _max_total_bytes: usize,
+    ) -> Result<Vec<String>, FileSystemError> {
+        Err(FileSystemError::Io(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "filesystem backend does not implement directory enumeration",
+        )))
+    }
+
+    /// Determine whether a path is an existing regular file.
+    ///
+    /// # Errors
+    ///
+    /// Returns meaningful host errors other than not-found or wrong-kind.
+    fn file_exists(&mut self, _path: &str) -> Result<bool, FileSystemError> {
+        Err(FileSystemError::Io(io::Error::from(
+            io::ErrorKind::Unsupported,
+        )))
+    }
+    /// Determine whether a path is an existing directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns meaningful host errors other than not-found or wrong-kind.
+    fn directory_exists(&mut self, _path: &str) -> Result<bool, FileSystemError> {
+        Err(FileSystemError::Io(io::Error::from(
+            io::ErrorKind::Unsupported,
+        )))
+    }
+    /// Create exactly one directory and report whether it was created.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified host error; missing parents are not created.
+    fn create_directory(&mut self, _path: &str) -> Result<bool, FileSystemError> {
+        Err(FileSystemError::Io(io::Error::from(
+            io::ErrorKind::Unsupported,
+        )))
+    }
+    /// Delete one regular file and report whether it existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified host error for wrong-kind or failed deletion.
+    fn delete_file(&mut self, _path: &str) -> Result<bool, FileSystemError> {
+        Err(FileSystemError::Io(io::Error::from(
+            io::ErrorKind::Unsupported,
+        )))
+    }
+    /// Delete one empty directory and report whether it existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a classified host error for non-empty, wrong-kind, or failed deletion.
+    fn delete_directory(&mut self, _path: &str) -> Result<bool, FileSystemError> {
+        Err(FileSystemError::Io(io::Error::from(
+            io::ErrorKind::Unsupported,
         )))
     }
 }
@@ -158,6 +239,21 @@ impl FileSystemBackend for StdFileSystemBackend {
         Ok(())
     }
 
+    fn append_all(&mut self, path: &str, content: &[u8]) -> Result<(), FileSystemError> {
+        if let Ok(metadata) = std::fs::metadata(path)
+            && metadata.is_dir()
+        {
+            return Err(FileSystemError::NotFile);
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .map_err(FileSystemError::Io)?;
+        file.write_all(content).map_err(FileSystemError::Io)?;
+        file.flush().map_err(FileSystemError::Io)
+    }
+
     fn list_files(
         &mut self,
         directory: &str,
@@ -193,6 +289,97 @@ impl FileSystemBackend for StdFileSystemBackend {
         }
         paths.sort();
         Ok(paths)
+    }
+
+    fn list_directories(
+        &mut self,
+        directory: &str,
+        max_entries: usize,
+        max_total_bytes: usize,
+    ) -> Result<Vec<String>, FileSystemError> {
+        if !std::fs::metadata(directory)
+            .map_err(FileSystemError::Io)?
+            .is_dir()
+        {
+            return Err(FileSystemError::NotDirectory);
+        }
+        let mut paths = Vec::new();
+        let mut total_bytes = 0;
+        for entry in std::fs::read_dir(directory).map_err(FileSystemError::Io)? {
+            let entry = entry.map_err(FileSystemError::Io)?;
+            let kind = entry.file_type().map_err(FileSystemError::Io)?;
+            if kind.is_symlink() || !kind.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            let Some(path) = path.to_str() else {
+                return Err(FileSystemError::InvalidPath);
+            };
+            collect_list_path(
+                &mut paths,
+                &mut total_bytes,
+                path,
+                max_entries,
+                max_total_bytes,
+            )?;
+        }
+        paths.sort();
+        Ok(paths)
+    }
+
+    fn file_exists(&mut self, path: &str) -> Result<bool, FileSystemError> {
+        match std::fs::metadata(path) {
+            Ok(metadata) => Ok(metadata.is_file()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(FileSystemError::Io(error)),
+        }
+    }
+
+    fn directory_exists(&mut self, path: &str) -> Result<bool, FileSystemError> {
+        match std::fs::metadata(path) {
+            Ok(metadata) => Ok(metadata.is_dir()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(FileSystemError::Io(error)),
+        }
+    }
+
+    fn create_directory(&mut self, path: &str) -> Result<bool, FileSystemError> {
+        match std::fs::create_dir(path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if std::fs::metadata(path)
+                    .map_err(FileSystemError::Io)?
+                    .is_dir()
+                {
+                    Ok(false)
+                } else {
+                    Err(FileSystemError::NotDirectory)
+                }
+            }
+            Err(error) => Err(FileSystemError::Io(error)),
+        }
+    }
+
+    fn delete_file(&mut self, path: &str) -> Result<bool, FileSystemError> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(_error) if std::fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()) => {
+                Err(FileSystemError::NotFile)
+            }
+            Err(error) => Err(FileSystemError::Io(error)),
+        }
+    }
+
+    fn delete_directory(&mut self, path: &str) -> Result<bool, FileSystemError> {
+        match std::fs::remove_dir(path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(_error) if std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) => {
+                Err(FileSystemError::NotDirectory)
+            }
+            Err(error) => Err(FileSystemError::Io(error)),
+        }
     }
 }
 
@@ -302,6 +489,20 @@ impl FileSystemBackend for MemoryFileSystemBackend {
         Ok(())
     }
 
+    fn append_all(&mut self, path: &str, content: &[u8]) -> Result<(), FileSystemError> {
+        let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        match guard.get_mut(path) {
+            Some(MemoryEntry::File(bytes)) => bytes.extend_from_slice(content),
+            Some(MemoryEntry::Directory | MemoryEntry::Symlink | MemoryEntry::Other) => {
+                return Err(FileSystemError::NotFile);
+            }
+            None => {
+                guard.insert(path.to_owned(), MemoryEntry::File(content.to_vec()));
+            }
+        }
+        Ok(())
+    }
+
     fn list_files(
         &mut self,
         directory: &str,
@@ -338,6 +539,108 @@ impl FileSystemBackend for MemoryFileSystemBackend {
         paths.sort();
         Ok(paths)
     }
+
+    fn list_directories(
+        &mut self,
+        directory: &str,
+        max_entries: usize,
+        max_total_bytes: usize,
+    ) -> Result<Vec<String>, FileSystemError> {
+        let guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        match guard.get(directory) {
+            Some(MemoryEntry::Directory) => {}
+            Some(_) => return Err(FileSystemError::NotDirectory),
+            None => {
+                return Err(FileSystemError::Io(io::Error::from(
+                    io::ErrorKind::NotFound,
+                )));
+            }
+        }
+        let directory = Path::new(directory);
+        let mut paths = Vec::new();
+        let mut total_bytes = 0;
+        for (path, entry) in guard.iter() {
+            if !matches!(entry, MemoryEntry::Directory)
+                || Path::new(path).parent() != Some(directory)
+            {
+                continue;
+            }
+            collect_list_path(
+                &mut paths,
+                &mut total_bytes,
+                path,
+                max_entries,
+                max_total_bytes,
+            )?;
+        }
+        paths.sort();
+        Ok(paths)
+    }
+
+    fn file_exists(&mut self, path: &str) -> Result<bool, FileSystemError> {
+        Ok(matches!(
+            self.entries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(path),
+            Some(MemoryEntry::File(_))
+        ))
+    }
+
+    fn directory_exists(&mut self, path: &str) -> Result<bool, FileSystemError> {
+        Ok(matches!(
+            self.entries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(path),
+            Some(MemoryEntry::Directory)
+        ))
+    }
+
+    fn create_directory(&mut self, path: &str) -> Result<bool, FileSystemError> {
+        let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        match guard.get(path) {
+            Some(MemoryEntry::Directory) => Ok(false),
+            Some(_) => Err(FileSystemError::NotDirectory),
+            None => {
+                guard.insert(path.to_owned(), MemoryEntry::Directory);
+                Ok(true)
+            }
+        }
+    }
+
+    fn delete_file(&mut self, path: &str) -> Result<bool, FileSystemError> {
+        let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        match guard.get(path) {
+            None => Ok(false),
+            Some(MemoryEntry::File(_)) => {
+                guard.remove(path);
+                Ok(true)
+            }
+            Some(_) => Err(FileSystemError::NotFile),
+        }
+    }
+
+    fn delete_directory(&mut self, path: &str) -> Result<bool, FileSystemError> {
+        let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        match guard.get(path) {
+            None => return Ok(false),
+            Some(MemoryEntry::Directory) => {}
+            Some(_) => return Err(FileSystemError::NotDirectory),
+        }
+        let directory = Path::new(path);
+        if guard
+            .keys()
+            .any(|candidate| Path::new(candidate).parent() == Some(directory))
+        {
+            return Err(FileSystemError::Io(io::Error::new(
+                io::ErrorKind::DirectoryNotEmpty,
+                "directory is not empty",
+            )));
+        }
+        guard.remove(path);
+        Ok(true)
+    }
 }
 
 /// Test backend that always fails with a chosen [`io::ErrorKind`], simulating
@@ -369,6 +672,22 @@ impl FileSystemBackend for FailingFileSystemBackend {
         _max_entries: usize,
         _max_total_bytes: usize,
     ) -> Result<Vec<String>, FileSystemError> {
+        Err(FileSystemError::Io(io::Error::from(self.kind)))
+    }
+
+    fn file_exists(&mut self, _path: &str) -> Result<bool, FileSystemError> {
+        Err(FileSystemError::Io(io::Error::from(self.kind)))
+    }
+    fn directory_exists(&mut self, _path: &str) -> Result<bool, FileSystemError> {
+        Err(FileSystemError::Io(io::Error::from(self.kind)))
+    }
+    fn create_directory(&mut self, _path: &str) -> Result<bool, FileSystemError> {
+        Err(FileSystemError::Io(io::Error::from(self.kind)))
+    }
+    fn delete_file(&mut self, _path: &str) -> Result<bool, FileSystemError> {
+        Err(FileSystemError::Io(io::Error::from(self.kind)))
+    }
+    fn delete_directory(&mut self, _path: &str) -> Result<bool, FileSystemError> {
         Err(FileSystemError::Io(io::Error::from(self.kind)))
     }
 }
@@ -407,6 +726,22 @@ impl FileSystemBackend for PartialWriteFailureFileSystemBackend {
         Err(FileSystemError::Io(io::Error::other(
             "simulated flush failure after content was written",
         )))
+    }
+
+    fn file_exists(&mut self, path: &str) -> Result<bool, FileSystemError> {
+        self.inner.file_exists(path)
+    }
+    fn directory_exists(&mut self, path: &str) -> Result<bool, FileSystemError> {
+        self.inner.directory_exists(path)
+    }
+    fn create_directory(&mut self, path: &str) -> Result<bool, FileSystemError> {
+        self.inner.create_directory(path)
+    }
+    fn delete_file(&mut self, path: &str) -> Result<bool, FileSystemError> {
+        self.inner.delete_file(path)
+    }
+    fn delete_directory(&mut self, path: &str) -> Result<bool, FileSystemError> {
+        self.inner.delete_directory(path)
     }
 }
 
@@ -656,7 +991,7 @@ fn read_all_text(
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn list_files(
+fn list_paths(
     context: *mut ExecutionContext,
     directory: *const AsterStrHeader,
     destination: *mut u8,
@@ -669,6 +1004,7 @@ fn list_files(
     oscode_offset: i32,
     kind_tags: *const i32,
     temporary: bool,
+    directories: bool,
 ) {
     if context.is_null() {
         return;
@@ -677,7 +1013,7 @@ fn list_files(
     #[allow(unsafe_code)]
     let context = unsafe { &mut *context };
     if destination.is_null() {
-        context.fail("aster.io.ListFiles received a null destination");
+        context.fail("aster.io directory listing received a null destination");
         return;
     }
     let (
@@ -694,14 +1030,14 @@ fn list_files(
         usize::try_from(oscode_offset),
     )
     else {
-        context.fail("aster.io.ListFiles received a negative layout size");
+        context.fail("aster.io directory listing received a negative layout size");
         return;
     };
     // SAFETY: generated code passes a pointer to 9 compiler-computed tag
     // constants (or null on a malformed layout, handled below).
     #[allow(unsafe_code)]
     let Some(kind_tags) = (unsafe { read_kind_tags(kind_tags) }) else {
-        context.fail("aster.io.ListFiles received a malformed IOErrorKind tag layout");
+        context.fail("aster.io directory listing received a malformed IOErrorKind tag layout");
         return;
     };
     // SAFETY: generated code passes its live context and a string reference
@@ -709,17 +1045,25 @@ fn list_files(
     #[allow(unsafe_code)]
     let directory = unsafe { view(directory) };
     let Some(directory) = directory else {
-        context.fail("aster.io.ListFiles received an invalid UTF-8 string reference");
+        context.fail("aster.io directory listing received an invalid UTF-8 string reference");
         return;
     };
 
     let mut paths = if directory.is_empty() || directory.contains('\0') {
         Err((PortableIoErrorKind::InvalidPath, 0))
     } else {
-        context
-            .filesystem_backend()
-            .list_files(directory, MAX_LIST_FILES, MAX_LIST_PATH_BYTES)
-            .map_err(classify)
+        if directories {
+            context.filesystem_backend().list_directories(
+                directory,
+                MAX_LIST_FILES,
+                MAX_LIST_PATH_BYTES,
+            )
+        } else {
+            context
+                .filesystem_backend()
+                .list_files(directory, MAX_LIST_FILES, MAX_LIST_PATH_BYTES)
+        }
+        .map_err(classify)
     };
 
     let validation_error = if let Ok(paths) = &mut paths {
@@ -798,7 +1142,7 @@ fn list_files(
     };
     let element_size = u32::try_from(size_of::<*const AsterStrHeader>()).unwrap_or(0);
     if element_size == 0 {
-        context.fail("aster.io.ListFiles cannot represent string array elements");
+        context.fail("aster.io directory listing cannot represent string array elements");
         return;
     }
     let array = if temporary {
@@ -819,12 +1163,12 @@ fn list_files(
             return;
         }
         let Ok(index) = i32::try_from(index) else {
-            context.fail("aster.io.ListFiles entry index exceeds the ABI range");
+            context.fail("aster.io directory listing entry index exceeds the ABI range");
             return;
         };
         let element = crate::aster_rt_array_element(std::ptr::from_mut(context), array, index);
         if element.is_null() {
-            context.fail("aster.io.ListFiles could not initialize its result array");
+            context.fail("aster.io directory listing could not initialize its result array");
             return;
         }
         // SAFETY: `array` was allocated above with exactly pointer-sized
@@ -870,7 +1214,7 @@ pub extern "C" fn aster_rt_io_list_files(
     oscode_offset: i32,
     kind_tags: *const i32,
 ) {
-    list_files(
+    list_paths(
         context,
         directory,
         destination,
@@ -882,6 +1226,7 @@ pub extern "C" fn aster_rt_io_list_files(
         kind_offset,
         oscode_offset,
         kind_tags,
+        false,
         false,
     );
 }
@@ -901,7 +1246,7 @@ pub extern "C" fn aster_rt_io_list_files_temporary(
     oscode_offset: i32,
     kind_tags: *const i32,
 ) {
-    list_files(
+    list_paths(
         context,
         directory,
         destination,
@@ -913,6 +1258,69 @@ pub extern "C" fn aster_rt_io_list_files_temporary(
         kind_offset,
         oscode_offset,
         kind_tags,
+        true,
+        false,
+    );
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments)]
+pub extern "C" fn aster_rt_io_list_directories(
+    context: *mut ExecutionContext,
+    directory: *const AsterStrHeader,
+    destination: *mut u8,
+    total_size: i32,
+    ok_tag: i32,
+    error_tag: i32,
+    ok_payload_offset: i32,
+    error_payload_offset: i32,
+    kind_offset: i32,
+    oscode_offset: i32,
+    kind_tags: *const i32,
+) {
+    list_paths(
+        context,
+        directory,
+        destination,
+        total_size,
+        ok_tag,
+        error_tag,
+        ok_payload_offset,
+        error_payload_offset,
+        kind_offset,
+        oscode_offset,
+        kind_tags,
+        false,
+        true,
+    );
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments)]
+pub extern "C" fn aster_rt_io_list_directories_temporary(
+    context: *mut ExecutionContext,
+    directory: *const AsterStrHeader,
+    destination: *mut u8,
+    total_size: i32,
+    ok_tag: i32,
+    error_tag: i32,
+    ok_payload_offset: i32,
+    error_payload_offset: i32,
+    kind_offset: i32,
+    oscode_offset: i32,
+    kind_tags: *const i32,
+) {
+    list_paths(
+        context,
+        directory,
+        destination,
+        total_size,
+        ok_tag,
+        error_tag,
+        ok_payload_offset,
+        error_payload_offset,
+        kind_offset,
+        oscode_offset,
+        kind_tags,
+        true,
         true,
     );
 }
@@ -1077,6 +1485,176 @@ pub extern "C" fn aster_rt_io_write_all_text(
     }
 }
 
+#[allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    clippy::too_many_arguments,
+    clippy::similar_names
+)]
+pub extern "C" fn aster_rt_io_append_all_text(
+    context: *mut ExecutionContext,
+    path: *const AsterStrHeader,
+    content: *const AsterStrHeader,
+    destination: *mut u8,
+    total_size: i32,
+    ok_tag: i32,
+    error_tag: i32,
+    ok_payload_offset: i32,
+    error_payload_offset: i32,
+    kind_offset: i32,
+    oscode_offset: i32,
+    kind_tags: *const i32,
+) {
+    if context.is_null() {
+        return;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    if destination.is_null() {
+        context.fail("aster.io.AppendAllText received a null destination");
+        return;
+    }
+    let (
+        Ok(total_size),
+        Ok(ok_payload_offset),
+        Ok(error_payload_offset),
+        Ok(kind_offset),
+        Ok(oscode_offset),
+    ) = (
+        usize::try_from(total_size),
+        usize::try_from(ok_payload_offset),
+        usize::try_from(error_payload_offset),
+        usize::try_from(kind_offset),
+        usize::try_from(oscode_offset),
+    )
+    else {
+        context.fail("aster.io.AppendAllText received invalid layout metadata");
+        return;
+    };
+    #[allow(unsafe_code)]
+    let Some(kind_tags) = (unsafe { read_kind_tags(kind_tags) }) else {
+        context.fail("aster.io.AppendAllText received invalid error metadata");
+        return;
+    };
+    #[allow(unsafe_code)]
+    let (Some(path), Some(content)) = (unsafe { view(path) }, unsafe { view(content) }) else {
+        context.fail("aster.io.AppendAllText received invalid string data");
+        return;
+    };
+    let outcome = if path.is_empty() || path.contains('\0') {
+        Err((PortableIoErrorKind::InvalidPath, 0))
+    } else if content.len() as u64 > MAX_FILE_BYTES {
+        Err((PortableIoErrorKind::LimitExceeded, 0))
+    } else {
+        context
+            .filesystem_backend()
+            .append_all(path, content.as_bytes())
+            .map(|()| i32::try_from(content.len()).unwrap_or(i32::MAX))
+            .map_err(classify)
+    };
+    #[allow(unsafe_code)]
+    unsafe {
+        write_result_io_error(
+            destination,
+            total_size,
+            ok_tag,
+            error_tag,
+            ok_payload_offset,
+            error_payload_offset,
+            kind_offset,
+            oscode_offset,
+            outcome,
+            &kind_tags,
+        );
+    }
+}
+
+/// Private operation codes: 0 `FileExists`, 1 `DirectoryExists`, 2
+/// `CreateDirectory`, 3 `DeleteFile`, 4 `DeleteDirectory`.
+#[allow(clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments)]
+pub extern "C" fn aster_rt_io_path_bool(
+    context: *mut ExecutionContext,
+    operation: i32,
+    path: *const AsterStrHeader,
+    destination: *mut u8,
+    total_size: i32,
+    ok_tag: i32,
+    error_tag: i32,
+    ok_payload_offset: i32,
+    error_payload_offset: i32,
+    kind_offset: i32,
+    oscode_offset: i32,
+    kind_tags: *const i32,
+) {
+    if context.is_null() {
+        return;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    if destination.is_null() {
+        context.fail("aster.io path operation received a null destination");
+        return;
+    }
+    let (
+        Ok(total_size),
+        Ok(ok_payload_offset),
+        Ok(error_payload_offset),
+        Ok(kind_offset),
+        Ok(oscode_offset),
+    ) = (
+        usize::try_from(total_size),
+        usize::try_from(ok_payload_offset),
+        usize::try_from(error_payload_offset),
+        usize::try_from(kind_offset),
+        usize::try_from(oscode_offset),
+    )
+    else {
+        context.fail("aster.io path operation received invalid layout metadata");
+        return;
+    };
+    #[allow(unsafe_code)]
+    let Some(kind_tags) = (unsafe { read_kind_tags(kind_tags) }) else {
+        context.fail("aster.io path operation received invalid error metadata");
+        return;
+    };
+    #[allow(unsafe_code)]
+    let Some(path) = (unsafe { view(path) }) else {
+        context.fail("aster.io path operation received invalid string data");
+        return;
+    };
+    let outcome = if path.is_empty() || path.contains('\0') {
+        Err((PortableIoErrorKind::InvalidPath, 0))
+    } else {
+        match operation {
+            0 => context.filesystem_backend().file_exists(path),
+            1 => context.filesystem_backend().directory_exists(path),
+            2 => context.filesystem_backend().create_directory(path),
+            3 => context.filesystem_backend().delete_file(path),
+            4 => context.filesystem_backend().delete_directory(path),
+            _ => {
+                context.fail("aster.io path operation received an invalid operation code");
+                return;
+            }
+        }
+        .map(i8::from)
+        .map_err(classify)
+    };
+    #[allow(unsafe_code)]
+    unsafe {
+        write_result_io_error(
+            destination,
+            total_size,
+            ok_tag,
+            error_tag,
+            ok_payload_offset,
+            error_payload_offset,
+            kind_offset,
+            oscode_offset,
+            outcome,
+            &kind_tags,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1201,6 +1779,61 @@ mod tests {
             .write_all("b.txt", b"created")
             .expect("write creates a new entry");
         assert_eq!(backend.read("b.txt"), Some(b"created".to_vec()));
+    }
+
+    #[test]
+    fn memory_backend_practical_file_and_directory_lifecycle_is_non_recursive() {
+        let mut backend = MemoryFileSystemBackend::new().with_directory("root");
+        assert!(
+            backend
+                .create_directory("root/a")
+                .expect("create directory")
+        );
+        assert!(
+            !backend
+                .create_directory("root/a")
+                .expect("existing directory")
+        );
+        assert!(
+            backend
+                .directory_exists("root/a")
+                .expect("directory exists")
+        );
+        assert!(!backend.file_exists("root/a").expect("wrong kind is false"));
+
+        backend
+            .append_all("root/a/data.txt", b"one")
+            .expect("append creates");
+        backend
+            .append_all("root/a/data.txt", b"two")
+            .expect("append extends");
+        assert_eq!(backend.read("root/a/data.txt"), Some(b"onetwo".to_vec()));
+        assert_eq!(
+            backend
+                .list_directories("root", 10, 1_000)
+                .expect("list directories"),
+            vec!["root/a"]
+        );
+        assert!(matches!(
+            backend.delete_directory("root/a"),
+            Err(FileSystemError::Io(error)) if error.kind() == io::ErrorKind::DirectoryNotEmpty
+        ));
+        assert!(backend.delete_file("root/a/data.txt").expect("delete file"));
+        assert!(
+            !backend
+                .delete_file("root/a/data.txt")
+                .expect("missing is false")
+        );
+        assert!(
+            backend
+                .delete_directory("root/a")
+                .expect("delete empty directory")
+        );
+        assert!(
+            !backend
+                .delete_directory("root/a")
+                .expect("missing is false")
+        );
     }
 
     #[test]

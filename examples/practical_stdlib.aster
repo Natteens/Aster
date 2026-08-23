@@ -1,0 +1,41 @@
+using aster.core;
+using aster.collections;
+using aster.math;
+using aster.random;
+using aster.text;
+using aster.time;
+
+public class Program
+{
+public static int Main()
+{
+    string[] words = ["small", "useful", "library"];
+    string message = String.Join(" ", words);
+
+    StringBuilder builder = new StringBuilder();
+    builder.Append(message);
+    builder.AppendLine();
+    builder.Append(42);
+
+    Random random = new Random(2UL);
+    int sample = random.NextInt(0, 10);
+    long started = Clock.MonotonicMilliseconds();
+
+    List<int> values = new List<int>();
+    values.EnsureCapacity(4);
+    values.AddRange([1, 2, 3]);
+    values.Insert(1, 9);
+    values.RemoveRange(2, 1);
+    values.Reverse();
+    int[] snapshot = values.GetRange(0, values.Length);
+    Array.Reverse<int>(snapshot);
+
+    Dictionary<int, string> names = new Dictionary<int, string>();
+    names.EnsureCapacity(8);
+    string first = names.GetOrAdd(1, "one");
+    string second = names.GetOr(2, "missing");
+
+    return builder.Length + sample + Math.Sign(started) + values.Capacity + snapshot[0]
+        + names.Capacity + first.Length + second.Length;
+}
+}

@@ -5,6 +5,16 @@ use crate::{
     string::{AsterStrHeader, decode_str},
 };
 
+/// Target-independent `SplitMix64` output permutation. The standard library
+/// owns state advancement; this narrow helper supplies the bit operations
+/// that are intentionally absent from ASTER's current source surface.
+#[must_use]
+pub extern "C" fn aster_rt_random_mix(mut value: u64) -> u64 {
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
 /// Record a structured equality assertion failure without exposing a Rust
 /// panic or an ungoverned ASTER allocation path.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -44,6 +54,17 @@ pub extern "C" fn aster_rt_math_unary_float(value: f32, operation: i32) -> f32 {
         4 => value.sin(),
         5 => value.cos(),
         6 => value.tan(),
+        7 => value.trunc(),
+        8 => value.exp(),
+        9 => value.ln(),
+        10 => value.log2(),
+        11 => value.log10(),
+        12 => value.asin(),
+        13 => value.acos(),
+        14 => value.atan(),
+        15 => value.sinh(),
+        16 => value.cosh(),
+        17 => value.tanh(),
         _ => f32::NAN,
     }
 }
@@ -59,6 +80,17 @@ pub extern "C" fn aster_rt_math_unary_double(value: f64, operation: i32) -> f64 
         4 => value.sin(),
         5 => value.cos(),
         6 => value.tan(),
+        7 => value.trunc(),
+        8 => value.exp(),
+        9 => value.ln(),
+        10 => value.log2(),
+        11 => value.log10(),
+        12 => value.asin(),
+        13 => value.acos(),
+        14 => value.atan(),
+        15 => value.sinh(),
+        16 => value.cosh(),
+        17 => value.tanh(),
         _ => f64::NAN,
     }
 }
@@ -71,6 +103,42 @@ pub extern "C" fn aster_rt_math_pow_float(value: f32, exponent: f32) -> f32 {
 #[must_use]
 pub extern "C" fn aster_rt_math_pow_double(value: f64, exponent: f64) -> f64 {
     value.powf(exponent)
+}
+
+#[must_use]
+pub extern "C" fn aster_rt_math_binary_float(left: f32, right: f32, operation: i32) -> f32 {
+    match operation {
+        0 => left.atan2(right),
+        _ => f32::NAN,
+    }
+}
+
+#[must_use]
+pub extern "C" fn aster_rt_math_binary_double(left: f64, right: f64, operation: i32) -> f64 {
+    match operation {
+        0 => left.atan2(right),
+        _ => f64::NAN,
+    }
+}
+
+#[must_use]
+pub extern "C" fn aster_rt_math_predicate_float(value: f32, operation: i32) -> i8 {
+    i8::from(match operation {
+        0 => value.is_nan(),
+        1 => value.is_infinite(),
+        2 => value.is_finite(),
+        _ => false,
+    })
+}
+
+#[must_use]
+pub extern "C" fn aster_rt_math_predicate_double(value: f64, operation: i32) -> i8 {
+    i8::from(match operation {
+        0 => value.is_nan(),
+        1 => value.is_infinite(),
+        2 => value.is_finite(),
+        _ => false,
+    })
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -89,6 +157,9 @@ pub extern "C" fn aster_rt_math_domain_error(context: *mut ExecutionContext, cod
         3 => "assertion failed: expected condition to be true",
         4 => "assertion failed: expected condition to be false",
         5 => "assertion failed: values are not equal",
+        6 => "Math.Sign does not accept NaN",
+        7 => "collection range is outside the valid bounds",
+        8 => "random range requires minInclusive to be less than maxExclusive",
         _ => "unknown runtime error",
     };
     context.fail(message);
@@ -118,7 +189,20 @@ mod tests {
     use super::{
         aster_rt_integer_arithmetic_error, aster_rt_math_domain_error, aster_rt_math_pow_double,
         aster_rt_math_pow_float, aster_rt_math_unary_double, aster_rt_math_unary_float,
+        aster_rt_random_mix,
     };
+
+    #[test]
+    fn splitmix64_mixer_matches_known_answers() {
+        assert_eq!(
+            aster_rt_random_mix(0x9e37_79b9_7f4a_7c15),
+            16_294_208_416_658_607_535
+        );
+        assert_eq!(
+            aster_rt_random_mix(11_400_714_819_323_198_608),
+            13_032_462_758_197_477_675
+        );
+    }
     use crate::ExecutionContext;
 
     #[test]

@@ -378,13 +378,35 @@ impl Lowerer<'_> {
                 if matches!(object.type_, hir::Type::List(_)) {
                     return hir::Expression {
                         type_: hir::Type::Int,
-                        kind: hir::ExpressionKind::ListLength(Box::new(object)),
+                        kind: if name == "Capacity" {
+                            hir::ExpressionKind::ListCapacity(Box::new(object))
+                        } else {
+                            hir::ExpressionKind::ListLength(Box::new(object))
+                        },
                     };
                 }
                 if matches!(object.type_, hir::Type::Dictionary(_, _)) {
                     return hir::Expression {
                         type_: hir::Type::Int,
-                        kind: hir::ExpressionKind::DictionaryLength(Box::new(object)),
+                        kind: if name == "Capacity" {
+                            hir::ExpressionKind::DictionaryCapacity(Box::new(object))
+                        } else {
+                            hir::ExpressionKind::DictionaryLength(Box::new(object))
+                        },
+                    };
+                }
+                if name == "Length"
+                    && self
+                        .string_builder
+                        .is_some_and(|builder| object.type_ == hir::Type::Class(builder.class))
+                {
+                    let class_symbol = self.string_builder.expect("checked above").class;
+                    return hir::Expression {
+                        type_: hir::Type::Int,
+                        kind: hir::ExpressionKind::StringBuilderLength {
+                            builder: Box::new(object),
+                            class_symbol,
+                        },
                     };
                 }
                 if let Some(key) = self.model.property_reads.get(&model_key) {
@@ -514,6 +536,11 @@ impl Lowerer<'_> {
                         hir::StringOperation::SubstringFrom
                         | hir::StringOperation::SubstringRange => hir::Type::String,
                         hir::StringOperation::TryParseBool
+                        | hir::StringOperation::TryParseChar
+                        | hir::StringOperation::TryParseSByte
+                        | hir::StringOperation::TryParseByte
+                        | hir::StringOperation::TryParseShort
+                        | hir::StringOperation::TryParseUShort
                         | hir::StringOperation::TryParseInt
                         | hir::StringOperation::TryParseUInt
                         | hir::StringOperation::TryParseLong
@@ -549,6 +576,74 @@ impl Lowerer<'_> {
                             receiver: Box::new(receiver),
                         },
                     };
+                }
+                if !has_resolved_call
+                    && let ast::ExpressionKind::Member { object, name } = &callee.kind
+                    && matches!(
+                        name.as_str(),
+                        "EnsureCapacity"
+                            | "AddRange"
+                            | "Insert"
+                            | "RemoveRange"
+                            | "Reverse"
+                            | "GetRange"
+                    )
+                {
+                    let object = self.expression(object);
+                    if let hir::Type::List(element_type) = object.type_.clone() {
+                        return match name.as_str() {
+                            "EnsureCapacity" => hir::Expression {
+                                type_: hir::Type::Int,
+                                kind: hir::ExpressionKind::ListEnsureCapacity {
+                                    list: Box::new(object),
+                                    minimum: Box::new(self.expression(&arguments[0])),
+                                },
+                            },
+                            "AddRange" => hir::Expression {
+                                type_: hir::Type::Void,
+                                kind: hir::ExpressionKind::ListAddRange {
+                                    list: Box::new(object),
+                                    values: Box::new(self.expression(&arguments[0])),
+                                    element_type: *element_type,
+                                },
+                            },
+                            "Insert" => hir::Expression {
+                                type_: hir::Type::Void,
+                                kind: hir::ExpressionKind::ListInsert {
+                                    list: Box::new(object),
+                                    index: Box::new(self.expression(&arguments[0])),
+                                    value: Box::new(convert(
+                                        self.expression(&arguments[1]),
+                                        &element_type,
+                                    )),
+                                },
+                            },
+                            "RemoveRange" => hir::Expression {
+                                type_: hir::Type::Void,
+                                kind: hir::ExpressionKind::ListRemoveRange {
+                                    list: Box::new(object),
+                                    index: Box::new(self.expression(&arguments[0])),
+                                    count: Box::new(self.expression(&arguments[1])),
+                                },
+                            },
+                            "Reverse" => hir::Expression {
+                                type_: hir::Type::Void,
+                                kind: hir::ExpressionKind::ListReverse {
+                                    list: Box::new(object),
+                                },
+                            },
+                            "GetRange" => hir::Expression {
+                                type_: hir::Type::Array(element_type.clone()),
+                                kind: hir::ExpressionKind::ListGetRange {
+                                    list: Box::new(object),
+                                    index: Box::new(self.expression(&arguments[0])),
+                                    count: Box::new(self.expression(&arguments[1])),
+                                    element_type: *element_type,
+                                },
+                            },
+                            _ => unreachable!(),
+                        };
+                    }
                 }
                 if !has_resolved_call
                     && let ast::ExpressionKind::Member { object, name } = &callee.kind
@@ -656,8 +751,13 @@ impl Lowerer<'_> {
                             .iter()
                             .map(|argument| self.expression(argument))
                             .collect::<Vec<_>>();
-                        if let Some(key) = lowered_arguments.first_mut() {
-                            *key = convert(key.clone(), &key_type);
+                        if let Some(first) = lowered_arguments.first_mut() {
+                            let expected = if name == "EnsureCapacity" {
+                                hir::Type::Int
+                            } else {
+                                (*key_type).clone()
+                            };
+                            *first = convert(first.clone(), &expected);
                         }
                         if let Some(value) = lowered_arguments.get_mut(1) {
                             *value = convert(value.clone(), &value_type);
@@ -782,6 +882,33 @@ impl Lowerer<'_> {
                                     value_type: *value_type,
                                 },
                             },
+                            "EnsureCapacity" => hir::Expression {
+                                type_: hir::Type::Int,
+                                kind: hir::ExpressionKind::DictionaryEnsureCapacity {
+                                    dictionary: Box::new(object),
+                                    minimum: key(),
+                                },
+                            },
+                            "GetOr" => hir::Expression {
+                                type_: (*value_type).clone(),
+                                kind: hir::ExpressionKind::DictionaryGetOr {
+                                    dictionary: Box::new(object),
+                                    key: key(),
+                                    fallback: Box::new(
+                                        lowered_arguments.next().expect("validated fallback"),
+                                    ),
+                                },
+                            },
+                            "GetOrAdd" => hir::Expression {
+                                type_: (*value_type).clone(),
+                                kind: hir::ExpressionKind::DictionaryGetOrAdd {
+                                    dictionary: Box::new(object),
+                                    key: key(),
+                                    value: Box::new(
+                                        lowered_arguments.next().expect("validated value"),
+                                    ),
+                                },
+                            },
                             _ => unreachable!("semantic analysis validated Dictionary method"),
                         };
                     }
@@ -876,9 +1003,23 @@ impl Lowerer<'_> {
                                 },
                             };
                         }
+                        crate::semantic::ResolvedStringBuilderOperation::Clear => {
+                            let ast::ExpressionKind::Member { object, .. } = &callee.kind else {
+                                unreachable!("StringBuilder.Clear is an instance method")
+                            };
+                            return hir::Expression {
+                                type_: hir::Type::Void,
+                                kind: hir::ExpressionKind::StringBuilderClear {
+                                    builder: Box::new(self.expression(object)),
+                                    class_symbol: builder.class,
+                                },
+                            };
+                        }
                     }
                 }
-                let resolved = &self.model.calls[&model_key];
+                let resolved = self.model.calls.get(&model_key).unwrap_or_else(|| {
+                    panic!("validated call is missing lowering metadata at {model_key:?}")
+                });
                 let symbol = self.callable_symbols[&resolved.callable];
                 let type_ = self.callable_results[&symbol].clone();
                 let parameter_types = self.callable_parameters[&symbol].clone();

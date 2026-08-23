@@ -1,0 +1,10 @@
+namespace aster.time;
+
+internal long __MonotonicMilliseconds() { return 0L; }
+internal long __UnixMilliseconds() { return 0L; }
+
+public static class Clock
+{
+    public static long MonotonicMilliseconds() { return __MonotonicMilliseconds(); }
+    public static long UnixMilliseconds() { return __UnixMilliseconds(); }
+}

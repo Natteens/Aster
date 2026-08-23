@@ -45,6 +45,11 @@ path = "examples/string_construction_matrix.rs"
 required-features = ["aarm-telemetry"]
 
 [[example]]
+name = "practical_stdlib_matrix"
+path = "examples/practical_stdlib_matrix.rs"
+required-features = ["aarm-telemetry"]
+
+[[example]]
 name = "array_loop_matrix"
 path = "examples/array_loop_matrix.rs"
 required-features = ["aarm-telemetry"]

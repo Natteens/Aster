@@ -39,6 +39,11 @@ values[1] = 25;
 The complete allocation, initialization, bounds, identity, and iteration rules are in
 [Arrays](arrays.md).
 
+`aster.collections.Array` provides `Copy<T>`, overlap-safe `CopyRange<T>`, `Fill<T>`, and
+in-place `Reverse<T>`. These are ordinary typed ASTER algorithms: they validate complete ranges
+before mutation, preserve reference identity for reference-bearing elements, and never create
+uninitialized non-null reference slots.
+
 ## `List<T>`
 
 `List<T>` is a nominal, growable reference collection:
@@ -56,6 +61,13 @@ int[] snapshot = values.ToArray();
 values.Clear();
 int count = values.Length;
 ```
+
+`Capacity` exposes the reusable backing size. `EnsureCapacity(minimum)` returns the resulting
+capacity, `AddRange(array)` reserves once and appends in order, `Insert(index, value)` accepts
+`index == Length`, `RemoveRange(index, count)` validates the whole range, `Reverse()` changes the
+active order in place, and `GetRange(index, count)` returns an independent initialized array.
+Negative/overflowing ranges fail in the controlled runtime path. A zero-count removal is a no-op;
+successful observable order/length changes participate in foreach version detection.
 
 `Length` is read-only. `Get`, `Set`, and `RemoveAt` validate the index. `Set` replaces one element
 without changing structural iteration version. `Clear` removes every element. `ToArray()` copies
@@ -92,6 +104,12 @@ string[] keys = counts.Keys();
 int[] values = counts.Values();
 counts.Clear();
 ```
+
+`Capacity` and `EnsureCapacity(minimum)` provide optional growth control without changing hashing,
+load factor, or insertion order. `GetOr(key, fallback)` eagerly evaluates and returns the fallback
+when absent. `GetOrAdd(key, value)` eagerly evaluates its supplied value, returns an existing value
+without mutation, or inserts and returns the supplied value. Runtime failure remains distinct from
+ordinary absence and semantic `false`.
 
 `Add` returns `false` for an existing key. `Set` inserts or replaces and reports whether it replaced
 an existing value. `Remove` reports whether a key was present. `TryGet` returns `Option<V>`, and

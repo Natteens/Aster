@@ -145,7 +145,32 @@ impl Codegen {
                     state,
                 );
             }
+            mir::Intrinsic::ListCapacity
+            | mir::Intrinsic::DictionaryCapacity
+            | mir::Intrinsic::DictionaryEnsureCapacity
+            | mir::Intrinsic::DictionaryGetOr
+            | mir::Intrinsic::DictionaryGetOrAdd
+            | mir::Intrinsic::ListEnsureCapacity
+            | mir::Intrinsic::ListAddRange
+            | mir::Intrinsic::ListInsert
+            | mir::Intrinsic::ListRemoveRange
+            | mir::Intrinsic::ListReverse
+            | mir::Intrinsic::ListGetRange
+            | mir::Intrinsic::ListGetRangeTemporary => {
+                return self.translate_collection_utility_intrinsic(
+                    builder,
+                    destination,
+                    intrinsic,
+                    arguments,
+                    state,
+                );
+            }
             mir::Intrinsic::StringTryParseBool
+            | mir::Intrinsic::StringTryParseChar
+            | mir::Intrinsic::StringTryParseSByte
+            | mir::Intrinsic::StringTryParseByte
+            | mir::Intrinsic::StringTryParseShort
+            | mir::Intrinsic::StringTryParseUShort
             | mir::Intrinsic::StringTryParseInt
             | mir::Intrinsic::StringTryParseUInt
             | mir::Intrinsic::StringTryParseLong
@@ -177,8 +202,16 @@ impl Codegen {
             mir::Intrinsic::FileReadAllText(_)
             | mir::Intrinsic::FileReadAllTextTemporary(_)
             | mir::Intrinsic::FileWriteAllText(_)
+            | mir::Intrinsic::FileAppendAllText(_)
             | mir::Intrinsic::FileListFiles(_)
-            | mir::Intrinsic::FileListFilesTemporary(_) => {
+            | mir::Intrinsic::FileListFilesTemporary(_)
+            | mir::Intrinsic::FileListDirectories(_)
+            | mir::Intrinsic::FileListDirectoriesTemporary(_)
+            | mir::Intrinsic::FileExists(_)
+            | mir::Intrinsic::DirectoryExists(_)
+            | mir::Intrinsic::FileCreateDirectory(_)
+            | mir::Intrinsic::FileDeleteFile(_)
+            | mir::Intrinsic::FileDeleteDirectory(_) => {
                 return self.translate_file_io(
                     builder,
                     destination,
@@ -234,6 +267,37 @@ impl Codegen {
             }
             mir::Intrinsic::StringTrim => ("aster_rt_string_trim", None, true),
             mir::Intrinsic::StringTrimTemporary => ("aster_rt_string_trim_temporary", None, true),
+            mir::Intrinsic::StringLastIndexOf => ("aster_rt_string_last_index_of", None, true),
+            mir::Intrinsic::StringTrimStart => ("aster_rt_string_trim_start", None, true),
+            mir::Intrinsic::StringTrimStartTemporary => {
+                ("aster_rt_string_trim_start_temporary", None, true)
+            }
+            mir::Intrinsic::StringTrimEnd => ("aster_rt_string_trim_end", None, true),
+            mir::Intrinsic::StringTrimEndTemporary => {
+                ("aster_rt_string_trim_end_temporary", None, true)
+            }
+            mir::Intrinsic::StringJoinArray => ("aster_rt_string_join_array", None, true),
+            mir::Intrinsic::StringJoinArrayTemporary => {
+                ("aster_rt_string_join_array_temporary", None, true)
+            }
+            mir::Intrinsic::StringConcatArray => ("aster_rt_string_concat_array", None, true),
+            mir::Intrinsic::StringConcatArrayTemporary => {
+                ("aster_rt_string_concat_array_temporary", None, true)
+            }
+            mir::Intrinsic::StringRepeat => ("aster_rt_string_repeat", None, true),
+            mir::Intrinsic::StringRepeatTemporary => {
+                ("aster_rt_string_repeat_temporary", None, true)
+            }
+            mir::Intrinsic::StringToChars => ("aster_rt_string_to_chars", None, true),
+            mir::Intrinsic::StringToCharsTemporary => {
+                ("aster_rt_string_to_chars_temporary", None, true)
+            }
+            mir::Intrinsic::StringFromChars => ("aster_rt_string_from_chars", None, true),
+            mir::Intrinsic::StringFromCharsTemporary => {
+                ("aster_rt_string_from_chars_temporary", None, true)
+            }
+            mir::Intrinsic::StringBuilderLength => ("aster_rt_string_builder_length", None, true),
+            mir::Intrinsic::StringBuilderClear => ("aster_rt_string_builder_clear", None, true),
             mir::Intrinsic::StringReplace => ("aster_rt_string_replace", None, true),
             mir::Intrinsic::StringReplaceTemporary => {
                 ("aster_rt_string_replace_temporary", None, true)
@@ -242,8 +306,19 @@ impl Codegen {
             mir::Intrinsic::StringSplitTemporary => ("aster_rt_string_split_temporary", None, true),
             mir::Intrinsic::MathUnaryFloat => ("aster_rt_math_unary_float", None, false),
             mir::Intrinsic::MathUnaryDouble => ("aster_rt_math_unary_double", None, false),
+            mir::Intrinsic::MathBinaryFloat => ("aster_rt_math_binary_float", None, false),
+            mir::Intrinsic::MathBinaryDouble => ("aster_rt_math_binary_double", None, false),
+            mir::Intrinsic::MathPredicateFloat => ("aster_rt_math_predicate_float", None, false),
+            mir::Intrinsic::MathPredicateDouble => ("aster_rt_math_predicate_double", None, false),
             mir::Intrinsic::MathPowFloat => ("aster_rt_math_pow_float", None, false),
             mir::Intrinsic::MathPowDouble => ("aster_rt_math_pow_double", None, false),
+            mir::Intrinsic::TimeMonotonicMilliseconds => {
+                ("aster_rt_time_monotonic_milliseconds", None, false)
+            }
+            mir::Intrinsic::TimeUnixMilliseconds => {
+                ("aster_rt_time_unix_milliseconds", None, false)
+            }
+            mir::Intrinsic::RandomMix => ("aster_rt_random_mix", None, false),
             mir::Intrinsic::StringFromBool => ("aster_rt_string_from_bool", None, true),
             mir::Intrinsic::StringFromBoolTemporary => {
                 ("aster_rt_string_from_bool_temporary", None, true)
@@ -261,6 +336,9 @@ impl Codegen {
                     mir::RuntimeErrorKind::AssertionTrue => 3,
                     mir::RuntimeErrorKind::AssertionFalse => 4,
                     mir::RuntimeErrorKind::AssertionEqual => 5,
+                    mir::RuntimeErrorKind::MathSignNaN => 6,
+                    mir::RuntimeErrorKind::CollectionRange => 7,
+                    mir::RuntimeErrorKind::RandomInvalidRange => 8,
                 }),
                 true,
             ),
@@ -293,6 +371,11 @@ impl Codegen {
             | mir::Intrinsic::ParallelForEach
             | mir::Intrinsic::ParallelReduce
             | mir::Intrinsic::StringTryParseBool
+            | mir::Intrinsic::StringTryParseChar
+            | mir::Intrinsic::StringTryParseSByte
+            | mir::Intrinsic::StringTryParseByte
+            | mir::Intrinsic::StringTryParseShort
+            | mir::Intrinsic::StringTryParseUShort
             | mir::Intrinsic::StringTryParseInt
             | mir::Intrinsic::StringTryParseUInt
             | mir::Intrinsic::StringTryParseLong
@@ -306,8 +389,28 @@ impl Codegen {
             | mir::Intrinsic::FileReadAllText(_)
             | mir::Intrinsic::FileReadAllTextTemporary(_)
             | mir::Intrinsic::FileWriteAllText(_)
+            | mir::Intrinsic::FileAppendAllText(_)
             | mir::Intrinsic::FileListFiles(_)
-            | mir::Intrinsic::FileListFilesTemporary(_) => {
+            | mir::Intrinsic::FileListFilesTemporary(_)
+            | mir::Intrinsic::FileListDirectories(_)
+            | mir::Intrinsic::FileListDirectoriesTemporary(_)
+            | mir::Intrinsic::FileExists(_)
+            | mir::Intrinsic::DirectoryExists(_)
+            | mir::Intrinsic::FileCreateDirectory(_)
+            | mir::Intrinsic::FileDeleteFile(_)
+            | mir::Intrinsic::FileDeleteDirectory(_)
+            | mir::Intrinsic::ListCapacity
+            | mir::Intrinsic::DictionaryCapacity
+            | mir::Intrinsic::DictionaryEnsureCapacity
+            | mir::Intrinsic::DictionaryGetOr
+            | mir::Intrinsic::DictionaryGetOrAdd
+            | mir::Intrinsic::ListEnsureCapacity
+            | mir::Intrinsic::ListAddRange
+            | mir::Intrinsic::ListInsert
+            | mir::Intrinsic::ListRemoveRange
+            | mir::Intrinsic::ListReverse
+            | mir::Intrinsic::ListGetRange
+            | mir::Intrinsic::ListGetRangeTemporary => {
                 unreachable!("handled by the dedicated translators above")
             }
         };
@@ -327,7 +430,12 @@ impl Codegen {
             values.push(self.translate_operand(builder, argument, state)?);
         }
         let call = builder.ins().call(function_ref, &values);
-        if matches!(intrinsic, mir::Intrinsic::ListVersionMismatch) {
+        if needs_context
+            && !matches!(
+                intrinsic,
+                mir::Intrinsic::Log | mir::Intrinsic::LogWarning | mir::Intrinsic::LogError
+            )
+        {
             self.continue_if_runtime_ok(builder, state)?;
         }
         if let Some(destination) = destination {
@@ -924,6 +1032,7 @@ impl Codegen {
         let call = builder
             .ins()
             .call(function_ref, &[context, array_pointer, count_value]);
+        self.continue_if_runtime_ok(builder, state)?;
         self.store_intrinsic_result(builder, destination, call, state)
     }
 
@@ -991,6 +1100,11 @@ impl Codegen {
             .ok_or_else(|| BackendError::new("string.TryParse* is missing its ExecutionContext"))?;
         let symbol_name = match intrinsic {
             mir::Intrinsic::StringTryParseBool => "aster_rt_string_try_parse_bool",
+            mir::Intrinsic::StringTryParseChar => "aster_rt_string_try_parse_char",
+            mir::Intrinsic::StringTryParseSByte => "aster_rt_string_try_parse_sbyte",
+            mir::Intrinsic::StringTryParseByte => "aster_rt_string_try_parse_byte",
+            mir::Intrinsic::StringTryParseShort => "aster_rt_string_try_parse_short",
+            mir::Intrinsic::StringTryParseUShort => "aster_rt_string_try_parse_ushort",
             mir::Intrinsic::StringTryParseInt => "aster_rt_string_try_parse_int",
             mir::Intrinsic::StringTryParseUInt => "aster_rt_string_try_parse_uint",
             mir::Intrinsic::StringTryParseLong => "aster_rt_string_try_parse_long",
@@ -1018,6 +1132,7 @@ impl Codegen {
                 payload_offset_value,
             ],
         );
+        self.continue_if_runtime_ok(builder, state)?;
         Ok(())
     }
 
@@ -1055,6 +1170,7 @@ impl Codegen {
                     .jit
                     .declare_func_in_func(self.runtime_ids[symbol], builder.func);
                 builder.ins().call(function_ref, &[context, value]);
+                self.continue_if_runtime_ok(builder, state)?;
                 Ok(())
             }
             mir::Intrinsic::ConsoleReadLine | mir::Intrinsic::ConsoleReadLineTemporary => {
@@ -1125,6 +1241,7 @@ impl Codegen {
                         payload_offset_value,
                     ],
                 );
+                self.continue_if_runtime_ok(builder, state)?;
                 Ok(())
             }
             _ => unreachable!("caller matched only console intrinsics"),
@@ -1313,8 +1430,18 @@ impl Codegen {
                 ("aster.io.ReadAllText", symbols)
             }
             mir::Intrinsic::FileWriteAllText(symbols) => ("aster.io.WriteAllText", symbols),
+            mir::Intrinsic::FileAppendAllText(symbols) => ("aster.io.AppendAllText", symbols),
             mir::Intrinsic::FileListFiles(symbols)
             | mir::Intrinsic::FileListFilesTemporary(symbols) => ("aster.io.ListFiles", symbols),
+            mir::Intrinsic::FileListDirectories(symbols)
+            | mir::Intrinsic::FileListDirectoriesTemporary(symbols) => {
+                ("aster.io.ListDirectories", symbols)
+            }
+            mir::Intrinsic::FileExists(symbols) => ("aster.io.FileExists", symbols),
+            mir::Intrinsic::DirectoryExists(symbols) => ("aster.io.DirectoryExists", symbols),
+            mir::Intrinsic::FileCreateDirectory(symbols) => ("aster.io.CreateDirectory", symbols),
+            mir::Intrinsic::FileDeleteFile(symbols) => ("aster.io.DeleteFile", symbols),
+            mir::Intrinsic::FileDeleteDirectory(symbols) => ("aster.io.DeleteDirectory", symbols),
             _ => unreachable!("caller matched only file-io intrinsics"),
         };
         let layout = self.result_io_error_layout(return_type, &symbols, operation)?;
@@ -1394,7 +1521,10 @@ impl Codegen {
                     ],
                 );
             }
-            mir::Intrinsic::FileListFiles(_) | mir::Intrinsic::FileListFilesTemporary(_) => {
+            mir::Intrinsic::FileListFiles(_)
+            | mir::Intrinsic::FileListFilesTemporary(_)
+            | mir::Intrinsic::FileListDirectories(_)
+            | mir::Intrinsic::FileListDirectoriesTemporary(_) => {
                 let [directory] = arguments else {
                     return Err(BackendError::new(
                         "aster.io.ListFiles requires exactly one argument",
@@ -1404,6 +1534,10 @@ impl Codegen {
                 let symbol = match intrinsic {
                     mir::Intrinsic::FileListFiles(_) => "aster_rt_io_list_files",
                     mir::Intrinsic::FileListFilesTemporary(_) => "aster_rt_io_list_files_temporary",
+                    mir::Intrinsic::FileListDirectories(_) => "aster_rt_io_list_directories",
+                    mir::Intrinsic::FileListDirectoriesTemporary(_) => {
+                        "aster_rt_io_list_directories_temporary"
+                    }
                     _ => unreachable!("caller matched only file-list intrinsics"),
                 };
                 let function_ref = self
@@ -1426,7 +1560,7 @@ impl Codegen {
                     ],
                 );
             }
-            mir::Intrinsic::FileWriteAllText(_) => {
+            mir::Intrinsic::FileWriteAllText(_) | mir::Intrinsic::FileAppendAllText(_) => {
                 let [path, content] = arguments else {
                     return Err(BackendError::new(
                         "aster.io.WriteAllText requires exactly two arguments",
@@ -1434,10 +1568,14 @@ impl Codegen {
                 };
                 let path_value = self.translate_operand(builder, path, state)?;
                 let content_value = self.translate_operand(builder, content, state)?;
-                let function_ref = self.jit.declare_func_in_func(
-                    self.runtime_ids["aster_rt_io_write_all_text"],
-                    builder.func,
-                );
+                let symbol = if matches!(intrinsic, mir::Intrinsic::FileAppendAllText(_)) {
+                    "aster_rt_io_append_all_text"
+                } else {
+                    "aster_rt_io_write_all_text"
+                };
+                let function_ref = self
+                    .jit
+                    .declare_func_in_func(self.runtime_ids[symbol], builder.func);
                 builder.ins().call(
                     function_ref,
                     &[
@@ -1456,8 +1594,50 @@ impl Codegen {
                     ],
                 );
             }
+            mir::Intrinsic::FileExists(_)
+            | mir::Intrinsic::DirectoryExists(_)
+            | mir::Intrinsic::FileCreateDirectory(_)
+            | mir::Intrinsic::FileDeleteFile(_)
+            | mir::Intrinsic::FileDeleteDirectory(_) => {
+                let [path] = arguments else {
+                    return Err(BackendError::new(
+                        "aster.io path operation requires one argument",
+                    ));
+                };
+                let operation = match intrinsic {
+                    mir::Intrinsic::FileExists(_) => 0,
+                    mir::Intrinsic::DirectoryExists(_) => 1,
+                    mir::Intrinsic::FileCreateDirectory(_) => 2,
+                    mir::Intrinsic::FileDeleteFile(_) => 3,
+                    mir::Intrinsic::FileDeleteDirectory(_) => 4,
+                    _ => unreachable!(),
+                };
+                let path = self.translate_operand(builder, path, state)?;
+                let operation = builder.ins().iconst(types::I32, operation);
+                let function_ref = self
+                    .jit
+                    .declare_func_in_func(self.runtime_ids["aster_rt_io_path_bool"], builder.func);
+                builder.ins().call(
+                    function_ref,
+                    &[
+                        context,
+                        operation,
+                        path,
+                        destination_address,
+                        total_size,
+                        ok_tag,
+                        error_tag,
+                        ok_offset,
+                        error_offset,
+                        kind_offset,
+                        oscode_offset,
+                        tags_pointer,
+                    ],
+                );
+            }
             _ => unreachable!("caller matched only file-io intrinsics"),
         }
+        self.continue_if_runtime_ok(builder, state)?;
         Ok(())
     }
 
@@ -1623,18 +1803,44 @@ impl Codegen {
         value: &mir::Operand,
         state: &FunctionState,
     ) -> Result<(), BackendError> {
-        let function_ref = self.jit.declare_func_in_func(
-            self.runtime_ids["aster_rt_string_builder_append"],
-            builder.func,
-        );
+        let symbol = match value.type_ {
+            mir::Type::String => "aster_rt_string_builder_append",
+            mir::Type::Bool => "aster_rt_string_builder_append_bool",
+            mir::Type::Char => "aster_rt_string_builder_append_char",
+            mir::Type::SByte | mir::Type::Short | mir::Type::Int | mir::Type::Long => {
+                "aster_rt_string_builder_append_long"
+            }
+            mir::Type::Byte | mir::Type::UShort | mir::Type::UInt | mir::Type::ULong => {
+                "aster_rt_string_builder_append_ulong"
+            }
+            mir::Type::Float => "aster_rt_string_builder_append_float",
+            mir::Type::Double => "aster_rt_string_builder_append_double",
+            _ => {
+                return Err(BackendError::new(
+                    "StringBuilder.Append received an unsupported MIR value type",
+                ));
+            }
+        };
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids[symbol], builder.func);
         let context = state.execution_context.ok_or_else(|| {
             BackendError::new("StringBuilder.Append is missing its ExecutionContext")
         })?;
         let receiver = self.translate_operand(builder, receiver, state)?;
-        let value = self.translate_operand(builder, value, state)?;
+        let mut translated_value = self.translate_operand(builder, value, state)?;
+        translated_value = match value.type_ {
+            mir::Type::SByte | mir::Type::Short | mir::Type::Int => {
+                builder.ins().sextend(types::I64, translated_value)
+            }
+            mir::Type::Byte | mir::Type::UShort | mir::Type::UInt => {
+                builder.ins().uextend(types::I64, translated_value)
+            }
+            _ => translated_value,
+        };
         let call = builder
             .ins()
-            .call(function_ref, &[context, receiver, value]);
+            .call(function_ref, &[context, receiver, translated_value]);
         let status = builder.inst_results(call)[0];
         let succeeded = builder.ins().icmp_imm(IntCC::Equal, status, 1);
         let continuation = builder.create_block();
@@ -2165,6 +2371,128 @@ impl Codegen {
             &[context, list_value, size, align, type_key, source_address],
         );
         Self::continue_if_runtime_status(builder, state, builder.inst_results(call)[0]);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn translate_collection_utility_intrinsic(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: Option<&mir::Place>,
+        intrinsic: mir::Intrinsic,
+        arguments: &[mir::Operand],
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new("collection utility intrinsic is missing its ExecutionContext")
+        })?;
+        let mut values = vec![context];
+        let symbol = match intrinsic {
+            mir::Intrinsic::ListCapacity => "aster_rt_list_capacity",
+            mir::Intrinsic::DictionaryCapacity => "aster_rt_dictionary_capacity",
+            mir::Intrinsic::DictionaryEnsureCapacity => "aster_rt_dictionary_ensure_capacity",
+            mir::Intrinsic::DictionaryGetOr | mir::Intrinsic::DictionaryGetOrAdd => {
+                "aster_rt_dictionary_get_or"
+            }
+            mir::Intrinsic::ListEnsureCapacity => "aster_rt_list_ensure_capacity",
+            mir::Intrinsic::ListAddRange => "aster_rt_list_add_range",
+            mir::Intrinsic::ListInsert => "aster_rt_list_insert",
+            mir::Intrinsic::ListRemoveRange => "aster_rt_list_remove_range",
+            mir::Intrinsic::ListReverse => "aster_rt_list_reverse",
+            mir::Intrinsic::ListGetRange | mir::Intrinsic::ListGetRangeTemporary => {
+                "aster_rt_list_get_range"
+            }
+            _ => {
+                return Err(BackendError::new(
+                    "unsupported collection utility intrinsic",
+                ));
+            }
+        };
+
+        if matches!(
+            intrinsic,
+            mir::Intrinsic::DictionaryGetOr | mir::Intrinsic::DictionaryGetOrAdd
+        ) {
+            let [dictionary, key, supplied] = arguments else {
+                return Err(BackendError::new(
+                    "Dictionary.GetOr requires three operands",
+                ));
+            };
+            let mir::Type::Dictionary(key_type, value_type) = &dictionary.type_ else {
+                return Err(BackendError::new(
+                    "Dictionary.GetOr receiver is not Dictionary<K, V>",
+                ));
+            };
+            values.push(self.translate_operand(builder, dictionary, state)?);
+            values.extend(self.dictionary_runtime_metadata(builder, key_type, value_type)?);
+            values.push(self.dictionary_operand_address(builder, key, state)?);
+            values.push(self.dictionary_operand_address(builder, supplied, state)?);
+            let destination = destination
+                .ok_or_else(|| BackendError::new("Dictionary.GetOr requires a destination"))?;
+            values.push(self.place_address(builder, destination, state)?);
+            values.push(builder.ins().iconst(
+                types::I8,
+                i64::from(intrinsic == mir::Intrinsic::DictionaryGetOrAdd),
+            ));
+        } else {
+            for (index, argument) in arguments.iter().enumerate() {
+                if intrinsic == mir::Intrinsic::ListInsert && index == 2 {
+                    let layout = self.layouts.type_layout(&argument.type_)?;
+                    let address = if is_aggregate(&argument.type_) {
+                        self.translate_operand(builder, argument, state)?
+                    } else {
+                        let value = self.translate_operand(builder, argument, state)?;
+                        let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                            StackSlotKind::ExplicitSlot,
+                            layout.size,
+                            layout.align_shift,
+                        ));
+                        builder.ins().stack_store(value, slot, 0);
+                        builder.ins().stack_addr(self.pointer_type, slot, 0)
+                    };
+                    values.push(address);
+                } else {
+                    values.push(self.translate_operand(builder, argument, state)?);
+                }
+            }
+        }
+        if matches!(
+            intrinsic,
+            mir::Intrinsic::ListGetRange | mir::Intrinsic::ListGetRangeTemporary
+        ) {
+            values.push(builder.ins().iconst(
+                types::I8,
+                i64::from(intrinsic == mir::Intrinsic::ListGetRangeTemporary),
+            ));
+        }
+
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids[symbol], builder.func);
+        let call = builder.ins().call(function_ref, &values);
+        let result = builder.inst_results(call)[0];
+        if matches!(
+            intrinsic,
+            mir::Intrinsic::DictionaryGetOr | mir::Intrinsic::DictionaryGetOrAdd
+        ) {
+            Self::continue_if_runtime_status(builder, state, result);
+            return Ok(());
+        }
+        if matches!(
+            intrinsic,
+            mir::Intrinsic::ListAddRange
+                | mir::Intrinsic::ListInsert
+                | mir::Intrinsic::ListRemoveRange
+                | mir::Intrinsic::ListReverse
+        ) {
+            Self::continue_if_runtime_status(builder, state, result);
+        } else {
+            self.continue_if_runtime_ok(builder, state)?;
+            let destination = destination.ok_or_else(|| {
+                BackendError::new("collection utility result requires a destination")
+            })?;
+            self.store_scalar(builder, destination, result, state)?;
+        }
         Ok(())
     }
 

@@ -50,6 +50,11 @@ by the project. The loader creates
 one deterministic compilation unit, gives linked declarations unique internal
 names, and retains source ownership so diagnostics still point at the correct file. See
 [`module-resolution.md`](module-resolution.md).
+Public source and project compilation entry points run the recursive front-end pipeline on one
+bounded dedicated compiler stack, so the embedded standard library has the same stack contract in
+the CLI, integration tests, and embedding hosts. The stack size and worker construction have one
+compiler-owned authority; project compilation calls its inner pipeline directly rather than nesting
+workers, and an unexpected worker panic is converted to a diagnostic that retains its payload.
 
 Generic namespace functions and generic class, struct, interface, and enum templates are specialized
 after linking and before ordinary semantic validation. A structural cache reuses identical closed
@@ -209,11 +214,13 @@ Integer division and remainder preserve their typed MIR operands through validat
 keeps controlled zero and signed-overflow paths for general operations, while an exact constant
 power-of-two `uint`/`ulong` divisor lowers mechanically to a logical shift or mask. General constant
 division remains Cranelift's target-specific responsibility; MIR contains no magic-number scheme.
-Public standard-library code reaches this backend as ordinary concrete MIR. The compact string
-transforms, floating-point math operations, and collection snapshots lower through typed HIR/MIR
-intrinsics with checked runtime ABI calls; Cranelift does not inspect public `Math`, `String`, or
-collection source names or standard-library paths. Those operations remain opaque to the general
-MIR optimizer and retain their allocation/failure ordering.
+Public standard-library code reaches this backend as ordinary concrete MIR. Algorithms that are
+safe and efficient in ASTER source—array bulk loops, line splitting/joining, lexical paths, seeded
+random, and assertion composition—remain ordinary specialized code. UTF-8 bulk transforms,
+floating-point host math, collection backing/capacity operations, clocks, and filesystem access
+lower through typed HIR/MIR intrinsics with checked registry ABI calls. Cranelift does not inspect
+public `Math`, `String`, collection, clock, or I/O source names. Runtime intrinsics remain opaque to
+the general MIR optimizer and retain allocation, host-effect, and failure ordering.
 
 Minimal native FFI follows the same typed authority. Before JIT finalization, Cranelift validates
 each foreign declaration/call and resolves its fully linked identity plus exact scalar signature

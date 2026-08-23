@@ -153,6 +153,10 @@ foreach (var value in values)
 replacement, removal, and insertion-order entry snapshots. `foreach` works over arrays, lists, and
 strings without a public iterator or hidden iterator allocation.
 
+The practical collection surface also includes list capacity/range operations, overlap-safe array
+copy/fill/reverse helpers, and dictionary fallback/get-or-add operations. Bulk helpers preserve
+concrete element types and initialized non-null reference slots.
+
 Strings are immutable UTF-8 values. Concatenation creates a new string, `==` compares content,
 `foreach (char scalar in text)` walks Unicode scalars, and `Length` counts those scalars. Direct
 string indexing is not supported; `text[index]` is rejected with a type diagnostic. ASTER does not
@@ -229,6 +233,11 @@ public int ClampScore(int score)
 The [namespace project](../examples/namespaces/app/main.aster) combines project code with
 `aster.math`. See [Namespaces and usings](reference/namespaces.md) and the
 [standard library](reference/standard-library.md) for the complete contracts.
+
+For application utilities, the standard library also provides strict scalar parsing, ordinal
+Unicode-scalar text helpers, explicitly seeded deterministic random, monotonic/Unix clock reads,
+operation-scoped text-file workflows, and compact assertions. The
+[practical standard-library example](../examples/practical_stdlib.aster) combines these surfaces.
 
 ## Current boundaries
 

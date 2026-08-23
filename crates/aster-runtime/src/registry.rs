@@ -8,22 +8,31 @@
 use crate::context::{
     aster_rt_array_element, aster_rt_array_length, aster_rt_array_new,
     aster_rt_array_new_temporary, aster_rt_call_enter, aster_rt_call_leave,
-    aster_rt_dictionary_add, aster_rt_dictionary_clear, aster_rt_dictionary_contains_key,
-    aster_rt_dictionary_entries, aster_rt_dictionary_keys, aster_rt_dictionary_length,
-    aster_rt_dictionary_new, aster_rt_dictionary_new_temporary, aster_rt_dictionary_remove,
-    aster_rt_dictionary_set, aster_rt_dictionary_try_get, aster_rt_dictionary_values,
-    aster_rt_has_error, aster_rt_list_add, aster_rt_list_clear, aster_rt_list_get,
-    aster_rt_list_length, aster_rt_list_new, aster_rt_list_new_temporary, aster_rt_list_remove_at,
-    aster_rt_list_set, aster_rt_list_to_array, aster_rt_list_version,
+    aster_rt_dictionary_add, aster_rt_dictionary_capacity, aster_rt_dictionary_clear,
+    aster_rt_dictionary_contains_key, aster_rt_dictionary_ensure_capacity,
+    aster_rt_dictionary_entries, aster_rt_dictionary_get_or, aster_rt_dictionary_keys,
+    aster_rt_dictionary_length, aster_rt_dictionary_new, aster_rt_dictionary_new_temporary,
+    aster_rt_dictionary_remove, aster_rt_dictionary_set, aster_rt_dictionary_try_get,
+    aster_rt_dictionary_values, aster_rt_has_error, aster_rt_list_add, aster_rt_list_add_range,
+    aster_rt_list_capacity, aster_rt_list_clear, aster_rt_list_ensure_capacity, aster_rt_list_get,
+    aster_rt_list_get_range, aster_rt_list_insert, aster_rt_list_length, aster_rt_list_new,
+    aster_rt_list_new_temporary, aster_rt_list_remove_at, aster_rt_list_remove_range,
+    aster_rt_list_reverse, aster_rt_list_set, aster_rt_list_to_array, aster_rt_list_version,
     aster_rt_list_version_mismatch, aster_rt_owned_region_enter, aster_rt_owned_region_exit,
-    aster_rt_string_builder_append, aster_rt_string_builder_new,
+    aster_rt_string_builder_append, aster_rt_string_builder_append_bool,
+    aster_rt_string_builder_append_char, aster_rt_string_builder_append_double,
+    aster_rt_string_builder_append_float, aster_rt_string_builder_append_long,
+    aster_rt_string_builder_append_ulong, aster_rt_string_builder_clear,
+    aster_rt_string_builder_length, aster_rt_string_builder_new,
     aster_rt_string_builder_new_temporary, aster_rt_string_builder_to_string,
     aster_rt_string_builder_to_string_temporary, aster_rt_temporary_scope_enter,
     aster_rt_temporary_scope_leave, aster_rt_temporary_subregion_enter,
     aster_rt_temporary_subregion_exit,
 };
 use crate::filesystem::{
-    aster_rt_io_list_files, aster_rt_io_list_files_temporary, aster_rt_io_read_all_text,
+    aster_rt_io_append_all_text, aster_rt_io_list_directories,
+    aster_rt_io_list_directories_temporary, aster_rt_io_list_files,
+    aster_rt_io_list_files_temporary, aster_rt_io_path_bool, aster_rt_io_read_all_text,
     aster_rt_io_read_all_text_temporary, aster_rt_io_write_all_text,
 };
 use crate::foreign::aster_rt_foreign_error;
@@ -33,30 +42,40 @@ use crate::io::{
 };
 use crate::log::aster_rt_log;
 use crate::math::{
-    aster_rt_assert_equal, aster_rt_integer_arithmetic_error, aster_rt_math_domain_error,
-    aster_rt_math_pow_double, aster_rt_math_pow_float, aster_rt_math_unary_double,
-    aster_rt_math_unary_float,
+    aster_rt_assert_equal, aster_rt_integer_arithmetic_error, aster_rt_math_binary_double,
+    aster_rt_math_binary_float, aster_rt_math_domain_error, aster_rt_math_pow_double,
+    aster_rt_math_pow_float, aster_rt_math_predicate_double, aster_rt_math_predicate_float,
+    aster_rt_math_unary_double, aster_rt_math_unary_float, aster_rt_random_mix,
 };
 use crate::object::{aster_rt_object_new, aster_rt_object_new_temporary};
 use crate::string::{
-    aster_rt_string_byte_length, aster_rt_string_concat, aster_rt_string_concat_temporary,
+    aster_rt_string_byte_length, aster_rt_string_concat, aster_rt_string_concat_array,
+    aster_rt_string_concat_array_temporary, aster_rt_string_concat_temporary,
     aster_rt_string_contains, aster_rt_string_decode_next, aster_rt_string_ends_with,
     aster_rt_string_eq, aster_rt_string_from_bool, aster_rt_string_from_bool_temporary,
-    aster_rt_string_from_char, aster_rt_string_from_char_temporary, aster_rt_string_from_double,
+    aster_rt_string_from_char, aster_rt_string_from_char_temporary, aster_rt_string_from_chars,
+    aster_rt_string_from_chars_temporary, aster_rt_string_from_double,
     aster_rt_string_from_double_temporary, aster_rt_string_from_float,
     aster_rt_string_from_float_temporary, aster_rt_string_from_long,
     aster_rt_string_from_long_temporary, aster_rt_string_from_ulong,
     aster_rt_string_from_ulong_temporary, aster_rt_string_index_of, aster_rt_string_join,
-    aster_rt_string_join_temporary, aster_rt_string_length, aster_rt_string_replace,
+    aster_rt_string_join_array, aster_rt_string_join_array_temporary,
+    aster_rt_string_join_temporary, aster_rt_string_last_index_of, aster_rt_string_length,
+    aster_rt_string_repeat, aster_rt_string_repeat_temporary, aster_rt_string_replace,
     aster_rt_string_replace_temporary, aster_rt_string_split, aster_rt_string_split_temporary,
     aster_rt_string_starts_with, aster_rt_string_substring_from,
     aster_rt_string_substring_from_temporary, aster_rt_string_substring_range,
-    aster_rt_string_substring_range_temporary, aster_rt_string_trim,
-    aster_rt_string_trim_temporary, aster_rt_string_try_parse_bool,
+    aster_rt_string_substring_range_temporary, aster_rt_string_to_chars,
+    aster_rt_string_to_chars_temporary, aster_rt_string_trim, aster_rt_string_trim_end,
+    aster_rt_string_trim_end_temporary, aster_rt_string_trim_start,
+    aster_rt_string_trim_start_temporary, aster_rt_string_trim_temporary,
+    aster_rt_string_try_parse_bool, aster_rt_string_try_parse_byte, aster_rt_string_try_parse_char,
     aster_rt_string_try_parse_double, aster_rt_string_try_parse_float,
-    aster_rt_string_try_parse_int, aster_rt_string_try_parse_long, aster_rt_string_try_parse_uint,
-    aster_rt_string_try_parse_ulong,
+    aster_rt_string_try_parse_int, aster_rt_string_try_parse_long, aster_rt_string_try_parse_sbyte,
+    aster_rt_string_try_parse_short, aster_rt_string_try_parse_uint,
+    aster_rt_string_try_parse_ulong, aster_rt_string_try_parse_ushort,
 };
+use crate::time::{aster_rt_time_monotonic_milliseconds, aster_rt_time_unix_milliseconds};
 
 /// Backend-neutral value type used in runtime signatures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -490,6 +509,44 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             },
         },
         RuntimeFunction {
+            name: "aster_rt_dictionary_capacity",
+            address: aster_rt_dictionary_capacity as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::I32),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_dictionary_ensure_capacity",
+            address: aster_rt_dictionary_ensure_capacity as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer, RuntimeType::I32],
+                result: Some(RuntimeType::I32),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_dictionary_get_or",
+            address: aster_rt_dictionary_get_or as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I64,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I64,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I8,
+                ],
+                result: Some(RuntimeType::I8),
+            },
+        },
+        RuntimeFunction {
             name: "aster_rt_string_builder_new",
             address: aster_rt_string_builder_new as *const u8,
             signature: RuntimeSignature {
@@ -515,6 +572,70 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
                     RuntimeType::Pointer,
                 ],
                 result: Some(RuntimeType::I8),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_builder_append_long",
+            address: aster_rt_string_builder_append_long as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer, RuntimeType::I64],
+                result: Some(RuntimeType::I8),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_builder_append_ulong",
+            address: aster_rt_string_builder_append_ulong as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer, RuntimeType::I64],
+                result: Some(RuntimeType::I8),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_builder_append_double",
+            address: aster_rt_string_builder_append_double as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer, RuntimeType::F64],
+                result: Some(RuntimeType::I8),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_builder_append_float",
+            address: aster_rt_string_builder_append_float as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer, RuntimeType::F32],
+                result: Some(RuntimeType::I8),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_builder_append_bool",
+            address: aster_rt_string_builder_append_bool as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer, RuntimeType::I8],
+                result: Some(RuntimeType::I8),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_builder_append_char",
+            address: aster_rt_string_builder_append_char as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer, RuntimeType::I32],
+                result: Some(RuntimeType::I8),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_builder_length",
+            address: aster_rt_string_builder_length as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::I32),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_builder_clear",
+            address: aster_rt_string_builder_clear as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: None,
             },
         },
         RuntimeFunction {
@@ -635,6 +756,82 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
                     RuntimeType::I32,
                     RuntimeType::I32,
                     RuntimeType::I64,
+                    RuntimeType::I8,
+                ],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_list_capacity",
+            address: aster_rt_list_capacity as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::I32),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_list_ensure_capacity",
+            address: aster_rt_list_ensure_capacity as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer, RuntimeType::I32],
+                result: Some(RuntimeType::I32),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_list_add_range",
+            address: aster_rt_list_add_range as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                ],
+                result: Some(RuntimeType::I8),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_list_insert",
+            address: aster_rt_list_insert as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::Pointer,
+                ],
+                result: Some(RuntimeType::I8),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_list_remove_range",
+            address: aster_rt_list_remove_range as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                ],
+                result: Some(RuntimeType::I8),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_list_reverse",
+            address: aster_rt_list_reverse as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::I8),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_list_get_range",
+            address: aster_rt_list_get_range as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
                     RuntimeType::I8,
                 ],
                 result: Some(RuntimeType::Pointer),
@@ -809,6 +1006,138 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             },
         },
         RuntimeFunction {
+            name: "aster_rt_string_last_index_of",
+            address: aster_rt_string_last_index_of as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                ],
+                result: Some(RuntimeType::I32),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_trim_start",
+            address: aster_rt_string_trim_start as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_trim_start_temporary",
+            address: aster_rt_string_trim_start_temporary as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_trim_end",
+            address: aster_rt_string_trim_end as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_trim_end_temporary",
+            address: aster_rt_string_trim_end_temporary as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_join_array",
+            address: aster_rt_string_join_array as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                ],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_join_array_temporary",
+            address: aster_rt_string_join_array_temporary as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                ],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_concat_array",
+            address: aster_rt_string_concat_array as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_concat_array_temporary",
+            address: aster_rt_string_concat_array_temporary as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_repeat",
+            address: aster_rt_string_repeat as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer, RuntimeType::I32],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_repeat_temporary",
+            address: aster_rt_string_repeat_temporary as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer, RuntimeType::I32],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_to_chars",
+            address: aster_rt_string_to_chars as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_to_chars_temporary",
+            address: aster_rt_string_to_chars_temporary as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_from_chars",
+            address: aster_rt_string_from_chars as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_from_chars_temporary",
+            address: aster_rt_string_from_chars_temporary as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
             name: "aster_rt_string_replace",
             address: aster_rt_string_replace as *const u8,
             signature: RuntimeSignature {
@@ -888,6 +1217,62 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             signature: RuntimeSignature {
                 parameters: &[RuntimeType::F64, RuntimeType::F64],
                 result: Some(RuntimeType::F64),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_math_binary_float",
+            address: aster_rt_math_binary_float as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::F32, RuntimeType::F32, RuntimeType::I32],
+                result: Some(RuntimeType::F32),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_math_binary_double",
+            address: aster_rt_math_binary_double as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::F64, RuntimeType::F64, RuntimeType::I32],
+                result: Some(RuntimeType::F64),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_math_predicate_float",
+            address: aster_rt_math_predicate_float as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::F32, RuntimeType::I32],
+                result: Some(RuntimeType::I8),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_math_predicate_double",
+            address: aster_rt_math_predicate_double as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::F64, RuntimeType::I32],
+                result: Some(RuntimeType::I8),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_time_monotonic_milliseconds",
+            address: aster_rt_time_monotonic_milliseconds as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[],
+                result: Some(RuntimeType::I64),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_time_unix_milliseconds",
+            address: aster_rt_time_unix_milliseconds as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[],
+                result: Some(RuntimeType::I64),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_random_mix",
+            address: aster_rt_random_mix as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::I64],
+                result: Some(RuntimeType::I64),
             },
         },
         RuntimeFunction {
@@ -1005,6 +1390,86 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
         RuntimeFunction {
             name: "aster_rt_string_try_parse_bool",
             address: aster_rt_string_try_parse_bool as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_try_parse_char",
+            address: aster_rt_string_try_parse_char as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_try_parse_sbyte",
+            address: aster_rt_string_try_parse_sbyte as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_try_parse_byte",
+            address: aster_rt_string_try_parse_byte as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_try_parse_short",
+            address: aster_rt_string_try_parse_short as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_string_try_parse_ushort",
+            address: aster_rt_string_try_parse_ushort as *const u8,
             signature: RuntimeSignature {
                 parameters: &[
                     RuntimeType::Pointer,
@@ -1247,6 +1712,88 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             signature: RuntimeSignature {
                 parameters: &[
                     RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::Pointer,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_io_append_all_text",
+            address: aster_rt_io_append_all_text as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::Pointer,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_io_list_directories",
+            address: aster_rt_io_list_directories as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::Pointer,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_io_list_directories_temporary",
+            address: aster_rt_io_list_directories_temporary as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::I32,
+                    RuntimeType::Pointer,
+                ],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_io_path_bool",
+            address: aster_rt_io_path_bool as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::I32,
                     RuntimeType::Pointer,
                     RuntimeType::Pointer,
                     RuntimeType::I32,
@@ -1509,6 +2056,25 @@ mod tests {
             ]
         );
         assert_eq!(append.signature.result, Some(RuntimeType::I8));
+
+        for (name, value_type) in [
+            ("aster_rt_string_builder_append_long", RuntimeType::I64),
+            ("aster_rt_string_builder_append_ulong", RuntimeType::I64),
+            ("aster_rt_string_builder_append_double", RuntimeType::F64),
+            ("aster_rt_string_builder_append_float", RuntimeType::F32),
+            ("aster_rt_string_builder_append_bool", RuntimeType::I8),
+            ("aster_rt_string_builder_append_char", RuntimeType::I32),
+        ] {
+            let function = functions
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(
+                function.signature.parameters,
+                &[RuntimeType::Pointer, RuntimeType::Pointer, value_type]
+            );
+            assert_eq!(function.signature.result, Some(RuntimeType::I8));
+        }
     }
 
     #[test]
@@ -1551,5 +2117,16 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn random_mixer_signature_is_fixed_width_and_context_free() {
+        let functions = runtime_functions();
+        let mixer = functions
+            .iter()
+            .find(|function| function.name == "aster_rt_random_mix")
+            .expect("missing random mixer runtime function");
+        assert_eq!(mixer.signature.parameters, &[RuntimeType::I64]);
+        assert_eq!(mixer.signature.result, Some(RuntimeType::I64));
     }
 }

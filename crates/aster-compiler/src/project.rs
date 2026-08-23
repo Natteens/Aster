@@ -21,7 +21,7 @@ use aster_syntax::{
 };
 
 use crate::standard_library::{StandardLibrary, is_official_name};
-use crate::{Compilation, compile_module};
+use crate::{Compilation, compile_module, run_on_compiler_stack};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProjectSourceOrigin {
@@ -301,14 +301,27 @@ pub(crate) fn compile_project_with_standard_library(
     path: &Path,
     standard_library: StandardLibrary,
 ) -> Result<ProjectCompilation, Vec<ProjectDiagnostic>> {
-    compile_project_with_standard_library_inner(path, standard_library, false)
+    compile_project_on_dedicated_stack(path, standard_library, false)
 }
 
 pub(crate) fn compile_project_with_standard_library_for_tests(
     path: &Path,
     standard_library: StandardLibrary,
 ) -> Result<ProjectCompilation, Vec<ProjectDiagnostic>> {
-    compile_project_with_standard_library_inner(path, standard_library, true)
+    compile_project_on_dedicated_stack(path, standard_library, true)
+}
+
+fn compile_project_on_dedicated_stack(
+    path: &Path,
+    standard_library: StandardLibrary,
+    include_tests: bool,
+) -> Result<ProjectCompilation, Vec<ProjectDiagnostic>> {
+    let path = path.to_path_buf();
+    let diagnostic_path = path.clone();
+    run_on_compiler_stack(move || {
+        compile_project_with_standard_library_inner(&path, standard_library, include_tests)
+    })
+    .map_err(|error| vec![plain_error(&diagnostic_path, error.to_string())])?
 }
 
 #[allow(clippy::too_many_lines)]

@@ -143,7 +143,7 @@ pub(super) fn validate_module(module: &mir::Module) -> Result<(), BackendError> 
     Ok(())
 }
 
-/// Console/filesystem I/O and foreign calls are rejected anywhere reachable from a
+/// Host operations and foreign calls are rejected anywhere reachable from a
 /// `Task.Run`/`Parallel.For`/`ForEach`/`Reduce` worker body: output order,
 /// input consumption, and file access would be non-deterministic across
 /// workers, and neither backend is shared or synchronized. Builds the whole
@@ -151,7 +151,9 @@ pub(super) fn validate_module(module: &mir::Module) -> Result<(), BackendError> 
 /// function whose body directly calls a host I/O intrinsic or foreign binding,
 /// then, for every worker entry point found anywhere in the module, walks
 /// the graph from its `Function` operand(s) to see whether an I/O-using
-/// function is reachable.
+/// function is reachable. Host operations currently include terminal/filesystem
+/// I/O and clock reads.
+#[allow(clippy::too_many_lines)]
 fn validate_no_console_io_in_workers(module: &mir::Module) -> Result<(), BackendError> {
     let mut callees: HashMap<mir::SymbolId, Vec<mir::SymbolId>> = HashMap::new();
     let mut io_users: HashSet<mir::SymbolId> = HashSet::new();
@@ -173,8 +175,18 @@ fn validate_no_console_io_in_workers(module: &mir::Module) -> Result<(), Backend
                             | mir::Intrinsic::FileReadAllText(_)
                             | mir::Intrinsic::FileReadAllTextTemporary(_)
                             | mir::Intrinsic::FileWriteAllText(_)
+                            | mir::Intrinsic::FileAppendAllText(_)
                             | mir::Intrinsic::FileListFiles(_)
-                            | mir::Intrinsic::FileListFilesTemporary(_),
+                            | mir::Intrinsic::FileListFilesTemporary(_)
+                            | mir::Intrinsic::FileListDirectories(_)
+                            | mir::Intrinsic::FileListDirectoriesTemporary(_)
+                            | mir::Intrinsic::FileExists(_)
+                            | mir::Intrinsic::DirectoryExists(_)
+                            | mir::Intrinsic::FileCreateDirectory(_)
+                            | mir::Intrinsic::FileDeleteFile(_)
+                            | mir::Intrinsic::FileDeleteDirectory(_)
+                            | mir::Intrinsic::TimeMonotonicMilliseconds
+                            | mir::Intrinsic::TimeUnixMilliseconds,
                         ..
                     } => {
                         io_users.insert(function.symbol);
@@ -235,7 +247,7 @@ fn validate_no_console_io_in_workers(module: &mir::Module) -> Result<(), Backend
                         && reaches(target, &io_users)
                     {
                         return Err(BackendError::new(format!(
-                            "function `{}` uses `{worker_name}` with a worker body that (directly or transitively) calls `aster.io.Write`/`WriteLine`/`ReadLine`/`ReadAllText`/`WriteAllText`/`ListFiles`, which is rejected in this version",
+                            "function `{}` uses `{worker_name}` with a worker body that (directly or transitively) calls `aster.io.Write`/`WriteLine`/`ReadLine`/`ReadAllText`/`WriteAllText`/`ListFiles`, another filesystem operation, or a clock host operation through `aster.time.Clock`, which is rejected in this version",
                             function.name
                         )));
                     }
@@ -519,6 +531,11 @@ fn validate_string_try_parse_targets(
             };
             let expected = match intrinsic {
                 mir::Intrinsic::StringTryParseBool => mir::Type::Bool,
+                mir::Intrinsic::StringTryParseChar => mir::Type::Char,
+                mir::Intrinsic::StringTryParseSByte => mir::Type::SByte,
+                mir::Intrinsic::StringTryParseByte => mir::Type::Byte,
+                mir::Intrinsic::StringTryParseShort => mir::Type::Short,
+                mir::Intrinsic::StringTryParseUShort => mir::Type::UShort,
                 mir::Intrinsic::StringTryParseInt => mir::Type::Int,
                 mir::Intrinsic::StringTryParseUInt => mir::Type::UInt,
                 mir::Intrinsic::StringTryParseLong => mir::Type::Long,
@@ -591,11 +608,19 @@ fn validate_file_io_result_shapes(
             let (expected_ok, layout) = match intrinsic {
                 mir::Intrinsic::FileReadAllText(layout)
                 | mir::Intrinsic::FileReadAllTextTemporary(layout) => (mir::Type::String, layout),
-                mir::Intrinsic::FileWriteAllText(layout) => (mir::Type::Int, layout),
+                mir::Intrinsic::FileWriteAllText(layout)
+                | mir::Intrinsic::FileAppendAllText(layout) => (mir::Type::Int, layout),
                 mir::Intrinsic::FileListFiles(layout)
-                | mir::Intrinsic::FileListFilesTemporary(layout) => {
+                | mir::Intrinsic::FileListFilesTemporary(layout)
+                | mir::Intrinsic::FileListDirectories(layout)
+                | mir::Intrinsic::FileListDirectoriesTemporary(layout) => {
                     (mir::Type::Array(Box::new(mir::Type::String)), layout)
                 }
+                mir::Intrinsic::FileExists(layout)
+                | mir::Intrinsic::DirectoryExists(layout)
+                | mir::Intrinsic::FileCreateDirectory(layout)
+                | mir::Intrinsic::FileDeleteFile(layout)
+                | mir::Intrinsic::FileDeleteDirectory(layout) => (mir::Type::Bool, layout),
                 _ => continue,
             };
             let malformed = || {
@@ -3382,6 +3407,11 @@ fn is_string_method_intrinsic(intrinsic: mir::Intrinsic) -> bool {
             | mir::Intrinsic::StringSplit
             | mir::Intrinsic::StringSplitTemporary
             | mir::Intrinsic::StringTryParseBool
+            | mir::Intrinsic::StringTryParseChar
+            | mir::Intrinsic::StringTryParseSByte
+            | mir::Intrinsic::StringTryParseByte
+            | mir::Intrinsic::StringTryParseShort
+            | mir::Intrinsic::StringTryParseUShort
             | mir::Intrinsic::StringTryParseInt
             | mir::Intrinsic::StringTryParseUInt
             | mir::Intrinsic::StringTryParseLong
@@ -3570,9 +3600,23 @@ fn validate_string_builder_append(
 ) -> Result<(), BackendError> {
     if !classes.contains(&class)
         || builder.type_ != mir::Type::Class(class)
-        || value.type_ != mir::Type::String
+        || !matches!(
+            value.type_,
+            mir::Type::String
+                | mir::Type::Bool
+                | mir::Type::Char
+                | mir::Type::SByte
+                | mir::Type::Byte
+                | mir::Type::Short
+                | mir::Type::UShort
+                | mir::Type::Int
+                | mir::Type::UInt
+                | mir::Type::Long
+                | mir::Type::ULong
+                | mir::Type::Float
+                | mir::Type::Double
+        )
         || !matches!(builder.kind, mir::OperandKind::Copy(_))
-        || matches!(value.kind, mir::OperandKind::Constant(ref constant) if !matches!(constant, mir::Constant::String(_)))
     {
         return Err(BackendError::new(format!(
             "function `{function_name}` has an invalid StringBuilder.Append operation"
@@ -4111,7 +4155,7 @@ fn validate_intrinsic_shape(
                 && return_type == &mir::Type::Bool
                 && matches!(arguments, [receiver, value] if receiver.type_ == mir::Type::String && value.type_ == mir::Type::String)
         }
-        mir::Intrinsic::StringIndexOf => {
+        mir::Intrinsic::StringIndexOf | mir::Intrinsic::StringLastIndexOf => {
             destination.is_some()
                 && return_type == &mir::Type::Int
                 && matches!(arguments, [receiver, value] if receiver.type_ == mir::Type::String && value.type_ == mir::Type::String)
@@ -4126,10 +4170,40 @@ fn validate_intrinsic_shape(
                 && return_type == &mir::Type::String
                 && matches!(arguments, [receiver, start, length] if receiver.type_ == mir::Type::String && start.type_ == mir::Type::Int && length.type_ == mir::Type::Int)
         }
-        mir::Intrinsic::StringTrim | mir::Intrinsic::StringTrimTemporary => {
+        mir::Intrinsic::StringTrim
+        | mir::Intrinsic::StringTrimTemporary
+        | mir::Intrinsic::StringTrimStart
+        | mir::Intrinsic::StringTrimStartTemporary
+        | mir::Intrinsic::StringTrimEnd
+        | mir::Intrinsic::StringTrimEndTemporary => {
             destination.is_some()
                 && return_type == &mir::Type::String
                 && matches!(arguments, [value] if value.type_ == mir::Type::String)
+        }
+        mir::Intrinsic::StringJoinArray | mir::Intrinsic::StringJoinArrayTemporary => {
+            destination.is_some()
+                && return_type == &mir::Type::String
+                && matches!(arguments, [separator, values] if separator.type_ == mir::Type::String && values.type_ == mir::Type::Array(Box::new(mir::Type::String)))
+        }
+        mir::Intrinsic::StringConcatArray | mir::Intrinsic::StringConcatArrayTemporary => {
+            destination.is_some()
+                && return_type == &mir::Type::String
+                && matches!(arguments, [values] if values.type_ == mir::Type::Array(Box::new(mir::Type::String)))
+        }
+        mir::Intrinsic::StringRepeat | mir::Intrinsic::StringRepeatTemporary => {
+            destination.is_some()
+                && return_type == &mir::Type::String
+                && matches!(arguments, [value, count] if value.type_ == mir::Type::String && count.type_ == mir::Type::Int)
+        }
+        mir::Intrinsic::StringToChars | mir::Intrinsic::StringToCharsTemporary => {
+            destination.is_some()
+                && return_type == &mir::Type::Array(Box::new(mir::Type::Char))
+                && matches!(arguments, [value] if value.type_ == mir::Type::String)
+        }
+        mir::Intrinsic::StringFromChars | mir::Intrinsic::StringFromCharsTemporary => {
+            destination.is_some()
+                && return_type == &mir::Type::String
+                && matches!(arguments, [values] if values.type_ == mir::Type::Array(Box::new(mir::Type::Char)))
         }
         mir::Intrinsic::StringReplace | mir::Intrinsic::StringReplaceTemporary => {
             destination.is_some()
@@ -4151,6 +4225,26 @@ fn validate_intrinsic_shape(
                 && return_type == &mir::Type::Double
                 && matches!(arguments, [value, operation] if value.type_ == mir::Type::Double && is_math_unary_operation(operation))
         }
+        mir::Intrinsic::MathBinaryFloat => {
+            destination.is_some()
+                && return_type == &mir::Type::Float
+                && matches!(arguments, [left, right, operation] if left.type_ == mir::Type::Float && right.type_ == mir::Type::Float && is_math_operation(operation, 0))
+        }
+        mir::Intrinsic::MathBinaryDouble => {
+            destination.is_some()
+                && return_type == &mir::Type::Double
+                && matches!(arguments, [left, right, operation] if left.type_ == mir::Type::Double && right.type_ == mir::Type::Double && is_math_operation(operation, 0))
+        }
+        mir::Intrinsic::MathPredicateFloat => {
+            destination.is_some()
+                && return_type == &mir::Type::Bool
+                && matches!(arguments, [value, operation] if value.type_ == mir::Type::Float && matches_math_operations(operation, &[0, 1, 2]))
+        }
+        mir::Intrinsic::MathPredicateDouble => {
+            destination.is_some()
+                && return_type == &mir::Type::Bool
+                && matches!(arguments, [value, operation] if value.type_ == mir::Type::Double && matches_math_operations(operation, &[0, 1, 2]))
+        }
         mir::Intrinsic::MathPowFloat => {
             destination.is_some()
                 && return_type == &mir::Type::Float
@@ -4160,6 +4254,72 @@ fn validate_intrinsic_shape(
             destination.is_some()
                 && return_type == &mir::Type::Double
                 && matches!(arguments, [value, exponent] if value.type_ == mir::Type::Double && exponent.type_ == mir::Type::Double)
+        }
+        mir::Intrinsic::TimeMonotonicMilliseconds | mir::Intrinsic::TimeUnixMilliseconds => {
+            destination.is_some() && return_type == &mir::Type::Long && arguments.is_empty()
+        }
+        mir::Intrinsic::RandomMix => {
+            destination.is_some()
+                && return_type == &mir::Type::ULong
+                && matches!(arguments, [value] if value.type_ == mir::Type::ULong)
+        }
+        mir::Intrinsic::StringBuilderLength => {
+            destination.is_some()
+                && return_type == &mir::Type::Int
+                && matches!(arguments, [builder] if matches!(builder.type_, mir::Type::Class(_)))
+        }
+        mir::Intrinsic::StringBuilderClear => {
+            destination.is_none()
+                && return_type == &mir::Type::Void
+                && matches!(arguments, [builder] if matches!(builder.type_, mir::Type::Class(_)))
+        }
+        mir::Intrinsic::ListCapacity => {
+            destination.is_some()
+                && return_type == &mir::Type::Int
+                && matches!(arguments, [list] if matches!(list.type_, mir::Type::List(_)))
+        }
+        mir::Intrinsic::DictionaryCapacity => {
+            destination.is_some()
+                && return_type == &mir::Type::Int
+                && matches!(arguments, [dictionary] if matches!(dictionary.type_, mir::Type::Dictionary(_, _)))
+        }
+        mir::Intrinsic::DictionaryEnsureCapacity => {
+            destination.is_some()
+                && return_type == &mir::Type::Int
+                && matches!(arguments, [dictionary, minimum] if matches!(dictionary.type_, mir::Type::Dictionary(_, _)) && minimum.type_ == mir::Type::Int)
+        }
+        mir::Intrinsic::DictionaryGetOr | mir::Intrinsic::DictionaryGetOrAdd => {
+            destination.is_some()
+                && matches!((return_type, arguments), (result, [dictionary, key, supplied]) if matches!(&dictionary.type_, mir::Type::Dictionary(key_type, value_type) if key_type.as_ref() == &key.type_ && value_type.as_ref() == result && result == &supplied.type_))
+        }
+        mir::Intrinsic::ListEnsureCapacity => {
+            destination.is_some()
+                && return_type == &mir::Type::Int
+                && matches!(arguments, [list, minimum] if matches!(list.type_, mir::Type::List(_)) && minimum.type_ == mir::Type::Int)
+        }
+        mir::Intrinsic::ListAddRange => {
+            destination.is_none()
+                && return_type == &mir::Type::Void
+                && matches!(arguments, [list, values] if matches!((&list.type_, &values.type_), (mir::Type::List(left), mir::Type::Array(right)) if left == right))
+        }
+        mir::Intrinsic::ListInsert => {
+            destination.is_none()
+                && return_type == &mir::Type::Void
+                && matches!(arguments, [list, index, value] if matches!(&list.type_, mir::Type::List(element) if element.as_ref() == &value.type_) && index.type_ == mir::Type::Int)
+        }
+        mir::Intrinsic::ListRemoveRange => {
+            destination.is_none()
+                && return_type == &mir::Type::Void
+                && matches!(arguments, [list, index, count] if matches!(list.type_, mir::Type::List(_)) && index.type_ == mir::Type::Int && count.type_ == mir::Type::Int)
+        }
+        mir::Intrinsic::ListReverse => {
+            destination.is_none()
+                && return_type == &mir::Type::Void
+                && matches!(arguments, [list] if matches!(list.type_, mir::Type::List(_)))
+        }
+        mir::Intrinsic::ListGetRange | mir::Intrinsic::ListGetRangeTemporary => {
+            destination.is_some()
+                && matches!((return_type, arguments), (mir::Type::Array(result), [list, index, count]) if matches!(&list.type_, mir::Type::List(element) if element == result) && index.type_ == mir::Type::Int && count.type_ == mir::Type::Int)
         }
         mir::Intrinsic::StringFromLong | mir::Intrinsic::StringFromLongTemporary => {
             destination.is_some()
@@ -4226,6 +4386,11 @@ fn validate_intrinsic_shape(
         // function does not have; `validate_string_try_parse_targets` (run
         // once over the whole module from `validate_module`) covers that.
         mir::Intrinsic::StringTryParseBool
+        | mir::Intrinsic::StringTryParseChar
+        | mir::Intrinsic::StringTryParseSByte
+        | mir::Intrinsic::StringTryParseByte
+        | mir::Intrinsic::StringTryParseShort
+        | mir::Intrinsic::StringTryParseUShort
         | mir::Intrinsic::StringTryParseInt
         | mir::Intrinsic::StringTryParseUInt
         | mir::Intrinsic::StringTryParseLong
@@ -4255,17 +4420,26 @@ fn validate_intrinsic_shape(
         // arity and argument types. `validate_file_io_result_shapes` (run
         // once over the whole module) confirms the enum is actually shaped
         // like `Result<T, IOError>`.
-        mir::Intrinsic::FileReadAllText(_) | mir::Intrinsic::FileReadAllTextTemporary(_) => {
+        mir::Intrinsic::FileReadAllText(_)
+        | mir::Intrinsic::FileReadAllTextTemporary(_)
+        | mir::Intrinsic::FileExists(_)
+        | mir::Intrinsic::DirectoryExists(_)
+        | mir::Intrinsic::FileCreateDirectory(_)
+        | mir::Intrinsic::FileDeleteFile(_)
+        | mir::Intrinsic::FileDeleteDirectory(_) => {
             destination.is_some()
                 && matches!(return_type, mir::Type::Enum(_))
                 && matches!(arguments, [path] if path.type_ == mir::Type::String)
         }
-        mir::Intrinsic::FileWriteAllText(_) => {
+        mir::Intrinsic::FileWriteAllText(_) | mir::Intrinsic::FileAppendAllText(_) => {
             destination.is_some()
                 && matches!(return_type, mir::Type::Enum(_))
                 && matches!(arguments, [path, content] if path.type_ == mir::Type::String && content.type_ == mir::Type::String)
         }
-        mir::Intrinsic::FileListFiles(_) | mir::Intrinsic::FileListFilesTemporary(_) => {
+        mir::Intrinsic::FileListFiles(_)
+        | mir::Intrinsic::FileListFilesTemporary(_)
+        | mir::Intrinsic::FileListDirectories(_)
+        | mir::Intrinsic::FileListDirectoriesTemporary(_) => {
             destination.is_some()
                 && matches!(return_type, mir::Type::Enum(_))
                 && matches!(arguments, [directory] if directory.type_ == mir::Type::String)
@@ -4478,12 +4652,19 @@ fn validate_intrinsic_shape(
 }
 
 fn is_math_unary_operation(operand: &mir::Operand) -> bool {
+    matches_math_operations(
+        operand,
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
+    )
+}
+
+fn is_math_operation(operand: &mir::Operand, expected: i32) -> bool {
+    matches_math_operations(operand, &[expected])
+}
+
+fn matches_math_operations(operand: &mir::Operand, expected: &[i32]) -> bool {
     operand.type_ == mir::Type::Int
-        && matches!(
-            &operand.kind,
-            mir::OperandKind::Constant(mir::Constant::Integer(code))
-                if matches!(code.as_str(), "0" | "1" | "2" | "3" | "4" | "5" | "6")
-        )
+        && matches!(&operand.kind, mir::OperandKind::Constant(mir::Constant::Integer(code)) if code.parse::<i32>().is_ok_and(|code| expected.contains(&code)))
 }
 
 fn function_operand_matches(
@@ -5146,10 +5327,10 @@ mod tests {
                 _ => None,
             })
             .expect("append instruction");
-        append.type_ = mir::Type::Int;
+        append.type_ = mir::Type::Decimal;
         assert!(
             validate_module(&wrong_append)
-                .expect_err("non-string append must fail")
+                .expect_err("unsupported append must fail")
                 .message()
                 .contains("StringBuilder.Append")
         );

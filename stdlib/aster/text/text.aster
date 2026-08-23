@@ -1,5 +1,7 @@
 namespace aster.text;
 
+using aster.core;
+
 internal string __Trim(string value)
 {
     return "";
@@ -14,6 +16,15 @@ internal string[] __Split(string value, string separator)
 {
     return [value];
 }
+
+internal int __LastIndexOf(string value, string pattern) { return -1; }
+internal string __TrimStart(string value) { return value; }
+internal string __TrimEnd(string value) { return value; }
+internal string __JoinArray(string separator, string[] values) { return ""; }
+internal string __ConcatArray(string[] values) { return ""; }
+internal string __Repeat(string value, int count) { return ""; }
+internal char[] __ToChars(string value) { return []; }
+internal string __FromChars(char[] values) { return ""; }
 
 public static class String
 {
@@ -37,6 +48,18 @@ public static class String
         return value.EndsWith(pattern);
     }
 
+    public static Option<int> IndexOf(string value, string pattern)
+    {
+        int index = value.IndexOf(pattern);
+        return index < 0 ? Option<int>.None : Option<int>.Some(index);
+    }
+
+    public static Option<int> LastIndexOf(string value, string pattern)
+    {
+        int index = __LastIndexOf(value, pattern);
+        return index < 0 ? Option<int>.None : Option<int>.Some(index);
+    }
+
     public static string Substring(string value, int start)
     {
         return value.Substring(start);
@@ -52,6 +75,9 @@ public static class String
         return __Trim(value);
     }
 
+    public static string TrimStart(string value) { return __TrimStart(value); }
+    public static string TrimEnd(string value) { return __TrimEnd(value); }
+
     public static string Replace(string value, string oldValue, string newValue)
     {
         return __Replace(value, oldValue, newValue);
@@ -61,4 +87,15 @@ public static class String
     {
         return __Split(value, separator);
     }
+
+
+    public static string Join(string separator, string[] values)
+    {
+        return __JoinArray(separator, values);
+    }
+
+    public static string Concat(string[] values) { return __ConcatArray(values); }
+    public static string Repeat(string value, int count) { return __Repeat(value, count); }
+    public static char[] ToChars(string value) { return __ToChars(value); }
+    public static string FromChars(char[] values) { return __FromChars(values); }
 }

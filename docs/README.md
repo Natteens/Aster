@@ -32,7 +32,8 @@ work that is not implemented.
   [postfix `?`](reference/result-propagation.md)
 - 🧬 [Generic functions](reference/generics.md) and [generic types](reference/generic-types.md)
 - 🧰 [Standard library](reference/standard-library.md), [filesystem and terminal I/O](reference/io.md),
-  [`aster.math`](reference/math.md), and [logging](reference/logging.md)
+  [`aster.math`](reference/math.md), [deterministic random](reference/random.md),
+  [clock reads](reference/time.md), and [logging](reference/logging.md)
 - ⚙️ [Tasks, parallel operations, and worker boundaries](reference/concurrency.md)
 - 🔌 [Minimal native FFI and lexical unsafe boundary](reference/native-ffi.md)
 - 🧪 [Package tests and assertions](reference/testing.md)

@@ -18,8 +18,27 @@ public class StringBuilder
 {
     public StringBuilder() {}
 
-    /// Appends `value` without constructing an intermediate ASTER string.
+    /// Appends `value`.
     public void Append(string value) {}
+    public void Append(bool value) { this.Append(value.ToString()); }
+    public void Append(char value) { this.Append(value.ToString()); }
+    public void Append(sbyte value) { this.Append(((int)value).ToString()); }
+    public void Append(byte value) { this.Append(((int)value).ToString()); }
+    public void Append(short value) { this.Append(((int)value).ToString()); }
+    public void Append(ushort value) { this.Append(((int)value).ToString()); }
+    public void Append(int value) { this.Append(value.ToString()); }
+    public void Append(uint value) { this.Append(value.ToString()); }
+    public void Append(long value) { this.Append(value.ToString()); }
+    public void Append(ulong value) { this.Append(value.ToString()); }
+    public void Append(float value) { this.Append(value.ToString()); }
+    public void Append(double value) { this.Append(value.ToString()); }
+
+    public int Length { get { return 0; } }
+
+    public void AppendLine() { this.Append("\n"); }
+    public void AppendLine(string value) { this.Append(value); this.Append("\n"); }
+
+    public void Clear() {}
 
     /// Returns an immutable snapshot of the current content.
     public string ToString() { return ""; }

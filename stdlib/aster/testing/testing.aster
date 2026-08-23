@@ -1,5 +1,7 @@
 namespace aster.testing;
 
+using aster.math;
+
 internal void __AssertionTrue()
 {
 }
@@ -11,6 +13,7 @@ internal void __AssertionEqual(string expected, string actual)
 internal void __AssertionFalse()
 {
 }
+
 
 public static class Assert
 {
@@ -43,4 +46,38 @@ public static class Assert
     public static void Equal(float expected, float actual) { if (expected != actual) { __AssertionEqual(expected.ToString(), actual.ToString()); } }
     public static void Equal(double expected, double actual) { if (expected != actual) { __AssertionEqual(expected.ToString(), actual.ToString()); } }
     public static void Equal(string expected, string actual) { if (expected != actual) { __AssertionEqual(expected, actual); } }
+
+    public static void NotEqual(bool expected, bool actual) { if (expected == actual) { __AssertionEqual("different values", actual.ToString()); } }
+    public static void NotEqual(char expected, char actual) { if (expected == actual) { __AssertionEqual("different values", actual.ToString()); } }
+    public static void NotEqual(sbyte expected, sbyte actual) { if (expected == actual) { __AssertionEqual("different values", ((int)actual).ToString()); } }
+    public static void NotEqual(byte expected, byte actual) { if (expected == actual) { __AssertionEqual("different values", ((int)actual).ToString()); } }
+    public static void NotEqual(short expected, short actual) { if (expected == actual) { __AssertionEqual("different values", ((int)actual).ToString()); } }
+    public static void NotEqual(ushort expected, ushort actual) { if (expected == actual) { __AssertionEqual("different values", ((int)actual).ToString()); } }
+    public static void NotEqual(int expected, int actual) { if (expected == actual) { __AssertionEqual("different values", actual.ToString()); } }
+    public static void NotEqual(uint expected, uint actual) { if (expected == actual) { __AssertionEqual("different values", actual.ToString()); } }
+    public static void NotEqual(long expected, long actual) { if (expected == actual) { __AssertionEqual("different values", actual.ToString()); } }
+    public static void NotEqual(ulong expected, ulong actual) { if (expected == actual) { __AssertionEqual("different values", actual.ToString()); } }
+    public static void NotEqual(float expected, float actual) { if (expected == actual) { __AssertionEqual("different values", actual.ToString()); } }
+    public static void NotEqual(double expected, double actual) { if (expected == actual) { __AssertionEqual("different values", actual.ToString()); } }
+    public static void NotEqual(string expected, string actual) { if (expected == actual) { __AssertionEqual("different values", actual); } }
+
+    public static void ApproximatelyEqual(float expected, float actual, float tolerance)
+    {
+        if (tolerance != tolerance || tolerance < 0.0f || expected != expected || actual != actual
+            || (expected != actual && Math.Abs(expected - actual) > tolerance))
+        {
+            __AssertionEqual(expected.ToString(), actual.ToString());
+        }
+    }
+
+    public static void ApproximatelyEqual(double expected, double actual, double tolerance)
+    {
+        if (tolerance != tolerance || tolerance < 0.0d || expected != expected || actual != actual
+            || (expected != actual && Math.Abs(expected - actual) > tolerance))
+        {
+            __AssertionEqual(expected.ToString(), actual.ToString());
+        }
+    }
+
+    public static void Fail(string message) { __AssertionEqual("no assertion failure", message); }
 }

@@ -21,6 +21,8 @@ const IO_SOURCE: &str = include_str!("../../../stdlib/aster/io/io.aster");
 const COLLECTIONS_SOURCE: &str =
     include_str!("../../../stdlib/aster/collections/collections.aster");
 const TESTING_SOURCE: &str = include_str!("../../../stdlib/aster/testing/testing.aster");
+const RANDOM_SOURCE: &str = include_str!("../../../stdlib/aster/random/random.aster");
+const TIME_SOURCE: &str = include_str!("../../../stdlib/aster/time/time.aster");
 
 /// All stdlib modules with their on-disk paths relative to the stdlib root.
 const STDLIB_MODULES: &[(&str, &str)] = &[
@@ -30,6 +32,8 @@ const STDLIB_MODULES: &[(&str, &str)] = &[
     ("aster.io", "aster/io/io.aster"),
     ("aster.collections", "aster/collections/collections.aster"),
     ("aster.testing", "aster/testing/testing.aster"),
+    ("aster.random", "aster/random/random.aster"),
+    ("aster.time", "aster/time/time.aster"),
 ];
 
 /// Namespace of the official core standard library, and the single source of
@@ -90,6 +94,8 @@ impl StandardLibrary {
                 ("aster.io", Cow::Borrowed(IO_SOURCE)),
                 ("aster.collections", Cow::Borrowed(COLLECTIONS_SOURCE)),
                 ("aster.testing", Cow::Borrowed(TESTING_SOURCE)),
+                ("aster.random", Cow::Borrowed(RANDOM_SOURCE)),
+                ("aster.time", Cow::Borrowed(TIME_SOURCE)),
             ]),
         }
     }
@@ -141,6 +147,7 @@ impl StandardLibrary {
         self.modules.get(module).map(Cow::as_ref)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn intrinsic_bindings(&self) -> HashMap<String, Intrinsic> {
         let mut bindings = HashMap::new();
         if self.modules.contains_key("aster.math") {
@@ -158,12 +165,32 @@ impl StandardLibrary {
                     Intrinsic::ReportRuntimeError(RuntimeErrorKind::MathClampInvalidRange),
                 ),
                 (
+                    "aster.math::__MathSignNaN".to_owned(),
+                    Intrinsic::ReportRuntimeError(RuntimeErrorKind::MathSignNaN),
+                ),
+                (
                     "aster.math::__MathUnaryFloat".to_owned(),
                     Intrinsic::MathUnaryFloat,
                 ),
                 (
                     "aster.math::__MathUnaryDouble".to_owned(),
                     Intrinsic::MathUnaryDouble,
+                ),
+                (
+                    "aster.math::__MathBinaryFloat".to_owned(),
+                    Intrinsic::MathBinaryFloat,
+                ),
+                (
+                    "aster.math::__MathBinaryDouble".to_owned(),
+                    Intrinsic::MathBinaryDouble,
+                ),
+                (
+                    "aster.math::__MathPredicateFloat".to_owned(),
+                    Intrinsic::MathPredicateFloat,
+                ),
+                (
+                    "aster.math::__MathPredicateDouble".to_owned(),
+                    Intrinsic::MathPredicateDouble,
                 ),
                 (
                     "aster.math::__MathPowFloat".to_owned(),
@@ -173,6 +200,21 @@ impl StandardLibrary {
                     "aster.math::__MathPowDouble".to_owned(),
                     Intrinsic::MathPowDouble,
                 ),
+            ]);
+        }
+        if self.modules.contains_key("aster.collections") {
+            bindings.insert(
+                "aster.collections::__CollectionRangeError".to_owned(),
+                Intrinsic::ReportRuntimeError(RuntimeErrorKind::CollectionRange),
+            );
+        }
+        if self.modules.contains_key("aster.random") {
+            bindings.extend([
+                (
+                    "aster.random::__RandomInvalidRange".to_owned(),
+                    Intrinsic::ReportRuntimeError(RuntimeErrorKind::RandomInvalidRange),
+                ),
+                ("aster.random::__RandomMix".to_owned(), Intrinsic::RandomMix),
             ]);
         }
         if self.modules.contains_key("aster.testing") {
@@ -194,8 +236,43 @@ impl StandardLibrary {
         if self.modules.contains_key("aster.text") {
             bindings.extend([
                 ("aster.text::__Trim".to_owned(), Intrinsic::StringTrim),
+                (
+                    "aster.text::__LastIndexOf".to_owned(),
+                    Intrinsic::StringLastIndexOf,
+                ),
+                (
+                    "aster.text::__TrimStart".to_owned(),
+                    Intrinsic::StringTrimStart,
+                ),
+                ("aster.text::__TrimEnd".to_owned(), Intrinsic::StringTrimEnd),
+                (
+                    "aster.text::__JoinArray".to_owned(),
+                    Intrinsic::StringJoinArray,
+                ),
+                (
+                    "aster.text::__ConcatArray".to_owned(),
+                    Intrinsic::StringConcatArray,
+                ),
+                ("aster.text::__Repeat".to_owned(), Intrinsic::StringRepeat),
+                ("aster.text::__ToChars".to_owned(), Intrinsic::StringToChars),
+                (
+                    "aster.text::__FromChars".to_owned(),
+                    Intrinsic::StringFromChars,
+                ),
                 ("aster.text::__Replace".to_owned(), Intrinsic::StringReplace),
                 ("aster.text::__Split".to_owned(), Intrinsic::StringSplit),
+            ]);
+        }
+        if self.modules.contains_key("aster.time") {
+            bindings.extend([
+                (
+                    "aster.time::__MonotonicMilliseconds".to_owned(),
+                    Intrinsic::TimeMonotonicMilliseconds,
+                ),
+                (
+                    "aster.time::__UnixMilliseconds".to_owned(),
+                    Intrinsic::TimeUnixMilliseconds,
+                ),
             ]);
         }
         if self.modules.contains_key("aster.io") {
@@ -224,6 +301,34 @@ impl StandardLibrary {
                     "aster.io::ListFiles".to_owned(),
                     Intrinsic::FileListFiles(FileIoResultLayout::UNRESOLVED),
                 ),
+                (
+                    "aster.io::AppendAllText".to_owned(),
+                    Intrinsic::FileAppendAllText(FileIoResultLayout::UNRESOLVED),
+                ),
+                (
+                    "aster.io::ListDirectories".to_owned(),
+                    Intrinsic::FileListDirectories(FileIoResultLayout::UNRESOLVED),
+                ),
+                (
+                    "aster.io::FileExists".to_owned(),
+                    Intrinsic::FileExists(FileIoResultLayout::UNRESOLVED),
+                ),
+                (
+                    "aster.io::DirectoryExists".to_owned(),
+                    Intrinsic::DirectoryExists(FileIoResultLayout::UNRESOLVED),
+                ),
+                (
+                    "aster.io::CreateDirectory".to_owned(),
+                    Intrinsic::FileCreateDirectory(FileIoResultLayout::UNRESOLVED),
+                ),
+                (
+                    "aster.io::DeleteFile".to_owned(),
+                    Intrinsic::FileDeleteFile(FileIoResultLayout::UNRESOLVED),
+                ),
+                (
+                    "aster.io::DeleteDirectory".to_owned(),
+                    Intrinsic::FileDeleteDirectory(FileIoResultLayout::UNRESOLVED),
+                ),
             ]);
         }
         bindings
@@ -236,7 +341,13 @@ impl StandardLibrary {
         }
         if matches!(
             module,
-            "aster.text" | "aster.core" | "aster.io" | "aster.collections" | "aster.testing"
+            "aster.text"
+                | "aster.core"
+                | "aster.io"
+                | "aster.collections"
+                | "aster.testing"
+                | "aster.random"
+                | "aster.time"
         ) {
             path.push(
                 module

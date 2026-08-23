@@ -28,11 +28,16 @@ function with a body. Tests cannot be `public`, so they are not exported as depe
 
 ## Assertions
 
-`aster.testing.Assert` provides `True(bool)`, `False(bool)`, and overloaded
-`Equal(expected, actual)` for bool, char, scalar numeric types, and string. `Equal` uses ASTER's
+`aster.testing.Assert` provides `True(bool)`, `False(bool)`, overloaded `Equal` and `NotEqual` for
+bool, char, scalar numeric types, and string, absolute-tolerance `ApproximatelyEqual` for
+float/double, and deliberate `Fail(message)`. `Equal` uses ASTER's
 ordinary equality semantics: in particular, it is exact for floats, `NaN != NaN`, and `+0 == -0`.
 Arrays and collections have no deep-equality assertion in this release; use `Assert.True` for a
 custom comparison.
+
+`ApproximatelyEqual` requires a non-negative tolerance. NaN always fails; equal infinities and
+signed zeros pass; otherwise the absolute difference must be at most the tolerance. All assertion
+failures use the existing controlled runtime assertion path—never exceptions or unwind.
 
 `aster.testing` is an ordinary standard-library namespace. It can also be imported by ordinary
 program code, where a failing assertion is the same controlled runtime error; no runner-specific

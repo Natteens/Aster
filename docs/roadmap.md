@@ -15,10 +15,12 @@ The current toolchain includes:
 - contextual `[]` and `new()`, expression-bodied callables, inferred `foreach` elements, checked
   `List<T>` indexing, named arguments, and compile-time default parameters;
 - immutable UTF-8 strings with Unicode-scalar `char`, scalar-counting `Length`, and `foreach` iteration;
-- practical ordinal string helpers, floating-point math helpers, and collection mutation/snapshot APIs;
+- practical strict scalar parsing, ordinal Unicode text helpers, scalar math/classification,
+  deterministic seeded random, clock reads, bulk collection helpers, and compact assertions;
 - region-based temporary and persistent allocation with conservative escape analysis, AARM fine
   reclaim, and compiler-proven long-lived owned-region reclamation for fresh return-only values;
-- terminal and host-managed filesystem operations;
+- terminal and operation-scoped host filesystem workflows for text, lines, existence, immediate
+  directory listing, one-level creation, and non-recursive deletion;
 - explicit lexical-unsafe calls to host-registered fixed-width scalar C-ABI wrappers, with no
   dynamic loading or ASTER-reference transfer;
 - multifile projects with `Aster.toml` and conventional `Main`;

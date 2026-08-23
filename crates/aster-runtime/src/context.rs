@@ -165,7 +165,10 @@ pub struct AsterList {
 #[repr(C)]
 pub struct AsterStringBuilder {
     data: *mut u8,
+    /// Initialized UTF-8 payload length in bytes.
     length: usize,
+    /// Unicode scalar count, maintained at append time for O(1) public Length.
+    scalar_length: usize,
     capacity: usize,
     region: ListRegion,
     birth_scope_depth: u32,
@@ -1332,6 +1335,7 @@ impl ExecutionContext {
             *header = AsterStringBuilder {
                 data: ptr::null_mut(),
                 length: 0,
+                scalar_length: 0,
                 capacity: 0,
                 region,
                 birth_scope_depth: if region == ListRegion::Temporary {
@@ -1353,9 +1357,15 @@ impl ExecutionContext {
         // SAFETY: generated code can obtain this pointer only from the
         // allocation functions below and keeps its execution context alive.
         #[allow(unsafe_code)]
-        let (data, length, capacity) =
-            unsafe { ((*builder).data, (*builder).length, (*builder).capacity) };
-        if length > capacity || (capacity == 0) != data.is_null() {
+        let (data, length, scalar_length, capacity) = unsafe {
+            (
+                (*builder).data,
+                (*builder).length,
+                (*builder).scalar_length,
+                (*builder).capacity,
+            )
+        };
+        if length > capacity || scalar_length > length || (capacity == 0) != data.is_null() {
             self.fail("StringBuilder header is invalid");
             return false;
         }
@@ -1367,7 +1377,7 @@ impl ExecutionContext {
         builder: *mut AsterStringBuilder,
         value: *const AsterStrHeader,
     ) -> bool {
-        if self.error.is_some() || !self.validate_string_builder(builder) {
+        if self.error.is_some() {
             return false;
         }
         // SAFETY: `value` is an immutable ASTER string owned by this context
@@ -1377,12 +1387,24 @@ impl ExecutionContext {
             self.fail("StringBuilder.Append received an invalid UTF-8 string reference");
             return false;
         };
+        self.string_builder_append_text(builder, value)
+    }
+
+    fn string_builder_append_text(
+        &mut self,
+        builder: *mut AsterStringBuilder,
+        value: &str,
+    ) -> bool {
+        if self.error.is_some() || !self.validate_string_builder(builder) {
+            return false;
+        }
         // SAFETY: validated above.
         #[allow(unsafe_code)]
-        let (old_data, old_length, old_capacity, region, birth_scope_depth) = unsafe {
+        let (old_data, old_length, old_scalar_length, old_capacity, region, birth_scope_depth) = unsafe {
             (
                 (*builder).data,
                 (*builder).length,
+                (*builder).scalar_length,
                 (*builder).capacity,
                 (*builder).region,
                 (*builder).birth_scope_depth,
@@ -1390,6 +1412,11 @@ impl ExecutionContext {
         };
         let Some(required) = old_length.checked_add(value.len()) else {
             self.fail("StringBuilder length overflow while appending");
+            return false;
+        };
+        let Some(required_scalar_length) = old_scalar_length.checked_add(value.chars().count())
+        else {
+            self.fail("StringBuilder scalar length overflow while appending");
             return false;
         };
         if required <= old_capacity {
@@ -1400,6 +1427,7 @@ impl ExecutionContext {
                 unsafe {
                     ptr::copy_nonoverlapping(value.as_ptr(), old_data.add(old_length), value.len());
                     (*builder).length = required;
+                    (*builder).scalar_length = required_scalar_length;
                 }
             }
             return true;
@@ -1435,6 +1463,7 @@ impl ExecutionContext {
         unsafe {
             (*builder).data = new_data;
             (*builder).length = required;
+            (*builder).scalar_length = required_scalar_length;
             (*builder).capacity = new_capacity;
         }
         true
@@ -1466,6 +1495,30 @@ impl ExecutionContext {
             self.allocate_temporary_string_parts(&[value])
         } else {
             self.allocate_string_parts(&[value])
+        }
+    }
+
+    fn string_builder_length(&mut self, builder: *const AsterStringBuilder) -> i32 {
+        if self.error.is_some() || !self.validate_string_builder(builder) {
+            return 0;
+        }
+        // SAFETY: validation established `scalar_length <= length <= capacity`.
+        #[allow(unsafe_code)]
+        let scalar_length = unsafe { (*builder).scalar_length };
+        i32::try_from(scalar_length).unwrap_or_else(|_| {
+            self.fail("StringBuilder.Length exceeds the supported `int` range");
+            0
+        })
+    }
+
+    fn string_builder_clear(&mut self, builder: *mut AsterStringBuilder) {
+        if self.error.is_some() || !self.validate_string_builder(builder) {
+            return;
+        }
+        #[allow(unsafe_code)]
+        unsafe {
+            (*builder).length = 0;
+            (*builder).scalar_length = 0;
         }
     }
 
@@ -2091,6 +2144,148 @@ impl ExecutionContext {
             entry_capacity
         };
         self.dictionary_rebuild(dictionary, new_bucket_capacity, new_entry_capacity)
+    }
+
+    fn dictionary_ensure_capacity(
+        &mut self,
+        dictionary: *mut AsterDictionary,
+        minimum: i32,
+    ) -> Option<i32> {
+        if self.error.is_some() {
+            return None;
+        }
+        if minimum < 0 {
+            self.fail("Dictionary.EnsureCapacity requires a nonnegative minimum");
+            return None;
+        }
+        if minimum > DICTIONARY_MAX_ENTRIES {
+            self.fail("Dictionary.EnsureCapacity exceeds the maximum supported entry count");
+            return None;
+        }
+        if !self.validate_dictionary_header(dictionary) {
+            return None;
+        }
+        #[allow(unsafe_code)]
+        let (entry_capacity, bucket_capacity) =
+            unsafe { ((*dictionary).entry_capacity, (*dictionary).bucket_capacity) };
+        let load_capacity = bucket_capacity.saturating_mul(3) / 4;
+        if entry_capacity >= minimum && load_capacity >= minimum {
+            return Some(entry_capacity);
+        }
+        let mut new_buckets = bucket_capacity.max(DICTIONARY_INITIAL_CAPACITY);
+        while new_buckets.saturating_mul(3) / 4 < minimum {
+            let Some(next) = new_buckets.checked_mul(2) else {
+                self.fail("Dictionary bucket capacity overflow");
+                return None;
+            };
+            new_buckets = next;
+        }
+        let mut new_entries = entry_capacity.max(DICTIONARY_INITIAL_CAPACITY);
+        while new_entries < minimum {
+            new_entries = match new_entries.checked_mul(2) {
+                Some(next) if next > new_entries => next,
+                _ => minimum,
+            };
+        }
+        if !self.dictionary_rebuild(dictionary, new_buckets, new_entries) {
+            return None;
+        }
+        #[allow(unsafe_code)]
+        Some(unsafe { (*dictionary).entry_capacity })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dictionary_get_or(
+        &mut self,
+        dictionary: *mut AsterDictionary,
+        key_kind: DictionaryKeyKind,
+        key_size: u32,
+        key_align: u32,
+        key_type_key: u64,
+        value_size: u32,
+        value_align: u32,
+        value_type_key: u64,
+        key: *const u8,
+        supplied: *const u8,
+        destination: *mut u8,
+        add_missing: bool,
+    ) -> bool {
+        if self.error.is_some() {
+            return false;
+        }
+        let operation = if add_missing { "GetOrAdd" } else { "GetOr" };
+        if supplied.is_null() || destination.is_null() {
+            self.fail(format!(
+                "Dictionary.{operation} received a null value address"
+            ));
+            return false;
+        }
+        if !self.validate_dictionary_operation(
+            dictionary,
+            key_kind,
+            key_size,
+            key_align,
+            key_type_key,
+            value_size,
+            value_align,
+            value_type_key,
+            operation,
+        ) {
+            return false;
+        }
+        let Some(hash) = self.dictionary_hash_key(key_kind, key, key_size, operation) else {
+            return false;
+        };
+        let Ok(found) = self.dictionary_find(dictionary, key, hash, operation) else {
+            return false;
+        };
+        if let Some((index, _, _)) = found {
+            #[allow(unsafe_code)]
+            let (entries, layout) = unsafe {
+                (
+                    (*dictionary).entries,
+                    dictionary_entry_layout(key_size, key_align, value_size, value_align)
+                        .expect("validated dictionary layout"),
+                )
+            };
+            let Some(entry) =
+                Self::dictionary_entry_pointer(entries, i32::try_from(index).unwrap_or(-1), layout)
+            else {
+                self.fail(format!("Dictionary.{operation} entry offset overflow"));
+                return false;
+            };
+            #[allow(unsafe_code)]
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    entry.add(layout.value_offset),
+                    destination,
+                    value_size as usize,
+                );
+            }
+            return true;
+        }
+        if add_missing
+            && self.dictionary_add_or_set(
+                dictionary,
+                key_kind,
+                key_size,
+                key_align,
+                key_type_key,
+                value_size,
+                value_align,
+                value_type_key,
+                key,
+                supplied,
+                false,
+            ) != 1
+        {
+            return false;
+        }
+        #[allow(unsafe_code)]
+        unsafe {
+            ptr::copy_nonoverlapping(supplied, destination, value_size as usize);
+        }
+        true
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -3160,6 +3355,331 @@ impl ExecutionContext {
         array
     }
 
+    fn list_capacity(&mut self, list: *const AsterList) -> i32 {
+        if self.error.is_some() || !self.validate_list_header(list) {
+            return 0;
+        }
+        #[allow(unsafe_code)]
+        unsafe {
+            (*list).capacity
+        }
+    }
+
+    fn list_reserve(&mut self, list: *mut AsterList, minimum: i32) -> Option<i32> {
+        if self.error.is_some() {
+            return None;
+        }
+        if minimum < 0 {
+            self.fail("List.EnsureCapacity requires a nonnegative minimum");
+            return None;
+        }
+        if !self.validate_list_header(list) {
+            return None;
+        }
+        #[allow(unsafe_code)]
+        let (data, length, capacity, element_size, element_align, region, birth_scope_depth) = unsafe {
+            (
+                (*list).data,
+                (*list).length,
+                (*list).capacity,
+                (*list).element_size,
+                (*list).element_align,
+                (*list).region,
+                (*list).birth_scope_depth,
+            )
+        };
+        if capacity >= minimum {
+            return Some(capacity);
+        }
+        let mut target = capacity.max(4);
+        while target < minimum {
+            target = match target.checked_mul(2) {
+                Some(doubled) if doubled > target => doubled,
+                _ => minimum,
+            };
+        }
+        let bytes = usize::try_from(target)
+            .ok()
+            .and_then(|count| count.checked_mul(element_size as usize));
+        let Some(bytes) = bytes else {
+            self.fail("list buffer size overflow while growing");
+            return None;
+        };
+        if region == ListRegion::Temporary && self.temporary_scopes.is_empty() {
+            self.fail("temporary list growth requires an active temporary scope");
+            return None;
+        }
+        let use_temporary = region == ListRegion::Temporary
+            && self.temporary_scopes.len() == birth_scope_depth as usize;
+        let new_data = self.allocate_in_region(bytes, element_align as usize, use_temporary)?;
+        let Some(live_bytes) = usize::try_from(length)
+            .ok()
+            .and_then(|length| length.checked_mul(element_size as usize))
+        else {
+            self.fail("list live byte count overflow while growing");
+            return None;
+        };
+        if live_bytes != 0 {
+            #[allow(unsafe_code)]
+            unsafe {
+                ptr::copy_nonoverlapping(data, new_data, live_bytes);
+            }
+        }
+        self.record_allocation(AllocationCategory::Object, bytes);
+        #[allow(unsafe_code)]
+        unsafe {
+            (*list).data = new_data;
+            (*list).capacity = target;
+        }
+        Some(target)
+    }
+
+    fn list_add_range(&mut self, list: *mut AsterList, values: *const AsterArray) -> bool {
+        if self.error.is_some() || !self.validate_list_header(list) {
+            return false;
+        }
+        if values.is_null() {
+            self.fail("List.AddRange received a null array");
+            return false;
+        }
+        #[allow(unsafe_code)]
+        let (source, count, source_size) =
+            unsafe { ((*values).data, (*values).length, (*values).element_size) };
+        #[allow(unsafe_code)]
+        let (old_length, element_size) = unsafe { ((*list).length, (*list).element_size) };
+        if source_size != element_size {
+            self.fail("List.AddRange element size mismatch");
+            return false;
+        }
+        if count == 0 {
+            return true;
+        }
+        let Some(new_length) = old_length.checked_add(count) else {
+            self.fail("list length overflow");
+            return false;
+        };
+        if self.list_reserve(list, new_length).is_none() {
+            return false;
+        }
+        let Some(byte_count) = usize::try_from(count)
+            .ok()
+            .and_then(|count| count.checked_mul(element_size as usize))
+        else {
+            self.fail("List.AddRange byte count overflow");
+            return false;
+        };
+        let Some(offset) = usize::try_from(old_length)
+            .ok()
+            .and_then(|length| length.checked_mul(element_size as usize))
+        else {
+            self.fail("List.AddRange destination offset overflow");
+            return false;
+        };
+        #[allow(unsafe_code)]
+        unsafe {
+            ptr::copy_nonoverlapping(source, (*list).data.add(offset), byte_count);
+            (*list).length = new_length;
+            (*list).version = (*list).version.wrapping_add(1);
+        }
+        true
+    }
+
+    fn list_insert(&mut self, list: *mut AsterList, index: i32, source: *const u8) -> bool {
+        if self.error.is_some() || !self.validate_list_header(list) {
+            return false;
+        }
+        if source.is_null() {
+            self.fail("List.Insert received a null value");
+            return false;
+        }
+        #[allow(unsafe_code)]
+        let (length, element_size) = unsafe { ((*list).length, (*list).element_size) };
+        if index < 0 || index > length {
+            self.fail("List.Insert index is outside the valid range");
+            return false;
+        }
+        let Some(new_length) = length.checked_add(1) else {
+            self.fail("list length overflow");
+            return false;
+        };
+        if self.list_reserve(list, new_length).is_none() {
+            return false;
+        }
+        let size = usize::try_from(element_size).unwrap_or(0);
+        let Some(offset) = usize::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_mul(size))
+        else {
+            self.fail("List.Insert destination offset overflow");
+            return false;
+        };
+        let Some(next_offset) = offset.checked_add(size) else {
+            self.fail("List.Insert shifted destination offset overflow");
+            return false;
+        };
+        let Some(move_bytes) = usize::try_from(length - index)
+            .ok()
+            .and_then(|count| count.checked_mul(size))
+        else {
+            self.fail("List.Insert shifted byte count overflow");
+            return false;
+        };
+        #[allow(unsafe_code)]
+        unsafe {
+            let data = (*list).data;
+            ptr::copy(data.add(offset), data.add(next_offset), move_bytes);
+            ptr::copy_nonoverlapping(source, data.add(offset), size);
+            (*list).length = new_length;
+            (*list).version = (*list).version.wrapping_add(1);
+        }
+        true
+    }
+
+    fn list_remove_range(&mut self, list: *mut AsterList, index: i32, count: i32) -> bool {
+        if self.error.is_some() || !self.validate_list_header(list) {
+            return false;
+        }
+        #[allow(unsafe_code)]
+        let (length, element_size) = unsafe { ((*list).length, (*list).element_size) };
+        if index < 0 || count < 0 || index > length || count > length - index {
+            self.fail("List.RemoveRange range is outside the valid bounds");
+            return false;
+        }
+        if count == 0 {
+            return true;
+        }
+        let new_length = length - count;
+        let size = usize::try_from(element_size).unwrap_or(0);
+        let Some(source_offset) = usize::try_from(index + count)
+            .ok()
+            .and_then(|index| index.checked_mul(size))
+        else {
+            self.fail("List.RemoveRange source offset overflow");
+            return false;
+        };
+        let Some(destination_offset) = usize::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_mul(size))
+        else {
+            self.fail("List.RemoveRange destination offset overflow");
+            return false;
+        };
+        let Some(move_bytes) = usize::try_from(length - index - count)
+            .ok()
+            .and_then(|count| count.checked_mul(size))
+        else {
+            self.fail("List.RemoveRange shifted byte count overflow");
+            return false;
+        };
+        let Some(clear_offset) = usize::try_from(new_length)
+            .ok()
+            .and_then(|length| length.checked_mul(size))
+        else {
+            self.fail("List.RemoveRange clear offset overflow");
+            return false;
+        };
+        let Some(clear_bytes) = usize::try_from(count)
+            .ok()
+            .and_then(|count| count.checked_mul(size))
+        else {
+            self.fail("List.RemoveRange clear byte count overflow");
+            return false;
+        };
+        #[allow(unsafe_code)]
+        unsafe {
+            let data = (*list).data;
+            ptr::copy(
+                data.add(source_offset),
+                data.add(destination_offset),
+                move_bytes,
+            );
+            ptr::write_bytes(data.add(clear_offset), 0, clear_bytes);
+            (*list).length = new_length;
+            (*list).version = (*list).version.wrapping_add(1);
+        }
+        true
+    }
+
+    fn list_reverse(&mut self, list: *mut AsterList) -> bool {
+        if self.error.is_some() || !self.validate_list_header(list) {
+            return false;
+        }
+        #[allow(unsafe_code)]
+        let (length, size, data) =
+            unsafe { ((*list).length, (*list).element_size as usize, (*list).data) };
+        if length <= 1 {
+            return true;
+        }
+        for index in 0..length / 2 {
+            let Some(left_offset) = usize::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_mul(size))
+            else {
+                self.fail("List.Reverse left offset overflow");
+                return false;
+            };
+            let Some(right_offset) = usize::try_from(length - 1 - index)
+                .ok()
+                .and_then(|index| index.checked_mul(size))
+            else {
+                self.fail("List.Reverse right offset overflow");
+                return false;
+            };
+            #[allow(unsafe_code)]
+            unsafe {
+                ptr::swap_nonoverlapping(data.add(left_offset), data.add(right_offset), size);
+            }
+        }
+        #[allow(unsafe_code)]
+        unsafe {
+            (*list).version = (*list).version.wrapping_add(1);
+        }
+        true
+    }
+
+    fn list_get_range(
+        &mut self,
+        list: *const AsterList,
+        index: i32,
+        count: i32,
+        temporary: bool,
+    ) -> *mut AsterArray {
+        if self.error.is_some() || !self.validate_list_header(list) {
+            return ptr::null_mut();
+        }
+        #[allow(unsafe_code)]
+        let (length, size, data) = unsafe { ((*list).length, (*list).element_size, (*list).data) };
+        if index < 0 || count < 0 || index > length || count > length - index {
+            self.fail("List.GetRange range is outside the valid bounds");
+            return ptr::null_mut();
+        }
+        let array = self.allocate_array_in_region(count, size, temporary);
+        if array.is_null() {
+            return ptr::null_mut();
+        }
+        if count != 0 {
+            let Some(source_offset) = usize::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_mul(usize::try_from(size).unwrap_or(0)))
+            else {
+                self.fail("List.GetRange source offset overflow");
+                return ptr::null_mut();
+            };
+            let Some(copy_bytes) = usize::try_from(count)
+                .ok()
+                .and_then(|count| count.checked_mul(usize::try_from(size).unwrap_or(0)))
+            else {
+                self.fail("List.GetRange byte count overflow");
+                return ptr::null_mut();
+            };
+            #[allow(unsafe_code)]
+            unsafe {
+                ptr::copy_nonoverlapping(data.add(source_offset), (*array).data, copy_bytes);
+            }
+        }
+        array
+    }
+
     /// Computes every checked offset `RemoveAt` needs: the removed slot's
     /// offset, the offset of the first element after it, how many bytes to
     /// shift, the new `length`, and the offset of the slot that falls out of
@@ -3704,6 +4224,140 @@ pub extern "C" fn aster_rt_string_builder_append(
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_builder_append_long(
+    context: *mut ExecutionContext,
+    builder: *mut AsterStringBuilder,
+    value: i64,
+) -> i8 {
+    if context.is_null() {
+        return 0;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let Some(text) = crate::string::display_text(value) else {
+        context.fail("scalar formatting exceeded the runtime buffer");
+        return 0;
+    };
+    i8::from(context.string_builder_append_text(builder, text.as_str()))
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_builder_append_ulong(
+    context: *mut ExecutionContext,
+    builder: *mut AsterStringBuilder,
+    value: i64,
+) -> i8 {
+    if context.is_null() {
+        return 0;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let value = u64::from_ne_bytes(value.to_ne_bytes());
+    let Some(text) = crate::string::display_text(value) else {
+        context.fail("scalar formatting exceeded the runtime buffer");
+        return 0;
+    };
+    i8::from(context.string_builder_append_text(builder, text.as_str()))
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_builder_append_double(
+    context: *mut ExecutionContext,
+    builder: *mut AsterStringBuilder,
+    value: f64,
+) -> i8 {
+    if context.is_null() {
+        return 0;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let Some(text) = crate::string::display_text(value) else {
+        context.fail("scalar formatting exceeded the runtime buffer");
+        return 0;
+    };
+    i8::from(context.string_builder_append_text(builder, text.as_str()))
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_builder_append_float(
+    context: *mut ExecutionContext,
+    builder: *mut AsterStringBuilder,
+    value: f32,
+) -> i8 {
+    if context.is_null() {
+        return 0;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let Some(text) = crate::string::display_text(value) else {
+        context.fail("scalar formatting exceeded the runtime buffer");
+        return 0;
+    };
+    i8::from(context.string_builder_append_text(builder, text.as_str()))
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_builder_append_bool(
+    context: *mut ExecutionContext,
+    builder: *mut AsterStringBuilder,
+    value: i8,
+) -> i8 {
+    if context.is_null() {
+        return 0;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let text = if value == 0 { "false" } else { "true" };
+    i8::from(context.string_builder_append_text(builder, text))
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_builder_append_char(
+    context: *mut ExecutionContext,
+    builder: *mut AsterStringBuilder,
+    value: u32,
+) -> i8 {
+    if context.is_null() {
+        return 0;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let Some(value) = char::from_u32(value) else {
+        context.fail("StringBuilder.Append received an invalid `char` value");
+        return 0;
+    };
+    let mut buffer = [0_u8; 4];
+    i8::from(context.string_builder_append_text(builder, value.encode_utf8(&mut buffer)))
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[must_use]
+pub extern "C" fn aster_rt_string_builder_length(
+    context: *mut ExecutionContext,
+    builder: *const AsterStringBuilder,
+) -> i32 {
+    if context.is_null() {
+        return 0;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    context.string_builder_length(builder)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_builder_clear(
+    context: *mut ExecutionContext,
+    builder: *mut AsterStringBuilder,
+) {
+    if context.is_null() {
+        return;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    context.string_builder_clear(builder);
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn aster_rt_string_builder_to_string(
     context: *mut ExecutionContext,
     builder: *const AsterStringBuilder,
@@ -3848,6 +4502,84 @@ pub extern "C" fn aster_rt_dictionary_length(
     unsafe {
         (*dictionary).length
     }
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_dictionary_capacity(
+    context: *mut ExecutionContext,
+    dictionary: *const AsterDictionary,
+) -> i32 {
+    if context.is_null() {
+        return 0;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    if context.error.is_some() || !context.validate_dictionary_header(dictionary) {
+        return 0;
+    }
+    #[allow(unsafe_code)]
+    unsafe {
+        (*dictionary).entry_capacity
+    }
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_dictionary_ensure_capacity(
+    context: *mut ExecutionContext,
+    dictionary: *mut AsterDictionary,
+    minimum: i32,
+) -> i32 {
+    if context.is_null() {
+        return 0;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    context
+        .dictionary_ensure_capacity(dictionary, minimum)
+        .unwrap_or(0)
+}
+
+#[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_dictionary_get_or(
+    context: *mut ExecutionContext,
+    dictionary: *mut AsterDictionary,
+    key_kind: i32,
+    key_size: i32,
+    key_align: i32,
+    key_type_key: i64,
+    value_size: i32,
+    value_align: i32,
+    value_type_key: i64,
+    key: *const u8,
+    supplied: *const u8,
+    destination: *mut u8,
+    add_missing: i8,
+) -> i8 {
+    if context.is_null() {
+        return 0;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let Some(key_kind) = DictionaryKeyKind::from_abi(key_kind) else {
+        context.fail("Dictionary.GetOr received invalid key metadata");
+        return 0;
+    };
+    #[allow(clippy::cast_sign_loss)]
+    let result = context.dictionary_get_or(
+        dictionary,
+        key_kind,
+        u32::try_from(key_size).unwrap_or(0),
+        u32::try_from(key_align).unwrap_or(0),
+        key_type_key as u64,
+        u32::try_from(value_size).unwrap_or(0),
+        u32::try_from(value_align).unwrap_or(0),
+        value_type_key as u64,
+        key,
+        supplied,
+        destination,
+        add_missing != 0,
+    );
+    i8::from(result)
 }
 
 #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
@@ -4465,6 +5197,106 @@ pub extern "C" fn aster_rt_list_to_array(
         expected_element_type_key as u64,
         temporary != 0,
     )
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_list_capacity(
+    context: *mut ExecutionContext,
+    list: *const AsterList,
+) -> i32 {
+    if context.is_null() {
+        return 0;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    context.list_capacity(list)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_list_ensure_capacity(
+    context: *mut ExecutionContext,
+    list: *mut AsterList,
+    minimum: i32,
+) -> i32 {
+    if context.is_null() {
+        return 0;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    context.list_reserve(list, minimum).unwrap_or(0)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_list_add_range(
+    context: *mut ExecutionContext,
+    list: *mut AsterList,
+    values: *const AsterArray,
+) -> i8 {
+    if context.is_null() {
+        return 0;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    i8::from(context.list_add_range(list, values))
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_list_insert(
+    context: *mut ExecutionContext,
+    list: *mut AsterList,
+    index: i32,
+    source_value_address: *const u8,
+) -> i8 {
+    if context.is_null() {
+        return 0;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    i8::from(context.list_insert(list, index, source_value_address))
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_list_remove_range(
+    context: *mut ExecutionContext,
+    list: *mut AsterList,
+    index: i32,
+    count: i32,
+) -> i8 {
+    if context.is_null() {
+        return 0;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    i8::from(context.list_remove_range(list, index, count))
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_list_reverse(
+    context: *mut ExecutionContext,
+    list: *mut AsterList,
+) -> i8 {
+    if context.is_null() {
+        return 0;
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    i8::from(context.list_reverse(list))
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_list_get_range(
+    context: *mut ExecutionContext,
+    list: *const AsterList,
+    index: i32,
+    count: i32,
+    temporary: i8,
+) -> *mut AsterArray {
+    if context.is_null() {
+        return ptr::null_mut();
+    }
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    context.list_get_range(list, index, count, temporary != 0)
 }
 
 #[cfg(test)]
@@ -7830,6 +8662,9 @@ mod tests {
         #[allow(unsafe_code)]
         let result = unsafe { crate::string::view(result) };
         assert_eq!(result, Some("Aá😀e\u{301}"));
+        assert_eq!(context.string_builder_length(builder), 5);
+        context.string_builder_clear(builder);
+        assert_eq!(context.string_builder_length(builder), 0);
         assert!(context.take_error().is_none());
     }
 

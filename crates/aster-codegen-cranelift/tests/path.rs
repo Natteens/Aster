@@ -1,13 +1,6 @@
-//! M2C (revised): `aster.io.CombinePath(string, string) -> Result<string,
-//! IOError>`, a purely lexical path-join operation. A nominal `Path` struct
-//! was attempted and removed: empirical audit showed structs support
-//! neither static nor instance methods on the Cranelift backend, and
-//! struct-literal construction requires every referenced field to be
-//! `public` (no same-namespace privilege), so a `Path` field would have
-//! been publicly writable -- unable to preserve "immutable, validated-only"
-//! as a real invariant. ASTER 1.0 therefore represents paths as plain
-//! `string`; `Path` is deferred until the language can build opaque,
-//! validated values without a public field.
+//! End-to-end path tests for the lexical `aster.io` helpers. Paths remain
+//! ordinary strings; the static `Path` class groups filename, directory, and
+//! extension operations without introducing a nominal path value.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -445,22 +438,22 @@ fn thousands_of_combine_path_calls_allocate_only_the_resulting_string_no_objects
     assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(15 * 5000)));
 }
 
-// --- Nominal-type regression: no aster.io.Path export ---------------------------
+// --- Static Path helper regression ----------------------------------------------
 
 #[test]
-fn no_official_path_type_is_exported_by_aster_io() {
-    // A user-declared `Path` (anywhere) must not collide with anything from
-    // `aster.io`: there is no official `aster.io::Path` symbol anymore.
-    let source = "using aster.core;\nusing aster.io;\n\
-        public struct Path { public string Value; }\n\
+fn official_path_helpers_are_exported_and_cannot_be_shadowed() {
+    let source = "using aster.io;\n\
         public int Main() {\n\
-            Path p = Path { Value: \"user-owned\" };\n\
-            switch (CombinePath(\"Data\", \"config.txt\")) {\n\
-                case Ok(text): return p.Value.Length + text.Length;\n\
-                case Error(e): return -1;\n\
-            }\n\
+            return Path.GetFileName(\"Data/config.txt\").Length;\n\
         }";
-    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(10 + 15)));
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(10)));
+
+    let collision = "using aster.io; public struct Path { public string Value; }";
+    assert!(
+        compile(collision)
+            .expect_err("the official Path helper class cannot be shadowed")
+            .contains("conflicts with the official export")
+    );
 }
 
 // --- Validation: MIR adulteration (reuses IOError's generic struct check) ------

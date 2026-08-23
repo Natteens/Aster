@@ -215,6 +215,39 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
             collect_expression(list, max);
             collect_expression(value, max);
         }
+        hir::ExpressionKind::ListEnsureCapacity { list, minimum } => {
+            collect_expression(list, max);
+            collect_expression(minimum, max);
+        }
+        hir::ExpressionKind::DictionaryEnsureCapacity {
+            dictionary,
+            minimum,
+        } => {
+            collect_expression(dictionary, max);
+            collect_expression(minimum, max);
+        }
+        hir::ExpressionKind::DictionaryGetOr {
+            dictionary,
+            key,
+            fallback,
+        } => {
+            collect_expression(dictionary, max);
+            collect_expression(key, max);
+            collect_expression(fallback, max);
+        }
+        hir::ExpressionKind::ListAddRange { list, values, .. } => {
+            collect_expression(list, max);
+            collect_expression(values, max);
+        }
+        hir::ExpressionKind::ListRemoveRange { list, index, count }
+        | hir::ExpressionKind::ListGetRange {
+            list, index, count, ..
+        } => {
+            collect_expression(list, max);
+            collect_expression(index, max);
+            collect_expression(count, max);
+        }
+        hir::ExpressionKind::ListReverse { list } => collect_expression(list, max),
         hir::ExpressionKind::StringBuilderAppend {
             builder,
             value,
@@ -227,6 +260,14 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
         hir::ExpressionKind::StringBuilderToString {
             builder,
             class_symbol,
+        }
+        | hir::ExpressionKind::StringBuilderLength {
+            builder,
+            class_symbol,
+        }
+        | hir::ExpressionKind::StringBuilderClear {
+            builder,
+            class_symbol,
         } => {
             note(max, *class_symbol);
             collect_expression(builder, max);
@@ -237,6 +278,11 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
             value,
         }
         | hir::ExpressionKind::DictionarySet {
+            dictionary,
+            key,
+            value,
+        }
+        | hir::ExpressionKind::DictionaryGetOrAdd {
             dictionary,
             key,
             value,
@@ -290,6 +336,7 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
             collect_expression(index, max);
         }
         hir::ExpressionKind::ListSet { list, index, value }
+        | hir::ExpressionKind::ListInsert { list, index, value }
         | hir::ExpressionKind::ListIndexAssignment {
             list, index, value, ..
         } => {
@@ -310,7 +357,9 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
         hir::ExpressionKind::ArrayLength(operand)
         | hir::ExpressionKind::StringLength(operand)
         | hir::ExpressionKind::ListLength(operand)
+        | hir::ExpressionKind::ListCapacity(operand)
         | hir::ExpressionKind::DictionaryLength(operand)
+        | hir::ExpressionKind::DictionaryCapacity(operand)
         | hir::ExpressionKind::Convert { operand }
         | hir::ExpressionKind::Unary { operand, .. } => {
             collect_expression(operand, max);

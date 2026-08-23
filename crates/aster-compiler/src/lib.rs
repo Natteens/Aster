@@ -22,10 +22,55 @@ mod standard_library;
 mod temporary_subregions;
 mod type_names;
 
-use std::path::Path;
+use std::{any::Any, path::Path};
 
-use aster_diagnostics::{Diagnostic, Severity};
+use aster_diagnostics::{Diagnostic, Severity, Span};
 use aster_syntax::{Module, Token, lex, parse};
+
+const COMPILER_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug)]
+pub(crate) enum CompilerWorkerError {
+    Spawn(std::io::Error),
+    Panic(String),
+}
+
+impl std::fmt::Display for CompilerWorkerError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(error) => write!(formatter, "could not start the compiler: {error}"),
+            Self::Panic(message) => write!(formatter, "the compiler panicked: {message}"),
+        }
+    }
+}
+
+/// Run one complete compiler entry point on the single centrally configured
+/// compiler stack. Callers must pass the inner implementation, never another
+/// public entry point, so project compilation cannot nest compiler workers.
+pub(crate) fn run_on_compiler_stack<T, F>(operation: F) -> Result<T, CompilerWorkerError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let worker = std::thread::Builder::new()
+        .name("aster-compiler".to_owned())
+        .stack_size(COMPILER_STACK_BYTES)
+        .spawn(operation)
+        .map_err(CompilerWorkerError::Spawn)?;
+    worker
+        .join()
+        .map_err(|payload| CompilerWorkerError::Panic(panic_payload_text(payload)))
+}
+
+fn panic_payload_text(payload: Box<dyn Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(message) => (*message).to_owned(),
+            Err(_) => "non-string panic payload".to_owned(),
+        },
+    }
+}
 
 pub use application::{ApplicationDiagnostic, ApplicationEntry, select_application_entry};
 pub use aster_hir as hir;
@@ -127,6 +172,24 @@ pub fn compile_without_array_loop_optimization_for_research(
 }
 
 fn compile_with_options(
+    source: &str,
+    rewrite_loop_string_concat: bool,
+    optimize_mir: bool,
+    optimize_array_loops: bool,
+) -> Result<Compilation, Vec<Diagnostic>> {
+    let source = source.to_owned();
+    run_on_compiler_stack(move || {
+        compile_with_options_inner(
+            &source,
+            rewrite_loop_string_concat,
+            optimize_mir,
+            optimize_array_loops,
+        )
+    })
+    .map_err(|error| vec![Diagnostic::error(error.to_string(), Span::default())])?
+}
+
+fn compile_with_options_inner(
     source: &str,
     rewrite_loop_string_concat: bool,
     optimize_mir: bool,
@@ -256,7 +319,7 @@ fn zero_defaults(type_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::compile;
+    use super::{CompilerWorkerError, compile, run_on_compiler_stack};
 
     #[test]
     fn old_ecs_syntax_is_a_controlled_diagnostic_not_a_silent_drop() {
@@ -265,5 +328,46 @@ mod tests {
         // silently accepted or dropped during lowering.
         let source = "component Position { float x; } system Bad(Position read) { foreach (position) { position.x += position.x; } }";
         assert!(compile(source).is_err());
+    }
+
+    #[test]
+    fn compiler_worker_preserves_string_panic_payloads() {
+        let error = run_on_compiler_stack(|| -> () { panic!("specific compiler failure") })
+            .expect_err("worker panic should be reported");
+        assert!(matches!(
+            error,
+            CompilerWorkerError::Panic(message) if message == "specific compiler failure"
+        ));
+    }
+
+    #[test]
+    fn repeated_compiler_entry_points_use_independent_workers() {
+        for _ in 0..32 {
+            let compilation = compile("public int Main() { return 42; }")
+                .expect("small compilation should succeed repeatedly");
+            assert!(!compilation.mir.functions.is_empty());
+        }
+    }
+
+    #[test]
+    fn concurrent_compiler_entry_points_are_independent() {
+        let workers = (0..8)
+            .map(|value| {
+                std::thread::spawn(move || {
+                    let source = format!("public int Main() {{ return {value}; }}");
+                    compile(&source).expect("independent compilation succeeds")
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            assert!(
+                !worker
+                    .join()
+                    .expect("test worker completes")
+                    .mir
+                    .functions
+                    .is_empty()
+            );
+        }
     }
 }

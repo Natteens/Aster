@@ -169,12 +169,29 @@ impl FunctionLowerer {
                 })
             }
             hir::Intrinsic::StringTrim
+            | hir::Intrinsic::StringLastIndexOf
+            | hir::Intrinsic::StringTrimStart
+            | hir::Intrinsic::StringTrimEnd
+            | hir::Intrinsic::StringJoinArray
+            | hir::Intrinsic::StringConcatArray
+            | hir::Intrinsic::StringRepeat
+            | hir::Intrinsic::StringToChars
+            | hir::Intrinsic::StringFromChars
             | hir::Intrinsic::StringReplace
             | hir::Intrinsic::StringSplit
             | hir::Intrinsic::MathUnaryFloat
             | hir::Intrinsic::MathUnaryDouble
+            | hir::Intrinsic::MathBinaryFloat
+            | hir::Intrinsic::MathBinaryDouble
+            | hir::Intrinsic::MathPredicateFloat
+            | hir::Intrinsic::MathPredicateDouble
             | hir::Intrinsic::MathPowFloat
-            | hir::Intrinsic::MathPowDouble => {
+            | hir::Intrinsic::MathPowDouble
+            | hir::Intrinsic::TimeMonotonicMilliseconds
+            | hir::Intrinsic::TimeUnixMilliseconds
+            | hir::Intrinsic::RandomMix
+            | hir::Intrinsic::StringBuilderLength
+            | hir::Intrinsic::StringBuilderClear => {
                 let arguments = arguments
                     .iter()
                     .map(|argument| {
@@ -232,6 +249,25 @@ impl FunctionLowerer {
                     kind: mir::OperandKind::Copy(destination),
                 })
             }
+            hir::Intrinsic::FileAppendAllText(layout) => {
+                let path = self
+                    .lower_expression(&arguments[0])
+                    .expect("validated append path");
+                let content = self
+                    .lower_expression(&arguments[1])
+                    .expect("validated append content");
+                let destination = mir::Place::Local(self.new_temporary(return_type.clone()));
+                self.instruction(mir::Instruction::CallIntrinsic {
+                    destination: Some(destination.clone()),
+                    intrinsic: mir::Intrinsic::FileAppendAllText(layout),
+                    arguments: vec![path, content],
+                    return_type: return_type.clone(),
+                });
+                Some(mir::Operand {
+                    type_: return_type.clone(),
+                    kind: mir::OperandKind::Copy(destination),
+                })
+            }
             hir::Intrinsic::FileListFiles(layout) => {
                 let directory = self
                     .lower_expression(&arguments[0])
@@ -242,6 +278,54 @@ impl FunctionLowerer {
                     destination: Some(destination.clone()),
                     intrinsic: mir::Intrinsic::FileListFiles(layout),
                     arguments: vec![directory],
+                    return_type: return_type.clone(),
+                });
+                Some(mir::Operand {
+                    type_: return_type.clone(),
+                    kind: mir::OperandKind::Copy(destination),
+                })
+            }
+            hir::Intrinsic::FileListDirectories(layout) => {
+                let directory = self
+                    .lower_expression(&arguments[0])
+                    .expect("validated directory path");
+                let destination = mir::Place::Local(self.new_temporary(return_type.clone()));
+                self.instruction(mir::Instruction::CallIntrinsic {
+                    destination: Some(destination.clone()),
+                    intrinsic: mir::Intrinsic::FileListDirectories(layout),
+                    arguments: vec![directory],
+                    return_type: return_type.clone(),
+                });
+                Some(mir::Operand {
+                    type_: return_type.clone(),
+                    kind: mir::OperandKind::Copy(destination),
+                })
+            }
+            hir::Intrinsic::FileExists(layout)
+            | hir::Intrinsic::DirectoryExists(layout)
+            | hir::Intrinsic::FileCreateDirectory(layout)
+            | hir::Intrinsic::FileDeleteFile(layout)
+            | hir::Intrinsic::FileDeleteDirectory(layout) => {
+                let path = self
+                    .lower_expression(&arguments[0])
+                    .expect("validated path");
+                let intrinsic = match intrinsic {
+                    hir::Intrinsic::FileExists(_) => mir::Intrinsic::FileExists(layout),
+                    hir::Intrinsic::DirectoryExists(_) => mir::Intrinsic::DirectoryExists(layout),
+                    hir::Intrinsic::FileCreateDirectory(_) => {
+                        mir::Intrinsic::FileCreateDirectory(layout)
+                    }
+                    hir::Intrinsic::FileDeleteFile(_) => mir::Intrinsic::FileDeleteFile(layout),
+                    hir::Intrinsic::FileDeleteDirectory(_) => {
+                        mir::Intrinsic::FileDeleteDirectory(layout)
+                    }
+                    _ => unreachable!(),
+                };
+                let destination = mir::Place::Local(self.new_temporary(return_type.clone()));
+                self.instruction(mir::Instruction::CallIntrinsic {
+                    destination: Some(destination.clone()),
+                    intrinsic,
+                    arguments: vec![path],
                     return_type: return_type.clone(),
                 });
                 Some(mir::Operand {

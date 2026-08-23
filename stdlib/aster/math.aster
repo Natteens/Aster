@@ -32,8 +32,20 @@ internal double __MathPowDouble(double value, double exponent)
     return value;
 }
 
+internal float __MathBinaryFloat(float left, float right, int operation) { return left; }
+internal double __MathBinaryDouble(double left, double right, int operation) { return left; }
+internal bool __MathPredicateFloat(float value, int operation) { return false; }
+internal bool __MathPredicateDouble(double value, int operation) { return false; }
+internal void __MathSignNaN() {}
+
 public static class Math
 {
+    public static float Abs(float value) { return value == 0.0f ? 0.0f : value < 0.0f ? -value : value; }
+    public static double Abs(double value) { return value == 0.0d ? 0.0d : value < 0.0d ? -value : value; }
+    public static double Pi() { return 3.141592653589793d; }
+    public static double Tau() { return 6.283185307179586d; }
+    public static double E() { return 2.718281828459045d; }
+
     public static float Sqrt(float value) { return __MathUnaryFloat(value, 0); }
     public static double Sqrt(double value) { return __MathUnaryDouble(value, 0); }
     public static float Floor(float value) { return __MathUnaryFloat(value, 1); }
@@ -48,8 +60,61 @@ public static class Math
     public static double Cos(double value) { return __MathUnaryDouble(value, 5); }
     public static float Tan(float value) { return __MathUnaryFloat(value, 6); }
     public static double Tan(double value) { return __MathUnaryDouble(value, 6); }
+    public static float Truncate(float value) { return __MathUnaryFloat(value, 7); }
+    public static double Truncate(double value) { return __MathUnaryDouble(value, 7); }
+    public static float Exp(float value) { return __MathUnaryFloat(value, 8); }
+    public static double Exp(double value) { return __MathUnaryDouble(value, 8); }
+    public static float Log(float value) { return __MathUnaryFloat(value, 9); }
+    public static double Log(double value) { return __MathUnaryDouble(value, 9); }
+    public static float Log2(float value) { return __MathUnaryFloat(value, 10); }
+    public static double Log2(double value) { return __MathUnaryDouble(value, 10); }
+    public static float Log10(float value) { return __MathUnaryFloat(value, 11); }
+    public static double Log10(double value) { return __MathUnaryDouble(value, 11); }
+    public static float Asin(float value) { return __MathUnaryFloat(value, 12); }
+    public static double Asin(double value) { return __MathUnaryDouble(value, 12); }
+    public static float Acos(float value) { return __MathUnaryFloat(value, 13); }
+    public static double Acos(double value) { return __MathUnaryDouble(value, 13); }
+    public static float Atan(float value) { return __MathUnaryFloat(value, 14); }
+    public static double Atan(double value) { return __MathUnaryDouble(value, 14); }
+    public static float Sinh(float value) { return __MathUnaryFloat(value, 15); }
+    public static double Sinh(double value) { return __MathUnaryDouble(value, 15); }
+    public static float Cosh(float value) { return __MathUnaryFloat(value, 16); }
+    public static double Cosh(double value) { return __MathUnaryDouble(value, 16); }
+    public static float Tanh(float value) { return __MathUnaryFloat(value, 17); }
+    public static double Tanh(double value) { return __MathUnaryDouble(value, 17); }
+    public static float Atan2(float y, float x) { return __MathBinaryFloat(y, x, 0); }
+    public static double Atan2(double y, double x) { return __MathBinaryDouble(y, x, 0); }
     public static float Pow(float value, float exponent) { return __MathPowFloat(value, exponent); }
     public static double Pow(double value, double exponent) { return __MathPowDouble(value, exponent); }
+
+    public static int Sign(sbyte value) { return value < 0 ? -1 : (value > 0 ? 1 : 0); }
+    public static int Sign(short value) { return value < 0 ? -1 : (value > 0 ? 1 : 0); }
+    public static int Sign(int value) { return value < 0 ? -1 : (value > 0 ? 1 : 0); }
+    public static int Sign(long value) { return value < 0L ? -1 : (value > 0L ? 1 : 0); }
+    public static int Sign(float value)
+    {
+        if (value != value) { __MathSignNaN(); return 0; }
+        return value < 0.0f ? -1 : (value > 0.0f ? 1 : 0);
+    }
+    public static int Sign(double value)
+    {
+        if (value != value) { __MathSignNaN(); return 0; }
+        return value < 0.0d ? -1 : (value > 0.0d ? 1 : 0);
+    }
+
+    public static bool IsNaN(float value) { return __MathPredicateFloat(value, 0); }
+    public static bool IsNaN(double value) { return __MathPredicateDouble(value, 0); }
+    public static bool IsInfinity(float value) { return __MathPredicateFloat(value, 1); }
+    public static bool IsInfinity(double value) { return __MathPredicateDouble(value, 1); }
+    public static bool IsFinite(float value) { return __MathPredicateFloat(value, 2); }
+    public static bool IsFinite(double value) { return __MathPredicateDouble(value, 2); }
+
+    public static float Lerp(float start, float end, float amount) { return start + (end - start) * amount; }
+    public static double Lerp(double start, double end, double amount) { return start + (end - start) * amount; }
+    public static float DegreesToRadians(float value) { return value * 0.017453292519943295f; }
+    public static double DegreesToRadians(double value) { return value * 0.017453292519943295d; }
+    public static float RadiansToDegrees(float value) { return value * 57.29577951308232f; }
+    public static double RadiansToDegrees(double value) { return value * 57.29577951308232d; }
 
     public static int Abs(int value)
     {

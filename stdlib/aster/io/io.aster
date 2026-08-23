@@ -1,6 +1,8 @@
 namespace aster.io;
 
 using aster.core;
+using aster.collections;
+using aster.text;
 
 /// Portable, stable categories reported by host-managed filesystem operations.
 public enum IOErrorKind
@@ -131,6 +133,113 @@ public Result<int, IOError> WriteAllText(string path, string content)
 public Result<string[], IOError> ListFiles(string directory)
 {
     return Result<string[], IOError>.Error(IOError { Kind: IOErrorKind.Other, OsCode: 0 });
+}
+
+public Result<string[], IOError> ReadAllLines(string path)
+{
+    switch (ReadAllText(path))
+    {
+        case Ok(text):
+            if (text.Length == 0) { return Result<string[], IOError>.Ok([]); }
+            string[] split = String.Split(text, "\n");
+            int count = split.Length;
+            if (count > 0 && split[count - 1].Length == 0) { count--; }
+            List<string> lines = new List<string>();
+            lines.EnsureCapacity(count);
+            for (int index = 0; index < count; index++)
+            {
+                string line = split[index];
+                if (line.EndsWith("\r")) { line = line.Substring(0, line.Length - 1); }
+                lines.Add(line);
+            }
+            return Result<string[], IOError>.Ok(lines.ToArray());
+        case Error(error):
+            return Result<string[], IOError>.Error(error);
+    }
+}
+
+public Result<int, IOError> WriteAllLines(string path, string[] lines)
+{
+    return WriteAllText(path, String.Join("\n", lines));
+}
+
+public Result<int, IOError> AppendAllText(string path, string text)
+{
+    return Result<int, IOError>.Error(IOError { Kind: IOErrorKind.Other, OsCode: 0 });
+}
+
+public Result<string[], IOError> ListDirectories(string directory)
+{
+    return Result<string[], IOError>.Error(IOError { Kind: IOErrorKind.Other, OsCode: 0 });
+}
+
+public Result<bool, IOError> FileExists(string path)
+{
+    return Result<bool, IOError>.Error(IOError { Kind: IOErrorKind.Other, OsCode: 0 });
+}
+
+public Result<bool, IOError> DirectoryExists(string path)
+{
+    return Result<bool, IOError>.Error(IOError { Kind: IOErrorKind.Other, OsCode: 0 });
+}
+
+public Result<bool, IOError> CreateDirectory(string path)
+{
+    return Result<bool, IOError>.Error(IOError { Kind: IOErrorKind.Other, OsCode: 0 });
+}
+
+public Result<bool, IOError> DeleteFile(string path)
+{
+    return Result<bool, IOError>.Error(IOError { Kind: IOErrorKind.Other, OsCode: 0 });
+}
+
+public Result<bool, IOError> DeleteDirectory(string path)
+{
+    return Result<bool, IOError>.Error(IOError { Kind: IOErrorKind.Other, OsCode: 0 });
+}
+
+public static class Path
+{
+    internal static int LastSeparator(string path)
+    {
+        int result = -1;
+        switch (String.LastIndexOf(path, "/")) { case Some(index): result = index; case None: result = result; }
+        switch (String.LastIndexOf(path, "\\")) { case Some(index): if (index > result) { result = index; } case None: result = result; }
+        return result;
+    }
+
+    public static string GetFileName(string path)
+    {
+        int separator = LastSeparator(path);
+        if (separator < 0) { return path; }
+        return path.Substring(separator + 1);
+    }
+
+    public static string GetDirectoryName(string path)
+    {
+        int separator = LastSeparator(path);
+        if (separator < 0) { return ""; }
+        if (separator == 0) { return path.Substring(0, 1); }
+        return path.Substring(0, separator);
+    }
+
+    public static string GetExtension(string path)
+    {
+        string name = GetFileName(path);
+        int dot = -1;
+        switch (String.LastIndexOf(name, ".")) { case Some(index): dot = index; case None: dot = dot; }
+        if (dot <= 0) { return ""; }
+        return name.Substring(dot);
+    }
+
+    public static string ChangeExtension(string path, string extension)
+    {
+        string current = GetExtension(path);
+        string prefix = current.Length == 0 ? path : path.Substring(0, path.Length - current.Length);
+        if (extension.Length == 0) { return prefix; }
+        if (extension.StartsWith(".")) { return prefix + extension; }
+        return prefix + "." + extension;
+    }
 }
 
 public void Write(string value)

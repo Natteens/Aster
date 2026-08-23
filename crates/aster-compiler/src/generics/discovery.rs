@@ -11,8 +11,13 @@ use super::{
 /// best-effort textual tracking (e.g. `helper().TryParseInt()`); the real
 /// receiver-type gate is semantic analysis's `receiver == Type::String`
 /// check, not this discovery pass.
-const TRY_PARSE_TARGETS: [(&str, &str); 7] = [
+const TRY_PARSE_TARGETS: [(&str, &str); 12] = [
     ("TryParseBool", "bool"),
+    ("TryParseChar", "char"),
+    ("TryParseSByte", "sbyte"),
+    ("TryParseByte", "byte"),
+    ("TryParseShort", "short"),
+    ("TryParseUShort", "ushort"),
     ("TryParseInt", "int"),
     ("TryParseUInt", "uint"),
     ("TryParseLong", "long"),

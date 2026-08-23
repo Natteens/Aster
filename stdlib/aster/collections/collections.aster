@@ -5,3 +5,58 @@ public struct DictionaryEntry<K, V>
     public K Key;
     public V Value;
 }
+
+internal void __CollectionRangeError() {}
+
+public static class Array
+{
+    public static T[] Copy<T>(T[] source)
+    {
+        List<T> values = new List<T>();
+        values.AddRange(source);
+        return values.ToArray();
+    }
+
+    public static void CopyRange<T>(T[] source, int sourceIndex, T[] destination, int destinationIndex, int count)
+    {
+        if (sourceIndex < 0 || destinationIndex < 0 || count < 0
+            || sourceIndex > source.Length - count
+            || destinationIndex > destination.Length - count)
+        {
+            __CollectionRangeError();
+            return;
+        }
+        if (count == 0) { return; }
+        if (source == destination && destinationIndex > sourceIndex && destinationIndex < sourceIndex + count)
+        {
+            for (int offset = count - 1; offset >= 0; offset--)
+            {
+                destination[destinationIndex + offset] = source[sourceIndex + offset];
+            }
+            return;
+        }
+        for (int offset = 0; offset < count; offset++)
+        {
+            destination[destinationIndex + offset] = source[sourceIndex + offset];
+        }
+    }
+
+    public static void Fill<T>(T[] values, T value)
+    {
+        for (int index = 0; index < values.Length; index++) { values[index] = value; }
+    }
+
+    public static void Reverse<T>(T[] values)
+    {
+        int left = 0;
+        int right = values.Length - 1;
+        while (left < right)
+        {
+            T value = values[left];
+            values[left] = values[right];
+            values[right] = value;
+            left++;
+            right--;
+        }
+    }
+}

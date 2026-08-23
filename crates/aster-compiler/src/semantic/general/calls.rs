@@ -257,7 +257,7 @@ impl Analyzer<'_> {
             return Type::Unknown;
         }
         if matches!(object_type, Type::List(_)) {
-            if name == "Length" {
+            if matches!(name, "Length" | "Capacity") {
                 return Type::Int;
             }
             self.diagnostics.push(Diagnostic::error(
@@ -267,7 +267,7 @@ impl Analyzer<'_> {
             return Type::Unknown;
         }
         if matches!(object_type, Type::Dictionary(_, _)) {
-            if name == "Length" {
+            if matches!(name, "Length" | "Capacity") {
                 return Type::Int;
             }
             self.diagnostics.push(Diagnostic::error(
@@ -717,6 +717,94 @@ impl Analyzer<'_> {
                             }
                             return Type::Array(element_type.clone());
                         }
+                        if name == "EnsureCapacity" {
+                            if arguments.len() != 1
+                                || !matches!(
+                                    argument_types.first(),
+                                    Some(Type::Int | Type::Unknown)
+                                )
+                            {
+                                self.diagnostics.push(Diagnostic::error(
+                                    "`List<T>.EnsureCapacity` expects one `int` argument",
+                                    span,
+                                ));
+                                return Type::Unknown;
+                            }
+                            return Type::Int;
+                        }
+                        if name == "AddRange" {
+                            if arguments.len() != 1
+                                || !matches!(argument_types.first(), Some(Type::Array(found)) if found.as_ref() == element_type.as_ref())
+                            {
+                                self.diagnostics.push(Diagnostic::error(
+                                    format!(
+                                        "`List<T>.AddRange` expects one `{}[]` argument",
+                                        element_type.display()
+                                    ),
+                                    span,
+                                ));
+                                return Type::Unknown;
+                            }
+                            return Type::Void;
+                        }
+                        if name == "Insert" {
+                            if arguments.len() != 2
+                                || !matches!(
+                                    argument_types.first(),
+                                    Some(Type::Int | Type::Unknown)
+                                )
+                            {
+                                self.diagnostics.push(Diagnostic::error(
+                                    "`List<T>.Insert` expects an `int` index and one element",
+                                    span,
+                                ));
+                                return Type::Unknown;
+                            }
+                            self.require_assignable_value(
+                                element_type,
+                                &argument_types[1],
+                                &arguments[1],
+                            );
+                            return Type::Void;
+                        }
+                        if name == "RemoveRange" {
+                            if arguments.len() != 2
+                                || !argument_types
+                                    .iter()
+                                    .all(|type_| matches!(type_, Type::Int | Type::Unknown))
+                            {
+                                self.diagnostics.push(Diagnostic::error(
+                                    "`List<T>.RemoveRange` expects `int` index and count arguments",
+                                    span,
+                                ));
+                                return Type::Unknown;
+                            }
+                            return Type::Void;
+                        }
+                        if name == "Reverse" {
+                            if !arguments.is_empty() {
+                                self.diagnostics.push(Diagnostic::error(
+                                    "`List<T>.Reverse` expects 0 arguments",
+                                    span,
+                                ));
+                                return Type::Unknown;
+                            }
+                            return Type::Void;
+                        }
+                        if name == "GetRange" {
+                            if arguments.len() != 2
+                                || !argument_types
+                                    .iter()
+                                    .all(|type_| matches!(type_, Type::Int | Type::Unknown))
+                            {
+                                self.diagnostics.push(Diagnostic::error(
+                                    "`List<T>.GetRange` expects `int` index and count arguments",
+                                    span,
+                                ));
+                                return Type::Unknown;
+                            }
+                            return Type::Array(element_type.clone());
+                        }
                         self.diagnostics.push(Diagnostic::error(
                             format!("list has no member `{name}`"),
                             callee.span,
@@ -725,8 +813,8 @@ impl Analyzer<'_> {
                     }
                     if let Type::Dictionary(key_type, value_type) = &receiver {
                         let expected_arity = match name.as_str() {
-                            "Add" | "Set" => Some(2),
-                            "TryGet" | "ContainsKey" | "Remove" => Some(1),
+                            "Add" | "Set" | "GetOr" | "GetOrAdd" => Some(2),
+                            "TryGet" | "ContainsKey" | "Remove" | "EnsureCapacity" => Some(1),
                             "Entries" | "Clear" | "Keys" | "Values" => Some(0),
                             _ => None,
                         };
@@ -748,12 +836,38 @@ impl Analyzer<'_> {
                             return Type::Unknown;
                         }
                         if let Some(argument) = arguments.first() {
-                            self.require_assignable_value(key_type, &argument_types[0], argument);
+                            if name == "EnsureCapacity" {
+                                self.require_assignable_value(
+                                    &Type::Int,
+                                    &argument_types[0],
+                                    argument,
+                                );
+                            } else {
+                                self.require_assignable_value(
+                                    key_type,
+                                    &argument_types[0],
+                                    argument,
+                                );
+                            }
                         }
                         if let Some(argument) = arguments.get(1) {
                             self.require_assignable_value(value_type, &argument_types[1], argument);
                         }
                         match name.as_str() {
+                            "EnsureCapacity" => {
+                                self.model.dictionary_operations.insert(
+                                    self.model_key(span),
+                                    ResolvedDictionaryOperation::Basic,
+                                );
+                                return Type::Int;
+                            }
+                            "GetOr" | "GetOrAdd" => {
+                                self.model.dictionary_operations.insert(
+                                    self.model_key(span),
+                                    ResolvedDictionaryOperation::Basic,
+                                );
+                                return (**value_type).clone();
+                            }
                             "Add" | "Set" | "ContainsKey" | "Remove" => {
                                 self.model.dictionary_operations.insert(
                                     self.model_key(span),
@@ -941,8 +1055,28 @@ impl Analyzer<'_> {
         }
         if callable_key.owner.as_deref() == Some(crate::standard_library::STRING_BUILDER_NAME) {
             let operation = match callable_key.name.as_str() {
-                "Append" => Some(ResolvedStringBuilderOperation::Append),
+                "Append"
+                    if matches!(
+                        callable.signature.parameters.as_slice(),
+                        [Type::String
+                            | Type::Bool
+                            | Type::Char
+                            | Type::SByte
+                            | Type::Byte
+                            | Type::Short
+                            | Type::UShort
+                            | Type::Int
+                            | Type::UInt
+                            | Type::Long
+                            | Type::ULong
+                            | Type::Float
+                            | Type::Double]
+                    ) =>
+                {
+                    Some(ResolvedStringBuilderOperation::Append)
+                }
                 "ToString" => Some(ResolvedStringBuilderOperation::ToString),
+                "Clear" => Some(ResolvedStringBuilderOperation::Clear),
                 _ => None,
             };
             if let Some(operation) = operation {
@@ -1033,16 +1167,18 @@ impl Analyzer<'_> {
                 return Type::Unknown;
             }
             (
-                "TryParseBool" | "TryParseInt" | "TryParseUInt" | "TryParseLong" | "TryParseULong"
-                | "TryParseFloat" | "TryParseDouble",
+                "TryParseBool" | "TryParseChar" | "TryParseSByte" | "TryParseByte"
+                | "TryParseShort" | "TryParseUShort" | "TryParseInt" | "TryParseUInt"
+                | "TryParseLong" | "TryParseULong" | "TryParseFloat" | "TryParseDouble",
                 0,
             ) => match self.try_parse_operation(name, span) {
                 Some(result) => result,
                 None => return Type::Unknown,
             },
             (
-                "TryParseBool" | "TryParseInt" | "TryParseUInt" | "TryParseLong" | "TryParseULong"
-                | "TryParseFloat" | "TryParseDouble",
+                "TryParseBool" | "TryParseChar" | "TryParseSByte" | "TryParseByte"
+                | "TryParseShort" | "TryParseUShort" | "TryParseInt" | "TryParseUInt"
+                | "TryParseLong" | "TryParseULong" | "TryParseFloat" | "TryParseDouble",
                 found,
             ) => {
                 self.diagnostics.push(Diagnostic::error(
@@ -1095,6 +1231,11 @@ impl Analyzer<'_> {
     ) -> Option<(StringOperation, Vec<Type>, Type)> {
         let operation = match name {
             "TryParseBool" => StringOperation::TryParseBool,
+            "TryParseChar" => StringOperation::TryParseChar,
+            "TryParseSByte" => StringOperation::TryParseSByte,
+            "TryParseByte" => StringOperation::TryParseByte,
+            "TryParseShort" => StringOperation::TryParseShort,
+            "TryParseUShort" => StringOperation::TryParseUShort,
             "TryParseInt" => StringOperation::TryParseInt,
             "TryParseUInt" => StringOperation::TryParseUInt,
             "TryParseLong" => StringOperation::TryParseLong,

@@ -448,14 +448,50 @@ pub enum Intrinsic {
     StringSubstringRangeTemporary,
     StringTrim,
     StringTrimTemporary,
+    StringLastIndexOf,
+    StringTrimStart,
+    StringTrimStartTemporary,
+    StringTrimEnd,
+    StringTrimEndTemporary,
+    StringJoinArray,
+    StringJoinArrayTemporary,
+    StringConcatArray,
+    StringConcatArrayTemporary,
+    StringRepeat,
+    StringRepeatTemporary,
+    StringToChars,
+    StringToCharsTemporary,
+    StringFromChars,
+    StringFromCharsTemporary,
+    StringBuilderLength,
+    StringBuilderClear,
+    ListCapacity,
+    DictionaryCapacity,
+    DictionaryEnsureCapacity,
+    DictionaryGetOr,
+    DictionaryGetOrAdd,
+    ListEnsureCapacity,
+    ListAddRange,
+    ListInsert,
+    ListRemoveRange,
+    ListReverse,
+    ListGetRange,
+    ListGetRangeTemporary,
     StringReplace,
     StringReplaceTemporary,
     StringSplit,
     StringSplitTemporary,
     MathUnaryFloat,
     MathUnaryDouble,
+    MathBinaryFloat,
+    MathBinaryDouble,
+    MathPredicateFloat,
+    MathPredicateDouble,
     MathPowFloat,
     MathPowDouble,
+    TimeMonotonicMilliseconds,
+    TimeUnixMilliseconds,
+    RandomMix,
     /// Convert a signed integer (widened to `long`) to a `string`.
     StringFromLong,
     StringFromLongTemporary,
@@ -547,6 +583,11 @@ pub enum Intrinsic {
     /// success, payload) directly into the destination; never returns a bare
     /// scalar or a partially-initialized enum.
     StringTryParseBool,
+    StringTryParseChar,
+    StringTryParseSByte,
+    StringTryParseByte,
+    StringTryParseShort,
+    StringTryParseUShort,
     StringTryParseInt,
     StringTryParseUInt,
     StringTryParseLong,
@@ -582,17 +623,26 @@ pub enum Intrinsic {
     /// the `Result<int, IOError>` specialization (bytes written on success).
     /// No string escapes this intrinsic, so it has no temporary counterpart.
     FileWriteAllText(FileIoResultLayout),
+    FileAppendAllText(FileIoResultLayout),
     /// `aster.io.ListFiles(string)`: lists direct regular-file paths through
     /// the host filesystem backend. Both the returned `string[]` and every
     /// contained string are allocated in this single selected region.
     FileListFiles(FileIoResultLayout),
     /// Temporary-arena counterpart of [`Self::FileListFiles`].
     FileListFilesTemporary(FileIoResultLayout),
+    FileListDirectories(FileIoResultLayout),
+    FileListDirectoriesTemporary(FileIoResultLayout),
+    FileExists(FileIoResultLayout),
+    DirectoryExists(FileIoResultLayout),
+    FileCreateDirectory(FileIoResultLayout),
+    FileDeleteFile(FileIoResultLayout),
+    FileDeleteDirectory(FileIoResultLayout),
 }
 
 impl Intrinsic {
     /// Region carried by intrinsics that create a dynamic string.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub const fn string_allocation_region(self) -> Option<AllocationRegion> {
         match self {
             Self::StringConcat
@@ -606,10 +656,19 @@ impl Intrinsic {
             | Self::StringSubstringFrom
             | Self::StringSubstringRange
             | Self::StringTrim
+            | Self::StringTrimStart
+            | Self::StringTrimEnd
+            | Self::StringJoinArray
+            | Self::StringConcatArray
+            | Self::StringRepeat
+            | Self::StringToChars
+            | Self::StringFromChars
             | Self::StringReplace
             | Self::StringSplit
             | Self::ConsoleReadLine
-            | Self::FileReadAllText(_) => Some(AllocationRegion::Persistent),
+            | Self::FileReadAllText(_)
+            | Self::FileListDirectories(_)
+            | Self::ListGetRange => Some(AllocationRegion::Persistent),
             Self::StringConcatTemporary
             | Self::StringFromLongTemporary
             | Self::StringFromULongTemporary
@@ -621,10 +680,19 @@ impl Intrinsic {
             | Self::StringSubstringFromTemporary
             | Self::StringSubstringRangeTemporary
             | Self::StringTrimTemporary
+            | Self::StringTrimStartTemporary
+            | Self::StringTrimEndTemporary
+            | Self::StringJoinArrayTemporary
+            | Self::StringConcatArrayTemporary
+            | Self::StringRepeatTemporary
+            | Self::StringToCharsTemporary
+            | Self::StringFromCharsTemporary
             | Self::StringReplaceTemporary
             | Self::StringSplitTemporary
             | Self::ConsoleReadLineTemporary
-            | Self::FileReadAllTextTemporary(_) => Some(AllocationRegion::Temporary),
+            | Self::FileReadAllTextTemporary(_)
+            | Self::FileListDirectoriesTemporary(_)
+            | Self::ListGetRangeTemporary => Some(AllocationRegion::Temporary),
             Self::Log
             | Self::LogWarning
             | Self::LogError
@@ -634,10 +702,30 @@ impl Intrinsic {
             | Self::StringStartsWith
             | Self::StringEndsWith
             | Self::StringIndexOf
+            | Self::StringLastIndexOf
             | Self::MathUnaryFloat
             | Self::MathUnaryDouble
+            | Self::MathBinaryFloat
+            | Self::MathBinaryDouble
+            | Self::MathPredicateFloat
+            | Self::MathPredicateDouble
             | Self::MathPowFloat
             | Self::MathPowDouble
+            | Self::TimeMonotonicMilliseconds
+            | Self::TimeUnixMilliseconds
+            | Self::RandomMix
+            | Self::StringBuilderLength
+            | Self::StringBuilderClear
+            | Self::ListCapacity
+            | Self::DictionaryCapacity
+            | Self::DictionaryEnsureCapacity
+            | Self::DictionaryGetOr
+            | Self::DictionaryGetOrAdd
+            | Self::ListEnsureCapacity
+            | Self::ListAddRange
+            | Self::ListInsert
+            | Self::ListRemoveRange
+            | Self::ListReverse
             | Self::ReportRuntimeError(_)
             | Self::AssertionEqual
             | Self::ListVersionMismatch
@@ -658,6 +746,11 @@ impl Intrinsic {
             | Self::ParallelForEach
             | Self::ParallelReduce
             | Self::StringTryParseBool
+            | Self::StringTryParseChar
+            | Self::StringTryParseSByte
+            | Self::StringTryParseByte
+            | Self::StringTryParseShort
+            | Self::StringTryParseUShort
             | Self::StringTryParseInt
             | Self::StringTryParseUInt
             | Self::StringTryParseLong
@@ -667,6 +760,12 @@ impl Intrinsic {
             | Self::ConsoleWrite
             | Self::ConsoleWriteLine
             | Self::FileWriteAllText(_)
+            | Self::FileAppendAllText(_)
+            | Self::FileExists(_)
+            | Self::DirectoryExists(_)
+            | Self::FileCreateDirectory(_)
+            | Self::FileDeleteFile(_)
+            | Self::FileDeleteDirectory(_)
             | Self::FileListFiles(_)
             | Self::FileListFilesTemporary(_) => None,
         }
@@ -768,6 +867,62 @@ impl Intrinsic {
             (Self::StringTrim | Self::StringTrimTemporary, AllocationRegion::Temporary) => {
                 Self::StringTrimTemporary
             }
+            (
+                Self::StringTrimStart | Self::StringTrimStartTemporary,
+                AllocationRegion::Persistent,
+            ) => Self::StringTrimStart,
+            (
+                Self::StringTrimStart | Self::StringTrimStartTemporary,
+                AllocationRegion::Temporary,
+            ) => Self::StringTrimStartTemporary,
+            (Self::StringTrimEnd | Self::StringTrimEndTemporary, AllocationRegion::Persistent) => {
+                Self::StringTrimEnd
+            }
+            (Self::StringTrimEnd | Self::StringTrimEndTemporary, AllocationRegion::Temporary) => {
+                Self::StringTrimEndTemporary
+            }
+            (
+                Self::StringJoinArray | Self::StringJoinArrayTemporary,
+                AllocationRegion::Persistent,
+            ) => Self::StringJoinArray,
+            (
+                Self::StringJoinArray | Self::StringJoinArrayTemporary,
+                AllocationRegion::Temporary,
+            ) => Self::StringJoinArrayTemporary,
+            (
+                Self::StringConcatArray | Self::StringConcatArrayTemporary,
+                AllocationRegion::Persistent,
+            ) => Self::StringConcatArray,
+            (
+                Self::StringConcatArray | Self::StringConcatArrayTemporary,
+                AllocationRegion::Temporary,
+            ) => Self::StringConcatArrayTemporary,
+            (Self::StringRepeat | Self::StringRepeatTemporary, AllocationRegion::Persistent) => {
+                Self::StringRepeat
+            }
+            (Self::StringRepeat | Self::StringRepeatTemporary, AllocationRegion::Temporary) => {
+                Self::StringRepeatTemporary
+            }
+            (Self::StringToChars | Self::StringToCharsTemporary, AllocationRegion::Persistent) => {
+                Self::StringToChars
+            }
+            (Self::StringToChars | Self::StringToCharsTemporary, AllocationRegion::Temporary) => {
+                Self::StringToCharsTemporary
+            }
+            (
+                Self::StringFromChars | Self::StringFromCharsTemporary,
+                AllocationRegion::Persistent,
+            ) => Self::StringFromChars,
+            (
+                Self::StringFromChars | Self::StringFromCharsTemporary,
+                AllocationRegion::Temporary,
+            ) => Self::StringFromCharsTemporary,
+            (Self::ListGetRange | Self::ListGetRangeTemporary, AllocationRegion::Persistent) => {
+                Self::ListGetRange
+            }
+            (Self::ListGetRange | Self::ListGetRangeTemporary, AllocationRegion::Temporary) => {
+                Self::ListGetRangeTemporary
+            }
             (Self::StringReplace | Self::StringReplaceTemporary, AllocationRegion::Persistent) => {
                 Self::StringReplace
             }
@@ -812,6 +967,14 @@ impl Intrinsic {
                 Self::FileListFiles(layout) | Self::FileListFilesTemporary(layout),
                 AllocationRegion::Temporary,
             ) => Self::FileListFilesTemporary(layout),
+            (
+                Self::FileListDirectories(layout) | Self::FileListDirectoriesTemporary(layout),
+                AllocationRegion::Persistent,
+            ) => Self::FileListDirectories(layout),
+            (
+                Self::FileListDirectories(layout) | Self::FileListDirectoriesTemporary(layout),
+                AllocationRegion::Temporary,
+            ) => Self::FileListDirectoriesTemporary(layout),
             _ => self.with_string_allocation_region(region),
         }
     }
@@ -825,6 +988,9 @@ pub enum RuntimeErrorKind {
     AssertionTrue,
     AssertionFalse,
     AssertionEqual,
+    MathSignNaN,
+    CollectionRange,
+    RandomInvalidRange,
 }
 
 #[derive(Clone, Debug, PartialEq)]

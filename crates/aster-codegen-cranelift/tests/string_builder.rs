@@ -43,6 +43,7 @@ fn empty_append_alias_snapshot_and_unicode_semantics() {
             if (first != "Aá") { return 1; }
             if (second != "Aá😀é") { return 2; }
             if (second.Length != 5) { return 3; }
+            if (a.Length != 5 || b.Length != 5) { return 6; }
             int count = 0;
             foreach (char value in second) { count += 1; }
             return count == 5 ? 42 : 4;
@@ -85,8 +86,8 @@ fn public_surface_rejects_wrong_constructor_and_method_shapes() {
             "too many arguments for this callable",
         ),
         (
-            "StringBuilder builder = new StringBuilder(); builder.Append(1); return 0;",
-            "expected `string`, found `int`",
+            "StringBuilder builder = new StringBuilder(); builder.Append(builder); return 0;",
+            "no overload of `Append` accepts",
         ),
         (
             "StringBuilder builder = new StringBuilder(); builder.ToString(\"x\"); return 0;",
@@ -148,6 +149,24 @@ fn many_small_appends_use_geometric_storage() {
     assert_eq!(stats.string_allocations, 1);
     assert!(stats.total_allocations < 32);
     assert!(stats.requested_bytes < 100_000);
+}
+
+#[test]
+fn scalar_appends_share_exact_locale_independent_formatting() {
+    let source = r#"
+        using aster.core;
+        public int Main() {
+            StringBuilder builder = new StringBuilder();
+            builder.Append(-9223372036854775807L - 1L); builder.Append('|');
+            builder.Append(18446744073709551615UL); builder.Append('|');
+            builder.Append('🙂'); builder.Append('|');
+            builder.Append(false); builder.Append('|');
+            builder.Append(-0.0f); builder.Append('|');
+            builder.Append(0.1d);
+            return builder.ToString() == "-9223372036854775808|18446744073709551615|🙂|false|-0|0.1" ? 42 : 0;
+        }
+    "#;
+    assert_eq!(run(source), Ok(ExecutionValue::Int(42)));
 }
 
 #[test]

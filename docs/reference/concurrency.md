@@ -99,6 +99,11 @@ host-resource boundary. No ASTER object graph, collection backing, interface tab
 pointer crosses workers. Non-transferable values may be created and consumed entirely inside one
 worker when they do not escape or reach a prohibited operation.
 
+Terminal, filesystem, foreign, and clock intrinsics are host operations and are rejected when
+directly or transitively reachable from worker bodies. Pure text, math, parsing, array, and seeded
+random algorithms remain usable inside a worker when their values satisfy the existing type rules.
+Mutable `Random`, `StringBuilder`, `List`, and `Dictionary` instances are not transferable.
+
 There is no public thread handle, shared-memory synchronization, user-visible atomic, cancellation
 token hierarchy, closure/delegate capture, forced thread termination, implicit parallelization, or
 general nested task graph.

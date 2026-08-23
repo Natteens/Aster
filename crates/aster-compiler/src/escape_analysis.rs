@@ -879,6 +879,11 @@ fn instruction_escape(
                     | mir::Intrinsic::StringSplit
                     | mir::Intrinsic::StringSplitTemporary
                     | mir::Intrinsic::StringTryParseBool
+                    | mir::Intrinsic::StringTryParseChar
+                    | mir::Intrinsic::StringTryParseSByte
+                    | mir::Intrinsic::StringTryParseByte
+                    | mir::Intrinsic::StringTryParseShort
+                    | mir::Intrinsic::StringTryParseUShort
                     | mir::Intrinsic::StringTryParseInt
                     | mir::Intrinsic::StringTryParseUInt
                     | mir::Intrinsic::StringTryParseLong
@@ -890,8 +895,16 @@ fn instruction_escape(
                     | mir::Intrinsic::FileReadAllText(_)
                     | mir::Intrinsic::FileReadAllTextTemporary(_)
                     | mir::Intrinsic::FileWriteAllText(_)
+                    | mir::Intrinsic::FileAppendAllText(_)
                     | mir::Intrinsic::FileListFiles(_)
                     | mir::Intrinsic::FileListFilesTemporary(_)
+                    | mir::Intrinsic::FileListDirectories(_)
+                    | mir::Intrinsic::FileListDirectoriesTemporary(_)
+                    | mir::Intrinsic::FileExists(_)
+                    | mir::Intrinsic::DirectoryExists(_)
+                    | mir::Intrinsic::FileCreateDirectory(_)
+                    | mir::Intrinsic::FileDeleteFile(_)
+                    | mir::Intrinsic::FileDeleteDirectory(_)
                     | mir::Intrinsic::ReportRuntimeError(_)
                     | mir::Intrinsic::AssertionEqual
             );

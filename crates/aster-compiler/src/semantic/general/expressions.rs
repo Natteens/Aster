@@ -1541,6 +1541,29 @@ impl Analyzer<'_> {
                 _ => {}
             }
         }
+        if let ExpressionKind::Member { object, name } = &target.kind
+            && name == "Capacity"
+        {
+            match self.expression(object) {
+                Type::List(_) => {
+                    self.diagnostics.push(
+                        Diagnostic::error("list Capacity is read-only", target.span)
+                            .with_help("call EnsureCapacity to request additional list capacity"),
+                    );
+                    return Type::Unknown;
+                }
+                Type::Dictionary(_, _) => {
+                    self.diagnostics.push(
+                        Diagnostic::error("dictionary Capacity is read-only", target.span)
+                            .with_help(
+                                "call EnsureCapacity to request additional dictionary capacity",
+                            ),
+                    );
+                    return Type::Unknown;
+                }
+                _ => {}
+            }
+        }
         if let Some(name) = self.foreach_readonly_binding(target) {
             self.diagnostics.push(
                 Diagnostic::error(

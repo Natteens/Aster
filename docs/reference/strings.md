@@ -88,6 +88,11 @@ if (String.StartsWith(changed, "ASTER"))
 | `StartsWith(value, pattern)` / `EndsWith(value, pattern)` | Ordinal prefix/suffix search. An empty pattern is true. |
 | `Substring(value, start)` / `Substring(value, start, length)` | Copies complete Unicode scalars at checked scalar offsets. |
 | `Trim(value)` | Removes ASTER's fixed Unicode White_Space scalars from both ends. |
+| `TrimStart(value)` / `TrimEnd(value)` | Removes that same fixed White_Space set from one end. |
+| `IndexOf(value, pattern)` / `LastIndexOf(value, pattern)` | Returns an ordinal Unicode-scalar offset as `Option<int>`. |
+| `Join(separator, values)` / `Concat(values)` | Produces one checked allocation for an array of strings. |
+| `Repeat(value, count)` | Repeats text in one checked allocation; a negative count is a controlled failure. |
+| `ToChars(value)` / `FromChars(values)` | Converts between UTF-8 text and Unicode-scalar `char[]`. |
 | `Replace(value, oldValue, newValue)` | Replaces non-overlapping ordinal matches. |
 | `Split(value, separator)` | Produces an array of ordinal segments, preserving empty leading, trailing, and adjacent segments. |
 
@@ -102,6 +107,18 @@ U+2000–U+200A, U+2028, U+2029, U+202F, U+205F, and U+3000. This set is indepen
 of operating-system locale and host Unicode-table updates. Zero-width space U+200B is not trimmed.
 `Replace` scans left to right and replaces non-overlapping matches; replacement text is never
 rescanned. `Split` treats the separator literally and preserves every empty segment.
+`IndexOf` returns `Some(0)` for an empty pattern; `LastIndexOf` returns `Some(value.Length)`.
+Both searches report scalar rather than byte offsets. `LastIndexOf`, like `Replace`, considers the
+non-overlapping matches produced by a left-to-right ordinal scan.
+
+## Strict parsing
+
+Scalar parsing consumes the complete string and never trims whitespace. Integers use ASCII decimal
+digits, checked bounds, and a leading sign only where the signed type permits it. Unsigned negative,
+overflowing, empty, trailing-garbage, and non-ASCII-digit inputs return `None`. Bool accepts exactly
+`true` or `false`; char accepts exactly one Unicode scalar. Float and double parsing is
+locale-independent and preserves the existing decimal, exponent, `NaN`, infinity, underflow, and
+signed-zero contract. Invalid user text is ordinary `Option.None`, not a runtime error.
 
 ## 🧠 Immutability and allocation
 
@@ -134,7 +151,12 @@ for (int i = 0; i < 20000; i++)
 string value = builder.ToString();
 ```
 
-The initial API is deliberately small: `StringBuilder()`, `Append(string)`, and `ToString()`.
+The practical API is `StringBuilder()`, `Length`, `Clear()`, `Append(string)`, scalar `Append`
+overloads, `AppendLine()`, `AppendLine(string)`, and `ToString()`. AppendLine always appends `\n`,
+independent of the host platform. Scalar overloads use the same locale-independent textual values
+as `ToString`; compiler-known lowering formats directly into the runtime append path without first
+allocating an intermediate host or ASTER string. `Length` is the incrementally maintained Unicode
+scalar count, not the UTF-8 byte count.
 Backing storage grows geometrically, so repeated append has amortized linear copy work rather than
 copying the accumulated prefix on every iteration. `ToString()` copies the active content into a
 normal immutable string. A later append cannot mutate a snapshot returned earlier.
@@ -155,6 +177,6 @@ control flow retains normal pairwise concatenation; not every concat loop is rew
 ## 🚧 Current limits
 
 There is no general implicit `ToString`, regex, nullable string, or direct string indexing.
-`StringBuilder` does not expose capacity, insertion, replacement, formatting, or implicit
+`StringBuilder` does not expose capacity, insertion, replacement, a format language, or implicit
 conversion. ASTER exposes neither UTF-8 bytes nor raw string pointers. Interpolation has no format
 specifiers, alignment, culture, or raw/verbatim form.

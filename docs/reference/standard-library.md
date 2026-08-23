@@ -13,7 +13,11 @@ intrinsics still resolve through official `aster.*` symbols rather than text or 
 - `aster.core` defines [`Option<T>`, `Result<T, E>`](option-result.md), and the explicit
   incremental [`StringBuilder`](strings.md#incremental-construction).
 - `aster.io` provides [terminal and host-managed filesystem operations](io.md).
-- `aster.math` provides scalar [`Abs`, `Min`, `Max`, `Clamp`, rounding, power, root, and trigonometric](math.md) overloads.
+- `aster.math` provides [practical scalar math](math.md), including constants, classification,
+  logarithms, trigonometry, and interpolation.
+- `aster.random` provides the explicitly seeded, cross-platform deterministic
+  [`Random`](random.md) generator.
+- `aster.time` provides operation-scoped [monotonic and Unix clock reads](time.md).
 - `aster.text` provides ordinal immutable-text helpers documented with [strings](strings.md).
 - `aster.collections` defines the official
   [`DictionaryEntry<K, V>` snapshot value](collections.md#dictionaryk-v).
@@ -23,6 +27,11 @@ intrinsics still resolve through official `aster.*` symbols rather than text or 
 `List<T>`, `Dictionary<K, V>`, `Task<T>`, and `Parallel` are official nominal surfaces recognized
 by the compiler. Their executable operations are described in
 [Collections](collections.md) and [Concurrency](concurrency.md).
+
+Primitive text conversion is locale-independent. Every scalar has `ToString()`; `string` provides
+strict `TryParseBool`, `TryParseChar`, `TryParseSByte`, `TryParseByte`, `TryParseShort`,
+`TryParseUShort`, `TryParseInt`, `TryParseUInt`, `TryParseLong`, `TryParseULong`, `TryParseFloat`,
+and `TryParseDouble`, each returning `Option<T>` rather than failing execution for invalid text.
 
 The `aster.*` prefix is reserved. Project source cannot shadow an official namespace or replace an
 official type with a class that has the same short name or layout.

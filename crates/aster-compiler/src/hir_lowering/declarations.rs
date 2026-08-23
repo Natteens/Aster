@@ -434,8 +434,29 @@ impl Lowerer<'_> {
             hir::Intrinsic::FileWriteAllText(_) => {
                 hir::Intrinsic::FileWriteAllText(self.resolve_file_io_result_layout(return_type))
             }
+            hir::Intrinsic::FileAppendAllText(_) => {
+                hir::Intrinsic::FileAppendAllText(self.resolve_file_io_result_layout(return_type))
+            }
             hir::Intrinsic::FileListFiles(_) => {
                 hir::Intrinsic::FileListFiles(self.resolve_file_io_result_layout(return_type))
+            }
+            hir::Intrinsic::FileListDirectories(_) => {
+                hir::Intrinsic::FileListDirectories(self.resolve_file_io_result_layout(return_type))
+            }
+            hir::Intrinsic::FileExists(_) => {
+                hir::Intrinsic::FileExists(self.resolve_file_io_result_layout(return_type))
+            }
+            hir::Intrinsic::DirectoryExists(_) => {
+                hir::Intrinsic::DirectoryExists(self.resolve_file_io_result_layout(return_type))
+            }
+            hir::Intrinsic::FileCreateDirectory(_) => {
+                hir::Intrinsic::FileCreateDirectory(self.resolve_file_io_result_layout(return_type))
+            }
+            hir::Intrinsic::FileDeleteFile(_) => {
+                hir::Intrinsic::FileDeleteFile(self.resolve_file_io_result_layout(return_type))
+            }
+            hir::Intrinsic::FileDeleteDirectory(_) => {
+                hir::Intrinsic::FileDeleteDirectory(self.resolve_file_io_result_layout(return_type))
             }
             other => other,
         }

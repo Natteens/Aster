@@ -10,9 +10,9 @@
 //! [`crate::ExecutionContext`]. The runtime only borrows input bytes during a
 //! call. No pointer may outlive its JIT session or temporary function scope.
 
-use std::ptr;
+use std::{fmt::Write, ptr};
 
-use crate::{ExecutionContext, aster_rt_array_element};
+use crate::{ExecutionContext, aster_rt_array_element, aster_rt_array_length};
 
 /// Header preceding the UTF-8 bytes of an ABI string.
 #[repr(C)]
@@ -284,11 +284,61 @@ fn string_from_display(
     // SAFETY: generated code passes its live hidden ExecutionContext.
     #[allow(unsafe_code)]
     let context = unsafe { &mut *context };
-    let value = value.to_string();
+    let Some(value) = display_text(value) else {
+        context.fail("scalar formatting exceeded the runtime buffer");
+        return ptr::null();
+    };
     if temporary {
-        context.allocate_temporary_string_parts(&[&value])
+        context.allocate_temporary_string_parts(&[value.as_str()])
     } else {
-        context.allocate_string_parts(&[&value])
+        context.allocate_string_parts(&[value.as_str()])
+    }
+}
+
+/// Canonical locale-independent scalar formatting used by both immutable
+/// `ToString` allocation and direct `StringBuilder` append entry points.
+pub(crate) fn display_text(value: impl std::fmt::Display) -> Option<DisplayText> {
+    let mut text = DisplayText::new();
+    write!(&mut text, "{value}").ok()?;
+    Some(text)
+}
+
+/// Stack-owned scalar display buffer. Rust's canonical finite `f64` display
+/// can use more than 300 bytes for extreme subnormals, so the fixed bound is
+/// deliberately 384 bytes. Numeric `StringBuilder.Append` calls therefore do
+/// not allocate a temporary host `String` even at IEEE boundaries.
+pub(crate) struct DisplayText {
+    bytes: [u8; 384],
+    length: usize,
+}
+
+impl DisplayText {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; 384],
+            length: 0,
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        // SAFETY: `fmt::Write::write_str` only copies valid UTF-8 `str` bytes.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::str::from_utf8_unchecked(&self.bytes[..self.length])
+        }
+    }
+}
+
+impl std::fmt::Write for DisplayText {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        let end = self.length.checked_add(text.len()).ok_or(std::fmt::Error)?;
+        let destination = self
+            .bytes
+            .get_mut(self.length..end)
+            .ok_or(std::fmt::Error)?;
+        destination.copy_from_slice(text.as_bytes());
+        self.length = end;
+        Ok(())
     }
 }
 
@@ -633,6 +683,40 @@ pub extern "C" fn aster_rt_string_index_of(
     }
 }
 
+/// Return the last (including overlapping) occurrence as a Unicode scalar
+/// index, or `-1`. The empty pattern is found after the final scalar.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[must_use]
+pub extern "C" fn aster_rt_string_last_index_of(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    pattern: *const AsterStrHeader,
+) -> i32 {
+    if context.is_null() {
+        return -1;
+    }
+    #[allow(unsafe_code)]
+    let (context, value, pattern) = unsafe { (&mut *context, view(value), view(pattern)) };
+    let (Some(value), Some(pattern)) = (value, pattern) else {
+        context.fail("String.LastIndexOf received an invalid UTF-8 string reference");
+        return -1;
+    };
+    let byte_index = if pattern.is_empty() {
+        value.len()
+    } else {
+        let mut last = None;
+        for (index, _) in value.match_indices(pattern) {
+            last = Some(index);
+        }
+        let Some(index) = last else { return -1 };
+        index
+    };
+    i32::try_from(value[..byte_index].chars().count()).unwrap_or_else(|_| {
+        context.fail("String.LastIndexOf result exceeds the supported `int` range");
+        -1
+    })
+}
+
 /// Copy from `start` (in Unicode scalar values) through the end into the
 /// persistent arena.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -787,6 +871,360 @@ fn string_trim(
     } else {
         context.allocate_string_parts(&[trimmed])
     }
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_trim_start(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+) -> *const AsterStrHeader {
+    string_trim_side(context, value, false, true)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_trim_start_temporary(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+) -> *const AsterStrHeader {
+    string_trim_side(context, value, true, true)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_trim_end(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+) -> *const AsterStrHeader {
+    string_trim_side(context, value, false, false)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_trim_end_temporary(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+) -> *const AsterStrHeader {
+    string_trim_side(context, value, true, false)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+fn string_trim_side(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    temporary: bool,
+    start: bool,
+) -> *const AsterStrHeader {
+    if context.is_null() {
+        return ptr::null();
+    }
+    #[allow(unsafe_code)]
+    let (context, value) = unsafe { (&mut *context, view(value)) };
+    let Some(value) = value else {
+        context.fail("String.Trim received an invalid UTF-8 string reference");
+        return ptr::null();
+    };
+    let result = if start {
+        value.trim_start_matches(is_aster_whitespace)
+    } else {
+        value.trim_end_matches(is_aster_whitespace)
+    };
+    if temporary {
+        context.allocate_temporary_string_parts(&[result])
+    } else {
+        context.allocate_string_parts(&[result])
+    }
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_join_array(
+    context: *mut ExecutionContext,
+    separator: *const AsterStrHeader,
+    values: *mut crate::context::AsterArray,
+) -> *const AsterStrHeader {
+    string_join_array(context, separator, values, false)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_join_array_temporary(
+    context: *mut ExecutionContext,
+    separator: *const AsterStrHeader,
+    values: *mut crate::context::AsterArray,
+) -> *const AsterStrHeader {
+    string_join_array(context, separator, values, true)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_concat_array(
+    context: *mut ExecutionContext,
+    values: *mut crate::context::AsterArray,
+) -> *const AsterStrHeader {
+    let empty = AsterStrHeader { len: 0 };
+    string_join_array(context, &raw const empty, values, false)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_concat_array_temporary(
+    context: *mut ExecutionContext,
+    values: *mut crate::context::AsterArray,
+) -> *const AsterStrHeader {
+    let empty = AsterStrHeader { len: 0 };
+    string_join_array(context, &raw const empty, values, true)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+fn string_join_array(
+    context: *mut ExecutionContext,
+    separator: *const AsterStrHeader,
+    values: *mut crate::context::AsterArray,
+    temporary: bool,
+) -> *const AsterStrHeader {
+    if context.is_null() {
+        return ptr::null();
+    }
+    #[allow(unsafe_code)]
+    let context_ref = unsafe { &mut *context };
+    #[allow(unsafe_code)]
+    let Some(separator) = (unsafe { view(separator) }) else {
+        context_ref.fail("String.Join received an invalid separator");
+        return ptr::null();
+    };
+    let length = aster_rt_array_length(context, values);
+    if crate::context::aster_rt_has_error(context) != 0 {
+        return ptr::null();
+    }
+    let mut output_len = separator
+        .len()
+        .checked_mul(usize::try_from(length.saturating_sub(1)).unwrap_or(0));
+    for index in 0..length {
+        let slot = aster_rt_array_element(context, values, index);
+        if slot.is_null() {
+            return ptr::null();
+        }
+        #[allow(unsafe_code)]
+        let item = unsafe { slot.cast::<*const AsterStrHeader>().read_unaligned() };
+        #[allow(unsafe_code)]
+        let Some(item) = (unsafe { view(item) }) else {
+            context_ref.fail("String.Join received an invalid string element");
+            return ptr::null();
+        };
+        output_len = output_len.and_then(|total| total.checked_add(item.len()));
+    }
+    let Some(output_len) = output_len else {
+        context_ref.fail("String.Join result exceeds the addressable range");
+        return ptr::null();
+    };
+    let output = context_ref.allocate_string_storage(output_len, temporary);
+    if output.is_null() {
+        return ptr::null();
+    }
+    #[allow(unsafe_code)]
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(
+            output.cast::<u8>().add(size_of::<AsterStrHeader>()),
+            output_len,
+        )
+    };
+    let mut cursor = 0;
+    for index in 0..length {
+        if index != 0 {
+            bytes[cursor..cursor + separator.len()].copy_from_slice(separator.as_bytes());
+            cursor += separator.len();
+        }
+        let slot = aster_rt_array_element(context, values, index);
+        #[allow(unsafe_code)]
+        let item =
+            unsafe { view(slot.cast::<*const AsterStrHeader>().read_unaligned()).unwrap_or("") };
+        bytes[cursor..cursor + item.len()].copy_from_slice(item.as_bytes());
+        cursor += item.len();
+    }
+    output
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_repeat(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    count: i32,
+) -> *const AsterStrHeader {
+    string_repeat(context, value, count, false)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_repeat_temporary(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    count: i32,
+) -> *const AsterStrHeader {
+    string_repeat(context, value, count, true)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+fn string_repeat(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    count: i32,
+    temporary: bool,
+) -> *const AsterStrHeader {
+    if context.is_null() {
+        return ptr::null();
+    }
+    #[allow(unsafe_code)]
+    let (context, value) = unsafe { (&mut *context, view(value)) };
+    let Some(value) = value else {
+        context.fail("String.Repeat received an invalid string");
+        return ptr::null();
+    };
+    let Ok(count) = usize::try_from(count) else {
+        context.fail("String.Repeat requires a nonnegative count");
+        return ptr::null();
+    };
+    let Some(output_len) = value.len().checked_mul(count) else {
+        context.fail("String.Repeat result exceeds the addressable range");
+        return ptr::null();
+    };
+    let output = context.allocate_string_storage(output_len, temporary);
+    if output.is_null() {
+        return ptr::null();
+    }
+    #[allow(unsafe_code)]
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(
+            output.cast::<u8>().add(size_of::<AsterStrHeader>()),
+            output_len,
+        )
+    };
+    for chunk in bytes.chunks_exact_mut(value.len().max(1)) {
+        if !value.is_empty() {
+            chunk.copy_from_slice(value.as_bytes());
+        }
+    }
+    output
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_to_chars(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+) -> *mut crate::context::AsterArray {
+    string_to_chars(context, value, false)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_to_chars_temporary(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+) -> *mut crate::context::AsterArray {
+    string_to_chars(context, value, true)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+fn string_to_chars(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    temporary: bool,
+) -> *mut crate::context::AsterArray {
+    if context.is_null() {
+        return ptr::null_mut();
+    }
+    #[allow(unsafe_code)]
+    let (context_ref, value) = unsafe { (&mut *context, view(value)) };
+    let Some(value) = value else {
+        context_ref.fail("String.ToChars received an invalid string");
+        return ptr::null_mut();
+    };
+    let Ok(length) = i32::try_from(value.chars().count()) else {
+        context_ref.fail("String.ToChars exceeds the supported array length");
+        return ptr::null_mut();
+    };
+    let output = if temporary {
+        context_ref.allocate_temporary_array(length, 4)
+    } else {
+        context_ref.allocate_array(length, 4)
+    };
+    if output.is_null() {
+        return ptr::null_mut();
+    }
+    for (index, character) in value.chars().enumerate() {
+        let slot =
+            aster_rt_array_element(context, output, i32::try_from(index).unwrap_or(i32::MAX));
+        if slot.is_null() {
+            return ptr::null_mut();
+        }
+        #[allow(unsafe_code)]
+        unsafe {
+            slot.cast::<u32>().write_unaligned(u32::from(character));
+        }
+    }
+    output
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_from_chars(
+    context: *mut ExecutionContext,
+    values: *mut crate::context::AsterArray,
+) -> *const AsterStrHeader {
+    string_from_chars(context, values, false)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_string_from_chars_temporary(
+    context: *mut ExecutionContext,
+    values: *mut crate::context::AsterArray,
+) -> *const AsterStrHeader {
+    string_from_chars(context, values, true)
+}
+
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+fn string_from_chars(
+    context: *mut ExecutionContext,
+    values: *mut crate::context::AsterArray,
+    temporary: bool,
+) -> *const AsterStrHeader {
+    if context.is_null() {
+        return ptr::null();
+    }
+    #[allow(unsafe_code)]
+    let context_ref = unsafe { &mut *context };
+    let length = aster_rt_array_length(context, values);
+    if crate::context::aster_rt_has_error(context) != 0 {
+        return ptr::null();
+    }
+    let mut output_len = Some(0_usize);
+    for index in 0..length {
+        let slot = aster_rt_array_element(context, values, index);
+        if slot.is_null() {
+            return ptr::null();
+        }
+        #[allow(unsafe_code)]
+        let scalar = unsafe { slot.cast::<u32>().read_unaligned() };
+        let Some(character) = char::from_u32(scalar) else {
+            context_ref.fail("String.FromChars received an invalid Unicode scalar");
+            return ptr::null();
+        };
+        output_len = output_len.and_then(|total| total.checked_add(character.len_utf8()));
+    }
+    let Some(output_len) = output_len else {
+        context_ref.fail("String.FromChars result exceeds the addressable range");
+        return ptr::null();
+    };
+    let output = context_ref.allocate_string_storage(output_len, temporary);
+    if output.is_null() {
+        return ptr::null();
+    }
+    #[allow(unsafe_code)]
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(
+            output.cast::<u8>().add(size_of::<AsterStrHeader>()),
+            output_len,
+        )
+    };
+    let mut cursor = 0;
+    for index in 0..length {
+        let slot = aster_rt_array_element(context, values, index);
+        #[allow(unsafe_code)]
+        let scalar = unsafe { slot.cast::<u32>().read_unaligned() };
+        let character = char::from_u32(scalar).unwrap_or('\u{FFFD}');
+        cursor += character.encode_utf8(&mut bytes[cursor..]).len();
+    }
+    output
 }
 
 /// Replace exact, non-overlapping matches from left to right.
@@ -1166,6 +1604,69 @@ pub extern "C" fn aster_rt_string_try_parse_bool(
         },
     );
 }
+
+/// Parses exactly one Unicode scalar value. Empty and multi-scalar strings
+/// produce `None`; valid ASTER strings are already guaranteed UTF-8.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn aster_rt_string_try_parse_char(
+    context: *mut ExecutionContext,
+    value: *const AsterStrHeader,
+    destination: *mut u8,
+    total_size: i32,
+    some_tag: i32,
+    none_tag: i32,
+    payload_offset: i32,
+) {
+    string_try_parse(
+        context,
+        value,
+        destination,
+        total_size,
+        some_tag,
+        none_tag,
+        payload_offset,
+        "TryParseChar",
+        |text| {
+            let mut chars = text.chars();
+            let value = chars.next()?;
+            chars.next().is_none().then_some(value)
+        },
+    );
+}
+
+macro_rules! define_narrow_integer_parser {
+    ($name:ident, $label:literal, $type:ty) => {
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
+        #[allow(clippy::too_many_arguments)]
+        pub extern "C" fn $name(
+            context: *mut ExecutionContext,
+            value: *const AsterStrHeader,
+            destination: *mut u8,
+            total_size: i32,
+            some_tag: i32,
+            none_tag: i32,
+            payload_offset: i32,
+        ) {
+            string_try_parse(
+                context,
+                value,
+                destination,
+                total_size,
+                some_tag,
+                none_tag,
+                payload_offset,
+                $label,
+                |text| text.parse::<$type>().ok(),
+            );
+        }
+    };
+}
+
+define_narrow_integer_parser!(aster_rt_string_try_parse_sbyte, "TryParseSByte", i8);
+define_narrow_integer_parser!(aster_rt_string_try_parse_byte, "TryParseByte", u8);
+define_narrow_integer_parser!(aster_rt_string_try_parse_short, "TryParseShort", i16);
+define_narrow_integer_parser!(aster_rt_string_try_parse_ushort, "TryParseUShort", u16);
 
 /// Consumes the entire string as an ASCII, optionally `+`/`-`-signed `int`;
 /// `str::parse::<i32>` already implements this contract exactly, including

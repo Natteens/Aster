@@ -150,6 +150,8 @@ mod tests {
             "aster/io/io.aster",
             "aster/collections/collections.aster",
             "aster/testing/testing.aster",
+            "aster/random/random.aster",
+            "aster/time/time.aster",
         ];
         for relative in modules {
             let full = root.join(relative);

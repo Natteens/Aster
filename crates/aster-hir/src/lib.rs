@@ -63,6 +63,16 @@ pub enum Intrinsic {
     /// Internal UTF-8-aware `aster.text.String` helpers. Their public static
     /// wrappers remain ordinary standard-library source methods.
     StringTrim,
+    StringLastIndexOf,
+    StringTrimStart,
+    StringTrimEnd,
+    StringJoinArray,
+    StringConcatArray,
+    StringRepeat,
+    StringToChars,
+    StringFromChars,
+    StringBuilderLength,
+    StringBuilderClear,
     StringReplace,
     StringSplit,
     /// Floating-point math helpers selected by the official `aster.math`
@@ -71,8 +81,17 @@ pub enum Intrinsic {
     /// before HIR and never inferred by a backend.
     MathUnaryFloat,
     MathUnaryDouble,
+    MathBinaryFloat,
+    MathBinaryDouble,
+    MathPredicateFloat,
+    MathPredicateDouble,
     MathPowFloat,
     MathPowDouble,
+    TimeMonotonicMilliseconds,
+    TimeUnixMilliseconds,
+    /// `SplitMix64`'s fixed, target-independent output mixer. State evolution
+    /// remains ordinary standard-library source.
+    RandomMix,
     /// `aster.io.Write(string)`: emits its argument's UTF-8 bytes verbatim.
     ConsoleWrite,
     /// `aster.io.WriteLine(string)`: like `ConsoleWrite`, plus a trailing LF.
@@ -90,11 +109,18 @@ pub enum Intrinsic {
     /// filesystem backend. Payload resolved the same way as
     /// [`Self::FileReadAllText`], against `Result<int, IOError>`.
     FileWriteAllText(FileIoResultLayout),
+    FileAppendAllText(FileIoResultLayout),
     /// `aster.io.ListFiles(string) -> Result<string[], IOError>`: lists the
     /// immediately contained regular files through the host filesystem
     /// backend. The concrete `Result<string[], IOError>` layout is resolved
     /// exactly once before MIR; the backend receives symbols, never names.
     FileListFiles(FileIoResultLayout),
+    FileListDirectories(FileIoResultLayout),
+    FileExists(FileIoResultLayout),
+    DirectoryExists(FileIoResultLayout),
+    FileCreateDirectory(FileIoResultLayout),
+    FileDeleteFile(FileIoResultLayout),
+    FileDeleteDirectory(FileIoResultLayout),
 }
 
 /// Every concrete symbol the M2D filesystem intrinsics need to construct a
@@ -168,6 +194,9 @@ pub enum RuntimeErrorKind {
     AssertionTrue,
     AssertionFalse,
     AssertionEqual,
+    MathSignNaN,
+    CollectionRange,
+    RandomInvalidRange,
 }
 
 /// Element-slot initialization contract for a source `new T[length]`.
@@ -344,6 +373,11 @@ pub enum StringOperation {
     /// allocation-free parsing into the official `Option<T>` for the
     /// matching primitive. Takes no arguments.
     TryParseBool,
+    TryParseChar,
+    TryParseSByte,
+    TryParseByte,
+    TryParseShort,
+    TryParseUShort,
     TryParseInt,
     TryParseUInt,
     TryParseLong,
@@ -359,6 +393,11 @@ impl StringOperation {
     pub const fn parse_target_name(self) -> Option<&'static str> {
         match self {
             Self::TryParseBool => Some("bool"),
+            Self::TryParseChar => Some("char"),
+            Self::TryParseSByte => Some("sbyte"),
+            Self::TryParseByte => Some("byte"),
+            Self::TryParseShort => Some("short"),
+            Self::TryParseUShort => Some("ushort"),
             Self::TryParseInt => Some("int"),
             Self::TryParseUInt => Some("uint"),
             Self::TryParseLong => Some("long"),
@@ -444,8 +483,24 @@ pub enum ExpressionKind {
     },
     /// `list.Length`: reads the `length` field of a `List<T>` header.
     ListLength(Box<Expression>),
+    ListCapacity(Box<Expression>),
     /// `dictionary.Length`: reads the native header's live-entry count.
     DictionaryLength(Box<Expression>),
+    DictionaryCapacity(Box<Expression>),
+    DictionaryEnsureCapacity {
+        dictionary: Box<Expression>,
+        minimum: Box<Expression>,
+    },
+    DictionaryGetOr {
+        dictionary: Box<Expression>,
+        key: Box<Expression>,
+        fallback: Box<Expression>,
+    },
+    DictionaryGetOrAdd {
+        dictionary: Box<Expression>,
+        key: Box<Expression>,
+        value: Box<Expression>,
+    },
     DictionaryAdd {
         dictionary: Box<Expression>,
         key: Box<Expression>,
@@ -495,6 +550,14 @@ pub enum ExpressionKind {
         value: Box<Expression>,
         class_symbol: SymbolId,
     },
+    StringBuilderLength {
+        builder: Box<Expression>,
+        class_symbol: SymbolId,
+    },
+    StringBuilderClear {
+        builder: Box<Expression>,
+        class_symbol: SymbolId,
+    },
     /// Produces an independent immutable `string` snapshot.
     StringBuilderToString {
         builder: Box<Expression>,
@@ -506,6 +569,34 @@ pub enum ExpressionKind {
     ListAdd {
         list: Box<Expression>,
         value: Box<Expression>,
+    },
+    ListEnsureCapacity {
+        list: Box<Expression>,
+        minimum: Box<Expression>,
+    },
+    ListAddRange {
+        list: Box<Expression>,
+        values: Box<Expression>,
+        element_type: Type,
+    },
+    ListInsert {
+        list: Box<Expression>,
+        index: Box<Expression>,
+        value: Box<Expression>,
+    },
+    ListRemoveRange {
+        list: Box<Expression>,
+        index: Box<Expression>,
+        count: Box<Expression>,
+    },
+    ListReverse {
+        list: Box<Expression>,
+    },
+    ListGetRange {
+        list: Box<Expression>,
+        index: Box<Expression>,
+        count: Box<Expression>,
+        element_type: Type,
     },
     /// `list.Get(index)`: always produces a value copy, never a pointer
     /// into the list's buffer. `element_type` is this expression's own

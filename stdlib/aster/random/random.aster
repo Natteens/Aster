@@ -1,0 +1,61 @@
+namespace aster.random;
+
+internal void __RandomInvalidRange() {}
+internal ulong __RandomMix(ulong value) { return value; }
+
+/// Explicitly seeded SplitMix64 generator. The sequence is deterministic
+/// across ASTER targets and is not suitable for cryptographic use.
+public class Random
+{
+    private ulong state;
+
+    public Random(ulong seed) { state = seed; }
+
+    public ulong NextULong()
+    {
+        state = state + 11400714819323198485UL;
+        return __RandomMix(state);
+    }
+
+    public uint NextUInt() { return (uint)(NextULong() / 4294967296UL); }
+    public bool NextBool() { return NextULong() / 9223372036854775808UL != 0UL; }
+
+    public int NextInt(int minInclusive, int maxExclusive)
+    {
+        if (minInclusive >= maxExclusive) { __RandomInvalidRange(); return minInclusive; }
+        ulong span = (ulong)((long)maxExclusive - (long)minInclusive);
+        ulong threshold = ((18446744073709551615UL % span) + 1UL) % span;
+        while (true)
+        {
+            ulong sample = NextULong();
+            if (sample >= threshold)
+            {
+                return (int)((long)minInclusive + (long)(sample % span));
+            }
+        }
+        return minInclusive;
+    }
+
+    public long NextLong(long minInclusive, long maxExclusive)
+    {
+        if (minInclusive >= maxExclusive) { __RandomInvalidRange(); return minInclusive; }
+        ulong span = (ulong)maxExclusive - (ulong)minInclusive;
+        ulong threshold = ((18446744073709551615UL % span) + 1UL) % span;
+        while (true)
+        {
+            ulong sample = NextULong();
+            if (sample >= threshold) { return (long)((ulong)minInclusive + (sample % span)); }
+        }
+        return minInclusive;
+    }
+
+    public float NextFloat()
+    {
+        return (float)(NextUInt() / 256u) / 16777216.0f;
+    }
+
+    public double NextDouble()
+    {
+        return (double)(NextULong() / 2048UL) / 9007199254740992.0d;
+    }
+}

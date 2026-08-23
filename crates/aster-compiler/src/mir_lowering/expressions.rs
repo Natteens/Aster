@@ -114,6 +114,23 @@ impl FunctionLowerer {
                     .expect("validated list produces a value");
                 Some(self.temporary(expression.type_.clone(), mir::RvalueKind::ListLength(list)))
             }
+            hir::ExpressionKind::ListCapacity(list) => {
+                let list = self
+                    .lower_expression(list)
+                    .expect("validated list produces a value");
+                let local = self.new_temporary(hir::Type::Int);
+                let destination = mir::Place::Local(local);
+                self.instruction(mir::Instruction::CallIntrinsic {
+                    destination: Some(destination.clone()),
+                    intrinsic: mir::Intrinsic::ListCapacity,
+                    arguments: vec![list],
+                    return_type: mir::Type::Int,
+                });
+                Some(mir::Operand {
+                    type_: mir::Type::Int,
+                    kind: mir::OperandKind::Copy(destination),
+                })
+            }
             hir::ExpressionKind::DictionaryLength(dictionary) => {
                 let dictionary = self
                     .lower_expression(dictionary)
@@ -122,6 +139,183 @@ impl FunctionLowerer {
                     expression.type_.clone(),
                     mir::RvalueKind::DictionaryLength(dictionary),
                 ))
+            }
+            hir::ExpressionKind::DictionaryCapacity(dictionary) => {
+                let dictionary = self
+                    .lower_expression(dictionary)
+                    .expect("validated dictionary produces a value");
+                let local = self.new_temporary(hir::Type::Int);
+                let destination = mir::Place::Local(local);
+                self.instruction(mir::Instruction::CallIntrinsic {
+                    destination: Some(destination.clone()),
+                    intrinsic: mir::Intrinsic::DictionaryCapacity,
+                    arguments: vec![dictionary],
+                    return_type: mir::Type::Int,
+                });
+                Some(mir::Operand {
+                    type_: mir::Type::Int,
+                    kind: mir::OperandKind::Copy(destination),
+                })
+            }
+            hir::ExpressionKind::DictionaryEnsureCapacity {
+                dictionary,
+                minimum,
+            } => {
+                let dictionary = self
+                    .lower_expression(dictionary)
+                    .expect("validated dictionary");
+                let minimum = self.lower_expression(minimum).expect("validated minimum");
+                let destination = mir::Place::Local(self.new_temporary(hir::Type::Int));
+                self.instruction(mir::Instruction::CallIntrinsic {
+                    destination: Some(destination.clone()),
+                    intrinsic: mir::Intrinsic::DictionaryEnsureCapacity,
+                    arguments: vec![dictionary, minimum],
+                    return_type: mir::Type::Int,
+                });
+                Some(mir::Operand {
+                    type_: mir::Type::Int,
+                    kind: mir::OperandKind::Copy(destination),
+                })
+            }
+            hir::ExpressionKind::DictionaryGetOr {
+                dictionary,
+                key,
+                fallback,
+            }
+            | hir::ExpressionKind::DictionaryGetOrAdd {
+                dictionary,
+                key,
+                value: fallback,
+            } => {
+                let dictionary = self
+                    .lower_expression(dictionary)
+                    .expect("validated dictionary");
+                let key = self.lower_expression(key).expect("validated key");
+                let fallback = self.lower_expression(fallback).expect("validated value");
+                let destination = mir::Place::Local(self.new_temporary(expression.type_.clone()));
+                let intrinsic = if matches!(
+                    &expression.kind,
+                    hir::ExpressionKind::DictionaryGetOrAdd { .. }
+                ) {
+                    mir::Intrinsic::DictionaryGetOrAdd
+                } else {
+                    mir::Intrinsic::DictionaryGetOr
+                };
+                self.instruction(mir::Instruction::CallIntrinsic {
+                    destination: Some(destination.clone()),
+                    intrinsic,
+                    arguments: vec![dictionary, key, fallback],
+                    return_type: expression.type_.clone(),
+                });
+                Some(mir::Operand {
+                    type_: expression.type_.clone(),
+                    kind: mir::OperandKind::Copy(destination),
+                })
+            }
+            hir::ExpressionKind::ListEnsureCapacity { list, minimum } => {
+                let list_value = self.lower_expression(list).expect("validated list");
+                let minimum = self.lower_expression(minimum).expect("validated minimum");
+                let element_type = match &list.type_ {
+                    hir::Type::List(element) => (**element).clone(),
+                    _ => hir::Type::Unknown,
+                };
+                let local = self.new_temporary(hir::Type::Int);
+                let destination = mir::Place::Local(local);
+                let _ = element_type;
+                self.instruction(mir::Instruction::CallIntrinsic {
+                    destination: Some(destination.clone()),
+                    intrinsic: mir::Intrinsic::ListEnsureCapacity,
+                    arguments: vec![list_value, minimum],
+                    return_type: mir::Type::Int,
+                });
+                Some(mir::Operand {
+                    type_: mir::Type::Int,
+                    kind: mir::OperandKind::Copy(destination),
+                })
+            }
+            hir::ExpressionKind::ListAddRange {
+                list,
+                values,
+                element_type,
+            } => {
+                let list = self.lower_expression(list).expect("validated list");
+                let values = self.lower_expression(values).expect("validated values");
+                let _ = element_type;
+                self.instruction(mir::Instruction::CallIntrinsic {
+                    destination: None,
+                    intrinsic: mir::Intrinsic::ListAddRange,
+                    arguments: vec![list, values],
+                    return_type: mir::Type::Void,
+                });
+                None
+            }
+            hir::ExpressionKind::ListInsert { list, index, value } => {
+                let element_type = value.type_.clone();
+                let list = self.lower_expression(list).expect("validated list");
+                let index = self.lower_expression(index).expect("validated index");
+                let value = self.lower_expression(value).expect("validated value");
+                let _ = element_type;
+                self.instruction(mir::Instruction::CallIntrinsic {
+                    destination: None,
+                    intrinsic: mir::Intrinsic::ListInsert,
+                    arguments: vec![list, index, value],
+                    return_type: mir::Type::Void,
+                });
+                None
+            }
+            hir::ExpressionKind::ListRemoveRange { list, index, count } => {
+                let element_type = match &list.type_ {
+                    hir::Type::List(element) => (**element).clone(),
+                    _ => hir::Type::Unknown,
+                };
+                let list = self.lower_expression(list).expect("validated list");
+                let index = self.lower_expression(index).expect("validated index");
+                let count = self.lower_expression(count).expect("validated count");
+                let _ = element_type;
+                self.instruction(mir::Instruction::CallIntrinsic {
+                    destination: None,
+                    intrinsic: mir::Intrinsic::ListRemoveRange,
+                    arguments: vec![list, index, count],
+                    return_type: mir::Type::Void,
+                });
+                None
+            }
+            hir::ExpressionKind::ListReverse { list } => {
+                let element_type = match &list.type_ {
+                    hir::Type::List(element) => (**element).clone(),
+                    _ => hir::Type::Unknown,
+                };
+                let list = self.lower_expression(list).expect("validated list");
+                let _ = element_type;
+                self.instruction(mir::Instruction::CallIntrinsic {
+                    destination: None,
+                    intrinsic: mir::Intrinsic::ListReverse,
+                    arguments: vec![list],
+                    return_type: mir::Type::Void,
+                });
+                None
+            }
+            hir::ExpressionKind::ListGetRange {
+                list,
+                index,
+                count,
+                element_type,
+            } => {
+                let list = self.lower_expression(list).expect("validated list");
+                let index = self.lower_expression(index).expect("validated index");
+                let count = self.lower_expression(count).expect("validated count");
+                let local = self.new_temporary(hir::Type::Array(Box::new(element_type.clone())));
+                let destination = mir::Place::Local(local);
+                self.instruction(mir::Instruction::CallIntrinsic {
+                    destination: Some(destination.clone()),
+                    intrinsic: mir::Intrinsic::ListGetRange,
+                    arguments: vec![list, index, count],
+                    return_type: mir::Type::Array(Box::new(element_type.clone())),
+                });
+                Some(mir::Operand {
+                    type_: mir::Type::Array(Box::new(element_type.clone())),
+                    kind: mir::OperandKind::Copy(destination),
+                })
             }
             hir::ExpressionKind::StringBuilderAppend {
                 builder,
@@ -138,6 +332,35 @@ impl FunctionLowerer {
                     builder,
                     value,
                     class: *class_symbol,
+                });
+                None
+            }
+            hir::ExpressionKind::StringBuilderLength { builder, .. } => {
+                let builder = self
+                    .lower_expression(builder)
+                    .expect("validated builder produces a value");
+                let local = self.new_temporary(hir::Type::Int);
+                let destination = mir::Place::Local(local);
+                self.instruction(mir::Instruction::CallIntrinsic {
+                    destination: Some(destination.clone()),
+                    intrinsic: mir::Intrinsic::StringBuilderLength,
+                    arguments: vec![builder],
+                    return_type: mir::Type::Int,
+                });
+                Some(mir::Operand {
+                    type_: mir::Type::Int,
+                    kind: mir::OperandKind::Copy(destination),
+                })
+            }
+            hir::ExpressionKind::StringBuilderClear { builder, .. } => {
+                let builder = self
+                    .lower_expression(builder)
+                    .expect("validated builder produces a value");
+                self.instruction(mir::Instruction::CallIntrinsic {
+                    destination: None,
+                    intrinsic: mir::Intrinsic::StringBuilderClear,
+                    arguments: vec![builder],
+                    return_type: mir::Type::Void,
                 });
                 None
             }
@@ -466,6 +689,11 @@ impl FunctionLowerer {
                     hir::StringOperation::SubstringFrom => mir::Intrinsic::StringSubstringFrom,
                     hir::StringOperation::SubstringRange => mir::Intrinsic::StringSubstringRange,
                     hir::StringOperation::TryParseBool => mir::Intrinsic::StringTryParseBool,
+                    hir::StringOperation::TryParseChar => mir::Intrinsic::StringTryParseChar,
+                    hir::StringOperation::TryParseSByte => mir::Intrinsic::StringTryParseSByte,
+                    hir::StringOperation::TryParseByte => mir::Intrinsic::StringTryParseByte,
+                    hir::StringOperation::TryParseShort => mir::Intrinsic::StringTryParseShort,
+                    hir::StringOperation::TryParseUShort => mir::Intrinsic::StringTryParseUShort,
                     hir::StringOperation::TryParseInt => mir::Intrinsic::StringTryParseInt,
                     hir::StringOperation::TryParseUInt => mir::Intrinsic::StringTryParseUInt,
                     hir::StringOperation::TryParseLong => mir::Intrinsic::StringTryParseLong,
@@ -1441,6 +1669,11 @@ pub(super) fn lower_intrinsic(intrinsic: hir::Intrinsic) -> mir::Intrinsic {
                 hir::RuntimeErrorKind::AssertionTrue => mir::RuntimeErrorKind::AssertionTrue,
                 hir::RuntimeErrorKind::AssertionFalse => mir::RuntimeErrorKind::AssertionFalse,
                 hir::RuntimeErrorKind::AssertionEqual => mir::RuntimeErrorKind::AssertionEqual,
+                hir::RuntimeErrorKind::MathSignNaN => mir::RuntimeErrorKind::MathSignNaN,
+                hir::RuntimeErrorKind::CollectionRange => mir::RuntimeErrorKind::CollectionRange,
+                hir::RuntimeErrorKind::RandomInvalidRange => {
+                    mir::RuntimeErrorKind::RandomInvalidRange
+                }
             })
         }
         hir::Intrinsic::AssertionEqual => mir::Intrinsic::AssertionEqual,
@@ -1452,14 +1685,38 @@ pub(super) fn lower_intrinsic(intrinsic: hir::Intrinsic) -> mir::Intrinsic {
         // symbols HIR lowering resolved pass straight through unchanged.
         hir::Intrinsic::FileReadAllText(layout) => mir::Intrinsic::FileReadAllText(layout),
         hir::Intrinsic::FileWriteAllText(layout) => mir::Intrinsic::FileWriteAllText(layout),
+        hir::Intrinsic::FileAppendAllText(layout) => mir::Intrinsic::FileAppendAllText(layout),
         hir::Intrinsic::FileListFiles(layout) => mir::Intrinsic::FileListFiles(layout),
+        hir::Intrinsic::FileListDirectories(layout) => mir::Intrinsic::FileListDirectories(layout),
+        hir::Intrinsic::FileExists(layout) => mir::Intrinsic::FileExists(layout),
+        hir::Intrinsic::DirectoryExists(layout) => mir::Intrinsic::DirectoryExists(layout),
+        hir::Intrinsic::FileCreateDirectory(layout) => mir::Intrinsic::FileCreateDirectory(layout),
+        hir::Intrinsic::FileDeleteFile(layout) => mir::Intrinsic::FileDeleteFile(layout),
+        hir::Intrinsic::FileDeleteDirectory(layout) => mir::Intrinsic::FileDeleteDirectory(layout),
         hir::Intrinsic::StringTrim => mir::Intrinsic::StringTrim,
+        hir::Intrinsic::StringLastIndexOf => mir::Intrinsic::StringLastIndexOf,
+        hir::Intrinsic::StringTrimStart => mir::Intrinsic::StringTrimStart,
+        hir::Intrinsic::StringTrimEnd => mir::Intrinsic::StringTrimEnd,
+        hir::Intrinsic::StringJoinArray => mir::Intrinsic::StringJoinArray,
+        hir::Intrinsic::StringConcatArray => mir::Intrinsic::StringConcatArray,
+        hir::Intrinsic::StringRepeat => mir::Intrinsic::StringRepeat,
+        hir::Intrinsic::StringToChars => mir::Intrinsic::StringToChars,
+        hir::Intrinsic::StringFromChars => mir::Intrinsic::StringFromChars,
         hir::Intrinsic::StringReplace => mir::Intrinsic::StringReplace,
         hir::Intrinsic::StringSplit => mir::Intrinsic::StringSplit,
         hir::Intrinsic::MathUnaryFloat => mir::Intrinsic::MathUnaryFloat,
         hir::Intrinsic::MathUnaryDouble => mir::Intrinsic::MathUnaryDouble,
+        hir::Intrinsic::MathBinaryFloat => mir::Intrinsic::MathBinaryFloat,
+        hir::Intrinsic::MathBinaryDouble => mir::Intrinsic::MathBinaryDouble,
+        hir::Intrinsic::MathPredicateFloat => mir::Intrinsic::MathPredicateFloat,
+        hir::Intrinsic::MathPredicateDouble => mir::Intrinsic::MathPredicateDouble,
         hir::Intrinsic::MathPowFloat => mir::Intrinsic::MathPowFloat,
         hir::Intrinsic::MathPowDouble => mir::Intrinsic::MathPowDouble,
+        hir::Intrinsic::TimeMonotonicMilliseconds => mir::Intrinsic::TimeMonotonicMilliseconds,
+        hir::Intrinsic::TimeUnixMilliseconds => mir::Intrinsic::TimeUnixMilliseconds,
+        hir::Intrinsic::RandomMix => mir::Intrinsic::RandomMix,
+        hir::Intrinsic::StringBuilderLength => mir::Intrinsic::StringBuilderLength,
+        hir::Intrinsic::StringBuilderClear => mir::Intrinsic::StringBuilderClear,
     }
 }
 

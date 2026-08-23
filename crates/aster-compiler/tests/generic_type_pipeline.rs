@@ -286,15 +286,15 @@ fn a_type_reserved_for_list_can_never_be_declared_to_shadow_the_builtin() {
 }
 
 #[test]
-fn list_length_cannot_be_assigned_and_capacity_does_not_exist() {
+fn list_length_and_capacity_are_read_only_and_count_does_not_exist() {
     for (source, expected) in [
         (
             "public int Run(List<int> values) { values.Length = 10; return 0; }",
             "list Length is read-only",
         ),
         (
-            "public int Run(List<int> values) { return values.Capacity; }",
-            "list has no member `Capacity`",
+            "public int Run(List<int> values) { values.Capacity = 10; return 0; }",
+            "list Capacity is read-only",
         ),
         (
             "public int Run(List<int> values) { return values.Count; }",

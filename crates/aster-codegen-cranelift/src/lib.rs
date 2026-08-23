@@ -327,6 +327,36 @@ impl PreparedSequentialExecution {
         self.program.invoke(self.entry, true, None, None, None)
     }
 
+    /// Invoke finalized code with one execution-scoped filesystem backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same controlled runtime and entry errors as
+    /// [`execute_with_filesystem`].
+    pub fn invoke_with_filesystem(
+        &self,
+        filesystem_backend: Box<dyn aster_runtime::FileSystemBackend>,
+    ) -> Result<ExecutionValue, BackendError> {
+        self.program
+            .invoke(self.entry, false, None, None, Some(filesystem_backend))
+            .map(|(value, _)| value)
+    }
+
+    /// Invoke finalized code with an execution-scoped filesystem backend and
+    /// return stable runtime memory statistics.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same controlled runtime and entry errors as
+    /// [`execute_with_filesystem_and_stats`].
+    pub fn invoke_with_filesystem_and_stats(
+        &self,
+        filesystem_backend: Box<dyn aster_runtime::FileSystemBackend>,
+    ) -> Result<(ExecutionValue, MemoryStats), BackendError> {
+        self.program
+            .invoke(self.entry, true, None, None, Some(filesystem_backend))
+    }
+
     /// Invoke finalized code once with experimental allocator telemetry.
     ///
     /// # Errors

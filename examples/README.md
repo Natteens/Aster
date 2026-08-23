@@ -60,6 +60,13 @@ into the compiler repository, so run the commands below from the repository root
    aster run examples/language_ergonomics.aster
    ```
 
+10. **Practical standard library** combines strict parsing, Unicode text, bulk collections,
+    deterministic random, clock reads, and ordinary result handling.
+
+    ```console
+    aster run examples/practical_stdlib.aster
+    ```
+
 ## Multifile projects
 
 Manifest-based projects can be checked and run from their own directory without passing a source

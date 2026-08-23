@@ -6,13 +6,42 @@
 //! `aster_runtime::ConsoleBackend` throughout so nothing here touches the
 //! real terminal.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
+};
 
 use aster_codegen_cranelift::{
     ExecutionValue, MemoryStats, execute, execute_with_console, execute_with_console_and_stats,
 };
 use aster_compiler::{compile_project, mir};
-use aster_runtime::MemoryConsoleBackend;
+use aster_runtime::{ConsoleBackend, MemoryConsoleBackend};
+
+struct FailFirstWrite {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ConsoleBackend for FailFirstWrite {
+    fn write(&mut self, _bytes: &[u8]) -> io::Result<()> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            Err(io::Error::other("deliberate first write failure"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn read_line(&mut self) -> io::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+}
 
 fn compile(source: &str) -> Result<mir::Module, String> {
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -204,6 +233,23 @@ fn calls_are_emitted_in_program_order() {
         }";
     let (_, output) = run_with_io(source, "Main", "");
     assert_eq!(output, b"12\n3");
+}
+
+#[test]
+fn console_failure_branches_before_later_observable_work() {
+    let module = compile_mir(
+        "using aster.io; public int Main() { Write(\"first\"); Write(\"must not run\"); return 42; }",
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let result = execute_with_console(
+        &module,
+        "Main",
+        Box::new(FailFirstWrite {
+            calls: Arc::clone(&calls),
+        }),
+    );
+    assert!(result.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]

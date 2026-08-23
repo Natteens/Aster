@@ -131,6 +131,7 @@ pub(crate) enum ResolvedDictionaryOperation {
 pub(crate) enum ResolvedStringBuilderOperation {
     Append,
     ToString,
+    Clear,
 }
 
 /// A resolved postfix `?` operator. Records the concrete official-`Result`

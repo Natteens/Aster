@@ -29,6 +29,7 @@ Result<string, IOError> path = CombinePath("data", "input.txt");
 Result<string, IOError> text = ReadAllText("data/input.txt");
 Result<int, IOError> written = WriteAllText("out/report.txt", "ready");
 Result<string[], IOError> files = ListFiles("data");
+Result<string[], IOError> lines = ReadAllLines("data/input.txt");
 ```
 
 - `CombinePath` performs a lexical join. It does not touch the filesystem or resolve `.`/`..`.
@@ -37,6 +38,17 @@ Result<string[], IOError> files = ListFiles("data");
   create parent directories or promise atomic replacement.
 - `ListFiles` returns complete paths for immediate regular-file children, sorted ordinally. It is
   non-recursive and excludes directories, symlinks, and other file types.
+- `ReadAllLines` recognizes LF and CRLF, returns `[]` for an empty file, and does not manufacture a
+  final empty line solely for one terminating newline. `WriteAllLines` joins with deterministic LF
+  and writes no extra final newline. `AppendAllText` creates or appends one bounded UTF-8 input.
+- `ListDirectories` returns immediate directory children in ordinal order and excludes symlinks.
+- `FileExists` and `DirectoryExists` return `Ok(false)` for missing or wrong-kind paths while
+  preserving meaningful host errors. `CreateDirectory` creates one directory only. `DeleteFile`
+  and `DeleteDirectory` report whether an entry was removed; directory deletion is non-recursive.
+
+`Path.GetFileName`, `GetDirectoryName`, `GetExtension`, and `ChangeExtension` are lexical helpers.
+They recognize `/` and `\` separators, do not access the filesystem, and do not resolve dot
+segments or symlinks.
 
 Text operations enforce an internal 64 MiB limit. After successfully opening an ordinary regular
 file, `ReadAllText` uses metadata from that handle to reject a known-oversized file before

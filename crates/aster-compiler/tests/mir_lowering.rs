@@ -74,7 +74,7 @@ fn lowers_standard_math_domain_failures_to_a_typed_intrinsic() {
             }
         })
         .collect::<Vec<_>>();
-    assert_eq!(hir_intrinsics.len(), 3);
+    assert_eq!(hir_intrinsics.len(), 4);
 
     let mir_intrinsics = compilation
         .compilation
@@ -98,6 +98,7 @@ fn lowers_standard_math_domain_failures_to_a_typed_intrinsic() {
         mir::RuntimeErrorKind::MathAbsIntOverflow,
         mir::RuntimeErrorKind::MathAbsLongOverflow,
         mir::RuntimeErrorKind::MathClampInvalidRange,
+        mir::RuntimeErrorKind::MathSignNaN,
     ] {
         assert!(mir_intrinsics.contains(&expected));
     }

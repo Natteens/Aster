@@ -18,11 +18,12 @@ Representative export groups:
 | --- | --- |
 | `aster_rt_string_*` | Immutable UTF-8 comparison, scalar traversal, formatting, parsing, slicing, and allocation |
 | `aster_rt_array_*` | Fixed-array allocation, checked element access, and length |
-| `aster_rt_list_*` | `List<T>` allocation, length, mutation, indexed access, and structural version checks |
-| `aster_rt_dictionary_*` | `Dictionary<K,V>` allocation, key operations, length, and entry snapshots |
+| `aster_rt_list_*` | `List<T>` allocation, capacity/range mutation, indexed access, snapshots, and version checks |
+| `aster_rt_dictionary_*` | `Dictionary<K,V>` allocation, capacity, key/fallback operations, length, and snapshots |
 | `aster_rt_string_builder_*` | Explicit mutable UTF-8 construction and immutable snapshots |
 | `aster_rt_object_*` | Class-object storage |
 | `aster_rt_io_*` | Terminal and host-managed filesystem operations |
+| `aster_rt_time_*` | Allocation-free monotonic and Unix millisecond clock reads |
 | `aster_rt_temporary_scope_*` | Temporary-arena checkpoints |
 | `aster_rt_temporary_subregion_*` | Private compiler-authorized fine Temporary checkpoints |
 | arithmetic/domain-error exports | Controlled runtime failures without exceptions or unwind |
@@ -52,13 +53,23 @@ Rules:
   counts Unicode scalar values.
 
 `StringBuilder` uses a separate private native header containing its active buffer pointer, byte
-length, capacity, allocation region, and temporary-scope birth depth. Capacity starts at zero and
+length, Unicode-scalar length, capacity, allocation region, and temporary-scope birth depth. The
+scalar count is maintained during append, so public `Length` is O(1) and never exposes UTF-8 byte
+length. Capacity starts at zero and
 grows to a checked power of two only when an append does not fit. Input strings are borrowed for one
 append call. `ToString()` allocates and copies an exact-size ordinary string, so immutable strings
 never alias builder storage. Its private append ABI takes context, builder, and string pointers and
 returns `I8`: exactly `1` means the append completed with no runtime error; `0` means an error was
 already present or the runtime recorded one. Generated code branches on that result directly; the
 runtime remains the sole authority for validation, growth, allocation, and diagnostics.
+Scalar append entry points share the immutable conversion formatter but write into a bounded stack
+buffer and pass its bytes directly to that same builder authority, avoiding both an intermediate
+host `String` and an intermediate ASTER string allocation.
+
+Fallible context-taking intrinsics transfer to the current generated runtime-failure block before
+generated code loads or otherwise consumes an out destination. Ordinary semantic outcomes such as
+`TryParse` returning `Option.None` or filesystem APIs returning `Result.Error` are fully initialized
+values, not runtime failures. The current failure block retains AARM/owned-region cleanup authority.
 
 Fallible private collection mutations and out-producing `List<T>` and `Dictionary<K,V>` calls return
 an `I8` success status. Generated code branches on that status before loading an out destination such
@@ -66,6 +77,13 @@ as `List.Get` or `TryGet`'s `Option<T>`. Dictionary operations with a source-lev
 use a private tri-state result instead: `0` is runtime failure, `1` is successful `false`, and `2` is
 successful `true`. These statuses are compiler/runtime control flow, not public ASTER values or a
 second diagnostic authority; `ExecutionContext` still owns first-error state.
+
+Bulk string intrinsics validate immutable UTF-8/array inputs, use checked size arithmetic, select
+the current allocation region, and publish only fully initialized strings or `char[]` values.
+Filesystem list/text/result intrinsics similarly write a complete typed `Result` destination only
+after the operation succeeds or a complete portable `IOError` is available. New list/dictionary
+capacity and range entry points keep the same private status-first rule and MemoryGovernor/region
+authority as their existing collection operations.
 
 ## Ownership and lifetime
 
