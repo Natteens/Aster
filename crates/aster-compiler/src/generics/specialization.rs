@@ -56,7 +56,7 @@ impl Monomorphizer {
                 return type_name.to_string();
             }
             let element = &type_name.arguments[0];
-            if element.arguments.is_empty() && !element.array {
+            if element.arguments.is_empty() && element.array_depth == 0 {
                 if element.base == "void" {
                     self.diagnostics.push(
                         Diagnostic::error("`List<void>` is not supported", span)
@@ -89,7 +89,7 @@ impl Monomorphizer {
                 return type_name.to_string();
             }
             let key = &type_name.arguments[0];
-            let supported_key = !key.array
+            let supported_key = key.array_depth == 0
                 && key.arguments.is_empty()
                 && matches!(
                     key.base.as_str(),
@@ -112,7 +112,7 @@ impl Monomorphizer {
                 ));
             }
             let value = &type_name.arguments[1];
-            if value.arguments.is_empty() && !value.array && value.base == "void" {
+            if value.arguments.is_empty() && value.array_depth == 0 && value.base == "void" {
                 self.diagnostics.push(Diagnostic::error(
                     "`Dictionary<K, void>` is not supported",
                     span,
@@ -152,11 +152,12 @@ impl Monomorphizer {
             );
             return type_name.to_string();
         }
-        if type_name.array {
+        if type_name.array_depth != 0 {
+            let depth = type_name.array_depth;
             let mut element = type_name.clone();
-            element.array = false;
+            element.array_depth = 0;
             let concrete = self.instantiate_type(&element.base, &element.arguments, span);
-            return format!("{concrete}[]");
+            return format!("{concrete}{}", "[]".repeat(depth));
         }
         self.instantiate_type(&type_name.base, &type_name.arguments, span)
     }
@@ -190,7 +191,7 @@ impl Monomorphizer {
                 return TypeName {
                     base: name.to_owned(),
                     arguments: concrete.to_vec(),
-                    array: false,
+                    array_depth: 0,
                 }
                 .to_string();
             }
@@ -216,14 +217,14 @@ impl Monomorphizer {
             return TypeName {
                 base: name.to_owned(),
                 arguments: concrete.to_vec(),
-                array: false,
+                array_depth: 0,
             }
             .to_string();
         }
         let specialized = TypeName {
             base: name.to_owned(),
             arguments: concrete.to_vec(),
-            array: false,
+            array_depth: 0,
         }
         .to_string();
         // Reserve the closed identity before walking its clone. Exact self-recursion then reuses
@@ -296,6 +297,9 @@ impl Monomorphizer {
         let concrete: Vec<String> = if explicit.is_empty() {
             let mut inferred = HashMap::new();
             for (parameter, actual) in template.parameters.iter().zip(arguments) {
+                if actual.is_empty() {
+                    continue;
+                }
                 infer_type(
                     &parameter.type_ref.name,
                     actual,
@@ -414,6 +418,9 @@ impl Monomorphizer {
         let concrete = if explicit.is_empty() {
             let mut inferred = HashMap::new();
             for (parameter, actual) in template.parameters.iter().zip(arguments) {
+                if actual.is_empty() {
+                    continue;
+                }
                 infer_type(
                     &parameter.type_ref.name,
                     actual,
@@ -567,7 +574,10 @@ impl AstVisitorMut for GenericTypeConcretizer<'_> {
     fn visit_expression_mut(&mut self, expression: &mut Expression) {
         match &mut expression.kind {
             ExpressionKind::StructLiteral { type_name, .. }
-            | ExpressionKind::NewObject { type_name, .. } => {
+            | ExpressionKind::NewObject {
+                type_name: Some(type_name),
+                ..
+            } => {
                 *type_name = self
                     .monomorphizer
                     .concretize_type_name(type_name, expression.span);

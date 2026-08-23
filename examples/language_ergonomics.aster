@@ -1,0 +1,32 @@
+using aster.collections;
+
+public class Program
+{
+    public static int Sum(List<int> values, int multiplier = 1)
+    {
+        int total = 0;
+        foreach (var value in values)
+        {
+            total += value;
+        }
+        return total * multiplier;
+    }
+
+    public static List<int> Create() => new();
+
+    public static int Main()
+    {
+        List<int> values = Create();
+        values.Add(10);
+        values.Add(20);
+        values[1] += 5;
+
+        string[][] labels = [[], ["ASTER"]];
+        if (labels[0].Length != 0 || labels[1].Length != 1)
+        {
+            return 1;
+        }
+
+        return Sum(values, multiplier: 2);
+    }
+}

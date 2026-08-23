@@ -393,6 +393,10 @@ pub enum ExpressionKind {
         class_symbol: SymbolId,
         constructor: SymbolId,
         arguments: Vec<Expression>,
+        /// Parameter index for each source-ordered argument. MIR evaluates
+        /// `arguments` left-to-right, then mechanically orders the resulting
+        /// operands for the callee ABI.
+        argument_order: Vec<usize>,
     },
     ArrayLiteral(Vec<Expression>),
     NewArray {
@@ -523,6 +527,23 @@ pub enum ExpressionKind {
         index: Box<Expression>,
         value: Box<Expression>,
     },
+    /// Source list index assignment. Kept distinct from `ListSet` so MIR can
+    /// evaluate receiver/index exactly once for compound assignment while
+    /// still returning the assignment expression's value.
+    ListIndexAssignment {
+        list: Box<Expression>,
+        index: Box<Expression>,
+        operator: AssignmentOperator,
+        value: Box<Expression>,
+        element_type: Type,
+    },
+    ListIndexIncrementDecrement {
+        list: Box<Expression>,
+        index: Box<Expression>,
+        operator: IncrementOperator,
+        prefix: bool,
+        element_type: Type,
+    },
     /// Removes every element while retaining the list's reusable backing.
     ListClear {
         list: Box<Expression>,
@@ -538,11 +559,13 @@ pub enum ExpressionKind {
     Call {
         callee: Box<Expression>,
         arguments: Vec<Expression>,
+        argument_order: Vec<usize>,
     },
     /// Resolved call to one concrete host-provided declaration.
     ForeignCall {
         function: SymbolId,
         arguments: Vec<Expression>,
+        argument_order: Vec<usize>,
     },
     PropertyAssignment {
         object: Box<Expression>,

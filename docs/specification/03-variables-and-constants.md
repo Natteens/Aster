@@ -27,6 +27,9 @@ name = "Aster";
 - Assignment requires a mutable variable and a compatible value.
 - Reading a local before definite initialization is an error.
 - Redeclaring a name in the same lexical scope is an error.
+- An explicit target type supplies context to otherwise untyped `[]` and `new()` expressions.
+  `var values = [];` and `var value = new();` remain errors because neither expression can invent
+  a concrete type.
 
 ### Constant expressions (implemented)
 

@@ -116,3 +116,6 @@ of the current language.
 Generic functions may propagate official `Option` or `Result` values built from type parameters.
 Specialization substitutes those parameters before concrete HIR, MIR, layout, and backend execution,
 so unresolved generic parameters do not reach Cranelift.
+
+Propagation composes with expression-bodied functions because those bodies normalize to the same
+typed return flow as a block-bodied function; no separate propagation path is involved.

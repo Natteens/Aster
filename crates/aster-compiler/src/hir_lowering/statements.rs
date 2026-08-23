@@ -86,7 +86,14 @@ impl Lowerer<'_> {
                 // The collection is lowered before the iteration scope exists,
                 // so the element binding cannot be referenced from it.
                 let collection = self.expression(collection);
-                let element_type = self.resolve_type(element_type);
+                let element_type = element_type.as_ref().map_or_else(
+                    || match &collection.type_ {
+                        hir::Type::Array(element) | hir::Type::List(element) => (**element).clone(),
+                        hir::Type::String => hir::Type::Char,
+                        _ => hir::Type::Unknown,
+                    },
+                    |element_type| self.resolve_type(element_type),
+                );
                 let symbol = self.allocate();
                 self.symbol_types.insert(symbol, element_type.clone());
                 let element = hir::Variable {

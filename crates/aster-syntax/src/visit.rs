@@ -198,6 +198,9 @@ pub fn walk_function_declaration_mut<V: AstVisitorMut + ?Sized>(
 
 pub fn walk_parameter_mut<V: AstVisitorMut + ?Sized>(visitor: &mut V, parameter: &mut Parameter) {
     visitor.visit_type_ref_mut(&mut parameter.type_ref);
+    if let Some(default) = &mut parameter.default {
+        visitor.visit_expression_mut(default);
+    }
 }
 
 /// Visiting a type parameter's constraints as ordinary type references is what
@@ -283,7 +286,9 @@ pub fn walk_statement_mut<V: AstVisitorMut + ?Sized>(visitor: &mut V, statement:
             body,
             ..
         } => {
-            visitor.visit_type_ref_mut(element_type);
+            if let Some(element_type) = element_type {
+                visitor.visit_type_ref_mut(element_type);
+            }
             visitor.visit_expression_mut(collection);
             visitor.visit_block_mut(body);
         }
@@ -343,7 +348,7 @@ pub fn walk_expression_mut<V: AstVisitorMut + ?Sized>(
         }
         ExpressionKind::NewObject { arguments, .. } => {
             for argument in arguments {
-                visitor.visit_expression_mut(argument);
+                visitor.visit_expression_mut(&mut argument.value);
             }
         }
         ExpressionKind::Index { array, index } => {
@@ -361,7 +366,7 @@ pub fn walk_expression_mut<V: AstVisitorMut + ?Sized>(
                 visitor.visit_type_ref_mut(argument);
             }
             for argument in arguments {
-                visitor.visit_expression_mut(argument);
+                visitor.visit_expression_mut(&mut argument.value);
             }
         }
         ExpressionKind::Unary { operand, .. }

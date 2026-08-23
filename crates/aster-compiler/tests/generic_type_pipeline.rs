@@ -177,7 +177,7 @@ fn list_of_int_is_not_assignable_to_list_of_long() {
 }
 
 #[test]
-fn list_set_is_typed_while_the_indexer_remains_unavailable() {
+fn list_set_and_indexing_lower_to_typed_list_mir() {
     let compilation = aster_compiler::compile(
         "public int Run(List<int> values) { values.Set(0, 1); return values.Get(0); }",
     )
@@ -188,14 +188,14 @@ fn list_set_is_typed_while_the_indexer_remains_unavailable() {
         compilation.mir
     );
 
-    let diagnostics =
-        aster_compiler::compile("public int Run(List<int> values) { return values[0]; }")
-            .expect_err("the List indexer remains unavailable");
+    let compilation = aster_compiler::compile(
+        "public int Run(List<int> values) { values[0] = 3; return values[0]; }",
+    )
+    .expect("List indexing must compile through the existing typed ListGet/ListSet MIR");
+    let mir = format!("{:#?}", compilation.mir);
     assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("cannot be indexed")),
-        "missing the List indexer diagnostic in {diagnostics:#?}"
+        mir.contains("ListGet") && mir.contains("ListSet"),
+        "missing typed ListGet/ListSet MIR in {mir}"
     );
 }
 

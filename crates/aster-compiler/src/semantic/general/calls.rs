@@ -1,16 +1,18 @@
 use super::{
-    Analyzer, Callable, Diagnostic, Dispatch, Expression, ExpressionKind, HashSet, Primitive,
-    ResolvedCall, ResolvedDictionaryOperation, ResolvedEnumCase, ResolvedParallelFor,
-    ResolvedParallelForEach, ResolvedParallelReduce, ResolvedStringBuilderOperation,
-    ResolvedTaskRun, Signature, Span, Type, TypeKind, TypeRef, Visibility, resolve_type_readonly,
+    Analyzer, Argument, Callable, Diagnostic, Dispatch, Expression, ExpressionKind, HashSet, Model,
+    Primitive, ResolvedArguments, ResolvedCall, ResolvedDefaultArgument,
+    ResolvedDictionaryOperation, ResolvedEnumCase, ResolvedParallelFor, ResolvedParallelForEach,
+    ResolvedParallelReduce, ResolvedStringBuilderOperation, ResolvedTaskRun, Signature, Span, Type,
+    TypeKind, TypeRef, Visibility, resolve_type_readonly,
 };
 use aster_hir::StringOperation;
 
 impl Analyzer<'_> {
+    #[allow(clippy::too_many_lines)] // validates one constructor resolution transaction end to end
     pub(super) fn new_object(
         &mut self,
         type_name: &str,
-        arguments: &[Expression],
+        arguments: &[Argument],
         span: Span,
     ) -> Type {
         if type_name == "List" || type_name.starts_with("List<") {
@@ -104,10 +106,27 @@ impl Analyzer<'_> {
                 span,
             ));
         }
-        self.check_arguments(&signature.signature, arguments, span);
-        self.model
-            .constructors
-            .insert(self.model_key(span), signature.key);
+        let argument_types = arguments
+            .iter()
+            .map(|argument| {
+                if super::expressions::needs_contextual_type(argument) {
+                    Type::Unknown
+                } else {
+                    self.expression(argument)
+                }
+            })
+            .collect::<Vec<_>>();
+        if let Some((signature, plan)) = self.resolve_call_overload(
+            type_name,
+            std::slice::from_ref(&signature),
+            &argument_types,
+            arguments,
+            span,
+        ) {
+            let key = self.model_key(span);
+            self.model.constructors.insert(key.clone(), signature.key);
+            self.model.call_arguments.insert(key, plan);
+        }
         if type_name == crate::standard_library::STRING_BUILDER_NAME {
             self.model
                 .string_builder_constructions
@@ -211,6 +230,7 @@ impl Analyzer<'_> {
                 ResolvedEnumCase {
                     enum_name: enum_name.clone(),
                     case_index,
+                    argument_order: Vec::new(),
                 },
             );
             return Type::Enum(enum_name.clone());
@@ -324,12 +344,7 @@ impl Analyzer<'_> {
     }
 
     #[allow(clippy::too_many_lines)]
-    pub(super) fn call(
-        &mut self,
-        callee: &Expression,
-        arguments: &[Expression],
-        span: Span,
-    ) -> Type {
+    pub(super) fn call(&mut self, callee: &Expression, arguments: &[Argument], span: Span) -> Type {
         if let ExpressionKind::Member { object, name } = &callee.kind
             && let ExpressionKind::Name(enum_name) = &object.kind
             && let Some(info) = self.context.types.get(enum_name)
@@ -351,30 +366,32 @@ impl Analyzer<'_> {
                 }
                 return Type::Unknown;
             };
-            let actual = arguments
-                .iter()
-                .map(|argument| self.expression(argument))
-                .collect::<Vec<_>>();
-            if actual.len() != case.fields.len() {
-                self.diagnostics.push(Diagnostic::error(
-                    format!(
-                        "enum case `{enum_name}.{name}` expects {} argument(s), found {}",
-                        case.fields.len(),
-                        actual.len()
-                    ),
+            let order = bind_enum_arguments(&case.fields, arguments);
+            if order.is_none() {
+                diagnose_enum_arguments(
+                    &enum_name,
+                    name,
+                    &case.fields,
+                    arguments,
                     span,
-                ));
+                    &mut self.diagnostics,
+                );
             }
-            for ((_, expected), (actual, expression)) in
-                case.fields.iter().zip(actual.iter().zip(arguments))
-            {
-                self.require_assignable_value(expected, actual, expression);
+            let order = order.unwrap_or_else(|| (0..arguments.len()).collect());
+            for (source, parameter) in order.iter().copied().enumerate() {
+                let Some((_, expected)) = case.fields.get(parameter) else {
+                    self.expression(&arguments[source]);
+                    continue;
+                };
+                let actual = self.expression_expected(&arguments[source], Some(expected));
+                self.require_assignable_value(expected, &actual, &arguments[source]);
             }
             self.model.enum_values.insert(
                 self.model_key(span),
                 ResolvedEnumCase {
                     enum_name: enum_name.clone(),
                     case_index,
+                    argument_order: order,
                 },
             );
             return Type::Enum(enum_name);
@@ -461,7 +478,13 @@ impl Analyzer<'_> {
         }
         let argument_types = arguments
             .iter()
-            .map(|argument| self.expression(argument))
+            .map(|argument| {
+                if super::expressions::needs_contextual_type(argument) {
+                    Type::Unknown
+                } else {
+                    self.expression(argument)
+                }
+            })
             .collect::<Vec<_>>();
         let resolved = match &callee.kind {
             ExpressionKind::Name(name) => {
@@ -480,18 +503,27 @@ impl Analyzer<'_> {
                 if candidates.is_empty() && self.methods.contains_key(name) {
                     None
                 } else {
-                    self.resolve_overload(name, &candidates, &argument_types, span)
-                        .map(|callable| {
-                            let dispatch = if callable.is_static
-                                || self.context.functions.get(name).is_some_and(|items| {
-                                    items.iter().any(|item| item.key == callable.key)
-                                }) {
-                                Dispatch::Direct
-                            } else {
-                                Dispatch::Instance
-                            };
-                            (callable, dispatch)
-                        })
+                    let resolved = self.resolve_call_overload(
+                        name,
+                        &candidates,
+                        &argument_types,
+                        arguments,
+                        span,
+                    );
+                    if !candidates.is_empty() && resolved.is_none() {
+                        return Type::Unknown;
+                    }
+                    resolved.map(|(callable, plan)| {
+                        let dispatch = if callable.is_static
+                            || self.context.functions.get(name).is_some_and(|items| {
+                                items.iter().any(|item| item.key == callable.key)
+                            }) {
+                            Dispatch::Direct
+                        } else {
+                            Dispatch::Instance
+                        };
+                        (callable, dispatch, plan)
+                    })
                 }
             }
             ExpressionKind::Member { object, name } => {
@@ -513,8 +545,17 @@ impl Analyzer<'_> {
                         ));
                         None
                     } else {
-                        self.resolve_overload(name, &candidates, &argument_types, span)
-                            .map(|candidate| (candidate, Dispatch::Direct))
+                        let resolved = self.resolve_call_overload(
+                            name,
+                            &candidates,
+                            &argument_types,
+                            arguments,
+                            span,
+                        );
+                        let Some((candidate, plan)) = resolved else {
+                            return Type::Unknown;
+                        };
+                        Some((candidate, Dispatch::Direct, plan))
                     }
                 } else {
                     let receiver = self.expression(object);
@@ -828,23 +869,32 @@ impl Analyzer<'_> {
                         ));
                         return Type::Unknown;
                     }
-                    let result = self.resolve_overload(name, &candidates, &argument_types, span);
-                    if let Some(callable) = &result {
+                    let result = self.resolve_call_overload(
+                        name,
+                        &candidates,
+                        &argument_types,
+                        arguments,
+                        span,
+                    );
+                    if let Some((callable, _)) = &result {
                         self.check_member_visibility(&type_name, name, callable.visibility, span);
                     }
-                    result.map(|callable| {
+                    if result.is_none() {
+                        return Type::Unknown;
+                    }
+                    result.map(|(callable, plan)| {
                         let dispatch = if interface_dispatch {
                             Dispatch::Interface
                         } else {
                             Dispatch::Instance
                         };
-                        (callable, dispatch)
+                        (callable, dispatch, plan)
                     })
                 }
             }
             _ => None,
         };
-        let Some((callable, dispatch)) = resolved else {
+        let Some((callable, dispatch, argument_plan)) = resolved else {
             if let ExpressionKind::Name(name) = &callee.kind
                 && !self.instance_context
                 && self
@@ -902,12 +952,13 @@ impl Analyzer<'_> {
             }
         }
         self.model.calls.insert(
-            model_key,
+            model_key.clone(),
             ResolvedCall {
                 callable: callable_key,
                 dispatch,
             },
         );
+        self.model.call_arguments.insert(model_key, argument_plan);
         callable.signature.result
     }
 
@@ -949,7 +1000,7 @@ impl Analyzer<'_> {
         &mut self,
         name: &str,
         argument_types: &[Type],
-        arguments: &[Expression],
+        arguments: &[Argument],
         span: Span,
     ) -> Type {
         let (operation, parameters, result) = match (name, argument_types.len()) {
@@ -1161,6 +1212,220 @@ impl Analyzer<'_> {
         Some((*best).clone())
     }
 
+    #[allow(clippy::too_many_lines)] // ranking, contextual validation, and default planning stay atomic
+    fn resolve_call_overload(
+        &mut self,
+        name: &str,
+        candidates: &[Callable],
+        argument_types: &[Type],
+        arguments: &[Argument],
+        span: Span,
+    ) -> Option<(Callable, ResolvedArguments)> {
+        let mut ranked = candidates
+            .iter()
+            .filter_map(|candidate| {
+                let mapping = bind_arguments(candidate, arguments)?;
+                let score =
+                    mapping
+                        .iter()
+                        .enumerate()
+                        .try_fold(0u32, |score, (source, parameter)| {
+                            let expected = &candidate.signature.parameters[*parameter];
+                            let actual = &argument_types[source];
+                            if super::expressions::needs_contextual_type(&arguments[source]) {
+                                self.contextual_argument_compatible(&arguments[source], expected)
+                                    .then_some(score)
+                            } else if expected == actual {
+                                Some(score)
+                            } else if *actual == Type::Unknown {
+                                Some(score + 2)
+                            } else if self.compatible(expected, actual) {
+                                Some(score + 1)
+                            } else {
+                                None
+                            }
+                        })?;
+                Some((score, candidate, mapping))
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by_key(|(score, candidate, _)| (*score, candidate.key.declaration_start));
+        let Some((best_score, candidate, mapping)) = ranked.first().cloned() else {
+            if let [candidate] = candidates {
+                self.diagnose_argument_binding(candidate, arguments, span);
+                if let Some(mapping) = bind_arguments(candidate, arguments) {
+                    for (source, parameter) in mapping.into_iter().enumerate() {
+                        let expected = &candidate.signature.parameters[parameter];
+                        let actual =
+                            if super::expressions::needs_contextual_type(&arguments[source]) {
+                                self.expression_expected(&arguments[source], Some(expected))
+                            } else {
+                                argument_types[source].clone()
+                            };
+                        self.require_assignable_value(expected, &actual, &arguments[source]);
+                    }
+                }
+            } else {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!("no overload of `{name}` accepts these arguments"),
+                        span,
+                    )
+                    .with_help("check argument names, required parameters, and exact types"),
+                );
+            }
+            return None;
+        };
+        if ranked
+            .get(1)
+            .is_some_and(|(score, _, _)| *score == best_score)
+        {
+            self.diagnostics.push(
+                Diagnostic::error(format!("call to `{name}` is ambiguous"), span)
+                    .with_help("use explicit argument types or names that select one overload"),
+            );
+            return None;
+        }
+
+        for (source, parameter) in mapping.iter().copied().enumerate() {
+            let expected = &candidate.signature.parameters[parameter];
+            let actual = if super::expressions::needs_contextual_type(&arguments[source]) {
+                self.expression_expected(&arguments[source], Some(expected))
+            } else {
+                argument_types[source].clone()
+            };
+            self.require_assignable_value(expected, &actual, &arguments[source]);
+        }
+
+        let mut defaults = Vec::new();
+        let supplied = mapping.iter().copied().collect::<HashSet<_>>();
+        for (parameter, default) in candidate.defaults.iter().enumerate() {
+            if supplied.contains(&parameter) {
+                continue;
+            }
+            let Some(default) = default else {
+                continue;
+            };
+            // Defaults belong to the declaration, not to the caller's local
+            // scope. A caller-local constant with the same spelling must not
+            // capture or alter an omitted argument.
+            let resolve = |name: &str| {
+                self.context
+                    .globals
+                    .get(name)
+                    .and_then(|binding| binding.value.clone())
+            };
+            if let Ok(value) = super::evaluate(default, &resolve) {
+                defaults.push(ResolvedDefaultArgument {
+                    parameter,
+                    value: value.coerce_to(&candidate.signature.parameters[parameter].display()),
+                });
+            }
+        }
+        Some((
+            candidate.clone(),
+            ResolvedArguments {
+                source_to_parameter: mapping,
+                defaults,
+            },
+        ))
+    }
+
+    /// Candidate-specific contextual checking must consider the complete
+    /// expression, including already-typed siblings beside `[]`/`new()`.
+    /// Analyze against a scratch model so overload probing cannot initialize
+    /// bindings, emit diagnostics, or leave a losing candidate's resolutions
+    /// in the real semantic model.
+    fn contextual_argument_compatible(&self, argument: &Expression, expected: &Type) -> bool {
+        let mut model = Model::default();
+        let mut analyzer = Analyzer {
+            context: self.context,
+            scopes: self.scopes.clone(),
+            return_type: self.return_type.clone(),
+            methods: self.methods.clone(),
+            owner: self.owner.clone(),
+            constructor: self.constructor,
+            instance_context: self.instance_context,
+            model: &mut model,
+            field_names: self.field_names.clone(),
+            diagnostics: Vec::new(),
+            loop_depth: self.loop_depth,
+            model_context: self.model_context.clone(),
+            async_state: self.async_state,
+            unsafe_depth: self.unsafe_depth,
+        };
+        let actual = analyzer.expression_expected(argument, Some(expected));
+        analyzer.require_assignable_value(expected, &actual, argument);
+        analyzer.diagnostics.is_empty()
+    }
+
+    fn diagnose_argument_binding(
+        &mut self,
+        candidate: &Callable,
+        arguments: &[Argument],
+        span: Span,
+    ) {
+        let mut occupied = vec![false; candidate.signature.parameters.len()];
+        let mut next = 0usize;
+        let mut saw_named = false;
+        for argument in arguments {
+            let parameter = if let Some(name) = &argument.name {
+                saw_named = true;
+                let Some(parameter) = candidate
+                    .parameter_names
+                    .iter()
+                    .position(|parameter| parameter == name)
+                else {
+                    self.diagnostics.push(Diagnostic::error(
+                        format!("unknown named argument `{name}`"),
+                        argument.span,
+                    ));
+                    continue;
+                };
+                parameter
+            } else {
+                if saw_named {
+                    self.diagnostics.push(Diagnostic::error(
+                        "positional arguments must precede named arguments",
+                        argument.span,
+                    ));
+                }
+                while next < occupied.len() && occupied[next] {
+                    next += 1;
+                }
+                if next == occupied.len() {
+                    self.diagnostics.push(Diagnostic::error(
+                        "too many arguments for this callable",
+                        argument.span,
+                    ));
+                    continue;
+                }
+                let parameter = next;
+                next += 1;
+                parameter
+            };
+            if std::mem::replace(&mut occupied[parameter], true) {
+                self.diagnostics.push(Diagnostic::error(
+                    format!(
+                        "parameter `{}` is supplied more than once",
+                        candidate.parameter_names[parameter]
+                    ),
+                    argument.span,
+                ));
+            }
+        }
+        for (parameter, supplied) in occupied.into_iter().enumerate() {
+            if !supplied && candidate.defaults[parameter].is_none() {
+                self.diagnostics.push(Diagnostic::error(
+                    format!(
+                        "missing required argument `{}`",
+                        candidate.parameter_names[parameter]
+                    ),
+                    span,
+                ));
+            }
+        }
+    }
+
     fn check_member_visibility(
         &mut self,
         owner: &str,
@@ -1176,7 +1441,7 @@ impl Analyzer<'_> {
         }
     }
 
-    fn logging_call(&mut self, level: LogLevel<'_>, arguments: &[Expression], span: Span) -> Type {
+    fn logging_call(&mut self, level: LogLevel<'_>, arguments: &[Argument], span: Span) -> Type {
         if matches!(level, LogLevel::Unknown("Info" | "Debug")) {
             self.diagnostics.push(
                 Diagnostic::error(format!("`Log.{}` does not exist", level.name()), span)
@@ -1202,7 +1467,7 @@ impl Analyzer<'_> {
     /// `aster.core.Task.Run(function, arguments...)`. The callable is
     /// resolved from the concrete argument types, while every runtime
     /// argument remains an ordinary caller-evaluated expression.
-    fn task_run(&mut self, arguments: &[Expression], span: Span) -> Type {
+    fn task_run(&mut self, arguments: &[Argument], span: Span) -> Type {
         let Some((target, values)) = arguments.split_first() else {
             self.diagnostics.push(Diagnostic::error(
                 "`Task.Run` expects a function argument",
@@ -1323,7 +1588,7 @@ impl Analyzer<'_> {
         }
     }
 
-    fn task_wait_all(&mut self, arguments: &[Expression], span: Span) -> Type {
+    fn task_wait_all(&mut self, arguments: &[Argument], span: Span) -> Type {
         let [tasks] = arguments else {
             self.diagnostics.push(Diagnostic::error(
                 format!(
@@ -1405,7 +1670,7 @@ impl Analyzer<'_> {
     /// normal argument evaluation happens inside `resolve_parallel_body_target`
     /// and here for `start`/`end`); `Body` must directly name a resolvable
     /// zero-capture free function or static method `void(int)`.
-    fn parallel_for(&mut self, arguments: &[Expression], span: Span) -> Type {
+    fn parallel_for(&mut self, arguments: &[Argument], span: Span) -> Type {
         let [start, end, body] = arguments else {
             self.diagnostics.push(Diagnostic::error(
                 format!(
@@ -1438,7 +1703,7 @@ impl Analyzer<'_> {
     /// `Parallel.ForEach(values, Body)`: `values` must be an array of a
     /// scalar transferable element type; `Body` must directly name a
     /// resolvable zero-capture free function or static method `void(T)`.
-    fn parallel_for_each(&mut self, arguments: &[Expression], span: Span) -> Type {
+    fn parallel_for_each(&mut self, arguments: &[Argument], span: Span) -> Type {
         let [values, body] = arguments else {
             self.diagnostics.push(Diagnostic::error(
                 format!(
@@ -1498,7 +1763,7 @@ impl Analyzer<'_> {
     /// evaluated left to right, exactly once: `values`, then `identity`;
     /// `Accumulate`/`Combine` are never evaluated as runtime expressions,
     /// only resolved structurally, exactly like `Parallel.For`/`ForEach`'s body.
-    fn parallel_reduce(&mut self, arguments: &[Expression], span: Span) -> Type {
+    fn parallel_reduce(&mut self, arguments: &[Argument], span: Span) -> Type {
         let [values, identity, accumulate_argument, combine_argument] = arguments else {
             self.diagnostics.push(Diagnostic::error(
                 format!(
@@ -1790,7 +2055,7 @@ impl Analyzer<'_> {
         }
     }
 
-    fn check_arguments(&mut self, signature: &Signature, arguments: &[Expression], span: Span) {
+    fn check_arguments(&mut self, signature: &Signature, arguments: &[Argument], span: Span) {
         if arguments.len() != signature.parameters.len() {
             self.diagnostics.push(
                 Diagnostic::error(
@@ -1808,6 +2073,136 @@ impl Analyzer<'_> {
             let expected = expected.clone();
             let actual = self.expression(argument);
             self.require_assignable_value(&expected, &actual, argument);
+        }
+    }
+}
+
+fn bind_arguments(candidate: &Callable, arguments: &[Argument]) -> Option<Vec<usize>> {
+    let mut occupied = vec![false; candidate.signature.parameters.len()];
+    let mut mapping = Vec::with_capacity(arguments.len());
+    let mut next = 0usize;
+    let mut saw_named = false;
+    for argument in arguments {
+        let parameter = if let Some(name) = &argument.name {
+            saw_named = true;
+            candidate
+                .parameter_names
+                .iter()
+                .position(|parameter| parameter == name)?
+        } else {
+            if saw_named {
+                return None;
+            }
+            while next < occupied.len() && occupied[next] {
+                next += 1;
+            }
+            if next == occupied.len() {
+                return None;
+            }
+            let parameter = next;
+            next += 1;
+            parameter
+        };
+        if std::mem::replace(&mut occupied[parameter], true) {
+            return None;
+        }
+        mapping.push(parameter);
+    }
+    if occupied
+        .iter()
+        .enumerate()
+        .any(|(parameter, supplied)| !supplied && candidate.defaults[parameter].is_none())
+    {
+        return None;
+    }
+    Some(mapping)
+}
+
+fn bind_enum_arguments(fields: &[(String, Type)], arguments: &[Argument]) -> Option<Vec<usize>> {
+    if arguments.len() != fields.len() {
+        return None;
+    }
+    let mut occupied = vec![false; fields.len()];
+    let mut order = Vec::with_capacity(arguments.len());
+    let mut next = 0usize;
+    let mut saw_named = false;
+    for argument in arguments {
+        let parameter = if let Some(name) = &argument.name {
+            saw_named = true;
+            fields.iter().position(|(field, _)| field == name)?
+        } else {
+            if saw_named {
+                return None;
+            }
+            let parameter = next;
+            next += 1;
+            parameter
+        };
+        if std::mem::replace(&mut occupied[parameter], true) {
+            return None;
+        }
+        order.push(parameter);
+    }
+    Some(order)
+}
+
+fn diagnose_enum_arguments(
+    enum_name: &str,
+    case_name: &str,
+    fields: &[(String, Type)],
+    arguments: &[Argument],
+    span: Span,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if arguments.len() != fields.len() {
+        diagnostics.push(Diagnostic::error(
+            format!(
+                "enum case `{enum_name}.{case_name}` expects {} argument(s), found {}",
+                fields.len(),
+                arguments.len()
+            ),
+            span,
+        ));
+    }
+    let mut occupied = vec![false; fields.len()];
+    let mut next = 0usize;
+    for argument in arguments {
+        let parameter = if let Some(name) = &argument.name {
+            let Some(parameter) = fields.iter().position(|(field, _)| field == name) else {
+                diagnostics.push(Diagnostic::error(
+                    format!("unknown enum payload argument `{name}`"),
+                    argument.span,
+                ));
+                continue;
+            };
+            parameter
+        } else {
+            while next < occupied.len() && occupied[next] {
+                next += 1;
+            }
+            if next == occupied.len() {
+                continue;
+            }
+            let parameter = next;
+            next += 1;
+            parameter
+        };
+        if std::mem::replace(&mut occupied[parameter], true) {
+            diagnostics.push(Diagnostic::error(
+                format!(
+                    "enum payload `{}` is supplied more than once",
+                    fields[parameter].0
+                ),
+                argument.span,
+            ));
+        }
+    }
+    for (index, supplied) in occupied.into_iter().enumerate() {
+        if !supplied {
+            diagnostics.push(Diagnostic::error(
+                format!("missing enum payload argument `{}`", fields[index].0),
+                span,
+            ));
         }
     }
 }

@@ -20,14 +20,40 @@ impl FunctionLowerer {
             hir::ExpressionKind::EnumValue {
                 case, tag, fields, ..
             } => {
-                let fields = fields
-                    .iter()
-                    .map(|field| mir::FieldOperand {
-                        field: field.field,
-                        value: self
-                            .lower_expression(&field.value)
-                            .expect("validated enum payload produces a value"),
-                    })
+                // Named payloads remain in source order through HIR so their
+                // expressions retain ordinary left-to-right evaluation. MIR's
+                // enum layout is declaration ordered, so materialize every
+                // value first and only then permute the inert operands.
+                let declared = self
+                    .enum_cases
+                    .get(case)
+                    .expect("validated enum case has a declaration")
+                    .fields
+                    .clone();
+                let mut ordered = std::iter::repeat_with(|| None)
+                    .take(declared.len())
+                    .collect::<Vec<Option<mir::FieldOperand>>>();
+                for field in fields {
+                    let value = self
+                        .lower_expression(&field.value)
+                        .expect("validated enum payload produces a value");
+                    let position = declared
+                        .iter()
+                        .position(|candidate| candidate.symbol == field.field)
+                        .expect("validated enum payload names a declared field");
+                    assert!(
+                        ordered[position]
+                            .replace(mir::FieldOperand {
+                                field: field.field,
+                                value,
+                            })
+                            .is_none(),
+                        "validated enum payload initializes each field once"
+                    );
+                }
+                let fields = ordered
+                    .into_iter()
+                    .map(|field| field.expect("validated enum payload initializes every field"))
                     .collect();
                 Some(self.temporary(
                     expression.type_.clone(),
@@ -42,11 +68,13 @@ impl FunctionLowerer {
                 class_symbol,
                 constructor,
                 arguments,
+                argument_order,
             } => Some(self.lower_new_object(
                 &expression.type_,
                 *class_symbol,
                 *constructor,
                 arguments,
+                argument_order,
             )),
             hir::ExpressionKind::ArrayLiteral(elements) => {
                 Some(self.lower_array_literal(&expression.type_, elements))
@@ -353,6 +381,28 @@ impl FunctionLowerer {
                 self.instruction(mir::Instruction::ListSet { list, index, value });
                 None
             }
+            hir::ExpressionKind::ListIndexAssignment {
+                list,
+                index,
+                operator,
+                value,
+                element_type,
+            } => {
+                Some(self.lower_list_index_assignment(list, index, *operator, value, element_type))
+            }
+            hir::ExpressionKind::ListIndexIncrementDecrement {
+                list,
+                index,
+                operator,
+                prefix,
+                element_type,
+            } => Some(self.lower_list_index_increment_decrement(
+                list,
+                index,
+                *operator,
+                *prefix,
+                element_type,
+            )),
             hir::ExpressionKind::ListClear { list } => {
                 let list = self
                     .lower_expression(list)
@@ -442,20 +492,17 @@ impl FunctionLowerer {
                     .expect("validated ToString receiver produces a value");
                 Some(self.stringify(receiver))
             }
-            hir::ExpressionKind::Call { callee, arguments } => {
-                self.lower_call(callee, arguments, &expression.type_)
-            }
+            hir::ExpressionKind::Call {
+                callee,
+                arguments,
+                argument_order,
+            } => self.lower_call(callee, arguments, argument_order, &expression.type_),
             hir::ExpressionKind::ForeignCall {
                 function,
                 arguments,
+                argument_order,
             } => {
-                let arguments = arguments
-                    .iter()
-                    .map(|argument| {
-                        self.lower_expression(argument)
-                            .expect("validated foreign arguments produce values")
-                    })
-                    .collect();
+                let arguments = self.lower_ordered_arguments(arguments, argument_order);
                 let destination = if expression.type_ == hir::Type::Void {
                     None
                 } else {
@@ -1061,6 +1108,7 @@ impl FunctionLowerer {
         class: hir::SymbolId,
         constructor: hir::SymbolId,
         arguments: &[hir::Expression],
+        argument_order: &[usize],
     ) -> mir::Operand {
         let local = self.new_temporary(type_.clone());
         let place = mir::Place::Local(local);
@@ -1074,11 +1122,7 @@ impl FunctionLowerer {
             kind: mir::OperandKind::Copy(place.clone()),
         };
         let mut lowered = vec![receiver.clone()];
-        lowered.extend(
-            arguments
-                .iter()
-                .filter_map(|argument| self.lower_expression(argument)),
-        );
+        lowered.extend(self.lower_ordered_arguments(arguments, argument_order));
         self.instruction(mir::Instruction::Call {
             destination: None,
             function: constructor,
@@ -1207,7 +1251,7 @@ impl FunctionLowerer {
         }
     }
 
-    fn lower_list_get(
+    pub(super) fn lower_list_get(
         &mut self,
         list: mir::Operand,
         index: mir::Operand,

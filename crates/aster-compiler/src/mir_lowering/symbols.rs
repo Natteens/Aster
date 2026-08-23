@@ -197,6 +197,7 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
             class_symbol,
             constructor,
             arguments,
+            ..
         } => {
             note(max, *class_symbol);
             note(max, *constructor);
@@ -283,11 +284,15 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
             collect_expression(dictionary, max);
         }
         hir::ExpressionKind::ListRemoveAt { list, index }
-        | hir::ExpressionKind::ListGet { list, index, .. } => {
+        | hir::ExpressionKind::ListGet { list, index, .. }
+        | hir::ExpressionKind::ListIndexIncrementDecrement { list, index, .. } => {
             collect_expression(list, max);
             collect_expression(index, max);
         }
-        hir::ExpressionKind::ListSet { list, index, value } => {
+        hir::ExpressionKind::ListSet { list, index, value }
+        | hir::ExpressionKind::ListIndexAssignment {
+            list, index, value, ..
+        } => {
             collect_expression(list, max);
             collect_expression(index, max);
             collect_expression(value, max);
@@ -327,7 +332,9 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
             note(max, *symbol);
             collect_expression(object, max);
         }
-        hir::ExpressionKind::Call { callee, arguments } => {
+        hir::ExpressionKind::Call {
+            callee, arguments, ..
+        } => {
             collect_expression(callee, max);
             for argument in arguments {
                 collect_expression(argument, max);
@@ -336,6 +343,7 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
         hir::ExpressionKind::ForeignCall {
             function,
             arguments,
+            ..
         }
         | hir::ExpressionKind::TaskRun {
             function,

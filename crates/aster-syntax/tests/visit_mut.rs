@@ -1,10 +1,10 @@
 use aster_diagnostics::Span;
 use aster_syntax::{
-    Accessor, AssignmentOperator, BinaryOperator, Block, EnumCase, EnumDeclaration, Expression,
-    ExpressionKind, Field, FieldInitializer, FunctionDeclaration, IncrementOperator, Item, Literal,
-    Member, Module, NamespaceDeclaration, Parameter, Property, Statement, SwitchCase,
-    TypeDeclaration, TypeParameter, TypeRef, UnaryOperator, UsingDeclaration, VariableDeclaration,
-    VariableKind, Visibility,
+    Accessor, Argument, AssignmentOperator, BinaryOperator, Block, EnumCase, EnumDeclaration,
+    Expression, ExpressionKind, Field, FieldInitializer, FunctionDeclaration, IncrementOperator,
+    Item, Literal, Member, Module, NamespaceDeclaration, Parameter, Property, Statement,
+    SwitchCase, TypeDeclaration, TypeParameter, TypeRef, UnaryOperator, UsingDeclaration,
+    VariableDeclaration, VariableKind, Visibility,
     visit::{
         AstVisitorMut, walk_enum_declaration_mut, walk_expression_mut,
         walk_function_declaration_mut, walk_item_mut, walk_switch_case_mut,
@@ -34,6 +34,7 @@ fn name(value: &str, position: usize) -> Expression {
     }
 }
 
+#[allow(clippy::too_many_lines)] // one fixture intentionally exercises every nested expression shape
 fn expression_tree() -> Expression {
     Expression {
         kind: ExpressionKind::Assignment {
@@ -43,15 +44,19 @@ fn expression_tree() -> Expression {
                         kind: ExpressionKind::Member {
                             object: Box::new(Expression {
                                 kind: ExpressionKind::NewObject {
-                                    type_name: "Object<T>".to_owned(),
-                                    arguments: vec![Expression {
-                                        kind: ExpressionKind::StructLiteral {
-                                            type_name: "Value<U>".to_owned(),
-                                            fields: vec![FieldInitializer {
-                                                name: "payload".to_owned(),
-                                                value: literal(101),
-                                                span: span(102),
-                                            }],
+                                    type_name: Some("Object<T>".to_owned()),
+                                    arguments: vec![Argument {
+                                        name: None,
+                                        value: Expression {
+                                            kind: ExpressionKind::StructLiteral {
+                                                type_name: "Value<U>".to_owned(),
+                                                fields: vec![FieldInitializer {
+                                                    name: "payload".to_owned(),
+                                                    value: literal(101),
+                                                    span: span(102),
+                                                }],
+                                            },
+                                            span: span(103),
                                         },
                                         span: span(103),
                                     }],
@@ -92,17 +97,21 @@ fn expression_tree() -> Expression {
                                         type_ref("Call<T>", 113),
                                         type_ref("CallArray<U>[]", 114),
                                     ],
-                                    arguments: vec![Expression {
-                                        kind: ExpressionKind::ArrayLiteral(vec![
-                                            Expression {
-                                                kind: ExpressionKind::NewArray {
-                                                    element_type: type_ref("Element<T>", 115),
-                                                    length: Box::new(literal(116)),
+                                    arguments: vec![Argument {
+                                        name: None,
+                                        value: Expression {
+                                            kind: ExpressionKind::ArrayLiteral(vec![
+                                                Expression {
+                                                    kind: ExpressionKind::NewArray {
+                                                        element_type: type_ref("Element<T>", 115),
+                                                        length: Box::new(literal(116)),
+                                                    },
+                                                    span: span(117),
                                                 },
-                                                span: span(117),
-                                            },
-                                            name("arrayValue", 118),
-                                        ]),
+                                                name("arrayValue", 118),
+                                            ]),
+                                            span: span(119),
+                                        },
                                         span: span(119),
                                     }],
                                 },
@@ -227,6 +236,7 @@ fn fixture() -> Module {
         parameters: vec![Parameter {
             type_ref: type_ref("Parameter<T>", 59),
             name: "input".to_owned(),
+            default: None,
             span: span(60),
         }],
         body: Some(body),
@@ -284,6 +294,7 @@ fn fixture() -> Module {
                 parameters: vec![Parameter {
                     type_ref: type_ref("Constructor<T>", 76),
                     name: "value".to_owned(),
+                    default: None,
                     span: span(77),
                 }],
                 body: Some(nested_block(78)),
@@ -345,6 +356,7 @@ fn fixture() -> Module {
                     fields: vec![Parameter {
                         type_ref: type_ref("EnumPayload<T>", 87),
                         name: "value".to_owned(),
+                        default: None,
                         span: span(88),
                     }],
                     span: span(89),
@@ -409,7 +421,10 @@ impl AstVisitorMut for RecordingVisitor {
         match &mut expression.kind {
             ExpressionKind::Name(value) => value.insert_str(0, "ref::"),
             ExpressionKind::StructLiteral { type_name, .. }
-            | ExpressionKind::NewObject { type_name, .. } => type_name.insert_str(0, "ref::"),
+            | ExpressionKind::NewObject {
+                type_name: Some(type_name),
+                ..
+            } => type_name.insert_str(0, "ref::"),
             _ => {}
         }
         walk_expression_mut(self, expression);
@@ -498,5 +513,97 @@ fn shared_traversal_reaches_every_current_child_shape() {
             .type_refs
             .iter()
             .all(|name| !name.starts_with("type::"))
+    );
+}
+
+#[test]
+fn traversal_reaches_defaults_named_values_target_new_and_inferred_foreach() {
+    #[derive(Default)]
+    struct ChildProbe(Vec<String>);
+
+    impl AstVisitorMut for ChildProbe {
+        fn visit_expression_mut(&mut self, expression: &mut Expression) {
+            if let ExpressionKind::Name(name) = &expression.kind {
+                self.0.push(name.clone());
+            }
+            walk_expression_mut(self, expression);
+        }
+    }
+
+    let mut module = Module {
+        namespace: None,
+        usings: Vec::new(),
+        items: vec![Item::Function(FunctionDeclaration {
+            constructor: false,
+            is_test: false,
+            is_static: false,
+            is_async: false,
+            is_foreign: false,
+            type_parameters: Vec::new(),
+            visibility: Visibility::Public,
+            return_type: type_ref("List<int>", 200),
+            name: "Build".to_owned(),
+            parameters: vec![Parameter {
+                type_ref: type_ref("int", 201),
+                name: "value".to_owned(),
+                default: Some(name("defaultValue", 202)),
+                span: span(203),
+            }],
+            body: Some(Block {
+                statements: vec![
+                    Statement::ForEach {
+                        element_type: None,
+                        element_name: "item".to_owned(),
+                        collection: name("collection", 204),
+                        body: Block {
+                            statements: vec![Statement::Expression(Expression {
+                                kind: ExpressionKind::Call {
+                                    callee: Box::new(name("Use", 205)),
+                                    type_arguments: Vec::new(),
+                                    arguments: vec![Argument {
+                                        name: Some("value".to_owned()),
+                                        value: name("argumentValue", 206),
+                                        span: span(207),
+                                    }],
+                                },
+                                span: span(208),
+                            })],
+                            span: span(209),
+                        },
+                        span: span(210),
+                    },
+                    Statement::Return {
+                        value: Some(Expression {
+                            kind: ExpressionKind::NewObject {
+                                type_name: None,
+                                arguments: vec![Argument {
+                                    name: Some("capacity".to_owned()),
+                                    value: name("constructorValue", 211),
+                                    span: span(212),
+                                }],
+                            },
+                            span: span(213),
+                        }),
+                        span: span(214),
+                    },
+                ],
+                span: span(215),
+            }),
+            span: span(216),
+        })],
+    };
+
+    let mut probe = ChildProbe::default();
+    probe.visit_module_mut(&mut module);
+    probe.0.sort();
+    assert_eq!(
+        probe.0,
+        [
+            "Use",
+            "argumentValue",
+            "collection",
+            "constructorValue",
+            "defaultValue",
+        ]
     );
 }

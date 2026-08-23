@@ -296,6 +296,73 @@ impl Analyzer<'_> {
     }
 
     pub(super) fn expression(&mut self, expression: &Expression) -> Type {
+        self.expression_expected(expression, None)
+    }
+
+    pub(super) fn expression_expected(
+        &mut self,
+        expression: &Expression,
+        expected: Option<&Type>,
+    ) -> Type {
+        match (&expression.kind, expected) {
+            (ExpressionKind::ArrayLiteral(elements), Some(Type::Array(element)))
+                if elements.is_empty() =>
+            {
+                self.model
+                    .contextual_empty_array_elements
+                    .insert(self.model_key(expression.span), element.display());
+                Type::Array(element.clone())
+            }
+            (ExpressionKind::ArrayLiteral(elements), Some(Type::Array(element)))
+                if elements.iter().any(needs_contextual_type) =>
+            {
+                for value in elements {
+                    let actual = self.expression_expected(value, Some(element));
+                    self.require_assignable_value(element, &actual, value);
+                }
+                Type::Array(element.clone())
+            }
+            (
+                ExpressionKind::NewObject {
+                    type_name: None,
+                    arguments,
+                },
+                Some(expected @ (Type::Class(_) | Type::List(_) | Type::Dictionary(_, _))),
+            ) => {
+                let type_name = expected.display();
+                self.model
+                    .contextual_new_types
+                    .insert(self.model_key(expression.span), type_name.clone());
+                self.new_object(&type_name, arguments, expression.span)
+            }
+            (
+                ExpressionKind::Conditional {
+                    condition,
+                    when_true,
+                    when_false,
+                },
+                Some(expected),
+            ) => self.conditional(condition, when_true, when_false, Some(expected)),
+            (
+                ExpressionKind::Switch {
+                    value,
+                    cases,
+                    default,
+                },
+                Some(expected),
+            ) => self.switch_expression(
+                value,
+                cases,
+                default.as_deref(),
+                expression.span,
+                Some(expected),
+            ),
+            _ => self.expression_synthesized(expression),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // central exhaustive expression-kind dispatch
+    fn expression_synthesized(&mut self, expression: &Expression) -> Type {
         match &expression.kind {
             ExpressionKind::Literal(literal) => self.literal(literal, expression.span),
             ExpressionKind::StructLiteral { type_name, fields } => {
@@ -309,7 +376,23 @@ impl Analyzer<'_> {
             ExpressionKind::NewObject {
                 type_name,
                 arguments,
-            } => self.new_object(type_name, arguments, expression.span),
+            } => {
+                if let Some(type_name) = type_name {
+                    self.new_object(type_name, arguments, expression.span)
+                } else {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "target-typed `new()` requires an expected constructible type",
+                            expression.span,
+                        )
+                        .with_help("use an explicit target type or write `new Type(...)`"),
+                    );
+                    for argument in arguments {
+                        self.expression(argument);
+                    }
+                    Type::Unknown
+                }
+            }
             ExpressionKind::Index { array, index } => self.index(array, index, expression.span),
             ExpressionKind::Name(name) => self.name(name, expression.span),
             ExpressionKind::This => self.this_expression(expression.span),
@@ -371,12 +454,12 @@ impl Analyzer<'_> {
                 condition,
                 when_true,
                 when_false,
-            } => self.conditional(condition, when_true, when_false),
+            } => self.conditional(condition, when_true, when_false, None),
             ExpressionKind::Switch {
                 value,
                 cases,
                 default,
-            } => self.switch_expression(value, cases, default.as_deref(), expression.span),
+            } => self.switch_expression(value, cases, default.as_deref(), expression.span, None),
             ExpressionKind::Cast { target, operand } => self.cast(target, operand, expression.span),
             ExpressionKind::Binary {
                 left,
@@ -477,12 +560,12 @@ impl Analyzer<'_> {
         }
         let mut initialized = HashSet::new();
         for field in fields {
-            let actual = self.expression(&field.value);
             if !initialized.insert(field.name.as_str()) {
                 self.diagnostics.push(Diagnostic::error(
                     format!("field `{}` is initialized more than once", field.name),
                     field.span,
                 ));
+                self.expression(&field.value);
                 continue;
             }
             let Some(expected) = info.fields.get(&field.name) else {
@@ -490,8 +573,10 @@ impl Analyzer<'_> {
                     format!("struct `{type_name}` has no field `{}`", field.name),
                     field.span,
                 ));
+                self.expression(&field.value);
                 continue;
             };
+            let actual = self.expression_expected(&field.value, Some(expected));
             if info.field_visibility.get(&field.name) != Some(&Visibility::Public) {
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -557,12 +642,6 @@ impl Analyzer<'_> {
             return Type::Unknown;
         };
         let element_type = self.expression(first);
-        if matches!(element_type, Type::Array(_)) {
-            self.diagnostics.push(
-                Diagnostic::error("nested arrays are not implemented", span)
-                    .with_help("use a one-dimensional array of scalar or struct values"),
-            );
-        }
         for element in &elements[1..] {
             let actual = self.expression(element);
             self.require_assignable_value(&element_type, &actual, element);
@@ -621,13 +700,17 @@ impl Analyzer<'_> {
         let index_type = self.expression(index);
         if index_type != Type::Int && index_type != Type::Unknown {
             self.diagnostics.push(
-                Diagnostic::error("array index must have type `int`", index.span)
+                Diagnostic::error("index must have type `int`", index.span)
                     .with_help("convert the index to `int`"),
             );
         }
         if constant_integer(index).is_some_and(|value| value < 0) {
             self.diagnostics.push(Diagnostic::error(
-                "array index cannot be negative",
+                if matches!(&array_type, Type::List(_)) {
+                    "list index cannot be negative"
+                } else {
+                    "array index cannot be negative"
+                },
                 index.span,
             ));
         }
@@ -645,6 +728,10 @@ impl Analyzer<'_> {
         }
         match array_type {
             Type::Array(element) => *element,
+            Type::List(element) => {
+                self.model.list_indexes.insert(self.model_key(span));
+                *element
+            }
             Type::Unknown => Type::Unknown,
             other => {
                 self.diagnostics.push(Diagnostic::error(
@@ -808,6 +895,23 @@ impl Analyzer<'_> {
             IncrementOperator::Increment => "++",
             IncrementOperator::Decrement => "--",
         };
+        if matches!(operand.kind, ExpressionKind::Index { .. }) {
+            let operand_type = self.expression(operand);
+            if self
+                .model
+                .list_indexes
+                .contains(&self.model_key(operand.span))
+            {
+                if operand_type.is_numeric() || operand_type == Type::Unknown {
+                    return operand_type;
+                }
+                self.diagnostics.push(Diagnostic::error(
+                    format!("`{symbol}` requires a numeric list element"),
+                    span,
+                ));
+                return Type::Unknown;
+            }
+        }
         let ExpressionKind::Name(name) = &operand.kind else {
             let operand_type = self.expression(operand);
             if operand_type != Type::Unknown {
@@ -868,6 +972,7 @@ impl Analyzer<'_> {
         condition: &Expression,
         when_true: &Expression,
         when_false: &Expression,
+        expected: Option<&Type>,
     ) -> Type {
         let condition_type = self.expression(condition);
         if condition_type != Type::Bool && condition_type != Type::Unknown {
@@ -882,8 +987,13 @@ impl Analyzer<'_> {
                 .with_help("use a boolean expression before `?`"),
             );
         }
-        let true_type = self.expression(when_true);
-        let false_type = self.expression(when_false);
+        let true_type = self.expression_expected(when_true, expected);
+        let false_type = self.expression_expected(when_false, expected);
+        if let Some(expected) = expected {
+            self.require_assignable_value(expected, &true_type, when_true);
+            self.require_assignable_value(expected, &false_type, when_false);
+            return expected.clone();
+        }
         if true_type == Type::Unknown || false_type == Type::Unknown {
             return Type::Unknown;
         }
@@ -922,6 +1032,7 @@ impl Analyzer<'_> {
         cases: &[aster_syntax::SwitchExpressionCase],
         default: Option<&Expression>,
         span: Span,
+        expected: Option<&Type>,
     ) -> Type {
         let selected = self.expression(value);
         let Type::Enum(enum_name) = selected else {
@@ -938,10 +1049,10 @@ impl Analyzer<'_> {
                 );
             }
             for case in cases {
-                self.expression(&case.value);
+                self.expression_expected(&case.value, expected);
             }
             if let Some(default) = default {
-                self.expression(default);
+                self.expression_expected(default, expected);
             }
             return Type::Unknown;
         };
@@ -988,13 +1099,19 @@ impl Analyzer<'_> {
                     );
                 }
             }
-            let arm_type = self.expression(&case.value);
+            let arm_type = self.expression_expected(&case.value, expected);
+            if let Some(expected) = expected {
+                self.require_assignable_value(expected, &arm_type, &case.value);
+            }
             self.scopes.pop();
             result_type = Some(self.switch_result_type(result_type, arm_type, case.value.span));
         }
         if let Some(default) = default {
             self.validate_switch_coverage(&enum_cases, &covered, Some(default.span), span);
-            let arm_type = self.expression(default);
+            let arm_type = self.expression_expected(default, expected);
+            if let Some(expected) = expected {
+                self.require_assignable_value(expected, &arm_type, default);
+            }
             result_type = Some(self.switch_result_type(result_type, arm_type, default.span));
         } else {
             self.validate_switch_coverage(&enum_cases, &covered, None, span);
@@ -1006,6 +1123,7 @@ impl Analyzer<'_> {
             ));
             Type::Unknown
         });
+        let result_type = expected.cloned().unwrap_or(result_type);
         if result_type != Type::Unknown {
             self.model
                 .switch_expression_types
@@ -1227,9 +1345,95 @@ impl Analyzer<'_> {
         value: &Expression,
         span: Span,
     ) -> Type {
-        let value_type = self.expression(value);
+        let contextual_target = if operator == AssignmentOperator::Assign {
+            match &target.kind {
+                ExpressionKind::Name(name) => self
+                    .binding(name)
+                    .map(|binding| binding.type_.clone())
+                    .or_else(|| {
+                        self.owner.as_ref().and_then(|owner| {
+                            self.context
+                                .types
+                                .get(owner)
+                                .and_then(|info| info.properties.get(name))
+                                .map(|property| property.type_.clone())
+                        })
+                    }),
+                ExpressionKind::Index { array, .. } => match self.expression(array) {
+                    Type::Array(element) | Type::List(element) => Some(*element),
+                    _ => None,
+                },
+                ExpressionKind::Member { object, name } => {
+                    let object_type = if matches!(object.kind, ExpressionKind::This) {
+                        self.owner.as_ref().map_or(Type::Unknown, |owner| {
+                            match self.context.types.get(owner).and_then(|info| info.kind) {
+                                Some(TypeKind::Class) => Type::Class(owner.clone()),
+                                Some(TypeKind::Interface) => Type::Interface(owner.clone()),
+                                Some(TypeKind::Struct) => Type::User(owner.clone()),
+                                _ => Type::Unknown,
+                            }
+                        })
+                    } else {
+                        self.expression(object)
+                    };
+                    match object_type {
+                        Type::User(owner) | Type::Class(owner) | Type::Interface(owner) => {
+                            self.context.types.get(&owner).and_then(|info| {
+                                info.fields.get(name).cloned().or_else(|| {
+                                    info.properties
+                                        .get(name)
+                                        .map(|property| property.type_.clone())
+                                })
+                            })
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let value_type = self.expression_expected(value, contextual_target.as_ref());
         if let ExpressionKind::Name(name) = &target.kind
             && self.instance_context
+            && let Some(owner) = self.owner.clone()
+            && let Some(property) = self
+                .context
+                .types
+                .get(&owner)
+                .and_then(|info| info.properties.get(name))
+                .cloned()
+        {
+            return self.assign_property(
+                &owner,
+                name,
+                property,
+                operator,
+                &value_type,
+                value,
+                span,
+                target.span,
+            );
+        }
+        if let ExpressionKind::Member { object, name } = &target.kind
+            && matches!(object.kind, ExpressionKind::This)
+            && self.field_names.contains(name)
+        {
+            let field_type = self
+                .binding(name)
+                .map_or(Type::Unknown, |binding| binding.type_.clone());
+            if operator != AssignmentOperator::Assign {
+                self.name(name, target.span);
+            }
+            let result = self.assignment_types(operator, field_type, &value_type, value, span);
+            if let Some(binding) = self.binding_mut(name) {
+                binding.initialized = true;
+            }
+            return result;
+        }
+        if let ExpressionKind::Member { object, name } = &target.kind
+            && matches!(object.kind, ExpressionKind::This)
             && let Some(owner) = self.owner.clone()
             && let Some(property) = self
                 .context
@@ -1336,22 +1540,6 @@ impl Analyzer<'_> {
                 }
                 _ => {}
             }
-        }
-        if let ExpressionKind::Member { object, name } = &target.kind
-            && matches!(object.kind, ExpressionKind::This)
-            && self.field_names.contains(name)
-        {
-            let field_type = self
-                .binding(name)
-                .map_or(Type::Unknown, |binding| binding.type_.clone());
-            if operator != AssignmentOperator::Assign {
-                self.name(name, target.span);
-            }
-            let result = self.assignment_types(operator, field_type, &value_type, value, span);
-            if let Some(binding) = self.binding_mut(name) {
-                binding.initialized = true;
-            }
-            return result;
         }
         if let Some(name) = self.foreach_readonly_binding(target) {
             self.diagnostics.push(
@@ -1572,5 +1760,26 @@ impl Analyzer<'_> {
             .iter_mut()
             .rev()
             .find_map(|scope| scope.get_mut(name))
+    }
+}
+
+pub(super) fn needs_contextual_type(expression: &Expression) -> bool {
+    match &expression.kind {
+        ExpressionKind::ArrayLiteral(elements) => {
+            elements.is_empty() || elements.iter().any(needs_contextual_type)
+        }
+        ExpressionKind::NewObject {
+            type_name: None, ..
+        } => true,
+        ExpressionKind::Conditional {
+            when_true,
+            when_false,
+            ..
+        } => needs_contextual_type(when_true) || needs_contextual_type(when_false),
+        ExpressionKind::Switch { cases, default, .. } => {
+            cases.iter().any(|case| needs_contextual_type(&case.value))
+                || default.as_deref().is_some_and(needs_contextual_type)
+        }
+        _ => false,
     }
 }

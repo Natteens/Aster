@@ -159,6 +159,12 @@ Semantic analysis owns overload selection and records a stable callable identity
 HIR receives an already resolved static, instance, interface, constructor, getter, or setter target;
 MIR and Cranelift do not repeat overload lookup. Property accessors lower as ordinary functions, and
 field initializer assignments are inserted at the beginning of constructors in declaration order.
+Expected types also resolve contextual `[]` and `new()` before HIR. Expression bodies normalize to
+ordinary blocks, `foreach (var ...)` retains the existing concrete iteration node, and List index
+syntax selects the existing checked List operations. Named arguments are recorded in source
+evaluation order with a compile-time parameter permutation; omitted defaults are appended as
+constants. MIR evaluates every supplied expression once and emits the ordinary positional ABI, so
+no argument names, default-expression AST, or source-only ergonomic marker reaches Cranelift.
 Aggregate equality is explicit MIR: structs compare typed fields recursively, class/array references
 compare pointer identity, and interfaces compare their object word.
 

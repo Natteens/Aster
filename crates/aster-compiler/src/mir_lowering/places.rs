@@ -2,6 +2,83 @@ use super::expressions::{compound_operator, one_constant};
 use super::{FunctionLowerer, hir, mir};
 
 impl FunctionLowerer {
+    pub(super) fn lower_list_index_assignment(
+        &mut self,
+        list: &hir::Expression,
+        index: &hir::Expression,
+        operator: hir::AssignmentOperator,
+        value: &hir::Expression,
+        element_type: &hir::Type,
+    ) -> mir::Operand {
+        let list = self
+            .lower_expression(list)
+            .expect("validated list receiver produces a value");
+        let index = self
+            .lower_expression(index)
+            .expect("validated list index produces a value");
+        let assigned = if operator == hir::AssignmentOperator::Assign {
+            self.lower_expression(value)
+                .expect("validated list assignment value produces a value")
+        } else {
+            let current = self.lower_list_get(list.clone(), index.clone(), element_type);
+            let right = self
+                .lower_expression(value)
+                .expect("validated list assignment value produces a value");
+            self.temporary(
+                element_type.clone(),
+                mir::RvalueKind::Binary {
+                    left: current,
+                    operator: compound_operator(operator),
+                    right,
+                },
+            )
+        };
+        self.instruction(mir::Instruction::ListSet {
+            list,
+            index,
+            value: assigned.clone(),
+        });
+        assigned
+    }
+
+    pub(super) fn lower_list_index_increment_decrement(
+        &mut self,
+        list: &hir::Expression,
+        index: &hir::Expression,
+        operator: hir::IncrementOperator,
+        prefix: bool,
+        element_type: &hir::Type,
+    ) -> mir::Operand {
+        let list = self
+            .lower_expression(list)
+            .expect("validated list receiver produces a value");
+        let index = self
+            .lower_expression(index)
+            .expect("validated list index produces a value");
+        let old = self.lower_list_get(list.clone(), index.clone(), element_type);
+        let step = match operator {
+            hir::IncrementOperator::Increment => mir::BinaryOperator::Add,
+            hir::IncrementOperator::Decrement => mir::BinaryOperator::Subtract,
+        };
+        let updated = self.temporary(
+            element_type.clone(),
+            mir::RvalueKind::Binary {
+                left: old.clone(),
+                operator: step,
+                right: mir::Operand {
+                    type_: element_type.clone(),
+                    kind: mir::OperandKind::Constant(one_constant(element_type)),
+                },
+            },
+        );
+        self.instruction(mir::Instruction::ListSet {
+            list,
+            index,
+            value: updated.clone(),
+        });
+        if prefix { updated } else { old }
+    }
+
     pub(super) fn place_operand(&mut self, expression: &hir::Expression) -> mir::Operand {
         mir::Operand {
             type_: expression.type_.clone(),

@@ -55,9 +55,10 @@ type-parameters     = "<" , identifier , { "," , identifier } , ">" ;
    parameter accepts at most one clause, and every listed type must be a
    non-generic interface. *)
 where-clause        = "where" , identifier , ":" , type , { "," , type } ;
-function-tail       = parameters , { where-clause } , block ;
+function-tail       = parameters , { where-clause } , executable-body ;
+executable-body     = block | "=>" , expression , ";" ;
 parameters          = "(" , [ parameter , { "," , parameter } ] , ")" ;
-parameter           = type , identifier ;
+parameter           = type , identifier , [ "=" , expression ] ;
 type-arguments      = "<" , type , { "," , type } , ">" ;
 
 namespace-variable  = variable-declaration ;
@@ -89,7 +90,7 @@ for-initializer     = type , identifier , [ "=" , expression ]
                     | "var" , identifier , [ "=" , expression ]
                     | "const" , type , identifier , [ "=" , expression ]
                     | expression ;
-foreach-statement   = "foreach" , "(" , type , identifier , "in" ,
+foreach-statement   = "foreach" , "(" , ( type | "var" ) , identifier , "in" ,
                       expression , ")" , block ;
 switch-statement    = "switch" , "(" , expression , ")" , "{" ,
                       { switch-case } , [ default-case ] , "}" ;
@@ -121,14 +122,15 @@ postfix             = primary , { "." , identifier | "[" , expression , "]"
                                 | call-suffix | "++" | "--" | try-propagation } ;
 call-suffix         = [ type-arguments ] , arguments ;
 try-propagation     = "?" ;  (* Result propagation; see below *)
-arguments           = "(" , [ expression , { "," , expression } ] , ")" ;
+arguments           = "(" , [ argument , { "," , argument } ] , ")" ;
+argument            = [ identifier , ":" ] , expression ;
 primary             = literal | enum-value | struct-literal | array-literal | new-array | new-object
                     | "this" | identifier | "(" , expression , ")" ;
 struct-literal      = named-type , "{" , field-value , { "," , field-value } , "}" ;
 field-value         = identifier , ":" , expression ;
 array-literal       = "[" , [ expression , { "," , expression } ] , "]" ;
 new-array           = "new" , element-type , "[" , expression , "]" ;
-new-object          = "new" , named-type , arguments ;
+new-object          = "new" , [ named-type ] , arguments ;
 enum-value          = named-type , "." , identifier , [ arguments ] ;
 assignment-op       = "=" | "+=" | "-=" | "*=" | "/=" ;
 literal             = integer , [ "L" | "l" | "U" | "u" | unsigned-long-suffix ]
@@ -138,7 +140,7 @@ literal             = integer , [ "L" | "l" | "U" | "u" | unsigned-long-suffix ]
 unsigned-long-suffix = ( "U" | "u" ) , ( "L" | "l" )
                      | ( "L" | "l" ) , ( "U" | "u" ) ;
 
-type                = element-type , [ "[" , "]" ] | "void" ;
+type                = element-type , { "[" , "]" } | "void" ;
 element-type        = "bool" | "sbyte" | "byte" | "short" | "ushort"
                     | "int" | "uint" | "long" | "ulong" | "float" | "double"
                     | "decimal" | "char" | "string" | named-type ;
@@ -194,15 +196,21 @@ visitors; it is not a general pattern-matching or expression-shape restriction.
 - Named struct literals require every public field exactly once. Nested finite structs,
   field projections, value copies, parameters and internal aggregate returns are executable.
 - Homogeneous fixed-length arrays support literals, zeroed `new T[length]`, checked indexing,
-  element writes, reference assignment, parameters, internal returns, read-only `Length`, and
-  compiler-known `foreach`.
-- `List<T>` supports construction, `Length`, `Add`, `Get`, `RemoveAt`, and fail-fast `foreach`.
+  element writes, nested array types, reference assignment, parameters, internal returns,
+  read-only `Length`, and compiler-known `foreach` with explicit or inferred element types.
+- An exact expected type can contextualize `[]`, nested empty array literals, and `new()` in
+  initializers, assignments, returns, conditional/switch arms, and selected call candidates.
+- `List<T>` supports construction, `Length`, `Add`, `Get`, `RemoveAt`, checked index syntax, and
+  fail-fast `foreach`.
   `Dictionary<K, V>` supports its official key types, lookup/update/removal, and entry snapshots.
 - Classes support one constructor, arena allocation, reference identity, declaration-order field
   initializers, instance and static methods, explicit properties, implicit instance receivers, and
   explicit `this`. Static fields and auto-properties are not accepted.
-- Functions and methods may overload parameter signatures. Exact matches precede safe implicit
-  conversions; ties are errors, and return types do not distinguish overloads.
+- Executable namespace functions and class, struct, static, and generic methods may use block or
+  expression bodies. Functions and methods may overload parameter signatures, accept positional
+  arguments followed by named arguments, and declare trailing compile-time defaults. Exact
+  matches precede safe implicit conversions; ties are errors, and return types do not distinguish
+  overloads.
 - Equality compares scalar and string values, comparable struct fields recursively, array/class
   reference identity, and the underlying object identity of interfaces.
 - Immutable strings support `string + string`, `+=`, Unicode-scalar `foreach`, and read-only
@@ -226,7 +234,7 @@ visitors; it is not a general pattern-matching or expression-shape restriction.
 ## Unsupported language features
 
 There is no class inheritance, interface inheritance, constructor/operator overloads, static
-fields, auto-properties, named/default arguments, general pattern matching, switch guards,
+fields, auto-properties, general pattern matching, switch guards,
 exceptions, `goto`,
 or engine lifecycle syntax. Application entry selection is a tooling rule rather than grammar:
 `aster run [FILE]` resolves one public static parameterless `Main` returning `void` or `int`, while

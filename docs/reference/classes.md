@@ -30,6 +30,19 @@ Methods and namespace-level functions may be overloaded by parameter count and t
 then documented safe implicit conversions. Equally good candidates are an error; return type never
 selects an overload. Constructor overloads remain unsupported.
 
+Executable methods may use `=> expression;`. Calls and the single supported constructor accept
+positional arguments followed by named arguments, and trailing parameters may have compile-time
+constant defaults:
+
+```aster
+public static int Scale(int value, int factor = 2) => value * factor;
+Player player = new(health: 100);
+```
+
+Named argument expressions evaluate left to right in source order. Target-typed `new()` is accepted
+when an initializer, assignment, return, or selected call candidate supplies one exact class or
+collection type.
+
 A `static class` is only a container for static methods. It has no instances, fields,
 constructors, properties, interfaces, or instance methods:
 
@@ -48,5 +61,5 @@ There is no inheritance, `base`, virtual dispatch, static fields, auto-propertie
 independent freeing, or `null`.
 
 Classes may declare type parameters, such as `Box<T>`. Every construction names a closed type,
-`new Box<int>(42)`, and each closed class has its own fields and methods while retaining the same
+`new Box<int>(42)` (or `Box<int> box = new(42);`), and each closed class has its own fields and methods while retaining the same
 ExecutionContext-owned reference semantics. See [generic types](generic-types.md).

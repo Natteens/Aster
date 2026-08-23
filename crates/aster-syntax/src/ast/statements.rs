@@ -34,7 +34,9 @@ pub enum Statement {
         span: Span,
     },
     ForEach {
-        element_type: TypeRef,
+        /// `None` represents `var`; semantic analysis derives the concrete
+        /// element type from the iterable before HIR is produced.
+        element_type: Option<TypeRef>,
         element_name: String,
         collection: Expression,
         body: Block,

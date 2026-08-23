@@ -96,6 +96,7 @@ struct Monomorphizer {
     /// satisfaction. Generated class specializations are added as they are
     /// produced, so `Wrapper<int>` keeps `Wrapper<T>`'s interface relation.
     class_interfaces: HashMap<String, Vec<String>>,
+    constants: HashMap<String, crate::constexpr::ConstValue>,
     diagnostics: Vec<Diagnostic>,
 }
 

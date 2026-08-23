@@ -592,6 +592,7 @@ fn accessor_function(
             vec![ast::Parameter {
                 type_ref: property.type_ref.clone(),
                 name: "value".to_owned(),
+                default: None,
                 span: accessor.span,
             }]
         },

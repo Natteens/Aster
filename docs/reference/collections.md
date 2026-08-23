@@ -5,10 +5,15 @@ an indexed control-flow graph; it does not allocate an iterator or use a public 
 
 ## `foreach`
 
-The element type is explicit:
+The element type may be explicit or inferred from the compiler-known collection:
 
 ```aster
 foreach (int value in values)
+{
+    total += value;
+}
+
+foreach (var value in values)
 {
     total += value;
 }
@@ -39,12 +44,13 @@ The complete allocation, initialization, bounds, identity, and iteration rules a
 `List<T>` is a nominal, growable reference collection:
 
 ```aster
-List<int> values = new List<int>();
+List<int> values = new();
 values.Add(10);
 values.Add(20);
-values.Set(1, 25);
+values[1] = 25;
 
-int first = values.Get(0);
+int first = values[0];
+values[0]++;
 values.RemoveAt(0);
 int[] snapshot = values.ToArray();
 values.Clear();
@@ -58,6 +64,11 @@ Assignment copies the list reference, not its elements. `Clear` preserves the li
 retain reusable backing capacity; every alias observes the empty list and subsequent `Add` calls
 reuse the same collection normally.
 
+`values[index]` is ergonomic syntax over the same checked `Get`/`Set` runtime operations. Reads,
+writes, numeric compound assignments, and numeric prefix/postfix increment/decrement are supported.
+The receiver and index are evaluated once, and a controlled failure branches before an unwritten
+`Get` result can be consumed. Dictionary and string indexing remain unsupported.
+
 `foreach` captures the list and checks its structural version as it advances. `Add` or `RemoveAt`
 through any alias during iteration fails with a controlled runtime error. The element binding is a
 copy obtained at the start of that iteration.
@@ -70,7 +81,7 @@ copy obtained at the start of that iteration.
 using aster.collections;
 using aster.core;
 
-Dictionary<string, int> counts = new Dictionary<string, int>();
+Dictionary<string, int> counts = new();
 counts.Add("aster", 1);
 counts.Set("aster", 2);
 
@@ -101,9 +112,12 @@ The snapshot storage is independent, so clearing or mutating the source collecti
 length, order, or element slots. `Dictionary.Clear()` preserves dictionary identity and reusable
 backing; newly added entries establish a new insertion order after the clear.
 
+Snapshot arrays work with inferred iteration variables, for example
+`foreach (var entry in counts.Entries())`.
+
 ## Strings
 
-`foreach (char scalar in text)` decodes immutable UTF-8 in Unicode-scalar order. Combining marks
+`foreach (char scalar in text)` and `foreach (var scalar in text)` decode immutable UTF-8 in Unicode-scalar order. Combining marks
 remain separate scalar values, and no grapheme-cluster allocation occurs. Direct string indexing is
 not supported. See [Strings](strings.md) for scalar iteration, interpolation, equality, and allocation
 behavior.

@@ -16,6 +16,7 @@ Cases are separated by commas. Construct a value through its enum type:
 ```aster
 Message quit = Message.Quit;
 Message move = Message.Move(10, 20);
+Message named = Message.Move(y: 20, x: 10);
 ```
 
 Enum values copy by value. Their numeric tag and memory layout are compiler details: ASTER does
@@ -63,6 +64,10 @@ public int Distance(Message message)
 The input is evaluated once and only the selected arm is evaluated. Arms must produce compatible
 types and are comma-separated. The same exhaustiveness and payload rules apply; `default`, when
 used, must be the final arm.
+
+When the surrounding expression supplies one exact type, switch arms receive it as context. This
+allows values such as `string[] names = mode switch { Empty => [], One => ["ASTER"], };` without
+changing exhaustiveness or evaluation rules.
 
 ```aster
 switch (message)

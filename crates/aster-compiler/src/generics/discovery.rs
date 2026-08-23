@@ -137,6 +137,7 @@ impl Monomorphizer {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // keeps one exhaustive statement traversal with one environment
     fn statement(&mut self, statement: &mut Statement, environment: &mut HashMap<String, String>) {
         match statement {
             Statement::Variable(variable) => {
@@ -200,12 +201,35 @@ impl Monomorphizer {
                 body,
                 ..
             } => {
-                if let Some(concrete) = environment.get(&element_type.name) {
+                if let Some(element_type) = element_type
+                    && let Some(concrete) = environment.get(&element_type.name)
+                {
                     element_type.name.clone_from(concrete);
                 }
-                self.expression(collection, environment);
+                let collection_type = self.expression(collection, environment);
+                let inferred_element = element_type.as_ref().map_or_else(
+                    || {
+                        collection_type
+                            .strip_suffix("[]")
+                            .map(str::to_owned)
+                            .or_else(|| {
+                                TypeName::parse(&collection_type).and_then(|type_name| {
+                                    (type_name.base == "List" && type_name.arguments.len() == 1)
+                                        .then(|| type_name.arguments[0].to_string())
+                                })
+                            })
+                            .unwrap_or_else(|| {
+                                if collection_type == "string" {
+                                    "char".to_owned()
+                                } else {
+                                    String::new()
+                                }
+                            })
+                    },
+                    |type_ref| type_ref.name.clone(),
+                );
                 let mut loop_environment = environment.clone();
-                loop_environment.insert(element_name.clone(), element_type.name.clone());
+                loop_environment.insert(element_name.clone(), inferred_element);
                 self.block(body, &mut loop_environment);
             }
             Statement::Switch {
@@ -259,9 +283,9 @@ impl Monomorphizer {
                 arguments,
             } => {
                 for argument in arguments {
-                    self.expression(argument, environment);
+                    self.expression(&mut argument.value, environment);
                 }
-                type_name.clone()
+                type_name.clone().unwrap_or_default()
             }
             ExpressionKind::Index { array, index } => {
                 let array = self.expression(array, environment);
@@ -407,7 +431,7 @@ impl Monomorphizer {
         &mut self,
         callee: &mut Expression,
         type_arguments: &mut Vec<TypeRef>,
-        arguments: &mut [Expression],
+        arguments: &mut [aster_syntax::Argument],
         span: aster_diagnostics::Span,
         environment: &HashMap<String, String>,
     ) -> String {
@@ -421,8 +445,13 @@ impl Monomorphizer {
         if is_task_run_callee(callee)
             && let Some((target, values)) = arguments.split_first_mut()
         {
-            let result =
-                self.call_expression(target, &mut Vec::new(), values, target.span, environment);
+            let result = self.call_expression(
+                &mut target.value,
+                &mut Vec::new(),
+                values,
+                target.span,
+                environment,
+            );
             return if result.is_empty() {
                 String::new()
             } else {
@@ -431,12 +460,15 @@ impl Monomorphizer {
         }
         let argument_types = arguments
             .iter_mut()
-            .map(|argument| self.expression(argument, environment))
+            .map(|argument| self.expression(&mut argument.value, environment))
             .collect::<Vec<_>>();
         if let ExpressionKind::Name(name) = &mut callee.kind
             && self.templates.contains_key(name)
         {
-            let result = self.instantiate(name, type_arguments, &argument_types, span);
+            let template = self.templates[name].clone();
+            let ordered = ordered_generic_argument_types(&template, arguments, &argument_types)
+                .unwrap_or_else(|| argument_types.clone());
+            let result = self.instantiate(name, type_arguments, &ordered, span);
             type_arguments.clear();
             if let Some((specialized, return_type)) = result {
                 *name = specialized;
@@ -471,12 +503,16 @@ impl Monomorphizer {
             let mut candidates = if type_arguments.is_empty() {
                 let inferable = templates
                     .iter()
-                    .filter(|template| method_inference_possible(template, &argument_types))
+                    .filter(|template| {
+                        method_inference_possible(template, arguments, &argument_types)
+                    })
                     .cloned()
                     .collect::<Vec<_>>();
                 let exact = inferable
                     .iter()
-                    .filter(|template| method_inferred_signature_exact(template, &argument_types))
+                    .filter(|template| {
+                        method_inferred_signature_exact(template, arguments, &argument_types)
+                    })
                     .cloned()
                     .collect::<Vec<_>>();
                 if exact.is_empty() { inferable } else { exact }
@@ -492,7 +528,12 @@ impl Monomorphizer {
                     .collect::<Vec<_>>();
                 let exact = matching_arity
                     .iter()
-                    .filter(|template| method_signature_exact(template, &concrete, &argument_types))
+                    .filter(|template| {
+                        ordered_generic_argument_types(template, arguments, &argument_types)
+                            .is_some_and(|ordered| {
+                                method_signature_exact(template, &concrete, &ordered)
+                            })
+                    })
                     .cloned()
                     .collect::<Vec<_>>();
                 if exact.is_empty() {
@@ -540,13 +581,11 @@ impl Monomorphizer {
                     return String::new();
                 }
             }
-            let result = self.instantiate_method(
-                &owner,
-                &candidates[0],
-                type_arguments,
-                &argument_types,
-                span,
-            );
+            let ordered =
+                ordered_generic_argument_types(&candidates[0], arguments, &argument_types)
+                    .unwrap_or_else(|| argument_types.clone());
+            let result =
+                self.instantiate_method(&owner, &candidates[0], type_arguments, &ordered, span);
             type_arguments.clear();
             if let Some((specialized, return_type)) = result {
                 let specialized_exact = self
@@ -680,8 +719,8 @@ impl Monomorphizer {
                 }
             }),
             ExpressionKind::This => environment.get("this").cloned().unwrap_or_default(),
-            ExpressionKind::NewObject { type_name, .. }
-            | ExpressionKind::StructLiteral { type_name, .. } => type_name.clone(),
+            ExpressionKind::NewObject { type_name, .. } => type_name.clone().unwrap_or_default(),
+            ExpressionKind::StructLiteral { type_name, .. } => type_name.clone(),
             _ => String::new(),
         }
     }
@@ -696,13 +735,25 @@ fn is_task_run_callee(callee: &Expression) -> bool {
     )
 }
 
-fn method_inference_possible(template: &FunctionDeclaration, arguments: &[String]) -> bool {
-    infer_method_arguments(template, arguments).is_some()
+fn method_inference_possible(
+    template: &FunctionDeclaration,
+    source_arguments: &[aster_syntax::Argument],
+    arguments: &[String],
+) -> bool {
+    ordered_generic_argument_types(template, source_arguments, arguments)
+        .and_then(|ordered| infer_method_arguments(template, &ordered))
+        .is_some()
 }
 
-fn method_inferred_signature_exact(template: &FunctionDeclaration, arguments: &[String]) -> bool {
-    infer_method_arguments(template, arguments)
-        .is_some_and(|concrete| method_signature_exact(template, &concrete, arguments))
+fn method_inferred_signature_exact(
+    template: &FunctionDeclaration,
+    source_arguments: &[aster_syntax::Argument],
+    arguments: &[String],
+) -> bool {
+    ordered_generic_argument_types(template, source_arguments, arguments).is_some_and(|ordered| {
+        infer_method_arguments(template, &ordered)
+            .is_some_and(|concrete| method_signature_exact(template, &concrete, &ordered))
+    })
 }
 
 fn infer_method_arguments(
@@ -717,6 +768,9 @@ fn infer_method_arguments(
     let mut inferred = HashMap::new();
     let mut diagnostics = Vec::new();
     for (parameter, actual) in template.parameters.iter().zip(arguments) {
+        if actual.is_empty() {
+            continue;
+        }
         super::infer_type(
             &parameter.type_ref.name,
             actual,
@@ -757,6 +811,52 @@ fn method_signature_exact(
         .iter()
         .zip(arguments)
         .all(|(parameter, argument)| {
-            super::substitute_name(&parameter.type_ref.name, &substitutions) == *argument
+            argument.is_empty()
+                || super::substitute_name(&parameter.type_ref.name, &substitutions) == *argument
         })
+}
+
+fn ordered_generic_argument_types(
+    template: &FunctionDeclaration,
+    arguments: &[aster_syntax::Argument],
+    types: &[String],
+) -> Option<Vec<String>> {
+    let mut ordered = vec![String::new(); template.parameters.len()];
+    let mut occupied = vec![false; template.parameters.len()];
+    let mut next = 0usize;
+    let mut saw_named = false;
+    for (argument, type_) in arguments.iter().zip(types) {
+        let parameter = if let Some(name) = &argument.name {
+            saw_named = true;
+            template
+                .parameters
+                .iter()
+                .position(|parameter| parameter.name == *name)?
+        } else {
+            if saw_named {
+                return None;
+            }
+            while next < occupied.len() && occupied[next] {
+                next += 1;
+            }
+            if next == occupied.len() {
+                return None;
+            }
+            let parameter = next;
+            next += 1;
+            parameter
+        };
+        if std::mem::replace(&mut occupied[parameter], true) {
+            return None;
+        }
+        ordered[parameter].clone_from(type_);
+    }
+    if occupied
+        .iter()
+        .enumerate()
+        .any(|(index, supplied)| !supplied && template.parameters[index].default.is_none())
+    {
+        return None;
+    }
+    Some(ordered)
 }

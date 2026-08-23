@@ -82,7 +82,7 @@ fn public_surface_rejects_wrong_constructor_and_method_shapes() {
     for (body, expected) in [
         (
             "StringBuilder builder = new StringBuilder(1); return 0;",
-            "expected 0 argument(s), found 1",
+            "too many arguments for this callable",
         ),
         (
             "StringBuilder builder = new StringBuilder(); builder.Append(1); return 0;",
@@ -90,7 +90,7 @@ fn public_surface_rejects_wrong_constructor_and_method_shapes() {
         ),
         (
             "StringBuilder builder = new StringBuilder(); builder.ToString(\"x\"); return 0;",
-            "expected 0 argument(s), found 1",
+            "too many arguments for this callable",
         ),
     ] {
         let source = format!("using aster.core; public int Main() {{ {body} }}");

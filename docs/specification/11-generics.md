@@ -164,7 +164,7 @@ Recommendation: keep invariance until real library APIs demonstrate a need.
 ## Not implemented
 
 Generic interface methods, generic constructors, non-interface constraints (`class`, `struct`,
-`new()`, numeric), variance, default arguments, partially applied types, generic class or interface
+`new()`, numeric), variance, partially applied types, generic class or interface
 inheritance, static members on generic owner types, reflection, boxing, and runtime type erasure
 remain unimplemented. Official `List<T>`, `Dictionary<K,V>`, `Option<T>`, and `Result<T,E>`
 specializations use the existing monomorphization pipeline.

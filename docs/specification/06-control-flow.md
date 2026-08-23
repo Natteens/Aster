@@ -20,6 +20,11 @@ foreach (int value in values)
 {
     total += value;
 }
+
+foreach (var value in values)
+{
+    total += value;
+}
 ```
 
 ## Rules
@@ -27,7 +32,8 @@ foreach (int value in values)
 - Conditions have type `bool`.
 - Control-flow bodies use blocks.
 - C-style `for` has initializer, condition, and update clauses.
-- `foreach (T name in expression)` requires an explicit element type.
+- `foreach (T name in expression)` checks an explicit element type; `foreach (var name in
+  expression)` infers the exact element type.
 - Arrays, `List<T>`, and strings are the only `foreach` collections.
 - The collection expression is evaluated once; no public iterator protocol is involved.
 - The iteration variable is read-only and scoped to the body.

@@ -23,8 +23,8 @@ Box<string> name = new Box<string>("Aster");
 ```
 
 `Box<int>` and `Box<string>` are different nominal types. They cannot be assigned to each other.
-Type arguments are required in annotations and after `new`; target-typed `new Box(...)` is not
-implemented.
+Type arguments are required in annotations. Construction may repeat the closed type or use an exact
+target: `Box<int> value = new Box<int>(42);` and `Box<int> value = new(42);` are equivalent.
 
 Generic structs keep value semantics:
 
@@ -88,6 +88,11 @@ public class Box<T>
 Box<string> box = new Box<string>("Aster");
 int answer = box.Choose<int>(42);
 ```
+
+Generic functions and methods may use expression bodies and named arguments. Concrete-typed
+trailing parameters may have compile-time defaults. A default whose parameter type depends on an
+open type parameter is rejected until ASTER can prove it valid for every permitted specialization;
+this does not impose a blanket ban on defaults in generic callables.
 
 Generic classes, structs, interfaces, and enums accept nominal interface-only `where` constraints,
 written after any interface list and before the body: `class Box<T> : IBox<int> where T :

@@ -139,7 +139,7 @@ fn rejects_missing_non_void_return() {
 fn validates_function_argument_count() {
     assert_error(
         "public int Add(int a, int b) { return a + b; } public int Use() { return Add(1); }",
-        "expected 2 argument(s), found 1",
+        "missing required argument `b`",
     );
 }
 

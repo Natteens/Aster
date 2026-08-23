@@ -3,8 +3,8 @@ use std::mem::discriminant;
 use aster_diagnostics::{Diagnostic, Span};
 
 use crate::{
-    Accessor, AssignmentOperator, BinaryOperator, Block, EnumCase, EnumDeclaration, Expression,
-    ExpressionKind, Field, FieldInitializer, FunctionDeclaration, IncrementOperator,
+    Accessor, Argument, AssignmentOperator, BinaryOperator, Block, EnumCase, EnumDeclaration,
+    Expression, ExpressionKind, Field, FieldInitializer, FunctionDeclaration, IncrementOperator,
     InterpolatedPart, Item, Literal, Member, Module, Parameter, Property, Statement, SwitchCase,
     SwitchExpressionCase, Token, TokenKind, TypeDeclaration, TypeParameter, TypeRef, UnaryOperator,
     VariableDeclaration, VariableKind, Visibility,
@@ -113,7 +113,7 @@ impl Parser {
                     pending.push((length, nested));
                 }
                 ExpressionKind::NewObject { arguments, .. } => {
-                    pending.extend(arguments.iter().map(|argument| (argument, nested)));
+                    pending.extend(arguments.iter().map(|argument| (&argument.value, nested)));
                 }
                 ExpressionKind::Index { array, index }
                 | ExpressionKind::Binary {
@@ -133,7 +133,7 @@ impl Parser {
                     callee, arguments, ..
                 } => {
                     pending.push((callee, nested));
-                    pending.extend(arguments.iter().map(|argument| (argument, nested)));
+                    pending.extend(arguments.iter().map(|argument| (&argument.value, nested)));
                 }
                 ExpressionKind::Conditional {
                     condition,
@@ -525,6 +525,7 @@ impl Parser {
                     owner_name.to_owned(),
                     start,
                     false,
+                    false,
                 )
                 .map(|mut constructor| {
                     constructor.constructor = true;
@@ -546,6 +547,7 @@ impl Parser {
                 name,
                 start,
                 owner == TypeKind::Interface,
+                true,
             )
             .map(Member::Method)
         } else if self.at(&TokenKind::LeftBrace) {
@@ -604,6 +606,7 @@ impl Parser {
                 name,
                 start,
                 false,
+                true,
             )
             .map(Item::Function)
         } else {
@@ -648,6 +651,7 @@ impl Parser {
         name: String,
         start: usize,
         signature_only: bool,
+        allow_expression_body: bool,
     ) -> Option<FunctionDeclaration> {
         let FunctionModifiers {
             visibility,
@@ -685,7 +689,25 @@ impl Parser {
                 span: Span::new(start, end),
             })
         } else {
-            let body = self.block()?;
+            let body = if allow_expression_body && let Some(arrow) = self.take(&TokenKind::FatArrow)
+            {
+                let expression = self.expression()?;
+                let end = self.expect(&TokenKind::Semicolon)?.span.end;
+                let statement = if return_type.name == "void" {
+                    Statement::Expression(expression)
+                } else {
+                    Statement::Return {
+                        value: Some(expression),
+                        span: Span::new(arrow.span.start, end),
+                    }
+                };
+                Block {
+                    statements: vec![statement],
+                    span: Span::new(arrow.span.start, end),
+                }
+            } else {
+                self.block()?
+            };
             let end = body.span.end.max(right_paren.span.end);
             Some(FunctionDeclaration {
                 constructor: false,
@@ -841,10 +863,19 @@ impl Parser {
             let start = self.current().span.start;
             let type_ref = self.type_ref()?;
             let (name, name_span) = self.identifier()?;
+            let default = if self.take(&TokenKind::Equal).is_some() {
+                Some(self.expression()?)
+            } else {
+                None
+            };
+            let end = default
+                .as_ref()
+                .map_or(name_span.end, |value| value.span.end);
             parameters.push(Parameter {
                 type_ref,
                 name,
-                span: Span::new(start, name_span.end),
+                default,
+                span: Span::new(start, end),
             });
             if self.take(&TokenKind::Comma).is_none() {
                 break;
@@ -1079,15 +1110,11 @@ impl Parser {
     fn foreach_statement(&mut self) -> Option<Statement> {
         let start = self.expect(&TokenKind::Foreach)?.span.start;
         self.expect(&TokenKind::LeftParen)?;
-        if self.at(&TokenKind::Var) {
-            let span = self.advance().span;
-            self.diagnostics.push(
-                Diagnostic::error("foreach requires an explicit element type", span)
-                    .with_help("write the concrete array element type before the variable name"),
-            );
-            return None;
-        }
-        let element_type = self.type_ref()?;
+        let element_type = if self.take(&TokenKind::Var).is_some() {
+            None
+        } else {
+            Some(self.type_ref()?)
+        };
         let (element_name, _) = self.identifier()?;
         self.expect(&TokenKind::In)?;
         let collection = self.expression()?;
@@ -1592,15 +1619,7 @@ impl Parser {
         mut expression: Expression,
         type_arguments: Vec<TypeRef>,
     ) -> Option<Expression> {
-        let mut arguments = Vec::new();
-        if !self.at(&TokenKind::RightParen) {
-            loop {
-                arguments.push(self.expression()?);
-                if self.take(&TokenKind::Comma).is_none() {
-                    break;
-                }
-            }
-        }
+        let arguments = self.arguments()?;
         let end = self.expect(&TokenKind::RightParen)?.span.end;
         let span = Span::new(expression.span.start, end);
         expression = Expression {
@@ -1718,7 +1737,7 @@ impl Parser {
             TokenKind::True => ExpressionKind::Literal(Literal::Boolean(true)),
             TokenKind::False => ExpressionKind::Literal(Literal::Boolean(false)),
             TokenKind::LeftBracket => return self.array_literal(token.span.start),
-            TokenKind::New => return self.new_array(token.span.start),
+            TokenKind::New => return self.new_expression(token.span.start),
             TokenKind::This => ExpressionKind::This,
             TokenKind::Identifier(name) if self.at(&TokenKind::LeftBrace) => {
                 return self.struct_literal(name, token.span.start);
@@ -1916,7 +1935,19 @@ impl Parser {
         })
     }
 
-    fn new_array(&mut self, start: usize) -> Option<Expression> {
+    fn new_expression(&mut self, start: usize) -> Option<Expression> {
+        if self.at(&TokenKind::LeftParen) {
+            self.advance();
+            let arguments = self.arguments()?;
+            let end = self.expect(&TokenKind::RightParen)?.span.end;
+            return Some(Expression {
+                kind: ExpressionKind::NewObject {
+                    type_name: None,
+                    arguments,
+                },
+                span: Span::new(start, end),
+            });
+        }
         let element_type = self.type_ref_base()?;
         if self.take(&TokenKind::LeftBracket).is_some() {
             let length = self.expression()?;
@@ -1930,23 +1961,58 @@ impl Parser {
             });
         }
         self.expect(&TokenKind::LeftParen)?;
-        let mut arguments = Vec::new();
-        if !self.at(&TokenKind::RightParen) {
-            loop {
-                arguments.push(self.expression()?);
-                if self.take(&TokenKind::Comma).is_none() {
-                    break;
-                }
-            }
-        }
+        let arguments = self.arguments()?;
         let end = self.expect(&TokenKind::RightParen)?.span.end;
         Some(Expression {
             kind: ExpressionKind::NewObject {
-                type_name: element_type.name,
+                type_name: Some(element_type.name),
                 arguments,
             },
             span: Span::new(start, end),
         })
+    }
+
+    fn arguments(&mut self) -> Option<Vec<Argument>> {
+        let mut arguments = Vec::new();
+        let mut saw_named = false;
+        if self.at(&TokenKind::RightParen) {
+            return Some(arguments);
+        }
+        loop {
+            let start = self.current().span.start;
+            let name = if matches!(self.current().kind, TokenKind::Identifier(_))
+                && self.peek(1).kind == TokenKind::Colon
+            {
+                let (name, _) = self.identifier()?;
+                self.expect(&TokenKind::Colon)?;
+                saw_named = true;
+                Some(name)
+            } else {
+                if saw_named {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "positional arguments cannot follow named arguments",
+                            self.current().span,
+                        )
+                        .with_help(
+                            "place every positional argument before the first named argument",
+                        ),
+                    );
+                }
+                None
+            };
+            let value = self.expression()?;
+            let end = value.span.end;
+            arguments.push(Argument {
+                name,
+                value,
+                span: Span::new(start, end),
+            });
+            if self.take(&TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+        Some(arguments)
     }
 
     fn generic_struct_literal_ahead(&self) -> bool {
@@ -1991,7 +2057,7 @@ impl Parser {
 
     fn type_ref_inner(&mut self) -> Option<TypeRef> {
         let mut type_ref = self.type_ref_base()?;
-        if self.take(&TokenKind::LeftBracket).is_some() {
+        while self.take(&TokenKind::LeftBracket).is_some() {
             let end = self.expect(&TokenKind::RightBracket)?.span.end;
             type_ref.name.push_str("[]");
             type_ref.span.end = end;
@@ -2064,7 +2130,7 @@ impl Parser {
         if self.peek(offset).kind == TokenKind::Less {
             offset = self.generic_arguments_end(offset)?;
         }
-        if self.peek(offset).kind == TokenKind::LeftBracket
+        while self.peek(offset).kind == TokenKind::LeftBracket
             && self.peek(offset + 1).kind == TokenKind::RightBracket
         {
             offset += 2;
@@ -2622,22 +2688,88 @@ mod tests {
         else {
             panic!("expected foreach statement");
         };
-        assert_eq!(element_type.name, "int");
+        assert_eq!(element_type.as_ref().expect("explicit type").name, "int");
         assert_eq!(element_name, "value");
         assert!(matches!(collection.kind, ExpressionKind::Name(ref name) if name == "values"));
         assert_eq!(body.statements.len(), 1);
     }
 
     #[test]
-    fn foreach_requires_an_explicit_type() {
-        let tokens =
-            lex("public void F() { foreach (var value in values) { } }").expect("lexing succeeds");
-        let diagnostics = parse(tokens).expect_err("var is not accepted by foreach");
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("explicit element type"))
+    fn foreach_accepts_var_element_type() {
+        let module = parse_source("public void F() { foreach (var value in values) { } }");
+        let Statement::ForEach { element_type, .. } = &first_function_statements(&module)[0] else {
+            panic!("expected foreach statement");
+        };
+        assert!(element_type.is_none());
+    }
+
+    #[test]
+    fn expression_bodies_normalize_to_the_existing_statement_forms() {
+        let module = parse_source(
+            "public int Double(int value) => value * 2; public void Touch(int value) => Double(value); test void Works() => Touch(1);",
         );
+        for (index, returns_value) in [(0usize, true), (1, false), (2, false)] {
+            let Item::Function(function) = &module.items[index] else {
+                panic!("expected function")
+            };
+            let body = function
+                .body
+                .as_ref()
+                .expect("expression body is executable");
+            assert_eq!(body.statements.len(), 1);
+            assert_eq!(
+                matches!(body.statements[0], Statement::Return { .. }),
+                returns_value
+            );
+        }
+    }
+
+    #[test]
+    fn parses_defaults_named_arguments_target_new_and_nested_array_types() {
+        let module = parse_source(
+            "public int[][] Build(int first, int second = 2) { List<int> values = new(); Use(second: first, first: second); return [[], []]; }",
+        );
+        let Item::Function(function) = &module.items[0] else {
+            panic!("expected function")
+        };
+        assert_eq!(function.return_type.name, "int[][]");
+        assert!(function.parameters[0].default.is_none());
+        assert!(function.parameters[1].default.is_some());
+        let statements = function.body.as_ref().expect("body").statements.as_slice();
+        let Statement::Variable(variable) = &statements[0] else {
+            panic!("expected variable")
+        };
+        assert!(matches!(
+            variable.initializer.as_ref().map(|value| &value.kind),
+            Some(ExpressionKind::NewObject {
+                type_name: None,
+                ..
+            })
+        ));
+        let Statement::Expression(call) = &statements[1] else {
+            panic!("expected call")
+        };
+        let ExpressionKind::Call { arguments, .. } = &call.kind else {
+            panic!("expected call expression")
+        };
+        assert_eq!(arguments[0].name.as_deref(), Some("second"));
+        assert_eq!(arguments[1].name.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn declaration_only_callables_reject_expression_bodies() {
+        for source in [
+            "public interface I { public int Value() => 1; }",
+            "public unsafe foreign int Native() => 1;",
+        ] {
+            let diagnostics = parse(lex(source).expect("lexing succeeds"))
+                .expect_err("declaration-only callables end with `;`");
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains("expected `;`"))
+            );
+        }
     }
 
     #[test]

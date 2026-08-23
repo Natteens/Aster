@@ -9,7 +9,7 @@ use std::fmt;
 pub(crate) struct TypeName {
     pub base: String,
     pub arguments: Vec<Self>,
-    pub array: bool,
+    pub array_depth: usize,
 }
 
 impl TypeName {
@@ -38,7 +38,7 @@ impl fmt::Display for TypeName {
             }
             formatter.write_str(">")?;
         }
-        if self.array {
+        for _ in 0..self.array_depth {
             formatter.write_str("[]")?;
         }
         Ok(())
@@ -85,11 +85,17 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let array = self.take(b'[') && self.take(b']');
+        let mut array_depth = 0usize;
+        while self.take(b'[') {
+            if !self.take(b']') {
+                return None;
+            }
+            array_depth += 1;
+        }
         Some(TypeName {
             base,
             arguments,
-            array,
+            array_depth,
         })
     }
 

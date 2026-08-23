@@ -2028,7 +2028,10 @@ impl AstVisitorMut for Rewriter<'_> {
                 }
             }
             ExpressionKind::StructLiteral { type_name, .. }
-            | ExpressionKind::NewObject { type_name, .. } => {
+            | ExpressionKind::NewObject {
+                type_name: Some(type_name),
+                ..
+            } => {
                 *type_name = self.rewrite_type_name(type_name, expression.span);
             }
             _ => {}

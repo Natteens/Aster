@@ -14,6 +14,8 @@ public int Add(int a, int b)
 {
     return a + b;
 }
+
+public int Double(int value) => value * 2;
 ```
 
 ### Class method
@@ -65,6 +67,14 @@ Interface members are public by contract and omit a redundant visibility modifie
 - A non-`void` callable returns a compatible value on every reachable path.
 - A `void` callable may use `return;` or reach the end of its body.
 - Calls supply the declared number of arguments with compatible types.
+- Executable namespace functions and class/struct/static/generic methods may use `=> expression;`.
+  It is normalized to the existing return or expression-statement semantics. Interface and foreign
+  declarations remain bodyless signatures ending in `;`.
+- Calls accept positional arguments followed by named arguments. Expressions always evaluate in
+  source order; names affect parameter placement only.
+- Trailing parameters may declare compile-time constant defaults. Required parameters cannot follow
+  an optional one. Omitted defaults are materialized before HIR/MIR, and defaults do not change
+  overload identity or break equal-best ambiguities.
 - Functions do not use `fn`, and return types do not use `->`.
 
 ## Valid design examples
@@ -114,10 +124,12 @@ direct recursion, and mutual recursion are implemented end to end (all signature
 declared before any body is compiled, so declaration order does not matter). Duplicate
 function signatures may be overloaded. Class instance methods and one
 user-declared constructor per class are executable in the JIT with an implicit receiver;
-`this` exposes that receiver explicitly. Static methods execute without a receiver. Exact overload
+`this` exposes that receiver explicitly. Static and struct methods execute with their established
+receiver semantics. Exact overload
 matches win before safe implicit conversions; an equal best match is diagnosed, and return type
-alone never distinguishes an overload. Struct methods, default/named arguments, constructor
-overloads remain future work.
+alone never distinguishes an overload. Named/default arguments share this resolver for functions,
+methods, interface dispatch, and the single supported constructor. Constructor overloads remain
+future work.
 
 Recursion is supported with a per-execution limit of 1,024 simultaneously active calls through a
 recursive call cycle. Exceeding it is a controlled runtime failure rather than a native stack
@@ -139,15 +151,6 @@ GPU work, or ECS lifecycle. `check`, `dump-hir`, and `dump-mir` do not require a
 libraries are valid compilation targets.
 
 ## OPEN QUESTIONS
-
-### PROPOSED — Overloads and optional arguments
-
-1. **No overloading/defaults** — simplest resolution and diagnostics; repetitive APIs.
-2. **Overloads only** — familiar type-directed APIs; ambiguity rules become necessary.
-3. **Overloads plus named/default arguments** — expressive; considerably expands call resolution.
-
-**Recommendation:** PROPOSED — begin without overloads or defaults, then evaluate named arguments
-before type-directed overloads.
 
 ### PROPOSED — Function values and closures
 

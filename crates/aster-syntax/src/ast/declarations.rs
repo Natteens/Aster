@@ -120,10 +120,14 @@ pub struct TypeParameter {
     pub constraints: Vec<TypeRef>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Parameter {
     pub type_ref: TypeRef,
     pub name: String,
+    /// Compile-time call-site default. Semantic analysis validates that this
+    /// is a constant compatible with `type_ref`; it never reaches the runtime
+    /// as declaration metadata.
+    pub default: Option<Expression>,
     pub span: Span,
 }
 

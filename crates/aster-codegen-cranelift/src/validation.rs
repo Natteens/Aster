@@ -4896,9 +4896,6 @@ fn executable_value_type(type_: &mir::Type) -> bool {
 
 fn validate_value_type(type_: &mir::Type, function_name: &str) -> Result<(), BackendError> {
     if let mir::Type::Array(element) = type_ {
-        if matches!(**element, mir::Type::Array(_)) {
-            return Err(unsupported(function_name, "nested arrays"));
-        }
         return validate_value_type(element, function_name);
     }
     if let mir::Type::List(element) = type_ {

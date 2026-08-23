@@ -2,8 +2,7 @@
 
 ## Objective
 
-Define proposed expression forms, evaluation order, and operator categories without
-claiming precedence or overflow behavior that has not been decided.
+Define implemented expression forms, evaluation order, and operator categories.
 
 ## Proposed syntax
 
@@ -29,21 +28,25 @@ int result = calculate(10, 20);
 - Implemented precedence, lowest to highest: assignment, `?:`, `||`, `&&`, equality,
   comparison, additive, multiplicative, unary (`!`, unary `-`, prefix `++`/`--`), postfix
   (member access, call, postfix `++`/`--`).
+- Calls evaluate the receiver and then argument expressions left to right in source order. Named
+  arguments map those already-evaluated values into parameter positions.
+- Empty `[]` and target-typed `new()` use one exact expected type from an explicit initializer,
+  assignment, return, selected call candidate, or contextual conditional/switch arm. They remain
+  errors without that context.
+- `List<T>` indexing uses the existing checked `Get`/`Set` semantics for reads, writes, compound
+  assignments, and prefix/postfix `++`/`--`. Receiver and index expressions are evaluated once.
 
-## Proposed rules
+## General rules
 
 - Literals, names, member access, indexing, calls, unary operations, binary operations,
   assignments, and parenthesized expressions are proposed expression forms.
-- Function arguments are proposed to evaluate from left to right.
-- Short-circuiting is proposed for `&&` and `||`.
+- Function arguments evaluate from left to right.
+- Short-circuiting applies to `&&` and `||`.
 - Assignment requires a writable place expression on the left.
 - Proposed arithmetic operators are `+`, `-`, `*`, `/`, and `%`.
 - Proposed comparison operators are `==`, `!=`, `<`, `<=`, `>`, and `>=`.
 - Proposed compound assignments include `+=`, `-=`, `*=`, `/=`, and `%=`.
 - No implicit truthiness is proposed; conditions require `bool`.
-
-Operator precedence is intentionally not fixed by this draft. Parentheses should be used
-where the intended grouping would otherwise depend on an open decision.
 
 ## Valid design examples
 
@@ -63,9 +66,4 @@ if (count) { }              // int has no proposed truthiness conversion
 
 ## OPEN QUESTIONS
 
-- **OPEN QUESTION:** What is the complete precedence and associativity table?
-- **OPEN QUESTION:** Are assignments expressions with values or statements only?
-- **OPEN QUESTION:** How do integer overflow, division by zero, and floating-point edge cases behave?
-- **OPEN QUESTION:** Which explicit cast syntax is used?
 - **OPEN QUESTION:** Are operator overloading, ranges, and lambdas supported? (The conditional expression `?:` is accepted above.)
-- **OPEN QUESTION:** Are method calls syntax sugar for free functions or a distinct dispatch feature?

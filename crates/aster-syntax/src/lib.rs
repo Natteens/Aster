@@ -7,8 +7,8 @@ mod token;
 pub mod visit;
 
 pub use ast::{
-    Accessor, AssignmentOperator, BinaryOperator, Block, EnumCase, EnumDeclaration, Expression,
-    ExpressionKind, Field, FieldInitializer, FunctionDeclaration, IncrementOperator,
+    Accessor, Argument, AssignmentOperator, BinaryOperator, Block, EnumCase, EnumDeclaration,
+    Expression, ExpressionKind, Field, FieldInitializer, FunctionDeclaration, IncrementOperator,
     InterpolatedPart, Item, Literal, Member, Module, NamespaceDeclaration, Parameter, Property,
     Statement, SwitchCase, SwitchExpressionCase, TypeDeclaration, TypeParameter, TypeRef,
     UnaryOperator, UsingDeclaration, VariableDeclaration, VariableKind, Visibility,

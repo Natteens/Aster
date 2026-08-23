@@ -66,6 +66,7 @@ impl Monomorphizer {
         let mut diagnostics = Vec::new();
         let mut declarations = HashMap::new();
         let mut class_interfaces = HashMap::new();
+        let mut constants = HashMap::new();
         // The constraint inventory is built in its own pass, ahead of template
         // discovery: a call site requesting a specialization can appear in
         // `module.items` before the class it names, so satisfaction cannot rely
@@ -105,6 +106,15 @@ impl Monomorphizer {
             }
         }
         for item in &module.items {
+            if let Item::Variable(variable) = item
+                && let aster_syntax::VariableKind::Constant(type_ref) = &variable.kind
+                && let Some(initializer) = &variable.initializer
+            {
+                let resolve = |name: &str| constants.get(name).cloned();
+                if let Ok(value) = crate::constexpr::evaluate(initializer, &resolve) {
+                    constants.insert(variable.name.clone(), value.coerce_to(&type_ref.name));
+                }
+            }
             match item {
                 Item::Function(function) => {
                     let generic = !function.type_parameters.is_empty();
@@ -216,6 +226,7 @@ impl Monomorphizer {
             generated_types: Vec::new(),
             declarations,
             class_interfaces,
+            constants,
             diagnostics,
         }
     }
@@ -229,10 +240,12 @@ impl Monomorphizer {
         let mut reported = Vec::new();
         for template in self.templates.values() {
             self.validate_type_parameters(&template.type_parameters, &mut reported);
+            self.validate_generic_parameter_defaults(template, &[], &mut reported);
         }
         for ((owner, _), templates) in &self.method_templates {
             for method in templates {
                 self.validate_type_parameters(&method.type_parameters, &mut reported);
+                self.validate_generic_parameter_defaults(method, &[], &mut reported);
                 if self
                     .declarations
                     .get(owner)
@@ -264,6 +277,11 @@ impl Monomorphizer {
             self.validate_type_parameters(&declaration.type_parameters, &mut reported);
             for member in &declaration.members {
                 if let Member::Method(method) = member {
+                    self.validate_generic_parameter_defaults(
+                        method,
+                        &declaration.type_parameters,
+                        &mut reported,
+                    );
                     if !method.type_parameters.is_empty() {
                         self.validate_type_parameters(&method.type_parameters, &mut reported);
                         if matches!(template, GenericTypeTemplate::Interface(_)) {
@@ -345,7 +363,7 @@ impl Monomorphizer {
                 );
                 continue;
             };
-            if type_name.array {
+            if type_name.array_depth != 0 {
                 reported.push(not_an_interface(name, "an array type", constraint.span));
                 continue;
             }
@@ -387,4 +405,139 @@ impl Monomorphizer {
             }
         }
     }
+}
+
+/// Open templates are removed before semantic analysis, so declaration-level
+/// default invariants that depend on genericity must be checked while the
+/// template still exists. Concrete defaults remain subject to the ordinary
+/// semantic constant/type validation after specialization.
+impl Monomorphizer {
+    fn validate_generic_parameter_defaults(
+        &self,
+        function: &FunctionDeclaration,
+        owner_parameters: &[TypeParameter],
+        reported: &mut Vec<Diagnostic>,
+    ) {
+        let parameter_names = function
+            .type_parameters
+            .iter()
+            .chain(owner_parameters)
+            .map(|parameter| parameter.name.as_str())
+            .collect::<Vec<_>>();
+        let mut saw_default = false;
+        for parameter in &function.parameters {
+            match &parameter.default {
+                Some(_) => {
+                    saw_default = true;
+                    if type_mentions_parameter(&parameter.type_ref.name, &parameter_names) {
+                        reported.push(
+                        Diagnostic::error(
+                            format!(
+                                "default for generic-dependent parameter `{}` cannot be proven valid for every specialization",
+                                parameter.name
+                            ),
+                            parameter.span,
+                        )
+                        .with_help(
+                            "use a concrete parameter type or require the caller to supply the value",
+                        ),
+                    );
+                        continue;
+                    }
+                    let default = parameter.default.as_ref().expect("matched default");
+                    let resolve = |name: &str| self.constants.get(name).cloned();
+                    match crate::constexpr::evaluate(default, &resolve) {
+                        Ok(value) => {
+                            if !constant_assignable(&value, &parameter.type_ref.name) {
+                                reported.push(Diagnostic::error(
+                                    format!(
+                                        "expected `{}`, found `{}`",
+                                        parameter.type_ref.name,
+                                        constant_type_name(&value)
+                                    ),
+                                    default.span,
+                                ));
+                            }
+                        }
+                        Err(crate::constexpr::ConstError::NotConstant(span)) => reported.push(
+                            Diagnostic::error(
+                                "default values must be compile-time constant expressions",
+                                span,
+                            )
+                            .with_help(
+                                "use literals, namespace constants, operators, `?:`, or casts",
+                            ),
+                        ),
+                        Err(crate::constexpr::ConstError::Overflow(span, type_name)) => reported
+                            .push(Diagnostic::error(
+                                format!("default value overflows `{type_name}`"),
+                                span,
+                            )),
+                        Err(crate::constexpr::ConstError::DivisionByZero(span)) => {
+                            reported.push(Diagnostic::error("default value divides by zero", span));
+                        }
+                    }
+                }
+                None if saw_default => reported.push(
+                    Diagnostic::error(
+                        format!(
+                            "required parameter `{}` cannot follow an optional parameter",
+                            parameter.name
+                        ),
+                        parameter.span,
+                    )
+                    .with_help("move required parameters before parameters with defaults"),
+                ),
+                None => {}
+            }
+        }
+    }
+}
+
+fn type_mentions_parameter(name: &str, parameters: &[&str]) -> bool {
+    fn contains(type_name: &TypeName, parameters: &[&str]) -> bool {
+        parameters.contains(&type_name.base.as_str())
+            || type_name
+                .arguments
+                .iter()
+                .any(|argument| contains(argument, parameters))
+    }
+    TypeName::parse(name).is_some_and(|type_name| contains(&type_name, parameters))
+}
+
+fn constant_type_name(value: &crate::constexpr::ConstValue) -> &'static str {
+    use crate::constexpr::ConstValue;
+    match value {
+        ConstValue::Integer(_, primitive) => primitive.name(),
+        ConstValue::Float(_) => "float",
+        ConstValue::Double(_) => "double",
+        ConstValue::Bool(_) => "bool",
+        ConstValue::Char(_) => "char",
+        ConstValue::Str(_) => "string",
+        ConstValue::Decimal(_) => "decimal",
+    }
+}
+
+fn constant_assignable(value: &crate::constexpr::ConstValue, expected: &str) -> bool {
+    use crate::constexpr::ConstValue;
+    let Some(expected) = crate::primitives::from_name(expected) else {
+        return false;
+    };
+    let actual = match value {
+        ConstValue::Integer(value, actual) => {
+            if expected.is_integer() {
+                return expected
+                    .integer_range()
+                    .is_some_and(|(minimum, maximum)| *value >= minimum && *value <= maximum);
+            }
+            *actual
+        }
+        ConstValue::Float(_) => crate::primitives::Primitive::Float,
+        ConstValue::Double(_) => crate::primitives::Primitive::Double,
+        ConstValue::Bool(_) => crate::primitives::Primitive::Bool,
+        ConstValue::Char(_) => crate::primitives::Primitive::Char,
+        ConstValue::Str(_) => crate::primitives::Primitive::String,
+        ConstValue::Decimal(_) => crate::primitives::Primitive::Decimal,
+    };
+    actual == expected || crate::primitives::implicit_converts(actual, expected)
 }

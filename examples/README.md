@@ -53,6 +53,13 @@ into the compiler repository, so run the commands below from the repository root
    aster run examples/result_propagation.aster
    ```
 
+9. **Language ergonomics** combines contextual construction, expression-bodied methods,
+   `foreach (var ...)`, checked list indexing, named arguments, and defaults.
+
+   ```console
+   aster run examples/language_ergonomics.aster
+   ```
+
 ## Multifile projects
 
 Manifest-based projects can be checked and run from their own directory without passing a source

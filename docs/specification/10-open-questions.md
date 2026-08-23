@@ -57,6 +57,10 @@ Build-profile filtering and its manifest schema remain `PROPOSED`; see `12-loggi
 ### Callables — ACCEPTED
 
 - Module functions, class methods, struct methods, and interface callable members coexist.
+- Executable functions and methods may use a block or `=> expression;`; declaration-only interface
+  and foreign signatures remain bodyless.
+- Calls support deterministic source-order positional/named arguments and compile-time trailing
+  defaults through candidate-specific overload resolution.
 - Applications use one public static parameterless `Main` returning `void` or `int`; an optional
   `Aster.toml` may select `namespace.Class.Main`, and `--function` is an explicit tooling override.
 - A `static class` is a non-instantiable container containing only static methods.

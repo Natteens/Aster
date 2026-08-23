@@ -43,6 +43,19 @@ public int LineTotal(int unitPrice, int quantity)
 }
 ```
 
+Executable functions and methods may use an expression body, and calls support named arguments
+and trailing compile-time defaults:
+
+```aster
+public int LineTotal(int unitPrice, int quantity, int multiplier = 1)
+    => unitPrice * quantity * multiplier;
+
+int total = LineTotal(12, 4, multiplier: 2);
+```
+
+Argument expressions still evaluate once, from left to right as written. Names select parameters;
+they do not reorder effects.
+
 Variables must be initialized before use. Constant expressions are evaluated by the compiler, with
 diagnostics for overflow and division by zero. Numeric conversions are implicit only when every
 source value can be represented exactly; lossy conversions require an explicit cast.
@@ -120,7 +133,23 @@ public int SumScores()
 }
 ```
 
-`List<T>` grows explicitly through `Add`, while `Dictionary<K, V>` provides insertion, lookup,
+An exact expected array or object type can supply omitted construction detail. Empty arrays remain
+non-null values, and `var` still requires an initializer that can determine its own type:
+
+```aster
+string[][] groups = [[], ["ASTER"]];
+List<int> values = new();
+values.Add(10);
+values[0]++;
+
+foreach (var value in values)
+{
+    scores[0] += value;
+}
+```
+
+`List<T>` grows explicitly through `Add` and uses the same checked runtime operations for
+`values[index]`, while `Dictionary<K, V>` provides insertion, lookup,
 replacement, removal, and insertion-order entry snapshots. `foreach` works over arrays, lists, and
 strings without a public iterator or hidden iterator allocation.
 

@@ -104,7 +104,7 @@ fn invalid_class_programs_have_specific_diagnostics() {
         ),
         (
             "public class C { public C(int x) {} } public int Run() { C c = new C(); return 0; }",
-            "expected 1 argument",
+            "missing required argument `x`",
         ),
         (
             "public class C { public C(int x) {} } public int Run() { C c = new C(false); return 0; }",

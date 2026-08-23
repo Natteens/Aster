@@ -12,6 +12,9 @@ Result<int, string> ok = Result<int, string>.Ok(42);
 Result<int, string> error = Result<int, string>.Error("invalid value");
 ```
 
+Enum payload constructors use the ordinary named-argument rule, so a payload may also be written as
+`Option<int>.Some(value: 42)`. The names are compile-time call metadata and do not change enum layout.
+
 | Container | Continue case | Early-return case | Enclosing function |
 | --- | --- | --- | --- |
 | `Option<T>` | `Some(T value)` | `None` | `Option<U>` |

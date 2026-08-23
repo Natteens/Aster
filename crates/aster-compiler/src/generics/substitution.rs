@@ -24,7 +24,7 @@ fn substitute_type_name(type_name: &mut TypeName, substitutions: &HashMap<String
         && let Some(replacement) = substitutions.get(&type_name.base)
         && let Some(mut replacement) = TypeName::parse(replacement)
     {
-        replacement.array |= type_name.array;
+        replacement.array_depth += type_name.array_depth;
         *type_name = replacement;
         return;
     }
@@ -47,7 +47,10 @@ impl AstVisitorMut for TypeSubstituter<'_> {
     fn visit_expression_mut(&mut self, expression: &mut Expression) {
         match &mut expression.kind {
             ExpressionKind::StructLiteral { type_name, .. }
-            | ExpressionKind::NewObject { type_name, .. } => {
+            | ExpressionKind::NewObject {
+                type_name: Some(type_name),
+                ..
+            } => {
                 *type_name = substitute_name(type_name, self.substitutions);
             }
             ExpressionKind::Name(name)

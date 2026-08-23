@@ -11,6 +11,7 @@ use aster_syntax::{
     },
 };
 
+use crate::constexpr::ConstValue;
 use crate::type_names::TypeName;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -54,6 +55,21 @@ pub(crate) struct ResolvedCall {
     pub dispatch: Dispatch,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ResolvedDefaultArgument {
+    pub parameter: usize,
+    pub value: ConstValue,
+}
+
+/// Candidate-specific binding of source-ordered arguments to declaration
+/// parameters. Defaults are already evaluated constants, so HIR never owns
+/// source-level optional-parameter semantics.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub(crate) struct ResolvedArguments {
+    pub source_to_parameter: Vec<usize>,
+    pub defaults: Vec<ResolvedDefaultArgument>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedPropertyAssignment {
     pub getter: Option<CallableKey>,
@@ -95,6 +111,7 @@ pub(crate) struct ResolvedParallelReduce {
 pub(crate) struct ResolvedEnumCase {
     pub enum_name: String,
     pub case_index: usize,
+    pub argument_order: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,6 +160,7 @@ pub(crate) enum ResolvedPropagation {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Model {
     pub calls: HashMap<ModelNodeKey, ResolvedCall>,
+    pub call_arguments: HashMap<ModelNodeKey, ResolvedArguments>,
     /// Call sites resolved to a concrete host-provided foreign declaration.
     /// HIR consumes this semantic decision; later stages never inspect names.
     pub foreign_calls: HashSet<ModelNodeKey>,
@@ -163,6 +181,14 @@ pub(crate) struct Model {
     /// an otherwise untyped empty array literal. This is deliberately narrow:
     /// ordinary expression inference remains one-way.
     pub contextual_empty_array_elements: HashMap<ModelNodeKey, String>,
+    /// Exact constructible type supplied to a target-typed `new(...)` site.
+    /// Source spelling is intentionally absent; HIR consumes this semantic
+    /// decision and receives an ordinary concrete construction.
+    pub contextual_new_types: HashMap<ModelNodeKey, String>,
+    /// Index expressions semantically resolved against `List<T>` rather than
+    /// an array. HIR lowers these through the existing List Get/Set runtime
+    /// boundary; length never changes the type-based decision.
+    pub list_indexes: HashSet<ModelNodeKey>,
     /// `new T[length]` sites whose length is proven constant zero by semantic
     /// constant evaluation. Lowering uses this proof to state that no default
     /// element slots exist; later layers never repeat source-level reasoning.
@@ -233,9 +259,10 @@ impl AstVisitorMut for DeferredLanguageSurfaceValidator {
             }
             ExpressionKind::Name(name) => self.validate_type_name(name, expression.span),
             ExpressionKind::StructLiteral { type_name, .. }
-            | ExpressionKind::NewObject { type_name, .. } => {
-                self.validate_type_name(type_name, expression.span);
-            }
+            | ExpressionKind::NewObject {
+                type_name: Some(type_name),
+                ..
+            } => self.validate_type_name(type_name, expression.span),
             _ => {}
         }
         walk_expression_mut(self, expression);

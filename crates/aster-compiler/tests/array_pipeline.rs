@@ -54,7 +54,7 @@ fn array_diagnostics_are_specific() {
     for (source, message) in [
         (
             "public int Run() { int[] a = [1]; return a[true]; }",
-            "array index must have type `int`",
+            "index must have type `int`",
         ),
         (
             "public int Run() { int[] a = [1]; a.Length = 2; return 0; }",
@@ -193,15 +193,21 @@ fn reference_array_defaults_stay_rejected_without_a_zero_proof() {
 }
 
 #[test]
-fn empty_array_literal_without_an_exact_target_stays_an_error() {
+fn empty_array_literal_uses_assignment_return_and_argument_contexts() {
     for source in [
-        "public int Run() { var values = []; return 0; }",
         "public int Run() { int[] values = [1]; values = []; return 0; }",
         "public int[] Values() { return []; }",
         "public void Use(int[] values) {} public int Run() { Use([]); return 0; }",
     ] {
-        let diagnostics = aster_compiler::compile(source)
-            .expect_err("contextual empty literals stay limited to explicit initializers");
+        aster_compiler::compile(source).expect("an exact array target supplies the element type");
+    }
+
+    for source in [
+        "public int Run() { var values = []; return 0; }",
+        "public int Run() { []; return 0; }",
+    ] {
+        let diagnostics =
+            aster_compiler::compile(source).expect_err("an untyped empty literal is ambiguous");
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic
                 .message

@@ -26,7 +26,7 @@ fn infer_type_name(
         .iter()
         .any(|parameter| parameter == &pattern.base)
         && pattern.arguments.is_empty()
-        && !pattern.array
+        && pattern.array_depth == 0
     {
         let concrete = actual.to_string();
         if let Some(previous) = inferred.get(&pattern.base) {
@@ -51,11 +51,11 @@ fn infer_type_name(
         .iter()
         .any(|parameter| parameter == &pattern.base)
         && pattern.arguments.is_empty()
-        && pattern.array
-        && actual.array
+        && pattern.array_depth == 1
+        && actual.array_depth >= 1
     {
         let mut element = actual.clone();
-        element.array = false;
+        element.array_depth -= 1;
         let concrete = element.to_string();
         if let Some(previous) = inferred.get(&pattern.base) {
             if previous != &concrete {
@@ -75,7 +75,7 @@ fn infer_type_name(
         }
         return;
     }
-    if pattern.array != actual.array
+    if pattern.array_depth != actual.array_depth
         || pattern.base != actual.base
         || pattern.arguments.len() != actual.arguments.len()
     {

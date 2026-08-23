@@ -170,7 +170,7 @@ fn struct_method_receiver_visibility_and_arguments_are_checked_semantically() {
         ),
         (
             "public struct Value { public int Add(int value) { return value; } } public int Run() { Value receiver = Value {}; return receiver.Add(); }",
-            "expected 1 argument(s), found 0",
+            "missing required argument `value`",
         ),
         (
             "public struct Value { public int Read() { return 1; } } public int Run() { return 42.Read(); }",

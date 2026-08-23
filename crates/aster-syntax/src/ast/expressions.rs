@@ -6,6 +6,30 @@ pub struct Expression {
     pub span: Span,
 }
 
+/// One source-order call or constructor argument. A name, when present, is
+/// consumed by semantic call resolution and does not survive into executable
+/// IR.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Argument {
+    pub name: Option<String>,
+    pub value: Expression,
+    pub span: Span,
+}
+
+impl std::ops::Deref for Argument {
+    type Target = Expression;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl std::ops::DerefMut for Argument {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExpressionKind {
     Literal(Literal),
@@ -21,8 +45,10 @@ pub enum ExpressionKind {
         length: Box<Expression>,
     },
     NewObject {
-        type_name: String,
-        arguments: Vec<Expression>,
+        /// `None` is target-typed `new(...)`; semantic analysis must receive
+        /// one exact constructible expected type before HIR lowering.
+        type_name: Option<String>,
+        arguments: Vec<Argument>,
     },
     Index {
         array: Box<Expression>,
@@ -35,7 +61,7 @@ pub enum ExpressionKind {
     Call {
         callee: Box<Expression>,
         type_arguments: Vec<super::TypeRef>,
-        arguments: Vec<Expression>,
+        arguments: Vec<Argument>,
     },
     Unary {
         operator: UnaryOperator,

@@ -1,7 +1,7 @@
 use super::{
     Analyzer, Binding, Block, ConstError, ConstValue, Diagnostic, EnumCaseInfo, Expression,
-    ExpressionKind, HashMap, HashSet, ResolvedEnumCase, Span, Statement, Type, TypeRef,
-    VariableDeclaration, VariableKind, evaluate, resolve_type_readonly,
+    HashMap, HashSet, ResolvedEnumCase, Span, Statement, Type, TypeRef, VariableDeclaration,
+    VariableKind, evaluate, resolve_type_readonly,
 };
 
 pub(super) struct ResolvedSwitch<'a> {
@@ -104,7 +104,7 @@ impl Analyzer<'_> {
                     ),
                     (expected, Some(value)) => {
                         let expected = expected.clone();
-                        let actual = self.expression(value);
+                        let actual = self.expression_expected(value, Some(&expected));
                         self.require_assignable_value(&expected, &actual, value);
                     }
                 }
@@ -209,7 +209,6 @@ impl Analyzer<'_> {
             } => {
                 let collection_type = self.expression(collection);
                 let collection_is_string = collection_type == Type::String;
-                let declared_type = self.resolve_local_type(element_type);
                 let actual_type = match collection_type {
                     Type::Array(element) | Type::List(element) => *element,
                     // Iterating a `string` produces Unicode scalar values,
@@ -230,6 +229,10 @@ impl Analyzer<'_> {
                         Type::Unknown
                     }
                 };
+                let declared_type = element_type.as_ref().map_or_else(
+                    || actual_type.clone(),
+                    |element_type| self.resolve_local_type(element_type),
+                );
                 if actual_type != Type::Unknown
                     && declared_type != Type::Unknown
                     && actual_type != declared_type
@@ -241,7 +244,9 @@ impl Analyzer<'_> {
                                     "foreach over string requires element type `char`, found `{}`",
                                     declared_type.display()
                                 ),
-                                element_type.span,
+                                element_type
+                                    .as_ref()
+                                    .map_or(collection.span, |value| value.span),
                             )
                             .with_help("declare the foreach variable as `char`"),
                         );
@@ -253,7 +258,7 @@ impl Analyzer<'_> {
                                     declared_type.display(),
                                     actual_type.display()
                                 ),
-                                element_type.span,
+                                element_type.as_ref().map_or(collection.span, |value| value.span),
                             )
                             .with_help("use the array element type for the foreach variable"),
                         );
@@ -267,7 +272,9 @@ impl Analyzer<'_> {
                         mutable: false,
                         iteration_readonly: true,
                         initialized: true,
-                        span: element_type.span,
+                        span: element_type
+                            .as_ref()
+                            .map_or(collection.span, |value| value.span),
                         value: None,
                     },
                 );
@@ -452,6 +459,7 @@ impl Analyzer<'_> {
             ResolvedEnumCase {
                 enum_name: resolved.enum_name.to_owned(),
                 case_index,
+                argument_order: Vec::new(),
             },
         );
         Some(info.clone())
@@ -515,19 +523,10 @@ impl Analyzer<'_> {
             }
             VariableKind::Inferred => None,
         };
-        let initializer_type = variable.initializer.as_ref().map(|value| {
-            if let (Some(Type::Array(element)), ExpressionKind::ArrayLiteral(elements)) =
-                (&declared_type, &value.kind)
-                && elements.is_empty()
-            {
-                self.model
-                    .contextual_empty_array_elements
-                    .insert(self.model_key(value.span), element.display());
-                Type::Array(element.clone())
-            } else {
-                self.expression(value)
-            }
-        });
+        let initializer_type = variable
+            .initializer
+            .as_ref()
+            .map(|value| self.expression_expected(value, declared_type.as_ref()));
         let (type_, mutable) = match &variable.kind {
             VariableKind::Explicit(_) => {
                 let expected = declared_type.expect("explicit variable has a declared type");

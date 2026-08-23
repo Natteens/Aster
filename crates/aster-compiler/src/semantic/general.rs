@@ -8,17 +8,17 @@ use crate::primitives::{
     fits_ulong,
 };
 use aster_syntax::{
-    AssignmentOperator, BinaryOperator, Block, Expression, ExpressionKind, Field,
+    Argument, AssignmentOperator, BinaryOperator, Block, Expression, ExpressionKind, Field,
     FunctionDeclaration, IncrementOperator, InterpolatedPart, Item, Literal, Member, Module,
     Property, Statement, TypeDeclaration, TypeRef, UnaryOperator, VariableDeclaration,
     VariableKind, Visibility,
 };
 
 use super::{
-    AccessorKind, CallableKey, Dispatch, Model, ResolvedCall, ResolvedDictionaryOperation,
-    ResolvedEnumCase, ResolvedParallelFor, ResolvedParallelForEach, ResolvedParallelReduce,
-    ResolvedPropagation, ResolvedPropertyAssignment, ResolvedStringBuilderOperation,
-    ResolvedTaskRun, callable_key,
+    AccessorKind, CallableKey, Dispatch, Model, ResolvedArguments, ResolvedCall,
+    ResolvedDefaultArgument, ResolvedDictionaryOperation, ResolvedEnumCase, ResolvedParallelFor,
+    ResolvedParallelForEach, ResolvedParallelReduce, ResolvedPropagation,
+    ResolvedPropertyAssignment, ResolvedStringBuilderOperation, ResolvedTaskRun, callable_key,
 };
 use crate::type_names::TypeName;
 
@@ -61,6 +61,8 @@ struct Signature {
 #[derive(Clone, Debug)]
 struct Callable {
     signature: Signature,
+    parameter_names: Vec<String>,
+    defaults: Vec<Option<Expression>>,
     visibility: Visibility,
     is_static: bool,
     is_foreign: bool,

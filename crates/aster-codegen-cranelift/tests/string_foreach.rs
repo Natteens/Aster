@@ -271,11 +271,9 @@ fn string_is_rejected_as_the_element_type() {
 }
 
 #[test]
-fn var_is_still_rejected_for_a_string_foreach() {
-    let errors = compile_errors(
-        "public int Main() { string text = \"ab\"; foreach (var value in text) { } return 0; }",
-    );
-    assert!(!errors.is_empty(), "expected `var` to be rejected");
+fn var_infers_char_for_a_string_foreach() {
+    let source = "public int Main() { string text = \"ab\"; int count = 0; foreach (var value in text) { if (value == 'b') { count++; } } return count; }";
+    assert_eq!(run(source), Ok(ExecutionValue::Int(1)));
 }
 
 #[test]

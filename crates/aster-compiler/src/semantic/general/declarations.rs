@@ -115,6 +115,15 @@ pub(super) fn collect_declarations(
                     let mut field_names = HashSet::new();
                     let mut fields = Vec::new();
                     for field in &case.fields {
+                        if field.default.is_some() {
+                            diagnostics.push(
+                                Diagnostic::error(
+                                    "enum payload fields cannot declare default values",
+                                    field.span,
+                                )
+                                .with_help("supply every enum payload explicitly"),
+                            );
+                        }
                         if !field_names.insert(field.name.as_str()) {
                             diagnostics.push(Diagnostic::error(
                                 format!("duplicate payload name `{}`", field.name),
@@ -150,6 +159,16 @@ pub(super) fn collect_declarations(
                 );
                 let callable = Callable {
                     signature: signature(function, context, diagnostics),
+                    parameter_names: function
+                        .parameters
+                        .iter()
+                        .map(|parameter| parameter.name.clone())
+                        .collect(),
+                    defaults: function
+                        .parameters
+                        .iter()
+                        .map(|parameter| parameter.default.clone())
+                        .collect(),
                     visibility: function.visibility,
                     is_static: true,
                     is_foreign: function.is_foreign,
@@ -293,6 +312,16 @@ fn collect_type_members(
                     }
                     constructor = Some(Callable {
                         signature: signature(method, context, diagnostics),
+                        parameter_names: method
+                            .parameters
+                            .iter()
+                            .map(|parameter| parameter.name.clone())
+                            .collect(),
+                        defaults: method
+                            .parameters
+                            .iter()
+                            .map(|parameter| parameter.default.clone())
+                            .collect(),
                         visibility: method.visibility,
                         is_static: false,
                         is_foreign: false,
@@ -317,6 +346,16 @@ fn collect_type_members(
                 }
                 let callable = Callable {
                     signature: signature(method, context, diagnostics),
+                    parameter_names: method
+                        .parameters
+                        .iter()
+                        .map(|parameter| parameter.name.clone())
+                        .collect(),
+                    defaults: method
+                        .parameters
+                        .iter()
+                        .map(|parameter| parameter.default.clone())
+                        .collect(),
                     visibility: method.visibility,
                     is_static: method.is_static,
                     is_foreign: false,
@@ -397,6 +436,8 @@ fn collect_type_members(
                         parameters: Vec::new(),
                         result: type_.clone(),
                     },
+                    parameter_names: Vec::new(),
+                    defaults: Vec::new(),
                     visibility: accessor.visibility,
                     is_static: false,
                     is_foreign: false,
@@ -412,6 +453,8 @@ fn collect_type_members(
                         parameters: vec![type_.clone()],
                         result: Type::Void,
                     },
+                    parameter_names: vec!["value".to_owned()],
+                    defaults: vec![None],
                     visibility: accessor.visibility,
                     is_static: false,
                     is_foreign: false,
@@ -639,6 +682,7 @@ fn signature(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Signature {
     let mut names = HashSet::new();
+    let mut saw_optional = false;
     let parameters = function
         .parameters
         .iter()
@@ -658,6 +702,20 @@ fn signature(
                     "parameters cannot have type `void`",
                     parameter.type_ref.span,
                 ));
+            }
+            if parameter.default.is_some() {
+                saw_optional = true;
+            } else if saw_optional {
+                diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "required parameter `{}` cannot follow an optional parameter",
+                            parameter.name
+                        ),
+                        parameter.span,
+                    )
+                    .with_help("place every required parameter before optional parameters"),
+                );
             }
             type_
         })
@@ -832,7 +890,14 @@ pub(super) fn validate_bodies(
                     }
                 }
             }
-            Item::Interface(_) | Item::Enum(_) | Item::Variable(_) => {}
+            Item::Interface(declaration) => {
+                for member in &declaration.members {
+                    if let Member::Method(method) = member {
+                        validate_function(method, context, Some(declaration), diagnostics, model);
+                    }
+                }
+            }
+            Item::Enum(_) | Item::Variable(_) => {}
         }
     }
 }
@@ -859,8 +924,8 @@ fn validate_field_initializer(
         crate::semantic::field_context(owner, &field.name, field.span.start),
         model,
     );
-    let actual = analyzer.expression(initializer);
     let expected = resolve_type_readonly(&field.type_ref, context);
+    let actual = analyzer.expression_expected(initializer, Some(&expected));
     analyzer.require_assignable_value(&expected, &actual, initializer);
     diagnostics.append(&mut analyzer.diagnostics);
 }
@@ -891,6 +956,7 @@ fn validate_function_with_initialized_fields(
     initialized_fields: &HashSet<String>,
 ) {
     validate_test_function(function, owner, diagnostics);
+    validate_parameter_defaults(function, context, owner, diagnostics, model);
     if function.is_async && function.body.is_none() {
         diagnostics.push(
             Diagnostic::error("an `async` function must have a body", function.span).with_help(
@@ -977,6 +1043,100 @@ fn validate_function_with_initialized_fields(
         );
     }
     diagnostics.append(&mut analyzer.diagnostics);
+}
+
+fn validate_parameter_defaults(
+    function: &FunctionDeclaration,
+    context: &Context,
+    owner: Option<&TypeDeclaration>,
+    diagnostics: &mut Vec<Diagnostic>,
+    model: &mut Model,
+) {
+    if !function
+        .parameters
+        .iter()
+        .any(|parameter| parameter.default.is_some())
+    {
+        return;
+    }
+    let mut analyzer = Analyzer::new(
+        context,
+        Type::Void,
+        HashMap::new(),
+        HashMap::new(),
+        owner.map(|owner| owner.name.clone()),
+        false,
+        false,
+        &HashSet::new(),
+        crate::semantic::function_context(function, owner),
+        model,
+    );
+    let generic_parameters = function
+        .type_parameters
+        .iter()
+        .map(|parameter| parameter.name.as_str())
+        .chain(owner.into_iter().flat_map(|owner| {
+            owner
+                .type_parameters
+                .iter()
+                .map(|parameter| parameter.name.as_str())
+        }))
+        .collect::<HashSet<_>>();
+    for parameter in &function.parameters {
+        let Some(default) = &parameter.default else {
+            continue;
+        };
+        if type_mentions_parameter(&parameter.type_ref.name, &generic_parameters) {
+            analyzer.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "default for generic-dependent parameter `{}` cannot be proven valid for every specialization",
+                        parameter.name
+                    ),
+                    parameter.span,
+                )
+                .with_help("use a concrete parameter type or require the caller to supply the value"),
+            );
+            continue;
+        }
+        let expected = resolve_type_readonly(&parameter.type_ref, context);
+        let actual = analyzer.expression_expected(default, Some(&expected));
+        analyzer.require_assignable_value(&expected, &actual, default);
+        let resolve = |name: &str| {
+            context
+                .globals
+                .get(name)
+                .and_then(|binding| binding.value.clone())
+        };
+        match super::evaluate(default, &resolve) {
+            Ok(_) => {}
+            Err(super::ConstError::NotConstant(span)) => analyzer.diagnostics.push(
+                Diagnostic::error(
+                    "default values must be compile-time constant expressions",
+                    span,
+                )
+                .with_help("use literals, namespace constants, operators, `?:`, or casts"),
+            ),
+            Err(super::ConstError::Overflow(span, type_name)) => analyzer.diagnostics.push(
+                Diagnostic::error(format!("default value overflows `{type_name}`"), span),
+            ),
+            Err(super::ConstError::DivisionByZero(span)) => analyzer
+                .diagnostics
+                .push(Diagnostic::error("default value divides by zero", span)),
+        }
+    }
+    diagnostics.append(&mut analyzer.diagnostics);
+}
+
+fn type_mentions_parameter(name: &str, parameters: &HashSet<&str>) -> bool {
+    fn contains(type_name: &TypeName, parameters: &HashSet<&str>) -> bool {
+        parameters.contains(type_name.base.as_str())
+            || type_name
+                .arguments
+                .iter()
+                .any(|argument| contains(argument, parameters))
+    }
+    TypeName::parse(name).is_some_and(|type_name| contains(&type_name, parameters))
 }
 
 fn validate_test_function(
@@ -1319,7 +1479,7 @@ fn collect_expression_calls<'a>(expression: &'a Expression, out: &mut Vec<&'a Ex
         ExpressionKind::NewArray { length, .. } => collect_expression_calls(length, out),
         ExpressionKind::NewObject { arguments, .. } => {
             for argument in arguments {
-                collect_expression_calls(argument, out);
+                collect_expression_calls(&argument.value, out);
             }
         }
         ExpressionKind::Index { array, index } => {
@@ -1332,7 +1492,7 @@ fn collect_expression_calls<'a>(expression: &'a Expression, out: &mut Vec<&'a Ex
         } => {
             collect_expression_calls(callee, out);
             for argument in arguments {
-                collect_expression_calls(argument, out);
+                collect_expression_calls(&argument.value, out);
             }
         }
         ExpressionKind::Unary { operand, .. }
@@ -1460,7 +1620,7 @@ fn collect_expression_awaits<'a>(expression: &'a Expression, out: &mut Vec<&'a E
         } => {
             collect_expression_awaits(callee, out);
             for argument in arguments {
-                collect_expression_awaits(argument, out);
+                collect_expression_awaits(&argument.value, out);
             }
         }
         ExpressionKind::Member { object, .. } => collect_expression_awaits(object, out),
@@ -1471,7 +1631,7 @@ fn collect_expression_awaits<'a>(expression: &'a Expression, out: &mut Vec<&'a E
         ExpressionKind::NewArray { length, .. } => collect_expression_awaits(length, out),
         ExpressionKind::NewObject { arguments, .. } => {
             for argument in arguments {
-                collect_expression_awaits(argument, out);
+                collect_expression_awaits(&argument.value, out);
             }
         }
         ExpressionKind::ArrayLiteral(elements) => {
@@ -1533,6 +1693,7 @@ fn validate_property(
             parameters: vec![aster_syntax::Parameter {
                 type_ref: property.type_ref.clone(),
                 name: "value".to_owned(),
+                default: None,
                 span: setter.span,
             }],
             body: Some(setter.body.clone()),

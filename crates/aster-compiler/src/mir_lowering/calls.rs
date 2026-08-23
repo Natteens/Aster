@@ -6,6 +6,7 @@ impl FunctionLowerer {
         &mut self,
         callee: &hir::Expression,
         arguments: &[hir::Expression],
+        argument_order: &[usize],
         return_type: &hir::Type,
     ) -> Option<mir::Operand> {
         let function = expression_symbol(callee).expect("validated call has a resolved symbol");
@@ -18,10 +19,7 @@ impl FunctionLowerer {
             let receiver = self
                 .lower_expression(object)
                 .expect("interface method receiver produces a value");
-            let lowered_arguments = arguments
-                .iter()
-                .filter_map(|argument| self.lower_expression(argument))
-                .collect();
+            let lowered_arguments = self.lower_ordered_arguments(arguments, argument_order);
             if return_type == &hir::Type::Void {
                 self.instruction(mir::Instruction::CallInterface {
                     destination: None,
@@ -53,11 +51,7 @@ impl FunctionLowerer {
                     .expect("method receiver produces a value"),
             );
         }
-        lowered_arguments.extend(
-            arguments
-                .iter()
-                .filter_map(|argument| self.lower_expression(argument)),
-        );
+        lowered_arguments.extend(self.lower_ordered_arguments(arguments, argument_order));
         if return_type == &hir::Type::Void {
             self.instruction(mir::Instruction::Call {
                 destination: None,
@@ -80,6 +74,28 @@ impl FunctionLowerer {
                 kind: mir::OperandKind::Copy(destination),
             })
         }
+    }
+
+    pub(super) fn lower_ordered_arguments(
+        &mut self,
+        arguments: &[hir::Expression],
+        argument_order: &[usize],
+    ) -> Vec<mir::Operand> {
+        debug_assert_eq!(arguments.len(), argument_order.len());
+        let mut ordered = vec![None; arguments.len()];
+        for (argument, parameter) in arguments.iter().zip(argument_order) {
+            let value = self
+                .lower_expression(argument)
+                .expect("validated call argument produces a value");
+            assert!(
+                *parameter < ordered.len() && ordered[*parameter].replace(value).is_none(),
+                "validated call argument mapping is a parameter permutation"
+            );
+        }
+        ordered
+            .into_iter()
+            .map(|argument| argument.expect("every required parameter has an argument"))
+            .collect()
     }
 
     /// Lowers a call to a function nominally bound to a host [`hir::Intrinsic`]

@@ -64,15 +64,19 @@ impl Lowerer<'_> {
             let enum_symbol = self.types[&resolved.enum_name];
             let (case_symbol, field_symbols) =
                 self.enum_cases[&(resolved.enum_name, resolved.case_index)].clone();
-            let arguments: &[ast::Expression] = match &expression.kind {
-                ast::ExpressionKind::Call { arguments, .. } => arguments,
-                ast::ExpressionKind::Member { .. } => &[],
+            let arguments = match &expression.kind {
+                ast::ExpressionKind::Call { arguments, .. } => arguments
+                    .iter()
+                    .map(|argument| &argument.value)
+                    .collect::<Vec<_>>(),
+                ast::ExpressionKind::Member { .. } => Vec::new(),
                 _ => unreachable!("enum case metadata belongs to a case expression"),
             };
             let fields = arguments
                 .iter()
-                .zip(field_symbols)
-                .map(|(argument, field)| {
+                .zip(&resolved.argument_order)
+                .map(|(argument, parameter)| {
+                    let field = field_symbols[*parameter];
                     let target = self.symbol_types[&field].clone();
                     hir::FieldValue {
                         field,
@@ -89,6 +93,26 @@ impl Lowerer<'_> {
                     fields,
                 },
             };
+        }
+        if let ast::ExpressionKind::NewObject {
+            type_name: None,
+            arguments,
+        } = &expression.kind
+        {
+            let type_name = self
+                .model
+                .contextual_new_types
+                .get(&model_key)
+                .expect("validated target-typed construction has a concrete type")
+                .clone();
+            let explicit = ast::Expression {
+                kind: ast::ExpressionKind::NewObject {
+                    type_name: Some(type_name),
+                    arguments: arguments.clone(),
+                },
+                span: expression.span,
+            };
+            return self.expression(&explicit);
         }
         match &expression.kind {
             ast::ExpressionKind::Literal(literal) => {
@@ -223,7 +247,10 @@ impl Lowerer<'_> {
                     },
                 }
             }
-            ast::ExpressionKind::NewObject { type_name, .. } if type_name.starts_with("List<") => {
+            ast::ExpressionKind::NewObject {
+                type_name: Some(type_name),
+                ..
+            } if type_name.starts_with("List<") => {
                 // `List` is reserved and never registered in `self.types`
                 // (see `validate_no_reserved_type_names`), so it is resolved
                 // structurally here instead of through the class lookup
@@ -239,9 +266,10 @@ impl Lowerer<'_> {
                     kind: hir::ExpressionKind::NewList { element_type },
                 }
             }
-            ast::ExpressionKind::NewObject { type_name, .. }
-                if type_name.starts_with("Dictionary<") =>
-            {
+            ast::ExpressionKind::NewObject {
+                type_name: Some(type_name),
+                ..
+            } if type_name.starts_with("Dictionary<") => {
                 let type_ = self.resolve_type(&ast::TypeRef::new(type_name, expression.span));
                 let hir::Type::Dictionary(key_type, value_type) = type_.clone() else {
                     return hir::Expression {
@@ -273,27 +301,54 @@ impl Lowerer<'_> {
                 type_name,
                 arguments,
             } => {
+                let type_name = type_name
+                    .as_ref()
+                    .expect("target-typed construction was resolved");
                 let class_symbol = self.types[type_name];
                 let constructor = self.callable_symbols[&self.model.constructors[&model_key]];
                 let parameter_types = self.callable_parameters[&constructor].clone();
-                let arguments = arguments
+                let plan = self.model.call_arguments[&model_key].clone();
+                let mut lowered = arguments
                     .iter()
-                    .enumerate()
-                    .map(|(index, argument)| {
-                        convert(self.expression(argument), &parameter_types[index])
+                    .zip(&plan.source_to_parameter)
+                    .map(|(argument, parameter)| {
+                        convert(self.expression(argument), &parameter_types[*parameter])
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
+                let mut argument_order = plan.source_to_parameter;
+                for default in plan.defaults {
+                    lowered.push(convert(
+                        constant_expression(&default.value),
+                        &parameter_types[default.parameter],
+                    ));
+                    argument_order.push(default.parameter);
+                }
                 hir::Expression {
                     type_: hir::Type::Class(class_symbol),
                     kind: hir::ExpressionKind::NewObject {
                         class_symbol,
                         constructor,
-                        arguments,
+                        arguments: lowered,
+                        argument_order,
                     },
                 }
             }
             ast::ExpressionKind::Index { array, index } => {
                 let array = self.expression(array);
+                if self.model.list_indexes.contains(&model_key) {
+                    let element_type = match &array.type_ {
+                        hir::Type::List(element) => (**element).clone(),
+                        _ => hir::Type::Unknown,
+                    };
+                    return hir::Expression {
+                        type_: element_type.clone(),
+                        kind: hir::ExpressionKind::ListGet {
+                            list: Box::new(array),
+                            index: Box::new(self.expression(index)),
+                            element_type,
+                        },
+                    };
+                }
                 let element_type = match &array.type_ {
                     hir::Type::Array(element) => (**element).clone(),
                     _ => hir::Type::Unknown,
@@ -827,23 +882,33 @@ impl Lowerer<'_> {
                 let symbol = self.callable_symbols[&resolved.callable];
                 let type_ = self.callable_results[&symbol].clone();
                 let parameter_types = self.callable_parameters[&symbol].clone();
-                let arguments = arguments
+                let plan = self.model.call_arguments[&model_key].clone();
+                let mut lowered = arguments
                     .iter()
-                    .enumerate()
-                    .map(|(index, value)| {
+                    .zip(&plan.source_to_parameter)
+                    .map(|(value, parameter)| {
                         let mut argument = self.expression(value);
-                        if let Some(target) = parameter_types.get(index) {
+                        if let Some(target) = parameter_types.get(*parameter) {
                             argument = convert(argument, target);
                         }
                         argument
                     })
                     .collect::<Vec<_>>();
+                let mut argument_order = plan.source_to_parameter;
+                for default in plan.defaults {
+                    lowered.push(convert(
+                        constant_expression(&default.value),
+                        &parameter_types[default.parameter],
+                    ));
+                    argument_order.push(default.parameter);
+                }
                 if self.model.foreign_calls.contains(&model_key) {
                     return hir::Expression {
                         type_,
                         kind: hir::ExpressionKind::ForeignCall {
                             function: symbol,
-                            arguments,
+                            arguments: lowered,
+                            argument_order,
                         },
                     };
                 }
@@ -879,7 +944,8 @@ impl Lowerer<'_> {
                     type_,
                     kind: hir::ExpressionKind::Call {
                         callee: Box::new(callee),
-                        arguments,
+                        arguments: lowered,
+                        argument_order,
                     },
                 }
             }
@@ -913,6 +979,30 @@ impl Lowerer<'_> {
                 prefix,
                 operand,
             } => {
+                let operand_key = crate::semantic::ModelNodeKey {
+                    context: self.model_context.clone(),
+                    span: operand.span,
+                };
+                if self.model.list_indexes.contains(&operand_key) {
+                    let ast::ExpressionKind::Index { array, index } = &operand.kind else {
+                        unreachable!("a list index model entry belongs to an index expression")
+                    };
+                    let list = self.expression(array);
+                    let element_type = match &list.type_ {
+                        hir::Type::List(element) => (**element).clone(),
+                        _ => hir::Type::Unknown,
+                    };
+                    return hir::Expression {
+                        type_: element_type.clone(),
+                        kind: hir::ExpressionKind::ListIndexIncrementDecrement {
+                            list: Box::new(list),
+                            index: Box::new(self.expression(index)),
+                            operator: increment(*operator),
+                            prefix: *prefix,
+                            element_type,
+                        },
+                    };
+                }
                 let target = self.expression(operand);
                 let type_ = target.type_.clone();
                 hir::Expression {
@@ -1072,6 +1162,30 @@ impl Lowerer<'_> {
                 operator,
                 value,
             } => {
+                let target_key = crate::semantic::ModelNodeKey {
+                    context: self.model_context.clone(),
+                    span: target.span,
+                };
+                if self.model.list_indexes.contains(&target_key) {
+                    let ast::ExpressionKind::Index { array, index } = &target.kind else {
+                        unreachable!("a list index model entry belongs to an index expression")
+                    };
+                    let list = self.expression(array);
+                    let element_type = match &list.type_ {
+                        hir::Type::List(element) => (**element).clone(),
+                        _ => hir::Type::Unknown,
+                    };
+                    return hir::Expression {
+                        type_: element_type.clone(),
+                        kind: hir::ExpressionKind::ListIndexAssignment {
+                            list: Box::new(list),
+                            index: Box::new(self.expression(index)),
+                            operator: assignment(*operator),
+                            value: Box::new(convert(self.expression(value), &element_type)),
+                            element_type,
+                        },
+                    };
+                }
                 if let Some(resolved) = self.model.property_assignments.get(&model_key) {
                     let object = match &target.kind {
                         ast::ExpressionKind::Member { object, .. } => self.expression(object),
@@ -1162,6 +1276,7 @@ impl Lowerer<'_> {
                     },
                 }),
                 arguments: Vec::new(),
+                argument_order: Vec::new(),
             },
         }
     }
