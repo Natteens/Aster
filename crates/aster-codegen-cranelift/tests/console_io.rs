@@ -139,6 +139,87 @@ fn list_mutation_failures_stop_before_later_console_output() {
 }
 
 #[test]
+fn array_bounds_failures_stop_before_later_console_output() {
+    for (operation, source) in [
+        (
+            "read",
+            "using aster.io; public void Main() { int[] values = [7]; int index = 1; int ignored = values[index]; WriteLine(\"must not execute\"); }",
+        ),
+        (
+            "write",
+            "using aster.io; public void Main() { int[] values = [7]; int index = 1; values[index] = 9; WriteLine(\"must not execute\"); }",
+        ),
+    ] {
+        let (result, output) = run_with_io(source, "Main", "");
+        assert!(result.is_err(), "out-of-bounds array {operation} must fail");
+        assert!(
+            output.is_empty(),
+            "out-of-bounds array {operation} must stop later user output"
+        );
+    }
+}
+
+#[test]
+fn integer_arithmetic_failures_stop_before_later_console_output() {
+    let source = r#"
+        using aster.io;
+        public int Zero() { return 0; }
+        public int NegativeOne() { return -1; }
+        public int Minimum() { return -2147483647 - 1; }
+        public void DivideZero() { int ignored = 10 / Zero(); WriteLine("must not execute"); }
+        public void RemainderZero() { int ignored = 10 % Zero(); WriteLine("must not execute"); }
+        public void DivideOverflow() { int ignored = Minimum() / NegativeOne(); WriteLine("must not execute"); }
+        public void RemainderOverflow() { int ignored = Minimum() % NegativeOne(); WriteLine("must not execute"); }
+    "#;
+    for function in [
+        "DivideZero",
+        "RemainderZero",
+        "DivideOverflow",
+        "RemainderOverflow",
+    ] {
+        let (result, output) = run_with_io(source, function, "");
+        assert!(result.is_err(), "{function} must fail");
+        assert!(output.is_empty(), "{function} must stop later user output");
+    }
+}
+
+#[test]
+fn task_and_parallel_failures_stop_before_later_console_output() {
+    let task = r#"
+        using aster.io;
+        public int Fail() { int[] values = [1]; return values[1]; }
+        public void Main() {
+            int ignored = Task.Run(Fail).Wait();
+            WriteLine("must not execute");
+        }
+    "#;
+    let (result, output) = run_with_io(task, "Main", "");
+    assert!(result.is_err(), "failed Task.Wait must fail the execution");
+    assert!(
+        output.is_empty(),
+        "failed Task.Wait must stop later user output"
+    );
+
+    let parallel = r#"
+        using aster.io;
+        public void FailAt(int index) { int[] values = [1]; int ignored = values[index]; }
+        public void Main() {
+            Parallel.For(1, 2, FailAt);
+            WriteLine("must not execute");
+        }
+    "#;
+    let (result, output) = run_with_io(parallel, "Main", "");
+    assert!(
+        result.is_err(),
+        "failed Parallel.For must fail the execution"
+    );
+    assert!(
+        output.is_empty(),
+        "failed Parallel.For must stop later user output"
+    );
+}
+
+#[test]
 fn extra_or_missing_arguments_are_rejected() {
     let errors = compile_errors(
         "using aster.io;\npublic string Main() { Write(\"a\", \"b\"); return \"x\"; }",

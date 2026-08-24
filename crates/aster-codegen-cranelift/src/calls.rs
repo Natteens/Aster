@@ -522,6 +522,7 @@ impl Codegen {
                 .ins()
                 .call(function_ref, &[context, symbol_constant, frame, size])
         };
+        self.continue_if_runtime_ok(builder, state)?;
         if let Some(destination) = destination {
             let result =
                 builder.inst_results(call).first().copied().ok_or_else(|| {
@@ -634,6 +635,7 @@ impl Codegen {
             .jit
             .declare_func_in_func(self.runtime_ids[symbol], builder.func);
         let call = builder.ins().call(function_ref, &[context, handle]);
+        self.continue_if_runtime_ok(builder, state)?;
         if let Some(destination) = destination {
             let result = builder.inst_results(call).first().copied().ok_or_else(|| {
                 BackendError::new("Task<T>.Wait did not produce its declared result")
@@ -671,11 +673,13 @@ impl Codegen {
                     "aster_async_spawn",
                     &[context, move_next, slot_count],
                 );
+                self.continue_if_runtime_ok(builder, state)?;
                 self.store_intrinsic_result(builder, destination, call, state)?;
             }
             mir::Intrinsic::AsyncState => {
                 let handle = self.translate_operand(builder, &arguments[0], state)?;
                 let call = self.call_runtime(builder, "aster_async_state", &[context, handle]);
+                self.continue_if_runtime_ok(builder, state)?;
                 self.store_intrinsic_result(builder, destination, call, state)?;
             }
             mir::Intrinsic::AsyncSetState => {
@@ -686,6 +690,7 @@ impl Codegen {
                     "aster_async_set_state",
                     &[context, handle, new_state],
                 );
+                self.continue_if_runtime_ok(builder, state)?;
             }
             mir::Intrinsic::AsyncStoreSlot => {
                 let handle = self.translate_operand(builder, &arguments[0], state)?;
@@ -701,12 +706,14 @@ impl Codegen {
                     "aster_async_store_slot",
                     &[context, handle, index, kind, bits],
                 );
+                self.continue_if_runtime_ok(builder, state)?;
             }
             mir::Intrinsic::AsyncLoadSlot => {
                 let handle = self.translate_operand(builder, &arguments[0], state)?;
                 let index = self.translate_operand(builder, &arguments[1], state)?;
                 let call =
                     self.call_runtime(builder, "aster_async_load_slot", &[context, handle, index]);
+                self.continue_if_runtime_ok(builder, state)?;
                 self.store_scalar_from_bits(builder, destination, call, return_type, state)?;
             }
             mir::Intrinsic::AsyncSpawnInner => {
@@ -763,11 +770,13 @@ impl Codegen {
                     "aster_async_spawn_inner",
                     &[context, handle, inner, frame, size],
                 );
+                self.continue_if_runtime_ok(builder, state)?;
             }
             mir::Intrinsic::AsyncAwaitResult => {
                 let handle = self.translate_operand(builder, &arguments[0], state)?;
                 let call =
                     self.call_runtime(builder, "aster_async_await_result", &[context, handle]);
+                self.continue_if_runtime_ok(builder, state)?;
                 self.store_scalar_from_bits(builder, destination, call, return_type, state)?;
             }
             mir::Intrinsic::AsyncSetResult => {
@@ -783,6 +792,7 @@ impl Codegen {
                     "aster_async_set_result",
                     &[context, handle, kind, bits],
                 );
+                self.continue_if_runtime_ok(builder, state)?;
             }
             mir::Intrinsic::ParallelFor => {
                 let start = self.translate_operand(builder, &arguments[0], state)?;
@@ -791,6 +801,7 @@ impl Codegen {
                     .ins()
                     .iconst(types::I32, function_symbol(&arguments[2])?);
                 self.call_runtime(builder, "aster_parallel_for", &[context, start, end, body]);
+                self.continue_if_runtime_ok(builder, state)?;
             }
             mir::Intrinsic::ParallelForEach => {
                 let values = self.translate_operand(builder, &arguments[0], state)?;
@@ -807,6 +818,7 @@ impl Codegen {
                     "aster_parallel_for_each",
                     &[context, values, body, kind],
                 );
+                self.continue_if_runtime_ok(builder, state)?;
             }
             mir::Intrinsic::ParallelReduce => {
                 let values = self.translate_operand(builder, &arguments[0], state)?;
@@ -843,6 +855,7 @@ impl Codegen {
                         combine,
                     ],
                 );
+                self.continue_if_runtime_ok(builder, state)?;
                 self.store_scalar_from_bits(builder, destination, call, return_type, state)?;
             }
             _ => unreachable!("caller matched only async and Parallel intrinsics"),
@@ -918,6 +931,7 @@ impl Codegen {
             .execution_context
             .ok_or_else(|| BackendError::new("runtime intrinsic requires an execution context"))?;
         let call = builder.ins().call(function_ref, &[context, value]);
+        self.continue_if_runtime_ok(builder, state)?;
         self.store_intrinsic_result(builder, destination, call, state)
     }
 
@@ -948,6 +962,7 @@ impl Codegen {
             .execution_context
             .ok_or_else(|| BackendError::new("runtime intrinsic requires an execution context"))?;
         let call = builder.ins().call(function_ref, &[context, value]);
+        self.continue_if_runtime_ok(builder, state)?;
         self.store_intrinsic_result(builder, destination, call, state)
     }
 
@@ -978,6 +993,7 @@ impl Codegen {
             .execution_context
             .ok_or_else(|| BackendError::new("runtime intrinsic requires an execution context"))?;
         let call = builder.ins().call(function_ref, &[context, value]);
+        self.continue_if_runtime_ok(builder, state)?;
         self.store_intrinsic_result(builder, destination, call, state)
     }
 
@@ -2784,6 +2800,7 @@ impl Codegen {
             ],
         );
         let ok = builder.inst_results(call)[0];
+        Self::continue_if_runtime_status(builder, state, ok);
         let scalar = builder
             .ins()
             .load(types::I32, MemFlags::new(), scalar_address, 0);

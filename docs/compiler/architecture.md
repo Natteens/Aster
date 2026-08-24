@@ -82,6 +82,10 @@ algebraic identities. Calls, allocations, indexed reads, collection operations, 
 operations, and lifetime instructions are never generic-DCE candidates. Task, async-frame, and
 Parallel intrinsics also stop propagated facts at the worker-transfer boundary. Runtime-intrinsic
 operands remain opaque to the optimizer so intrinsic-specific ABI shapes cannot be rewritten.
+Constant facts are sparse: an absent local means no usable fact, so large lowered switch/enum CFGs
+do not carry a dense local-sized state through every edge. Branch-only comparison facts are consumed
+at their branch, and CFG trampoline targets are memoized with cycle-safe path compression. These are
+representation/scaling changes only; the same conservative meet and effect barriers remain.
 
 Struct literals keep resolved type and field symbols. Nominal class-to-interface conversions are
 explicit in typed HIR, after semantic validation checks every required public method against its
@@ -210,6 +214,10 @@ The backend rejects unsupported MIR before code generation. Decimal source is re
 the post-link language-surface gate because its numeric and ABI contract remains unspecified;
 backend validation still rejects hand-built decimal MIR fail-closed. The backend does not inspect
 AST/HIR, implement inheritance, or generate object files or link executables.
+Validation reconstructs every copied place's concrete type from the function local table and nominal
+field/case metadata. It rejects unknown or duplicate nominal identities, undeclared or mistyped local
+loads, field ownership mismatches, malformed checked-array receiver/index/element metadata, call
+destination mismatches, and return mismatches before Cranelift can select a load width or address.
 Integer division and remainder preserve their typed MIR operands through validation. The backend
 keeps controlled zero and signed-overflow paths for general operations, while an exact constant
 power-of-two `uint`/`ulong` divisor lowers mechanically to a logical shift or mask. General constant
@@ -221,6 +229,9 @@ floating-point host math, collection backing/capacity operations, clocks, and fi
 lower through typed HIR/MIR intrinsics with checked registry ABI calls. Cranelift does not inspect
 public `Math`, `String`, collection, clock, or I/O source names. Runtime intrinsics remain opaque to
 the general MIR optimizer and retain allocation, host-effect, and failure ordering.
+`Random.NextUInt` advances and mixes the same SplitMix64 state directly as `NextULong`, then selects
+the high 32 bits through the existing unsigned power-of-two division lowering. This preserves the
+published deterministic sequence while avoiding an otherwise redundant ASTER method frame.
 
 Minimal native FFI follows the same typed authority. Before JIT finalization, Cranelift validates
 each foreign declaration/call and resolves its fully linked identity plus exact scalar signature

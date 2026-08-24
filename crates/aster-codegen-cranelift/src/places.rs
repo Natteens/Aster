@@ -296,8 +296,6 @@ impl Codegen {
         }
         let in_bounds = builder.create_block();
         let out_of_bounds = builder.create_block();
-        let join = builder.create_block();
-        builder.append_block_param(join, self.pointer_type);
 
         let non_negative = builder
             .ins()
@@ -315,22 +313,11 @@ impl Codegen {
         let function_ref = self
             .jit
             .declare_func_in_func(self.runtime_ids["aster_rt_array_element"], builder.func);
-        let call = builder.ins().call(function_ref, &[context, array, index]);
-        let address = builder.inst_results(call)[0];
-        builder.ins().jump(join, &[address.into()]);
+        builder.ins().call(function_ref, &[context, array, index]);
+        builder.ins().jump(state.runtime_failure, &[]);
 
         builder.switch_to_block(in_bounds);
-        let address = self.unchecked_array_element_address(
-            builder,
-            array,
-            index,
-            element_type,
-            array_data_offset,
-        )?;
-        builder.ins().jump(join, &[address.into()]);
-
-        builder.switch_to_block(join);
-        Ok(builder.block_params(join)[0])
+        self.unchecked_array_element_address(builder, array, index, element_type, array_data_offset)
     }
 
     fn unchecked_array_element_address(

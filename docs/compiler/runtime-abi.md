@@ -70,6 +70,9 @@ Fallible context-taking intrinsics transfer to the current generated runtime-fai
 generated code loads or otherwise consumes an out destination. Ordinary semantic outcomes such as
 `TryParse` returning `Option.None` or filesystem APIs returning `Result.Error` are fully initialized
 values, not runtime failures. The current failure block retains AARM/owned-region cleanup authority.
+This applies equally to checked array access, integer arithmetic reporters, string decoding and
+formatting, Task/async/Parallel operations, and collection calls: an error edge never rejoins the
+success path through a dummy value or an unwritten out slot.
 
 Fallible private collection mutations and out-producing `List<T>` and `Dictionary<K,V>` calls return
 an `I8` success status. Generated code branches on that status before loading an out destination such
@@ -84,6 +87,12 @@ Filesystem list/text/result intrinsics similarly write a complete typed `Result`
 after the operation succeeds or a complete portable `IOError` is available. New list/dictionary
 capacity and range entry points keep the same private status-first rule and MemoryGovernor/region
 authority as their existing collection operations.
+Runtime entry points validate every tag, success payload, error payload, `IOError.kind`, and
+`IOError.osCode` offset against the complete destination size with checked arithmetic before host
+effects or publication. `ReadLine` also derives a byte ceiling from the current execution's
+configured per-allocation string materialization limit and caps standard-input reading before
+allocating the ASTER string; it does not claim that this ceiling is a snapshot of remaining arena
+capacity. LF, CRLF, EOF, embedded NUL, and UTF-8 validation retain their existing semantics.
 
 ## Ownership and lifetime
 

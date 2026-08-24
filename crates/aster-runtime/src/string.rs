@@ -1547,7 +1547,13 @@ fn string_try_parse<T>(
         ));
         return;
     };
-    if payload_offset > total_size {
+    let Some(payload_end) = payload_offset.checked_add(std::mem::size_of::<T>()) else {
+        context.fail(format!(
+            "String.{operation} Option<T> payload layout overflow"
+        ));
+        return;
+    };
+    if total_size < std::mem::size_of::<i32>() || payload_end > total_size {
         context.fail(format!(
             "String.{operation} destination layout is too small for its payload"
         ));
@@ -1897,9 +1903,11 @@ mod tests {
         aster_rt_string_replace, aster_rt_string_split, aster_rt_string_starts_with,
         aster_rt_string_substring_from, aster_rt_string_substring_range,
         aster_rt_string_substring_range_temporary, aster_rt_string_trim,
-        aster_rt_string_try_parse_bool, aster_rt_string_try_parse_double,
-        aster_rt_string_try_parse_float, aster_rt_string_try_parse_int, encode_str,
-        is_valid_float_grammar, view,
+        aster_rt_string_try_parse_bool, aster_rt_string_try_parse_byte,
+        aster_rt_string_try_parse_char, aster_rt_string_try_parse_double,
+        aster_rt_string_try_parse_float, aster_rt_string_try_parse_int,
+        aster_rt_string_try_parse_long, aster_rt_string_try_parse_short,
+        aster_rt_string_try_parse_ulong, encode_str, is_valid_float_grammar, view,
     };
     use crate::{
         ExecutionContext, MemoryGovernor, aster_rt_array_element, aster_rt_array_length,
@@ -2312,6 +2320,81 @@ mod tests {
         // never being partially initialized from a call that never publishes
         // a result.
         assert_eq!(destination, option_destination());
+    }
+
+    #[test]
+    fn try_parse_rejects_out_of_bounds_option_layouts_without_touching_destination() {
+        let value = aligned("42");
+        for (total_size, payload_offset) in [(3, 0), (8, 7), (16, i32::MAX)] {
+            let mut destination = vec![0xaaaa_aaaa_aaaa_aaaa_u64; 3];
+            let expected = destination.clone();
+            let mut context = ExecutionContext::new();
+            aster_rt_string_try_parse_int(
+                &raw mut context,
+                pointer(&value),
+                destination.as_mut_ptr().cast::<u8>(),
+                total_size,
+                1,
+                0,
+                payload_offset,
+            );
+            assert!(
+                context
+                    .take_error()
+                    .is_some_and(|error| error.contains("layout")),
+                "layout total={total_size} payload={payload_offset} must fail"
+            );
+            assert_eq!(destination, expected, "malformed layout must not write");
+        }
+    }
+
+    #[test]
+    fn try_parse_payload_bounds_follow_each_scalar_width() {
+        type Parser = extern "C" fn(
+            *mut ExecutionContext,
+            *const AsterStrHeader,
+            *mut u8,
+            i32,
+            i32,
+            i32,
+            i32,
+        );
+        let parsers: [(&str, Parser, i32, i32); 9] = [
+            ("Bool", aster_rt_string_try_parse_bool, 8, 8),
+            ("Byte", aster_rt_string_try_parse_byte, 8, 8),
+            ("Short", aster_rt_string_try_parse_short, 8, 7),
+            ("Char", aster_rt_string_try_parse_char, 8, 5),
+            ("Int", aster_rt_string_try_parse_int, 8, 5),
+            ("Long", aster_rt_string_try_parse_long, 16, 9),
+            ("ULong", aster_rt_string_try_parse_ulong, 16, 9),
+            ("Float", aster_rt_string_try_parse_float, 8, 5),
+            ("Double", aster_rt_string_try_parse_double, 16, 9),
+        ];
+        let value = aligned("1");
+        for (name, parser, total_size, payload_offset) in parsers {
+            let mut destination = vec![0xaaaa_aaaa_aaaa_aaaa_u64; 3];
+            let expected = destination.clone();
+            let mut context = ExecutionContext::new();
+            parser(
+                &raw mut context,
+                pointer(&value),
+                destination.as_mut_ptr().cast::<u8>(),
+                total_size,
+                1,
+                0,
+                payload_offset,
+            );
+            assert!(
+                context
+                    .take_error()
+                    .is_some_and(|error| error.contains(name) && error.contains("layout")),
+                "TryParse{name} malformed payload must fail"
+            );
+            assert_eq!(
+                destination, expected,
+                "TryParse{name} must not publish a malformed Option"
+            );
+        }
     }
 
     #[test]

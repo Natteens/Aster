@@ -885,6 +885,26 @@ unsafe fn write_unaligned<T>(destination: *mut u8, value: T) {
     }
 }
 
+fn result_io_error_layout_fits<T>(
+    total_size: usize,
+    ok_offset: usize,
+    error_offset: usize,
+    kind_offset: usize,
+    oscode_offset: usize,
+) -> bool {
+    let ok_end = ok_offset.checked_add(size_of::<T>());
+    let kind_end = error_offset
+        .checked_add(kind_offset)
+        .and_then(|offset| offset.checked_add(size_of::<i32>()));
+    let oscode_end = error_offset
+        .checked_add(oscode_offset)
+        .and_then(|offset| offset.checked_add(size_of::<i32>()));
+    total_size >= size_of::<i32>()
+        && ok_end.is_some_and(|end| end <= total_size)
+        && kind_end.is_some_and(|end| end <= total_size)
+        && oscode_end.is_some_and(|end| end <= total_size)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn read_all_text(
     context: *mut ExecutionContext,
@@ -927,6 +947,16 @@ fn read_all_text(
         context.fail("aster.io.ReadAllText received a negative layout size");
         return;
     };
+    if !result_io_error_layout_fits::<*const AsterStrHeader>(
+        total_size,
+        ok_payload_offset,
+        error_payload_offset,
+        kind_offset,
+        oscode_offset,
+    ) {
+        context.fail("aster.io.ReadAllText received a malformed Result layout");
+        return;
+    }
     // SAFETY: generated code passes a pointer to 9 compiler-computed tag
     // constants (or null on a malformed layout, handled below).
     #[allow(unsafe_code)]
@@ -1033,6 +1063,16 @@ fn list_paths(
         context.fail("aster.io directory listing received a negative layout size");
         return;
     };
+    if !result_io_error_layout_fits::<*mut AsterStrHeader>(
+        total_size,
+        ok_payload_offset,
+        error_payload_offset,
+        kind_offset,
+        oscode_offset,
+    ) {
+        context.fail("aster.io directory listing received a malformed Result layout");
+        return;
+    }
     // SAFETY: generated code passes a pointer to 9 compiler-computed tag
     // constants (or null on a malformed layout, handled below).
     #[allow(unsafe_code)]
@@ -1437,6 +1477,16 @@ pub extern "C" fn aster_rt_io_write_all_text(
         context.fail("aster.io.WriteAllText received a negative layout size");
         return;
     };
+    if !result_io_error_layout_fits::<i32>(
+        total_size,
+        ok_payload_offset,
+        error_payload_offset,
+        kind_offset,
+        oscode_offset,
+    ) {
+        context.fail("aster.io.WriteAllText received a malformed Result layout");
+        return;
+    }
     // SAFETY: generated code passes a pointer to 9 compiler-computed tag
     // constants (or null on a malformed layout, handled below).
     #[allow(unsafe_code)]
@@ -1530,6 +1580,16 @@ pub extern "C" fn aster_rt_io_append_all_text(
         context.fail("aster.io.AppendAllText received invalid layout metadata");
         return;
     };
+    if !result_io_error_layout_fits::<i32>(
+        total_size,
+        ok_payload_offset,
+        error_payload_offset,
+        kind_offset,
+        oscode_offset,
+    ) {
+        context.fail("aster.io.AppendAllText received a malformed Result layout");
+        return;
+    }
     #[allow(unsafe_code)]
     let Some(kind_tags) = (unsafe { read_kind_tags(kind_tags) }) else {
         context.fail("aster.io.AppendAllText received invalid error metadata");
@@ -1611,6 +1671,16 @@ pub extern "C" fn aster_rt_io_path_bool(
         context.fail("aster.io path operation received invalid layout metadata");
         return;
     };
+    if !result_io_error_layout_fits::<i8>(
+        total_size,
+        ok_payload_offset,
+        error_payload_offset,
+        kind_offset,
+        oscode_offset,
+    ) {
+        context.fail("aster.io path operation received a malformed Result layout");
+        return;
+    }
     #[allow(unsafe_code)]
     let Some(kind_tags) = (unsafe { read_kind_tags(kind_tags) }) else {
         context.fail("aster.io path operation received invalid error metadata");
@@ -1660,7 +1730,7 @@ mod tests {
     use super::{
         FailingFileSystemBackend, FileSystemBackend, FileSystemError, MemoryFileSystemBackend,
         PartialWriteFailureFileSystemBackend, StdFileSystemBackend, classify,
-        read_bounded_regular_file,
+        read_bounded_regular_file, result_io_error_layout_fits,
     };
     use crate::io_error::PortableIoErrorKind;
     use std::cell::Cell;
@@ -1672,6 +1742,23 @@ mod tests {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("aster-fs-test-{label}-{}-{id}", std::process::id()))
+    }
+
+    #[test]
+    fn result_layout_validation_rejects_every_out_of_bounds_payload_shape() {
+        assert!(result_io_error_layout_fits::<usize>(32, 8, 16, 0, 4));
+        assert!(!result_io_error_layout_fits::<usize>(3, 0, 0, 0, 0));
+        assert!(!result_io_error_layout_fits::<usize>(12, 8, 0, 0, 4));
+        assert!(!result_io_error_layout_fits::<usize>(20, 0, 16, 0, 4));
+        assert!(!result_io_error_layout_fits::<usize>(20, 0, 8, 9, 4));
+        assert!(!result_io_error_layout_fits::<usize>(20, 0, 8, 0, 9));
+        assert!(!result_io_error_layout_fits::<usize>(
+            usize::MAX,
+            usize::MAX,
+            0,
+            0,
+            0,
+        ));
     }
 
     #[test]

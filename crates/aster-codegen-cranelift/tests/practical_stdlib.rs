@@ -161,6 +161,55 @@ public int Main()
 }
 
 #[test]
+fn direct_next_uint_is_sequence_compatible_across_seeds_and_interleaving() {
+    let module = compile(
+        r"
+using aster.random;
+
+public bool VerifyNextUIntSequence(ulong seed, int count)
+{
+    Random direct = new Random(seed);
+    Random reference = new Random(seed);
+    for (int i = 0; i < count; i++)
+    {
+        if (direct.NextUInt() != (uint)(reference.NextULong() / 4294967296UL)) { return false; }
+    }
+    return true;
+}
+
+public bool VerifyInterleavedSequence(ulong seed, int count)
+{
+    Random direct = new Random(seed);
+    Random reference = new Random(seed);
+    for (int i = 0; i < count; i++)
+    {
+        if (direct.NextUInt() != (uint)(reference.NextULong() / 4294967296UL)) { return false; }
+        bool expectedBool = reference.NextULong() / 9223372036854775808UL != 0UL;
+        if (direct.NextBool() != expectedBool) { return false; }
+        ulong expectedDoubleWord = reference.NextULong();
+        double expectedDouble = (double)(expectedDoubleWord / 2048UL) / 9007199254740992.0d;
+        if (direct.NextDouble() != expectedDouble) { return false; }
+        if (direct.NextULong() != reference.NextULong()) { return false; }
+    }
+    return true;
+}
+
+public int Main()
+{
+    ulong[] sequenceSeeds = [0UL, 1UL, 123UL, 987654321UL, 18446744073709551615UL];
+    for (int i = 0; i < sequenceSeeds.Length; i++)
+    {
+        if (!VerifyNextUIntSequence(sequenceSeeds[i], 512)) { return 1; }
+        if (!VerifyInterleavedSequence(sequenceSeeds[i], 128)) { return 2; }
+    }
+    return 42;
+}
+",
+    );
+    assert_eq!(execute(&module, "Main"), Ok(ExecutionValue::Int(42)));
+}
+
+#[test]
 fn deterministic_random_collections_and_clock_invariants_hold() {
     let module = compile(
         r#"
@@ -174,6 +223,7 @@ public int Main()
     Random random = new Random(123UL);
     if (random.NextULong() != 13032462758197477675UL) { return 1; }
     if (random.NextULong() != 18015028434894305148UL) { return 2; }
+
     Random zero = new Random(0UL);
     if (zero.NextULong() != 16294208416658607535UL) { return 16; }
     Random booleans = new Random(0UL);

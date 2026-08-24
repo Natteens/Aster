@@ -21,6 +21,30 @@ use crate::string::{AsterStrHeader, view, write_option_result};
 /// include the terminator (if any); callers strip it.
 pub type ReadLineResult = io::Result<Option<Vec<u8>>>;
 
+fn strip_line_terminator(bytes: &[u8]) -> &[u8] {
+    match bytes.strip_suffix(b"\n") {
+        Some(rest) => rest.strip_suffix(b"\r").unwrap_or(rest),
+        None => bytes,
+    }
+}
+
+fn read_line_bounded(reader: &mut impl BufRead, max_content_bytes: usize) -> ReadLineResult {
+    let probe_limit = max_content_bytes.saturating_add(2);
+    let mut buffer = Vec::new();
+    let mut limited = std::io::Read::take(reader, u64::try_from(probe_limit).unwrap_or(u64::MAX));
+    let read = limited.read_until(b'\n', &mut buffer)?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if strip_line_terminator(&buffer).len() > max_content_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "console input line exceeds the execution string limit",
+        ));
+    }
+    Ok(Some(buffer))
+}
+
 /// Injectable terminal backend for `aster.io`. Implementations own whatever
 /// host resource they read from/write to; this trait never assumes a shared
 /// or global stream.
@@ -65,6 +89,30 @@ pub trait ConsoleBackend: Send {
     ///
     /// Returns an error if the underlying host read fails.
     fn read_line(&mut self) -> ReadLineResult;
+
+    /// Read one line while bounding host scratch to a payload the current
+    /// execution could materialize as an ASTER string. Custom backends keep
+    /// source compatibility through this checked default; built-in backends
+    /// override it so the read itself is bounded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backend read fails or the returned line is
+    /// larger than `max_content_bytes` after removing its line terminator.
+    fn read_line_with_limit(&mut self, max_content_bytes: usize) -> ReadLineResult {
+        let line = self.read_line()?;
+        if line
+            .as_deref()
+            .is_some_and(|bytes| strip_line_terminator(bytes).len() > max_content_bytes)
+        {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "console input line exceeds the execution string limit",
+            ))
+        } else {
+            Ok(line)
+        }
+    }
 }
 
 /// Default backend: the process's real stdin/stdout.
@@ -91,13 +139,11 @@ impl ConsoleBackend for StdConsoleBackend {
     }
 
     fn read_line(&mut self) -> ReadLineResult {
-        let mut buffer = Vec::new();
-        let read = io::stdin().lock().read_until(b'\n', &mut buffer)?;
-        if read == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(buffer))
-        }
+        self.read_line_with_limit(ExecutionContext::AARM_MAX_CONTEXT_CAPACITY_BYTES)
+    }
+
+    fn read_line_with_limit(&mut self, max_content_bytes: usize) -> ReadLineResult {
+        read_line_bounded(&mut io::stdin().lock(), max_content_bytes)
     }
 }
 
@@ -148,17 +194,15 @@ impl ConsoleBackend for MemoryConsoleBackend {
     }
 
     fn read_line(&mut self) -> ReadLineResult {
+        self.read_line_with_limit(ExecutionContext::AARM_MAX_CONTEXT_CAPACITY_BYTES)
+    }
+
+    fn read_line_with_limit(&mut self, max_content_bytes: usize) -> ReadLineResult {
         let mut guard = self
             .input
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut buffer = Vec::new();
-        let read = guard.read_until(b'\n', &mut buffer)?;
-        if read == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(buffer))
-        }
+        read_line_bounded(&mut *guard, max_content_bytes)
     }
 }
 
@@ -233,18 +277,6 @@ pub extern "C" fn aster_rt_io_write_line(
     write_and_flush(context, value, true, "WriteLine");
 }
 
-/// Strip exactly one logical line terminator: a trailing `\n`, and then a
-/// trailing `\r` if one remains. Never trims anything else.
-fn strip_line_terminator(bytes: &[u8]) -> &[u8] {
-    // A trailing `\r` is only part of a CRLF terminator, and thus only
-    // stripped, when a `\n` was actually found and stripped first. A lone
-    // trailing `\r` (no `\n`, e.g. at EOF) is ordinary content.
-    match bytes.strip_suffix(b"\n") {
-        Some(rest) => rest.strip_suffix(b"\r").unwrap_or(rest),
-        None => bytes,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn read_line_into_option(
     context: *mut ExecutionContext,
@@ -279,7 +311,10 @@ fn read_line_into_option(
         context.fail("aster.io.ReadLine destination is too small for its payload");
         return;
     }
-    let line = context.console_backend().read_line();
+    let max_content_bytes = context.string_materialization_limit_bytes();
+    let line = context
+        .console_backend()
+        .read_line_with_limit(max_content_bytes);
     match line {
         Ok(None) => {
             // SAFETY: `destination` is `total_size` bytes, `total_size` and
@@ -372,7 +407,7 @@ mod tests {
     use super::{
         ConsoleBackend, FailingConsoleBackend, MemoryConsoleBackend, aster_rt_io_read_line,
         aster_rt_io_read_line_temporary, aster_rt_io_write, aster_rt_io_write_line,
-        strip_line_terminator,
+        read_line_bounded, strip_line_terminator,
     };
     use crate::ExecutionContext;
     use crate::context::aster_rt_temporary_scope_enter;
@@ -427,6 +462,52 @@ mod tests {
         assert_eq!(backend.read_line().unwrap(), Some(b"c".to_vec()));
         assert_eq!(backend.read_line().unwrap(), None);
         assert_eq!(backend.read_line().unwrap(), None);
+    }
+
+    #[test]
+    fn bounded_line_reader_covers_zero_through_limit_plus_one_for_every_terminator() {
+        for limit in [0_usize, 1, 4] {
+            let mut lengths = vec![0, limit.saturating_sub(1), limit, limit + 1];
+            lengths.sort_unstable();
+            lengths.dedup();
+            for length in lengths {
+                for terminator in [b"".as_slice(), b"\n", b"\r\n"] {
+                    let mut input = vec![b'x'; length];
+                    input.extend_from_slice(terminator);
+                    let mut reader = std::io::Cursor::new(&input);
+                    let result = read_line_bounded(&mut reader, limit);
+                    if length > limit {
+                        assert_eq!(
+                            result.expect_err("limit + 1 must fail").kind(),
+                            std::io::ErrorKind::InvalidData,
+                            "limit={limit} length={length} terminator={terminator:?}"
+                        );
+                    } else if input.is_empty() {
+                        assert_eq!(result.unwrap(), None, "empty EOF remains EOF");
+                    } else {
+                        assert_eq!(
+                            result.expect("content within the limit is valid"),
+                            Some(input),
+                            "limit={limit} length={length} terminator={terminator:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_line_reader_preserves_line_order_and_eof() {
+        let mut reader = std::io::Cursor::new(b"one\ntwo\n".to_vec());
+        assert_eq!(
+            read_line_bounded(&mut reader, 3).unwrap(),
+            Some(b"one\n".to_vec())
+        );
+        assert_eq!(
+            read_line_bounded(&mut reader, 3).unwrap(),
+            Some(b"two\n".to_vec())
+        );
+        assert_eq!(read_line_bounded(&mut reader, 3).unwrap(), None);
     }
 
     #[test]

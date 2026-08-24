@@ -196,12 +196,9 @@ impl Codegen {
             self.runtime_ids["aster_rt_integer_arithmetic_error"],
             builder.func,
         );
-        let value_type = builder.func.dfg.value_type(left);
         let zero_error = builder.create_block();
         let nonzero = builder.create_block();
         let valid = builder.create_block();
-        let join = builder.create_block();
-        builder.append_block_param(join, value_type);
 
         let right_is_zero = builder.ins().icmp_imm(IntCC::Equal, right, 0);
         builder
@@ -211,8 +208,7 @@ impl Codegen {
         builder.switch_to_block(zero_error);
         let zero_code = builder.ins().iconst(types::I32, zero_code);
         builder.ins().call(reporter, &[context, zero_code]);
-        let dummy = builder.ins().iconst(value_type, 0);
-        builder.ins().jump(join, &[dummy.into()]);
+        builder.ins().jump(state.runtime_failure, &[]);
 
         builder.switch_to_block(nonzero);
         let unsigned = is_unsigned_integer(operand_type);
@@ -231,8 +227,7 @@ impl Codegen {
             builder.switch_to_block(overflow_error);
             let overflow_code = builder.ins().iconst(types::I32, overflow_code);
             builder.ins().call(reporter, &[context, overflow_code]);
-            let dummy = builder.ins().iconst(value_type, 0);
-            builder.ins().jump(join, &[dummy.into()]);
+            builder.ins().jump(state.runtime_failure, &[]);
         }
 
         builder.switch_to_block(valid);
@@ -247,9 +242,7 @@ impl Codegen {
                 ));
             }
         };
-        builder.ins().jump(join, &[result.into()]);
-        builder.switch_to_block(join);
-        Ok(builder.block_params(join)[0])
+        Ok(result)
     }
 
     #[allow(clippy::too_many_lines)]

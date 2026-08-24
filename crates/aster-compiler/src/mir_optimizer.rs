@@ -49,12 +49,12 @@ fn contains_lifetime_markers(function: &mir::Function) -> bool {
 enum ConstantFact {
     Constant(mir::Operand),
     EnumTag(u32),
-    Overdefined,
 }
 
+type ConstantFacts = HashMap<mir::LocalId, ConstantFact>;
+
 fn propagate_fold_and_simplify_branches(function: &mut mir::Function) -> bool {
-    let local_indices = local_indices(function);
-    let entry_facts = constant_entry_facts(function, &local_indices);
+    let entry_facts = constant_entry_facts(function);
     let block_indices = function
         .blocks
         .iter()
@@ -73,7 +73,7 @@ fn propagate_fold_and_simplify_branches(function: &mut mir::Function) -> bool {
         let mut copies = HashMap::<mir::LocalId, mir::Operand>::new();
 
         for instruction in &mut block.instructions {
-            changed |= rewrite_instruction_operands(instruction, &facts, &copies, &local_indices);
+            changed |= rewrite_instruction_operands(instruction, &facts, &copies);
 
             match instruction {
                 mir::Instruction::Assign {
@@ -92,7 +92,7 @@ fn propagate_fold_and_simplify_branches(function: &mut mir::Function) -> bool {
                         }
                         _ => None,
                     };
-                    set_value_fact(&mut facts, &local_indices, *destination, value);
+                    set_value_fact(&mut facts, *destination, value);
                     if let Some(replacement) = replacement {
                         copies.insert(*destination, replacement);
                     }
@@ -100,9 +100,9 @@ fn propagate_fold_and_simplify_branches(function: &mut mir::Function) -> bool {
                 mir::Instruction::Assign {
                     target: mir::Place::Local(destination),
                     value,
-                } if enum_tag_fact(value, &facts, &local_indices).is_some() => {
+                } if enum_tag_fact(value, &facts).is_some() => {
                     invalidate_copy_facts(&mut copies, *destination);
-                    set_value_fact(&mut facts, &local_indices, *destination, value);
+                    set_value_fact(&mut facts, *destination, value);
                 }
                 mir::Instruction::Assign { .. } => {
                     clear_facts(&mut facts, &mut copies);
@@ -111,8 +111,7 @@ fn propagate_fold_and_simplify_branches(function: &mut mir::Function) -> bool {
             }
         }
 
-        changed |=
-            rewrite_terminator_operands(&mut block.terminator, &facts, &copies, &local_indices);
+        changed |= rewrite_terminator_operands(&mut block.terminator, &facts, &copies);
         if let mir::Terminator::Branch {
             condition:
                 mir::Operand {
@@ -132,25 +131,7 @@ fn propagate_fold_and_simplify_branches(function: &mut mir::Function) -> bool {
     changed
 }
 
-fn local_indices(function: &mir::Function) -> HashMap<mir::LocalId, usize> {
-    let mut locals = function
-        .parameters
-        .iter()
-        .chain(&function.locals)
-        .map(|local| local.id)
-        .collect::<Vec<_>>();
-    locals.sort_unstable_by_key(|local| local.0);
-    locals
-        .into_iter()
-        .enumerate()
-        .map(|(index, local)| (local, index))
-        .collect()
-}
-
-fn constant_entry_facts(
-    function: &mir::Function,
-    local_indices: &HashMap<mir::LocalId, usize>,
-) -> Vec<Option<Vec<ConstantFact>>> {
+fn constant_entry_facts(function: &mir::Function) -> Vec<Option<ConstantFacts>> {
     let block_indices = function
         .blocks
         .iter()
@@ -161,18 +142,25 @@ fn constant_entry_facts(
     let Some(entry) = block_indices.get(&function.entry).copied() else {
         return incoming;
     };
-    incoming[entry] = Some(vec![ConstantFact::Overdefined; local_indices.len()]);
+    incoming[entry] = Some(ConstantFacts::new());
     let mut pending = VecDeque::from([entry]);
+    let use_counts = direct_local_use_counts(function);
 
     while let Some(block_index) = pending.pop_front() {
         let Some(mut outgoing) = incoming[block_index].clone() else {
             continue;
         };
-        transfer_constant_facts(
-            &function.blocks[block_index].instructions,
-            &mut outgoing,
-            local_indices,
-        );
+        transfer_constant_facts(&function.blocks[block_index].instructions, &mut outgoing);
+        if let mir::Terminator::Branch { condition, .. } = &function.blocks[block_index].terminator
+            && let mir::OperandKind::Copy(mir::Place::Local(condition)) = condition.kind
+            && use_counts.get(&condition) == Some(&1)
+        {
+            // A single-use comparison temporary is fully consumed here.
+            // Keeping one such result per arm made lowered switch chains
+            // accumulate quadratically large dataflow states. A condition
+            // referenced anywhere else remains available to successors.
+            outgoing.remove(&condition);
+        }
         for successor in successors(&function.blocks[block_index].terminator) {
             let Some(successor_index) = block_indices.get(&successor).copied() else {
                 continue;
@@ -191,11 +179,257 @@ fn constant_entry_facts(
     incoming
 }
 
-fn transfer_constant_facts(
-    instructions: &[mir::Instruction],
-    facts: &mut [ConstantFact],
-    local_indices: &HashMap<mir::LocalId, usize>,
-) {
+fn direct_local_use_counts(function: &mir::Function) -> HashMap<mir::LocalId, usize> {
+    let mut uses = HashMap::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            count_instruction_uses(instruction, &mut uses);
+        }
+        match &block.terminator {
+            mir::Terminator::Branch { condition, .. } => count_operand_uses(condition, &mut uses),
+            mir::Terminator::Return(Some(value)) => count_operand_uses(value, &mut uses),
+            mir::Terminator::Goto(_)
+            | mir::Terminator::Return(None)
+            | mir::Terminator::End
+            | mir::Terminator::Unreachable => {}
+        }
+    }
+    uses
+}
+
+#[allow(clippy::too_many_lines)]
+fn count_instruction_uses(instruction: &mir::Instruction, uses: &mut HashMap<mir::LocalId, usize>) {
+    let operand = |value: &mir::Operand, uses: &mut HashMap<mir::LocalId, usize>| {
+        count_operand_uses(value, uses);
+    };
+    let place = |value: &mir::Place, uses: &mut HashMap<mir::LocalId, usize>| {
+        count_place_input_uses(value, uses);
+    };
+    match instruction {
+        mir::Instruction::OwnedRegionEnter { .. }
+        | mir::Instruction::OwnedRegionExit { .. }
+        | mir::Instruction::TemporarySubregionEnter { .. }
+        | mir::Instruction::TemporarySubregionExit { .. } => {}
+        mir::Instruction::Assign { target, value } => {
+            place(target, uses);
+            count_rvalue_uses(value, uses);
+        }
+        mir::Instruction::Call {
+            destination,
+            arguments,
+            ..
+        }
+        | mir::Instruction::ForeignCall {
+            destination,
+            arguments,
+            ..
+        }
+        | mir::Instruction::CallIntrinsic {
+            destination,
+            arguments,
+            ..
+        } => {
+            if let Some(destination) = destination {
+                place(destination, uses);
+            }
+            for argument in arguments {
+                operand(argument, uses);
+            }
+        }
+        mir::Instruction::CallInterface {
+            destination,
+            receiver,
+            arguments,
+            ..
+        } => {
+            if let Some(destination) = destination {
+                place(destination, uses);
+            }
+            operand(receiver, uses);
+            for argument in arguments {
+                operand(argument, uses);
+            }
+        }
+        mir::Instruction::AllocateArray {
+            destination,
+            length,
+            ..
+        } => {
+            place(destination, uses);
+            operand(length, uses);
+        }
+        mir::Instruction::AllocateObject { destination, .. }
+        | mir::Instruction::AllocateList { destination, .. }
+        | mir::Instruction::AllocateDictionary { destination, .. }
+        | mir::Instruction::AllocateStringBuilder { destination, .. } => place(destination, uses),
+        mir::Instruction::StringBuilderAppend { builder, value, .. } => {
+            operand(builder, uses);
+            operand(value, uses);
+        }
+        mir::Instruction::StringBuilderToString {
+            destination,
+            builder,
+            ..
+        } => {
+            place(destination, uses);
+            operand(builder, uses);
+        }
+        mir::Instruction::DictionaryAdd {
+            destination,
+            dictionary,
+            key,
+            value,
+        }
+        | mir::Instruction::DictionarySet {
+            destination,
+            dictionary,
+            key,
+            value,
+        } => {
+            place(destination, uses);
+            operand(dictionary, uses);
+            operand(key, uses);
+            operand(value, uses);
+        }
+        mir::Instruction::DictionaryTryGet {
+            destination,
+            dictionary,
+            key,
+            ..
+        }
+        | mir::Instruction::DictionaryContainsKey {
+            destination,
+            dictionary,
+            key,
+        }
+        | mir::Instruction::DictionaryRemove {
+            destination,
+            dictionary,
+            key,
+        } => {
+            place(destination, uses);
+            operand(dictionary, uses);
+            operand(key, uses);
+        }
+        mir::Instruction::DictionaryEntries {
+            destination,
+            dictionary,
+            ..
+        }
+        | mir::Instruction::DictionaryKeys {
+            destination,
+            dictionary,
+            ..
+        }
+        | mir::Instruction::DictionaryValues {
+            destination,
+            dictionary,
+            ..
+        } => {
+            place(destination, uses);
+            operand(dictionary, uses);
+        }
+        mir::Instruction::DictionaryClear { dictionary } => operand(dictionary, uses),
+        mir::Instruction::ListAdd { list, value } => {
+            operand(list, uses);
+            operand(value, uses);
+        }
+        mir::Instruction::ListGet {
+            destination,
+            list,
+            index,
+            ..
+        } => {
+            place(destination, uses);
+            operand(list, uses);
+            operand(index, uses);
+        }
+        mir::Instruction::ListRemoveAt { list, index } => {
+            operand(list, uses);
+            operand(index, uses);
+        }
+        mir::Instruction::ListSet { list, index, value } => {
+            operand(list, uses);
+            operand(index, uses);
+            operand(value, uses);
+        }
+        mir::Instruction::ListClear { list } => operand(list, uses),
+        mir::Instruction::ListToArray {
+            destination, list, ..
+        } => {
+            place(destination, uses);
+            operand(list, uses);
+        }
+        mir::Instruction::StringDecodeNext {
+            string,
+            cursor,
+            char_destination,
+            next_cursor_destination,
+            ok_destination,
+        } => {
+            operand(string, uses);
+            operand(cursor, uses);
+            place(char_destination, uses);
+            place(next_cursor_destination, uses);
+            place(ok_destination, uses);
+        }
+    }
+}
+
+fn count_rvalue_uses(value: &mir::Rvalue, uses: &mut HashMap<mir::LocalId, usize>) {
+    match &value.kind {
+        mir::RvalueKind::Use(value)
+        | mir::RvalueKind::Discriminant(value)
+        | mir::RvalueKind::ArrayLength(value)
+        | mir::RvalueKind::ListLength(value)
+        | mir::RvalueKind::DictionaryLength(value)
+        | mir::RvalueKind::ListVersion(value)
+        | mir::RvalueKind::StringByteLength(value)
+        | mir::RvalueKind::Cast(value)
+        | mir::RvalueKind::Unary { operand: value, .. } => count_operand_uses(value, uses),
+        mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
+            for field in fields {
+                count_operand_uses(&field.value, uses);
+            }
+        }
+        mir::RvalueKind::MakeInterface { object, .. } => count_operand_uses(object, uses),
+        mir::RvalueKind::Binary { left, right, .. }
+        | mir::RvalueKind::Equality { left, right, .. } => {
+            count_operand_uses(left, uses);
+            count_operand_uses(right, uses);
+        }
+    }
+}
+
+fn count_operand_uses(operand: &mir::Operand, uses: &mut HashMap<mir::LocalId, usize>) {
+    if let mir::OperandKind::Copy(place) = &operand.kind {
+        count_read_place_uses(place, uses);
+    }
+}
+
+fn count_read_place_uses(place: &mir::Place, uses: &mut HashMap<mir::LocalId, usize>) {
+    if let mir::Place::Local(local) = place {
+        *uses.entry(*local).or_default() += 1;
+    } else {
+        count_place_input_uses(place, uses);
+    }
+}
+
+fn count_place_input_uses(place: &mir::Place, uses: &mut HashMap<mir::LocalId, usize>) {
+    match place {
+        mir::Place::Local(_) | mir::Place::Symbol(_) => {}
+        mir::Place::Field { base, .. } | mir::Place::EnumField { base, .. } => {
+            count_read_place_uses(base, uses);
+        }
+        mir::Place::Index { array, index, .. } => {
+            count_operand_uses(array, uses);
+            count_operand_uses(index, uses);
+        }
+        mir::Place::ObjectField { object, .. } => count_operand_uses(object, uses),
+    }
+}
+
+fn transfer_constant_facts(instructions: &[mir::Instruction], facts: &mut ConstantFacts) {
     for instruction in instructions {
         match instruction {
             mir::Instruction::Assign {
@@ -203,43 +437,37 @@ fn transfer_constant_facts(
                 value,
             } => {
                 let next = if pure_non_failing_rvalue(value) {
-                    constant_rvalue_with_facts(value, facts, local_indices)
-                        .map_or(ConstantFact::Overdefined, ConstantFact::Constant)
-                } else if let Some(tag) = enum_tag_fact(value, facts, local_indices) {
-                    ConstantFact::EnumTag(tag)
+                    constant_rvalue_with_facts(value, facts).map(ConstantFact::Constant)
                 } else {
-                    ConstantFact::Overdefined
+                    enum_tag_fact(value, facts).map(ConstantFact::EnumTag)
                 };
-                let Some(index) = local_indices.get(destination).copied() else {
-                    continue;
-                };
-                facts[index] = next;
+                if let Some(next) = next {
+                    facts.insert(*destination, next);
+                } else {
+                    facts.remove(destination);
+                }
             }
-            _ => facts.fill(ConstantFact::Overdefined),
+            _ => facts.clear(),
         }
     }
 }
 
-fn meet_facts(left: &[ConstantFact], right: &[ConstantFact]) -> Vec<ConstantFact> {
-    left.iter()
-        .zip(right)
-        .map(|(left, right)| {
-            if left == right {
-                left.clone()
-            } else {
-                ConstantFact::Overdefined
-            }
-        })
+fn meet_facts(left: &ConstantFacts, right: &ConstantFacts) -> ConstantFacts {
+    let (smaller, larger) = if left.len() <= right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    smaller
+        .iter()
+        .filter(|(local, fact)| larger.get(local) == Some(*fact))
+        .map(|(local, fact)| (*local, fact.clone()))
         .collect()
 }
 
-fn constant_rvalue_with_facts(
-    value: &mir::Rvalue,
-    facts: &[ConstantFact],
-    local_indices: &HashMap<mir::LocalId, usize>,
-) -> Option<mir::Operand> {
+fn constant_rvalue_with_facts(value: &mir::Rvalue, facts: &ConstantFacts) -> Option<mir::Operand> {
     let mut value = value.clone();
-    rewrite_rvalue_operands(&mut value, facts, &HashMap::new(), local_indices);
+    rewrite_rvalue_operands(&mut value, facts, &HashMap::new());
     fold_rvalue(&mut value);
     match value.kind {
         mir::RvalueKind::Use(operand)
@@ -252,50 +480,42 @@ fn constant_rvalue_with_facts(
     }
 }
 
-fn set_value_fact(
-    facts: &mut [ConstantFact],
-    local_indices: &HashMap<mir::LocalId, usize>,
-    destination: mir::LocalId,
-    value: &mir::Rvalue,
-) {
-    let Some(index) = local_indices.get(&destination).copied() else {
-        return;
-    };
-    let enum_tag = enum_tag_fact(value, facts, local_indices);
-    facts[index] = match &value.kind {
+fn set_value_fact(facts: &mut ConstantFacts, destination: mir::LocalId, value: &mir::Rvalue) {
+    let enum_tag = enum_tag_fact(value, facts);
+    let next = match &value.kind {
         mir::RvalueKind::Use(operand)
             if propagatable_type(&operand.type_)
                 && matches!(operand.kind, mir::OperandKind::Constant(_)) =>
         {
-            ConstantFact::Constant(operand.clone())
+            Some(ConstantFact::Constant(operand.clone()))
         }
-        _ => enum_tag.map_or(ConstantFact::Overdefined, ConstantFact::EnumTag),
+        _ => enum_tag.map(ConstantFact::EnumTag),
     };
+    if let Some(next) = next {
+        facts.insert(destination, next);
+    } else {
+        facts.remove(&destination);
+    }
 }
 
-fn enum_tag_fact(
-    value: &mir::Rvalue,
-    facts: &[ConstantFact],
-    local_indices: &HashMap<mir::LocalId, usize>,
-) -> Option<u32> {
+fn enum_tag_fact(value: &mir::Rvalue, facts: &ConstantFacts) -> Option<u32> {
     match &value.kind {
         mir::RvalueKind::EnumConstruct { tag, .. } => Some(*tag),
         mir::RvalueKind::Use(mir::Operand {
             kind: mir::OperandKind::Copy(mir::Place::Local(local)),
             ..
         }) => {
-            let index = *local_indices.get(local)?;
-            let ConstantFact::EnumTag(tag) = facts[index] else {
+            let ConstantFact::EnumTag(tag) = facts.get(local)? else {
                 return None;
             };
-            Some(tag)
+            Some(*tag)
         }
         _ => None,
     }
 }
 
-fn clear_facts(facts: &mut [ConstantFact], copies: &mut HashMap<mir::LocalId, mir::Operand>) {
-    facts.fill(ConstantFact::Overdefined);
+fn clear_facts(facts: &mut ConstantFacts, copies: &mut HashMap<mir::LocalId, mir::Operand>) {
+    facts.clear();
     copies.clear();
 }
 
@@ -382,26 +602,25 @@ fn simple_operand(operand: &mir::Operand) -> bool {
 #[allow(clippy::too_many_lines)]
 fn rewrite_instruction_operands(
     instruction: &mut mir::Instruction,
-    facts: &[ConstantFact],
+    facts: &ConstantFacts,
     copies: &HashMap<mir::LocalId, mir::Operand>,
-    local_indices: &HashMap<mir::LocalId, usize>,
 ) -> bool {
     let mut changed = false;
     macro_rules! operand {
         ($operand:expr) => {
-            changed |= rewrite_operand($operand, facts, copies, local_indices)
+            changed |= rewrite_operand($operand, facts, copies)
         };
     }
     macro_rules! place {
         ($place:expr) => {
-            changed |= rewrite_place_inputs($place, facts, copies, local_indices)
+            changed |= rewrite_place_inputs($place, facts, copies)
         };
     }
 
     match instruction {
         mir::Instruction::Assign { target, value } => {
             place!(target);
-            rewrite_rvalue_operands(value, facts, copies, local_indices);
+            rewrite_rvalue_operands(value, facts, copies);
             changed |= fold_rvalue(value);
         }
         mir::Instruction::Call {
@@ -556,13 +775,12 @@ fn rewrite_instruction_operands(
 
 fn rewrite_rvalue_operands(
     value: &mut mir::Rvalue,
-    facts: &[ConstantFact],
+    facts: &ConstantFacts,
     copies: &HashMap<mir::LocalId, mir::Operand>,
-    local_indices: &HashMap<mir::LocalId, usize>,
 ) -> bool {
     let mut changed = false;
     let mut operand = |operand: &mut mir::Operand| {
-        changed |= rewrite_operand(operand, facts, copies, local_indices);
+        changed |= rewrite_operand(operand, facts, copies);
     };
     match &mut value.kind {
         mir::RvalueKind::Use(value)
@@ -590,8 +808,7 @@ fn rewrite_rvalue_operands(
         kind: mir::OperandKind::Copy(mir::Place::Local(local)),
         ..
     }) = value.kind
-        && let Some(index) = local_indices.get(&local).copied()
-        && let ConstantFact::EnumTag(tag) = facts[index]
+        && let Some(ConstantFact::EnumTag(tag)) = facts.get(&local)
     {
         value.kind = mir::RvalueKind::Use(mir::Operand {
             type_: value.type_.clone(),
@@ -604,17 +821,12 @@ fn rewrite_rvalue_operands(
 
 fn rewrite_terminator_operands(
     terminator: &mut mir::Terminator,
-    facts: &[ConstantFact],
+    facts: &ConstantFacts,
     copies: &HashMap<mir::LocalId, mir::Operand>,
-    local_indices: &HashMap<mir::LocalId, usize>,
 ) -> bool {
     match terminator {
-        mir::Terminator::Branch { condition, .. } => {
-            rewrite_operand(condition, facts, copies, local_indices)
-        }
-        mir::Terminator::Return(Some(value)) => {
-            rewrite_operand(value, facts, copies, local_indices)
-        }
+        mir::Terminator::Branch { condition, .. } => rewrite_operand(condition, facts, copies),
+        mir::Terminator::Return(Some(value)) => rewrite_operand(value, facts, copies),
         mir::Terminator::Goto(_)
         | mir::Terminator::Return(None)
         | mir::Terminator::End
@@ -624,30 +836,25 @@ fn rewrite_terminator_operands(
 
 fn rewrite_place_inputs(
     place: &mut mir::Place,
-    facts: &[ConstantFact],
+    facts: &ConstantFacts,
     copies: &HashMap<mir::LocalId, mir::Operand>,
-    local_indices: &HashMap<mir::LocalId, usize>,
 ) -> bool {
     match place {
         mir::Place::Local(_) | mir::Place::Symbol(_) => false,
         mir::Place::Field { base, .. } | mir::Place::EnumField { base, .. } => {
-            rewrite_place_inputs(base, facts, copies, local_indices)
+            rewrite_place_inputs(base, facts, copies)
         }
         mir::Place::Index { array, index, .. } => {
-            rewrite_operand(array, facts, copies, local_indices)
-                | rewrite_operand(index, facts, copies, local_indices)
+            rewrite_operand(array, facts, copies) | rewrite_operand(index, facts, copies)
         }
-        mir::Place::ObjectField { object, .. } => {
-            rewrite_operand(object, facts, copies, local_indices)
-        }
+        mir::Place::ObjectField { object, .. } => rewrite_operand(object, facts, copies),
     }
 }
 
 fn rewrite_operand(
     operand: &mut mir::Operand,
-    facts: &[ConstantFact],
+    facts: &ConstantFacts,
     copies: &HashMap<mir::LocalId, mir::Operand>,
-    local_indices: &HashMap<mir::LocalId, usize>,
 ) -> bool {
     if !propagatable_type(&operand.type_) {
         return false;
@@ -662,10 +869,7 @@ fn rewrite_operand(
             *operand = replacement.clone();
             continue;
         }
-        let Some(index) = local_indices.get(&local).copied() else {
-            break;
-        };
-        let ConstantFact::Constant(replacement) = &facts[index] else {
+        let Some(ConstantFact::Constant(replacement)) = facts.get(&local) else {
             break;
         };
         *operand = replacement.clone();
@@ -972,22 +1176,23 @@ fn simplify_cfg(function: &mut mir::Function) -> bool {
             None
         })
         .collect::<HashMap<_, _>>();
+    let forwarded = forwarded_targets(&trampolines);
     let mut changed = false;
 
     for block in &mut function.blocks {
         match &mut block.terminator {
             mir::Terminator::Goto(target) => {
-                let forwarded = forwarded_target(*target, &trampolines);
-                changed |= forwarded != *target;
-                *target = forwarded;
+                let next = forwarded.get(target).copied().unwrap_or(*target);
+                changed |= next != *target;
+                *target = next;
             }
             mir::Terminator::Branch {
                 then_block,
                 else_block,
                 ..
             } => {
-                let forwarded_then = forwarded_target(*then_block, &trampolines);
-                let forwarded_else = forwarded_target(*else_block, &trampolines);
+                let forwarded_then = forwarded.get(then_block).copied().unwrap_or(*then_block);
+                let forwarded_else = forwarded.get(else_block).copied().unwrap_or(*else_block);
                 changed |= forwarded_then != *then_block || forwarded_else != *else_block;
                 *then_block = forwarded_then;
                 *else_block = forwarded_else;
@@ -1008,19 +1213,38 @@ fn simplify_cfg(function: &mut mir::Function) -> bool {
     changed | (before != function.blocks.len())
 }
 
-fn forwarded_target(
-    start: mir::BasicBlockId,
+fn forwarded_targets(
     trampolines: &HashMap<mir::BasicBlockId, mir::BasicBlockId>,
-) -> mir::BasicBlockId {
-    let mut current = start;
-    let mut seen = HashSet::new();
-    while let Some(next) = trampolines.get(&current).copied() {
-        if !seen.insert(current) || seen.contains(&next) {
-            return start;
+) -> HashMap<mir::BasicBlockId, mir::BasicBlockId> {
+    let mut resolved = HashMap::<mir::BasicBlockId, Option<mir::BasicBlockId>>::new();
+    for start in trampolines.keys().copied() {
+        if resolved.contains_key(&start) {
+            continue;
         }
-        current = next;
+        let mut path = Vec::new();
+        let mut positions = HashMap::new();
+        let mut current = start;
+        let terminal = loop {
+            if let Some(known) = resolved.get(&current).copied() {
+                break known;
+            }
+            if positions.insert(current, path.len()).is_some() {
+                break None;
+            }
+            path.push(current);
+            let Some(next) = trampolines.get(&current).copied() else {
+                break Some(current);
+            };
+            current = next;
+        };
+        for block in path {
+            resolved.insert(block, terminal);
+        }
     }
-    current
+    resolved
+        .into_iter()
+        .filter_map(|(block, target)| target.map(|target| (block, target)))
+        .collect()
 }
 
 fn reachable_blocks(function: &mir::Function) -> HashSet<mir::BasicBlockId> {
@@ -1059,6 +1283,183 @@ fn successors(terminator: &mir::Terminator) -> Vec<mir::BasicBlockId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bool_operand(local: mir::LocalId) -> mir::Operand {
+        mir::Operand {
+            type_: mir::Type::Bool,
+            kind: mir::OperandKind::Copy(mir::Place::Local(local)),
+        }
+    }
+
+    fn branch_fact_function(successor_uses_condition: bool) -> mir::Function {
+        let condition = mir::LocalId(0);
+        let observed = mir::LocalId(1);
+        mir::Function {
+            constructor: false,
+            symbol: mir::SymbolId(1),
+            owner: None,
+            name: "BranchFacts".to_owned(),
+            visibility: mir::Visibility::Public,
+            parameters: Vec::new(),
+            locals: vec![
+                mir::Local {
+                    id: condition,
+                    symbol: None,
+                    name: "condition".to_owned(),
+                    type_: mir::Type::Bool,
+                    mutable: true,
+                    temporary: true,
+                },
+                mir::Local {
+                    id: observed,
+                    symbol: None,
+                    name: "observed".to_owned(),
+                    type_: mir::Type::Bool,
+                    mutable: true,
+                    temporary: true,
+                },
+            ],
+            return_type: mir::Type::Void,
+            entry: mir::BasicBlockId(0),
+            blocks: vec![
+                mir::BasicBlock {
+                    id: mir::BasicBlockId(0),
+                    instructions: vec![mir::Instruction::Assign {
+                        target: mir::Place::Local(condition),
+                        value: mir::Rvalue {
+                            type_: mir::Type::Bool,
+                            kind: mir::RvalueKind::Use(mir::Operand {
+                                type_: mir::Type::Bool,
+                                kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+                            }),
+                        },
+                    }],
+                    terminator: mir::Terminator::Branch {
+                        condition: bool_operand(condition),
+                        then_block: mir::BasicBlockId(1),
+                        else_block: mir::BasicBlockId(2),
+                    },
+                },
+                mir::BasicBlock {
+                    id: mir::BasicBlockId(1),
+                    instructions: if successor_uses_condition {
+                        vec![mir::Instruction::Assign {
+                            target: mir::Place::Local(observed),
+                            value: mir::Rvalue {
+                                type_: mir::Type::Bool,
+                                kind: mir::RvalueKind::Use(bool_operand(condition)),
+                            },
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    terminator: mir::Terminator::Return(None),
+                },
+                mir::BasicBlock {
+                    id: mir::BasicBlockId(2),
+                    instructions: Vec::new(),
+                    terminator: mir::Terminator::Return(None),
+                },
+            ],
+            temporary_subregion_candidates: Vec::new(),
+        }
+    }
+
+    fn int_fact(value: &str) -> ConstantFact {
+        ConstantFact::Constant(mir::Operand {
+            type_: mir::Type::Int,
+            kind: mir::OperandKind::Constant(mir::Constant::Integer(value.to_owned())),
+        })
+    }
+
+    #[test]
+    fn sparse_constant_meet_keeps_only_identical_facts() {
+        let shared = mir::LocalId(1);
+        let conflict = mir::LocalId(2);
+        let one_sided = mir::LocalId(3);
+        let left = HashMap::from([
+            (shared, int_fact("7")),
+            (conflict, int_fact("8")),
+            (one_sided, int_fact("9")),
+        ]);
+        let right = HashMap::from([(shared, int_fact("7")), (conflict, int_fact("10"))]);
+
+        assert_eq!(
+            meet_facts(&left, &right),
+            HashMap::from([(shared, int_fact("7"))])
+        );
+        assert!(meet_facts(&HashMap::new(), &right).is_empty());
+    }
+
+    #[test]
+    fn switch_condition_fact_is_removed_only_when_the_branch_is_its_last_use() {
+        let condition = mir::LocalId(0);
+        let single_use = branch_fact_function(false);
+        assert_eq!(
+            direct_local_use_counts(&single_use).get(&condition),
+            Some(&1)
+        );
+        assert!(
+            constant_entry_facts(&single_use)[1]
+                .as_ref()
+                .is_some_and(|facts| !facts.contains_key(&condition))
+        );
+
+        let successor_use = branch_fact_function(true);
+        assert_eq!(
+            direct_local_use_counts(&successor_use).get(&condition),
+            Some(&2)
+        );
+        assert_eq!(
+            constant_entry_facts(&successor_use)[1]
+                .as_ref()
+                .and_then(|facts| facts.get(&condition)),
+            Some(&ConstantFact::Constant(mir::Operand {
+                type_: mir::Type::Bool,
+                kind: mir::OperandKind::Constant(mir::Constant::Boolean(true)),
+            }))
+        );
+    }
+
+    #[test]
+    fn optimizer_is_deterministic_and_idempotent() {
+        let original = branch_fact_function(true);
+        let mut left = original.clone();
+        let mut right = original;
+        optimize_function(&mut left);
+        optimize_function(&mut right);
+        assert_eq!(left, right);
+
+        let once = left.clone();
+        optimize_function(&mut left);
+        assert_eq!(left, once);
+    }
+
+    #[test]
+    fn trampoline_forwarding_compresses_long_chains_and_declines_cycles() {
+        let block = mir::BasicBlockId;
+        let chain = HashMap::from([
+            (block(1), block(2)),
+            (block(2), block(3)),
+            (block(3), block(4)),
+        ]);
+        let forwarded = forwarded_targets(&chain);
+        assert_eq!(forwarded.get(&block(1)), Some(&block(4)));
+        assert_eq!(forwarded.get(&block(2)), Some(&block(4)));
+        assert_eq!(forwarded.get(&block(3)), Some(&block(4)));
+
+        for cycle in [
+            HashMap::from([(block(1), block(1))]),
+            HashMap::from([(block(1), block(2)), (block(2), block(1))]),
+            HashMap::from([
+                (block(0), block(1)),
+                (block(1), block(2)),
+                (block(2), block(1)),
+            ]),
+        ] {
+            assert!(forwarded_targets(&cycle).is_empty());
+        }
+    }
 
     fn integer_value(
         type_: &mir::Type,
@@ -1218,11 +1619,13 @@ mod tests {
     #[test]
     fn runtime_intrinsic_arguments_are_opaque_fact_barriers() {
         let local = mir::LocalId(0);
-        let local_indices = HashMap::from([(local, 0)]);
-        let facts = vec![ConstantFact::Constant(mir::Operand {
-            type_: mir::Type::Int,
-            kind: mir::OperandKind::Constant(mir::Constant::Integer("7".to_owned())),
-        })];
+        let facts = HashMap::from([(
+            local,
+            ConstantFact::Constant(mir::Operand {
+                type_: mir::Type::Int,
+                kind: mir::OperandKind::Constant(mir::Constant::Integer("7".to_owned())),
+            }),
+        )]);
         let copies = HashMap::new();
 
         for intrinsic in [
@@ -1263,8 +1666,7 @@ mod tests {
             assert!(!rewrite_instruction_operands(
                 &mut instruction,
                 &facts,
-                &copies,
-                &local_indices
+                &copies
             ));
             let mir::Instruction::CallIntrinsic { arguments, .. } = instruction else {
                 unreachable!()
@@ -1280,14 +1682,13 @@ mod tests {
     fn standard_library_collection_operations_are_opaque_fact_barriers() {
         let scalar = mir::LocalId(0);
         let list = mir::LocalId(1);
-        let local_indices = HashMap::from([(scalar, 0), (list, 1)]);
-        let facts = vec![
+        let facts = HashMap::from([(
+            scalar,
             ConstantFact::Constant(mir::Operand {
                 type_: mir::Type::Int,
                 kind: mir::OperandKind::Constant(mir::Constant::Integer("7".to_owned())),
             }),
-            ConstantFact::Overdefined,
-        ];
+        )]);
         let mut instruction = mir::Instruction::ListSet {
             list: mir::Operand {
                 type_: mir::Type::List(Box::new(mir::Type::Int)),
@@ -1305,8 +1706,7 @@ mod tests {
         assert!(!rewrite_instruction_operands(
             &mut instruction,
             &facts,
-            &HashMap::new(),
-            &local_indices
+            &HashMap::new()
         ));
         let mir::Instruction::ListSet { index, value, .. } = instruction else {
             unreachable!()

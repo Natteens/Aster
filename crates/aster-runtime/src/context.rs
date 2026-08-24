@@ -648,6 +648,11 @@ impl ExecutionContext {
     #[doc(hidden)]
     pub const AARM_DEFAULT_PAGE_CAPACITY_BYTES: usize = crate::arena::DEFAULT_PAGE_SIZE;
 
+    pub(crate) fn string_materialization_limit_bytes(&self) -> usize {
+        self.allocation_limit_bytes
+            .saturating_sub(size_of::<AsterStrHeader>())
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::with_options(false, EXECUTION_ALLOCATION_LIMIT_BYTES)

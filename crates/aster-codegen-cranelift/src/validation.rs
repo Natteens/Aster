@@ -73,7 +73,129 @@ pub(super) fn validate_invocable_entry(
     Ok(())
 }
 
+#[derive(Default)]
+struct MirTypeIndex {
+    kinds: HashMap<mir::SymbolId, NominalKind>,
+    struct_fields: HashMap<(mir::SymbolId, mir::SymbolId), mir::Type>,
+    class_fields: HashMap<(mir::SymbolId, mir::SymbolId), mir::Type>,
+    enum_cases: HashMap<mir::SymbolId, mir::SymbolId>,
+    enum_fields: HashMap<(mir::SymbolId, mir::SymbolId), mir::Type>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NominalKind {
+    Struct,
+    Class,
+    Interface,
+    Enum,
+}
+
+impl MirTypeIndex {
+    fn build(module: &mir::Module) -> Result<Self, BackendError> {
+        let mut index = Self::default();
+        // `Layouts` intentionally indexes executable fields by their module-
+        // wide symbol identity. Reject collisions here, before layout
+        // construction could silently replace one owner's field metadata.
+        let mut field_symbols = HashSet::new();
+        for definition in &module.structs {
+            index.insert_type(definition.symbol, NominalKind::Struct)?;
+            for field in &definition.fields {
+                if !field_symbols.insert(field.symbol) {
+                    return Err(BackendError::new("duplicate field symbol in MIR"));
+                }
+                if index
+                    .struct_fields
+                    .insert((definition.symbol, field.symbol), field.type_.clone())
+                    .is_some()
+                {
+                    return Err(BackendError::new("duplicate struct field symbol in MIR"));
+                }
+            }
+        }
+        for definition in &module.classes {
+            index.insert_type(definition.symbol, NominalKind::Class)?;
+            for field in &definition.fields {
+                if !field_symbols.insert(field.symbol) {
+                    return Err(BackendError::new("duplicate field symbol in MIR"));
+                }
+                if index
+                    .class_fields
+                    .insert((definition.symbol, field.symbol), field.type_.clone())
+                    .is_some()
+                {
+                    return Err(BackendError::new("duplicate class field symbol in MIR"));
+                }
+            }
+        }
+        for definition in &module.interfaces {
+            index.insert_type(definition.symbol, NominalKind::Interface)?;
+        }
+        for definition in &module.enums {
+            index.insert_type(definition.symbol, NominalKind::Enum)?;
+            for case in &definition.cases {
+                if index
+                    .enum_cases
+                    .insert(case.symbol, definition.symbol)
+                    .is_some()
+                {
+                    return Err(BackendError::new("duplicate enum case symbol in MIR"));
+                }
+                for field in &case.fields {
+                    if !field_symbols.insert(field.symbol) {
+                        return Err(BackendError::new("duplicate field symbol in MIR"));
+                    }
+                    if index
+                        .enum_fields
+                        .insert((case.symbol, field.symbol), field.type_.clone())
+                        .is_some()
+                    {
+                        return Err(BackendError::new("duplicate enum field symbol in MIR"));
+                    }
+                }
+            }
+        }
+        Ok(index)
+    }
+
+    fn insert_type(
+        &mut self,
+        symbol: mir::SymbolId,
+        kind: NominalKind,
+    ) -> Result<(), BackendError> {
+        if self.kinds.insert(symbol, kind).is_some() {
+            Err(BackendError::new("duplicate nominal type symbol in MIR"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate_type(&self, type_: &mir::Type, function_name: &str) -> Result<(), BackendError> {
+        let valid = match type_ {
+            mir::Type::User(symbol) => self.kinds.get(symbol) == Some(&NominalKind::Struct),
+            mir::Type::Class(symbol) => self.kinds.get(symbol) == Some(&NominalKind::Class),
+            mir::Type::Interface(symbol) => self.kinds.get(symbol) == Some(&NominalKind::Interface),
+            mir::Type::Enum(symbol) => self.kinds.get(symbol) == Some(&NominalKind::Enum),
+            mir::Type::Array(element) | mir::Type::Task(element) | mir::Type::List(element) => {
+                return self.validate_type(element, function_name);
+            }
+            mir::Type::Dictionary(key, value) => {
+                self.validate_type(key, function_name)?;
+                return self.validate_type(value, function_name);
+            }
+            _ => true,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(BackendError::new(format!(
+                "function `{function_name}` references an unknown or mismatched nominal type"
+            )))
+        }
+    }
+}
+
 pub(super) fn validate_module(module: &mir::Module) -> Result<(), BackendError> {
+    let type_index = MirTypeIndex::build(module)?;
     let mut signatures = HashMap::new();
     for function in &module.functions {
         if signatures.insert(function.symbol, function).is_some() {
@@ -120,6 +242,7 @@ pub(super) fn validate_module(module: &mir::Module) -> Result<(), BackendError> 
             &enums,
             &interface_methods,
             &implementations,
+            &type_index,
         )?;
     }
     let enum_definitions = module
@@ -747,6 +870,521 @@ fn validate_interface_metadata<'a>(
     Ok((methods, implementations))
 }
 
+fn validate_typed_function(
+    function: &mir::Function,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+    signatures: &HashMap<mir::SymbolId, &mir::Function>,
+    types: &MirTypeIndex,
+) -> Result<(), BackendError> {
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            validate_typed_instruction(instruction, &function.name, locals, signatures, types)?;
+        }
+        match &block.terminator {
+            mir::Terminator::Branch { condition, .. } => {
+                validate_typed_operand(condition, &function.name, locals, signatures, types)?;
+            }
+            mir::Terminator::Return(Some(value)) => {
+                validate_typed_operand(value, &function.name, locals, signatures, types)?;
+                if value.type_ != function.return_type {
+                    return Err(BackendError::new(format!(
+                        "function `{}` returns `{}` from a function declared `{}`",
+                        function.name,
+                        type_name(&value.type_),
+                        type_name(&function.return_type)
+                    )));
+                }
+            }
+            mir::Terminator::Return(None) if function.return_type != mir::Type::Void => {
+                return Err(BackendError::new(format!(
+                    "function `{}` returns no value from a non-void function",
+                    function.name
+                )));
+            }
+            mir::Terminator::Goto(_)
+            | mir::Terminator::Return(None)
+            | mir::Terminator::End
+            | mir::Terminator::Unreachable => {}
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_typed_instruction(
+    instruction: &mir::Instruction,
+    function_name: &str,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+    signatures: &HashMap<mir::SymbolId, &mir::Function>,
+    types: &MirTypeIndex,
+) -> Result<(), BackendError> {
+    let place =
+        |value: &mir::Place| validate_typed_place(value, function_name, locals, signatures, types);
+    let operand = |value: &mir::Operand| {
+        validate_typed_operand(value, function_name, locals, signatures, types)
+    };
+    let destination = |value: &mir::Place, expected: &mir::Type| -> Result<(), BackendError> {
+        let actual = place(value)?;
+        if &actual == expected {
+            Ok(())
+        } else {
+            Err(BackendError::new(format!(
+                "function `{function_name}` stores `{}` into a destination declared `{}`",
+                type_name(expected),
+                type_name(&actual)
+            )))
+        }
+    };
+
+    match instruction {
+        mir::Instruction::OwnedRegionEnter { .. }
+        | mir::Instruction::OwnedRegionExit { .. }
+        | mir::Instruction::TemporarySubregionEnter { .. }
+        | mir::Instruction::TemporarySubregionExit { .. } => Ok(()),
+        mir::Instruction::Assign { target, value } => {
+            let target_type = place(target)?;
+            validate_typed_rvalue(value, function_name, locals, signatures, types)?;
+            if target_type == value.type_ {
+                Ok(())
+            } else {
+                Err(BackendError::new(format!(
+                    "function `{function_name}` assigns `{}` into a place declared `{}`",
+                    type_name(&value.type_),
+                    type_name(&target_type)
+                )))
+            }
+        }
+        mir::Instruction::Call {
+            destination: result,
+            arguments,
+            return_type,
+            ..
+        }
+        | mir::Instruction::ForeignCall {
+            destination: result,
+            arguments,
+            return_type,
+            ..
+        }
+        | mir::Instruction::CallIntrinsic {
+            destination: result,
+            arguments,
+            return_type,
+            ..
+        } => {
+            for argument in arguments {
+                operand(argument)?;
+            }
+            if let Some(result) = result {
+                destination(result, return_type)?;
+            }
+            Ok(())
+        }
+        mir::Instruction::CallInterface {
+            destination: result,
+            receiver,
+            arguments,
+            return_type,
+            ..
+        } => {
+            operand(receiver)?;
+            for argument in arguments {
+                operand(argument)?;
+            }
+            if let Some(result) = result {
+                destination(result, return_type)?;
+            }
+            Ok(())
+        }
+        mir::Instruction::AllocateArray {
+            destination: result,
+            element_type,
+            length,
+            ..
+        } => {
+            operand(length)?;
+            destination(result, &mir::Type::Array(Box::new(element_type.clone())))
+        }
+        mir::Instruction::AllocateObject {
+            destination: result,
+            class,
+            ..
+        }
+        | mir::Instruction::AllocateStringBuilder {
+            destination: result,
+            class,
+            ..
+        } => destination(result, &mir::Type::Class(*class)),
+        mir::Instruction::AllocateList {
+            destination: result,
+            element_type,
+            ..
+        } => destination(result, &mir::Type::List(Box::new(element_type.clone()))),
+        mir::Instruction::AllocateDictionary {
+            destination: result,
+            key_type,
+            value_type,
+            ..
+        } => destination(
+            result,
+            &mir::Type::Dictionary(Box::new(key_type.clone()), Box::new(value_type.clone())),
+        ),
+        mir::Instruction::StringBuilderAppend { builder, value, .. } => {
+            operand(builder)?;
+            operand(value)
+        }
+        mir::Instruction::StringBuilderToString {
+            destination: result,
+            builder,
+            ..
+        } => {
+            operand(builder)?;
+            destination(result, &mir::Type::String)
+        }
+        mir::Instruction::DictionaryAdd {
+            destination: result,
+            dictionary,
+            key,
+            value,
+        }
+        | mir::Instruction::DictionarySet {
+            destination: result,
+            dictionary,
+            key,
+            value,
+        } => {
+            operand(dictionary)?;
+            operand(key)?;
+            operand(value)?;
+            destination(result, &mir::Type::Bool)
+        }
+        mir::Instruction::DictionaryTryGet {
+            destination: result,
+            dictionary,
+            key,
+            ..
+        }
+        | mir::Instruction::DictionaryContainsKey {
+            destination: result,
+            dictionary,
+            key,
+        }
+        | mir::Instruction::DictionaryRemove {
+            destination: result,
+            dictionary,
+            key,
+        } => {
+            operand(dictionary)?;
+            operand(key)?;
+            place(result).map(|_| ())
+        }
+        mir::Instruction::DictionaryEntries {
+            destination: result,
+            dictionary,
+            key_type,
+            value_type,
+            entry_type,
+            ..
+        } => {
+            operand(dictionary)?;
+            let expected_dictionary =
+                mir::Type::Dictionary(Box::new(key_type.clone()), Box::new(value_type.clone()));
+            if dictionary.type_ != expected_dictionary {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` has Dictionary entries metadata that does not match its receiver"
+                )));
+            }
+            destination(result, &mir::Type::Array(Box::new(entry_type.clone())))
+        }
+        mir::Instruction::DictionaryClear { dictionary } => operand(dictionary),
+        mir::Instruction::DictionaryKeys {
+            destination: result,
+            dictionary,
+            key_type,
+            ..
+        } => {
+            operand(dictionary)?;
+            destination(result, &mir::Type::Array(Box::new(key_type.clone())))
+        }
+        mir::Instruction::DictionaryValues {
+            destination: result,
+            dictionary,
+            value_type,
+            ..
+        } => {
+            operand(dictionary)?;
+            destination(result, &mir::Type::Array(Box::new(value_type.clone())))
+        }
+        mir::Instruction::ListAdd { list, value } => {
+            operand(list)?;
+            operand(value)
+        }
+        mir::Instruction::ListGet {
+            destination: result,
+            list,
+            index,
+            element_type,
+        } => {
+            operand(list)?;
+            operand(index)?;
+            destination(result, element_type)
+        }
+        mir::Instruction::ListRemoveAt { list, index } => {
+            operand(list)?;
+            operand(index)
+        }
+        mir::Instruction::ListSet { list, index, value } => {
+            operand(list)?;
+            operand(index)?;
+            operand(value)
+        }
+        mir::Instruction::ListClear { list } => operand(list),
+        mir::Instruction::ListToArray {
+            destination: result,
+            list,
+            element_type,
+            ..
+        } => {
+            operand(list)?;
+            destination(result, &mir::Type::Array(Box::new(element_type.clone())))
+        }
+        mir::Instruction::StringDecodeNext {
+            string,
+            cursor,
+            char_destination,
+            next_cursor_destination,
+            ok_destination,
+        } => {
+            operand(string)?;
+            operand(cursor)?;
+            destination(char_destination, &mir::Type::Char)?;
+            destination(next_cursor_destination, &mir::Type::Int)?;
+            destination(ok_destination, &mir::Type::Bool)
+        }
+    }
+}
+
+fn validate_typed_rvalue(
+    value: &mir::Rvalue,
+    function_name: &str,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+    signatures: &HashMap<mir::SymbolId, &mir::Function>,
+    types: &MirTypeIndex,
+) -> Result<(), BackendError> {
+    types.validate_type(&value.type_, function_name)?;
+    let operand = |value: &mir::Operand| {
+        validate_typed_operand(value, function_name, locals, signatures, types)
+    };
+    match &value.kind {
+        mir::RvalueKind::Use(input) => {
+            operand(input)?;
+            ensure_same_type(&value.type_, &input.type_, function_name, "copy")
+        }
+        mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
+            for field in fields {
+                operand(&field.value)?;
+            }
+            Ok(())
+        }
+        mir::RvalueKind::Discriminant(input) => {
+            operand(input)?;
+            if matches!(input.type_, mir::Type::Enum(_)) && value.type_ == mir::Type::UInt {
+                Ok(())
+            } else {
+                Err(BackendError::new(format!(
+                    "function `{function_name}` has a malformed enum discriminant"
+                )))
+            }
+        }
+        mir::RvalueKind::ArrayLength(input) => {
+            operand(input)?;
+            if matches!(input.type_, mir::Type::Array(_)) && value.type_ == mir::Type::Int {
+                Ok(())
+            } else {
+                Err(BackendError::new(format!(
+                    "function `{function_name}` has a malformed array length read"
+                )))
+            }
+        }
+        mir::RvalueKind::ListLength(input)
+        | mir::RvalueKind::DictionaryLength(input)
+        | mir::RvalueKind::StringByteLength(input)
+        | mir::RvalueKind::ListVersion(input)
+        | mir::RvalueKind::Cast(input)
+        | mir::RvalueKind::Unary { operand: input, .. } => operand(input),
+        mir::RvalueKind::MakeInterface { object, .. } => operand(object),
+        mir::RvalueKind::Binary {
+            left,
+            operator,
+            right,
+        } => {
+            operand(left)?;
+            operand(right)?;
+            ensure_same_type(&left.type_, &right.type_, function_name, "binary operands")?;
+            let expected = if matches!(
+                operator,
+                mir::BinaryOperator::Less
+                    | mir::BinaryOperator::LessEqual
+                    | mir::BinaryOperator::Greater
+                    | mir::BinaryOperator::GreaterEqual
+                    | mir::BinaryOperator::Equal
+                    | mir::BinaryOperator::NotEqual
+                    | mir::BinaryOperator::LogicalAnd
+                    | mir::BinaryOperator::LogicalOr
+            ) {
+                &mir::Type::Bool
+            } else {
+                &left.type_
+            };
+            ensure_same_type(&value.type_, expected, function_name, "binary result")
+        }
+        mir::RvalueKind::Equality { left, right, .. } => {
+            operand(left)?;
+            operand(right)?;
+            ensure_same_type(
+                &left.type_,
+                &right.type_,
+                function_name,
+                "equality operands",
+            )?;
+            ensure_same_type(
+                &value.type_,
+                &mir::Type::Bool,
+                function_name,
+                "equality result",
+            )
+        }
+    }
+}
+
+fn validate_typed_operand(
+    operand: &mir::Operand,
+    function_name: &str,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+    signatures: &HashMap<mir::SymbolId, &mir::Function>,
+    types: &MirTypeIndex,
+) -> Result<(), BackendError> {
+    types.validate_type(&operand.type_, function_name)?;
+    match &operand.kind {
+        mir::OperandKind::Constant(constant) => {
+            validate_constant_type(constant, &operand.type_, function_name)
+        }
+        mir::OperandKind::Copy(place) => {
+            let actual = validate_typed_place(place, function_name, locals, signatures, types)?;
+            ensure_same_type(&operand.type_, &actual, function_name, "copied place")
+        }
+        mir::OperandKind::Function(symbol) => {
+            if signatures.contains_key(symbol) {
+                Ok(())
+            } else {
+                Err(BackendError::new(format!(
+                    "function `{function_name}` references an unknown function value"
+                )))
+            }
+        }
+    }
+}
+
+fn validate_typed_place(
+    place: &mir::Place,
+    function_name: &str,
+    locals: &HashMap<mir::LocalId, mir::Type>,
+    signatures: &HashMap<mir::SymbolId, &mir::Function>,
+    types: &MirTypeIndex,
+) -> Result<mir::Type, BackendError> {
+    match place {
+        mir::Place::Local(local) => locals.get(local).cloned().ok_or_else(|| {
+            BackendError::new(format!(
+                "function `{function_name}` references undeclared local {local:?}"
+            ))
+        }),
+        mir::Place::Field { base, field } => {
+            let mir::Type::User(owner) =
+                validate_typed_place(base, function_name, locals, signatures, types)?
+            else {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` reads a struct field from a non-struct place"
+                )));
+            };
+            types
+                .struct_fields
+                .get(&(owner, *field))
+                .cloned()
+                .ok_or_else(|| BackendError::new("MIR struct field does not belong to its base"))
+        }
+        mir::Place::Index {
+            array,
+            index,
+            element_type,
+            ..
+        } => {
+            validate_typed_operand(array, function_name, locals, signatures, types)?;
+            validate_typed_operand(index, function_name, locals, signatures, types)?;
+            if array.type_ != mir::Type::Array(Box::new(element_type.clone()))
+                || index.type_ != mir::Type::Int
+            {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` contains malformed array index metadata"
+                )));
+            }
+            Ok(element_type.clone())
+        }
+        mir::Place::ObjectField { object, field } => {
+            validate_typed_operand(object, function_name, locals, signatures, types)?;
+            let mir::Type::Class(owner) = object.type_ else {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` reads an object field from a non-class value"
+                )));
+            };
+            types
+                .class_fields
+                .get(&(owner, *field))
+                .cloned()
+                .ok_or_else(|| BackendError::new("MIR class field does not belong to its object"))
+        }
+        mir::Place::EnumField { base, case, field } => {
+            let mir::Type::Enum(owner) =
+                validate_typed_place(base, function_name, locals, signatures, types)?
+            else {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` reads an enum field from a non-enum place"
+                )));
+            };
+            if types.enum_cases.get(case) != Some(&owner) {
+                return Err(BackendError::new(
+                    "MIR enum case does not belong to its base",
+                ));
+            }
+            types
+                .enum_fields
+                .get(&(*case, *field))
+                .cloned()
+                .ok_or_else(|| BackendError::new("MIR enum field does not belong to its case"))
+        }
+        mir::Place::Symbol(_) => Err(unsupported(
+            function_name,
+            "module globals, classes, and objects",
+        )),
+    }
+}
+
+fn ensure_same_type(
+    actual: &mir::Type,
+    expected: &mir::Type,
+    function_name: &str,
+    operation: &str,
+) -> Result<(), BackendError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(BackendError::new(format!(
+            "function `{function_name}` has mismatched types for {operation}: `{}` and `{}`",
+            type_name(actual),
+            type_name(expected)
+        )))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_function(
     function: &mir::Function,
@@ -758,6 +1396,7 @@ fn validate_function(
     enums: &HashSet<mir::SymbolId>,
     interface_methods: &InterfaceMethods<'_>,
     implementations: &HashSet<(mir::SymbolId, mir::SymbolId)>,
+    type_index: &MirTypeIndex,
 ) -> Result<(), BackendError> {
     if !function.temporary_subregion_candidates.is_empty() {
         return Err(unsupported(
@@ -831,6 +1470,11 @@ fn validate_function(
     }
     array_bounds::validate(function)?;
     validate_explicit_array_initialization(function)?;
+    type_index.validate_type(&function.return_type, &function.name)?;
+    for local in function.parameters.iter().chain(&function.locals) {
+        type_index.validate_type(&local.type_, &function.name)?;
+    }
+    validate_typed_function(function, &locals, signatures, type_index)?;
     Ok(())
 }
 
@@ -3306,6 +3950,7 @@ fn validate_call(
             type_name(&called.return_type)
         )));
     }
+    validate_call_destination_shape(destination, return_type, function_name, &called.name)?;
     if arguments.len() != called.parameters.len()
         || arguments
             .iter()
@@ -4107,6 +4752,7 @@ fn validate_interface_call(
             "function `{function_name}` contains an interface call with an incompatible signature"
         )));
     }
+    validate_call_destination_shape(destination, return_type, function_name, "interface method")?;
     for argument in arguments {
         validate_operand(argument, function_name)?;
     }
@@ -4906,6 +5552,59 @@ fn validate_operand(operand: &mir::Operand, function_name: &str) -> Result<(), B
     validate_operand_with_proven_bounds(operand, function_name, false)
 }
 
+fn validate_constant_type(
+    constant: &mir::Constant,
+    type_: &mir::Type,
+    function_name: &str,
+) -> Result<(), BackendError> {
+    let matches = match constant {
+        mir::Constant::Integer(_) => matches!(
+            type_,
+            mir::Type::SByte
+                | mir::Type::Byte
+                | mir::Type::Short
+                | mir::Type::UShort
+                | mir::Type::Int
+                | mir::Type::UInt
+                | mir::Type::Long
+                | mir::Type::ULong
+        ),
+        mir::Constant::Float(_) => matches!(type_, mir::Type::Float | mir::Type::Double),
+        mir::Constant::Decimal(_) => *type_ == mir::Type::Decimal,
+        mir::Constant::String(_) => *type_ == mir::Type::String,
+        mir::Constant::Character(_) => *type_ == mir::Type::Char,
+        mir::Constant::Boolean(_) => *type_ == mir::Type::Bool,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(BackendError::new(format!(
+            "function `{function_name}` gives a MIR constant an incompatible type `{}`",
+            type_name(type_)
+        )))
+    }
+}
+
+fn validate_call_destination_shape(
+    destination: Option<&mir::Place>,
+    return_type: &mir::Type,
+    function_name: &str,
+    called_name: &str,
+) -> Result<(), BackendError> {
+    let valid = if *return_type == mir::Type::Void {
+        destination.is_none()
+    } else {
+        destination.is_some()
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(BackendError::new(format!(
+            "function `{function_name}` calls `{called_name}` with a destination that does not match its return type"
+        )))
+    }
+}
+
 fn validate_operand_with_proven_bounds(
     operand: &mir::Operand,
     function_name: &str,
@@ -5166,6 +5865,243 @@ mod tests {
             .expect_err("reference or aggregate division must be rejected");
             assert!(error.message().contains("unsupported operand type"));
         }
+    }
+
+    #[test]
+    fn typed_mir_rejects_a_copy_whose_claimed_type_disagrees_with_its_local() {
+        let mut module = aster_compiler::compile("public int Read(int value) { return value; }")
+            .expect("validation source compiles")
+            .mir;
+        let function = module
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Read")
+            .expect("Read exists");
+        function.return_type = mir::Type::Long;
+        let mir::Terminator::Return(Some(value)) = &mut function.blocks[0].terminator else {
+            panic!("Read returns its parameter")
+        };
+        value.type_ = mir::Type::Long;
+
+        let error = validate_module(&module).expect_err("mismatched local load must fail");
+        assert!(error.message().contains("copied place"));
+    }
+
+    #[test]
+    fn typed_mir_rejects_array_metadata_that_disagrees_with_the_receiver() {
+        let mut module = aster_compiler::compile(
+            "public int Read(int[] values, int index) { return values[index]; }",
+        )
+        .expect("validation source compiles")
+        .mir;
+        let function = module
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Read")
+            .expect("Read exists");
+        function.return_type = mir::Type::Long;
+        let mir::Terminator::Return(Some(value)) = &mut function.blocks[0].terminator else {
+            panic!("Read returns the indexed value")
+        };
+        value.type_ = mir::Type::Long;
+        let mir::OperandKind::Copy(mir::Place::Index { element_type, .. }) = &mut value.kind else {
+            panic!("Read returns an indexed place")
+        };
+        *element_type = mir::Type::Long;
+
+        let error = validate_module(&module).expect_err("wrong array metadata must fail");
+        assert!(error.message().contains("array index metadata"));
+    }
+
+    #[test]
+    fn duplicate_nominal_type_symbols_are_rejected_before_layout_construction() {
+        let mut module = aster_compiler::compile(
+            "public struct Left { public int value; } public struct Right { public int value; }",
+        )
+        .expect("validation source compiles")
+        .mir;
+        module.structs[1].symbol = module.structs[0].symbol;
+
+        let error = validate_module(&module).expect_err("duplicate type identity must fail");
+        assert!(error.message().contains("duplicate nominal type symbol"));
+    }
+
+    #[test]
+    fn duplicate_field_symbols_across_distinct_owners_are_rejected_before_layout_construction() {
+        let mut module = aster_compiler::compile(
+            "public struct Left { public int value; } public class Right { public int other; public Right() {} }",
+        )
+        .expect("validation source compiles")
+        .mir;
+        module.classes[0].fields[0].symbol = module.structs[0].fields[0].symbol;
+
+        let error =
+            validate_module(&module).expect_err("global field identity collision must fail");
+        assert!(error.message().contains("duplicate field symbol"));
+    }
+
+    #[test]
+    fn typed_mir_rejects_a_constant_whose_variant_disagrees_with_its_type() {
+        let mut module = aster_compiler::compile("public int Read() { return 1; }")
+            .expect("validation source compiles")
+            .mir;
+        let mir::Terminator::Return(Some(value)) = &mut module.functions[0].blocks[0].terminator
+        else {
+            panic!("Read returns a value")
+        };
+        value.kind = mir::OperandKind::Constant(mir::Constant::Boolean(true));
+
+        let error = validate_module(&module).expect_err("boolean bytes cannot masquerade as int");
+        assert!(error.message().contains("constant an incompatible type"));
+    }
+
+    #[test]
+    fn typed_mir_rejects_a_field_symbol_from_an_unrelated_struct() {
+        let mut module = aster_compiler::compile(
+            "public struct Left { public int value; } public struct Right { public int other; } public int Read(Left input) { return input.value; }",
+        )
+        .expect("validation source compiles")
+        .mir;
+        let unrelated_field = module
+            .structs
+            .iter()
+            .find(|definition| definition.name.ends_with("Right"))
+            .expect("Right exists")
+            .fields[0]
+            .symbol;
+        let function = module
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Read")
+            .expect("Read exists");
+        let mir::Terminator::Return(Some(mir::Operand {
+            kind: mir::OperandKind::Copy(mir::Place::Field { field, .. }),
+            ..
+        })) = &mut function.blocks[0].terminator
+        else {
+            panic!("Read returns a struct field")
+        };
+        *field = unrelated_field;
+
+        let error = validate_module(&module).expect_err("wrong field owner must fail");
+        assert!(error.message().contains("does not belong to its base"));
+    }
+
+    #[test]
+    fn typed_mir_rejects_a_call_destination_with_the_wrong_declared_type() {
+        let mut module = aster_compiler::compile(
+            "internal int Give() { return 1; } public int Read() { return Give(); }",
+        )
+        .expect("validation source compiles")
+        .mir;
+        let function = module
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Read")
+            .expect("Read exists");
+        let destination = function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .find_map(|instruction| match instruction {
+                mir::Instruction::Call {
+                    destination: Some(mir::Place::Local(local)),
+                    ..
+                } => Some(*local),
+                _ => None,
+            })
+            .expect("Read has a call destination");
+        function
+            .locals
+            .iter_mut()
+            .find(|local| local.id == destination)
+            .expect("destination local is declared")
+            .type_ = mir::Type::Long;
+
+        let error = validate_module(&module).expect_err("wrong call destination must fail");
+        assert!(
+            error
+                .message()
+                .contains("stores `int` into a destination declared `long`")
+        );
+    }
+
+    #[test]
+    fn non_void_call_requires_a_destination() {
+        let mut module = aster_compiler::compile(
+            "internal int Give() { return 1; } public int Read() { return Give(); }",
+        )
+        .expect("validation source compiles")
+        .mir;
+        let call = module
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Read")
+            .expect("Read exists")
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+            .find(|instruction| matches!(instruction, mir::Instruction::Call { .. }))
+            .expect("Read calls Give");
+        let mir::Instruction::Call { destination, .. } = call else {
+            unreachable!()
+        };
+        *destination = None;
+
+        let error = validate_module(&module).expect_err("non-void call without output must fail");
+        assert!(error.message().contains("destination"));
+    }
+
+    #[test]
+    fn void_call_rejects_a_destination() {
+        let mut module =
+            aster_compiler::compile("internal void Act() {} public void Run() { Act(); }")
+                .expect("validation source compiles")
+                .mir;
+        let call = module
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Run")
+            .expect("Run exists")
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+            .find(|instruction| matches!(instruction, mir::Instruction::Call { .. }))
+            .expect("Run calls Act");
+        let mir::Instruction::Call { destination, .. } = call else {
+            unreachable!()
+        };
+        *destination = Some(mir::Place::Local(mir::LocalId(u32::MAX)));
+
+        let error = validate_module(&module).expect_err("void call with output must fail");
+        assert!(error.message().contains("destination"));
+    }
+
+    #[test]
+    fn non_void_interface_call_requires_a_destination() {
+        let mut module = aster_compiler::compile(
+            "public interface IValue { int Get(); } public class Value : IValue { public Value() {} public int Get() { return 1; } } public int Read() { IValue value = new Value(); return value.Get(); }",
+        )
+        .expect("validation source compiles")
+        .mir;
+        let call = module
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Read")
+            .expect("Read exists")
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+            .find(|instruction| matches!(instruction, mir::Instruction::CallInterface { .. }))
+            .expect("Read dispatches through IValue");
+        let mir::Instruction::CallInterface { destination, .. } = call else {
+            unreachable!()
+        };
+        *destination = None;
+
+        let error =
+            validate_module(&module).expect_err("non-void interface call without output must fail");
+        assert!(error.message().contains("destination"));
     }
 
     const OWNED_REGION_SOURCE: &str = r"
