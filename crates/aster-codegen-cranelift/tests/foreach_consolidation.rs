@@ -268,7 +268,7 @@ fn the_list_collection_expression_cannot_reference_the_element_variable() {
     let errors = compile_errors(
         "public int Main() { List<int> values = new List<int>(); foreach (int value in value) { } return 0; }",
     );
-    assert!(!errors.is_empty());
+    assert_ne!(errors, [] as [std::string::String; 0]);
 }
 
 #[test]
@@ -276,7 +276,7 @@ fn the_string_collection_expression_cannot_reference_the_element_variable() {
     let errors = compile_errors(
         "public int Main() { string text = \"a\"; foreach (char value in value) { } return 0; }",
     );
-    assert!(!errors.is_empty());
+    assert_ne!(errors, [] as [std::string::String; 0]);
 }
 
 #[test]

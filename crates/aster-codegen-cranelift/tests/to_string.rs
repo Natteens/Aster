@@ -577,7 +577,7 @@ fn adulterated_mir_rejects_an_incorrect_receiver_type() {
     assert_eq!(*intrinsic, mir::Intrinsic::StringFromLong);
     arguments[0].type_ = mir::Type::Double;
     let error = execute(&module, "Main").expect_err("a mismatched receiver type must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }
 
 #[test]
@@ -590,7 +590,7 @@ fn adulterated_mir_rejects_a_non_string_return_type() {
     };
     *return_type = mir::Type::Int;
     let error = execute(&module, "Main").expect_err("a non-string return type must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }
 
 #[test]
@@ -603,7 +603,7 @@ fn adulterated_mir_rejects_an_undeclared_destination_local() {
     };
     *destination = Some(mir::Place::Local(mir::LocalId(u32::MAX)));
     let error = execute(&module, "Main").expect_err("an undeclared destination must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }
 
 #[test]

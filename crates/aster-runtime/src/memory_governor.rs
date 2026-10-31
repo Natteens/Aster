@@ -110,6 +110,8 @@ impl MemoryGovernor {
         }
     }
 
+    // ASTER supports Rust 1.85; AtomicU64::try_update requires Rust 1.95.
+    #[allow(deprecated)]
     fn release(&self, bytes: u64) {
         self.current_capacity_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {

@@ -106,7 +106,11 @@ fn invalid_utf8_is_a_controlled_cli_failure() {
     assert_controlled_failure(&root_output, "valid UTF-8");
     let root_error = String::from_utf8_lossy(&root_output.stderr);
     assert!(root_error.contains("could not load root source file"));
-    assert!(root_error.contains(path.to_string_lossy().as_ref()));
+    let canonical_path = fs::canonicalize(&path).expect("canonical invalid UTF-8 root path");
+    assert!(
+        root_error.contains(canonical_path.to_string_lossy().as_ref()),
+        "stderr={root_error}"
+    );
     assert!(!root_error.contains("namespace file"));
     assert!(!root_error.contains("fix the using"));
     remove_source(&path);

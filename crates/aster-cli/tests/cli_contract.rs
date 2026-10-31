@@ -12,13 +12,13 @@ fn global_help_version_and_usage_use_stable_streams_and_codes() {
     for arguments in [vec![], vec!["--help"], vec!["-h"]] {
         let output = aster(Path::new("."), arguments);
         assert_eq!(output.status.code(), Some(0));
-        assert!(stderr(&output).is_empty());
+        assert_eq!(stderr(&output), "");
         assert!(stdout(&output).contains("aster <command> [arguments]"));
     }
     for arguments in [vec!["--version"], vec!["-V"]] {
         let output = aster(Path::new("."), arguments);
         assert_eq!(output.status.code(), Some(0));
-        assert!(stderr(&output).is_empty());
+        assert_eq!(stderr(&output), "");
         assert_eq!(
             stdout(&output).trim(),
             format!("aster {}", env!("CARGO_PKG_VERSION"))
@@ -99,7 +99,7 @@ fn new_distinguishes_invalid_names_from_operational_failures() {
 
     let created = aster(&directory, ["new", "Healthy"]);
     assert_eq!(created.status.code(), Some(0));
-    assert!(stderr(&created).is_empty());
+    assert_eq!(stderr(&created), "");
     assert!(stdout(&created).contains("ASTER project created"));
     fs::remove_dir_all(directory).expect("remove new directory");
 }
@@ -117,14 +117,14 @@ fn check_and_dumps_publish_output_only_after_success() {
 
     let check = aster(&directory, ["check", valid]);
     assert_eq!(check.status.code(), Some(0));
-    assert!(stderr(&check).is_empty());
+    assert_eq!(stderr(&check), "");
     assert!(stdout(&check).contains("checked"));
 
     for command in ["dump-hir", "dump-mir"] {
         let output = aster(&directory, [command, valid]);
         assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-        assert!(stderr(&output).is_empty());
-        assert!(!stdout(&output).is_empty());
+        assert_eq!(stderr(&output), "");
+        assert_ne!(stdout(&output), "");
         if command == "dump-mir" {
             assert!(!stdout(&output).contains("kind: Binary"));
             assert!(stdout(&output).contains("Integer("));
@@ -142,8 +142,8 @@ fn check_and_dumps_publish_output_only_after_success() {
     for command in ["check", "dump-hir", "dump-mir"] {
         let output = aster(&directory, [command, language]);
         assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-        assert!(stderr(&output).is_empty());
-        assert!(!stdout(&output).is_empty());
+        assert_eq!(stderr(&output), "");
+        assert_ne!(stdout(&output), "");
     }
     let output = aster(&directory, ["run", language]);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
@@ -159,12 +159,12 @@ fn check_and_dumps_publish_output_only_after_success() {
     for command in ["check", "dump-hir", "dump-mir"] {
         let output = aster(&directory, [command, foreign]);
         assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-        assert!(stderr(&output).is_empty());
-        assert!(!stdout(&output).is_empty());
+        assert_eq!(stderr(&output), "");
+        assert_ne!(stdout(&output), "");
     }
     let output = aster(&directory, ["run", foreign]);
     assert_failure(&output);
-    assert!(stdout(&output).is_empty());
+    assert_eq!(stdout(&output), "");
     assert!(stderr(&output).contains("missing foreign binding"));
     assert_diagnostic_is_controlled(&output);
 
@@ -241,7 +241,7 @@ fn run_keeps_main_value_on_stdout_and_reports_runtime_failure_on_stderr() {
         ],
     );
     assert_failure(&output);
-    assert!(stdout(&output).is_empty());
+    assert_eq!(stdout(&output), "");
     assert!(stderr(&output).contains("integer division by zero"));
     assert_diagnostic_is_controlled(&output);
     fs::remove_dir_all(directory).expect("remove run directory");
@@ -274,7 +274,7 @@ fn project_manifest_entrypoint_and_frontend_failures_are_operational() {
             ["check", path.to_str().expect("UTF-8 diagnostic source")],
         );
         assert_failure(&output);
-        assert!(stdout(&output).is_empty());
+        assert_eq!(stdout(&output), "");
         assert_diagnostic_is_controlled(&output);
     }
 
@@ -297,7 +297,7 @@ fn project_manifest_entrypoint_and_frontend_failures_are_operational() {
     .expect("write project source");
     let output = aster(&project, ["check"]);
     assert_failure(&output);
-    assert!(stdout(&output).is_empty());
+    assert_eq!(stdout(&output), "");
     assert!(stderr(&output).contains("Aster.toml"));
     fs::remove_dir_all(directory).expect("remove diagnostics directory");
 }
@@ -317,7 +317,7 @@ fn invalid_standard_library_is_an_operational_failure_without_fallback() {
         .output()
         .expect("run with invalid stdlib");
     assert_failure(&output);
-    assert!(stdout(&output).is_empty());
+    assert_eq!(stdout(&output), "");
     assert!(stderr(&output).contains("ASTER_STDLIB"));
     fs::remove_dir_all(directory).expect("remove stdlib directory");
 }
@@ -332,7 +332,7 @@ fn watch_rejects_initial_failures_instead_of_entering_the_poll_loop() {
         ["watch", invalid.to_str().expect("UTF-8 watch source")],
     );
     assert_failure(&output);
-    assert!(stdout(&output).is_empty());
+    assert_eq!(stdout(&output), "");
     assert!(stderr(&output).contains("compilation failed"));
     assert!(!stderr(&output).contains("panicked"));
 
@@ -481,8 +481,8 @@ fn ordinary_project_commands_do_not_load_test_sources() {
 
     let tests = aster(&directory, ["test"]);
     assert_eq!(tests.status.code(), Some(1));
-    assert!(stdout(&tests).is_empty());
-    assert!(!stderr(&tests).is_empty());
+    assert_eq!(stdout(&tests), "");
+    assert_ne!(stderr(&tests), "");
     fs::remove_dir_all(directory).expect("remove project");
 }
 
@@ -659,8 +659,8 @@ fn assert_usage(output: &Output) {
         stdout(output),
         stderr(output)
     );
-    assert!(stdout(output).is_empty());
-    assert!(!stderr(output).is_empty());
+    assert_eq!(stdout(output), "");
+    assert_ne!(stderr(output), "");
 }
 
 fn assert_failure(output: &Output) {
@@ -671,7 +671,7 @@ fn assert_failure(output: &Output) {
         stdout(output),
         stderr(output)
     );
-    assert!(!stderr(output).is_empty());
+    assert_ne!(stderr(output), "");
 }
 
 fn assert_diagnostic_is_controlled(output: &Output) {

@@ -112,7 +112,10 @@ fn parses_one_where_clause_per_constrained_type_parameter() {
         panic!("function")
     };
     assert_eq!(constraints(&build.type_parameters[0]), ["IFirst"]);
-    assert!(build.type_parameters[1].constraints.is_empty());
+    assert_eq!(
+        build.type_parameters[1].constraints,
+        [] as [aster_syntax::TypeRef; 0]
+    );
     assert_eq!(constraints(&build.type_parameters[2]), ["ISecond"]);
 }
 

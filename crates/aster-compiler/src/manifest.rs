@@ -441,7 +441,10 @@ mod tests {
         )
         .expect("application manifest");
         assert_eq!(manifest.package.name, "app");
-        assert!(manifest.dependencies.is_empty());
+        assert_eq!(
+            manifest.dependencies,
+            [] as [crate::manifest::DependencyManifest; 0]
+        );
         assert_eq!(
             manifest.application.expect("application").entry.namespace,
             "app"
@@ -518,7 +521,7 @@ mod tests {
                 "[package]\nname = \"app\"\n\n[dependencies]\n{entry}\n"
             ))
             .expect_err("invalid Git dependency");
-            assert!(!error.message.is_empty());
+            assert_ne!(error.message, "");
         }
     }
 }

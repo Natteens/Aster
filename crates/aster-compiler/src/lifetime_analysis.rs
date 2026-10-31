@@ -1095,7 +1095,7 @@ mod tests {
         let report = analyze(&module(vec![function]));
         let proof = proof(&report, FUNCTION, 10, 0);
 
-        assert!(proof.dead_after.is_empty());
+        assert_eq!(proof.dead_after, [] as [aster_mir::MirPoint; 0]);
         assert_eq!(report.summary.temporary_sites_unresolved, 1);
     }
 
@@ -1315,7 +1315,7 @@ mod tests {
         let proof = proof(&report, FUNCTION, 10, 0);
 
         assert_eq!(proof.region, mir::AllocationRegion::Persistent);
-        assert!(proof.dead_after.is_empty());
+        assert_eq!(proof.dead_after, [] as [aster_mir::MirPoint; 0]);
     }
 
     #[test]
@@ -1965,7 +1965,7 @@ mod tests {
             .find(|proof| proof.site.function == borrowed_run)
             .expect("Run allocation");
         assert_eq!(borrowed_proof.region, mir::AllocationRegion::Temporary);
-        assert!(!borrowed_proof.dead_after.is_empty());
+        assert_ne!(borrowed_proof.dead_after, [] as [aster_mir::MirPoint; 0]);
 
         let returned_alias = crate::compile(
             "public class Box { public Box() {} public int Get() { return 1; } } \
@@ -1988,7 +1988,7 @@ mod tests {
             .expect("Run allocation");
         assert_eq!(alias_proof.region, mir::AllocationRegion::Temporary);
         assert!(alias_proof.aliases.len() >= 2);
-        assert!(!alias_proof.dead_after.is_empty());
+        assert_ne!(alias_proof.dead_after, [] as [aster_mir::MirPoint; 0]);
     }
 
     #[test]

@@ -686,7 +686,7 @@ mod tests {
         let hello = aligned("hello-from-first");
         aster_rt_io_write(&raw mut first, pointer(&hello));
         assert_eq!(first_backend.output(), b"hello-from-first");
-        assert!(second_backend.output().is_empty());
+        assert_eq!(second_backend.output(), [] as [u8; 0]);
 
         let mut destination = option_destination();
         let destination_ptr = destination.as_mut_ptr().cast::<u8>();

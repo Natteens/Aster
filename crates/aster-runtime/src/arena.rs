@@ -45,6 +45,8 @@ pub(crate) const MAX_ALIGN: usize = 16;
 
 static NEXT_ARENA_ID: AtomicU64 = AtomicU64::new(1);
 
+// ASTER supports Rust 1.85; AtomicU64::try_update requires Rust 1.95.
+#[allow(deprecated)]
 fn next_arena_id() -> u64 {
     NEXT_ARENA_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))

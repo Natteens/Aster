@@ -345,7 +345,7 @@ mod tests {
         for _ in 0..32 {
             let compilation = compile("public int Main() { return 42; }")
                 .expect("small compilation should succeed repeatedly");
-            assert!(!compilation.mir.functions.is_empty());
+            assert_ne!(compilation.mir.functions, [] as [aster_mir::Function; 0]);
         }
     }
 
@@ -360,13 +360,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         for worker in workers {
-            assert!(
-                !worker
-                    .join()
-                    .expect("test worker completes")
-                    .mir
-                    .functions
-                    .is_empty()
+            assert_ne!(
+                worker.join().expect("test worker completes").mir.functions,
+                [] as [aster_mir::Function; 0]
             );
         }
     }

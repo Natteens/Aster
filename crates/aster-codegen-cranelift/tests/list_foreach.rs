@@ -1279,7 +1279,7 @@ fn adulterated_mir_rejects_a_list_get_with_a_fake_non_list_receiver() {
     };
     list.type_ = mir::Type::Int;
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -1308,7 +1308,7 @@ fn adulterated_mir_rejects_a_list_get_with_a_mismatched_element_type() {
         }
     }
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -1319,7 +1319,7 @@ fn adulterated_mir_rejects_a_list_get_with_a_nonexistent_destination() {
     };
     *destination = mir::Place::Local(mir::LocalId(u32::MAX));
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -1330,7 +1330,7 @@ fn adulterated_mir_rejects_a_list_get_with_a_non_int_index() {
     };
     index.type_ = mir::Type::Bool;
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -1353,7 +1353,7 @@ fn adulterated_mir_rejects_a_list_length_local_retyped_to_a_non_int() {
     };
     value.type_ = mir::Type::Bool;
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -1376,7 +1376,7 @@ fn adulterated_mir_rejects_a_list_version_local_retyped_to_a_non_long() {
     };
     value.type_ = mir::Type::Int;
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -1407,7 +1407,7 @@ fn adulterated_mir_rejects_a_list_version_read_on_a_non_list_receiver() {
     };
     list.type_ = mir::Type::Int;
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -1430,7 +1430,7 @@ fn adulterated_mir_rejects_a_list_version_mismatch_call_given_a_stray_argument()
         kind: mir::OperandKind::Constant(mir::Constant::Integer("0".to_owned())),
     });
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -1441,7 +1441,7 @@ fn adulterated_mir_rejects_a_non_bool_branch_condition_in_a_list_foreach_program
             if let mir::Terminator::Branch { condition, .. } = &mut block.terminator {
                 condition.type_ = mir::Type::Int;
                 let error = execute_error(&module);
-                assert!(!error.is_empty());
+                assert_ne!(error, "");
                 return;
             }
         }
@@ -1457,7 +1457,7 @@ fn adulterated_mir_rejects_a_branch_targeting_an_unknown_block_in_a_list_foreach
             if let mir::Terminator::Branch { then_block, .. } = &mut block.terminator {
                 *then_block = mir::BasicBlockId(u32::MAX);
                 let error = execute_error(&module);
-                assert!(!error.is_empty());
+                assert_ne!(error, "");
                 return;
             }
         }
@@ -1474,7 +1474,7 @@ fn adulterated_mir_rejects_a_missing_entry_block_in_a_list_foreach_program() {
         }
     }
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -1485,5 +1485,5 @@ fn adulterated_mir_rejects_list_foreach_metadata_missing_a_concrete_list_element
     };
     *element_type = mir::Type::Unknown;
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }

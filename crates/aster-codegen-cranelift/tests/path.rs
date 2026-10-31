@@ -514,7 +514,7 @@ fn adulterated_mir_rejects_an_io_error_construction_reached_through_combine_path
     };
     fields.pop();
     let error = execute(&module, "Main").expect_err("an IOError missing a field must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }
 
 // --- Security: no panic/abort/trap on any input -------------------------------

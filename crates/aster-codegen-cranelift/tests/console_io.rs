@@ -557,7 +557,7 @@ fn console_io_is_rejected_inside_a_task_run_body() {
         public int Main() { Task<int> task = Task.Run(Body); return task.Wait(); }";
     let errors =
         run(source, "Main").expect_err("expected Task.Run with console I/O to be rejected");
-    assert!(!errors.is_empty());
+    assert_ne!(errors, "");
 }
 
 #[test]
@@ -567,7 +567,7 @@ fn console_io_is_rejected_inside_a_parallel_for_body() {
         public int Main() { Parallel.For(0, 4, Body); return 0; }";
     let errors =
         run(source, "Main").expect_err("expected Parallel.For with console I/O to be rejected");
-    assert!(!errors.is_empty());
+    assert_ne!(errors, "");
 }
 
 #[test]
@@ -581,7 +581,7 @@ fn console_io_is_rejected_inside_a_parallel_for_each_body() {
         }";
     let errors =
         run(source, "Main").expect_err("expected Parallel.ForEach with console I/O to be rejected");
-    assert!(!errors.is_empty());
+    assert_ne!(errors, "");
 }
 
 #[test]
@@ -632,7 +632,7 @@ fn adulterated_mir_rejects_a_non_string_write_argument() {
     };
     arguments[0].type_ = mir::Type::Int;
     let error = execute(&module, "Main").expect_err("a non-string Write argument must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }
 
 #[test]
@@ -649,7 +649,7 @@ fn adulterated_mir_rejects_a_non_void_write_line_return() {
     *return_type = mir::Type::Int;
     let error =
         execute(&module, "Main").expect_err("a non-void WriteLine return type must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }
 
 #[test]
@@ -671,7 +671,7 @@ fn adulterated_mir_rejects_an_undeclared_read_line_destination() {
     *destination = Some(mir::Place::Local(mir::LocalId(u32::MAX)));
     let error =
         execute(&module, "Main").expect_err("an undeclared ReadLine destination must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }
 
 #[test]
@@ -707,7 +707,7 @@ fn adulterated_mir_rejects_the_wrong_option_specialization_for_read_line() {
     *return_type = mir::Type::Enum(int_option_symbol);
     let error =
         execute(&module, "Main").expect_err("ReadLine returning Option<int> must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }
 
 // --- Section 22.45-47: memory ---------------------------------------------------

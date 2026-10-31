@@ -852,7 +852,7 @@ fn adulterated_mir_rejects_a_read_all_text_call_with_a_non_string_path() {
     };
     arguments[0].type_ = mir::Type::Int;
     let error = compile_mir_execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -864,7 +864,7 @@ fn adulterated_mir_rejects_a_read_all_text_call_with_wrong_arity() {
     };
     arguments.clear();
     let error = compile_mir_execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -876,7 +876,7 @@ fn adulterated_mir_rejects_a_read_all_text_call_returning_a_non_enum_type() {
     };
     *return_type = mir::Type::String;
     let error = compile_mir_execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -888,7 +888,7 @@ fn adulterated_mir_rejects_a_read_all_text_call_retargeted_to_an_unknown_enum_sy
     };
     *return_type = mir::Type::Enum(mir::SymbolId(u32::MAX));
     let error = compile_mir_execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -915,7 +915,7 @@ fn adulterated_mir_rejects_a_write_all_text_call_with_a_non_string_content_argum
     };
     arguments[1].type_ = mir::Type::Bool;
     let error = compile_mir_execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 // --- Nominal identity: symbols only, never a name comparison at codegen ------
@@ -1031,7 +1031,7 @@ fn adulterated_mir_rejects_a_wholly_unresolved_placeholder_layout() {
         };
     });
     let error = compile_mir_execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -1061,7 +1061,7 @@ fn adulterated_mir_rejects_a_kind_field_retyped_to_a_non_enum() {
         }
     }
     let error = compile_mir_execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]

@@ -1444,8 +1444,14 @@ fn sequential_fine_rewinds_zero_and_reuse_retained_temporary_capacity() {
             execute_with_aarm_parallel_governor(&module, "Run", 1, Arc::clone(&governor))
                 .expect("one retained page serves both fine subregions");
         assert_eq!(value, ExecutionValue::Int(0));
-        assert!(plans.is_empty());
-        assert!(workers.is_empty());
+        assert_eq!(
+            plans,
+            [] as [aster_codegen_cranelift::AarmParallelPlanningTelemetry; 0]
+        );
+        assert_eq!(
+            workers,
+            [] as [aster_codegen_cranelift::AarmMemoryTelemetry; 0]
+        );
         let during = telemetry.governor.expect("execution is governed");
         assert_eq!(during.current_capacity_bytes, page as u64);
         assert_eq!(during.grant_events, 1);

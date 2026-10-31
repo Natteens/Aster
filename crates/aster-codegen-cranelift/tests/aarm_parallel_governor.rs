@@ -178,8 +178,14 @@ fn task_run_remains_ungoverned_in_the_experimental_parallel_entry() {
             .expect("Task.Run keeps its ordinary independent context");
 
     assert_eq!(value, ExecutionValue::Int(20_000));
-    assert!(plans.is_empty());
-    assert!(worker_snapshots.is_empty());
+    assert_eq!(
+        plans,
+        [] as [aster_codegen_cranelift::AarmParallelPlanningTelemetry; 0]
+    );
+    assert_eq!(
+        worker_snapshots,
+        [] as [aster_codegen_cranelift::AarmMemoryTelemetry; 0]
+    );
     assert_eq!(
         memory
             .governor

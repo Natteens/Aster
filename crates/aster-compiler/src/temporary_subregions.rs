@@ -2192,7 +2192,10 @@ mod tests {
     #[test]
     fn empty_and_persistent_functions_have_empty_candidate_plans() {
         let (empty, _) = single_block_plan(Vec::new(), Vec::new());
-        assert!(empty.functions[0].temporary_subregion_candidates.is_empty());
+        assert_eq!(
+            empty.functions[0].temporary_subregion_candidates,
+            [] as [aster_mir::TemporarySubregionCandidate; 0]
+        );
 
         let returned = function(
             FUNCTION,
@@ -2206,10 +2209,9 @@ mod tests {
         );
         let (returned, report) = prepare(module(vec![returned]));
         assert_eq!(report.proofs[0].region, mir::AllocationRegion::Persistent);
-        assert!(
-            returned.functions[0]
-                .temporary_subregion_candidates
-                .is_empty()
+        assert_eq!(
+            returned.functions[0].temporary_subregion_candidates,
+            [] as [aster_mir::TemporarySubregionCandidate; 0]
         );
     }
 
@@ -2339,10 +2341,9 @@ mod tests {
                 .iter()
                 .all(|proof| proof.dead_after.is_empty())
         );
-        assert!(
-            same_local.functions[0]
-                .temporary_subregion_candidates
-                .is_empty()
+        assert_eq!(
+            same_local.functions[0].temporary_subregion_candidates,
+            [] as [aster_mir::TemporarySubregionCandidate; 0]
         );
 
         let multi_block = function(
@@ -2359,10 +2360,9 @@ mod tests {
             vec![object_local(1)],
         );
         let (multi_block, _) = prepare(module(vec![multi_block]));
-        assert!(
-            multi_block.functions[0]
-                .temporary_subregion_candidates
-                .is_empty()
+        assert_eq!(
+            multi_block.functions[0].temporary_subregion_candidates,
+            [] as [aster_mir::TemporarySubregionCandidate; 0]
         );
     }
 
@@ -2403,10 +2403,9 @@ mod tests {
             vec![object_local(1)],
         );
         assert_eq!(report.proofs[0].region, mir::AllocationRegion::Temporary);
-        assert!(
-            module.functions[0]
-                .temporary_subregion_candidates
-                .is_empty()
+        assert_eq!(
+            module.functions[0].temporary_subregion_candidates,
+            [] as [aster_mir::TemporarySubregionCandidate; 0]
         );
     }
 
@@ -2738,10 +2737,10 @@ public int Main() {
             )],
             vec![object_local(1), object_local(2)],
         )]);
-        assert!(
+        assert_eq!(
             estimate_aarm_coalescing_opportunities_for_research(&separated)
-                .expect("non-adjacent safe regions can be analyzed")
-                .is_empty()
+                .expect("non-adjacent safe regions can be analyzed"),
+            [] as [crate::temporary_subregions::AarmTemporarySubregionCoalescingOpportunity; 0]
         );
 
         let mixed = module(vec![function(
@@ -3397,7 +3396,10 @@ public int Main() {
         }
 
         fn reason(report: &TemporarySubregionValidationReport) -> Reason {
-            assert!(report.validated.is_empty());
+            assert_eq!(
+                report.validated,
+                [] as [crate::temporary_subregions::validation::ValidatedTemporarySubregion; 0]
+            );
             assert_eq!(report.rejected.len(), 1);
             report.rejected[0].reason
         }
@@ -3736,7 +3738,10 @@ public int Main() {
                     allocations: vec![site(0)],
                 }]
             );
-            assert!(object_analysis.validation.rejected.is_empty());
+            assert_eq!(
+                object_analysis.validation.rejected,
+                [] as [crate::temporary_subregions::validation::RejectedTemporarySubregion; 0]
+            );
             assert_eq!(object_analysis.validation.validated_allocation_count(), 1);
             assert_eq!(
                 object_module.functions[0]
@@ -3855,7 +3860,10 @@ public int Main() {
             assert_eq!(first.validation.validated_allocation_count(), 2);
             assert_eq!(first.validation.validated[0].checkpoint, point(0));
             assert_eq!(first.validation.validated[1].checkpoint, point(2));
-            assert!(first.validation.rejected.is_empty());
+            assert_eq!(
+                first.validation.rejected,
+                [] as [crate::temporary_subregions::validation::RejectedTemporarySubregion; 0]
+            );
         }
 
         #[test]
@@ -3979,7 +3987,10 @@ public int Main() {
                 ),
                 vec![candidate(0, 0, 2, vec![0])],
             );
-            assert!(report.validated.is_empty());
+            assert_eq!(
+                report.validated,
+                [] as [crate::temporary_subregions::validation::ValidatedTemporarySubregion; 0]
+            );
             assert_eq!(
                 report.rejected[0].reason,
                 Reason::UnaccountedTemporaryAllocation
@@ -4001,7 +4012,10 @@ public int Main() {
             );
             let crossing = vec![candidate(0, 0, 4, vec![0]), candidate(1, 2, 6, vec![4])];
             let report = validate_raw(module.clone(), crossing.clone());
-            assert!(report.validated.is_empty());
+            assert_eq!(
+                report.validated,
+                [] as [crate::temporary_subregions::validation::ValidatedTemporarySubregion; 0]
+            );
             assert_eq!(report.rejected.len(), 2);
             assert!(
                 report
@@ -4015,7 +4029,10 @@ public int Main() {
 
             let nested = vec![candidate(0, 0, 6, vec![0, 4]), candidate(1, 2, 6, vec![4])];
             let report = validate_raw(module.clone(), nested);
-            assert!(report.validated.is_empty());
+            assert_eq!(
+                report.validated,
+                [] as [crate::temporary_subregions::validation::ValidatedTemporarySubregion; 0]
+            );
             assert_eq!(report.rejected.len(), 2);
             assert!(
                 report
@@ -4026,7 +4043,10 @@ public int Main() {
 
             let duplicate = vec![candidate(0, 0, 4, vec![0]), candidate(1, 0, 4, vec![0])];
             let report = validate_raw(module, duplicate);
-            assert!(report.validated.is_empty());
+            assert_eq!(
+                report.validated,
+                [] as [crate::temporary_subregions::validation::ValidatedTemporarySubregion; 0]
+            );
             assert_eq!(report.rejected.len(), 2);
             assert!(
                 report
@@ -4195,7 +4215,10 @@ public int Main() {
                 vec![candidate(0, 0, 1, vec![0])],
             );
             assert_eq!(report.validated.len(), 1);
-            assert!(report.rejected.is_empty());
+            assert_eq!(
+                report.rejected,
+                [] as [crate::temporary_subregions::validation::RejectedTemporarySubregion; 0]
+            );
 
             let mut multiple_rewinds = candidate(0, 0, 2, vec![0]);
             multiple_rewinds.rewinds.push(point(2));
@@ -4247,7 +4270,10 @@ public int Main() {
                 vec![candidate(0, 1, 3, vec![1])],
             );
             assert_eq!(outside.validated.len(), 1);
-            assert!(outside.rejected.is_empty());
+            assert_eq!(
+                outside.rejected,
+                [] as [crate::temporary_subregions::validation::RejectedTemporarySubregion; 0]
+            );
         }
 
         #[test]
@@ -4292,7 +4318,10 @@ public int Main() {
                 vec![candidate(0, 0, 1, vec![0])],
             );
             assert_eq!(builder_report.validated.len(), 1, "{builder_report:#?}");
-            assert!(builder_report.rejected.is_empty());
+            assert_eq!(
+                builder_report.rejected,
+                [] as [crate::temporary_subregions::validation::RejectedTemporarySubregion; 0]
+            );
 
             let string = mir::Instruction::CallIntrinsic {
                 destination: Some(mir::Place::Local(mir::LocalId(1))),
@@ -4308,7 +4337,10 @@ public int Main() {
                 vec![candidate(0, 0, 1, vec![0])],
             );
             assert_eq!(string_report.validated.len(), 1, "{string_report:#?}");
-            assert!(string_report.rejected.is_empty());
+            assert_eq!(
+                string_report.rejected,
+                [] as [crate::temporary_subregions::validation::RejectedTemporarySubregion; 0]
+            );
 
             let join = mir::Instruction::CallIntrinsic {
                 destination: Some(mir::Place::Local(mir::LocalId(1))),
@@ -4392,7 +4424,10 @@ public int Main() {
                     vec![candidate(0, 0, 1, vec![0])],
                 );
                 assert_eq!(report.validated.len(), 1, "{intrinsic:?}: {report:#?}");
-                assert!(report.rejected.is_empty());
+                assert_eq!(
+                    report.rejected,
+                    [] as [crate::temporary_subregions::validation::RejectedTemporarySubregion; 0]
+                );
             }
         }
 
@@ -4607,7 +4642,7 @@ public int Main() {
                 vec![candidate(0, 0, 4, vec![0])],
             );
             assert_eq!(object_report.validated.len(), 1);
-            assert!(object_report.rejected.is_empty());
+            assert_eq!(object_report.rejected.len(), 0);
 
             let array_type = mir::Type::Array(Box::new(mir::Type::Int));
             let array = copy(1, array_type.clone());
@@ -4664,7 +4699,7 @@ public int Main() {
                 vec![candidate(0, 0, 4, vec![0])],
             );
             assert_eq!(array_report.validated.len(), 1);
-            assert!(array_report.rejected.is_empty());
+            assert_eq!(array_report.rejected.len(), 0);
         }
 
         #[test]
@@ -4773,8 +4808,14 @@ public int Main() {
                 ],
                 vec![object_local(1)],
             ));
-            assert!(ambiguous.validation.validated.is_empty());
-            assert!(ambiguous.validation.rejected.is_empty());
+            assert_eq!(
+                ambiguous.validation.validated,
+                [] as [crate::temporary_subregions::validation::ValidatedTemporarySubregion; 0]
+            );
+            assert_eq!(
+                ambiguous.validation.rejected,
+                [] as [crate::temporary_subregions::validation::RejectedTemporarySubregion; 0]
+            );
         }
     }
 
@@ -4843,10 +4884,9 @@ public int Main() {
                 id: mir::TemporarySubregionId(1)
             }
         ));
-        assert!(
-            module.functions[0]
-                .temporary_subregion_candidates
-                .is_empty()
+        assert_eq!(
+            module.functions[0].temporary_subregion_candidates,
+            [] as [aster_mir::TemporarySubregionCandidate; 0]
         );
     }
 
@@ -4872,10 +4912,9 @@ public int Main() {
         let report = lower_aarm_temporary_subregions_for_research(&mut module)
             .expect("rejected research candidates are safely omitted");
         assert_eq!(report.subregions_lowered, 0);
-        assert!(
-            module.functions[0]
-                .temporary_subregion_candidates
-                .is_empty()
+        assert_eq!(
+            module.functions[0].temporary_subregion_candidates,
+            [] as [aster_mir::TemporarySubregionCandidate; 0]
         );
         assert!(
             module.functions[0].blocks[0]
@@ -5244,10 +5283,9 @@ public int Main() {
             vec![object_local(1), object_local(2)],
         );
         let (module, _) = prepare(module(vec![loop_function]));
-        assert!(
-            module.functions[0]
-                .temporary_subregion_candidates
-                .is_empty()
+        assert_eq!(
+            module.functions[0].temporary_subregion_candidates,
+            [] as [aster_mir::TemporarySubregionCandidate; 0]
         );
     }
 
@@ -5527,10 +5565,9 @@ public int Main() {
             vec![object_local(1)],
         );
         let (module, _) = prepare(module(vec![function]));
-        assert!(
-            module.functions[0]
-                .temporary_subregion_candidates
-                .is_empty()
+        assert_eq!(
+            module.functions[0].temporary_subregion_candidates,
+            [] as [aster_mir::TemporarySubregionCandidate; 0]
         );
     }
 
@@ -5572,11 +5609,13 @@ public int Main() {
             vec![object_local(1), object_local(2)],
         );
         let (module, analysis) = prepare_research(module(vec![loop_function]));
-        assert!(analysis.validation.validated.is_empty());
-        assert!(
-            module.functions[0]
-                .temporary_subregion_candidates
-                .is_empty()
+        assert_eq!(
+            analysis.validation.validated,
+            [] as [crate::temporary_subregions::validation::ValidatedTemporarySubregion; 0]
+        );
+        assert_eq!(
+            module.functions[0].temporary_subregion_candidates,
+            [] as [aster_mir::TemporarySubregionCandidate; 0]
         );
     }
 }

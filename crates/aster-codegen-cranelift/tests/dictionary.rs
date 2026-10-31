@@ -582,7 +582,7 @@ fn malformed_dictionary_mir_is_rejected_before_jit() {
         unreachable!()
     };
     key.type_ = mir::Type::Int;
-    assert!(!reject(&wrong_key).is_empty());
+    assert_ne!(reject(&wrong_key), "");
 
     let mut wrong_value = module.clone();
     let instruction = wrong_value
@@ -596,7 +596,7 @@ fn malformed_dictionary_mir_is_rejected_before_jit() {
         unreachable!()
     };
     value.type_ = mir::Type::String;
-    assert!(!reject(&wrong_value).is_empty());
+    assert_ne!(reject(&wrong_value), "");
 
     let mut fake_option = module.clone();
     let instruction = fake_option
@@ -610,7 +610,7 @@ fn malformed_dictionary_mir_is_rejected_before_jit() {
         unreachable!()
     };
     option_layout.some_case = mir::SymbolId(u32::MAX);
-    assert!(!reject(&fake_option).is_empty());
+    assert_ne!(reject(&fake_option), "");
 
     let mut fake_entry = module.clone();
     let instruction = fake_entry
@@ -624,7 +624,7 @@ fn malformed_dictionary_mir_is_rejected_before_jit() {
         unreachable!()
     };
     entry_layout.key_field = mir::SymbolId(u32::MAX);
-    assert!(!reject(&fake_entry).is_empty());
+    assert_ne!(reject(&fake_entry), "");
 
     let mut missing_destination = module.clone();
     let instruction = missing_destination
@@ -638,7 +638,7 @@ fn malformed_dictionary_mir_is_rejected_before_jit() {
         unreachable!()
     };
     *destination = mir::Place::Local(mir::LocalId(u32::MAX));
-    assert!(!reject(&missing_destination).is_empty());
+    assert_ne!(reject(&missing_destination), "");
 
     for key_type in [mir::Type::Int, mir::Type::Float, mir::Type::Unknown] {
         let mut adulterated = module.clone();
@@ -664,7 +664,7 @@ fn malformed_dictionary_mir_is_rejected_before_jit() {
             unreachable!()
         };
         *actual = key_type;
-        assert!(!reject(&adulterated).is_empty());
+        assert_ne!(reject(&adulterated), "");
     }
 
     let mut wrong_allocate_value = module.clone();
@@ -687,7 +687,7 @@ fn malformed_dictionary_mir_is_rejected_before_jit() {
         unreachable!()
     };
     *value_type = mir::Type::String;
-    assert!(!reject(&wrong_allocate_value).is_empty());
+    assert_ne!(reject(&wrong_allocate_value), "");
 
     for destination in [
         mir::Place::Local(mir::LocalId(u32::MAX)),
@@ -717,7 +717,7 @@ fn malformed_dictionary_mir_is_rejected_before_jit() {
             unreachable!()
         };
         *actual = destination;
-        assert!(!reject(&adulterated).is_empty());
+        assert_ne!(reject(&adulterated), "");
     }
 
     let length_case = |mut adulterated: mir::Module,
@@ -764,32 +764,32 @@ fn malformed_dictionary_mir_is_rejected_before_jit() {
             "{name}"
         );
     }
-    assert!(
-        !reject(&length_case(
+    assert_ne!(
+        reject(&length_case(
             module.clone(),
             Some((
                 mir::LocalId(u32::MAX),
                 mir::Type::Dictionary(Box::new(mir::Type::String), Box::new(mir::Type::Int)),
             )),
             None,
-        ))
-        .is_empty()
+        )),
+        ""
     );
-    assert!(
-        !reject(&length_case(
+    assert_ne!(
+        reject(&length_case(
             module.clone(),
             None,
             Some(mir::Place::Local(mir::LocalId(u32::MAX))),
-        ))
-        .is_empty()
+        )),
+        ""
     );
-    assert!(
-        !reject(&length_case(
+    assert_ne!(
+        reject(&length_case(
             module.clone(),
             None,
             Some(mir::Place::Local(local(&module, "ordinary").0)),
-        ))
-        .is_empty()
+        )),
+        ""
     );
 
     let mut declared_type_divergence = module;
@@ -818,7 +818,7 @@ fn malformed_dictionary_mir_is_rejected_before_jit() {
         unreachable!()
     };
     receiver.type_ = mir::Type::Dictionary(Box::new(mir::Type::Int), Box::new(mir::Type::Int));
-    assert!(!reject(&declared_type_divergence).is_empty());
+    assert_ne!(reject(&declared_type_divergence), "");
 }
 
 #[test]

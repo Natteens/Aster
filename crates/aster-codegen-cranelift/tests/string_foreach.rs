@@ -702,7 +702,7 @@ fn adulterated_mir_rejects_string_decode_next_on_a_non_string_receiver() {
     };
     string.type_ = mir::Type::Int;
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -714,7 +714,7 @@ fn adulterated_mir_rejects_string_decode_next_with_a_non_int_cursor() {
     };
     cursor.type_ = mir::Type::Bool;
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -726,7 +726,7 @@ fn adulterated_mir_rejects_string_decode_next_with_a_nonexistent_cursor_local() 
     };
     cursor.kind = mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(u32::MAX)));
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -738,7 +738,7 @@ fn adulterated_mir_rejects_string_decode_next_with_a_nonexistent_string_operand(
     };
     string.kind = mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(u32::MAX)));
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -752,7 +752,7 @@ fn adulterated_mir_rejects_string_decode_next_with_a_nonexistent_char_destinatio
     };
     *char_destination = mir::Place::Local(mir::LocalId(u32::MAX));
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -769,7 +769,7 @@ fn adulterated_mir_rejects_string_decode_next_with_a_char_destination_of_the_wro
     };
     retype_local(&mut module, local_id, &mir::Type::Int);
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -784,7 +784,7 @@ fn adulterated_mir_rejects_string_decode_next_with_a_nonexistent_next_cursor_des
     };
     *next_cursor_destination = mir::Place::Local(mir::LocalId(u32::MAX));
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -802,7 +802,7 @@ fn adulterated_mir_rejects_string_decode_next_with_a_next_cursor_destination_of_
     };
     retype_local(&mut module, local_id, &mir::Type::Bool);
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -818,7 +818,7 @@ fn adulterated_mir_rejects_string_decode_next_writing_two_destinations_into_the_
     };
     *next_cursor_destination = char_destination.clone();
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -849,7 +849,7 @@ fn adulterated_mir_rejects_a_string_byte_length_on_a_non_string_receiver() {
     };
     operand.type_ = mir::Type::Int;
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -872,7 +872,7 @@ fn adulterated_mir_rejects_a_string_byte_length_local_retyped_to_a_non_int() {
     };
     value.type_ = mir::Type::Bool;
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -883,7 +883,7 @@ fn adulterated_mir_rejects_a_non_bool_branch_condition_in_a_string_foreach_progr
             if let mir::Terminator::Branch { condition, .. } = &mut block.terminator {
                 condition.type_ = mir::Type::Int;
                 let error = execute_error(&module);
-                assert!(!error.is_empty());
+                assert_ne!(error, "");
                 return;
             }
         }
@@ -899,7 +899,7 @@ fn adulterated_mir_rejects_a_branch_targeting_an_unknown_block_in_a_string_forea
             if let mir::Terminator::Branch { then_block, .. } = &mut block.terminator {
                 *then_block = mir::BasicBlockId(u32::MAX);
                 let error = execute_error(&module);
-                assert!(!error.is_empty());
+                assert_ne!(error, "");
                 return;
             }
         }
@@ -916,7 +916,7 @@ fn adulterated_mir_rejects_a_missing_entry_block_in_a_string_foreach_program() {
         }
     }
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -927,7 +927,7 @@ fn adulterated_mir_rejects_a_duplicated_block_id_in_a_string_foreach_program() {
             let duplicate_id = function.blocks[0].id;
             function.blocks[1].id = duplicate_id;
             let error = execute_error(&module);
-            assert!(!error.is_empty());
+            assert_ne!(error, "");
             return;
         }
     }

@@ -457,7 +457,7 @@ fn adulterated_mir_rejects_a_none_construction_with_a_mismatched_case() {
     }
     assert!(mutated, "the None EnumConstruct instruction was not found");
     let error = execute(&module, "Main").expect_err("a mismatched None case must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }
 
 #[test]
@@ -494,5 +494,5 @@ fn adulterated_mir_rejects_a_discriminant_over_a_non_enum_operand() {
     assert!(mutated, "the Discriminant instruction was not found");
     let error =
         execute(&module, "Main").expect_err("a discriminant over a non-enum type must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }

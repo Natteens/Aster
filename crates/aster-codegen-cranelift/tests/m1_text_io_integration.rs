@@ -397,7 +397,7 @@ fn adulterated_mir_rejects_string_from_float_receiving_a_double_operand() {
     arguments[0].type_ = mir::Type::Double;
     let error = execute(&module, "Main")
         .expect_err("StringFromFloat with a `double` operand must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }
 
 #[test]
@@ -415,5 +415,5 @@ fn adulterated_mir_rejects_string_from_double_receiving_a_float_operand() {
     arguments[0].type_ = mir::Type::Float;
     let error = execute(&module, "Main")
         .expect_err("StringFromDouble with a `float` operand must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }

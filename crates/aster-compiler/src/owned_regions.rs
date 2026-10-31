@@ -478,7 +478,7 @@ mod tests {
                 _ => None,
             })
             .expect("owned exit exists");
-        assert!(!exit.is_empty());
+        assert_ne!(exit.as_slice(), []);
         assert!(exit.windows(2).all(|pair| pair[0].0 < pair[1].0));
     }
 

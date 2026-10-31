@@ -97,10 +97,16 @@ fn parses_simple_and_generic_payload_enums() {
         panic!("expected Direction enum")
     };
     assert_eq!(direction.visibility, Visibility::Public);
-    assert!(direction.type_parameters.is_empty());
+    assert_eq!(
+        direction.type_parameters,
+        [] as [aster_syntax::TypeParameter; 0]
+    );
     assert_eq!(direction.cases.len(), 2);
     assert_eq!(direction.cases[0].name, "North");
-    assert!(direction.cases[0].fields.is_empty());
+    assert_eq!(
+        direction.cases[0].fields,
+        [] as [aster_syntax::Parameter; 0]
+    );
 
     let Item::Enum(option) = &module.items[1] else {
         panic!("expected Option enum")
@@ -163,7 +169,7 @@ fn parses_short_qualified_and_default_switch_cases() {
     assert_eq!(cases[0].body.statements.len(), 1);
     assert_eq!(cases[1].enum_name.as_deref(), Some("Option"));
     assert_eq!(cases[1].case_name, "None");
-    assert!(cases[1].bindings.is_empty());
+    assert_eq!(cases[1].bindings, [] as [std::string::String; 0]);
     assert_eq!(cases[1].body.statements.len(), 1);
     assert_eq!(default.as_ref().expect("default case").statements.len(), 1);
 }

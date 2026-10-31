@@ -50,7 +50,7 @@ impl Lowerer<'_> {
             }
         }
         let result = values.pop().expect("binary expression produced a value");
-        debug_assert!(values.is_empty());
+        debug_assert_eq!(values, [] as [hir::Expression; 0]);
         result
     }
 

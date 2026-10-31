@@ -586,7 +586,7 @@ fn adulterated_mir_rejects_a_non_string_receiver() {
     };
     arguments[0].type_ = mir::Type::Int;
     let error = execute(&module, "Main").expect_err("non-string receiver must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }
 
 #[test]
@@ -619,7 +619,7 @@ fn adulterated_mir_rejects_a_scalar_return_type() {
         }
     }
     let error = execute(&module, "Main").expect_err("a scalar return type must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }
 
 #[test]
@@ -631,7 +631,7 @@ fn adulterated_mir_rejects_an_undeclared_destination_local() {
     };
     *destination = Some(mir::Place::Local(mir::LocalId(u32::MAX)));
     let error = execute(&module, "Main").expect_err("an undeclared destination must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }
 
 #[test]
@@ -671,7 +671,7 @@ fn adulterated_mir_rejects_the_wrong_option_specialization() {
     *return_type = mir::Type::Enum(bool_option_symbol);
     let error =
         execute(&module, "Main").expect_err("TryParseInt returning Option<bool> must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }
 
 #[test]
@@ -702,7 +702,7 @@ fn adulterated_mir_rejects_a_destination_type_mismatched_with_the_intrinsic() {
     }
     let error =
         execute(&module, "Main").expect_err("a mismatched destination local must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }
 
 // --- Section 19.24-26: memory ----------------------------------------------

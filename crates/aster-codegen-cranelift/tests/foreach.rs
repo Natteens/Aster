@@ -1163,7 +1163,7 @@ fn adulterated_mir_rejects_an_index_place_retargeted_to_an_unknown_local() {
     };
     array.kind = mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(u32::MAX)));
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -1186,7 +1186,7 @@ fn adulterated_mir_rejects_a_length_local_retyped_to_a_non_int() {
     };
     value.type_ = mir::Type::Bool;
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -1197,7 +1197,7 @@ fn adulterated_mir_rejects_an_index_operand_retyped_to_a_non_int() {
     };
     index.type_ = mir::Type::Bool;
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -1223,7 +1223,7 @@ fn adulterated_mir_rejects_an_element_destination_with_an_incompatible_type() {
     };
     value.type_ = mir::Type::Bool;
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -1234,7 +1234,7 @@ fn adulterated_mir_rejects_an_index_place_with_a_mismatched_element_type() {
     };
     *element_type = mir::Type::Bool;
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -1245,7 +1245,7 @@ fn adulterated_mir_rejects_a_non_bool_branch_condition() {
             if let mir::Terminator::Branch { condition, .. } = &mut block.terminator {
                 condition.type_ = mir::Type::Int;
                 let error = execute_error(&module);
-                assert!(!error.is_empty());
+                assert_ne!(error, "");
                 return;
             }
         }
@@ -1261,7 +1261,7 @@ fn adulterated_mir_rejects_a_branch_targeting_an_unknown_block() {
             if let mir::Terminator::Branch { then_block, .. } = &mut block.terminator {
                 *then_block = mir::BasicBlockId(u32::MAX);
                 let error = execute_error(&module);
-                assert!(!error.is_empty());
+                assert_ne!(error, "");
                 return;
             }
         }
@@ -1291,7 +1291,7 @@ fn adulterated_mir_rejects_a_goto_targeting_an_unknown_update_block() {
         "a foreach program always lowers to at least one Goto"
     );
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]
@@ -1302,7 +1302,7 @@ fn adulterated_mir_rejects_a_duplicated_block_id() {
             let duplicate_id = function.blocks[0].id;
             function.blocks[1].id = duplicate_id;
             let error = execute_error(&module);
-            assert!(!error.is_empty());
+            assert_ne!(error, "");
             return;
         }
     }
@@ -1318,7 +1318,7 @@ fn adulterated_mir_rejects_a_missing_entry_block() {
         }
     }
     let error = execute_error(&module);
-    assert!(!error.is_empty());
+    assert_ne!(error, "");
 }
 
 #[test]

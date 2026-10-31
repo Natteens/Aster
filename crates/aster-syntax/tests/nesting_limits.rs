@@ -78,7 +78,7 @@ fn malformed_deep_generic_syntax_is_a_controlled_diagnostic() {
     );
     let source = format!("public {nested} Read() {{ return value; }}");
     let diagnostics = nesting_diagnostic(&source);
-    assert!(!diagnostics.is_empty());
+    assert_ne!(diagnostics, [] as [aster_diagnostics::Diagnostic; 0]);
     assert!(
         diagnostics
             .iter()

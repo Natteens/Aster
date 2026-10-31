@@ -625,7 +625,7 @@ fn adulterated_mir_rejects_a_struct_with_a_missing_field() {
     };
     fields.pop();
     let error = execute(&module, "Main").expect_err("a struct missing a field must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }
 
 #[test]
@@ -658,7 +658,7 @@ fn adulterated_mir_rejects_a_struct_with_an_extra_field() {
     fields.push(extra);
     let error =
         execute(&module, "Main").expect_err("a struct with an extra field must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }
 
 #[test]
@@ -694,7 +694,7 @@ fn adulterated_mir_rejects_io_error_kind_field_with_the_wrong_type() {
     fields[0].value.kind = mir::OperandKind::Constant(mir::Constant::Integer("0".to_owned()));
     let error =
         execute(&module, "Main").expect_err("IOError.Kind with the wrong type must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }
 
 #[test]
@@ -727,7 +727,7 @@ fn adulterated_mir_rejects_io_error_os_code_field_with_the_wrong_type() {
     fields[1].value.kind = mir::OperandKind::Constant(mir::Constant::Boolean(true));
     let error =
         execute(&module, "Main").expect_err("IOError.OsCode with the wrong type must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }
 
 #[test]
@@ -750,7 +750,7 @@ fn adulterated_mir_rejects_an_unknown_struct_symbol() {
     };
     value.type_ = mir::Type::User(mir::SymbolId(u32::MAX));
     let error = execute(&module, "Main").expect_err("an unknown struct symbol must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }
 
 #[test]
@@ -781,7 +781,7 @@ fn adulterated_mir_rejects_io_error_kind_construct_with_an_unknown_case() {
     };
     *case = mir::SymbolId(u32::MAX);
     let error = execute(&module, "Main").expect_err("an unknown enum case symbol must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }
 
 #[test]
@@ -812,5 +812,5 @@ fn adulterated_mir_rejects_io_error_kind_construct_with_a_divergent_tag() {
     };
     *tag = tag.wrapping_add(1);
     let error = execute(&module, "Main").expect_err("a divergent enum tag must be rejected");
-    assert!(!error.to_string().is_empty());
+    assert_ne!(error.to_string(), "");
 }

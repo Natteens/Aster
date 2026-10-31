@@ -40,7 +40,7 @@ fn no_file_commands_find_the_nearest_manifest_from_nested_directories() {
     let output = aster(&nested, ["run"]);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(stdout(&output).trim(), "42");
-    assert!(stderr(&output).is_empty());
+    assert_eq!(stderr(&output), "");
 
     fs::remove_dir_all(root).expect("remove nested project");
 }
@@ -72,7 +72,7 @@ fn the_nearest_manifest_wins_when_ancestors_have_manifests() {
     let output = aster(&nested, ["run"]);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(stdout(&output).trim(), "7");
-    assert!(stderr(&output).is_empty());
+    assert_eq!(stderr(&output), "");
 
     fs::remove_dir_all(root).expect("remove nearest-manifest project");
 }
@@ -95,7 +95,7 @@ fn explicit_function_ignores_an_invalid_relevant_manifest() {
     );
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(stdout(&output).trim(), "42");
-    assert!(stderr(&output).is_empty());
+    assert_eq!(stderr(&output), "");
 
     fs::remove_dir_all(project).expect("remove function override project");
 }
@@ -119,7 +119,7 @@ fn explicit_function_resolves_a_package_qualified_root_symbol() {
     );
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(stdout(&output).trim(), "42");
-    assert!(stderr(&output).is_empty());
+    assert_eq!(stderr(&output), "");
 
     fs::remove_dir_all(project).expect("remove package function project");
 }
@@ -142,7 +142,7 @@ fn a_library_manifest_needs_no_application_table() {
         ["check", source.to_str().expect("UTF-8 source path")],
     );
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert!(stderr(&output).is_empty());
+    assert_eq!(stderr(&output), "");
 
     let output = aster(
         &project,
