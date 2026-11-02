@@ -1,0 +1,21 @@
+internal int Measure(int index)
+{
+    string left = "item-";
+    string text = left + "alpha" + "-beta";
+    return text.Length + index % 3;
+}
+
+public int Run()
+{
+    int total = 0;
+    for (int index = 0; index < 100000; index++)
+    {
+        total += Measure(index);
+    }
+    string joined = "";
+    for (int index = 0; index < 500; index++)
+    {
+        joined = joined + "ab";
+    }
+    return total + joined.Length;
+}

@@ -274,20 +274,30 @@ impl PreparedTestProgram {
     }
 }
 
+/// Backend preparation split reported by [`PreparedSequentialExecution::prepare_timed`].
+/// `validation` is MIR validation and entry selection, `codegen` is JIT setup
+/// through Cranelift compilation of every function, `finalize` is
+/// `finalize_definitions` plus entry-address lookup.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct PreparePhaseTimings {
+    pub validation: std::time::Duration,
+    pub codegen: std::time::Duration,
+    pub finalize: std::time::Duration,
+}
+
 /// Release-benchmark seam that prepares sequential machine code once and
 /// invokes it repeatedly against fresh execution contexts.
 ///
 /// Normal ASTER execution continues to use [`execute`]. This type exists so
 /// research measurements can exclude MIR validation, Cranelift compilation,
 /// and JIT finalization from the timed execution interval.
-#[cfg(feature = "aarm-telemetry")]
 #[doc(hidden)]
 pub struct PreparedSequentialExecution {
     program: execution::PreparedProgram,
     entry: mir::SymbolId,
 }
 
-#[cfg(feature = "aarm-telemetry")]
 impl PreparedSequentialExecution {
     /// Validate and finalize one sequential entry before measurement.
     ///
@@ -296,6 +306,21 @@ impl PreparedSequentialExecution {
     /// Returns a controlled error for invalid MIR, an invalid entry, task
     /// operations, or Cranelift preparation failure.
     pub fn prepare(module: &mir::Module, function_name: &str) -> Result<Self, BackendError> {
+        Self::prepare_timed(module, function_name).map(|(prepared, _)| prepared)
+    }
+
+    /// The single implementation behind [`Self::prepare`], also returning the wall-clock split of the
+    /// backend phases. Used by the performance baseline harness; the prepared
+    /// program is identical to the one `prepare` builds.
+    ///
+    /// # Errors
+    ///
+    /// Same controlled errors as [`Self::prepare`].
+    pub fn prepare_timed(
+        module: &mir::Module,
+        function_name: &str,
+    ) -> Result<(Self, PreparePhaseTimings), BackendError> {
+        let validation_started = std::time::Instant::now();
         validate_module(module)?;
         if task_runtime::module_uses_tasks(module) {
             return Err(BackendError::new(
@@ -303,8 +328,19 @@ impl PreparedSequentialExecution {
             ));
         }
         let entry = select_entry(module, function_name)?.symbol;
-        let program = execution::PreparedProgram::prepare(module)?;
-        Ok(Self { program, entry })
+        let validation = validation_started.elapsed();
+        let (program, timings) = execution::PreparedProgram::prepare_timed_with_foreign_registry(
+            module,
+            &aster_runtime::ForeignRegistry::new(),
+        )?;
+        Ok((
+            Self { program, entry },
+            PreparePhaseTimings {
+                validation,
+                codegen: timings.codegen,
+                finalize: timings.finalize,
+            },
+        ))
     }
 
     /// Invoke finalized code once without collecting memory statistics.

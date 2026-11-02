@@ -1,0 +1,36 @@
+public T Choose<T>(bool condition, T first, T second)
+{
+    return condition ? first : second;
+}
+
+public class Box<T>
+{
+    private T value;
+
+    public Box(T initialValue)
+    {
+        value = initialValue;
+    }
+
+    public T Get()
+    {
+        return value;
+    }
+
+    public void Set(T nextValue)
+    {
+        value = nextValue;
+    }
+}
+
+public int Run()
+{
+    Box<int> box = new Box<int>(0);
+    Box<long> wide = new Box<long>(0L);
+    for (int index = 0; index < 200000; index++)
+    {
+        box.Set(Choose<int>(index % 2 == 0, box.Get() + 1, box.Get() + 2));
+        wide.Set(wide.Get() + (long)Choose<int>(index % 3 == 0, 1, 2));
+    }
+    return box.Get() + (int)(wide.Get() % 1000L);
+}

@@ -1,0 +1,22 @@
+public int Run()
+{
+    long sum = 0L;
+    for (int round = 0; round < 400; round++)
+    {
+        int[] values = new int[500];
+        for (int i = 0; i < 500; i++)
+        {
+            values[i] = i;
+        }
+        List<int> list = new List<int>();
+        for (int i = 0; i < 500; i++)
+        {
+            list.Add(values[i] + round);
+        }
+        for (int i = 0; i < 500; i++)
+        {
+            sum = sum + (long)list.Get(i);
+        }
+    }
+    return (int)(sum % 1000000007L);
+}

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::task_runtime::{TaskRuntime, module_uses_tasks};
 #[cfg(feature = "aarm-telemetry")]
@@ -43,6 +44,13 @@ fn foreign_type(type_: &mir::Type) -> Result<aster_runtime::ForeignType, Backend
     })
 }
 
+/// Wall-clock split of [`PreparedProgram`] preparation.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PrepareTimings {
+    pub(super) codegen: Duration,
+    pub(super) finalize: Duration,
+}
+
 /// A JIT module compiled and finalized once, ready to invoke any function of
 /// `mir::Module` by its resolved [`mir::SymbolId`] any number of times
 /// without recompiling. Every invocation allocates a brand new
@@ -74,6 +82,18 @@ impl PreparedProgram {
         module: &mir::Module,
         registry: &aster_runtime::ForeignRegistry,
     ) -> Result<Self, BackendError> {
+        Self::prepare_timed_with_foreign_registry(module, registry).map(|(program, _)| program)
+    }
+
+    /// Same preparation as [`Self::prepare_with_foreign_registry`], also reporting
+    /// where the time went: `codegen` covers JIT setup, declaration and
+    /// per-function Cranelift compilation; `finalize` covers
+    /// `finalize_definitions` and entry-address lookup.
+    pub(super) fn prepare_timed_with_foreign_registry(
+        module: &mir::Module,
+        registry: &aster_runtime::ForeignRegistry,
+    ) -> Result<(Self, PrepareTimings), BackendError> {
+        let codegen_started = Instant::now();
         let mut builder = jit_builder()?;
         for function in runtime_functions() {
             builder.symbol(function.name, function.address);
@@ -104,6 +124,8 @@ impl PreparedProgram {
                 )?;
             }
         }
+        let codegen_elapsed = codegen_started.elapsed();
+        let finalize_started = Instant::now();
         codegen.jit.finalize_definitions().map_err(module_error)?;
         let entries = module
             .functions
@@ -126,11 +148,18 @@ impl PreparedProgram {
                 (function.symbol, (pointer, function.return_type.clone()))
             })
             .collect();
-        Ok(Self {
-            jit: Some(codegen.jit),
-            entries,
-            task_entries,
-        })
+        let finalize = finalize_started.elapsed();
+        Ok((
+            Self {
+                jit: Some(codegen.jit),
+                entries,
+                task_entries,
+            },
+            PrepareTimings {
+                codegen: codegen_elapsed,
+                finalize,
+            },
+        ))
     }
 
     /// Run the function bound to `symbol` once against a fresh

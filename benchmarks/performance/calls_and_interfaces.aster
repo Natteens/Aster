@@ -1,0 +1,50 @@
+public interface IScore
+{
+    int Value(int input);
+}
+
+public class Doubler : IScore
+{
+    public int Value(int input)
+    {
+        return input * 2;
+    }
+}
+
+public class Adder : IScore
+{
+    private int offset;
+
+    public Adder(int offset)
+    {
+        this.offset = offset;
+    }
+
+    public int Value(int input)
+    {
+        return input + offset;
+    }
+}
+
+internal int Step(int value)
+{
+    return value % 1000 + 1;
+}
+
+internal int Apply(IScore score, int input)
+{
+    return score.Value(Step(input));
+}
+
+public int Run()
+{
+    IScore doubler = new Doubler();
+    IScore adder = new Adder(3);
+    long total = 0L;
+    for (int index = 0; index < 200000; index++)
+    {
+        total = total + (long)Apply(doubler, index);
+        total = total + (long)Apply(adder, index);
+    }
+    return (int)(total % 1000000007L);
+}
