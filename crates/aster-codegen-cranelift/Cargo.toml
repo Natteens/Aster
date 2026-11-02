@@ -55,16 +55,16 @@ path = "examples/array_loop_matrix.rs"
 required-features = ["aarm-telemetry"]
 
 [dependencies]
-aster-mir = { path = "../aster-mir", version = "0.66.1" }
-aster-runtime = { path = "../aster-runtime", version = "0.66.1" }
-aster-types = { path = "../aster-types", version = "0.66.1" }
+aster-mir = { path = "../aster-mir", version = "0.66.2" }
+aster-runtime = { path = "../aster-runtime", version = "0.66.2" }
+aster-types = { path = "../aster-types", version = "0.66.2" }
 cranelift-codegen = "=0.123.20"
 cranelift-frontend = "=0.123.20"
 cranelift-jit = "=0.123.20"
 cranelift-module = "=0.123.20"
 
 [dev-dependencies]
-aster-compiler = { path = "../aster-compiler", version = "0.66.1" }
+aster-compiler = { path = "../aster-compiler", version = "0.66.2" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59.0", features = [
