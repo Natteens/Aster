@@ -173,3 +173,8 @@ cargo run --release -p aster-codegen-cranelift --example memory_regions
 
 Compare results only on the same machine, Rust toolchain, Aster revision, and
 build profile.
+
+## Phase-separated timing
+
+Codegen, finalization, and warm execution are measured separately by the
+Performance Baseline v1 harness; see `benchmarks/performance/README.md`.
