@@ -203,10 +203,10 @@ fn read_bounded_regular_file<R: io::Read>(
 
 impl FileSystemBackend for StdFileSystemBackend {
     fn read_all(&mut self, path: &str, probe_limit: u64) -> Result<Vec<u8>, FileSystemError> {
-        if let Ok(metadata) = std::fs::metadata(path) {
-            if metadata.is_dir() {
-                return Err(FileSystemError::NotFile);
-            }
+        if let Ok(metadata) = std::fs::metadata(path)
+            && metadata.is_dir()
+        {
+            return Err(FileSystemError::NotFile);
         }
         let file = std::fs::File::open(path).map_err(FileSystemError::Io)?;
         let opened_metadata = file.metadata().ok();

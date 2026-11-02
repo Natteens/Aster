@@ -245,7 +245,7 @@ impl PageBackend for WindowsVirtualPageBackend {
         if base.is_null() {
             return Err(ArenaAllocError::OutOfMemory);
         }
-        if base as usize % alignment != 0 {
+        if !(base as usize).is_multiple_of(alignment) {
             let released = virtual_free(base.cast::<u8>(), 0, MEM_RELEASE);
             debug_assert!(released, "misaligned Windows allocation must release");
             return Err(ArenaAllocError::AddressSpace);
@@ -375,7 +375,7 @@ impl PageBackend for LinuxAnonymousPageBackend {
         if base == libc::MAP_FAILED {
             return Err(ArenaAllocError::OutOfMemory);
         }
-        if base as usize % alignment != 0 {
+        if !(base as usize).is_multiple_of(alignment) {
             let released = linux_munmap(base.cast::<u8>(), mapping_size);
             debug_assert!(released, "misaligned Linux mapping must release");
             return Err(ArenaAllocError::AddressSpace);
@@ -1730,7 +1730,7 @@ mod tests {
 
         fn discard(&self, _backing: &mut PageBacking) -> Result<(), ArenaAllocError> {
             let call = self.discard_calls.fetch_add(1, Ordering::Relaxed);
-            if call % 2 == 0 {
+            if call.is_multiple_of(2) {
                 Ok(())
             } else {
                 Err(ArenaAllocError::OutOfMemory)

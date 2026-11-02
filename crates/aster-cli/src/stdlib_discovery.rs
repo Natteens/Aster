@@ -76,24 +76,24 @@ pub fn discover_detailed() -> Result<DiscoveredStandardLibrary, StandardLibraryD
     }
 
     // 2. stdlib relative to the running executable: <exe>/../stdlib/
-    if let Some(candidate) = exe_relative_stdlib() {
-        if candidate.is_dir() {
-            match StandardLibrary::from_path(&candidate) {
-                Ok(standard_library) => {
-                    return Ok(DiscoveredStandardLibrary {
-                        standard_library,
-                        origin: StandardLibraryOrigin::ExecutableRelative(candidate.clone()),
-                    });
-                }
-                Err(error) => {
-                    // A directory was found but it is incomplete — this is a
-                    // broken installation. Error immediately rather than
-                    // silently falling back, so the user knows to fix it.
-                    return Err(StandardLibraryDiscoveryError::ExecutableRelative {
-                        path: candidate,
-                        reason: error,
-                    });
-                }
+    if let Some(candidate) = exe_relative_stdlib()
+        && candidate.is_dir()
+    {
+        match StandardLibrary::from_path(&candidate) {
+            Ok(standard_library) => {
+                return Ok(DiscoveredStandardLibrary {
+                    standard_library,
+                    origin: StandardLibraryOrigin::ExecutableRelative(candidate.clone()),
+                });
+            }
+            Err(error) => {
+                // A directory was found but it is incomplete — this is a
+                // broken installation. Error immediately rather than
+                // silently falling back, so the user knows to fix it.
+                return Err(StandardLibraryDiscoveryError::ExecutableRelative {
+                    path: candidate,
+                    reason: error,
+                });
             }
         }
     }

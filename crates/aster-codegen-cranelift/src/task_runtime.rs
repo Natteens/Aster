@@ -1624,13 +1624,12 @@ fn collect_chunks_observed(
         if let Some(snapshot) = outcome.telemetry {
             telemetry.push(snapshot);
         }
-        if let Some((index, error)) = outcome.first_error {
-            if first_error
+        if let Some((index, error)) = outcome.first_error
+            && first_error
                 .as_ref()
                 .is_none_or(|(current, _)| index < *current)
-            {
-                first_error = Some((index, error));
-            }
+        {
+            first_error = Some((index, error));
         }
     }
     let result = match first_error {

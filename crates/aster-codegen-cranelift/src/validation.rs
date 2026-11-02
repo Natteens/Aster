@@ -1406,13 +1406,14 @@ fn validate_function(
     }
     validate_executable_temporary_subregions(function)?;
     validate_executable_owned_regions(function, owned_effects)?;
-    if let Some(owner) = function.owner {
-        if !classes.contains(&owner) && !structs.contains(&owner) {
-            return Err(BackendError::new(format!(
-                "function `{}` has an unknown method owner",
-                function.name
-            )));
-        }
+    if let Some(owner) = function.owner
+        && !classes.contains(&owner)
+        && !structs.contains(&owner)
+    {
+        return Err(BackendError::new(format!(
+            "function `{}` has an unknown method owner",
+            function.name
+        )));
     }
     validate_return_type(&function.return_type, &function.name)?;
     for parameter in &function.parameters {

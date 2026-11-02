@@ -744,10 +744,10 @@ fn selected_scales() -> Vec<Scale> {
     while let Some(argument) = arguments.next() {
         if let Some(value) = argument.strip_prefix("--scale=") {
             tokens.push(value.to_string());
-        } else if argument == "--scale" {
-            if let Some(value) = arguments.next() {
-                tokens.push(value);
-            }
+        } else if argument == "--scale"
+            && let Some(value) = arguments.next()
+        {
+            tokens.push(value);
         }
     }
 
@@ -760,10 +760,10 @@ fn selected_scales() -> Vec<Scale> {
         if token == "all" {
             return vec![Scale::Small, Scale::Medium, Scale::Large];
         }
-        if let Some(scale) = Scale::parse(token) {
-            if !scales.contains(&scale) {
-                scales.push(scale);
-            }
+        if let Some(scale) = Scale::parse(token)
+            && !scales.contains(&scale)
+        {
+            scales.push(scale);
         }
     }
 

@@ -49,8 +49,8 @@ impl TaskPayload {
             return Ok(Self::default());
         }
         if pointer.is_null()
-            || size % 8 != 0
-            || (pointer as usize) % std::mem::align_of::<u64>() != 0
+            || !size.is_multiple_of(8)
+            || !(pointer as usize).is_multiple_of(std::mem::align_of::<u64>())
         {
             return Err(BackendError::new(
                 "Task.Run received an invalid argument frame",
@@ -1171,10 +1171,10 @@ impl ExecutionPool {
                     "a worker thread terminated before completing initialization",
                 ))
             });
-            if let Err(error) = outcome {
-                if failure.is_none() {
-                    failure = Some(error);
-                }
+            if let Err(error) = outcome
+                && failure.is_none()
+            {
+                failure = Some(error);
             }
         }
 
