@@ -45,16 +45,14 @@ pub fn encode_str(value: &str) -> Vec<u8> {
 /// returned lifetime.
 #[allow(unsafe_code)]
 pub(crate) unsafe fn view<'a>(string: *const AsterStrHeader) -> Option<&'a str> {
-    if string.is_null() {
-        return None;
+    // SAFETY: forwarded caller contract, identical to `raw_bytes`'.
+    let bytes = unsafe { raw_bytes(string) }?;
+    if bytes.is_ascii() {
+        // SAFETY: `is_ascii` just proved every byte is <= 0x7f, and every
+        // sequence of such bytes is valid UTF-8 (each is a one-byte scalar).
+        #[allow(unsafe_code)]
+        return Some(unsafe { std::str::from_utf8_unchecked(bytes) });
     }
-    // SAFETY: the caller guarantees a live allocation in the documented
-    // layout: a readable header followed by `len` readable payload bytes.
-    let bytes = unsafe {
-        let len = (*string).len;
-        let payload = string.cast::<u8>().add(size_of::<AsterStrHeader>());
-        std::slice::from_raw_parts(payload, len)
-    };
     std::str::from_utf8(bytes).ok()
 }
 
@@ -461,12 +459,22 @@ pub extern "C" fn aster_rt_string_length(
     // SAFETY: generated code passes the live context and an ABI string owned
     // by that context or the live JIT module.
     #[allow(unsafe_code)]
-    let (context, value) = unsafe { (&mut *context, view(value)) };
-    let Some(value) = value else {
+    let (context, bytes) = unsafe { (&mut *context, raw_bytes(value)) };
+    let Some(bytes) = bytes else {
         context.fail("string Length received an invalid UTF-8 string reference");
         return 0;
     };
-    if let Ok(length) = i32::try_from(value.chars().count()) {
+    // One scan decides the common case: an ASCII payload is valid UTF-8 and
+    // each byte is one scalar. Anything else is fully validated before counting.
+    let scalars = if bytes.is_ascii() {
+        bytes.len()
+    } else if let Ok(text) = std::str::from_utf8(bytes) {
+        text.chars().count()
+    } else {
+        context.fail("string Length received an invalid UTF-8 string reference");
+        return 0;
+    };
+    if let Ok(length) = i32::try_from(scalars) {
         length
     } else {
         context.fail("string Length exceeds the supported `int` range");
@@ -504,7 +512,10 @@ pub extern "C" fn aster_rt_string_byte_length(
 /// need only a bounded window -- like `foreach`'s per-scalar cursor decode
 /// -- validate exactly that window themselves, keeping per-step cost O(1)
 /// instead of O(remaining bytes); walking the whole remaining string on
-/// every step would make a full iteration quadratic.
+/// every step would make a full iteration quadratic. [`view`] and
+/// `aster_rt_string_length` also start from here, so they can take a single
+/// ASCII scan instead of full validation; non-ASCII payloads they still
+/// validate in full before trusting any byte.
 ///
 /// # Safety
 ///
@@ -3128,5 +3139,208 @@ mod tests {
             "string_join must not allocate host memory"
         );
         assert!(context.take_error().is_none());
+    }
+
+    const LENGTH_INVALID_UTF8: &str = "string Length received an invalid UTF-8 string reference";
+
+    /// 8-byte-aligned ABI string whose payload is exactly `bytes`, valid UTF-8
+    /// or not.
+    fn aligned_bytes(bytes: &[u8]) -> Vec<u64> {
+        let mut buffer = vec![0_u64; (size_of::<AsterStrHeader>() + bytes.len()).div_ceil(8)];
+        buffer[0] = bytes.len() as u64;
+        // SAFETY: the buffer owns the header word plus `bytes.len()` payload
+        // bytes; only the payload region after the header is written.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                buffer
+                    .as_mut_ptr()
+                    .cast::<u8>()
+                    .add(size_of::<AsterStrHeader>()),
+                bytes.len(),
+            );
+        }
+        buffer
+    }
+
+    /// Run `aster_rt_string_length` on a fresh context and return the result
+    /// together with the published error.
+    fn length_of(bytes: &[u8]) -> (i32, Option<String>) {
+        let buffer = aligned_bytes(bytes);
+        let mut context = ExecutionContext::new();
+        let length = aster_rt_string_length(&raw mut context, pointer(&buffer));
+        (length, context.take_error())
+    }
+
+    fn view_of(bytes: &[u8]) -> Option<String> {
+        let buffer = aligned_bytes(bytes);
+        // SAFETY: `buffer` is an 8-byte-aligned, live ABI string.
+        #[allow(unsafe_code)]
+        unsafe { view(pointer(&buffer)) }.map(str::to_owned)
+    }
+
+    fn assert_length_rejects(bytes: &[u8], what: &str) {
+        assert_eq!(view_of(bytes), None, "view accepted {what}: {bytes:02x?}");
+        assert_eq!(
+            length_of(bytes),
+            (0, Some(LENGTH_INVALID_UTF8.to_owned())),
+            "Length accepted {what}: {bytes:02x?}"
+        );
+    }
+
+    #[test]
+    fn ascii_view_and_length_accept_every_length_and_boundary() {
+        // Bytes cycle through all of 0x00..=0x7f, so NUL, controls,
+        // whitespace, punctuation and DEL all occur at varying offsets.
+        for len in (0..=130).chain([255, 256, 1023, 1024, 4097]) {
+            let bytes: Vec<u8> = (0..len)
+                .map(|index| u8::try_from(index % 128).expect("below 128"))
+                .collect();
+            let expected = std::str::from_utf8(&bytes).expect("ASCII is UTF-8");
+            assert_eq!(
+                view_of(&bytes).as_deref(),
+                Some(expected),
+                "view, len {len}"
+            );
+            let scalars = expected.chars().count();
+            assert_eq!(scalars, len);
+            assert_eq!(
+                length_of(&bytes),
+                (i32::try_from(len).expect("test length fits i32"), None),
+                "Length, len {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn ascii_boundary_lengths_with_embedded_nul_punctuation_and_whitespace() {
+        for len in [0_usize, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 70] {
+            let text: String = "a \t\n\0!~,.;:-_".chars().cycle().take(len).collect();
+            assert_eq!(text.len(), len);
+            assert_eq!(view_of(text.as_bytes()).as_deref(), Some(text.as_str()));
+            assert_eq!(
+                length_of(text.as_bytes()),
+                (i32::try_from(len).expect("test length fits i32"), None)
+            );
+        }
+        let lone_nul = [0_u8];
+        assert_eq!(view_of(&lone_nul).as_deref(), Some("\0"));
+        assert_eq!(length_of(&lone_nul), (1, None));
+    }
+
+    #[test]
+    fn valid_non_ascii_length_counts_scalars_not_bytes() {
+        let cases: [(&str, i32); 8] = [
+            ("á", 1),
+            ("日本語", 3),
+            ("🙂", 1),
+            ("e\u{301}", 2),
+            ("🙂🙂🙂🙂🙂", 5),
+            ("ascii and ünïcödé ✓ 🙂 mixed", 27),
+            ("\u{7f}\u{80}", 2),
+            ("\u{10ffff}", 1),
+        ];
+        for (text, scalars) in cases {
+            assert_eq!(text.chars().count(), usize::try_from(scalars).unwrap());
+            assert_eq!(view_of(text.as_bytes()).as_deref(), Some(text), "{text:?}");
+            assert_eq!(length_of(text.as_bytes()), (scalars, None), "{text:?}");
+        }
+        // One non-ASCII scalar at every offset of a 70-byte ASCII payload.
+        let ascii: String = (0..70_u8)
+            .map(|index| char::from(b'a' + index % 26))
+            .collect();
+        for offset in 0..=70 {
+            for scalar in ['é', '日', '🙂'] {
+                let mut text = ascii.clone();
+                text.insert(offset, scalar);
+                assert_eq!(view_of(text.as_bytes()).as_deref(), Some(text.as_str()));
+                assert_eq!(
+                    length_of(text.as_bytes()),
+                    (71, None),
+                    "{scalar} at {offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_utf8_is_rejected_by_view_and_length() {
+        let cases: [(&str, &[u8]); 16] = [
+            ("standalone continuation", &[0x80]),
+            ("continuation after ASCII", b"ab\x80cd"),
+            ("invalid leading byte 0xff", &[0xff]),
+            ("invalid leading byte 0xf8", &[0xf8, 0x88, 0x80, 0x80, 0x80]),
+            ("truncated 2-byte", &[0xc3]),
+            ("truncated 2-byte before ASCII", &[0xc3, 0x28]),
+            ("truncated 3-byte", &[0xe2, 0x82]),
+            ("truncated 4-byte", &[0xf0, 0x9f, 0x99]),
+            ("overlong 2-byte NUL", &[0xc0, 0x80]),
+            ("overlong 3-byte", &[0xe0, 0x80, 0x80]),
+            ("overlong 4-byte", &[0xf0, 0x80, 0x80, 0x80]),
+            ("UTF-16 surrogate", &[0xed, 0xa0, 0x80]),
+            ("above U+10FFFF", &[0xf4, 0x90, 0x80, 0x80]),
+            ("leading byte 0xf5", &[0xf5, 0x80, 0x80, 0x80]),
+            (
+                "valid prefix then truncated tail",
+                "ok 🙂".as_bytes().split_last().unwrap().1,
+            ),
+            ("ASCII then 0xc1", b"0123456789abcdef\xc1\xbf"),
+        ];
+        for (what, bytes) in cases {
+            assert_length_rejects(bytes, what);
+        }
+    }
+
+    #[test]
+    fn invalid_byte_at_every_offset_of_an_ascii_payload_is_rejected() {
+        for len in [1_usize, 7, 8, 15, 16, 31, 32, 63, 64, 65, 70, 71] {
+            for offset in 0..len {
+                for invalid in [0x80_u8, 0xc3, 0xe2, 0xf0, 0xff] {
+                    let mut bytes: Vec<u8> = (0..len)
+                        .map(|index| b'a' + u8::try_from(index % 26).expect("below 26"))
+                        .collect();
+                    bytes[offset] = invalid;
+                    // 0xc3/0xe2/0xf0 followed only by ASCII is always malformed.
+                    assert_length_rejects(&bytes, &format!("{invalid:#x} at {offset}/{len}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn length_keeps_the_first_error_and_still_validates_after_a_failure() {
+        let invalid = aligned_bytes(&[b'a', 0xff]);
+        let valid = aligned("abc");
+        let mut context = ExecutionContext::new();
+        context.fail("earlier failure");
+        assert_eq!(
+            aster_rt_string_length(&raw mut context, pointer(&invalid)),
+            0
+        );
+        assert_eq!(context.take_error().as_deref(), Some("earlier failure"));
+
+        assert_eq!(
+            aster_rt_string_length(&raw mut context, pointer(&invalid)),
+            0
+        );
+        assert_eq!(context.take_error().as_deref(), Some(LENGTH_INVALID_UTF8));
+        assert_eq!(aster_rt_string_length(&raw mut context, pointer(&valid)), 3);
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    fn length_keeps_its_null_contracts() {
+        let valid = aligned("abc");
+        let mut context = ExecutionContext::new();
+        assert_eq!(
+            aster_rt_string_length(std::ptr::null_mut(), pointer(&valid)),
+            0
+        );
+        assert_eq!(
+            aster_rt_string_length(&raw mut context, std::ptr::null()),
+            0
+        );
+        assert_eq!(context.take_error().as_deref(), Some(LENGTH_INVALID_UTF8));
     }
 }
