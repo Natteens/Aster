@@ -15,7 +15,8 @@ use std::{
 };
 
 use aster_codegen_cranelift::{
-    ExecutionValue, MemoryStats, execute, execute_with_console, execute_with_console_and_stats,
+    ExecutionValue, MemoryStats, PreparedSequentialExecution, execute, execute_with_console,
+    execute_with_console_and_stats,
 };
 use aster_compiler::{compile_project, mir};
 use aster_runtime::{ConsoleBackend, MemoryConsoleBackend};
@@ -115,6 +116,91 @@ fn list_get_failure_stops_before_later_console_output() {
         output.is_empty(),
         "runtime failure must stop later user output"
     );
+}
+
+const NESTED_FAILURE_SOURCE: &str = "using aster.io;\n\
+    internal int Inner(List<int> values) {\n\
+        int first = values.Get(0);\n\
+        int second = values.Get(7);\n\
+        WriteLine(\"must not execute: inner\");\n\
+        return first + second;\n\
+    }\n\
+    internal int Middle(List<int> values) {\n\
+        int value = Inner(values);\n\
+        WriteLine(\"must not execute: middle\");\n\
+        return value;\n\
+    }\n\
+    public int Main() {\n\
+        WriteLine(\"before\");\n\
+        List<int> values = new List<int>();\n\
+        int total = Middle(values);\n\
+        WriteLine(\"must not execute: main\");\n\
+        return total;\n\
+    }";
+
+#[test]
+fn nested_runtime_failure_reaches_the_host_and_keeps_the_first_error() {
+    let (result, output) = run_with_io(NESTED_FAILURE_SOURCE, "Main", "");
+    let error = result.expect_err("the nested List.Get failure must reach the host");
+    assert_eq!(
+        output, b"before\n",
+        "no user work may run after the failure"
+    );
+    // The failing `Get(0)` is the first error; the unreachable `Get(7)` would
+    // have reported a different index had execution continued past it.
+    assert!(
+        !error.contains('7'),
+        "later error replaced the first: {error}"
+    );
+    // Deterministic across independent invocations (no residual state).
+    let (again, again_output) = run_with_io(NESTED_FAILURE_SOURCE, "Main", "");
+    assert_eq!(again, Err(error));
+    assert_eq!(again_output, b"before\n");
+}
+
+#[test]
+fn healthy_nested_calls_do_not_trip_the_runtime_failure_check() {
+    let source = "using aster.io;\n\
+        internal int Inner(List<int> values) { return values.Get(0) + values.Get(1); }\n\
+        internal int Middle(List<int> values) { int value = Inner(values); WriteLine(\"middle\"); return value; }\n\
+        public int Main() {\n\
+            List<int> values = new List<int>();\n\
+            values.Add(20);\n\
+            values.Add(22);\n\
+            int total = Middle(values);\n\
+            WriteLine(\"main\");\n\
+            return total;\n\
+        }";
+    let (result, output) = run_with_io(source, "Main", "");
+    assert_eq!(result, Ok(ExecutionValue::Int(42)));
+    assert_eq!(output, b"middle\nmain\n");
+}
+
+#[test]
+fn repeated_prepared_invocations_keep_failure_state_per_invocation() {
+    let failing = aster_compiler::compile(
+        "public int Run() { List<int> values = new List<int>(); return values.Get(0); }",
+    )
+    .expect("failing source compiles");
+    let prepared = PreparedSequentialExecution::prepare(&failing.mir, "Run").expect("prepare");
+    let first = prepared
+        .invoke()
+        .expect_err("out-of-bounds Get must fail")
+        .to_string();
+    let second = prepared
+        .invoke()
+        .expect_err("failure must repeat")
+        .to_string();
+    assert_eq!(first, second);
+
+    let healthy = aster_compiler::compile(
+        "public int Run() { List<int> values = new List<int>(); values.Add(7); return values.Get(0); }",
+    )
+    .expect("healthy source compiles");
+    let prepared = PreparedSequentialExecution::prepare(&healthy.mir, "Run").expect("prepare");
+    for _ in 0..3 {
+        assert_eq!(prepared.invoke(), Ok(ExecutionValue::Int(7)));
+    }
 }
 
 #[test]

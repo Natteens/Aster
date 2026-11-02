@@ -51,6 +51,13 @@ pub struct AsterArray {
 pub const ASTER_ARRAY_DATA_OFFSET: usize = std::mem::offset_of!(AsterArray, data);
 pub const ASTER_ARRAY_LENGTH_OFFSET: usize = std::mem::offset_of!(AsterArray, length);
 
+/// Offset of the one-byte error flag inside an [`ExecutionContext`], read
+/// directly by generated code after fallible runtime calls instead of calling
+/// [`aster_rt_has_error`]. Derived from the struct, not duplicated in a
+/// backend; a private JIT ABI, not a foreign-function interface.
+pub const EXECUTION_CONTEXT_ERROR_FLAG_OFFSET: usize =
+    std::mem::offset_of!(ExecutionContext, error_flag);
+
 fn array_allocation_layout(length: usize, element_size: usize) -> Option<(usize, usize, usize)> {
     let payload_bytes = checked_allocation_size(length, element_size)?;
     let data_offset = checked_align_up(size_of::<AsterArray>(), 8)?;
@@ -588,6 +595,11 @@ pub struct ExecutionContext {
     allocation_limit_kind: AllocationLimitKind,
     call_depth: u32,
     error: Option<String>,
+    /// Cheap projection of `error.is_some()` read directly by generated code at
+    /// [`EXECUTION_CONTEXT_ERROR_FLAG_OFFSET`]: `1` iff `error` is `Some`, else
+    /// `0`. `error` stays the authority; only `new`, `fail` and `take_error`
+    /// write either of the two.
+    error_flag: u8,
     collect_stats: bool,
     stats: MemoryStats,
     /// Opaque host extension slot: an untyped handle to whatever the current
@@ -686,6 +698,7 @@ impl ExecutionContext {
             allocation_limit_kind: AllocationLimitKind::Execution,
             call_depth: 0,
             error: None,
+            error_flag: 0,
             collect_stats,
             stats: MemoryStats::default(),
             task_runtime: None,
@@ -811,6 +824,7 @@ impl ExecutionContext {
     }
 
     pub fn take_error(&mut self) -> Option<String> {
+        self.error_flag = 0;
         self.error.take()
     }
 
@@ -877,6 +891,7 @@ impl ExecutionContext {
     pub fn fail(&mut self, message: impl Into<String>) {
         if self.error.is_none() {
             self.error = Some(message.into());
+            self.error_flag = 1;
         }
     }
 
@@ -9971,6 +9986,98 @@ mod tests {
             aster_rt_call_leave(first_pointer);
         }
         assert_eq!(first.call_depth, 0);
+    }
+
+    /// Read the byte generated code reads: the error flag at the exported
+    /// offset from the context pointer.
+    fn error_flag_through_exported_offset(context: &ExecutionContext) -> u8 {
+        // SAFETY: the exported offset addresses the `u8` `error_flag` field
+        // inside the live context borrowed here.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::from_ref(context)
+                .cast::<u8>()
+                .add(EXECUTION_CONTEXT_ERROR_FLAG_OFFSET)
+                .read()
+        }
+    }
+
+    fn assert_error_flag_mirrors_error(context: &ExecutionContext) {
+        let expected = u8::from(context.error.is_some());
+        assert_eq!(context.error_flag, expected);
+        assert_eq!(error_flag_through_exported_offset(context), expected);
+        assert_eq!(
+            aster_rt_has_error(std::ptr::from_ref(context)),
+            i8::from(expected != 0)
+        );
+    }
+
+    #[test]
+    fn error_flag_starts_clear_and_follows_fail_and_take() {
+        let mut context = ExecutionContext::new();
+        assert!(context.error.is_none());
+        assert_error_flag_mirrors_error(&context);
+        assert_eq!(context.error_flag, 0);
+
+        context.fail("first");
+        assert_eq!(context.error.as_deref(), Some("first"));
+        assert_eq!(context.error_flag, 1);
+        assert_error_flag_mirrors_error(&context);
+
+        context.fail("second");
+        assert_eq!(context.error.as_deref(), Some("first"));
+        assert_eq!(context.error_flag, 1);
+        assert_error_flag_mirrors_error(&context);
+
+        assert_eq!(context.take_error().as_deref(), Some("first"));
+        assert!(context.error.is_none());
+        assert_eq!(context.error_flag, 0);
+        assert_error_flag_mirrors_error(&context);
+
+        assert_eq!(context.take_error(), None);
+        assert_eq!(context.error_flag, 0);
+
+        context.fail("third");
+        assert_eq!(context.error.as_deref(), Some("third"));
+        assert_eq!(context.error_flag, 1);
+        assert_error_flag_mirrors_error(&context);
+    }
+
+    #[test]
+    fn error_flag_follows_runtime_entry_points_and_stays_context_local() {
+        let mut failing = ExecutionContext::new();
+        let mut healthy = ExecutionContext::new();
+        // A null string reference makes a runtime entry publish its error.
+        assert_eq!(
+            crate::string::aster_rt_string_length(&raw mut failing, std::ptr::null()),
+            0
+        );
+        assert!(failing.error.is_some());
+        assert_error_flag_mirrors_error(&failing);
+        assert_error_flag_mirrors_error(&healthy);
+        assert_eq!(healthy.error_flag, 0);
+        healthy.fail("independent");
+        assert_eq!(
+            failing.take_error().as_deref().map(str::is_empty),
+            Some(false)
+        );
+        assert_error_flag_mirrors_error(&failing);
+        assert_eq!(healthy.error_flag, 1);
+    }
+
+    #[test]
+    fn error_flag_offset_is_derived_from_the_struct_and_fits_a_load_offset() {
+        assert_eq!(
+            EXECUTION_CONTEXT_ERROR_FLAG_OFFSET,
+            std::mem::offset_of!(ExecutionContext, error_flag)
+        );
+        assert!(i32::try_from(EXECUTION_CONTEXT_ERROR_FLAG_OFFSET).is_ok());
+        assert!(EXECUTION_CONTEXT_ERROR_FLAG_OFFSET < size_of::<ExecutionContext>());
+    }
+
+    #[test]
+    fn has_error_keeps_its_null_context_contract() {
+        assert_eq!(aster_rt_has_error(std::ptr::null()), 1);
     }
 
     #[test]

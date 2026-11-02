@@ -1,3 +1,5 @@
+use aster_runtime::EXECUTION_CONTEXT_ERROR_FLAG_OFFSET;
+
 use super::{
     BackendError, Codegen, FuncId, FunctionBuilder, FunctionBuilderContext, FunctionState, HashMap,
     HashSet, InstBuilder, IntCC, MemFlags, Module, StackSlotData, StackSlotKind, is_aggregate, mir,
@@ -230,6 +232,9 @@ impl Codegen {
         Ok(())
     }
 
+    // Keeps the receiver shared with its many call sites; it no longer needs
+    // `self` because the check is an inline load, not a runtime call.
+    #[allow(clippy::unused_self)]
     pub(super) fn continue_if_runtime_ok(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
@@ -238,12 +243,19 @@ impl Codegen {
         let context = state
             .execution_context
             .ok_or_else(|| BackendError::new("Aster function is missing its ExecutionContext"))?;
-        let has_error_ref = self
-            .jit
-            .declare_func_in_func(self.runtime_ids["aster_rt_has_error"], builder.func);
-        let failed = builder.ins().call(has_error_ref, &[context]);
-        let failed = builder.inst_results(failed)[0];
+        let flag_offset = i32::try_from(EXECUTION_CONTEXT_ERROR_FLAG_OFFSET)
+            .map_err(|_| BackendError::new("ExecutionContext error flag offset is too large"))?;
+        // A null context takes the failure path, exactly as `aster_rt_has_error`
+        // reports it; only a non-null context is dereferenced.
+        let load_flag = builder.create_block();
         let continuation = builder.create_block();
+        builder
+            .ins()
+            .brif(context, load_flag, &[], state.runtime_failure, &[]);
+        builder.switch_to_block(load_flag);
+        let failed = builder
+            .ins()
+            .load(types::I8, MemFlags::new(), context, flag_offset);
         builder
             .ins()
             .brif(failed, state.runtime_failure, &[], continuation, &[]);
