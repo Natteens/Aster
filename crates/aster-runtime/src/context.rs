@@ -308,17 +308,15 @@ fn siphash13(k0: u64, k1: u64, bytes: &[u8]) -> u64 {
     let mut v1 = k1 ^ 0x646f_7261_6e64_6f6d;
     let mut v2 = k0 ^ 0x6c79_6765_6e65_7261;
     let mut v3 = k1 ^ 0x7465_6462_7974_6573;
-    let mut chunks = bytes.chunks_exact(8);
-    for chunk in &mut chunks {
-        let mut word = [0_u8; 8];
-        word.copy_from_slice(chunk);
-        let message = u64::from_le_bytes(word);
+    let (chunks, remainder) = bytes.as_chunks::<8>();
+    for chunk in chunks {
+        let message = u64::from_le_bytes(*chunk);
         v3 ^= message;
         sip_round(&mut v0, &mut v1, &mut v2, &mut v3);
         v0 ^= message;
     }
     let mut tail = (bytes.len() as u64) << 56;
-    for (index, byte) in chunks.remainder().iter().enumerate() {
+    for (index, byte) in remainder.iter().enumerate() {
         tail |= u64::from(*byte) << (index * 8);
     }
     v3 ^= tail;
@@ -2618,8 +2616,8 @@ impl ExecutionContext {
         if entry_size == 0
             || key_end > entry_size
             || value_end > entry_size
-            || key_offset % key_align != 0
-            || value_offset % value_align != 0
+            || !key_offset.is_multiple_of(key_align)
+            || !value_offset.is_multiple_of(value_align)
         {
             self.fail("Dictionary.Entries has invalid DictionaryEntry field layout");
             return ptr::null_mut();

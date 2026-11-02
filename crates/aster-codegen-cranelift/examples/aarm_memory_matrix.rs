@@ -2016,10 +2016,10 @@ fn parse_matrix_options(
                     selected = vec![Scale::Small, Scale::Medium, Scale::Large];
                     continue;
                 }
-                if let Some(scale) = Scale::parse(token) {
-                    if !selected.contains(&scale) {
-                        selected.push(scale);
-                    }
+                if let Some(scale) = Scale::parse(token)
+                    && !selected.contains(&scale)
+                {
+                    selected.push(scale);
                 }
             }
         }

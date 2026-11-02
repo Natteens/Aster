@@ -146,10 +146,10 @@ fn sha256(input: &[u8]) -> [u8; 32] {
     }
     padded.extend_from_slice(&bit_length.to_be_bytes());
     let mut hash = INITIAL;
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0 {
         let mut words = [0_u32; 64];
-        for (index, bytes) in chunk.chunks_exact(4).enumerate() {
-            words[index] = u32::from_be_bytes(bytes.try_into().expect("four-byte SHA word"));
+        for (index, bytes) in chunk.as_chunks::<4>().0.iter().enumerate() {
+            words[index] = u32::from_be_bytes(*bytes);
         }
         for index in 16..64 {
             let s0 = words[index - 15].rotate_right(7)
@@ -189,7 +189,7 @@ fn sha256(input: &[u8]) -> [u8; 32] {
         }
     }
     let mut output = [0_u8; 32];
-    for (bytes, value) in output.chunks_exact_mut(4).zip(hash) {
+    for (bytes, value) in output.as_chunks_mut::<4>().0.iter_mut().zip(hash) {
         bytes.copy_from_slice(&value.to_be_bytes());
     }
     output
@@ -397,34 +397,34 @@ struct RemoteArgument {
 
 fn remote_argument(git: &str) -> Result<RemoteArgument, String> {
     #[cfg(debug_assertions)]
-    if let Some(root) = env::var_os("ASTER_GIT_TEST_REMOTE_ROOT") {
-        if let Some(relative) = git.strip_prefix("https://example.invalid/") {
-            let relative = Path::new(relative);
-            if relative
-                .components()
-                .any(|component| !matches!(component, Component::Normal(_)))
-            {
-                return Err("invalid test Git repository path".to_owned());
-            }
-            let root = fs::canonicalize(root)
-                .map_err(|error| format!("invalid test Git remote root: {error}"))?;
-            let path = fs::canonicalize(root.join(relative))
-                .map_err(|error| format!("test Git repository is unavailable: {error}"))?;
-            if !path.starts_with(&root) {
-                return Err("test Git repository escapes its root".to_owned());
-            }
-            let path = path.to_string_lossy().replace('\\', "/");
-            let path = path.strip_prefix("//?/").unwrap_or(&path);
-            let value = if path.starts_with('/') {
-                format!("file://{path}")
-            } else {
-                format!("file:///{path}")
-            };
-            return Ok(RemoteArgument {
-                value,
-                allow_file: true,
-            });
+    if let Some(root) = env::var_os("ASTER_GIT_TEST_REMOTE_ROOT")
+        && let Some(relative) = git.strip_prefix("https://example.invalid/")
+    {
+        let relative = Path::new(relative);
+        if relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err("invalid test Git repository path".to_owned());
         }
+        let root = fs::canonicalize(root)
+            .map_err(|error| format!("invalid test Git remote root: {error}"))?;
+        let path = fs::canonicalize(root.join(relative))
+            .map_err(|error| format!("test Git repository is unavailable: {error}"))?;
+        if !path.starts_with(&root) {
+            return Err("test Git repository escapes its root".to_owned());
+        }
+        let path = path.to_string_lossy().replace('\\', "/");
+        let path = path.strip_prefix("//?/").unwrap_or(&path);
+        let value = if path.starts_with('/') {
+            format!("file://{path}")
+        } else {
+            format!("file:///{path}")
+        };
+        return Ok(RemoteArgument {
+            value,
+            allow_file: true,
+        });
     }
     Ok(RemoteArgument {
         value: git.to_owned(),

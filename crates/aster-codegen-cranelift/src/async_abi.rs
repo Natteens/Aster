@@ -448,7 +448,7 @@ fn copy_scalar_array(
     if array.is_null() {
         return Err(BackendError::new("Parallel.ForEach received a null array"));
     }
-    if (array as usize) % std::mem::align_of::<aster_runtime::AsterArray>() != 0 {
+    if !(array as usize).is_multiple_of(std::mem::align_of::<aster_runtime::AsterArray>()) {
         return Err(BackendError::new(
             "Parallel.ForEach received a misaligned array header",
         ));

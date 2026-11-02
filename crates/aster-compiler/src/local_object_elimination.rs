@@ -892,11 +892,11 @@ fn rewrite_place(
     place: &mut mir::Place,
     fields: &HashMap<(mir::LocalId, mir::SymbolId), mir::LocalId>,
 ) {
-    if let mir::Place::ObjectField { object, field } = place {
-        if let Some(local) = direct_local(object).and_then(|object| fields.get(&(object, *field))) {
-            *place = mir::Place::Local(*local);
-            return;
-        }
+    if let mir::Place::ObjectField { object, field } = place
+        && let Some(local) = direct_local(object).and_then(|object| fields.get(&(object, *field)))
+    {
+        *place = mir::Place::Local(*local);
+        return;
     }
     match place {
         mir::Place::Field { base, .. } | mir::Place::EnumField { base, .. } => {
