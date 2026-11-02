@@ -58,6 +58,26 @@ pub(crate) unsafe fn view<'a>(string: *const AsterStrHeader) -> Option<&'a str> 
     std::str::from_utf8(bytes).ok()
 }
 
+/// Borrow the raw payload bytes behind a non-null ABI string pointer without
+/// validating them. Callers must only copy bytes of a string that an earlier
+/// [`view`] of the same, unmodified allocation already accepted.
+///
+/// # Safety
+///
+/// `string` must be non-null and point to a live, 8-byte-aligned allocation
+/// in the documented layout whose payload stays valid and unmodified for the
+/// returned lifetime.
+#[allow(unsafe_code)]
+unsafe fn payload_bytes<'a>(string: *const AsterStrHeader) -> &'a [u8] {
+    // SAFETY: the caller guarantees a readable header followed by `len`
+    // readable payload bytes.
+    unsafe {
+        let len = (*string).len;
+        let payload = string.cast::<u8>().add(size_of::<AsterStrHeader>());
+        std::slice::from_raw_parts(payload, len)
+    }
+}
+
 /// Copy the payload of an ABI string into host-owned memory.
 ///
 /// Returns `None` for a null pointer or invalid UTF-8. Callers use this to
@@ -386,24 +406,47 @@ fn string_join(
     // SAFETY: caller (generated code) provides `count` live pointers, as
     // documented above.
     let headers = unsafe { std::slice::from_raw_parts(parts, count) };
-    let mut views = Vec::new();
-    if views.try_reserve_exact(count).is_err() {
-        context.fail("string interpolation exceeds available host memory");
-        return ptr::null();
-    }
+    // Pass 1: validate every part before anything is allocated, summing the
+    // checked output length. An overflow is reported only after every part
+    // has validated, matching the order of the former two-step allocation.
+    let mut output_len = Some(0_usize);
     for &header in headers {
         // SAFETY: each pointer is owned by the live context or JIT module.
         let Some(text) = (unsafe { view(header) }) else {
             context.fail("string interpolation received an invalid UTF-8 string reference");
             return ptr::null();
         };
-        views.push(text);
+        output_len = output_len.and_then(|total| total.checked_add(text.len()));
     }
-    if temporary {
-        context.allocate_temporary_string_parts(&views)
-    } else {
-        context.allocate_string_parts(&views)
+    let Some(output_len) = output_len else {
+        context.fail("string concatenation exceeds the addressable range");
+        return ptr::null();
+    };
+    let output = context.allocate_string_storage(output_len, temporary);
+    if output.is_null() {
+        return ptr::null();
     }
+    // SAFETY: `output` owns `output_len` payload bytes freshly allocated by
+    // `allocate_string_storage`; this function fills them exactly once before
+    // publishing the string.
+    let destination = unsafe {
+        std::slice::from_raw_parts_mut(
+            output.cast::<u8>().add(size_of::<AsterStrHeader>()),
+            output_len,
+        )
+    };
+    // Pass 2: every part already validated as UTF-8 in pass 1, and ASTER
+    // strings are immutable, so copying the validated bytes verbatim yields
+    // valid UTF-8 without a second validation.
+    let mut cursor = 0;
+    for &header in headers {
+        // SAFETY: `header` was non-null and live in pass 1; the destination is
+        // a distinct fresh allocation, so nothing mutated the source payload.
+        let payload = unsafe { payload_bytes(header) };
+        destination[cursor..cursor + payload.len()].copy_from_slice(payload);
+        cursor += payload.len();
+    }
+    output
 }
 
 /// Return the number of Unicode scalar values in one immutable string.
@@ -1899,11 +1942,11 @@ mod tests {
     use super::{
         AsterStrHeader, aster_rt_string_concat, aster_rt_string_contains,
         aster_rt_string_ends_with, aster_rt_string_eq, aster_rt_string_from_double,
-        aster_rt_string_from_float, aster_rt_string_index_of, aster_rt_string_length,
-        aster_rt_string_replace, aster_rt_string_split, aster_rt_string_starts_with,
-        aster_rt_string_substring_from, aster_rt_string_substring_range,
-        aster_rt_string_substring_range_temporary, aster_rt_string_trim,
-        aster_rt_string_try_parse_bool, aster_rt_string_try_parse_byte,
+        aster_rt_string_from_float, aster_rt_string_index_of, aster_rt_string_join,
+        aster_rt_string_join_temporary, aster_rt_string_length, aster_rt_string_replace,
+        aster_rt_string_split, aster_rt_string_starts_with, aster_rt_string_substring_from,
+        aster_rt_string_substring_range, aster_rt_string_substring_range_temporary,
+        aster_rt_string_trim, aster_rt_string_try_parse_bool, aster_rt_string_try_parse_byte,
         aster_rt_string_try_parse_char, aster_rt_string_try_parse_double,
         aster_rt_string_try_parse_float, aster_rt_string_try_parse_int,
         aster_rt_string_try_parse_long, aster_rt_string_try_parse_short,
@@ -2850,5 +2893,240 @@ mod tests {
             let value = std::ptr::read_unaligned(destination_ptr.add(4).cast::<f32>());
             assert!((value - 2.5).abs() < f32::EPSILON);
         }
+    }
+
+    /// Counts host-heap allocations made by the current thread so a test can
+    /// assert that `string_join` itself no longer allocates host memory.
+    struct CountingAllocator;
+
+    thread_local! {
+        static HOST_ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn count_host_allocation() {
+        let _ = HOST_ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+    }
+
+    // SAFETY: every call is forwarded unchanged to the system allocator; the
+    // only addition is a thread-local counter increment that never allocates.
+    #[allow(unsafe_code)]
+    unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            count_host_allocation();
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
+            unsafe { std::alloc::System.dealloc(pointer, layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+            count_host_allocation();
+            unsafe { std::alloc::System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(
+            &self,
+            pointer: *mut u8,
+            layout: std::alloc::Layout,
+            size: usize,
+        ) -> *mut u8 {
+            count_host_allocation();
+            unsafe { std::alloc::System.realloc(pointer, layout, size) }
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING_ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    fn host_allocations() -> usize {
+        HOST_ALLOCATIONS.with(std::cell::Cell::get)
+    }
+
+    /// Join `parts` through the real ABI entry point.
+    fn join_text(
+        context: &mut ExecutionContext,
+        parts: &[&str],
+        temporary: bool,
+    ) -> Option<String> {
+        let buffers: Vec<Vec<u64>> = parts.iter().map(|part| aligned(part)).collect();
+        let pointers: Vec<*const AsterStrHeader> = buffers.iter().map(|b| pointer(b)).collect();
+        let count = i32::try_from(pointers.len()).expect("test part count fits i32");
+        let result = if temporary {
+            aster_rt_string_join_temporary(&raw mut *context, pointers.as_ptr(), count)
+        } else {
+            aster_rt_string_join(&raw mut *context, pointers.as_ptr(), count)
+        };
+        // SAFETY: a non-null result is owned by the live context.
+        #[allow(unsafe_code)]
+        unsafe { view(result) }.map(str::to_owned)
+    }
+
+    #[test]
+    fn join_concatenates_parts_in_order_for_both_regions() {
+        let cases: [&[&str]; 6] = [
+            &[],
+            &["only"],
+            &["item-", "alpha", "-beta"],
+            &["héllo ", "wörld ", "✓ 🙂"],
+            &["", "a", "", "bc", ""],
+            &["", "", ""],
+        ];
+        for parts in cases {
+            let expected = parts.concat();
+            let mut context = ExecutionContext::with_stats();
+            assert_eq!(
+                join_text(&mut context, parts, false),
+                Some(expected.clone()),
+                "{parts:?}"
+            );
+            aster_rt_temporary_scope_enter(&raw mut context);
+            assert_eq!(
+                join_text(&mut context, parts, true),
+                Some(expected),
+                "{parts:?}"
+            );
+            aster_rt_temporary_scope_leave(&raw mut context);
+            assert!(context.take_error().is_none());
+        }
+    }
+
+    #[test]
+    fn join_makes_exactly_one_string_allocation_in_the_selected_region() {
+        let mut context = ExecutionContext::with_stats();
+        assert_eq!(
+            join_text(&mut context, &["item-", "alpha", "-beta"], false).as_deref(),
+            Some("item-alpha-beta")
+        );
+        let stats = context.memory_stats();
+        assert_eq!((stats.total_allocations, stats.string_allocations), (1, 1));
+        assert_eq!(
+            stats.requested_bytes,
+            u64::try_from(size_of::<usize>() + "item-alpha-beta".len()).unwrap()
+        );
+        let persistent_used = stats.used_bytes;
+
+        aster_rt_temporary_scope_enter(&raw mut context);
+        assert_eq!(
+            join_text(&mut context, &["item-", "alpha", "-beta"], true).as_deref(),
+            Some("item-alpha-beta")
+        );
+        assert!(context.memory_stats().used_bytes > persistent_used);
+        aster_rt_temporary_scope_leave(&raw mut context);
+        assert_eq!(context.memory_stats().string_allocations, 2);
+        assert_eq!(context.memory_stats().used_bytes, persistent_used);
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    fn join_rejects_invalid_input_without_publishing_a_string() {
+        let valid_left = aligned("left");
+        let valid_right = aligned("right");
+        // Header says 2 bytes; the payload 0xC3 0x28 is not valid UTF-8.
+        let mut invalid = vec![0_u64; 2];
+        invalid[0] = 2;
+        #[allow(unsafe_code)]
+        unsafe {
+            let bytes = invalid.as_mut_ptr().cast::<u8>().add(size_of::<usize>());
+            bytes.write(0xC3);
+            bytes.add(1).write(0x28);
+        }
+        let invalid_pointer: *const AsterStrHeader = invalid.as_ptr().cast();
+        let message = "string interpolation received an invalid UTF-8 string reference";
+        for bad in [invalid_pointer, std::ptr::null()] {
+            let parts = [pointer(&valid_left), bad, pointer(&valid_right)];
+            for temporary in [false, true] {
+                let mut context = ExecutionContext::with_stats();
+                if temporary {
+                    aster_rt_temporary_scope_enter(&raw mut context);
+                }
+                let result = if temporary {
+                    aster_rt_string_join_temporary(&raw mut context, parts.as_ptr(), 3)
+                } else {
+                    aster_rt_string_join(&raw mut context, parts.as_ptr(), 3)
+                };
+                assert!(result.is_null());
+                assert_eq!(context.take_error().as_deref(), Some(message));
+                assert_eq!(context.memory_stats().total_allocations, 0);
+                assert_eq!(context.memory_stats().used_bytes, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn join_validates_every_part_before_checking_the_temporary_scope() {
+        let valid = aligned("ok");
+        let parts = [pointer(&valid), std::ptr::null()];
+        let mut context = ExecutionContext::with_stats();
+        assert!(aster_rt_string_join_temporary(&raw mut context, parts.as_ptr(), 2).is_null());
+        assert_eq!(
+            context.take_error().as_deref(),
+            Some("string interpolation received an invalid UTF-8 string reference")
+        );
+        let valid_parts = [pointer(&valid)];
+        assert!(
+            aster_rt_string_join_temporary(&raw mut context, valid_parts.as_ptr(), 1).is_null()
+        );
+        assert_eq!(
+            context.take_error().as_deref(),
+            Some("temporary string allocation requires an active temporary scope")
+        );
+        assert_eq!(context.memory_stats().total_allocations, 0);
+    }
+
+    #[test]
+    fn join_keeps_its_null_and_negative_count_contracts() {
+        let valid = aligned("ok");
+        let parts = [pointer(&valid)];
+        let mut context = ExecutionContext::with_stats();
+        assert!(aster_rt_string_join(std::ptr::null_mut(), parts.as_ptr(), 1).is_null());
+        assert!(aster_rt_string_join(&raw mut context, std::ptr::null(), 1).is_null());
+        assert!(aster_rt_string_join(&raw mut context, parts.as_ptr(), -1).is_null());
+        assert!(aster_rt_string_join_temporary(&raw mut context, parts.as_ptr(), -1).is_null());
+        assert!(context.take_error().is_none());
+        assert_eq!(context.memory_stats().total_allocations, 0);
+    }
+
+    #[test]
+    fn join_reports_allocation_failure_without_publishing_a_string() {
+        let large = "x".repeat(512 * 1024);
+        let source = aligned(&large);
+        let parts = [pointer(&source); 16];
+        let mut context = limited_context();
+        assert!(aster_rt_string_join(&raw mut context, parts.as_ptr(), 16).is_null());
+        assert!(context.take_error().is_some());
+        // The context stays usable after the controlled failure.
+        assert_eq!(
+            join_text(&mut context, &["a", "b"], false).as_deref(),
+            Some("ab")
+        );
+        assert!(context.take_error().is_none());
+    }
+
+    #[test]
+    fn join_makes_no_host_heap_allocation_once_the_arena_is_warm() {
+        let left = aligned("item-");
+        let middle = aligned("alpha");
+        let right = aligned("-beta");
+        let parts = [pointer(&left), pointer(&middle), pointer(&right)];
+        let mut context = ExecutionContext::with_stats();
+        aster_rt_temporary_scope_enter(&raw mut context);
+        for _ in 0..4 {
+            assert!(!aster_rt_string_join(&raw mut context, parts.as_ptr(), 3).is_null());
+            assert!(!aster_rt_string_join_temporary(&raw mut context, parts.as_ptr(), 3).is_null());
+        }
+        let before = host_allocations();
+        for _ in 0..16 {
+            assert!(!aster_rt_string_join(&raw mut context, parts.as_ptr(), 3).is_null());
+            assert!(!aster_rt_string_join_temporary(&raw mut context, parts.as_ptr(), 3).is_null());
+        }
+        let after = host_allocations();
+        aster_rt_temporary_scope_leave(&raw mut context);
+        assert_eq!(
+            after - before,
+            0,
+            "string_join must not allocate host memory"
+        );
+        assert!(context.take_error().is_none());
     }
 }
