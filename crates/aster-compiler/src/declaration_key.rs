@@ -19,10 +19,29 @@
 //! such as visibility, `static` and `async`, and generic parameter spellings
 //! (references to a type parameter are keyed by position).
 //!
-//! Keys are meant to be computed from a linked module, where type names are
-//! already canonical. Nothing in the compiler consumes them yet: incremental
-//! compilation will be their consumer, and this module only defines and tests
-//! the identity model.
+//! # Phase contract
+//!
+//! Source declaration keys are computed from the *linked, pre-monomorphization*
+//! AST: the module `project::link` produces (type names already canonical,
+//! generic templates still present) before `compile_module` runs
+//! `generics::monomorphize`. Three identities exist, one per phase:
+//!
+//! - [`DeclarationKey`]: stable identity of a source declaration, including a
+//!   generic template.
+//! - [`SpecializationKey`]: stable identity of a concrete specialization,
+//!   derived from the template's key and the ordered concrete type arguments,
+//!   never from generated names.
+//! - `SymbolId`: dense, ephemeral identity inside one compiled snapshot.
+//!
+//! Do not pass a monomorphized module (such as `Compilation::module`) to
+//! [`source_declaration_keys`]: the monomorphizer replaces templates with
+//! generated declarations, and generic-method specializations are named from
+//! the template's source offset, so keys of generated items move with
+//! unrelated edits. A uniqueness check over such output is possible but proves
+//! nothing about cross-edit stability.
+//!
+//! Nothing in the compiler consumes keys yet: incremental compilation will be
+//! their consumer, and this module only defines and tests the identity model.
 
 #![allow(dead_code, reason = "keys are defined ahead of their first consumer")]
 
@@ -274,18 +293,23 @@ impl SpecializationKey {
     }
 }
 
-/// Every declaration in `module` (including members, accessors, enum cases
-/// and their payload fields), in source order. The result is a set of
-/// identities: callers must not rely on the order.
-pub(crate) fn declaration_keys(module: &Module) -> Vec<DeclarationKey> {
+/// Source identities of every declaration in `module` (including members,
+/// accessors, enum cases and their payload fields), in source order. The
+/// result is a set of identities: callers must not rely on the order.
+///
+/// `module` must be the linked, **pre-monomorphization** module (see the
+/// module docs). Generic templates yield one key each (with their arity);
+/// their specializations are identified by [`SpecializationKey`], not by
+/// keys of generated items.
+pub(crate) fn source_declaration_keys(module: &Module) -> Vec<DeclarationKey> {
     let mut keys = Vec::new();
     for item in &module.items {
-        item_keys(item, &mut keys);
+        source_item_keys(item, &mut keys);
     }
     keys
 }
 
-pub(crate) fn item_keys(item: &Item, keys: &mut Vec<DeclarationKey>) {
+pub(crate) fn source_item_keys(item: &Item, keys: &mut Vec<DeclarationKey>) {
     match item {
         Item::Function(function) => {
             keys.push(callable_key(None, function, &[], DeclarationKind::Function));
@@ -428,14 +452,14 @@ fn enum_keys(declaration: &EnumDeclaration, keys: &mut Vec<DeclarationKey>) {
 mod tests {
     use aster_syntax::{Module, lex, parse};
 
-    use super::{DeclarationKey, DeclarationKind, declaration_keys};
+    use super::{DeclarationKey, DeclarationKind, source_declaration_keys};
 
     fn module(source: &str) -> Module {
         parse(lex(source).expect("lex")).expect("parse")
     }
 
     fn keys(source: &str) -> Vec<DeclarationKey> {
-        declaration_keys(&module(source))
+        source_declaration_keys(&module(source))
     }
 
     /// The single key of `kind` named `name` (optionally under `owner`).
@@ -681,8 +705,10 @@ mod tests {
         assert_ne!(pair_a, pair_b);
     }
 
+    /// Uniqueness only: this runs over post-monomorphization output, so it makes no
+    /// claim about cross-edit stability (see the phase contract in the module docs).
     #[test]
-    fn linked_keys_are_unique_across_every_compilable_example_project() {
+    fn post_monomorphization_keys_are_unique_across_every_compilable_example_project() {
         let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut files = Vec::new();
         collect_sources(&repository.join("examples"), &mut files);
@@ -694,17 +720,98 @@ mod tests {
             let Ok(compilation) = crate::compile_project(file) else {
                 continue;
             };
-            let all = declaration_keys(&compilation.compilation.module);
+            let all = source_declaration_keys(&compilation.compilation.module);
             let unique: std::collections::HashSet<_> = all.iter().collect();
             assert_eq!(
                 unique.len(),
                 all.len(),
-                "duplicate linked keys in {}",
+                "duplicate post-monomorphization keys in {}",
                 file.display()
             );
             linked += 1;
         }
         assert!(linked >= 5, "only {linked} example projects compiled");
+    }
+
+    // --- phase contract: source identity vs. monomorphized output -------------
+
+    const TOOLS: &str = "public class Tools { public Tools() {} public T Identity<T>(T value) { return value; } } \
+        public int Run() { Tools tools = new Tools(); int a = tools.Identity<int>(1); string s = tools.Identity<string>(\"x\"); return a + s.Length; }";
+    const EARLIER: &str = "public int Earlier() { return 0; } ";
+
+    /// Names of the generic-method specializations the monomorphizer generated.
+    fn generated_method_names(source: &str) -> Vec<String> {
+        let compilation = crate::compile(source).expect("valid generic method program");
+        let mut names: Vec<String> = compilation
+            .module
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                aster_syntax::Item::Class(class) => Some(&class.members),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|member| match member {
+                aster_syntax::Member::Method(method) if method.name.contains("#method#") => {
+                    Some(method.name.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn monomorphized_method_names_and_keys_move_with_unrelated_edits() {
+        // Why `source_declaration_keys` must never see post-monomorphization output:
+        // generated method names embed the template's source offset.
+        let before = generated_method_names(TOOLS);
+        let after = generated_method_names(&format!("{EARLIER}{TOOLS}"));
+        assert_eq!(before.len(), 2, "{before:?}");
+        assert_eq!(after.len(), 2, "{after:?}");
+        assert_ne!(
+            before, after,
+            "generated names should shift with span.start"
+        );
+
+        let keys_of = |source: &str| {
+            let module = crate::compile(source).expect("compiles").module;
+            source_declaration_keys(&module)
+        };
+        let before_keys = keys_of(TOOLS);
+        let after_keys = keys_of(&format!("{EARLIER}{TOOLS}"));
+        let generated = |keys: &[DeclarationKey]| -> Vec<DeclarationKey> {
+            keys.iter()
+                .filter(|key| key.name().contains("#method#"))
+                .cloned()
+                .collect()
+        };
+        assert_ne!(
+            generated(&before_keys),
+            generated(&after_keys),
+            "post-monomorphization keys are not stable identities"
+        );
+    }
+
+    #[test]
+    fn generic_method_template_and_specialization_keys_are_stable_before_monomorphization() {
+        use super::SpecializationKey;
+        let template_of = |source: &str| {
+            let all = keys(source);
+            find(&all, DeclarationKind::Method, Some("Tools"), "Identity")
+        };
+        let before = template_of(TOOLS);
+        let after = template_of(&format!("{EARLIER}{TOOLS}"));
+        assert_eq!(before, after);
+        assert_eq!(before.generic_arity(), 1);
+
+        let specialize = |template: &DeclarationKey, argument: &str| {
+            SpecializationKey::new(template.clone(), &[argument]).expect("well-formed argument")
+        };
+        assert_eq!(specialize(&before, "int"), specialize(&after, "int"));
+        assert_eq!(specialize(&before, "string"), specialize(&after, "string"));
+        assert_ne!(specialize(&before, "int"), specialize(&before, "string"));
     }
 
     // --- packages and multi-file projects -------------------------------------
@@ -730,7 +837,14 @@ mod tests {
         write("app/main.aster", main);
         write("lib/lib/Lib.aster", library);
         let compilation = crate::compile_project(&root.join("app/main.aster"));
-        let keys = declaration_keys(&compilation.expect("workspace compiles").compilation.module);
+        let keys =
+            source_declaration_keys(&compilation.expect("workspace compiles").compilation.module);
+        // The stability assertions below are only valid because these fixtures have no
+        // generics, so the monomorphized module equals the pre-monomorphization one.
+        assert!(
+            keys.iter().all(|key| !key.name().contains('#')),
+            "fixture must not generate declarations"
+        );
         let _ = std::fs::remove_dir_all(&root);
         keys
     }
@@ -831,7 +945,7 @@ mod tests {
             let Some(parsed) = lex(&source).ok().and_then(|tokens| parse(tokens).ok()) else {
                 continue;
             };
-            let all = declaration_keys(&parsed);
+            let all = source_declaration_keys(&parsed);
             let unique: std::collections::HashSet<_> = all.iter().collect();
             assert_eq!(
                 unique.len(),
