@@ -319,7 +319,12 @@ fn compile_project_on_dedicated_stack(
     let path = path.to_path_buf();
     let diagnostic_path = path.clone();
     run_on_compiler_stack(move || {
-        compile_project_with_standard_library_inner(&path, standard_library, include_tests)
+        compile_project_with_standard_library_inner(
+            &path,
+            standard_library,
+            include_tests,
+            &mut |_| {},
+        )
     })
     .map_err(|error| vec![plain_error(&diagnostic_path, error.to_string())])?
 }
@@ -329,6 +334,7 @@ fn compile_project_with_standard_library_inner(
     path: &Path,
     standard_library: StandardLibrary,
     include_tests: bool,
+    observe_linked: &mut dyn FnMut(&Module),
 ) -> Result<ProjectCompilation, Vec<ProjectDiagnostic>> {
     let root_path = absolute_path(path).map_err(|message| vec![plain_error(path, message)])?;
     if root_path.extension().and_then(|value| value.to_str()) != Some("aster") {
@@ -438,8 +444,7 @@ fn compile_project_with_standard_library_inner(
         loader.diagnostics.append(&mut link_diagnostics);
         return Err(loader.finish_diagnostics());
     }
-    #[cfg(test)]
-    record_linked_module_for_test(&loader.fallback_path, &module);
+    observe_linked(&module);
     let intrinsic_bindings = loader.standard_library.intrinsic_bindings();
     match compile_module(tokens, module, &intrinsic_bindings, true, true, true) {
         Ok(compilation) => {
@@ -2059,29 +2064,24 @@ impl AstVisitorMut for Rewriter<'_> {
     }
 }
 
-/// Test-only record of the linked, pre-monomorphization module of each project
-/// compiled in this process, keyed by its canonical root path. It lets tests
-/// inspect the exact module `compile_module` receives without exposing `link`.
+/// Test-only: compile `path` as a project and return the linked,
+/// pre-monomorphization module `compile_module` receives, observed through the
+/// inner pipeline's scoped observer. Nothing is retained after the call.
 #[cfg(test)]
-static LINKED_MODULES: std::sync::Mutex<std::collections::BTreeMap<PathBuf, Module>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
-
-#[cfg(test)]
-fn record_linked_module_for_test(root: &Path, module: &Module) {
-    LINKED_MODULES
-        .lock()
-        .expect("linked module record")
-        .insert(root.to_path_buf(), module.clone());
-}
-
-#[cfg(test)]
-pub(crate) fn linked_module_for_test(root: &Path) -> Option<Module> {
-    let key = absolute_path(root).ok()?;
-    LINKED_MODULES
-        .lock()
-        .expect("linked module record")
-        .get(&key)
-        .cloned()
+pub(crate) fn linked_module_for_test(path: &Path) -> Option<Module> {
+    let path = path.to_path_buf();
+    run_on_compiler_stack(move || {
+        let mut captured = None;
+        let _ = compile_project_with_standard_library_inner(
+            &path,
+            StandardLibrary::embedded(),
+            false,
+            &mut |module| captured = Some(module.clone()),
+        );
+        captured
+    })
+    .ok()
+    .flatten()
 }
 
 #[cfg(test)]
