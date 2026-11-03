@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 
 import { appendFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { readVersion } from "./bundle.mjs";
+import { git, remoteRef } from "./git-state.mjs";
 
 const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const SHA = /^[0-9a-f]{40}$/;
@@ -67,31 +67,6 @@ export function classifySemanticRelease({
         tag: `v${afterVersion}`,
         sha: headSha,
     };
-}
-
-function git(repositoryRoot, arguments_, { allowEmpty = false } = {}) {
-    const result = spawnSync("git", arguments_, {
-        cwd: repositoryRoot,
-        encoding: "utf8",
-    });
-    if (result.error) throw new Error(`git ${arguments_[0]} failed: ${result.error.message}`);
-    if (result.status !== 0) {
-        throw new Error(`git ${arguments_[0]} failed`);
-    }
-    const output = result.stdout.trim();
-    if (!allowEmpty && output.length === 0) {
-        throw new Error(`git ${arguments_[0]} returned no result`);
-    }
-    return output;
-}
-
-function remoteRef(repositoryRoot, ref) {
-    const output = git(repositoryRoot, ["ls-remote", "--refs", "origin", ref]);
-    const lines = output.split(/\r?\n/).filter(Boolean);
-    if (lines.length !== 1) throw new Error(`remote ref ${ref} is missing or ambiguous`);
-    const [sha, name] = lines[0].split(/\s+/);
-    if (name !== ref) throw new Error(`remote ref ${ref} returned an unexpected name`);
-    return sha;
 }
 
 export function inspectSemanticRelease(repositoryRoot, beforeVersion, beforeSha) {

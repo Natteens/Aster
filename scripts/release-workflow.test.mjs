@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const workflow = readFileSync(join(root, ".github", "workflows", "release.yml"), "utf8");
 const ci = readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8");
+const recovery = readFileSync(join(root, ".github", "workflows", "release-recovery.yml"), "utf8");
 const releaseConfig = readFileSync(join(root, "release.config.mjs"), "utf8");
 const releaseValidator = readFileSync(join(root, "scripts", "validate-release-ref.mjs"), "utf8");
 const packageManifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
@@ -94,7 +95,11 @@ test("main CI runs semantic-release after verification and directly calls M6F", 
     assert.match(ci, /github\.event_name == 'push'/);
     assert.match(ci, /github\.ref == 'refs\/heads\/main'/);
     assert.match(ci, /!contains\(github\.event\.head_commit\.message, '\[skip ci\]'\)/);
-    assert.match(ci, /run: npm run release/);
+    assert.match(
+        ci,
+        /node scripts\/run-semantic-release\.mjs\s+"\$\{\{ steps\.before\.outputs\.version \}\}"\s+"\$\{\{ steps\.before\.outputs\.sha \}\}"/,
+    );
+    assert.doesNotMatch(ci, /run: npm run release/);
     assert.match(ci, /^  release-pipeline:\s*$/m);
     assert.match(ci, /uses: \.\/\.github\/workflows\/release\.yml/);
     assert.match(ci, /if: needs\.semantic-release\.outputs\.released == 'true'/);
@@ -117,14 +122,15 @@ test("semantic-release owns version and tag but not the GitHub Release", () => {
 });
 
 test("every release-path action is official and pinned to its audited commit", () => {
-    const releasePath = `${ci}\n${workflow}`;
+    const releasePath = `${ci}\n${workflow}\n${recovery}`;
     const uses = [...releasePath.matchAll(/uses:\s+([^@\s]+)@([0-9a-f]+)(?:\s+#.*)?/g)];
     assert.ok(uses.length > 0);
     for (const [, name, revision] of uses) {
         assert.equal(actionPins.get(name), revision, `${name}@${revision}`);
         assert.match(revision, /^[0-9a-f]{40}$/);
     }
-    assert.equal((releasePath.match(/\buses:/g) ?? []).length, uses.length + 1);
+    // The only non-pinned `uses:` are the local reusable-release calls (CI and recovery).
+    assert.equal((releasePath.match(/\buses:/g) ?? []).length, uses.length + 2);
     assert.match(releasePath, /uses: \.\/\.github\/workflows\/release\.yml/);
 });
 
@@ -209,4 +215,21 @@ test("installers use the stable latest-release URL and target aliases", () => {
     }
     assert.match(windowsInstaller, /aster-windows-x64\.zip/);
     assert.match(linuxInstaller, /aster-linux-x64\.tar\.gz/);
+});
+
+test("semantic-release has no publish, success, or fail steps for the notes tolerance to skip", () => {
+    // run-semantic-release.mjs tolerates only a rejected notes push, which happens after the
+    // release commit and tag are pushed. That is safe only while no plugin has a publish,
+    // success, or fail step that the failed run would skip.
+    for (const forbidden of [
+        "@semantic-release/github",
+        "@semantic-release/npm",
+        "publishCmd",
+        "successCmd",
+        "failCmd",
+        "addChannelCmd",
+        "verifyReleaseCmd",
+    ]) {
+        assert.equal(releaseConfig.includes(forbidden), false, forbidden);
+    }
 });

@@ -57,17 +57,18 @@ export function detectBundleTarget() {
 }
 
 /** Read [workspace.package].version from Cargo.toml. */
-export function readVersion(cargoTomlPath) {
-    const content = readFileSync(cargoTomlPath, "utf8");
+export function parseWorkspaceVersion(content, label = "Cargo.toml") {
     const match = content.match(
         /\[workspace\.package\][\s\S]*?^\s*version\s*=\s*"([^"]+)"/m,
     );
     if (!match) {
-        throw new Error(
-            `Could not read [workspace.package].version from ${cargoTomlPath}`,
-        );
+        throw new Error(`Could not read [workspace.package].version from ${label}`);
     }
     return match[1];
+}
+
+export function readVersion(cargoTomlPath) {
+    return parseWorkspaceVersion(readFileSync(cargoTomlPath, "utf8"), cargoTomlPath);
 }
 
 /** Canonical bundle directory name, e.g. "aster-0.40.0-windows-x64". */
