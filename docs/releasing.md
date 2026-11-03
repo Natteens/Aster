@@ -85,3 +85,35 @@ npm run release:dry-run
 
 The dry run needs full Git history and repository access. It does not create a version commit, tag,
 or release. Do not run `npm run release` from a development machine.
+
+## Git Notes and interrupted releases
+
+semantic-release 25 records the channel of every tag in a per-tag Git Note ref,
+`refs/notes/semantic-release-v<version>`, and pushes it last, after the release commit and the
+tag. CI runs it through `scripts/run-semantic-release.mjs`, which tolerates exactly one failure:
+a rejected push of that one notes ref for the version that was just released. It does so only
+after the same checks the workflow runs next (`semantic-release-result.mjs`) prove that the
+release commit, the tag, and `main` agree, and it retries the push once. A tag without a note is
+read as the default channel, which is what a `main` release records, so later version
+calculation is unaffected. Any other error, including any other failed push, a second error, or
+a release that cannot be verified, fails the job unchanged. This is only valid while the release
+configuration has no publish, success, or fail steps for the tolerated failure to skip; a test
+enforces that.
+
+If a release commit and tag were created but the public GitHub Release was not, recover it with
+the **Release recovery** workflow (Actions, `workflow_dispatch`, from `main`) and the existing tag,
+for example `v0.67.0`. Recovery never calculates a version or creates a tag. It requires that:
+
+- the tag is a `vMAJOR.MINOR.PATCH` release tag and the local and remote tag objects agree;
+- `Cargo.toml` at the tag has exactly that version, and the tagged commit is the canonical
+  `chore(release): <version> [skip ci]` commit in the `origin/main` history;
+- the tag is the newest release tag, so another release cannot be substituted or re-marked as
+  latest;
+- no GitHub Release for the tag exists, so a published release is never overwritten.
+
+It then calls the same reusable release workflow as the automatic path with the exact tag commit,
+so the Linux and Windows builds, asset assembly, installer verification, and draft-then-publish
+steps all run before anything becomes public. Running the release workflow directly with
+`workflow_dispatch` still validates only and publishes nothing. A leftover draft release for the
+tag (not visible to the read-only check) makes the publish step fail closed; delete the draft
+first.

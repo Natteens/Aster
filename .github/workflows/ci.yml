@@ -107,7 +107,10 @@ jobs:
       - name: Calculate version, commit changelog, and create tag
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: npm run release
+        run: >-
+          node scripts/run-semantic-release.mjs
+          "${{ steps.before.outputs.version }}"
+          "${{ steps.before.outputs.sha }}"
 
       - name: Validate semantic-release result
         id: result
