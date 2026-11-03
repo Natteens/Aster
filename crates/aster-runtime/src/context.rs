@@ -58,6 +58,33 @@ pub const ASTER_ARRAY_LENGTH_OFFSET: usize = std::mem::offset_of!(AsterArray, le
 pub const EXECUTION_CONTEXT_ERROR_FLAG_OFFSET: usize =
     std::mem::offset_of!(ExecutionContext, error_flag);
 
+/// Copies one list element of `size` bytes. Behaves exactly like
+/// `ptr::copy_nonoverlapping(source, destination, size)`; the common element
+/// sizes use constant-length copies so they compile to plain moves instead of
+/// a runtime-sized `memcpy` call. Constant-length byte copies need no
+/// alignment beyond `u8`'s.
+///
+/// # Safety
+///
+/// Same contract as `ptr::copy_nonoverlapping`: `source` is readable and
+/// `destination` is writable for `size` bytes, and the ranges do not overlap.
+#[inline(always)]
+#[allow(unsafe_code, clippy::inline_always)] // must inline so constant sizes become plain moves
+unsafe fn copy_list_element(source: *const u8, destination: *mut u8, size: usize) {
+    // SAFETY: each arm copies at most `size` bytes (exactly `size` for the
+    // constant arms), covered by the caller's contract.
+    unsafe {
+        match size {
+            1 => ptr::copy_nonoverlapping(source, destination, 1),
+            2 => ptr::copy_nonoverlapping(source, destination, 2),
+            4 => ptr::copy_nonoverlapping(source, destination, 4),
+            8 => ptr::copy_nonoverlapping(source, destination, 8),
+            16 => ptr::copy_nonoverlapping(source, destination, 16),
+            _ => ptr::copy_nonoverlapping(source, destination, size),
+        }
+    }
+}
+
 fn array_allocation_layout(length: usize, element_size: usize) -> Option<(usize, usize, usize)> {
     let payload_bytes = checked_allocation_size(length, element_size)?;
     let data_offset = checked_align_up(size_of::<AsterArray>(), 8)?;
@@ -3091,7 +3118,7 @@ impl ExecutionContext {
         // duration of this call.
         #[allow(unsafe_code)]
         unsafe {
-            ptr::copy_nonoverlapping(
+            copy_list_element(
                 source,
                 data.add(offset),
                 usize::try_from(element_size).unwrap_or(0),
@@ -3193,7 +3220,7 @@ impl ExecutionContext {
         // duration of this call.
         #[allow(unsafe_code)]
         unsafe {
-            ptr::copy_nonoverlapping(
+            copy_list_element(
                 data.add(offset),
                 destination,
                 usize::try_from(element_size).unwrap_or(0),
@@ -3255,7 +3282,7 @@ impl ExecutionContext {
         // structural change, so the list version intentionally stays stable.
         #[allow(unsafe_code)]
         unsafe {
-            ptr::copy_nonoverlapping(
+            copy_list_element(
                 source,
                 data.add(offset),
                 usize::try_from(element_size).unwrap_or(0),
@@ -7489,6 +7516,129 @@ mod tests {
 
     fn source_address(value: &i32) -> *const u8 {
         (std::ptr::from_ref(value)).cast::<u8>()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn list_add_get_set_copy_exact_element_bytes_for_every_size_class() {
+        fn pattern(seed: usize, size: usize) -> Vec<u8> {
+            (0..size)
+                .map(|byte| u8::try_from((seed * 31 + byte * 7 + 1) % 251).expect("below 251"))
+                .collect()
+        }
+
+        // 1/2/4/8/16 take the fixed-size paths; 3 and 12 take the fallback.
+        for (size, align) in [
+            (1_i32, 1_i32),
+            (2, 2),
+            (4, 4),
+            (8, 8),
+            (16, 8),
+            (3, 1),
+            (12, 4),
+        ] {
+            let width = usize::try_from(size).expect("positive size");
+            let mut context = ExecutionContext::new();
+            let context_pointer = &raw mut context;
+            let list = aster_rt_list_new(context_pointer, size, align, 7);
+            // Six adds cross the first growth (capacity 4 -> 8).
+            for index in 0..6 {
+                let element = pattern(index, width);
+                assert_eq!(
+                    aster_rt_list_add(context_pointer, list, size, align, 7, element.as_ptr()),
+                    1
+                );
+            }
+            assert!(context.error.is_none(), "size {size}");
+            // SAFETY: `list` is a live, validated list owned by `context`.
+            #[allow(unsafe_code)]
+            unsafe {
+                assert_eq!((*list).length, 6);
+                assert_eq!((*list).version, 6);
+            }
+
+            // Get returns exactly `size` bytes and touches nothing beyond them.
+            for index in 0..6 {
+                let mut destination = vec![0xEE_u8; width + 8];
+                assert_eq!(
+                    aster_rt_list_get(
+                        context_pointer,
+                        list,
+                        size,
+                        align,
+                        7,
+                        i32::try_from(index).expect("small index"),
+                        destination.as_mut_ptr(),
+                    ),
+                    1
+                );
+                assert_eq!(
+                    &destination[..width],
+                    pattern(index, width).as_slice(),
+                    "size {size}"
+                );
+                assert!(
+                    destination[width..].iter().all(|byte| *byte == 0xEE),
+                    "size {size}"
+                );
+            }
+
+            // Set replaces exactly one element, leaves neighbours alone, and
+            // does not change the structural version.
+            let replacement = pattern(100, width);
+            assert_eq!(
+                aster_rt_list_set(
+                    context_pointer,
+                    list,
+                    size,
+                    align,
+                    7,
+                    2,
+                    replacement.as_ptr()
+                ),
+                1
+            );
+            for index in 0..6 {
+                let mut destination = vec![0u8; width];
+                aster_rt_list_get(
+                    context_pointer,
+                    list,
+                    size,
+                    align,
+                    7,
+                    i32::try_from(index).expect("small index"),
+                    destination.as_mut_ptr(),
+                );
+                let expected = if index == 2 {
+                    pattern(100, width)
+                } else {
+                    pattern(index, width)
+                };
+                assert_eq!(destination, expected, "size {size} index {index}");
+            }
+            // SAFETY: `list` is still live and unaliased.
+            #[allow(unsafe_code)]
+            unsafe {
+                assert_eq!((*list).version, 6, "Set must not be structural");
+            }
+
+            // A failing Get leaves the destination untouched.
+            let mut untouched = vec![0xAB_u8; width];
+            assert_eq!(
+                aster_rt_list_get(
+                    context_pointer,
+                    list,
+                    size,
+                    align,
+                    7,
+                    99,
+                    untouched.as_mut_ptr()
+                ),
+                0
+            );
+            assert!(untouched.iter().all(|byte| *byte == 0xAB));
+            assert!(context.take_error().is_some());
+        }
     }
 
     #[test]
