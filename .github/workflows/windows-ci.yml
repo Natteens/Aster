@@ -1,6 +1,9 @@
 name: Windows CI
 
 on:
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
   schedule:
     - cron: "0 6 * * 1"
@@ -15,8 +18,8 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
 
 concurrency:
-  group: windows-ci
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   verify:
