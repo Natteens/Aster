@@ -3,6 +3,7 @@
 mod application;
 mod array_loop_optimization;
 mod constexpr;
+mod declaration_key;
 mod escape_analysis;
 mod generics;
 mod git_source;
