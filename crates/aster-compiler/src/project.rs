@@ -438,6 +438,8 @@ fn compile_project_with_standard_library_inner(
         loader.diagnostics.append(&mut link_diagnostics);
         return Err(loader.finish_diagnostics());
     }
+    #[cfg(test)]
+    record_linked_module_for_test(&loader.fallback_path, &module);
     let intrinsic_bindings = loader.standard_library.intrinsic_bindings();
     match compile_module(tokens, module, &intrinsic_bindings, true, true, true) {
         Ok(compilation) => {
@@ -2055,6 +2057,31 @@ impl AstVisitorMut for Rewriter<'_> {
     fn visit_type_ref_mut(&mut self, type_ref: &mut TypeRef) {
         type_ref.name = self.rewrite_type_name(&type_ref.name, type_ref.span);
     }
+}
+
+/// Test-only record of the linked, pre-monomorphization module of each project
+/// compiled in this process, keyed by its canonical root path. It lets tests
+/// inspect the exact module `compile_module` receives without exposing `link`.
+#[cfg(test)]
+static LINKED_MODULES: std::sync::Mutex<std::collections::BTreeMap<PathBuf, Module>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+fn record_linked_module_for_test(root: &Path, module: &Module) {
+    LINKED_MODULES
+        .lock()
+        .expect("linked module record")
+        .insert(root.to_path_buf(), module.clone());
+}
+
+#[cfg(test)]
+pub(crate) fn linked_module_for_test(root: &Path) -> Option<Module> {
+    let key = absolute_path(root).ok()?;
+    LINKED_MODULES
+        .lock()
+        .expect("linked module record")
+        .get(&key)
+        .cloned()
 }
 
 #[cfg(test)]
