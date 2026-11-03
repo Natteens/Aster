@@ -673,7 +673,7 @@ impl Page {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ArenaMark {
     arena_id: u64,
-    mark_id: u64,
+    mark_depth: usize,
     active_pages: usize,
     cursor: usize,
     used_bytes: usize,
@@ -839,8 +839,7 @@ pub(crate) struct PagedArena {
     used_bytes: usize,
     reserved_bytes: usize,
     arena_id: u64,
-    next_mark_id: u64,
-    mark_stack: Vec<u64>,
+    active_mark_depth: usize,
     delayed_purge: Option<DelayedPurgeState>,
     #[cfg(feature = "aarm-telemetry")]
     telemetry: ArenaTelemetryState,
@@ -856,8 +855,7 @@ impl PagedArena {
             used_bytes: 0,
             reserved_bytes: 0,
             arena_id: next_arena_id(),
-            next_mark_id: 1,
-            mark_stack: Vec::new(),
+            active_mark_depth: 0,
             delayed_purge: None,
             #[cfg(feature = "aarm-telemetry")]
             telemetry: ArenaTelemetryState {
@@ -1338,12 +1336,11 @@ impl PagedArena {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn mark(&mut self) -> ArenaMark {
-        let mark_id = self.next_mark_id;
-        self.next_mark_id = self
-            .next_mark_id
+        let mark_depth = self
+            .active_mark_depth
             .checked_add(1)
-            .expect("arena mark id space exhausted");
-        self.mark_stack.push(mark_id);
+            .expect("arena mark depth overflow");
+        self.active_mark_depth = mark_depth;
 
         let cursor = if self.active_pages == 0 {
             0
@@ -1353,7 +1350,7 @@ impl PagedArena {
 
         ArenaMark {
             arena_id: self.arena_id,
-            mark_id,
+            mark_depth,
             active_pages: self.active_pages,
             cursor,
             used_bytes: self.used_bytes,
@@ -1385,7 +1382,7 @@ impl PagedArena {
         let old_active_pages = self.active_pages;
         let ArenaMark {
             arena_id,
-            mark_id,
+            mark_depth,
             active_pages,
             cursor,
             used_bytes,
@@ -1398,14 +1395,10 @@ impl PagedArena {
             "arena mark belongs to a different arena"
         );
 
-        let active_mark = self
-            .mark_stack
-            .last()
-            .copied()
-            .expect("arena has no active mark");
+        assert!(self.active_mark_depth > 0, "arena has no active mark");
 
         assert_eq!(
-            mark_id, active_mark,
+            mark_depth, self.active_mark_depth,
             "arena marks must be rewound in LIFO order"
         );
         assert!(
@@ -1453,13 +1446,7 @@ impl PagedArena {
             }
         }
 
-        let removed = self.mark_stack.pop();
-
-        assert_eq!(
-            removed,
-            Some(mark_id),
-            "arena mark stack changed during rewind"
-        );
+        self.active_mark_depth = mark_depth - 1;
 
         #[cfg(feature = "aarm-telemetry")]
         {
@@ -4759,6 +4746,59 @@ mod tests {
         let outer = arena.mark();
         let _inner = arena.mark();
         arena.rewind(outer);
+    }
+
+    #[test]
+    fn mark_depth_reuse_after_an_inner_mark_keeps_lifo_and_state_exact() {
+        let mut arena = PagedArena::new();
+        let a = arena.mark();
+        let a_value = arena.alloc(8, 8);
+        // SAFETY: `a_value` points to eight live arena-owned bytes.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::ptr::write(a_value as *mut u64, 0xA);
+        }
+        let used_after_a = arena.metrics().used_bytes;
+        assert_eq!(used_after_a, 8);
+
+        let b = arena.mark();
+        arena.alloc(64, 8);
+        assert!(arena.metrics().used_bytes > used_after_a);
+        arena.rewind(b);
+        assert_eq!(arena.metrics().used_bytes, used_after_a);
+
+        // `c` is taken at the nesting depth `b` just released.
+        let c = arena.mark();
+        arena.alloc(DEFAULT_PAGE_SIZE, 8);
+        arena.alloc(DEFAULT_PAGE_SIZE, 8);
+        assert!(arena.metrics().used_bytes > used_after_a);
+        arena.rewind(c);
+        assert_eq!(arena.metrics().used_bytes, used_after_a);
+
+        // SAFETY: `a_value` was allocated before every inner mark.
+        #[allow(unsafe_code)]
+        let value = unsafe { std::ptr::read(a_value as *const u64) };
+        assert_eq!(value, 0xA);
+
+        arena.rewind(a);
+        assert_eq!(arena.metrics().used_bytes, 0);
+
+        // The arena is fully reusable and a fresh outermost mark works.
+        let again = arena.mark();
+        arena.alloc(16, 8);
+        arena.rewind(again);
+        assert_eq!(arena.metrics().used_bytes, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "arena marks must be rewound in LIFO order")]
+    fn outer_mark_cannot_rewind_while_a_depth_reusing_inner_mark_is_active() {
+        let mut arena = PagedArena::new();
+        let a = arena.mark();
+        let b = arena.mark();
+        arena.rewind(b);
+        let _c = arena.mark();
+        arena.rewind(a);
     }
 
     #[test]
