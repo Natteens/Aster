@@ -101,6 +101,16 @@ construction, and return machinery to evaluate the operand once, continue on `Ok
 the enclosing `Result`'s `Error` — so Cranelift sees only concrete branches and enum data
 (`docs/reference/result-propagation.md`).
 
+### Source declaration identity (internal)
+
+Besides the dense, per-compilation `SymbolId`, `aster-compiler` has a structural identity for source
+declarations: `DeclarationKey` (`declaration_key.rs`), which excludes spans, paths, ordering and
+symbol ids. `SourceDeclarationIndex` (`source_declaration_index.rs`) maps those keys to snapshot-local
+locators in one module and can compare two indices by logical identity (added, removed, retained;
+retained does not mean unchanged). Both are computed from the linked, pre-monomorphization module,
+the same traversal defines which declarations exist, and neither is consumed by the compilation
+pipeline yet: semantic analysis, HIR, and MIR are unchanged.
+
 ### `aster-hir`
 
 Owns the backend-independent high-level intermediate representation. HIR removes source-only syntax,

@@ -293,6 +293,62 @@ impl SpecializationKey {
     }
 }
 
+/// Where a declaration lives inside the exact [`Module`] its key was collected
+/// from. This is snapshot-local data: inserting an unrelated declaration earlier
+/// shifts these indices, so a locator is never part of a [`DeclarationKey`] and
+/// must not be compared across modules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum DeclarationLocator {
+    /// `module.items[item]`.
+    Item(usize),
+    /// `module.items[item]`'s `members[member]`: a field, method, constructor
+    /// or property. A property's getter and setter share the property's
+    /// member; the key's kind tells them apart.
+    Member { item: usize, member: usize },
+    /// `cases[case]` of the enum at `module.items[item]`.
+    EnumCase { item: usize, case: usize },
+    /// `cases[case].fields[field]` of the enum at `module.items[item]`.
+    EnumCaseField {
+        item: usize,
+        case: usize,
+        field: usize,
+    },
+}
+
+/// One declaration found by the shared source traversal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeyedDeclaration {
+    pub(crate) key: DeclarationKey,
+    pub(crate) locator: DeclarationLocator,
+}
+
+fn push(
+    out: &mut Vec<KeyedDeclaration>,
+    key: DeclarationKey,
+    locator: DeclarationLocator,
+) -> DeclarationKey {
+    out.push(KeyedDeclaration {
+        key: key.clone(),
+        locator,
+    });
+    key
+}
+
+/// The single traversal that defines which declarations exist in `module` and
+/// what their keys are, in source order, each with its snapshot-local locator.
+/// [`source_declaration_keys`] and the source declaration index are both views
+/// of this walk.
+///
+/// `module` must be the linked, **pre-monomorphization** module (see the
+/// module docs).
+pub(crate) fn collect_source_declarations(module: &Module) -> Vec<KeyedDeclaration> {
+    let mut out = Vec::new();
+    for (index, item) in module.items.iter().enumerate() {
+        collect_item(item, index, &mut out);
+    }
+    out
+}
+
 /// Source identities of every declaration in `module` (including members,
 /// accessors, enum cases and their payload fields), in source order. The
 /// result is a set of identities: callers must not rely on the order.
@@ -302,23 +358,31 @@ impl SpecializationKey {
 /// their specializations are identified by [`SpecializationKey`], not by
 /// keys of generated items.
 pub(crate) fn source_declaration_keys(module: &Module) -> Vec<DeclarationKey> {
-    let mut keys = Vec::new();
-    for item in &module.items {
-        source_item_keys(item, &mut keys);
-    }
-    keys
+    collect_source_declarations(module)
+        .into_iter()
+        .map(|declaration| declaration.key)
+        .collect()
 }
 
-pub(crate) fn source_item_keys(item: &Item, keys: &mut Vec<DeclarationKey>) {
+fn collect_item(item: &Item, index: usize, out: &mut Vec<KeyedDeclaration>) {
+    let here = DeclarationLocator::Item(index);
     match item {
         Item::Function(function) => {
-            keys.push(callable_key(None, function, &[], DeclarationKind::Function));
+            push(
+                out,
+                callable_key(None, function, &[], DeclarationKind::Function),
+                here,
+            );
         }
-        Item::Variable(variable) => keys.push(variable_key(variable)),
-        Item::Class(declaration) => type_keys(declaration, DeclarationKind::Class, keys),
-        Item::Struct(declaration) => type_keys(declaration, DeclarationKind::Struct, keys),
-        Item::Interface(declaration) => type_keys(declaration, DeclarationKind::Interface, keys),
-        Item::Enum(declaration) => enum_keys(declaration, keys),
+        Item::Variable(variable) => {
+            push(out, variable_key(variable), here);
+        }
+        Item::Class(declaration) => type_keys(declaration, DeclarationKind::Class, index, out),
+        Item::Struct(declaration) => type_keys(declaration, DeclarationKind::Struct, index, out),
+        Item::Interface(declaration) => {
+            type_keys(declaration, DeclarationKind::Interface, index, out);
+        }
+        Item::Enum(declaration) => enum_keys(declaration, index, out),
     }
 }
 
@@ -367,83 +431,101 @@ fn variable_key(variable: &VariableDeclaration) -> DeclarationKey {
     DeclarationKey::new(None, DeclarationKind::Variable, &variable.name, 0, None)
 }
 
-fn type_keys(declaration: &TypeDeclaration, kind: DeclarationKind, keys: &mut Vec<DeclarationKey>) {
-    let owner = DeclarationKey::new(
-        None,
-        kind,
-        &declaration.name,
-        declaration.type_parameters.len(),
-        None,
+fn type_keys(
+    declaration: &TypeDeclaration,
+    kind: DeclarationKind,
+    item: usize,
+    out: &mut Vec<KeyedDeclaration>,
+) {
+    let owner = push(
+        out,
+        DeclarationKey::new(
+            None,
+            kind,
+            &declaration.name,
+            declaration.type_parameters.len(),
+            None,
+        ),
+        DeclarationLocator::Item(item),
     );
     let owner_parameters = parameter_names(&declaration.type_parameters);
-    keys.push(owner.clone());
-    for member in &declaration.members {
+    for (index, member) in declaration.members.iter().enumerate() {
+        let at = DeclarationLocator::Member {
+            item,
+            member: index,
+        };
         match member {
-            Member::Field(field) => keys.push(DeclarationKey::new(
-                Some(&owner),
-                DeclarationKind::Field,
-                &field.name,
-                0,
-                None,
-            )),
-            Member::Method(method) => keys.push(callable_key(
-                Some(&owner),
-                method,
-                &owner_parameters,
-                DeclarationKind::Method,
-            )),
-            Member::Property(property) => {
-                keys.push(DeclarationKey::new(
-                    Some(&owner),
-                    DeclarationKind::Property,
-                    &property.name,
-                    0,
-                    None,
-                ));
-                if property.getter.is_some() {
-                    keys.push(DeclarationKey::new(
+            Member::Field(field) => {
+                push(
+                    out,
+                    DeclarationKey::new(Some(&owner), DeclarationKind::Field, &field.name, 0, None),
+                    at,
+                );
+            }
+            Member::Method(method) => {
+                push(
+                    out,
+                    callable_key(
                         Some(&owner),
-                        DeclarationKind::Getter,
-                        &property.name,
-                        0,
-                        None,
-                    ));
+                        method,
+                        &owner_parameters,
+                        DeclarationKind::Method,
+                    ),
+                    at,
+                );
+            }
+            Member::Property(property) => {
+                let property_key =
+                    |kind| DeclarationKey::new(Some(&owner), kind, &property.name, 0, None);
+                push(out, property_key(DeclarationKind::Property), at);
+                if property.getter.is_some() {
+                    push(out, property_key(DeclarationKind::Getter), at);
                 }
                 if property.setter.is_some() {
-                    keys.push(DeclarationKey::new(
-                        Some(&owner),
-                        DeclarationKind::Setter,
-                        &property.name,
-                        0,
-                        None,
-                    ));
+                    push(out, property_key(DeclarationKind::Setter), at);
                 }
             }
         }
     }
 }
 
-fn enum_keys(declaration: &EnumDeclaration, keys: &mut Vec<DeclarationKey>) {
-    let owner = DeclarationKey::new(
-        None,
-        DeclarationKind::Enum,
-        &declaration.name,
-        declaration.type_parameters.len(),
-        None,
+fn enum_keys(declaration: &EnumDeclaration, item: usize, out: &mut Vec<KeyedDeclaration>) {
+    let owner = push(
+        out,
+        DeclarationKey::new(
+            None,
+            DeclarationKind::Enum,
+            &declaration.name,
+            declaration.type_parameters.len(),
+            None,
+        ),
+        DeclarationLocator::Item(item),
     );
-    keys.push(owner.clone());
-    for case in &declaration.cases {
-        let case_key =
-            DeclarationKey::new(Some(&owner), DeclarationKind::EnumCase, &case.name, 0, None);
-        keys.push(case_key.clone());
-        for field in &case.fields {
-            keys.push(DeclarationKey::new(
-                Some(&case_key),
-                DeclarationKind::EnumCaseField,
-                &field.name,
-                0,
-                None,
-            ));
+    for (case_index, case) in declaration.cases.iter().enumerate() {
+        let case_key = push(
+            out,
+            DeclarationKey::new(Some(&owner), DeclarationKind::EnumCase, &case.name, 0, None),
+            DeclarationLocator::EnumCase {
+                item,
+                case: case_index,
+            },
+        );
+        for (field_index, field) in case.fields.iter().enumerate() {
+            push(
+                out,
+                DeclarationKey::new(
+                    Some(&case_key),
+                    DeclarationKind::EnumCaseField,
+                    &field.name,
+                    0,
+                    None,
+                ),
+                DeclarationLocator::EnumCaseField {
+                    item,
+                    case: case_index,
+                    field: field_index,
+                },
+            );
         }
     }
 }

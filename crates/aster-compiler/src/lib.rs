@@ -19,6 +19,7 @@ mod owned_regions;
 mod primitives;
 mod project;
 mod semantic;
+mod source_declaration_index;
 mod standard_library;
 mod temporary_subregions;
 mod type_names;
