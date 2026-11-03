@@ -2893,6 +2893,8 @@ impl ExecutionContext {
     /// # Safety
     ///
     /// `list` must be non-null and point to a header this runtime allocated.
+    #[inline(always)] // runs on every list operation; a call here costs more than the checks
+    #[allow(clippy::inline_always)]
     fn validate_list_header(&mut self, list: *const AsterList) -> bool {
         // SAFETY: caller guarantees `list` is non-null and runtime-owned;
         // every field is read once, transiently, into locals below.
@@ -7814,6 +7816,43 @@ mod tests {
                 .take_error()
                 .is_some_and(|error| error.contains("length greater than"))
         );
+    }
+
+    #[test]
+    fn list_add_rejects_each_remaining_corrupt_header_shape() {
+        type Corrupt = fn(&mut AsterList);
+        let cases: [(&str, Corrupt); 4] = [
+            ("negative capacity", |list| list.capacity = -1),
+            ("zero element size", |list| list.element_size = 0),
+            ("non-power-of-two element alignment", |list| {
+                list.element_align = 3;
+            }),
+            ("data pointer despite zero capacity", |list| {
+                list.data = ptr::NonNull::<u8>::dangling().as_ptr();
+            }),
+        ];
+        for (expected, corrupt) in cases {
+            let mut context = ExecutionContext::new();
+            let context_pointer = &raw mut context;
+            let list = aster_rt_list_new(context_pointer, 4, 4, 1);
+            // SAFETY: `list` was just allocated above; this simulates a
+            // corrupted header and the operation must reject it before use.
+            #[allow(unsafe_code)]
+            unsafe {
+                corrupt(&mut *list);
+            }
+            let value = 1_i32;
+            assert_eq!(
+                aster_rt_list_add(context_pointer, list, 4, 4, 1, source_address(&value)),
+                0
+            );
+            assert!(
+                context
+                    .take_error()
+                    .is_some_and(|error| error.contains(expected)),
+                "{expected}"
+            );
+        }
     }
 
     #[test]
