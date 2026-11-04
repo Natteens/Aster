@@ -317,3 +317,6 @@ compiler-proven last use; ambiguous, shared, contained, interface, and cyclic fa
 until that invocation ends. Interface values borrow those object references and
 their JIT-owned tables; they cannot outlive the invocation. Inheritance, finalization and a
 general source-visible/AOT ownership model remain deliberately undecided.
+
+The [core readiness audit](core-readiness-audit.md) is a point-in-time snapshot of verified capabilities,
+confirmed defects, and the stabilization backlog for the language core.
