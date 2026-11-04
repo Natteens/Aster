@@ -48,6 +48,42 @@ An integer without a suffix is `int` when it fits and otherwise `long`. A value 
 | `D` or `d` | `double` |
 | `M` or `m` | reserved `decimal` syntax; rejected by the language-surface gate |
 
+### Hexadecimal and binary integer literals
+
+An integer literal may be written with a `0x`/`0X` (hexadecimal) or `0b`/`0B` (binary) prefix and the
+same integer suffixes (`U`, `L`, `UL`, `LU`, any case). The literal is a non-negative value; a sign is
+the separate unary operator. The type follows the C# order for unsuffixed literals, so a bit pattern
+keeps its width:
+
+| Written | Type |
+| --- | --- |
+| no suffix | the first of `int`, `uint`, `long`, `ulong` that holds the value |
+| `U` or `u` | `uint` when it fits, otherwise `ulong` (as for decimal literals) |
+| `L` or `l` | `long`; a value above `9223372036854775807` is an error (there is no fallback to `ulong`, unlike C#) |
+| `UL`, `LU` and mixed-case equivalents | `ulong` |
+
+| Literal | Type | Value |
+| --- | --- | --- |
+| `0x7FFFFFFF` | `int` | 2147483647 |
+| `0x80000000` | `uint` | 2147483648 |
+| `0xFFFFFFFF` | `uint` | 4294967295 |
+| `0x100000000` | `long` | 4294967296 |
+| `0x7FFFFFFFFFFFFFFF` | `long` | 9223372036854775807 |
+| `0x8000000000000000` | `ulong` | 9223372036854775808 |
+| `0xFFFFFFFFFFFFFFFF` | `ulong` | 18446744073709551615 |
+
+A value above `ulong` is rejected. Binary literals follow the same table (`0b` followed by 32 ones is
+`uint`). Unsuffixed decimal literals keep the stricter rule above, so `4294967295` is a `long` while
+`0xFFFFFFFF` is a `uint`.
+
+These literals add no conversion rule: the integer-constant conversion and the implicit-conversion
+table apply as for any literal (`byte b = 0xFF;` is valid, `int i = 0x80000000;` is not because the
+constant does not fit `int`). Unary minus does not negate an unsigned literal, so `-0x80000000` is
+rejected; write `(int)0x80000000` (an explicit constant cast wraps) for `-2147483648` and
+`(long)0x8000000000000000` for the smallest `long`. `uint` combined with `int` promotes to `long`, so
+`0xFFFFFFFF | 1` is a `long`; write `0xFFFFFFFF | 1U` to stay unsigned. Digit separators are not
+implemented.
+
 A decimal-point literal without a suffix is currently `float`. This differs from C# and is
 kept for compatibility with existing ASTER source. Floating literals that parse as infinity
 because they exceed their type's finite range are rejected rather than rounded silently to

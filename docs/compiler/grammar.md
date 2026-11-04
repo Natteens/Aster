@@ -139,11 +139,17 @@ enum-value          = named-type , "." , identifier , [ arguments ] ;
 assignment-op       = "=" | "+=" | "-=" | "*=" | "/=" | "&=" | "|=" | "^="
                     | "<<=" | ">>=" | ">>>=" ;
 literal             = integer , [ "L" | "l" | "U" | "u" | unsigned-long-suffix ]
+                    | prefixed-integer
                     | ( integer | float ) , ( "f" | "F" | "d" | "D" )
                     | ( integer | float ) , ( "m" | "M" )
                     | float | string | character | "true" | "false" ;
 unsigned-long-suffix = ( "U" | "u" ) , ( "L" | "l" )
                      | ( "L" | "l" ) , ( "U" | "u" ) ;
+prefixed-integer     = ( "0x" | "0X" ) , hex-digit , { hex-digit } , [ integer-suffix ]
+                     | ( "0b" | "0B" ) , bin-digit , { bin-digit } , [ integer-suffix ] ;
+integer-suffix       = "L" | "l" | "U" | "u" | unsigned-long-suffix ;
+hex-digit            = "0".."9" | "a".."f" | "A".."F" ;
+bin-digit            = "0" | "1" ;  (* the value must fit ulong; see the type specification *)
 
 type                = element-type , { "[" , "]" } | "void" ;
 element-type        = "bool" | "sbyte" | "byte" | "short" | "ushort"

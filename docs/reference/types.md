@@ -58,7 +58,8 @@ decimal price = 19.95m;
 Only conversions that preserve every possible source value are implicit. Narrowing, sign changes,
 and precision-losing conversions require an explicit cast such as `(byte)value`. See the exact
 tables and overflow policy in the [type specification](../specification/02-types.md). Integers also
-support the [bitwise and shift operators](operators.md).
+support the [bitwise and shift operators](operators.md) and can be written in decimal, hexadecimal
+(`0xFF`), or binary (`0b1010`).
 
 ## 🧩 What is not primitive
 

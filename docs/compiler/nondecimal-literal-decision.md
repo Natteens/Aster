@@ -1,14 +1,15 @@
 # Decision record: hexadecimal and binary integer literals
 
-**Status: PROPOSED — awaiting maintainer approval.** Nothing in this record is implemented. Every
-ASTER snippet below that uses a `0x` or `0b` literal is *proposed syntax* and is not currently
-executable: today `0xFF` lexes as the integer `0` followed by the identifier `xFF` and is a syntax
-error. Approving this record does not change the language; it authorizes the implementation in
-section 11.
+**Status: ACCEPTED and implemented.** The maintainer delegated the decision and approved D1–D7 as
+proposed. The literals described below work through the whole pipeline; sections 1 and 2 describe the
+situation before the change (at the proposal baseline). The canonical behavior now lives in the
+[lexical structure](../specification/01-lexical-structure.md) and
+[type](../specification/02-types.md#hexadecimal-and-binary-integer-literals) specifications. As built,
+the change is confined to the lexer exactly as section 11 describes; no other layer changed.
 
 | | |
 | --- | --- |
-| Baseline | `da7944784a19533e77a38459ff19a86ef4a1a480`, release 0.68.0 |
+| Proposal baseline | `da7944784a19533e77a38459ff19a86ef4a1a480`, release 0.68.0 |
 | Origin | D9 of the [bitwise and shift decision](bitwise-shift-decision.md): masks are written in decimal today |
 | Related | [lexical structure](../specification/01-lexical-structure.md), [types](../specification/02-types.md), [grammar](grammar.md), [operators](../reference/operators.md), [compatibility policy](../reference/compatibility.md) |
 | C# references | [Integral numeric types, integer literals](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/builtin-types/integral-numeric-types), [C# language specification, lexical structure](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/lexical-structure) |
@@ -21,7 +22,7 @@ only write them in decimal: the SplitMix64 constants are `13787848793156543929UL
 literals are the obvious notation for these values, they are familiar from C#, and they cost nothing
 at run time.
 
-## 2. Current behavior (authority: the repository)
+## 2. Behavior before this change (at the proposal baseline)
 
 - **Lexer** (`crates/aster-syntax/src/lexer.rs`, `number`): scans decimal digits, an optional
   fractional part, and one suffix, then emits one of `IntegerLiteral`, `LongLiteral` (`L`),
@@ -111,7 +112,7 @@ unsigned type: `0x80000000` is `uint`.
 Decimal literals keep their stricter rule. Consequently, `4294967295` is a `long` while
 `0xFFFFFFFF` is a `uint`; this is an intentional, documented asymmetry.
 
-### Boundary values (all proposed)
+### Boundary values
 
 | Hexadecimal | Binary | Type | Value |
 | --- | --- | --- | --- |
@@ -136,7 +137,6 @@ integer-constant conversion (a constant that fits converts to a narrower or diff
 target) and the exact implicit-conversion table apply unchanged.
 
 ```aster
-// All of the following are PROPOSED and not currently executable.
 int mask = 0xFF;                  // int 255
 int flags = 0b1010;               // int 10
 byte low = 0xFF;                  // int constant 255 fits byte
@@ -188,7 +188,7 @@ them as their own task.
 
 All are lexical errors with a source span; the lexer then continues after the literal.
 
-| Situation | Example | Message (proposed) | Span |
+| Situation | Example | Message | Span |
 | --- | --- | --- | --- |
 | No digits after the prefix | `0x`, `0b`, `0x;` | `hexadecimal literal has no digits` / `binary literal has no digits` | the prefix |
 | Invalid digit | `0b102`, `0xG1`, `0b1F` | ``invalid digit `2` in binary literal`` | the offending character |
@@ -219,7 +219,7 @@ Differences from C#, all deliberate:
 4. Digit separators are deferred (section 8).
 5. Decimal unsuffixed literals keep the ASTER rule, so decimal and prefixed typing differ.
 
-## 11. Future implementation path
+## 11. Implementation (as built)
 
 The smallest complete change is confined to the lexer; no type-promotion table is added or changed.
 
@@ -252,9 +252,11 @@ Focused tests for that change:
   value, bit-pattern casts, interaction with `& | ^ ~ << >>`, constant versus runtime parity, and the
   SplitMix64 constants written in hexadecimal producing the same `Random` sequence.
 
-## 12. Decisions requested
+## 12. Decisions
 
-| ID | Question | Recommendation |
+The maintainer approved D1–D7 as recommended below.
+
+| ID | Question | Outcome |
 | --- | --- | --- |
 | D1 | Accept `0x`/`0X` and `0b`/`0B` with the digit sets above | Yes |
 | D2 | Unsuffixed prefixed literals follow the C# order `int`, `uint`, `long`, `ulong` | Yes |
@@ -269,3 +271,13 @@ Focused tests for that change:
 This record does not add digit separators, octal literals, hexadecimal floating-point literals,
 exponents, an `unchecked` operator, or constant adaptation, and it does not change decimal literal
 typing, numeric promotion, the implicit-conversion table, or any existing diagnostic.
+
+## 14. Known limitations found during implementation
+
+- Passing an `int` literal (decimal or prefixed) as the argument of a `ulong` or `uint` parameter,
+  for example `F(0)` where `F(ulong seed)`, makes the compiler panic with "validated call is missing
+  lowering metadata". It is independent of this feature (a decimal `F(123)` fails the same way) and is
+  not changed here; use an exactly typed argument such as `F(0UL)`.
+- A `ulong` operand does not join an `int` literal even when the value is small
+  (`0xFFFFFFFFFFFFFFFF ^ 0xFF` is rejected); write `0xFFUL`. This is the existing absence of constant
+  adaptation (decision D7).

@@ -349,6 +349,13 @@ impl Lexer<'_> {
     }
 
     fn number(&mut self, start: usize) {
+        if self.source.as_bytes()[start] == b'0'
+            && self.cursor == start + 1
+            && matches!(self.peek(), Some('x' | 'X' | 'b' | 'B'))
+        {
+            self.prefixed_number(start);
+            return;
+        }
         while self.peek().is_some_and(|c| c.is_ascii_digit()) {
             self.bump();
         }
@@ -409,6 +416,97 @@ impl Lexer<'_> {
             }
             _ if is_float => TokenKind::FloatLiteral(text),
             _ => TokenKind::IntegerLiteral(text),
+        };
+        self.token(kind, start);
+    }
+
+    /// A hexadecimal (`0x`) or binary (`0b`) integer literal. The cursor is on the
+    /// prefix letter. The literal is validated here and then emitted as one of
+    /// the existing integer token kinds with its value rendered as decimal text,
+    /// so semantic analysis, constant evaluation, HIR, MIR, and the backend never
+    /// see a radix. Unsuffixed literals take the first of `int`, `uint`, `long`,
+    /// `ulong` that holds the value; suffixes keep their decimal-literal meaning.
+    fn prefixed_number(&mut self, start: usize) {
+        let marker = self.bump().expect("the prefix letter was peeked");
+        let (radix, name) = if matches!(marker, 'x' | 'X') {
+            (16, "hexadecimal")
+        } else {
+            (2, "binary")
+        };
+        let digits_start = self.cursor;
+        while self.peek().is_some_and(|c| c.is_ascii_alphanumeric()) {
+            self.bump();
+        }
+        let run = self.source[digits_start..self.cursor].to_owned();
+        let digit_count = run
+            .chars()
+            .take_while(|character| character.is_digit(radix))
+            .count();
+        let (digits, suffix) = run.split_at(digit_count);
+        if digits.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!("{name} literal has no digits"),
+                    Span::new(start, digits_start),
+                )
+                .with_help(format!("write at least one digit after `0{marker}`")),
+            );
+            return;
+        }
+        let suffix_start = digits_start + digit_count;
+        let suffix_kind = match suffix.to_ascii_lowercase().as_str() {
+            "" => None,
+            "u" => Some(TokenKind::UIntLiteral as fn(String) -> TokenKind),
+            "l" => Some(TokenKind::LongLiteral as fn(String) -> TokenKind),
+            "ul" | "lu" => Some(TokenKind::ULongLiteral as fn(String) -> TokenKind),
+            _ => {
+                let first = suffix.chars().next().expect("a non-empty suffix");
+                if matches!(first, 'u' | 'U' | 'l' | 'L') {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            format!("invalid integer literal suffix `{suffix}`"),
+                            Span::new(suffix_start, self.cursor),
+                        )
+                        .with_help("the valid suffixes are `U`, `L`, `UL`, and `LU`"),
+                    );
+                } else {
+                    let mut diagnostic = Diagnostic::error(
+                        format!("invalid digit `{first}` in {name} literal"),
+                        Span::new(suffix_start, suffix_start + first.len_utf8()),
+                    );
+                    if matches!(first, 'f' | 'F' | 'd' | 'D' | 'm' | 'M') {
+                        diagnostic = diagnostic.with_help(
+                            "the `f`, `d`, and `m` suffixes apply only to decimal literals",
+                        );
+                    }
+                    self.diagnostics.push(diagnostic);
+                }
+                return;
+            }
+        };
+        let mut value: u128 = 0;
+        for digit in digits.chars() {
+            value = value * u128::from(radix) + u128::from(digit.to_digit(radix).expect("a digit"));
+            if value > u128::from(u64::MAX) {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!("{name} literal exceeds the range of `ulong`"),
+                        Span::new(start, self.cursor),
+                    )
+                    .with_help("the largest prefixed literal is 64 bits wide"),
+                );
+                return;
+            }
+        }
+        let text = value.to_string();
+        let kind = match suffix_kind {
+            Some(constructor) => constructor(text),
+            None if value <= u128::from(i32::MAX.cast_unsigned()) => {
+                TokenKind::IntegerLiteral(text)
+            }
+            None if value <= u128::from(u32::MAX) => TokenKind::UIntLiteral(text),
+            None if value <= u128::from(i64::MAX.cast_unsigned()) => TokenKind::LongLiteral(text),
+            None => TokenKind::ULongLiteral(text),
         };
         self.token(kind, start);
     }

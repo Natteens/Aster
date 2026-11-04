@@ -1,9 +1,10 @@
-// Bitwise and shift operators: a small ability-flags program.
+// Bitwise and shift operators with binary and hexadecimal literals: a small
+// ability-flags program.
 // Run with: aster run examples/bitwise_flags.aster
 
-const int CAN_JUMP = 1;
-const int CAN_RUN = 2;
-const int CAN_ATTACK = 4;
+const int CAN_JUMP = 0b001;
+const int CAN_RUN = 0b010;
+const int CAN_ATTACK = 0b100;
 
 public bool Has(int abilities, int flag)
 {
@@ -30,10 +31,14 @@ public class Program
         ushort low = 7;
         uint packed = ((uint)high << 16) | low;
         uint unpackedHigh = packed >> 16;
-        uint unpackedLow = packed & 65535U;
+        uint unpackedLow = packed & 0xFFFFU;
         Log("packed=" + packed.ToString()
             + " high=" + unpackedHigh.ToString()
             + " low=" + unpackedLow.ToString());
+
+        // A hexadecimal literal above int is a uint or ulong, so a bit pattern keeps its width.
+        uint highBit = 0x80000000;
+        Log("high bit=" + highBit.ToString() + " as int=" + ((int)highBit).ToString());
 
         // Arithmetic versus logical right shift on a negative value.
         int negative = -8;

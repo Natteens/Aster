@@ -36,11 +36,19 @@ bool enabled = true;
 - Implemented numeric literals use decimal digits, optionally followed by the suffixes
   `L`/`l`, `U`/`u`, `UL`/`LU` in either case, `F`/`f`, `D`/`d`, or `M`/`m`. Floating-point
   and decimal literals may contain one decimal point followed by digits.
+- Integer literals may also be hexadecimal (`0x`/`0X` followed by `0-9`, `a-f`, `A-F`) or binary
+  (`0b`/`0B` followed by `0` or `1`), optionally followed by `U`, `L`, `UL`, or `LU` in either case.
+  The `f`, `d`, and `m` suffixes do not apply to them. The prefix is recognized only when the
+  literal is exactly `0` followed immediately by the prefix letter. A prefixed literal must have at
+  least one digit and its value must fit `ulong`; otherwise the lexer reports a controlled error
+  (empty prefix, invalid digit, malformed suffix, or value out of range). The type rules are in
+  [types](02-types.md#literals).
 - Proposed strings use double quotes and proposed character literals use single quotes.
 - Punctuation includes `(){}[]`, `,`, `.`, `:`, and `;`; operators are defined with
   expressions rather than silently inferred here.
 
-Hexadecimal/binary notation, exponents and digit separators are not implemented.
+Exponents, octal notation, hexadecimal floating-point literals, and digit separators are not
+implemented.
 
 ## Valid design examples
 
@@ -64,7 +72,7 @@ int player-count = 1;  // `-` separates tokens; it is not part of an identifier
 - **OPEN QUESTION:** Are identifiers normalized to a Unicode normalization form?
 - **OPEN QUESTION:** Are block comments supported, and may they nest?
 - **OPEN QUESTION:** Which escape sequences and raw-string forms exist?
-- **OPEN QUESTION:** What syntax will hexadecimal, binary, exponent, and digit-separator
-  forms use? Decimal numeric suffixes are already defined in `02-types.md`.
+- **OPEN QUESTION:** What syntax will exponent and digit-separator forms use? Decimal numeric
+  suffixes and hexadecimal/binary integer literals are defined in `02-types.md`.
 - **OPEN QUESTION:** Are newlines ever syntactically significant?
 - **OPEN QUESTION:** Is a byte-order mark accepted at the beginning of a file?
