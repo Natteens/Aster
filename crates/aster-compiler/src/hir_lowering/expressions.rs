@@ -1,5 +1,6 @@
 use super::types::{
     binary_type, conditional_type, constant_expression, convert, literal_value, promoted,
+    unary_promoted,
 };
 use super::{Lowerer, ast, hir};
 
@@ -31,7 +32,21 @@ impl Lowerer<'_> {
                 Work::Combine(operator) => {
                     let mut right = values.pop().expect("binary right operand was lowered");
                     let mut left = values.pop().expect("binary left operand was lowered");
-                    if let Some(promoted) = promoted(&left.type_, &right.type_) {
+                    if matches!(
+                        operator,
+                        ast::BinaryOperator::ShiftLeft
+                            | ast::BinaryOperator::ShiftRight
+                            | ast::BinaryOperator::UnsignedShiftRight
+                    ) {
+                        // Only the left operand is promoted. The count is converted to
+                        // the same type: widening or reinterpreting an `int` preserves
+                        // the low bits that the shift masks, so negative counts keep
+                        // their specified meaning while both MIR operands share a type.
+                        if let Some(promoted) = unary_promoted(&left.type_) {
+                            left = convert(left, &promoted);
+                            right = convert(right, &promoted);
+                        }
+                    } else if let Some(promoted) = promoted(&left.type_, &right.type_) {
                         left = convert(left, &promoted);
                         right = convert(right, &promoted);
                     }
@@ -1103,7 +1118,12 @@ impl Lowerer<'_> {
                         )),
                     };
                 }
-                let operand = self.expression(operand);
+                let mut operand = self.expression(operand);
+                if *operator == ast::UnaryOperator::BitwiseNot
+                    && let Some(promoted) = unary_promoted(&operand.type_)
+                {
+                    operand = convert(operand, &promoted);
+                }
                 let type_ = operand.type_.clone();
                 hir::Expression {
                     type_,
@@ -1508,7 +1528,12 @@ macro_rules! convert_operator {
     };
 }
 
-convert_operator!(unary, ast::UnaryOperator, hir::UnaryOperator, [Not, Negate]);
+convert_operator!(
+    unary,
+    ast::UnaryOperator,
+    hir::UnaryOperator,
+    [Not, Negate, BitwiseNot]
+);
 convert_operator!(
     increment,
     ast::IncrementOperator,
@@ -1532,7 +1557,13 @@ convert_operator!(
         Equal,
         NotEqual,
         LogicalAnd,
-        LogicalOr
+        LogicalOr,
+        BitwiseAnd,
+        BitwiseOr,
+        BitwiseXor,
+        ShiftLeft,
+        ShiftRight,
+        UnsignedShiftRight
     ]
 );
 convert_operator!(
@@ -1544,6 +1575,12 @@ convert_operator!(
         AddAssign,
         SubtractAssign,
         MultiplyAssign,
-        DivideAssign
+        DivideAssign,
+        BitwiseAndAssign,
+        BitwiseOrAssign,
+        BitwiseXorAssign,
+        ShiftLeftAssign,
+        ShiftRightAssign,
+        UnsignedShiftRightAssign
     ]
 );

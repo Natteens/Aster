@@ -121,6 +121,34 @@ long amount = 1000L;
 value += amount; // invalid: the operation produces long and would narrow to byte
 ```
 
+## Bitwise and shift operators
+
+Integers support `&`, `|`, `^`, unary `~`, `<<`, `>>`, and `>>>`; `bool` supports eager `&`, `|`, and
+`^`. See the [operators reference](../reference/operators.md) for examples.
+
+- **`&`, `|`, `^`** on integers use the binary promotion table above: both operands convert to the
+  common type, which is also the result type. `byte & byte` is `int`, `int | uint` is `long`, and
+  `ulong` with a signed integer has no common type and is rejected.
+- **`~`** applies unary promotion: `sbyte`, `byte`, `short`, and `ushort` become `int`; `int`, `uint`,
+  `long`, and `ulong` keep their type.
+- **Shifts** apply unary promotion to the left operand only; the result has that type. The count must
+  implicitly convert to `int` (`sbyte`, `byte`, `short`, `ushort`, `int`); `uint`, `long`, `ulong`,
+  and non-integer counts are rejected. The effective count is `count & 31` when the promoted left
+  operand is 32-bit and `count & 63` when it is 64-bit, so negative counts and counts at or above the
+  width wrap. `<<` fills with zeros, `>>` is arithmetic for signed and logical for unsigned operands,
+  and `>>>` is always logical (on a signed operand it reinterprets the bits and keeps the signed type).
+- **`bool`**: `&`, `|`, and `^` evaluate both operands, left to right; `^` equals `!=`. They are
+  distinct from the short-circuiting `&&` and `||`.
+- `float`, `double`, `decimal`, `string`, and `char` operands are rejected. Mixed `bool` and integer
+  operands are rejected.
+- These operations never overflow and never fail at runtime. Constant expressions evaluate them with
+  the same truncating semantics and report no overflow diagnostic.
+
+Compound forms `&=`, `|=`, `^=`, `<<=`, `>>=`, and `>>>=` follow the compound-assignment rule above:
+the operation type (the promoted left type for shifts) must equal the target type, so
+`byte b |= 1;` is rejected and `b = (byte)(b | 1);` is written instead. This is an intentional
+difference from C#, as is the rejection of `char` operands.
+
 ## Explicit casts
 
 Numeric casts use `(type)expression`. Integer narrowing keeps the low two's-complement bits.
@@ -138,7 +166,8 @@ continues to reject hand-built or adulterated decimal MIR as a fail-closed invar
 ## ⚠️ Overflow and division
 
 - Runtime integer addition, subtraction, multiplication and explicit narrowing wrap at the
-  operation or target width in both debug and release builds.
+  operation or target width in both debug and release builds. Bitwise and shift operations cannot
+  overflow.
 - Constant integer arithmetic is checked; overflow is a compile-time error. This intentional
   difference prevents an overflowing value from becoming part of a constant declaration.
 - Unsigned comparisons, division and remainder use unsigned semantics.

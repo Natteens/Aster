@@ -324,5 +324,9 @@ confirmed defects, and the stabilization backlog for the language core.
 For how the official library is organized and when an API needs compiler support, see the
 [standard library extension contract](standard-library-extension.md).
 
-Bitwise and shift operators are not implemented; the proposed semantics are recorded in the
-[bitwise and shift operator decision record](bitwise-shift-decision.md) (status: proposed).
+Bitwise and shift operators are implemented through the whole pipeline. They reuse the central
+numeric promotion in `aster-types` (`promote` and `promote_unary`), the parser recognizes right shifts
+from adjacent `>` tokens so nested generics are unaffected, and shifts and complement only reach
+Cranelift on 32- and 64-bit integers, where they become single native instructions. The
+[bitwise and shift operator decision record](bitwise-shift-decision.md) (status: accepted) records
+the reasoning and the layer responsibilities.

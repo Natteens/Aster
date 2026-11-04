@@ -197,6 +197,12 @@ pub(super) fn promoted(left: &hir::Type, right: &hir::Type) -> Option<hir::Type>
     primitives::promote(left, right).map(primitives::to_hir)
 }
 
+/// The type of an integer operand of unary `~` or the left operand of a shift,
+/// from the central table: small integers become `int`.
+pub(super) fn unary_promoted(type_: &hir::Type) -> Option<hir::Type> {
+    primitives::promote_unary(primitives::of_hir(type_)?).map(primitives::to_hir)
+}
+
 pub(super) fn binary_type(
     operator: ast::BinaryOperator,
     left: &hir::Type,

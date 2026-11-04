@@ -23,8 +23,8 @@ work that is not implemented.
 - 🚪 [Application entry points](reference/application-entry.md)
 - 🗂️ [Namespaces and `using`](reference/namespaces.md)
 - 📦 [Packages and path/Git dependencies](reference/packages.md)
-- 🔤 [Primitive types](reference/types.md), [strings](reference/strings.md), and
-  [arrays](reference/arrays.md)
+- 🔤 [Primitive types](reference/types.md), [bitwise and shift operators](reference/operators.md),
+  [strings](reference/strings.md), and [arrays](reference/arrays.md)
 - 📦 [`List<T>` and `Dictionary<K,V>`](reference/collections.md)
 - 🧱 [Classes](reference/classes.md), [structs](reference/structs.md), and
   [interfaces](reference/interfaces.md)

@@ -23,11 +23,17 @@ int result = calculate(10, 20);
   the operator is right-associative. Its precedence sits between assignment (lower) and `||`
   (higher).
 - `&&` and `||` short-circuit.
+- The bitwise operators `&`, `|`, `^`, unary `~`, and the shifts `<<`, `>>`, `>>>` are implemented
+  with C# precedence and semantics (see [types](02-types.md#bitwise-and-shift-operators)). `&`, `|`,
+  and `^` on `bool` operands are eager: both operands are evaluated, left to right. `a & b == 0`
+  parses as `a & (b == 0)`, as in C#.
+- `>>` and `>>>` are recognized from directly adjacent `>` characters in operator position only, so
+  nested generic arguments such as `List<List<int>>` are unaffected; `a > > b` is not a shift.
 - `==` and `!=` compare scalar and string values, comparable structs field by field, arrays and
   classes by reference identity, and interfaces by the identity of their underlying object.
-- Implemented precedence, lowest to highest: assignment, `?:`, `||`, `&&`, equality,
-  comparison, additive, multiplicative, unary (`!`, unary `-`, prefix `++`/`--`), postfix
-  (member access, call, postfix `++`/`--`).
+- Implemented precedence, lowest to highest: assignment, `?:`, `||`, `&&`, `|`, `^`, `&`, equality,
+  comparison, shift (`<<`, `>>`, `>>>`), additive, multiplicative, unary (`!`, unary `-`, `~`,
+  prefix `++`/`--`), postfix (member access, call, postfix `++`/`--`).
 - Calls evaluate the receiver and then argument expressions left to right in source order. Named
   arguments map those already-evaluated values into parameter positions.
 - Empty `[]` and target-typed `new()` use one exact expected type from an explicit initializer,
@@ -45,7 +51,8 @@ int result = calculate(10, 20);
 - Assignment requires a writable place expression on the left.
 - Proposed arithmetic operators are `+`, `-`, `*`, `/`, and `%`.
 - Proposed comparison operators are `==`, `!=`, `<`, `<=`, `>`, and `>=`.
-- Proposed compound assignments include `+=`, `-=`, `*=`, `/=`, and `%=`.
+- Implemented compound assignments are `+=`, `-=`, `*=`, `/=`, `&=`, `|=`, `^=`, `<<=`, `>>=`, and
+  `>>>=`. `%=` is only proposed and is not parsed.
 - No implicit truthiness is proposed; conditions require `bool`.
 
 ## Valid design examples

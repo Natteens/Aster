@@ -100,6 +100,10 @@ impl Lexer<'_> {
                 self.token(TokenKind::FatArrow, start);
             }
             '=' => self.two_character(start, '=', TokenKind::EqualEqual, TokenKind::Equal),
+            '<' if self.peek() == Some('<') => {
+                self.bump();
+                self.two_character(start, '=', TokenKind::LessLessEqual, TokenKind::LessLess);
+            }
             '<' => self.two_character(start, '=', TokenKind::LessEqual, TokenKind::Less),
             '>' => self.two_character(start, '=', TokenKind::GreaterEqual, TokenKind::Greater),
             '&' if self.peek() == Some('&') => {
@@ -110,15 +114,10 @@ impl Lexer<'_> {
                 self.bump();
                 self.token(TokenKind::OrOr, start);
             }
-            '&' | '|' => self.diagnostics.push(
-                Diagnostic::error(
-                    format!("unexpected operator `{character}`"),
-                    Span::new(start, self.cursor),
-                )
-                .with_help(format!(
-                    "use `{character}{character}` for a logical operator"
-                )),
-            ),
+            '&' => self.two_character(start, '=', TokenKind::AmpersandEqual, TokenKind::Ampersand),
+            '|' => self.two_character(start, '=', TokenKind::PipeEqual, TokenKind::Pipe),
+            '^' => self.two_character(start, '=', TokenKind::CaretEqual, TokenKind::Caret),
+            '~' => self.token(TokenKind::Tilde, start),
             _ => self.diagnostics.push(Diagnostic::error(
                 format!("unexpected character `{character}`"),
                 Span::new(start, self.cursor),

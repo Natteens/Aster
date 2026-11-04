@@ -1164,6 +1164,7 @@ fn validate_typed_instruction(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_typed_rvalue(
     value: &mir::Rvalue,
     function_name: &str,
@@ -1206,6 +1207,27 @@ fn validate_typed_rvalue(
                 )))
             }
         }
+        mir::RvalueKind::Unary {
+            operator: mir::UnaryOperator::BitwiseNot,
+            operand: input,
+        } => {
+            operand(input)?;
+            // Complement only reaches the backend on 32- and 64-bit integers:
+            // narrower operands are promoted first, and no 8- or 16-bit shape
+            // may be emitted.
+            if !is_wide_integer(&input.type_) {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` has a bitwise complement of unsupported type `{}`",
+                    type_name(&input.type_)
+                )));
+            }
+            ensure_same_type(
+                &value.type_,
+                &input.type_,
+                function_name,
+                "complement result",
+            )
+        }
         mir::RvalueKind::ListLength(input)
         | mir::RvalueKind::DictionaryLength(input)
         | mir::RvalueKind::StringByteLength(input)
@@ -1221,6 +1243,7 @@ fn validate_typed_rvalue(
             operand(left)?;
             operand(right)?;
             ensure_same_type(&left.type_, &right.type_, function_name, "binary operands")?;
+            validate_bitwise_operands(*operator, &left.type_, function_name)?;
             let expected = if matches!(
                 operator,
                 mir::BinaryOperator::Less
@@ -1254,6 +1277,52 @@ fn validate_typed_rvalue(
                 "equality result",
             )
         }
+    }
+}
+
+fn is_wide_integer(type_: &mir::Type) -> bool {
+    matches!(
+        type_,
+        mir::Type::Int | mir::Type::UInt | mir::Type::Long | mir::Type::ULong
+    )
+}
+
+/// Fail-closed operand check for the bitwise and shift operators. Shifts are
+/// only ever generated for 32- and 64-bit integers, so no 8- or 16-bit shape can
+/// reach code generation; bitwise `&`, `|`, `^` also accept `bool`.
+fn validate_bitwise_operands(
+    operator: mir::BinaryOperator,
+    operand_type: &mir::Type,
+    function_name: &str,
+) -> Result<(), BackendError> {
+    let valid = match operator {
+        mir::BinaryOperator::BitwiseAnd
+        | mir::BinaryOperator::BitwiseOr
+        | mir::BinaryOperator::BitwiseXor => {
+            *operand_type == mir::Type::Bool || integer_width_of(operand_type).is_some()
+        }
+        mir::BinaryOperator::ShiftLeft
+        | mir::BinaryOperator::ShiftRight
+        | mir::BinaryOperator::UnsignedShiftRight => is_wide_integer(operand_type),
+        _ => return Ok(()),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(BackendError::new(format!(
+            "function `{function_name}` has a bitwise or shift operation on unsupported type `{}`",
+            type_name(operand_type)
+        )))
+    }
+}
+
+fn integer_width_of(type_: &mir::Type) -> Option<u16> {
+    match type_ {
+        mir::Type::SByte | mir::Type::Byte => Some(8),
+        mir::Type::Short | mir::Type::UShort => Some(16),
+        mir::Type::Int | mir::Type::UInt => Some(32),
+        mir::Type::Long | mir::Type::ULong => Some(64),
+        _ => None,
     }
 }
 
@@ -5865,6 +5934,95 @@ mod tests {
             )
             .expect_err("reference or aggregate division must be rejected");
             assert!(error.message().contains("unsupported operand type"));
+        }
+    }
+
+    /// Rewrites every local and operand of `Read` to `type_`, producing the MIR
+    /// a buggy front end could emit for a shift or complement of a narrow type.
+    fn retyped_module(source: &str, type_: &mir::Type) -> mir::Module {
+        let mut module = aster_compiler::compile(source)
+            .expect("validation source compiles")
+            .mir;
+        let function = module
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Read")
+            .expect("Read exists");
+        function.return_type = type_.clone();
+        for local in function
+            .parameters
+            .iter_mut()
+            .chain(function.locals.iter_mut())
+        {
+            local.type_ = type_.clone();
+        }
+        for block in &mut function.blocks {
+            for instruction in &mut block.instructions {
+                if let mir::Instruction::Assign { value, .. } = instruction {
+                    value.type_ = type_.clone();
+                    match &mut value.kind {
+                        mir::RvalueKind::Binary { left, right, .. } => {
+                            left.type_ = type_.clone();
+                            right.type_ = type_.clone();
+                        }
+                        mir::RvalueKind::Unary { operand, .. } => operand.type_ = type_.clone(),
+                        _ => {}
+                    }
+                }
+            }
+            if let mir::Terminator::Return(Some(value)) = &mut block.terminator {
+                value.type_ = type_.clone();
+            }
+        }
+        module
+    }
+
+    #[test]
+    fn shifts_and_complement_of_narrow_or_non_integer_operands_are_rejected() {
+        let shapes = [
+            ("public int Read(int a, int b) { return a << b; }", "<<"),
+            ("public int Read(int a, int b) { return a >> b; }", ">>"),
+            ("public int Read(int a, int b) { return a >>> b; }", ">>>"),
+            ("public int Read(int a) { return ~a; }", "~"),
+        ];
+        for (source, operator) in shapes {
+            // The unmodified 32-bit shape is accepted.
+            validate_module(&aster_compiler::compile(source).expect("compiles").mir)
+                .unwrap_or_else(|error| panic!("{operator} on int must validate: {error}"));
+            for type_ in [
+                mir::Type::SByte,
+                mir::Type::Byte,
+                mir::Type::Short,
+                mir::Type::UShort,
+                mir::Type::Bool,
+                mir::Type::Float,
+                mir::Type::Double,
+            ] {
+                let module = retyped_module(source, &type_);
+                let error = validate_module(&module)
+                    .expect_err("a narrow or non-integer shift or complement must be rejected");
+                assert!(
+                    error.message().contains("unsupported type")
+                        || error.message().contains("require integer operands"),
+                    "{operator} on {type_:?}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bitwise_and_or_xor_reject_floating_point_and_reference_operands() {
+        for operator in ["&", "|", "^"] {
+            let source = format!("public int Read(int a, int b) {{ return a {operator} b; }}");
+            validate_module(&aster_compiler::compile(&source).expect("compiles").mir)
+                .expect("int operands validate");
+            for type_ in [mir::Type::Float, mir::Type::Double, mir::Type::String] {
+                let module = retyped_module(&source, &type_);
+                assert!(
+                    validate_module(&module).is_err(),
+                    "{operator} on {type_:?} must be rejected"
+                );
+            }
         }
     }
 
