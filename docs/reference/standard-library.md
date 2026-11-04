@@ -16,7 +16,7 @@ intrinsics still resolve through official `aster.*` symbols rather than text or 
 - `aster.math` provides [practical scalar math](math.md), including constants, classification,
   logarithms, trigonometry, and interpolation.
 - `aster.random` provides the explicitly seeded, cross-platform deterministic
-  [`Random`](random.md) generator.
+  [`Random`](random.md) generator, plus `Random.FromEntropy()` for an OS-seeded one.
 - `aster.time` provides operation-scoped [monotonic and Unix clock reads](time.md).
 - `aster.text` provides ordinal immutable-text helpers documented with [strings](strings.md).
 - `aster.collections` defines the official

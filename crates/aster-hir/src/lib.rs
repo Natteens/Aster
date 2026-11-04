@@ -92,6 +92,7 @@ pub enum Intrinsic {
     /// `SplitMix64`'s fixed, target-independent output mixer. State evolution
     /// remains ordinary standard-library source.
     RandomMix,
+    RandomEntropySeed,
     /// `aster.io.Write(string)`: emits its argument's UTF-8 bytes verbatim.
     ConsoleWrite,
     /// `aster.io.WriteLine(string)`: like `ConsoleWrite`, plus a trailing LF.

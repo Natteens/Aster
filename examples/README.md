@@ -92,6 +92,7 @@ The remaining programs isolate narrower behavior:
 
 - `arrays`, `array_initialized`, and `array_structs` cover allocation and value cases.
 - `integer_widths`, `numeric_types`, and `expressions` exercise numeric rules and evaluation order.
+- `random_game` shows seeded and `Random.FromEntropy()` generators and random work in parallel tasks.
 - `bitwise_flags` shows `&`, `|`, `^`, `~`, and the shift operators with a flags and packing example.
 - `classes_counter`, `class_composition`, `properties_and_equality`, and `structs` show
   value/reference combinations.

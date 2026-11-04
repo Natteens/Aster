@@ -202,33 +202,36 @@ Other ordinary code:
 | Controlled runtime errors | `__CollectionRangeError`, `__AbsIntOverflow`, `__AssertionTrue` | Entry into the runtime error channel; there is no source-level `throw` |
 | Math | `aster.math.__MathUnaryFloat`, `__MathPowDouble` | Floating-point library routines provided by the runtime |
 | Random mixing | `aster.random.__RandomMix` | See below |
+| Entropy seed | `aster.random.__RandomEntropySeed` | A host read of operating-system entropy, used once per `Random.FromEntropy()` |
 
 `aster.random.__RandomMix` implements the SplitMix64 finalizer. It became an intrinsic because the
 language originally had no bitwise or shift operators. The language now has them (see the
 [bitwise and shift decision record](bitwise-shift-decision.md)) and the function is expressible in
-ASTER and verified against the intrinsic, but `Random` has not been migrated yet, so the intrinsic
-and its binding remain until that separate change lands.
+ASTER and verified against the intrinsic, but a controlled benchmark measured the ASTER version about
+1.8 times slower on the `NextULong` and `NextUInt` hot paths, so the intrinsic is kept on
+performance grounds (condition 5 of the extension rule, backed by a measurement).
 
 ## 5. Intrinsic inventory
 
 ### Registered bindings
 
-`StandardLibrary::intrinsic_bindings` registers **44** entries at this commit, grouped by module.
+`StandardLibrary::intrinsic_bindings` registers **45** entries at this commit, grouped by module.
 Verify the count by listing the `"aster.<module>::<name>"` keys in
-`crates/aster-compiler/src/standard_library.rs`; the older readiness audit's "about 44" matches.
+`crates/aster-compiler/src/standard_library.rs`; the older readiness audit's "about 44" predates the entropy seed.
 
 | Group | Bindings | Count | Classification |
 | --- | --- | --- | --- |
 | Host effects: terminal | `aster.io::Write`, `WriteLine`, `ReadLine` | 3 | Inherently runtime-backed |
 | Host effects: filesystem | `aster.io::ReadAllText`, `WriteAllText`, `AppendAllText`, `ListFiles`, `ListDirectories`, `FileExists`, `DirectoryExists`, `CreateDirectory`, `DeleteFile`, `DeleteDirectory` | 10 | Inherently runtime-backed |
 | Host effects: clock | `aster.time::__MonotonicMilliseconds`, `__UnixMilliseconds` | 2 | Inherently runtime-backed |
+| Host effects: entropy | `aster.random::__RandomEntropySeed` | 1 | Inherently runtime-backed (OS entropy) |
 | Controlled runtime errors | `aster.math::__AbsIntOverflow`, `__AbsLongOverflow`, `__ClampInvalidRange`, `__MathSignNaN`; `aster.collections::__CollectionRangeError`; `aster.random::__RandomInvalidRange`; `aster.testing::__AssertionTrue`, `__AssertionFalse` | 8 | Inherently runtime-backed (error channel) |
 | Assertion with message | `aster.testing::__AssertionEqual` | 1 | Inherently runtime-backed (error channel with expected and actual text) |
 | Math operations | `aster.math::__MathUnaryFloat`, `__MathUnaryDouble`, `__MathBinaryFloat`, `__MathBinaryDouble`, `__MathPredicateFloat`, `__MathPredicateDouble`, `__MathPowFloat`, `__MathPowDouble` | 8 | Runtime-backed (floating-point library routines) |
-| Random | `aster.random::__RandomMix` | 1 | Now expressible in ASTER (migration pending); kept until `Random` is migrated |
+| Random | `aster.random::__RandomMix` | 1 | Expressible in ASTER with the bitwise operators, but measured about 1.8 times slower on the `NextULong`/`NextUInt` hot paths, so it is kept |
 | Text operations | `aster.text::__Trim`, `__TrimStart`, `__TrimEnd`, `__LastIndexOf`, `__Replace`, `__Split`, `__Repeat`, `__JoinArray`, `__ConcatArray`, `__ToChars`, `__FromChars` | 11 | Mixed; see below |
 
-(3 + 10 + 2 + 8 + 1 + 8 + 1 + 11 = 44.)
+(3 + 10 + 2 + 1 + 8 + 1 + 8 + 1 + 11 = 45.)
 
 **Text operations (uncertain).** Strings are immutable runtime-owned UTF-8 values. The operations
 `__ToChars` and `__FromChars` cross the representation boundary and are runtime-backed. The others

@@ -15,6 +15,19 @@ pub extern "C" fn aster_rt_random_mix(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
+/// A fresh 64-bit seed from the operating system's entropy, for
+/// `Random.FromEntropy()`. The standard library seeds its per-thread hash keys
+/// from the OS random source and advances them on every `RandomState::new()`,
+/// so consecutive calls on one thread and calls on different threads differ.
+/// This is a seed for a non-cryptographic generator, not a secret.
+#[must_use]
+pub extern "C" fn aster_rt_random_entropy_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+}
+
 /// Record a structured equality assertion failure without exposing a Rust
 /// panic or an ungoverned ASTER allocation path.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]

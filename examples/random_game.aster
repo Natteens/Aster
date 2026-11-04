@@ -1,0 +1,41 @@
+// Seeded and unpredictable random numbers, and random work in parallel tasks.
+// Run with: aster run examples/random_game.aster
+using aster.random;
+
+public int Roll(ulong seed)
+{
+    Random random = new Random(seed);
+    return random.NextInt(1, 7);
+}
+
+public class Program
+{
+    public static int Main()
+    {
+        // An explicit seed reproduces the same numbers on every run and every platform.
+        Random seeded = new Random(2024);
+        Log("seeded: " + seeded.NextInt(10, 20).ToString() + " " + seeded.NextInt(10, 20).ToString());
+
+        // FromEntropy() starts from an unpredictable, operating-system seed.
+        Random random = Random.FromEntropy();
+        int damage = random.NextInt(10, 20);   // 10 to 19: the upper bound is exclusive
+        float chance = random.NextFloat();     // 0.0 up to, but not including, 1.0
+        Log("damage in range: " + (damage >= 10 && damage < 20).ToString());
+        Log("chance in range: " + (chance >= 0.0f && chance < 1.0f).ToString());
+
+        // Workers cannot read entropy, so the main thread draws their seeds.
+        Random seeds = Random.FromEntropy();
+        ulong firstSeed = seeds.NextULong();
+        ulong secondSeed = seeds.NextULong();
+        Task<int> first = Task.Run(Roll, firstSeed);
+        Task<int> second = Task.Run(Roll, secondSeed);
+        int a = first.Wait();
+        int b = second.Wait();
+        Log("rolls valid: " + (a >= 1 && a <= 6 && b >= 1 && b <= 6).ToString());
+
+        // The same seed in a worker and on the main thread gives the same roll.
+        Task<int> again = Task.Run(Roll, firstSeed);
+        Log("reproducible: " + (again.Wait() == a).ToString());
+        return 0;
+    }
+}

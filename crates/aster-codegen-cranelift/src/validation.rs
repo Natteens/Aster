@@ -275,7 +275,7 @@ pub(super) fn validate_module(module: &mir::Module) -> Result<(), BackendError> 
 /// then, for every worker entry point found anywhere in the module, walks
 /// the graph from its `Function` operand(s) to see whether an I/O-using
 /// function is reachable. Host operations currently include terminal/filesystem
-/// I/O and clock reads.
+/// I/O, clock reads, and the entropy seed read.
 #[allow(clippy::too_many_lines)]
 fn validate_no_console_io_in_workers(module: &mir::Module) -> Result<(), BackendError> {
     let mut callees: HashMap<mir::SymbolId, Vec<mir::SymbolId>> = HashMap::new();
@@ -309,7 +309,8 @@ fn validate_no_console_io_in_workers(module: &mir::Module) -> Result<(), Backend
                             | mir::Intrinsic::FileDeleteFile(_)
                             | mir::Intrinsic::FileDeleteDirectory(_)
                             | mir::Intrinsic::TimeMonotonicMilliseconds
-                            | mir::Intrinsic::TimeUnixMilliseconds,
+                            | mir::Intrinsic::TimeUnixMilliseconds
+                            | mir::Intrinsic::RandomEntropySeed,
                         ..
                     } => {
                         io_users.insert(function.symbol);
@@ -370,7 +371,7 @@ fn validate_no_console_io_in_workers(module: &mir::Module) -> Result<(), Backend
                         && reaches(target, &io_users)
                     {
                         return Err(BackendError::new(format!(
-                            "function `{}` uses `{worker_name}` with a worker body that (directly or transitively) calls `aster.io.Write`/`WriteLine`/`ReadLine`/`ReadAllText`/`WriteAllText`/`ListFiles`, another filesystem operation, or a clock host operation through `aster.time.Clock`, which is rejected in this version",
+                            "function `{}` uses `{worker_name}` with a worker body that (directly or transitively) calls `aster.io.Write`/`WriteLine`/`ReadLine`/`ReadAllText`/`WriteAllText`/`ListFiles`, another filesystem operation, a clock host operation through `aster.time.Clock`, or an entropy host operation through `Random.FromEntropy`, which is rejected in this version",
                             function.name
                         )));
                     }
@@ -4979,6 +4980,9 @@ fn validate_intrinsic_shape(
                 && return_type == &mir::Type::ULong
                 && matches!(arguments, [value] if value.type_ == mir::Type::ULong)
         }
+        mir::Intrinsic::RandomEntropySeed => {
+            destination.is_some() && return_type == &mir::Type::ULong && arguments.is_empty()
+        }
         mir::Intrinsic::StringBuilderLength => {
             destination.is_some()
                 && return_type == &mir::Type::Int
@@ -6008,6 +6012,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn entropy_seed_intrinsic_has_a_fixed_nullary_ulong_shape() {
+        let place = mir::Place::Local(mir::LocalId(0));
+        let signatures = HashMap::new();
+        let check = |destination: Option<&mir::Place>,
+                     arguments: &[mir::Operand],
+                     return_type: &mir::Type| {
+            validate_intrinsic_shape(
+                destination,
+                mir::Intrinsic::RandomEntropySeed,
+                arguments,
+                return_type,
+                "Draw",
+                &signatures,
+            )
+        };
+        check(Some(&place), &[], &mir::Type::ULong).expect("a nullary ulong read validates");
+        assert!(
+            check(None, &[], &mir::Type::ULong).is_err(),
+            "the seed must be stored"
+        );
+        assert!(
+            check(Some(&place), &[], &mir::Type::Long).is_err(),
+            "wrong result type"
+        );
+        let argument = mir::Operand {
+            type_: mir::Type::ULong,
+            kind: mir::OperandKind::Constant(mir::Constant::Integer("1".to_owned())),
+        };
+        assert!(
+            check(Some(&place), &[argument], &mir::Type::ULong).is_err(),
+            "the intrinsic takes no arguments"
+        );
     }
 
     #[test]

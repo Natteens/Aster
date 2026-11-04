@@ -29,3 +29,43 @@ of a mixed sample. A zero seed is valid; it does not create a stuck state.
 
 `Random` is an ordinary mutable class. It may be created and used locally in a worker, but an
 instance is not transferable or shared across Task/Parallel boundaries.
+
+## Unpredictable seeds
+
+`Random.FromEntropy()` creates a generator whose seed comes from the operating system's entropy
+(through the runtime, which owns this host read). Each call draws a fresh seed, so two generators
+created back to back differ, and no global state is involved:
+
+```aster
+using aster.random;
+
+Random random = Random.FromEntropy();
+int damage = random.NextInt(10, 20);   // 10 to 19 (the upper bound is exclusive)
+float chance = random.NextFloat();     // 0.0 up to, but not including, 1.0
+```
+
+The seed is read once, when the generator is created. Every later number costs exactly what it costs
+for an explicitly seeded generator, and the explicit `new Random(seed)` sequences are unchanged and
+fully reproducible. The seed is not a secret: `Random` is not suitable for cryptography, with or
+without `FromEntropy`.
+
+`FromEntropy` is a host operation, like the clock reads, so it is rejected in a `Task` or `Parallel`
+worker body (directly or through a helper). Workers receive an explicit seed instead, which also keeps
+parallel runs reproducible: draw the seeds on the main thread and pass them as `ulong` arguments:
+
+```aster
+public int Roll(ulong seed)
+{
+    Random random = new Random(seed);
+    return random.NextInt(1, 7);
+}
+
+Random seeds = Random.FromEntropy();
+Task<int> first = Task.Run(Roll, seeds.NextULong());
+Task<int> second = Task.Run(Roll, seeds.NextULong());
+```
+
+Constructor overloads do not exist, so there is no parameterless `new Random()`; and there is no
+global generator or static `Random.Range`. See the
+[random API decision](../compiler/random-api-decision.md) for the reasons and the design that would
+be needed.
