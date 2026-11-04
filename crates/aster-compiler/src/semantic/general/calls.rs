@@ -1382,6 +1382,16 @@ impl Analyzer<'_> {
                                 Some(score + 2)
                             } else if self.compatible(expected, actual) {
                                 Some(score + 1)
+                            } else if self
+                                .integer_constant_conversion(expected, actual, &arguments[source])
+                                .is_some_and(|(constant, minimum, maximum)| {
+                                    (minimum..=maximum).contains(&constant)
+                                })
+                            {
+                                // An integer constant that fits the parameter (the rule behind
+                                // `byte b = 10;`) is applicable, but ranks below every implicit
+                                // conversion so existing overload choices do not change.
+                                Some(score + 3)
                             } else {
                                 None
                             }
