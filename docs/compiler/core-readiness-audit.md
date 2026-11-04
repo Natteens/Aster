@@ -11,7 +11,8 @@ not restated here.
 | Item | Value |
 | --- | --- |
 | Repository | `Natteens/Aster` |
-| Baseline commit | `e580b4f5effb3a8a15b22b99c7e69a63cfcee55c` (`main`, release 0.67.0, after PR #69) |
+| Baseline commit | `e580b4f5effb3a8a15b22b99c7e69a63cfcee55c` (`main`, after PR #69) |
+| Workspace version | 0.67.0. The baseline is a later commit than the published release: tag `v0.67.0` points to `0f3a65b4ad1fb8e77150ca878b54b3a7204c8026` (`chore(release): 0.67.0 [skip ci]`), and `main` contains subsequent commits that did not change the version |
 | Audit date | 2026-11-03 |
 | Open pull requests at start | none |
 | Method | Read the canonical documentation, read implementation and test sources, ran the validation gates, and ran temporary reproduction programs kept outside the repository |
@@ -104,10 +105,18 @@ type `int`." The central table `crates/aster-types/src/lib.rs` (`promote`) imple
 semantic analysis uses it (compound assignment `byte x = 200; x += x;` is correctly rejected with
 "compound assignment would narrow `int` to `byte`").
 
-HIR lowering computes the result type separately. `binary_type` in
-`crates/aster-compiler/src/hir_lowering/types.rs` returns the left operand type when both operand
-types are equal (line 214) before it consults `promoted`. For `byte + byte`, HIR therefore types the
-expression as `Byte`, and MIR/Cranelift perform the arithmetic at 8 bits.
+HIR lowering involves two cooperating points, and both contribute:
+
+1. `crates/aster-compiler/src/hir_lowering/expressions.rs` (`Work::Combine` in the binary
+   expression lowering): operands are converted to the promoted type only when
+   `left.type_ != right.type_`. Two operands of the same small type are therefore never converted.
+2. `crates/aster-compiler/src/hir_lowering/types.rs` (`binary_type`, line 214): when both operand
+   types are equal it returns that type before consulting `promoted`.
+
+For `byte + byte`, the operands stay `Byte`, the expression is typed `Byte`, and MIR/Cranelift
+perform the arithmetic at 8 bits. The result is then widened to `int` only after it has wrapped.
+Changing only the result type recorded on the HIR expression would not repair this: the operands
+would still be narrow, so the operation would still execute at 8 bits.
 
 Reproduction (temporary file, run with `aster run`; results observed):
 
@@ -169,11 +178,16 @@ decision record must exist before implementation starts.
 **P0-1. Make small-integer binary expressions follow the promotion table end to end.**
 
 - Problem and evidence: D1.
-- Layer: HIR lowering (`binary_type`); verify that MIR lowering and constant folding agree.
+- Layer: HIR lowering (`binary_expression` in `hir_lowering/expressions.rs` and `binary_type` in
+  `hir_lowering/types.rs`); verify that MIR lowering, constant folding, and Cranelift agree.
 - User impact: silently wrong integer results for `byte`, `sbyte`, `short`, `ushort` pairs.
-- Smallest acceptable correction: route equal-type small-integer operands through the central
-  promotion (`promoted` / `aster_types::promote`) before the `left == right` shortcut. No new
-  feature, no refactor of unrelated paths.
+- Smallest acceptable correction: when both operands are small integers (equal or different
+  types), convert both operands to the promoted type (`promoted` / `aster_types::promote`) before
+  the operation is built, and derive the expression type from the converted operands. The
+  semantic, HIR, MIR, and Cranelift layers must then agree that the operation executes at the
+  promoted width. Changing only `Expression.type_` to `int` is insufficient, because the operands
+  would remain narrow and the arithmetic would still wrap at the operand width. No new feature,
+  no refactor of unrelated paths.
 - Acceptance criteria: every row of the D1 table matches the specification; `byte + byte`,
   `sbyte + sbyte`, `short + short`, `ushort + ushort` have HIR type `int` in `aster dump-hir`;
   compound assignment diagnostics are unchanged; `cargo test --workspace --all-targets` passes.
