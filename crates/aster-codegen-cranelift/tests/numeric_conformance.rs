@@ -678,3 +678,76 @@ fn floating_point_remainder_is_rejected_before_execution() {
         );
     }
 }
+
+#[test]
+fn conditional_expressions_execute_both_paths_at_the_promoted_width() {
+    // Equal small-integer branches promote to `int`; either path yields the
+    // exact value, and arithmetic on the result happens at `int` width.
+    let cases: Vec<(&str, ExecutionValue)> = vec![
+        (
+            "public int @() { bool c = true; byte a = 200; byte b = 100; return c ? a : b; }",
+            ExecutionValue::Int(200),
+        ),
+        (
+            "public int @() { bool c = false; byte a = 200; byte b = 100; return c ? a : b; }",
+            ExecutionValue::Int(100),
+        ),
+        (
+            "public int @() { bool c = true; sbyte a = -100; sbyte b = 100; return c ? a : b; }",
+            ExecutionValue::Int(-100),
+        ),
+        (
+            "public int @() { bool c = false; short a = -30000; short b = 30000; return c ? a : b; }",
+            ExecutionValue::Int(30_000),
+        ),
+        (
+            "public int @() { bool c = true; ushort a = 60000; ushort b = 1; return c ? a : b; }",
+            ExecutionValue::Int(60_000),
+        ),
+        // The result is an `int`, so arithmetic on it does not wrap at 8 bits.
+        (
+            "public int @() { bool c = true; byte a = 200; byte b = 100; var x = c ? a : b; return x + x; }",
+            ExecutionValue::Int(400),
+        ),
+        (
+            "public int @() { bool c = false; byte a = 200; byte b = 250; return (c ? a : b) + (c ? a : b); }",
+            ExecutionValue::Int(500),
+        ),
+        // Nested conditionals.
+        (
+            "public int @() { bool c = true; bool d = false; byte a = 200; byte b = 150; return c ? (d ? a : b) : a; }",
+            ExecutionValue::Int(150),
+        ),
+        (
+            "public int @() { bool c = false; bool d = true; ushort a = 65535; ushort b = 7; return c ? a : (d ? b : a); }",
+            ExecutionValue::Int(7),
+        ),
+        // Contextual narrow target keeps its declared type.
+        (
+            "public byte @() { bool c = true; byte a = 200; byte b = 100; byte x = c ? a : b; return x; }",
+            ExecutionValue::Byte(200),
+        ),
+        // Mixed and unchanged cases.
+        (
+            "public int @() { bool c = false; byte a = 200; short b = -5; return c ? a : b; }",
+            ExecutionValue::Int(-5),
+        ),
+        (
+            "public long @() { bool c = true; int a = -1; uint b = 4000000000U; return c ? a : b; }",
+            ExecutionValue::Long(-1),
+        ),
+        (
+            "public string @() { bool c = false; string a = \"a\"; string b = \"b\"; return c ? a : b; }",
+            ExecutionValue::String("b".to_owned()),
+        ),
+        (
+            "public bool @() { bool c = true; bool a = false; bool b = true; return c ? a : b; }",
+            ExecutionValue::Bool(false),
+        ),
+    ];
+    let cases: Vec<_> = cases
+        .into_iter()
+        .map(|(body, value)| (body.to_owned(), value))
+        .collect();
+    run_all(&cases);
+}

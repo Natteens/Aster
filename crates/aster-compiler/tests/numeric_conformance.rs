@@ -582,11 +582,6 @@ fn conditional_expressions_promote_unequal_numeric_branches() {
                 continue;
             };
             let target = &all[index];
-            // Equal small-integer branches are covered by the known-gap
-            // reproducer in `numeric_conformance_known_gaps.rs`.
-            if left.name == right.name && target.name != left.name {
-                continue;
-            }
             let compilation = compile_valid(&format!(
                 "public {2} Pick(bool c, {0} a, {1} b) {{ return c ? a : b; }}",
                 left.name, right.name, target.name
