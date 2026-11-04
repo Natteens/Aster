@@ -793,6 +793,25 @@ pub(super) fn cast_value(
                 builder.ins().fcvt_from_sint(clif_target, value)
             }
         }
+        (None, Some(to)) if float(source) && to < 32 => {
+            // Cranelift's x64 backend cannot emit the saturating conversion
+            // with an 8- or 16-bit result. Convert to `i32` first (truncates
+            // toward zero, saturates at the `i32` range, NaN becomes zero), then
+            // clamp to the destination range before reducing. Every 8- and
+            // 16-bit range fits in a signed `i32`, so signed comparisons are
+            // correct for signed and unsigned destinations alike.
+            let (minimum, maximum) = if is_unsigned_integer(target) {
+                (0, (1_i64 << to) - 1)
+            } else {
+                (-(1_i64 << (to - 1)), (1_i64 << (to - 1)) - 1)
+            };
+            let wide = builder.ins().fcvt_to_sint_sat(types::I32, value);
+            let lower = builder.ins().iconst(types::I32, minimum);
+            let upper = builder.ins().iconst(types::I32, maximum);
+            let clamped = builder.ins().smax(wide, lower);
+            let clamped = builder.ins().smin(clamped, upper);
+            builder.ins().ireduce(clif_integer(to)?, clamped)
+        }
         (None, Some(to)) if float(source) => {
             let clif_target = clif_integer(to)?;
             if is_unsigned_integer(target) {
