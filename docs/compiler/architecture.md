@@ -323,3 +323,6 @@ confirmed defects, and the stabilization backlog for the language core.
 
 For how the official library is organized and when an API needs compiler support, see the
 [standard library extension contract](standard-library-extension.md).
+
+Bitwise and shift operators are not implemented; the proposed semantics are recorded in the
+[bitwise and shift operator decision record](bitwise-shift-decision.md) (status: proposed).
