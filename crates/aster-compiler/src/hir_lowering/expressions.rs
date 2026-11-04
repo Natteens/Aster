@@ -31,9 +31,7 @@ impl Lowerer<'_> {
                 Work::Combine(operator) => {
                     let mut right = values.pop().expect("binary right operand was lowered");
                     let mut left = values.pop().expect("binary left operand was lowered");
-                    if left.type_ != right.type_
-                        && let Some(promoted) = promoted(&left.type_, &right.type_)
-                    {
+                    if let Some(promoted) = promoted(&left.type_, &right.type_) {
                         left = convert(left, &promoted);
                         right = convert(right, &promoted);
                     }
