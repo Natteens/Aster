@@ -29,9 +29,9 @@ int halved    = a >> 1;   // 2
 ## Flags
 
 ```aster
-const int CAN_JUMP = 1;
-const int CAN_RUN = 2;
-const int CAN_ATTACK = 4;
+const int CAN_JUMP = 0b001;
+const int CAN_RUN = 0b010;
+const int CAN_ATTACK = 0b100;
 
 int abilities = CAN_JUMP | CAN_ATTACK;          // set two flags
 bool canAttack = (abilities & CAN_ATTACK) != 0; // test one; the parentheses are required
@@ -96,4 +96,8 @@ C# accepts the commented line. This keeps one rule for every compound operator.
 1. `char` operands are rejected; write `(int)c`.
 2. Compound assignment never narrows implicitly (above).
 
-There are no hexadecimal or binary literals yet, so masks are written in decimal.
+Masks and flags can be written as hexadecimal (`0xFF`) or binary (`0b1010`) literals; see the
+[type specification](../specification/02-types.md#hexadecimal-and-binary-integer-literals). An
+unsuffixed literal above `int` is a `uint`, `long`, or `ulong`, so combine it with a matching operand:
+`flags |= 0xFFU;` for a `uint` and `0xFFFFFFFFFFFFFFFF ^ 0xFFUL` for a `ulong`, because an `int`
+operand does not join a `ulong`.

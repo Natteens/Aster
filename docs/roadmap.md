@@ -15,7 +15,7 @@ The current toolchain includes:
 - contextual `[]` and `new()`, expression-bodied callables, inferred `foreach` elements, checked
   `List<T>` indexing, named arguments, and compile-time default parameters;
 - C#-style bitwise and shift operators (`& | ^ ~ << >> >>>` and their compound forms) on integers,
-  with eager `&`, `|`, `^` on `bool`;
+  with eager `&`, `|`, `^` on `bool`, and hexadecimal and binary integer literals;
 - immutable UTF-8 strings with Unicode-scalar `char`, scalar-counting `Length`, and `foreach` iteration;
 - practical strict scalar parsing, ordinal Unicode text helpers, scalar math/classification,
   deterministic seeded random, clock reads, bulk collection helpers, and compact assertions;

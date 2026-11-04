@@ -54,8 +54,8 @@ output function cannot be written in ASTER (see section 8).
   `+ - * /` and comparisons from a single operand type; division and remainder go through a guard
   that produces controlled runtime errors.
 - **`char`** is not numeric: `char < char` is already rejected. `(int)c` is a supported cast.
-- Hexadecimal and binary literals do not exist (open question in the lexical specification), so
-  all literals below are decimal.
+- Hexadecimal and binary literals did not exist at that time (they were added later; see the
+  [nondecimal literal decision](nondecimal-literal-decision.md)), so the examples below are decimal.
 
 ## 3. Recommendation
 
@@ -289,7 +289,7 @@ tries (the earlier float-to-narrow-integer cast crash was a shape of this kind).
 2. **Compound assignment never narrows implicitly.** `byte b |= 1;` and `ushort w <<= 1;` are
    errors ("would narrow `int` to `byte`"); write `b = (byte)(b | 1);`. C# narrows implicitly.
 
-Remaining limitations: there are no hexadecimal or binary literals (D9), ASTER's unary `-` on a
+Remaining limitations: ASTER's unary `-` on a
 small signed integer still keeps its type while C# promotes (D10), and generic type-argument
 discovery still infers the left operand's type for a binary expression, as it already did for
 arithmetic.
@@ -375,7 +375,7 @@ The maintainer approved D1–D8 as recommended below and kept D9 and D10 as sepa
 | D6 | Keep the strict compound-assignment rule for the new operators? | Yes; revisit separately with evidence |
 | D7 | Reject `char` operands and require `(int)c`? | Yes |
 | D8 | Land the feature as one vertical PR? | Yes |
-| D9 | Hexadecimal and binary literals | Separate record, recommended soon after; now proposed in the [nondecimal literal decision](nondecimal-literal-decision.md) |
+| D9 | Hexadecimal and binary literals | Separate record; accepted and implemented in the [nondecimal literal decision](nondecimal-literal-decision.md) |
 | D10 | ASTER's unary `-` keeps small operand types while C# promotes; align it? | Out of scope here; track separately |
 
 ## 12. Non-goals
