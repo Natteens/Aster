@@ -320,3 +320,6 @@ general source-visible/AOT ownership model remain deliberately undecided.
 
 The [core readiness audit](core-readiness-audit.md) is a point-in-time snapshot of verified capabilities,
 confirmed defects, and the stabilization backlog for the language core.
+
+For how the official library is organized and when an API needs compiler support, see the
+[standard library extension contract](standard-library-extension.md).
