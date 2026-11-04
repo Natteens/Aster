@@ -2323,3 +2323,69 @@ fn stats_separate_executions_have_independent_metrics() {
     let (_, stats2) = run_with_stats(source, "Run").expect("second run");
     assert_eq!(stats1, stats2);
 }
+
+#[test]
+fn small_integer_binary_operations_execute_at_promoted_int_width() {
+    let source = r#"
+        public int ByteAdd() { byte a = 200; byte b = 200; return a + b; }
+        public int SByteAdd() { sbyte a = 100; sbyte b = 100; return a + b; }
+        public int ShortAdd() { short a = 30000; short b = 30000; return a + b; }
+        public int UShortAdd() { ushort a = 60000; ushort b = 60000; return a + b; }
+        public int ByteTriple() { byte a = 200; return a * a * a; }
+        public bool ByteCompare() { byte a = 200; return (a + a) > 300; }
+        public int ByteHalf() { byte a = 200; return (a + a) / 2; }
+        public int ByteSubtract() { byte a = 10; byte b = 20; return a - b; }
+        public int UShortSubtract() { ushort a = 1; ushort b = 2; return a - b; }
+        public int ShortMultiply() { short a = 300; short b = 300; return a * b; }
+        public int SByteNegative() { sbyte a = -100; sbyte b = -100; return a + b; }
+        public int ByteZeroExtend() { byte a = 255; byte b = 1; return a + b; }
+        public int UShortZeroExtend() { ushort a = 65535; ushort b = 1; return a + b; }
+        public int MixedByteSByte() { byte a = 200; sbyte b = -100; return a + b; }
+        public int MixedShortUShort() { short a = 30000; ushort b = 60000; return a + b; }
+        public int MixedByteShort() { byte a = 200; short b = 30000; return a + b; }
+        public int Nested() { byte a = 200; return ((a + a) - a) * 2; }
+        public bool MixedCompare() { sbyte a = -1; byte b = 1; return a < b; }
+        public int NarrowingCast() { byte a = 200; return (int)(byte)(a + a); }
+        public int StringLength() { string a = "ab"; string b = "cd"; return (a + b).Length; }
+        public int BooleanLogic() { bool a = true; bool b = false; return (a && !b) || b ? 1 : 0; }
+        public int ByteDivideByZero() { byte a = 200; byte zero = 0; return (a + a) / zero; }
+        public int ShortRemainderByZero() { short a = 200; short zero = 0; return (a + a) % zero; }
+    "#;
+    for (function, expected) in [
+        ("ByteAdd", 400),
+        ("SByteAdd", 200),
+        ("ShortAdd", 60000),
+        ("UShortAdd", 120_000),
+        ("ByteTriple", 8_000_000),
+        ("ByteHalf", 200),
+        ("ByteSubtract", -10),
+        ("UShortSubtract", -1),
+        ("ShortMultiply", 90_000),
+        ("SByteNegative", -200),
+        ("ByteZeroExtend", 256),
+        ("UShortZeroExtend", 65_536),
+        ("MixedByteSByte", 100),
+        ("MixedShortUShort", 90_000),
+        ("MixedByteShort", 30_200),
+        ("Nested", 400),
+        ("NarrowingCast", 144),
+        ("StringLength", 4),
+        ("BooleanLogic", 1),
+    ] {
+        assert_eq!(
+            run(source, function),
+            Ok(ExecutionValue::Int(expected)),
+            "{function}"
+        );
+    }
+    assert_eq!(run(source, "ByteCompare"), Ok(ExecutionValue::Bool(true)));
+    assert_eq!(run(source, "MixedCompare"), Ok(ExecutionValue::Bool(true)));
+    assert_eq!(
+        run(source, "ByteDivideByZero"),
+        Err("Aster runtime error: integer division by zero".to_owned())
+    );
+    assert_eq!(
+        run(source, "ShortRemainderByZero"),
+        Err("Aster runtime error: integer remainder by zero".to_owned())
+    );
+}

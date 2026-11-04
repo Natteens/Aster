@@ -211,8 +211,7 @@ pub(super) fn binary_type(
     ) {
         return hir::Type::Bool;
     }
-    if left == right {
-        return left.clone();
-    }
+    // Equal operand types still go through the central table: two equal small
+    // integers promote to `int`.
     promoted(left, right).unwrap_or_else(|| left.clone())
 }
