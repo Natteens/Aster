@@ -180,14 +180,14 @@ pub(super) fn convert(expression: hir::Expression, target: &hir::Type) -> hir::E
 /// The validated common type of two `?:` branches (the promotion table for
 /// numeric branches, or their identical type otherwise).
 pub(super) fn conditional_type(left: &hir::Type, right: &hir::Type) -> hir::Type {
-    if left == right {
-        return left.clone();
-    }
     match (left, right) {
         (hir::Type::Class(_), hir::Type::Interface(_)) => return right.clone(),
         (hir::Type::Interface(_), hir::Type::Class(_)) => return left.clone(),
         _ => {}
     }
+    // Equal numeric types still go through the central table: two equal small
+    // integers promote to `int`, matching semantic analysis. Any other equal
+    // type has no promotion and is kept as is.
     promoted(left, right).unwrap_or_else(|| left.clone())
 }
 
