@@ -203,10 +203,11 @@ Other ordinary code:
 | Math | `aster.math.__MathUnaryFloat`, `__MathPowDouble` | Floating-point library routines provided by the runtime |
 | Random mixing | `aster.random.__RandomMix` | See below |
 
-`aster.random.__RandomMix` implements the SplitMix64 finalizer. It is an intrinsic because the
-current language has no general bitwise or shift operators, so the algorithm cannot be written in
-ASTER. This records a present language limitation (the audit tracks it as
-[P1-2](core-readiness-audit.md)); it is not a decision about whether those operators will be added.
+`aster.random.__RandomMix` implements the SplitMix64 finalizer. It became an intrinsic because the
+language originally had no bitwise or shift operators. The language now has them (see the
+[bitwise and shift decision record](bitwise-shift-decision.md)) and the function is expressible in
+ASTER and verified against the intrinsic, but `Random` has not been migrated yet, so the intrinsic
+and its binding remain until that separate change lands.
 
 ## 5. Intrinsic inventory
 
@@ -224,7 +225,7 @@ Verify the count by listing the `"aster.<module>::<name>"` keys in
 | Controlled runtime errors | `aster.math::__AbsIntOverflow`, `__AbsLongOverflow`, `__ClampInvalidRange`, `__MathSignNaN`; `aster.collections::__CollectionRangeError`; `aster.random::__RandomInvalidRange`; `aster.testing::__AssertionTrue`, `__AssertionFalse` | 8 | Inherently runtime-backed (error channel) |
 | Assertion with message | `aster.testing::__AssertionEqual` | 1 | Inherently runtime-backed (error channel with expected and actual text) |
 | Math operations | `aster.math::__MathUnaryFloat`, `__MathUnaryDouble`, `__MathBinaryFloat`, `__MathBinaryDouble`, `__MathPredicateFloat`, `__MathPredicateDouble`, `__MathPowFloat`, `__MathPowDouble` | 8 | Runtime-backed (floating-point library routines) |
-| Random | `aster.random::__RandomMix` | 1 | Language-limited (no bitwise operators) |
+| Random | `aster.random::__RandomMix` | 1 | Now expressible in ASTER (migration pending); kept until `Random` is migrated |
 | Text operations | `aster.text::__Trim`, `__TrimStart`, `__TrimEnd`, `__LastIndexOf`, `__Replace`, `__Split`, `__Repeat`, `__JoinArray`, `__ConcatArray`, `__ToChars`, `__FromChars` | 11 | Mixed; see below |
 
 (3 + 10 + 2 + 8 + 1 + 8 + 1 + 11 = 44.)

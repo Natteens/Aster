@@ -2,7 +2,7 @@
 
 pub(crate) use aster_types::{
     IntegerFit, Primitive, UnsignedFit, classify_integer, classify_unsigned, fits_long, fits_ulong,
-    from_name, implicit_converts, promote,
+    from_name, implicit_converts, promote, promote_unary,
 };
 
 /// Map an HIR type to its primitive, when it has one.

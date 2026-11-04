@@ -177,6 +177,10 @@ fn unary(operator: UnaryOperator, value: ConstValue, span: Span) -> Result<Const
             }
             in_range(-value, kind, span)
         }
+        (UnaryOperator::BitwiseNot, ConstValue::Integer(value, kind)) => {
+            let kind = primitives::promote_unary(kind).ok_or(ConstError::NotConstant(span))?;
+            Ok(ConstValue::Integer(wrap_to(!value, kind), kind))
+        }
         (UnaryOperator::Negate, ConstValue::Float(value)) => Ok(ConstValue::Float(-value)),
         (UnaryOperator::Negate, ConstValue::Double(value)) => Ok(ConstValue::Double(-value)),
         _ => Err(ConstError::NotConstant(span)),
@@ -190,7 +194,9 @@ fn binary(
     resolve: &dyn Fn(&str) -> Option<ConstValue>,
     span: Span,
 ) -> Result<ConstValue, ConstError> {
-    use BinaryOperator::{Add, Equal, LogicalAnd, LogicalOr, NotEqual};
+    use BinaryOperator::{
+        Add, BitwiseAnd, BitwiseOr, BitwiseXor, Equal, LogicalAnd, LogicalOr, NotEqual,
+    };
     if matches!(operator, LogicalAnd | LogicalOr) {
         let ConstValue::Bool(left) = evaluate(left, resolve)? else {
             return Err(ConstError::NotConstant(span));
@@ -218,6 +224,10 @@ fn binary(
         (ConstValue::Bool(left), ConstValue::Bool(right)) => match operator {
             Equal => Ok(ConstValue::Bool(left == right)),
             NotEqual => Ok(ConstValue::Bool(left != right)),
+            // Both operands are already evaluated, so eager and lazy agree here.
+            BitwiseAnd => Ok(ConstValue::Bool(*left && *right)),
+            BitwiseOr => Ok(ConstValue::Bool(*left || *right)),
+            BitwiseXor => Ok(ConstValue::Bool(*left ^ *right)),
             _ => Err(ConstError::NotConstant(span)),
         },
         (ConstValue::Char(left), ConstValue::Char(right)) => match operator {
@@ -225,6 +235,13 @@ fn binary(
             NotEqual => Ok(ConstValue::Bool(left != right)),
             _ => Err(ConstError::NotConstant(span)),
         },
+        (ConstValue::Integer(a, left_kind), ConstValue::Integer(count, _))
+            if is_shift(operator) =>
+        {
+            let kind =
+                primitives::promote_unary(*left_kind).ok_or(ConstError::NotConstant(span))?;
+            Ok(ConstValue::Integer(shift(operator, *a, *count, kind), kind))
+        }
         (ConstValue::Integer(a, left_kind), ConstValue::Integer(b, right_kind)) => {
             let kind = primitives::promote(*left_kind, *right_kind)
                 .filter(|kind| kind.is_integer())
@@ -265,7 +282,9 @@ fn integer_binary(
     kind: Primitive,
     span: Span,
 ) -> Result<ConstValue, ConstError> {
-    use BinaryOperator::{Add, Divide, Multiply, Remainder, Subtract};
+    use BinaryOperator::{
+        Add, BitwiseAnd, BitwiseOr, BitwiseXor, Divide, Multiply, Remainder, Subtract,
+    };
     match operator {
         Add => checked_integer(left.checked_add(right), kind, span),
         Subtract => checked_integer(left.checked_sub(right), kind, span),
@@ -273,7 +292,45 @@ fn integer_binary(
         Divide | Remainder if right == 0 => Err(ConstError::DivisionByZero(span)),
         Divide => in_range(left / right, kind, span),
         Remainder => in_range(left % right, kind, span),
+        // Bitwise operators cannot overflow, so they never report one.
+        BitwiseAnd => Ok(ConstValue::Integer(wrap_to(left & right, kind), kind)),
+        BitwiseOr => Ok(ConstValue::Integer(wrap_to(left | right, kind), kind)),
+        BitwiseXor => Ok(ConstValue::Integer(wrap_to(left ^ right, kind), kind)),
         _ => comparison(operator, &left, &right, span),
+    }
+}
+
+fn is_shift(operator: BinaryOperator) -> bool {
+    matches!(
+        operator,
+        BinaryOperator::ShiftLeft | BinaryOperator::ShiftRight | BinaryOperator::UnsignedShiftRight
+    )
+}
+
+/// Reduce `value` to the two's-complement range of the integer `kind`.
+fn wrap_to(value: i128, kind: Primitive) -> i128 {
+    let bits = u32::from(kind.bit_width().expect("integer kind has a width"));
+    let wrapped = value.rem_euclid(1_i128 << bits);
+    if kind.integer_range().is_some_and(|(minimum, _)| minimum < 0)
+        && wrapped >= 1_i128 << (bits - 1)
+    {
+        wrapped - (1_i128 << bits)
+    } else {
+        wrapped
+    }
+}
+
+/// A shift of a 32- or 64-bit `kind`: the count is masked to the operand width,
+/// `<<` discards high bits, `>>` is arithmetic for signed and logical for
+/// unsigned kinds, and `>>>` is always logical. Nothing can overflow.
+fn shift(operator: BinaryOperator, value: i128, count: i128, kind: Primitive) -> i128 {
+    let bits = u32::from(kind.bit_width().expect("integer kind has a width"));
+    let count = u32::try_from(count.rem_euclid(i128::from(bits))).expect("masked count fits");
+    let pattern = value.rem_euclid(1_i128 << bits);
+    match operator {
+        BinaryOperator::ShiftLeft => wrap_to(pattern << count, kind),
+        BinaryOperator::ShiftRight => wrap_to(value >> count, kind),
+        _ => wrap_to(pattern >> count, kind),
     }
 }
 

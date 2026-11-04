@@ -96,6 +96,7 @@ impl Codegen {
                     mir::UnaryOperator::Not => builder.ins().icmp_imm(IntCC::Equal, operand, 0),
                     mir::UnaryOperator::Negate if is_float => builder.ins().fneg(operand),
                     mir::UnaryOperator::Negate => builder.ins().ineg(operand),
+                    mir::UnaryOperator::BitwiseNot => builder.ins().bnot(operand),
                 })
             }
             mir::RvalueKind::Binary {
@@ -665,8 +666,19 @@ fn translate_binary(
         }
         mir::BinaryOperator::Equal => builder.ins().icmp(IntCC::Equal, left, right),
         mir::BinaryOperator::NotEqual => builder.ins().icmp(IntCC::NotEqual, left, right),
-        mir::BinaryOperator::LogicalAnd => builder.ins().band(left, right),
-        mir::BinaryOperator::LogicalOr => builder.ins().bor(left, right),
+        mir::BinaryOperator::LogicalAnd | mir::BinaryOperator::BitwiseAnd => {
+            builder.ins().band(left, right)
+        }
+        mir::BinaryOperator::LogicalOr | mir::BinaryOperator::BitwiseOr => {
+            builder.ins().bor(left, right)
+        }
+        mir::BinaryOperator::BitwiseXor => builder.ins().bxor(left, right),
+        // Cranelift masks the shift amount to the operand width, which is the
+        // specified count semantics; validation guarantees 32- or 64-bit operands.
+        mir::BinaryOperator::ShiftLeft => builder.ins().ishl(left, right),
+        mir::BinaryOperator::ShiftRight if unsigned => builder.ins().ushr(left, right),
+        mir::BinaryOperator::ShiftRight => builder.ins().sshr(left, right),
+        mir::BinaryOperator::UnsignedShiftRight => builder.ins().ushr(left, right),
     })
 }
 
@@ -749,6 +761,16 @@ fn translate_float_binary(
         mir::BinaryOperator::LogicalAnd | mir::BinaryOperator::LogicalOr => {
             return Err(BackendError::new(
                 "logical operators require boolean operands",
+            ));
+        }
+        mir::BinaryOperator::BitwiseAnd
+        | mir::BinaryOperator::BitwiseOr
+        | mir::BinaryOperator::BitwiseXor
+        | mir::BinaryOperator::ShiftLeft
+        | mir::BinaryOperator::ShiftRight
+        | mir::BinaryOperator::UnsignedShiftRight => {
+            return Err(BackendError::new(
+                "bitwise and shift operators require integer operands",
             ));
         }
     })

@@ -200,6 +200,21 @@ pub fn promote(left: Primitive, right: Primitive) -> Option<Primitive> {
     })
 }
 
+/// Type of an integer operand of a unary integer operation (`~`) or the left
+/// operand of a shift: small integers become `int`, every other integer keeps
+/// its type, and non-integers have no unary promotion.
+#[must_use]
+pub fn promote_unary(primitive: Primitive) -> Option<Primitive> {
+    if !primitive.is_integer() {
+        return None;
+    }
+    Some(if is_small_integer(primitive) {
+        Primitive::Int
+    } else {
+        primitive
+    })
+}
+
 const fn is_small_integer(primitive: Primitive) -> bool {
     matches!(
         primitive,
@@ -348,6 +363,36 @@ mod tests {
         assert!(!implicit_converts(Primitive::Int, Primitive::Float));
         assert!(!implicit_converts(Primitive::Long, Primitive::Double));
         assert!(!implicit_converts(Primitive::ULong, Primitive::Double));
+    }
+
+    #[test]
+    fn unary_promotion_widens_only_small_integers() {
+        for small in [
+            Primitive::SByte,
+            Primitive::Byte,
+            Primitive::Short,
+            Primitive::UShort,
+        ] {
+            assert_eq!(promote_unary(small), Some(Primitive::Int));
+        }
+        for same in [
+            Primitive::Int,
+            Primitive::UInt,
+            Primitive::Long,
+            Primitive::ULong,
+        ] {
+            assert_eq!(promote_unary(same), Some(same));
+        }
+        for other in [
+            Primitive::Bool,
+            Primitive::Char,
+            Primitive::Float,
+            Primitive::Double,
+            Primitive::Decimal,
+            Primitive::String,
+        ] {
+            assert_eq!(promote_unary(other), None);
+        }
     }
 
     #[test]

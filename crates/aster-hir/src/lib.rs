@@ -852,6 +852,7 @@ pub enum Literal {
 pub enum UnaryOperator {
     Not,
     Negate,
+    BitwiseNot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -882,6 +883,12 @@ pub enum BinaryOperator {
     NotEqual,
     LogicalAnd,
     LogicalOr,
+    BitwiseAnd,
+    BitwiseOr,
+    BitwiseXor,
+    ShiftLeft,
+    ShiftRight,
+    UnsignedShiftRight,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -891,6 +898,12 @@ pub enum AssignmentOperator {
     SubtractAssign,
     MultiplyAssign,
     DivideAssign,
+    BitwiseAndAssign,
+    BitwiseOrAssign,
+    BitwiseXorAssign,
+    ShiftLeftAssign,
+    ShiftRightAssign,
+    UnsignedShiftRightAssign,
 }
 
 impl fmt::Display for Module {

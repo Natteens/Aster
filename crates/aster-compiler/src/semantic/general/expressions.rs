@@ -433,6 +433,14 @@ impl Analyzer<'_> {
                         Type::Unknown
                     }
                     UnaryOperator::Negate if operand_type.is_numeric() => operand_type,
+                    UnaryOperator::BitwiseNot
+                        if operand_type.primitive().is_some_and(Primitive::is_integer) =>
+                    {
+                        operand_type
+                            .primitive()
+                            .and_then(crate::primitives::promote_unary)
+                            .map_or(Type::Unknown, Type::from_primitive)
+                    }
                     _ => {
                         self.diagnostics.push(Diagnostic::error(
                             format!(
@@ -1173,8 +1181,9 @@ impl Analyzer<'_> {
 
     fn binary(&mut self, operator: BinaryOperator, left: &Type, right: &Type, span: Span) -> Type {
         use BinaryOperator::{
-            Add, Divide, Equal, Greater, GreaterEqual, Less, LessEqual, LogicalAnd, LogicalOr,
-            Multiply, NotEqual, Remainder, Subtract,
+            Add, BitwiseAnd, BitwiseOr, BitwiseXor, Divide, Equal, Greater, GreaterEqual, Less,
+            LessEqual, LogicalAnd, LogicalOr, Multiply, NotEqual, Remainder, ShiftLeft, ShiftRight,
+            Subtract, UnsignedShiftRight,
         };
         if *left == Type::Unknown || *right == Type::Unknown {
             return Type::Unknown;
@@ -1218,6 +1227,36 @@ impl Analyzer<'_> {
                     Some(promoted) => promoted,
                     None => self.no_common_type(left, right, span),
                 }
+            }
+            // Eager Boolean operators: both operands are always evaluated.
+            BitwiseAnd | BitwiseOr | BitwiseXor if *left == Type::Bool && *right == Type::Bool => {
+                Type::Bool
+            }
+            BitwiseAnd | BitwiseOr | BitwiseXor if is_integer(left) && is_integer(right) => {
+                match promoted_numeric(left, right) {
+                    Some(promoted) => promoted,
+                    None => self.no_common_type(left, right, span),
+                }
+            }
+            ShiftLeft | ShiftRight | UnsignedShiftRight
+                if is_integer(left) && is_integer(right) =>
+            {
+                if !is_shift_count(right) {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            format!(
+                                "shift count of type `{}` does not convert to `int`",
+                                right.display()
+                            ),
+                            span,
+                        )
+                        .with_help("cast the count explicitly, e.g. `(int)count`"),
+                    );
+                    return Type::Unknown;
+                }
+                left.primitive()
+                    .and_then(crate::primitives::promote_unary)
+                    .map_or(Type::Unknown, Type::from_primitive)
             }
             _ => {
                 self.diagnostics.push(
@@ -1659,6 +1698,8 @@ impl Analyzer<'_> {
             && *value == Type::String
         {
             // String concatenation is the sole non-numeric compound assignment.
+        } else if let Some(kind) = bit_operation(operator) {
+            self.bit_assignment(kind, &target, value, span);
         } else if let Some(operation_type) = promoted_numeric(&target, value) {
             if operation_type != target {
                 self.diagnostics.push(
@@ -1683,6 +1724,76 @@ impl Analyzer<'_> {
             );
         }
         target
+    }
+
+    /// Compound assignment with a bitwise or shift operator. The rules mirror
+    /// the binary operators, and the operation type must equal the target type:
+    /// ASTER never inserts a hidden narrowing conversion.
+    fn bit_assignment(&mut self, kind: BitOperation, target: &Type, value: &Type, span: Span) {
+        if *target == Type::Unknown || *value == Type::Unknown {
+            return;
+        }
+        let operation_type = match kind {
+            BitOperation::Logical if *target == Type::Bool && *value == Type::Bool => {
+                Some(Type::Bool)
+            }
+            BitOperation::Logical if is_integer(target) && is_integer(value) => {
+                promoted_numeric(target, value)
+            }
+            BitOperation::Shift if is_integer(target) && is_integer(value) => {
+                if !is_shift_count(value) {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            format!(
+                                "shift count of type `{}` does not convert to `int`",
+                                value.display()
+                            ),
+                            span,
+                        )
+                        .with_help("cast the count explicitly, e.g. `(int)count`"),
+                    );
+                    return;
+                }
+                target
+                    .primitive()
+                    .and_then(crate::primitives::promote_unary)
+                    .map(Type::from_primitive)
+            }
+            _ => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "compound assignment is not valid for `{}` and `{}`",
+                            target.display(),
+                            value.display()
+                        ),
+                        span,
+                    )
+                    .with_help("bitwise and shift assignment need integer operands, or `bool` for `&=`, `|=`, `^=`"),
+                );
+                return;
+            }
+        };
+        match operation_type {
+            Some(operation_type) if operation_type == *target => {}
+            Some(operation_type) => self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "compound assignment would narrow `{}` to `{}`",
+                        operation_type.display(),
+                        target.display()
+                    ),
+                    span,
+                )
+                .with_help(format!(
+                    "rewrite the operation as an explicit assignment and cast the result to `{}`",
+                    target.display()
+                )),
+            ),
+            None => {
+                self.no_common_type(target, value, span);
+            }
+        }
     }
 
     /// Like `require_assignable`, but with the value expression available:
@@ -1805,4 +1916,36 @@ pub(super) fn needs_contextual_type(expression: &Expression) -> bool {
         }
         _ => false,
     }
+}
+
+/// Which family a bitwise or shift compound assignment belongs to.
+#[derive(Clone, Copy)]
+enum BitOperation {
+    /// `&=`, `|=`, `^=`: integer or `bool` operands.
+    Logical,
+    /// `<<=`, `>>=`, `>>>=`: integer target and an `int`-convertible count.
+    Shift,
+}
+
+fn bit_operation(operator: AssignmentOperator) -> Option<BitOperation> {
+    match operator {
+        AssignmentOperator::BitwiseAndAssign
+        | AssignmentOperator::BitwiseOrAssign
+        | AssignmentOperator::BitwiseXorAssign => Some(BitOperation::Logical),
+        AssignmentOperator::ShiftLeftAssign
+        | AssignmentOperator::ShiftRightAssign
+        | AssignmentOperator::UnsignedShiftRightAssign => Some(BitOperation::Shift),
+        _ => None,
+    }
+}
+
+fn is_integer(type_: &Type) -> bool {
+    type_.primitive().is_some_and(Primitive::is_integer)
+}
+
+/// A shift count must implicitly convert to `int`.
+fn is_shift_count(type_: &Type) -> bool {
+    type_
+        .primitive()
+        .is_some_and(|primitive| crate::primitives::implicit_converts(primitive, Primitive::Int))
 }

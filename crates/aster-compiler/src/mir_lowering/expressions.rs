@@ -1811,6 +1811,14 @@ pub(super) fn compound_operator(operator: hir::AssignmentOperator) -> mir::Binar
         hir::AssignmentOperator::SubtractAssign => mir::BinaryOperator::Subtract,
         hir::AssignmentOperator::MultiplyAssign => mir::BinaryOperator::Multiply,
         hir::AssignmentOperator::DivideAssign => mir::BinaryOperator::Divide,
+        hir::AssignmentOperator::BitwiseAndAssign => mir::BinaryOperator::BitwiseAnd,
+        hir::AssignmentOperator::BitwiseOrAssign => mir::BinaryOperator::BitwiseOr,
+        hir::AssignmentOperator::BitwiseXorAssign => mir::BinaryOperator::BitwiseXor,
+        hir::AssignmentOperator::ShiftLeftAssign => mir::BinaryOperator::ShiftLeft,
+        hir::AssignmentOperator::ShiftRightAssign => mir::BinaryOperator::ShiftRight,
+        hir::AssignmentOperator::UnsignedShiftRightAssign => {
+            mir::BinaryOperator::UnsignedShiftRight
+        }
         hir::AssignmentOperator::Assign => unreachable!("plain assignment has no binary operator"),
     }
 }
@@ -1823,7 +1831,12 @@ macro_rules! convert_operator {
     };
 }
 
-convert_operator!(unary, hir::UnaryOperator, mir::UnaryOperator, [Not, Negate]);
+convert_operator!(
+    unary,
+    hir::UnaryOperator,
+    mir::UnaryOperator,
+    [Not, Negate, BitwiseNot]
+);
 convert_operator!(
     binary,
     hir::BinaryOperator,
@@ -1841,6 +1854,12 @@ convert_operator!(
         Equal,
         NotEqual,
         LogicalAnd,
-        LogicalOr
+        LogicalOr,
+        BitwiseAnd,
+        BitwiseOr,
+        BitwiseXor,
+        ShiftLeft,
+        ShiftRight,
+        UnsignedShiftRight
     ]
 );

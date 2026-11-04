@@ -1,0 +1,48 @@
+// Bitwise and shift operators: a small ability-flags program.
+// Run with: aster run examples/bitwise_flags.aster
+
+const int CAN_JUMP = 1;
+const int CAN_RUN = 2;
+const int CAN_ATTACK = 4;
+
+public bool Has(int abilities, int flag)
+{
+    // `&` binds more loosely than `!=`, so the parentheses are required.
+    return (abilities & flag) != 0;
+}
+
+public class Program
+{
+    public static int Main()
+    {
+        int abilities = CAN_JUMP | CAN_ATTACK;
+        Log("jump=" + Has(abilities, CAN_JUMP).ToString()
+            + " run=" + Has(abilities, CAN_RUN).ToString()
+            + " attack=" + Has(abilities, CAN_ATTACK).ToString());
+
+        abilities |= CAN_RUN;
+        abilities &= ~CAN_JUMP;
+        abilities ^= CAN_ATTACK;
+        Log("after edits: " + abilities.ToString());
+
+        // Packing and unpacking two 16-bit values in one uint.
+        ushort high = 513;
+        ushort low = 7;
+        uint packed = ((uint)high << 16) | low;
+        uint unpackedHigh = packed >> 16;
+        uint unpackedLow = packed & 65535U;
+        Log("packed=" + packed.ToString()
+            + " high=" + unpackedHigh.ToString()
+            + " low=" + unpackedLow.ToString());
+
+        // Arithmetic versus logical right shift on a negative value.
+        int negative = -8;
+        Log("arithmetic=" + (negative >> 1).ToString()
+            + " logical=" + (negative >>> 1).ToString());
+
+        // The shift count is masked to the operand width.
+        Log("1 << 33 = " + (1 << 33).ToString());
+
+        return abilities;
+    }
+}

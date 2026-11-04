@@ -945,6 +945,29 @@ fn fold_unary(
         (mir::UnaryOperator::Negate, mir::Constant::Integer(value)) => {
             fold_integer_negate(type_, value)
         }
+        (mir::UnaryOperator::BitwiseNot, mir::Constant::Integer(value)) => {
+            fold_integer_complement(type_, value)
+        }
+        _ => None,
+    }
+}
+
+fn fold_integer_complement(type_: &mir::Type, value: &str) -> Option<mir::Constant> {
+    macro_rules! complement {
+        ($integer:ty) => {{
+            let value = value.parse::<$integer>().ok()?;
+            Some(mir::Constant::Integer((!value).to_string()))
+        }};
+    }
+    match type_ {
+        mir::Type::SByte => complement!(i8),
+        mir::Type::Byte => complement!(u8),
+        mir::Type::Short => complement!(i16),
+        mir::Type::UShort => complement!(u16),
+        mir::Type::Int => complement!(i32),
+        mir::Type::UInt => complement!(u32),
+        mir::Type::Long => complement!(i64),
+        mir::Type::ULong => complement!(u64),
         _ => None,
     }
 }
@@ -986,8 +1009,12 @@ fn fold_binary(
             let value = match operator {
                 mir::BinaryOperator::Equal => *left == *right,
                 mir::BinaryOperator::NotEqual => *left != *right,
-                mir::BinaryOperator::LogicalAnd => *left && *right,
-                mir::BinaryOperator::LogicalOr => *left || *right,
+                // Both operands are constants, so eager and lazy agree here.
+                mir::BinaryOperator::LogicalAnd | mir::BinaryOperator::BitwiseAnd => {
+                    *left && *right
+                }
+                mir::BinaryOperator::LogicalOr | mir::BinaryOperator::BitwiseOr => *left || *right,
+                mir::BinaryOperator::BitwiseXor => *left ^ *right,
                 _ => return None,
             };
             Some(mir::Constant::Boolean(value))
@@ -999,6 +1026,12 @@ fn fold_binary(
     }
 }
 
+#[allow(
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)] // Shift counts and signed/unsigned views are masked or reinterpreted on purpose.
 fn fold_integer_binary(
     type_: &mir::Type,
     operator: mir::BinaryOperator,
@@ -1006,10 +1039,36 @@ fn fold_integer_binary(
     right: &str,
 ) -> Option<mir::Constant> {
     macro_rules! integer {
-        ($integer:ty) => {{
+        ($integer:ty, $unsigned:ty) => {{
             let left = left.parse::<$integer>().ok()?;
             let right = right.parse::<$integer>().ok()?;
+            // Shifts only exist for 32- and 64-bit operands (narrower operands
+            // are promoted first) and mask the count to the operand width.
+            let shiftable = <$integer>::BITS >= 32;
             match operator {
+                mir::BinaryOperator::BitwiseAnd => {
+                    Some(mir::Constant::Integer((left & right).to_string()))
+                }
+                mir::BinaryOperator::BitwiseOr => {
+                    Some(mir::Constant::Integer((left | right).to_string()))
+                }
+                mir::BinaryOperator::BitwiseXor => {
+                    Some(mir::Constant::Integer((left ^ right).to_string()))
+                }
+                mir::BinaryOperator::ShiftLeft if shiftable => Some(mir::Constant::Integer(
+                    left.wrapping_shl(right as u32).to_string(),
+                )),
+                mir::BinaryOperator::ShiftRight if shiftable => Some(mir::Constant::Integer(
+                    left.wrapping_shr(right as u32).to_string(),
+                )),
+                mir::BinaryOperator::UnsignedShiftRight if shiftable => {
+                    Some(mir::Constant::Integer(
+                        ((left as $unsigned).wrapping_shr(right as u32) as $integer).to_string(),
+                    ))
+                }
+                mir::BinaryOperator::ShiftLeft
+                | mir::BinaryOperator::ShiftRight
+                | mir::BinaryOperator::UnsignedShiftRight => None,
                 mir::BinaryOperator::Multiply => {
                     Some(mir::Constant::Integer(left.wrapping_mul(right).to_string()))
                 }
@@ -1033,14 +1092,14 @@ fn fold_integer_binary(
         }};
     }
     match type_ {
-        mir::Type::SByte => integer!(i8),
-        mir::Type::Byte => integer!(u8),
-        mir::Type::Short => integer!(i16),
-        mir::Type::UShort => integer!(u16),
-        mir::Type::Int => integer!(i32),
-        mir::Type::UInt => integer!(u32),
-        mir::Type::Long => integer!(i64),
-        mir::Type::ULong => integer!(u64),
+        mir::Type::SByte => integer!(i8, u8),
+        mir::Type::Byte => integer!(u8, u8),
+        mir::Type::Short => integer!(i16, u16),
+        mir::Type::UShort => integer!(u16, u16),
+        mir::Type::Int => integer!(i32, u32),
+        mir::Type::UInt => integer!(u32, u32),
+        mir::Type::Long => integer!(i64, u64),
+        mir::Type::ULong => integer!(u64, u64),
         _ => None,
     }
 }
@@ -1075,7 +1134,13 @@ fn fold_float_binary(
                 mir::BinaryOperator::NotEqual => Some(mir::Constant::Boolean(left != right)),
                 mir::BinaryOperator::Remainder
                 | mir::BinaryOperator::LogicalAnd
-                | mir::BinaryOperator::LogicalOr => None,
+                | mir::BinaryOperator::LogicalOr
+                | mir::BinaryOperator::BitwiseAnd
+                | mir::BinaryOperator::BitwiseOr
+                | mir::BinaryOperator::BitwiseXor
+                | mir::BinaryOperator::ShiftLeft
+                | mir::BinaryOperator::ShiftRight
+                | mir::BinaryOperator::UnsignedShiftRight => None,
             }
         }};
     }

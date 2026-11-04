@@ -106,17 +106,27 @@ pub enum TokenKind {
     BangEqual,
     AndAnd,
     OrOr,
+    Ampersand,
+    Pipe,
+    Caret,
+    Tilde,
+    LessLess,
     Equal,
     FatArrow,
     PlusEqual,
     MinusEqual,
     StarEqual,
     SlashEqual,
+    AmpersandEqual,
+    PipeEqual,
+    CaretEqual,
+    LessLessEqual,
     Eof,
 }
 
 impl TokenKind {
     #[must_use]
+    #[allow(clippy::too_many_lines)] // One arm per token kind.
     pub fn description(&self) -> &'static str {
         match self {
             Self::Public => "`public`",
@@ -207,12 +217,21 @@ impl TokenKind {
             Self::BangEqual => "`!=`",
             Self::AndAnd => "`&&`",
             Self::OrOr => "`||`",
+            Self::Ampersand => "`&`",
+            Self::Pipe => "`|`",
+            Self::Caret => "`^`",
+            Self::Tilde => "`~`",
+            Self::LessLess => "`<<`",
             Self::Equal => "`=`",
             Self::FatArrow => "`=>`",
             Self::PlusEqual => "`+=`",
             Self::MinusEqual => "`-=`",
             Self::StarEqual => "`*=`",
             Self::SlashEqual => "`/=`",
+            Self::AmpersandEqual => "`&=`",
+            Self::PipeEqual => "`|=`",
+            Self::CaretEqual => "`^=`",
+            Self::LessLessEqual => "`<<=`",
             Self::Eof => "end of file",
         }
     }

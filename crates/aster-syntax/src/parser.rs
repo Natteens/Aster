@@ -56,6 +56,16 @@ struct FunctionModifiers {
     is_foreign: bool,
 }
 
+/// A run of directly adjacent `>` characters, as seen by the expression parser.
+struct GreaterRun {
+    /// Number of `>` characters, counting a trailing `>=` as one.
+    characters: usize,
+    /// Whether the run ends with `=` (a `>=`, `>>=`, or `>>>=` operator).
+    equals: bool,
+    /// Number of lexer tokens the run occupies.
+    tokens: usize,
+}
+
 impl Parser {
     fn with_nesting<T>(&mut self, parse: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
         if self.nesting_depth >= MAX_SOURCE_NESTING {
@@ -1267,17 +1277,36 @@ impl Parser {
     fn assignment_expression(&mut self) -> Option<Expression> {
         let target = self.conditional()?;
         let operator = match self.current().kind {
-            TokenKind::Equal => Some(AssignmentOperator::Assign),
-            TokenKind::PlusEqual => Some(AssignmentOperator::AddAssign),
-            TokenKind::MinusEqual => Some(AssignmentOperator::SubtractAssign),
-            TokenKind::StarEqual => Some(AssignmentOperator::MultiplyAssign),
-            TokenKind::SlashEqual => Some(AssignmentOperator::DivideAssign),
+            TokenKind::Equal => Some((AssignmentOperator::Assign, 1)),
+            TokenKind::PlusEqual => Some((AssignmentOperator::AddAssign, 1)),
+            TokenKind::MinusEqual => Some((AssignmentOperator::SubtractAssign, 1)),
+            TokenKind::StarEqual => Some((AssignmentOperator::MultiplyAssign, 1)),
+            TokenKind::SlashEqual => Some((AssignmentOperator::DivideAssign, 1)),
+            TokenKind::AmpersandEqual => Some((AssignmentOperator::BitwiseAndAssign, 1)),
+            TokenKind::PipeEqual => Some((AssignmentOperator::BitwiseOrAssign, 1)),
+            TokenKind::CaretEqual => Some((AssignmentOperator::BitwiseXorAssign, 1)),
+            TokenKind::LessLessEqual => Some((AssignmentOperator::ShiftLeftAssign, 1)),
+            TokenKind::Greater | TokenKind::GreaterEqual => match self.greater_run() {
+                GreaterRun {
+                    characters: 2,
+                    equals: true,
+                    tokens,
+                } => Some((AssignmentOperator::ShiftRightAssign, tokens)),
+                GreaterRun {
+                    characters: 3,
+                    equals: true,
+                    tokens,
+                } => Some((AssignmentOperator::UnsignedShiftRightAssign, tokens)),
+                _ => None,
+            },
             _ => None,
         };
-        let Some(operator) = operator else {
+        let Some((operator, tokens)) = operator else {
             return Some(target);
         };
-        self.advance();
+        for _ in 0..tokens {
+            self.advance();
+        }
         let value = self.with_nesting(Self::assignment_expression)?;
         let span = Span::new(target.span.start, value.span.end);
         Some(Expression {
@@ -1402,8 +1431,29 @@ impl Parser {
 
     fn logical_and(&mut self) -> Option<Expression> {
         self.binary_level(
-            Self::equality,
+            Self::bitwise_or,
             &[(TokenKind::AndAnd, BinaryOperator::LogicalAnd)],
+        )
+    }
+
+    fn bitwise_or(&mut self) -> Option<Expression> {
+        self.binary_level(
+            Self::bitwise_xor,
+            &[(TokenKind::Pipe, BinaryOperator::BitwiseOr)],
+        )
+    }
+
+    fn bitwise_xor(&mut self) -> Option<Expression> {
+        self.binary_level(
+            Self::bitwise_and,
+            &[(TokenKind::Caret, BinaryOperator::BitwiseXor)],
+        )
+    }
+
+    fn bitwise_and(&mut self) -> Option<Expression> {
+        self.binary_level(
+            Self::equality,
+            &[(TokenKind::Ampersand, BinaryOperator::BitwiseAnd)],
         )
     }
 
@@ -1418,15 +1468,80 @@ impl Parser {
     }
 
     fn comparison(&mut self) -> Option<Expression> {
-        self.binary_level(
-            Self::term,
-            &[
-                (TokenKind::Less, BinaryOperator::Less),
-                (TokenKind::LessEqual, BinaryOperator::LessEqual),
-                (TokenKind::Greater, BinaryOperator::Greater),
-                (TokenKind::GreaterEqual, BinaryOperator::GreaterEqual),
-            ],
-        )
+        self.binary_level_by(Self::shift, |parser| match parser.current().kind {
+            TokenKind::Less => Some((BinaryOperator::Less, 1)),
+            TokenKind::LessEqual => Some((BinaryOperator::LessEqual, 1)),
+            // A lone `>` or `>=` only: a longer run of adjacent `>` is a shift.
+            TokenKind::Greater | TokenKind::GreaterEqual => match parser.greater_run() {
+                GreaterRun {
+                    characters: 1,
+                    equals: false,
+                    ..
+                } => Some((BinaryOperator::Greater, 1)),
+                GreaterRun {
+                    characters: 1,
+                    equals: true,
+                    ..
+                } => Some((BinaryOperator::GreaterEqual, 1)),
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
+    /// `<<`, `>>`, and `>>>`. The lexer never merges `>` characters, because a
+    /// nested generic argument list such as `List<List<int>>` closes with
+    /// consecutive `>` tokens; the right shifts are recognized here, in
+    /// operator position only, from adjacent tokens.
+    fn shift(&mut self) -> Option<Expression> {
+        self.binary_level_by(Self::term, |parser| match parser.current().kind {
+            TokenKind::LessLess => Some((BinaryOperator::ShiftLeft, 1)),
+            TokenKind::Greater => match parser.greater_run() {
+                GreaterRun {
+                    characters: 2,
+                    equals: false,
+                    tokens,
+                } => Some((BinaryOperator::ShiftRight, tokens)),
+                GreaterRun {
+                    characters: 3,
+                    equals: false,
+                    tokens,
+                } => Some((BinaryOperator::UnsignedShiftRight, tokens)),
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
+    /// Measures the run of directly adjacent `>` tokens starting at the
+    /// current token (whitespace between tokens ends the run). A final `>=`
+    /// token counts as one `>` character plus a trailing `=`.
+    fn greater_run(&self) -> GreaterRun {
+        let mut run = GreaterRun {
+            characters: 0,
+            equals: false,
+            tokens: 0,
+        };
+        let mut offset = 0;
+        loop {
+            let token = self.peek(offset);
+            match token.kind {
+                TokenKind::Greater => {}
+                TokenKind::GreaterEqual => {
+                    run.characters += 1;
+                    run.equals = true;
+                    run.tokens += 1;
+                    return run;
+                }
+                _ => return run,
+            }
+            run.characters += 1;
+            run.tokens += 1;
+            if self.peek(offset + 1).span.start != token.span.end {
+                return run;
+            }
+            offset += 1;
+        }
     }
 
     fn term(&mut self) -> Option<Expression> {
@@ -1455,10 +1570,27 @@ impl Parser {
         operand: fn(&mut Self) -> Option<Expression>,
         operators: &[(TokenKind, BinaryOperator)],
     ) -> Option<Expression> {
+        self.binary_level_by(operand, |parser| {
+            operators
+                .iter()
+                .find(|(token, _)| parser.at(token))
+                .map(|(_, operator)| (*operator, 1))
+        })
+    }
+
+    /// One left-associative level. `matcher` reports the operator at the
+    /// current position and how many tokens it spans.
+    fn binary_level_by(
+        &mut self,
+        operand: fn(&mut Self) -> Option<Expression>,
+        matcher: impl Fn(&Self) -> Option<(BinaryOperator, usize)>,
+    ) -> Option<Expression> {
         let mut expression = operand(self)?;
-        while let Some((_, operator)) = operators.iter().find(|(token, _)| self.at(token)) {
-            let operator = *operator;
+        while let Some((operator, tokens)) = matcher(self) {
             let operator_span = self.advance().span;
+            for _ in 1..tokens {
+                self.advance();
+            }
             let right = operand(self)?;
             let span = Span::new(expression.span.start, right.span.end);
             expression = Expression {
@@ -1519,6 +1651,7 @@ impl Parser {
         let operator = match self.current().kind {
             TokenKind::Bang => Some(UnaryOperator::Not),
             TokenKind::Minus => Some(UnaryOperator::Negate),
+            TokenKind::Tilde => Some(UnaryOperator::BitwiseNot),
             _ => None,
         };
         if let Some(operator) = operator {
@@ -1678,6 +1811,14 @@ impl Parser {
                     | TokenKind::GreaterEqual
                     | TokenKind::AndAnd
                     | TokenKind::OrOr
+                    | TokenKind::Ampersand
+                    | TokenKind::Pipe
+                    | TokenKind::Caret
+                    | TokenKind::LessLess
+                    | TokenKind::AmpersandEqual
+                    | TokenKind::PipeEqual
+                    | TokenKind::CaretEqual
+                    | TokenKind::LessLessEqual
                     | TokenKind::Equal
                     | TokenKind::PlusEqual
                     | TokenKind::MinusEqual

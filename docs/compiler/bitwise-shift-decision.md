@@ -1,13 +1,18 @@
 # Decision record: bitwise and shift operators
 
-**Status: PROPOSED — awaiting maintainer approval.** Nothing in this record is implemented. Every
-ASTER snippet below that uses `&`, `|`, `^`, `~`, `<<`, `>>`, or `>>>` is *proposed syntax* and does
-not compile today. Approving this record does not change the language; it authorizes the
-implementation work in section 9.
+**Status: ACCEPTED and implemented.** The maintainer delegated the decision and approved D1–D8 as
+proposed. D9 (hexadecimal and binary literals) and D10 (ASTER's unary `-` on small integers) are
+separate future decisions and are not changed here. The operators described below are implemented
+through the whole pipeline: lexer, parser, semantic analysis, HIR, MIR, optimizer, backend
+validation, and the Cranelift JIT. Sections 2 and 3 record the situation and reasoning at the time
+of the proposal (baseline `28d284363a9658e972a00c3bc06500b3c89201ae`); section 9 describes how the
+feature was built. The canonical behavior now lives in the
+[types](../specification/02-types.md) and [expressions](../specification/04-expressions.md)
+specifications and the [operators](../reference/operators.md) reference.
 
 | | |
 | --- | --- |
-| Baseline | `28d284363a9658e972a00c3bc06500b3c89201ae`, workspace version 0.67.3 |
+| Proposal baseline | `28d284363a9658e972a00c3bc06500b3c89201ae`, workspace version 0.67.3 |
 | Origin | P1-2 and capability C05 of the [core readiness audit](core-readiness-audit.md) |
 | Related | [standard library extension contract](standard-library-extension.md), [types](../specification/02-types.md), [expressions](../specification/04-expressions.md), [compatibility policy](../reference/compatibility.md) |
 | C# references | [Bitwise and shift operators](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/operators/bitwise-and-shift-operators), [C# language specification, expressions](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/expressions) |
@@ -19,7 +24,7 @@ integers, hash, or implement bit-level algorithms. The standard library already 
 `aster.random.Random` calls the compiler-known intrinsic `__RandomMix` because the SplitMix64
 output function cannot be written in ASTER (see section 8).
 
-## 2. Current behavior (authority: the repository)
+## 2. Behavior before this feature (at the proposal baseline)
 
 - **Lexer** (`crates/aster-syntax/src/lexer.rs`): `&&` and `||` are tokens. A single `&` or `|` is a
   lexical error with the help "use `&&` for a logical operator". `^`, `~`, `<<`, and `>>` do not
@@ -56,7 +61,7 @@ output function cannot be written in ASTER (see section 8).
 
 Add the C# set, with C# semantics, adapted only where ASTER's existing guarantees require it.
 
-| Operator | Meaning | Proposed |
+| Operator | Meaning | Decision |
 | --- | --- | --- |
 | `&`, `\|`, `^` | bitwise AND / OR / XOR on integers; eager logical on `bool` | include |
 | `~` | bitwise complement | include |
@@ -117,7 +122,7 @@ should follow C# (recommended) or the current unary `-` behavior.
   bits and returns the signed promoted type.
 - Shifts never overflow and never fail at runtime. Debug and release behave identically.
 
-### 4.4 Examples of typing outcomes (proposed)
+### 4.4 Examples of typing outcomes
 
 | Expression | Operand types | Result |
 | --- | --- | --- |
@@ -194,7 +199,7 @@ record.
 
 ## 7. Comparison with C#
 
-| Operation | C# behavior | Proposed ASTER | Relationship |
+| Operation | C# behavior | ASTER | Relationship |
 | --- | --- | --- | --- |
 | `&` `\|` `^` on integers | Defined for `int`, `uint`, `long`, `ulong`; smaller types convert to `int`; mixed types go to the closest containing type | Same, using `aster_types::promote` | Compatible |
 | `int` with `uint` | `long` | `long` | Compatible |
@@ -224,11 +229,11 @@ z = (z ^ (z >> 27)) * 0x94D049BB133111EB
 return z ^ (z >> 31)        // all arithmetic wraps modulo 2^64
 ```
 
-**The proposed operator set is sufficient.** The function needs only `ulong ^`, `ulong >>` by
+**The accepted operator set is sufficient.** The function needs only `ulong ^`, `ulong >>` by
 constants 30, 27, and 31 (logical, because the operand is unsigned), and `ulong *`, which already
 wraps. The constants fit as decimal `ulong` literals: `0xBF58476D1CE4E5B9` is
 `13787848793156543929` and `0x94D049BB133111EB` is `10723151780598845931`. A future replacement
-would look like this (**proposed; not executable today**):
+looks like this (it compiles and runs today; `Random` still uses `__RandomMix`):
 
 ```aster
 internal ulong Mix(ulong value)
@@ -240,11 +245,14 @@ internal ulong Mix(ulong value)
 ```
 
 This formula was checked against the repository rather than assumed: an independent Python
-implementation of the above reproduces the actual `Random(seed).NextULong()` output of the current
-build for the first three values of seeds `0`, `1`, `123`, and `18446744073709551615`. `>>>` and
+implementation of the above reproduced the actual `Random(seed).NextULong()` output for the first
+three values of seeds `0`, `1`, `123`, and `18446744073709551615`, and the test
+`splitmix64_is_expressible_and_matches_the_library_generator` in
+`crates/aster-codegen-cranelift/tests/bitwise_shift.rs` compares the ASTER function above with the
+library generator for 16 outputs of each of those seeds. `>>>` and
 `>>` on signed types are not needed.
 
-Requirements for the future migration (a separate PR; `__RandomMix` is not replaced here):
+Requirements for the migration (a separate PR; `__RandomMix` is not replaced by this feature):
 
 - keep the documented sequence bit-for-bit, with fixed-seed equivalence tests (including the
   seeds above and edge states) that compare the ASTER implementation with the retained
@@ -254,58 +262,39 @@ Requirements for the future migration (a separate PR; `__RandomMix` is not repla
   [extension contract](standard-library-extension.md);
 - measure `NextULong` before and after; no performance claim is made here.
 
-## 9. Implementation plan (future work)
+## 9. Implementation
 
-The roadmap rule applies: a feature is complete only when syntax, semantics, HIR, MIR, the JIT,
-diagnostics, tests, and a usable example agree. The smallest vertical path, in dependency order:
+The roadmap rule applied: the feature landed as one vertical change in which syntax, semantics, HIR,
+MIR, the JIT, diagnostics, tests, documentation, and an example agree.
 
-1. **Syntax.** New lexer tokens as in section 5 (keep `>` single); `ast::BinaryOperator`,
-   `ast::UnaryOperator`, and `ast::AssignmentOperator` members; the parser precedence ladder;
-   adjacent-`>` composition in operator position; extend `at_try_propagation`; replace the
-   "use `&&`" lexer help with a message that matches the new tokens.
-2. **Semantic analysis.** New arms in `binary` (integer promotion through `promoted_numeric`,
-   eager `bool`, shifts with their own count rule), unary `~`, the compound-assignment check
-   (including a `bool` case), and `constexpr.rs` evaluation with truncating semantics.
-3. **HIR.** New operator members and `convert_operator!` entries; operand conversion to the
-   promoted type as for other binary operators. Convert a shift count to the promoted *left* type:
-   because only the low 5 or 6 bits matter and widening preserves them, this keeps the MIR
-   invariant that both operands of a binary operation have one type and preserves C# masking.
-4. **MIR.** New `mir::BinaryOperator` and `mir::UnaryOperator` members and lowering. Review every
-   exhaustive match (optimizer folding, escape and lifetime analysis, validation); leaving an
-   operation unfolded is always safe, so folding can follow later.
-5. **Cranelift.** `band`, `bor`, `bxor`, `bnot` on integers and booleans; `ishl`, `sshr`, `ushr` by
-   operator and signedness. Shifts and `~` must only ever see 32- and 64-bit values because
-   promotion removes the 8- and 16-bit cases; add backend validation that rejects any narrower
-   shift or complement fail-closed. This matters: the earlier float-to-narrow-integer cast crash
-   showed that Cranelift's x64 backend panics on some 8- and 16-bit shapes.
-6. **Tests.** Extend the numeric conformance matrix (all pairs: HIR operands and result types, MIR
-   operand widths, rejected pairs, diagnostics), add JIT boundary tables (counts `0`, `1`, `31`,
-   `32`, `33`, `63`, `64`, `65`, `-1`, `-32` for every shiftable type; complement and mixed
-   promotions; eager `bool`), compare constant folding against runtime evaluation, run debug and
-   release, and add parser regressions for `List<List<int>>`, `Dictionary<string, List<int>>`, and
-   generic calls next to shift expressions.
-7. **Docs and examples.** Update the specification chapters, grammar, reference, compatibility
-   notes, and add an example, only in the PR that makes the operators work.
-8. **Migrate `Random`.** Separate PR after the feature lands, per section 8.
+| Layer | Responsibility |
+| --- | --- |
+| Lexer (`aster-syntax`) | New tokens `&`, `\|`, `^`, `~`, `<<`, `&=`, `\|=`, `^=`, `<<=`. A single `>` is never merged with a following `>`, so `List<List<int>>` still closes. The old "use `&&`" error for a lone `&` or `\|` is gone. |
+| Parser | New precedence levels (`\|`, `^`, `&` between `&&` and equality; shifts between comparison and additive). `>>`, `>>>`, `>>=`, and `>>>=` are recognized in operator position from directly adjacent `>`/`>=` tokens (`greater_run`); comparison accepts only a lone `>` or `>=`. The postfix-`?` follow set includes the new binary operators. |
+| `aster-types` | `promote_unary` (small integers become `int`) next to the existing `promote`; no second promotion table. |
+| Semantic analysis | `binary`, unary `~`, and `assignment_types` reuse `promote`/`promote_unary`; shift counts are checked separately against `implicit_converts(_, int)`; compound forms keep the strict "operation type must equal the target" rule. |
+| Constants | `constexpr.rs` evaluates the new operators with truncating two's-complement semantics and no overflow diagnostics; shift counts are masked. |
+| HIR lowering | Binary operands convert to the promoted type; a shift promotes only its left operand and converts the count to that type, so negative counts keep their low bits and MIR keeps one type per binary operation. `~` converts its operand to the promoted type. |
+| MIR | `BitwiseAnd/Or/Xor`, `ShiftLeft/Right`, `UnsignedShiftRight`, and `BitwiseNot`; the optimizer folds them with wrapping semantics (shifts only for 32/64-bit operands). |
+| Backend validation | Shifts and complement are accepted only on `int`, `uint`, `long`, `ulong`; `&`, `\|`, `^` also on `bool` and the other integers; floats and references are rejected before code generation. |
+| Cranelift | Direct `band`, `bor`, `bxor`, `bnot`, `ishl`, and `sshr`/`ushr` (by signedness, and `ushr` for `>>>`). Cranelift masks the count to the operand width, which is the specified behavior. No runtime helper, allocation, or call is involved. |
 
-**Sequencing.** Steps 1–7 should land together (or behind a build that rejects the new tokens until
-the backend exists), because a half-implemented operator would violate the fail-closed rule.
-Step 8 depends on them.
+Because promotion removes every 8- and 16-bit operand before MIR, those shapes can never reach
+Cranelift's x64 backend for shifts or complement, and validation rejects them if hand-built MIR
+tries (the earlier float-to-narrow-integer cast crash was a shape of this kind).
 
-**Risks.**
+### Intentional differences from C#
 
-- *`>` tokenization.* Merging `>>` in the lexer would break nested generics; the adjacency rule
-  must be tested thoroughly, including `generic_call_ahead` lookahead.
-- *Precedence regressions.* New ladder levels touch every expression; the existing parser and
-  conformance tests should pass unchanged.
-- *MIR consumers.* Passes that match operators exhaustively must not treat a new operator as an
-  arithmetic one.
-- *Backend narrow types.* Guard against 8- and 16-bit shifts reaching Cranelift (item 5).
-- *Constants.* Truncating constant shifts differ from checked arithmetic and must be documented.
-- *Ergonomics.* No hexadecimal or binary literals means masks are written in decimal; hex literals
-  are a separate, already-open decision that this feature makes more valuable.
+1. **`char` operands are rejected.** ASTER's `char` is a non-numeric Unicode scalar; write `(int)c`.
+2. **Compound assignment never narrows implicitly.** `byte b |= 1;` and `ushort w <<= 1;` are
+   errors ("would narrow `int` to `byte`"); write `b = (byte)(b | 1);`. C# narrows implicitly.
 
-## 10. Proposed examples (not executable today)
+Remaining limitations: there are no hexadecimal or binary literals (D9), ASTER's unary `-` on a
+small signed integer still keeps its type while C# promotes (D10), and generic type-argument
+discovery still infers the left operand's type for a binary expression, as it already did for
+arithmetic.
+
+## 10. Examples
 
 ```aster
 int a = 5;
@@ -368,13 +357,15 @@ Expected results, computed independently of any ASTER build:
 | `(short)-1 << 16` | `int` | `-65536` |
 | `true & false`, `true \| false`, `true ^ true` | `bool` | `false`, `true`, `false` |
 
-Rejected (proposed diagnostics): `1.5 & 2`, `"a" | "b"`, `'a' & 'b'`, `1 << 3L`, `1 << 3U`,
+Rejected (with the diagnostics listed in the tests): `1.5 & 2`, `"a" | "b"`, `'a' & 'b'`, `1 << 3L`, `1 << 3U`,
 `long & ulong`, `int & ulong`, `~true`, `~1.5`, `true << 1`, `byte b; b |= 1;` (would narrow
 `int` to `byte`).
 
-## 11. Decisions requested
+## 11. Decisions
 
-| ID | Question | Recommendation |
+The maintainer approved D1–D8 as recommended below and kept D9 and D10 as separate future tasks.
+
+| ID | Question | Outcome |
 | --- | --- | --- |
 | D1 | Include `>>>` and `>>>=`? | Include; it is separable and not needed by `Random` |
 | D2 | Include eager `&`, `\|`, `^` on `bool`? | Include |

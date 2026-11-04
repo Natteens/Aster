@@ -1130,6 +1130,7 @@ pub enum Constant {
 pub enum UnaryOperator {
     Not,
     Negate,
+    BitwiseNot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1147,6 +1148,12 @@ pub enum BinaryOperator {
     NotEqual,
     LogicalAnd,
     LogicalOr,
+    BitwiseAnd,
+    BitwiseOr,
+    BitwiseXor,
+    ShiftLeft,
+    ShiftRight,
+    UnsignedShiftRight,
 }
 
 impl fmt::Display for Module {

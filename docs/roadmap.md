@@ -14,6 +14,8 @@ The current toolchain includes:
 - arrays, `List<T>`, `Dictionary<K, V>`, `Option<T>`, `Result<T, E>`, and compiler-known `foreach`;
 - contextual `[]` and `new()`, expression-bodied callables, inferred `foreach` elements, checked
   `List<T>` indexing, named arguments, and compile-time default parameters;
+- C#-style bitwise and shift operators (`& | ^ ~ << >> >>>` and their compound forms) on integers,
+  with eager `&`, `|`, `^` on `bool`;
 - immutable UTF-8 strings with Unicode-scalar `char`, scalar-counting `Length`, and `foreach` iteration;
 - practical strict scalar parsing, ordinal Unicode text helpers, scalar math/classification,
   deterministic seeded random, clock reads, bulk collection helpers, and compact assertions;

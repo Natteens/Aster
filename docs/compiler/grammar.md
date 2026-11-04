@@ -109,12 +109,16 @@ switch-expression-case = [ identifier , "." ] , identifier , [ "(" , identifiers
                          "=>" , assignment ;
 switch-expression-default = "default" , "=>" , assignment ;
 logical-or          = logical-and , { "||" , logical-and } ;
-logical-and         = equality , { "&&" , equality } ;
+logical-and         = bitwise-or , { "&&" , bitwise-or } ;
+bitwise-or          = bitwise-xor , { "|" , bitwise-xor } ;
+bitwise-xor         = bitwise-and , { "^" , bitwise-and } ;
+bitwise-and         = equality , { "&" , equality } ;
 equality            = comparison , { ( "==" | "!=" ) , comparison } ;
-comparison          = additive , { ( "<" | "<=" | ">" | ">=" ) , additive } ;
+comparison          = shift , { ( "<" | "<=" | ">" | ">=" ) , shift } ;
+shift               = additive , { ( "<<" | ">>" | ">>>" ) , additive } ;
 additive            = multiplicative , { ( "+" | "-" ) , multiplicative } ;
 multiplicative      = unary , { ( "*" | "/" | "%" ) , unary } ;
-unary               = ( "!" | "-" | "++" | "--" | "await" ) , unary | cast | postfix ;
+unary               = ( "!" | "-" | "~" | "++" | "--" | "await" ) , unary | cast | postfix ;
 cast                = "(" , value-type , ")" , unary ;
 value-type          = "sbyte" | "byte" | "short" | "ushort" | "int" | "uint"
                     | "long" | "ulong" | "float" | "double" | "decimal" | "char" ;
@@ -132,7 +136,8 @@ array-literal       = "[" , [ expression , { "," , expression } ] , "]" ;
 new-array           = "new" , element-type , "[" , expression , "]" ;
 new-object          = "new" , [ named-type ] , arguments ;
 enum-value          = named-type , "." , identifier , [ arguments ] ;
-assignment-op       = "=" | "+=" | "-=" | "*=" | "/=" ;
+assignment-op       = "=" | "+=" | "-=" | "*=" | "/=" | "&=" | "|=" | "^="
+                    | "<<=" | ">>=" | ">>>=" ;
 literal             = integer , [ "L" | "l" | "U" | "u" | unsigned-long-suffix ]
                     | ( integer | float ) , ( "f" | "F" | "d" | "D" )
                     | ( integer | float ) , ( "m" | "M" )
@@ -160,8 +165,13 @@ produce migration diagnostics.
 Assignment and the conditional expression `?:` are right-associative. All other implemented
 binary operators are left-associative with precedence shown from lowest to highest in the
 grammar. The full precedence order, from lowest to highest, is: assignment, conditional `?:`,
-`||`, `&&`, equality, comparison, additive, multiplicative, unary (including prefix `++`/`--`),
-and postfix (member access, calls, postfix `++`/`--`, and `?`).
+`||`, `&&`, `|`, `^`, `&`, equality, comparison, shift, additive, multiplicative, unary (including
+`~` and prefix `++`/`--`), and postfix (member access, calls, postfix `++`/`--`, and `?`).
+
+The lexer produces `<<`, `<<=`, `&=`, `|=`, and `^=` as single tokens but never merges `>`
+characters, because nested generic argument lists close with consecutive `>` tokens. The expression
+parser recognizes `>>`, `>>>`, `>>=`, and `>>>=` only in operator position, from `>` tokens (and a
+final `>=`) with no whitespace between them. A comparison accepts only a lone `>` or `>=`.
 
 A trailing `?` in postfix position is the `Result` propagation operator
 (`docs/reference/result-propagation.md`), distinct from the ternary `?:`. It is
