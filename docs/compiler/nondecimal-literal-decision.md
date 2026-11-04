@@ -274,10 +274,11 @@ typing, numeric promotion, the implicit-conversion table, or any existing diagno
 
 ## 14. Known limitations found during implementation
 
-- Passing an `int` literal (decimal or prefixed) as the argument of a `ulong` or `uint` parameter,
-  for example `F(0)` where `F(ulong seed)`, makes the compiler panic with "validated call is missing
-  lowering metadata". It is independent of this feature (a decimal `F(123)` fails the same way) and is
-  not changed here; use an exactly typed argument such as `F(0UL)`.
+- Passing an `int` constant (decimal or prefixed) as the argument of a `ulong` or `uint` parameter,
+  for example `F(0)` where `F(ulong seed)`, used to make the compiler panic with "validated call is
+  missing lowering metadata". It was independent of this feature (a decimal `F(123)` failed the same
+  way) and has been fixed separately: overload resolution now treats an integer constant that fits
+  the parameter as applicable, ranked below every implicit conversion.
 - A `ulong` operand does not join an `int` literal even when the value is small
   (`0xFFFFFFFFFFFFFFFF ^ 0xFF` is rejected); write `0xFFUL`. This is the existing absence of constant
   adaptation (decision D7).

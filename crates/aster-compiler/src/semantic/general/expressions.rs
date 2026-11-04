@@ -1812,41 +1812,51 @@ impl Analyzer<'_> {
         {
             return;
         }
-        if let (Some(target), Some(source)) = (expected.primitive(), actual.primitive())
-            && target.is_integer()
-            && source.is_integer()
-            && let Some((minimum, maximum)) = target.integer_range()
+        if let Some((constant, minimum, maximum)) =
+            self.integer_constant_conversion(expected, actual, value)
         {
-            let evaluated = {
-                let resolve =
-                    |name: &str| self.binding(name).and_then(|binding| binding.value.clone());
-                evaluate(value, &resolve)
-                    .ok()
-                    .as_ref()
-                    .and_then(integer_value)
-            };
-            match evaluated {
-                Some(constant) if (minimum..=maximum).contains(&constant) => return,
-                Some(constant) => {
-                    self.diagnostics.push(
-                        Diagnostic::error(
-                            format!(
-                                "constant value `{constant}` does not fit `{}`",
-                                expected.display()
-                            ),
-                            value.span,
-                        )
-                        .with_help(format!(
-                            "`{}` holds {minimum} to {maximum}",
-                            expected.display()
-                        )),
-                    );
-                    return;
-                }
-                None => {}
+            if (minimum..=maximum).contains(&constant) {
+                return;
             }
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "constant value `{constant}` does not fit `{}`",
+                        expected.display()
+                    ),
+                    value.span,
+                )
+                .with_help(format!(
+                    "`{}` holds {minimum} to {maximum}",
+                    expected.display()
+                )),
+            );
+            return;
         }
         self.require_assignable(expected, actual, value.span);
+    }
+
+    /// The integer-constant conversion rule behind `byte b = 10;` and constant
+    /// call arguments: when an integer constant `value` (of integer type `actual`)
+    /// is converted to the integer type `expected`, returns its value and the
+    /// range of `expected`. The caller decides whether the value fits.
+    pub(super) fn integer_constant_conversion(
+        &self,
+        expected: &Type,
+        actual: &Type,
+        value: &Expression,
+    ) -> Option<(i128, i128, i128)> {
+        let (target, source) = (expected.primitive()?, actual.primitive()?);
+        if !target.is_integer() || !source.is_integer() {
+            return None;
+        }
+        let (minimum, maximum) = target.integer_range()?;
+        let resolve = |name: &str| self.binding(name).and_then(|binding| binding.value.clone());
+        let constant = evaluate(value, &resolve)
+            .ok()
+            .as_ref()
+            .and_then(integer_value)?;
+        Some((constant, minimum, maximum))
     }
 
     pub(super) fn require_assignable(&mut self, expected: &Type, actual: &Type, span: Span) {
