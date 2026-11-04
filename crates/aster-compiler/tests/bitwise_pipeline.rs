@@ -601,6 +601,51 @@ fn compound_shift_assignment_uses_the_promoted_target_and_an_int_count() {
 }
 
 #[test]
+fn compound_narrowing_help_names_the_target_and_never_suggests_addition() {
+    for (operator, target, count) in [
+        ("|=", "byte", "1"),
+        ("&=", "ushort", "3"),
+        ("^=", "sbyte", "1"),
+        ("<<=", "byte", "1"),
+        (">>=", "short", "1"),
+        (">>>=", "ushort", "1"),
+    ] {
+        let source = format!(
+            "public void F({target} a, {target} b) {{ a {operator} {} ; }}",
+            if operator.starts_with(['<', '>']) {
+                count
+            } else {
+                "b"
+            }
+        );
+        let errors = compile(&source).expect_err("narrowing must be rejected");
+        assert_eq!(errors.len(), 1, "{operator}: {errors:?}");
+        // The error message is unchanged.
+        assert_eq!(
+            errors[0].message,
+            format!("compound assignment would narrow `int` to `{target}`"),
+            "{operator}"
+        );
+        // The help is generic: it names the target type and does not mention
+        // the wrong operator or invent variable names.
+        let help = errors[0].help.as_deref().expect("a help message");
+        assert_eq!(
+            help,
+            format!(
+                "rewrite the operation as an explicit assignment and cast the result to `{target}`"
+            ),
+            "{operator}"
+        );
+        for wrong in ["+", "value", "other"] {
+            assert!(
+                !help.contains(wrong),
+                "{operator}: help mentions `{wrong}`: {help}"
+            );
+        }
+    }
+}
+
+#[test]
 fn compound_boolean_and_invalid_operand_assignments_are_controlled_errors() {
     for operator in ["&=", "|=", "^="] {
         compile_valid(&format!(

@@ -1786,7 +1786,7 @@ impl Analyzer<'_> {
                     span,
                 )
                 .with_help(format!(
-                    "write an explicit assignment and cast, for example `value = ({}) (value + other)`",
+                    "rewrite the operation as an explicit assignment and cast the result to `{}`",
                     target.display()
                 )),
             ),
