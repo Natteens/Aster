@@ -375,7 +375,7 @@ The maintainer approved D1–D8 as recommended below and kept D9 and D10 as sepa
 | D6 | Keep the strict compound-assignment rule for the new operators? | Yes; revisit separately with evidence |
 | D7 | Reject `char` operands and require `(int)c`? | Yes |
 | D8 | Land the feature as one vertical PR? | Yes |
-| D9 | Hexadecimal and binary literals | Separate record, recommended soon after |
+| D9 | Hexadecimal and binary literals | Separate record, recommended soon after; now proposed in the [nondecimal literal decision](nondecimal-literal-decision.md) |
 | D10 | ASTER's unary `-` keeps small operand types while C# promotes; align it? | Out of scope here; track separately |
 
 ## 12. Non-goals
