@@ -23,6 +23,12 @@ public class Program
         Log("damage in range: " + (damage >= 10 && damage < 20).ToString());
         Log("chance in range: " + (chance >= 0.0f && chance < 1.0f).ToString());
 
+        // Float ranges are half-open too: 5.0 up to, but not including, 8.0.
+        float speed = random.NextFloat(5.0f, 8.0f);
+        double scale = random.NextDouble(0.5d, 2.0d);
+        Log("speed in range: " + (speed >= 5.0f && speed < 8.0f).ToString());
+        Log("scale in range: " + (scale >= 0.5d && scale < 2.0d).ToString());
+
         // Workers cannot read entropy, so the main thread draws their seeds.
         Random seeds = Random.FromEntropy();
         ulong firstSeed = seeds.NextULong();

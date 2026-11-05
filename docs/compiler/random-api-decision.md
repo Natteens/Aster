@@ -1,7 +1,7 @@
 # Decision record: Random API ergonomics
 
-**Status.** Part A (`Random.FromEntropy()`) is **ACCEPTED and implemented**. Part B (a global,
-Unity-style `Random.Range`/`Random.Value` API) and Part C (floating-point range overloads) are
+**Status.** Part A (`Random.FromEntropy()`) and Part C (floating-point range overloads) are
+**ACCEPTED and implemented**. Part B (a global, Unity-style `Random.Range`/`Random.Value` API) is
 **PROPOSED** and deliberately not implemented; this record states why and what a future change would
 need.
 
@@ -137,20 +137,44 @@ the need is demonstrated:
   `FromEntropy` removing the only missing capability. A static convenience API is therefore deferred
   until a concrete need shows that storing a generator in a field is not enough.
 
-## 5. Part C — floating-point range overloads (proposed, not implemented)
+## 5. Part C — floating-point range overloads (accepted)
 
 ```aster
-// PROPOSED, not implemented.
 float speed = random.NextFloat(5.0f, 8.0f);   // 5.0 up to, but not including, 8.0
 double scale = random.NextDouble(0.5d, 2.0d);
 ```
 
-Methods may be overloaded by parameter count, so these would not be ambiguous with `NextFloat()`. The
-semantics to specify are half-open `[minInclusive, maxExclusive)` to match `NextInt`, a controlled
-error through the existing invalid-range path when `min >= max` or an argument is not finite, and a
-guard against `min + value * (max - min)` rounding up to `max` (redraw, which keeps the result
-uniform, rather than clamp). It is plain ASTER with no compiler change, which is why it is separable;
-it is left out of this change to keep the review focused on the entropy seed.
+Plain ASTER in `stdlib/aster/random/random.aster`, no compiler or runtime change, overloaded by
+parameter count next to the unchanged `NextFloat()` and `NextDouble()`.
+
+- **Contract.** `[minInclusive, maxExclusive)`; NaN, infinities, equal and reversed bounds go through
+  the existing invalid-range intrinsic (`Math.IsFinite` checks the bounds).
+- **Why not just `min + unit * (max - min)`.** Two things break it. The subtraction overflows to
+  infinity for intervals such as `[-MaxValue, MaxValue)`, and the sum can round up to `max` when the
+  interval is only a few representable values wide (for adjacent bounds, about half the draws).
+- **Algorithm.** `unit` is the zero-argument draw, so the new methods advance the generator by exactly
+  one sample and `NextFloat(0.0f, 1.0f)` equals `NextFloat()` for the same state. `float` computes in
+  `double`, where the span of any two finite floats is exact and cannot overflow. `double` uses the
+  plain span unless it is infinite, in which case it computes `(min + t) + t` with `t = unit *
+  (max/2 - min/2)`, which stays finite. If the final value is not below `maxExclusive`, the result is
+  `minInclusive`.
+- **Why a fallback and not a redraw.** The earlier proposal suggested redrawing. A redraw loop has no
+  bound in principle and cannot be justified when the interval holds a single representable value
+  (adjacent bounds), where every draw would be rejected. Returning `minInclusive` always terminates,
+  is exact for adjacent bounds (the only member), and only matters when the interval is within an ulp
+  or so, where the result set is a handful of values anyway. For wider intervals the fallback is
+  reached with negligible probability. The cost is a slight bias toward `minInclusive` in that regime,
+  which is documented rather than hidden.
+- **Cost.** No host read, no global state, no allocation. The per-number path is the zero-argument
+  draw plus a few floating-point operations and comparisons, and the two `Math.IsFinite`
+  predicates that validate the bounds; in a release build on the development machine, 100 million calls took about 2.1 s for
+  either ranged method against about 0.75 s for the zero-argument ones (roughly 21 ns against 7 ns per
+  call including the loop), the extra being the call, the bound validation, and the scaling. A
+  predicate-free validation (`x - x != 0`) saved only about 10% and was not worth the obscurity.
+- **Tested.** Ordinary, negative, zero-crossing, narrow, adjacent-bound, subnormal and extreme-magnitude
+  intervals (for example `[-MaxValue, MaxValue)` for both types), every invalid-bound case, fixed-seed
+  reproducibility, one-sample-per-call consumption, equality with the zero-argument methods on
+  `[0, 1)`, and unchanged zero-argument sequences.
 
 ## 6. Decisions
 
@@ -159,5 +183,5 @@ it is left out of this change to keep the review focused on the entropy seed.
 | R1 | Unseeded generators | Accepted: `Random.FromEntropy()` with an OS-entropy seed |
 | R2 | A `Random()` constructor | Not possible without constructor overloads; the factory is the substitute |
 | R3 | Global generator and static `Random.Range` | Deferred (proposed): needs context-owned state and a worker policy |
-| R4 | Float range overloads | Deferred (proposed): half-open, redraw guard, no compiler change |
+| R4 | Float range overloads | Accepted: half-open, finite bounds, overflow-safe span, `minInclusive` fallback instead of a redraw loop |
 | R5 | Replacing `__RandomMix` | Out of scope; measured slower |

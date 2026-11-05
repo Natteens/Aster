@@ -1,5 +1,7 @@
 namespace aster.random;
 
+using aster.math;
+
 internal void __RandomInvalidRange() {}
 internal ulong __RandomMix(ulong value) { return value; }
 internal ulong __RandomEntropySeed() { return 0UL; }
@@ -70,5 +72,54 @@ public class Random
     public double NextDouble()
     {
         return (double)(NextULong() / 2048UL) / 9007199254740992.0d;
+    }
+
+    /// A float in `[minInclusive, maxExclusive)`. Both bounds must be finite with
+    /// `minInclusive < maxExclusive`, otherwise it is a controlled runtime error.
+    /// Draws exactly one `NextUInt()`. The arithmetic runs in `double`, so even
+    /// the widest float interval cannot overflow; when rounding to `float` would
+    /// reach the exclusive bound the result is `minInclusive`, so the bound is
+    /// never returned.
+    public float NextFloat(float minInclusive, float maxExclusive)
+    {
+        if (!Math.IsFinite(minInclusive) || !Math.IsFinite(maxExclusive) || minInclusive >= maxExclusive)
+        {
+            __RandomInvalidRange();
+            return minInclusive;
+        }
+        double unit = (double)(NextUInt() / 256u) / 16777216.0d;
+        double low = (double)minInclusive;
+        float value = (float)(low + unit * ((double)maxExclusive - low));
+        if (value >= maxExclusive) { return minInclusive; }
+        return value;
+    }
+
+    /// A double in `[minInclusive, maxExclusive)`. Both bounds must be finite with
+    /// `minInclusive < maxExclusive`, otherwise it is a controlled runtime error.
+    /// Draws exactly one `NextULong()`. When `maxExclusive - minInclusive` would
+    /// overflow, the span is taken in halves so the result stays finite. When
+    /// rounding would reach the exclusive bound the result is `minInclusive`, so
+    /// the bound is never returned and no redraw loop exists.
+    public double NextDouble(double minInclusive, double maxExclusive)
+    {
+        if (!Math.IsFinite(minInclusive) || !Math.IsFinite(maxExclusive) || minInclusive >= maxExclusive)
+        {
+            __RandomInvalidRange();
+            return minInclusive;
+        }
+        double unit = (double)(NextULong() / 2048UL) / 9007199254740992.0d;
+        double span = maxExclusive - minInclusive;
+        double value;
+        if (Math.IsInfinity(span))
+        {
+            double part = unit * (maxExclusive * 0.5d - minInclusive * 0.5d);
+            value = (minInclusive + part) + part;
+        }
+        else
+        {
+            value = minInclusive + unit * span;
+        }
+        if (value >= maxExclusive) { return minInclusive; }
+        return value;
     }
 }
