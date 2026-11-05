@@ -45,7 +45,8 @@ use crate::math::{
     aster_rt_assert_equal, aster_rt_integer_arithmetic_error, aster_rt_math_binary_double,
     aster_rt_math_binary_float, aster_rt_math_domain_error, aster_rt_math_pow_double,
     aster_rt_math_pow_float, aster_rt_math_predicate_double, aster_rt_math_predicate_float,
-    aster_rt_math_unary_double, aster_rt_math_unary_float, aster_rt_random_mix,
+    aster_rt_math_unary_double, aster_rt_math_unary_float, aster_rt_random_entropy_seed,
+    aster_rt_random_mix,
 };
 use crate::object::{aster_rt_object_new, aster_rt_object_new_temporary};
 use crate::string::{
@@ -1268,6 +1269,14 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             },
         },
         RuntimeFunction {
+            name: "aster_rt_random_entropy_seed",
+            address: aster_rt_random_entropy_seed as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer],
+                result: Some(RuntimeType::I64),
+            },
+        },
+        RuntimeFunction {
             name: "aster_rt_random_mix",
             address: aster_rt_random_mix as *const u8,
             signature: RuntimeSignature {
@@ -2117,6 +2126,18 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn entropy_seed_takes_the_execution_context_and_returns_a_fixed_width_seed() {
+        let functions = runtime_functions();
+        let seed = functions
+            .iter()
+            .find(|function| function.name == "aster_rt_random_entropy_seed")
+            .expect("missing entropy seed runtime function");
+        // The context is how a failed OS read becomes a controlled runtime error.
+        assert_eq!(seed.signature.parameters, &[RuntimeType::Pointer]);
+        assert_eq!(seed.signature.result, Some(RuntimeType::I64));
     }
 
     #[test]

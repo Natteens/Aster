@@ -190,6 +190,7 @@ impl FunctionLowerer {
             | hir::Intrinsic::TimeMonotonicMilliseconds
             | hir::Intrinsic::TimeUnixMilliseconds
             | hir::Intrinsic::RandomMix
+            | hir::Intrinsic::RandomEntropySeed
             | hir::Intrinsic::StringBuilderLength
             | hir::Intrinsic::StringBuilderClear => {
                 let arguments = arguments

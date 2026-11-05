@@ -215,6 +215,10 @@ impl StandardLibrary {
                     Intrinsic::ReportRuntimeError(RuntimeErrorKind::RandomInvalidRange),
                 ),
                 ("aster.random::__RandomMix".to_owned(), Intrinsic::RandomMix),
+                (
+                    "aster.random::__RandomEntropySeed".to_owned(),
+                    Intrinsic::RandomEntropySeed,
+                ),
             ]);
         }
         if self.modules.contains_key("aster.testing") {

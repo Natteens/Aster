@@ -492,6 +492,7 @@ pub enum Intrinsic {
     TimeMonotonicMilliseconds,
     TimeUnixMilliseconds,
     RandomMix,
+    RandomEntropySeed,
     /// Convert a signed integer (widened to `long`) to a `string`.
     StringFromLong,
     StringFromLongTemporary,
@@ -714,6 +715,7 @@ impl Intrinsic {
             | Self::TimeMonotonicMilliseconds
             | Self::TimeUnixMilliseconds
             | Self::RandomMix
+            | Self::RandomEntropySeed
             | Self::StringBuilderLength
             | Self::StringBuilderClear
             | Self::ListCapacity

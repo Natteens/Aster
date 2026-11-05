@@ -61,7 +61,7 @@ pub use io::{
 };
 pub use io_error::{PortableIoError, PortableIoErrorKind, classify_io_error};
 pub use log::LogLevel;
-pub use math::aster_rt_random_mix;
+pub use math::{aster_rt_random_entropy_seed, aster_rt_random_mix};
 pub use memory_governor::{MemoryGovernor, MemoryGovernorTelemetry};
 pub use registry::{RuntimeFunction, RuntimeSignature, RuntimeType, runtime_functions};
 pub use string::{AsterStrHeader, decode_str, encode_str};

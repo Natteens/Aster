@@ -1715,6 +1715,7 @@ pub(super) fn lower_intrinsic(intrinsic: hir::Intrinsic) -> mir::Intrinsic {
         hir::Intrinsic::TimeMonotonicMilliseconds => mir::Intrinsic::TimeMonotonicMilliseconds,
         hir::Intrinsic::TimeUnixMilliseconds => mir::Intrinsic::TimeUnixMilliseconds,
         hir::Intrinsic::RandomMix => mir::Intrinsic::RandomMix,
+        hir::Intrinsic::RandomEntropySeed => mir::Intrinsic::RandomEntropySeed,
         hir::Intrinsic::StringBuilderLength => mir::Intrinsic::StringBuilderLength,
         hir::Intrinsic::StringBuilderClear => mir::Intrinsic::StringBuilderClear,
     }
