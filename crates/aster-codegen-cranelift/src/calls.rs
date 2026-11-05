@@ -319,7 +319,7 @@ impl Codegen {
                 ("aster_rt_time_unix_milliseconds", None, false)
             }
             mir::Intrinsic::RandomMix => ("aster_rt_random_mix", None, false),
-            mir::Intrinsic::RandomEntropySeed => ("aster_rt_random_entropy_seed", None, false),
+            mir::Intrinsic::RandomEntropySeed => ("aster_rt_random_entropy_seed", None, true),
             mir::Intrinsic::StringFromBool => ("aster_rt_string_from_bool", None, true),
             mir::Intrinsic::StringFromBoolTemporary => {
                 ("aster_rt_string_from_bool_temporary", None, true)

@@ -15,17 +15,124 @@ pub extern "C" fn aster_rt_random_mix(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-/// A fresh 64-bit seed from the operating system's entropy, for
-/// `Random.FromEntropy()`. The standard library seeds its per-thread hash keys
-/// from the OS random source and advances them on every `RandomState::new()`,
-/// so consecutive calls on one thread and calls on different threads differ.
-/// This is a seed for a non-cryptographic generator, not a secret.
-#[must_use]
-pub extern "C" fn aster_rt_random_entropy_seed() -> u64 {
-    use std::hash::{BuildHasher, Hasher};
-    std::collections::hash_map::RandomState::new()
-        .build_hasher()
-        .finish()
+/// Reads 64 bits through `fill`, which stands for the operating system's random
+/// source. Kept separate from the exported function so tests can inject a
+/// provider, including one that fails. There is no fallback: a failure is
+/// returned, never replaced by a clock, a counter, or a constant.
+fn entropy_seed_with<E: std::fmt::Display>(
+    fill: impl FnOnce(&mut [u8]) -> Result<(), E>,
+) -> Result<u64, String> {
+    let mut bytes = [0_u8; 8];
+    fill(&mut bytes).map_err(|error| {
+        format!("Random.FromEntropy could not read operating-system entropy: {error}")
+    })?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+/// Draws a seed from `fill` or records the first controlled runtime error in
+/// `context`. The returned value is only meaningful when no error was recorded
+/// (generated code stops at the recorded error), so the failure value `0` is
+/// never observed as a seed.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+fn seed_or_fail<E: std::fmt::Display>(
+    context: *mut ExecutionContext,
+    fill: impl FnOnce(&mut [u8]) -> Result<(), E>,
+) -> u64 {
+    match entropy_seed_with(fill) {
+        Ok(seed) => seed,
+        Err(message) => {
+            if !context.is_null() {
+                // SAFETY: JIT-generated calls receive the live host-owned context as
+                // their hidden first argument and cannot retain it after the call.
+                #[allow(unsafe_code)]
+                let context = unsafe { &mut *context };
+                context.fail(message);
+            }
+            0
+        }
+    }
+}
+
+/// Fills `bytes` from the operating system's random source for this target:
+/// `getrandom(2)` on Linux and `BCryptGenRandom` with the system-preferred RNG
+/// on Windows. Both are the platform's documented random-byte APIs and both
+/// report failure, which is returned. Other targets have no supported source
+/// and fail the same way instead of inventing one.
+fn operating_system_entropy(bytes: &mut [u8]) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        windows_entropy(bytes)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_entropy(bytes)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = bytes;
+        Err("this platform has no supported operating-system entropy source".to_owned())
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_entropy(bytes: &mut [u8]) -> Result<(), String> {
+    use windows_sys::Win32::Security::Cryptography::{
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
+    };
+    let length =
+        u32::try_from(bytes.len()).map_err(|_| "entropy request is too large".to_owned())?;
+    // SAFETY: `bytes` is a live, writable buffer of exactly `length` bytes. A null
+    // algorithm handle together with BCRYPT_USE_SYSTEM_PREFERRED_RNG selects the
+    // system RNG, as documented for BCryptGenRandom.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            length,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "BCryptGenRandom failed with NTSTATUS 0x{status:08X}"
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn linux_entropy(bytes: &mut [u8]) -> Result<(), String> {
+    let mut filled = 0;
+    while filled < bytes.len() {
+        let remaining = &mut bytes[filled..];
+        // SAFETY: `remaining` is a live, writable buffer of `remaining.len()` bytes.
+        // Flag 0 waits until the kernel entropy pool is initialized, so the bytes are
+        // never drawn from an unseeded pool.
+        let read = unsafe { libc::getrandom(remaining.as_mut_ptr().cast(), remaining.len(), 0) };
+        if read < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!("getrandom failed: {error}"));
+        }
+        filled +=
+            usize::try_from(read).map_err(|_| "getrandom returned a bad length".to_owned())?;
+    }
+    Ok(())
+}
+
+/// A fresh 64-bit seed from the operating system's random source, for
+/// `Random.FromEntropy()`. The read is fallible: if the OS source is
+/// unavailable the first controlled runtime error is recorded in `context` and
+/// no Rust panic crosses the C ABI. The seed is for a non-cryptographic
+/// generator; the operating system, not `SplitMix64`, supplies the entropy.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_random_entropy_seed(context: *mut ExecutionContext) -> u64 {
+    seed_or_fail(context, operating_system_entropy)
 }
 
 /// Record a structured equality assertion failure without exposing a Rust
@@ -202,8 +309,76 @@ mod tests {
     use super::{
         aster_rt_integer_arithmetic_error, aster_rt_math_domain_error, aster_rt_math_pow_double,
         aster_rt_math_pow_float, aster_rt_math_unary_double, aster_rt_math_unary_float,
-        aster_rt_random_mix,
+        aster_rt_random_entropy_seed, aster_rt_random_mix, entropy_seed_with, seed_or_fail,
     };
+
+    #[test]
+    fn entropy_seed_is_the_little_endian_value_of_the_provider_bytes() {
+        let seed = entropy_seed_with(|bytes: &mut [u8]| -> Result<(), &str> {
+            bytes.copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            Ok(())
+        })
+        .expect("a succeeding provider");
+        assert_eq!(seed, 0x0807_0605_0403_0201);
+        // The provider is asked for exactly 64 bits.
+        entropy_seed_with(|bytes: &mut [u8]| -> Result<(), &str> {
+            assert_eq!(bytes.len(), 8);
+            Ok(())
+        })
+        .expect("a succeeding provider");
+    }
+
+    #[test]
+    fn entropy_failure_is_a_controlled_error_with_no_fallback_seed() {
+        let mut context = ExecutionContext::new();
+        let mut attempts = 0;
+        let seed = seed_or_fail(&raw mut context, |_: &mut [u8]| -> Result<(), &str> {
+            attempts += 1;
+            Err("the OS source is unavailable")
+        });
+        // One attempt only: nothing is retried or replaced by a predictable value.
+        assert_eq!(attempts, 1);
+        assert_eq!(seed, 0);
+        assert_eq!(
+            context.take_error().as_deref(),
+            Some(
+                "Random.FromEntropy could not read operating-system entropy: the OS source is unavailable"
+            )
+        );
+        // A failing provider cannot panic across the C ABI even without a context.
+        let seed = seed_or_fail(std::ptr::null_mut(), |_: &mut [u8]| -> Result<(), &str> {
+            Err("unavailable")
+        });
+        assert_eq!(seed, 0);
+        // A succeeding provider records no error.
+        let mut context = ExecutionContext::new();
+        let seed = seed_or_fail(&raw mut context, |bytes: &mut [u8]| -> Result<(), &str> {
+            bytes.fill(0xAB);
+            Ok(())
+        });
+        assert_eq!(seed, 0xABAB_ABAB_ABAB_ABAB);
+        assert_eq!(context.take_error(), None);
+    }
+
+    #[test]
+    fn the_exported_function_reads_the_operating_system_and_reports_no_error() {
+        let mut context = ExecutionContext::new();
+        let mut drawn = std::collections::HashSet::new();
+        for _ in 0..256 {
+            assert!(
+                drawn.insert(aster_rt_random_entropy_seed(&raw mut context)),
+                "consecutive 64-bit entropy draws must differ"
+            );
+        }
+        assert_eq!(context.take_error(), None);
+        let other = std::thread::spawn(|| {
+            let mut context = ExecutionContext::new();
+            aster_rt_random_entropy_seed(&raw mut context)
+        })
+        .join()
+        .expect("thread");
+        assert!(!drawn.contains(&other));
+    }
 
     #[test]
     fn splitmix64_mixer_matches_known_answers() {

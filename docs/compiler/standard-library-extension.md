@@ -202,7 +202,7 @@ Other ordinary code:
 | Controlled runtime errors | `__CollectionRangeError`, `__AbsIntOverflow`, `__AssertionTrue` | Entry into the runtime error channel; there is no source-level `throw` |
 | Math | `aster.math.__MathUnaryFloat`, `__MathPowDouble` | Floating-point library routines provided by the runtime |
 | Random mixing | `aster.random.__RandomMix` | See below |
-| Entropy seed | `aster.random.__RandomEntropySeed` | A host read of operating-system entropy, used once per `Random.FromEntropy()` |
+| Entropy seed | `aster.random.__RandomEntropySeed` | A fallible host read of the operating system's random source, used once per `Random.FromEntropy()` |
 
 `aster.random.__RandomMix` implements the SplitMix64 finalizer. It became an intrinsic because the
 language originally had no bitwise or shift operators. The language now has them (see the
@@ -224,7 +224,7 @@ Verify the count by listing the `"aster.<module>::<name>"` keys in
 | Host effects: terminal | `aster.io::Write`, `WriteLine`, `ReadLine` | 3 | Inherently runtime-backed |
 | Host effects: filesystem | `aster.io::ReadAllText`, `WriteAllText`, `AppendAllText`, `ListFiles`, `ListDirectories`, `FileExists`, `DirectoryExists`, `CreateDirectory`, `DeleteFile`, `DeleteDirectory` | 10 | Inherently runtime-backed |
 | Host effects: clock | `aster.time::__MonotonicMilliseconds`, `__UnixMilliseconds` | 2 | Inherently runtime-backed |
-| Host effects: entropy | `aster.random::__RandomEntropySeed` | 1 | Inherently runtime-backed (OS entropy) |
+| Host effects: entropy | `aster.random::__RandomEntropySeed` | 1 | Inherently runtime-backed (fallible OS random source) |
 | Controlled runtime errors | `aster.math::__AbsIntOverflow`, `__AbsLongOverflow`, `__ClampInvalidRange`, `__MathSignNaN`; `aster.collections::__CollectionRangeError`; `aster.random::__RandomInvalidRange`; `aster.testing::__AssertionTrue`, `__AssertionFalse` | 8 | Inherently runtime-backed (error channel) |
 | Assertion with message | `aster.testing::__AssertionEqual` | 1 | Inherently runtime-backed (error channel with expected and actual text) |
 | Math operations | `aster.math::__MathUnaryFloat`, `__MathUnaryDouble`, `__MathBinaryFloat`, `__MathBinaryDouble`, `__MathPredicateFloat`, `__MathPredicateDouble`, `__MathPowFloat`, `__MathPowDouble` | 8 | Runtime-backed (floating-point library routines) |

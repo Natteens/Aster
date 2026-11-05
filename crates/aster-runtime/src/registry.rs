@@ -1272,7 +1272,7 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             name: "aster_rt_random_entropy_seed",
             address: aster_rt_random_entropy_seed as *const u8,
             signature: RuntimeSignature {
-                parameters: &[],
+                parameters: &[RuntimeType::Pointer],
                 result: Some(RuntimeType::I64),
             },
         },
@@ -2129,26 +2129,15 @@ mod tests {
     }
 
     #[test]
-    fn entropy_seed_is_nullary_context_free_and_varies_between_calls() {
+    fn entropy_seed_takes_the_execution_context_and_returns_a_fixed_width_seed() {
         let functions = runtime_functions();
         let seed = functions
             .iter()
             .find(|function| function.name == "aster_rt_random_entropy_seed")
             .expect("missing entropy seed runtime function");
-        assert_eq!(seed.signature.parameters, &[] as &[RuntimeType]);
+        // The context is how a failed OS read becomes a controlled runtime error.
+        assert_eq!(seed.signature.parameters, &[RuntimeType::Pointer]);
         assert_eq!(seed.signature.result, Some(RuntimeType::I64));
-        let mut drawn = std::collections::HashSet::new();
-        for _ in 0..256 {
-            assert!(
-                drawn.insert(crate::aster_rt_random_entropy_seed()),
-                "consecutive entropy seeds must differ"
-            );
-        }
-        // Another thread draws from its own OS-seeded keys.
-        let other = std::thread::spawn(|| crate::aster_rt_random_entropy_seed())
-            .join()
-            .expect("thread");
-        assert!(!drawn.contains(&other));
     }
 
     #[test]

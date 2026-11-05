@@ -57,15 +57,29 @@ Answers to the required decisions:
    them is a separate language feature. A static factory gives the same capability with an honest name
    that states the seed source. `Random.FromEntropy()` is a static method that creates and returns a
    new generator.
-2. **Seed source and owner.** The seed is a fresh 64-bit value from the operating system's entropy,
-   read by a new runtime function `aster_rt_random_entropy_seed` behind the intrinsic
-   `aster.random::__RandomEntropySeed`. The runtime owns the read, as it owns the clock. It uses the
-   standard library's `RandomState`, which seeds per-thread hash keys from the OS random source and
-   advances them on every call, so no new dependency, no `unsafe`, and no shared state are needed.
-   Consecutive calls and calls on different threads differ. It is a seed for a non-cryptographic
-   generator, not a secret.
-3. **No weak default.** There is no clock, counter, or constant fallback. If a future platform cannot
-   provide entropy, the read must fail in a controlled way rather than return a predictable value.
+2. **Seed source and owner.** The seed is 64 bits read from the operating system's random source by a
+   new runtime function, `aster_rt_random_entropy_seed(context)`, behind the intrinsic
+   `aster.random::__RandomEntropySeed`. The runtime owns the read, as it owns the clock. The source
+   is the platform's documented random-byte API: `getrandom(2)` on Linux (flag 0, so it waits for an
+   initialized pool) and `BCryptGenRandom` with the system-preferred RNG on Windows. They are called
+   through the `libc` and `windows-sys` dependencies the runtime already has, so **no new dependency
+   is added**. Both calls fill the eight seed bytes directly: nothing is hashed or derived (a
+   randomized hash builder such as `RandomState` is not a documented entropy API and is not used).
+
+   *Why not the `getrandom` crate.* It is the established choice, and version 0.4.3 (MSRV 1.85) was
+   evaluated. Both 0.4.3 and 0.3.4 import their Windows entry point with `raw-dylib`, which needs
+   `dlltool.exe` on the `windows-gnu` toolchain; on the project's default Windows development
+   toolchain without MinGW binutils on `PATH` the crate does not compile ("error calling dlltool").
+   Adding it would break local builds that work today, while the two direct calls above are small,
+   documented, and testable.
+3. **Failure and no weak default.** The read is fallible. If the OS call fails, the runtime records the
+   first controlled runtime error in the execution context
+   (`Random.FromEntropy could not read operating-system entropy: <cause>`) and returns `0`, which
+   generated code never observes because it stops at the recorded error. No Rust panic crosses the C
+   ABI. There is no retry with another source and no clock, counter, or constant fallback. A target
+   other than Linux and Windows has no supported source and fails the same way. The ABI changed from
+   a nullary `u64` to a function that takes the execution context, which is how the failure is
+   reported.
 4. **State, reuse, and workers.** There is no new state: the entropy is consumed once, to build an
    ordinary `Random` that the caller owns, stores, and reuses. The read is a host operation, so it is
    rejected in worker bodies by the existing worker validation (the message now names
@@ -77,17 +91,18 @@ Answers to the required decisions:
 7. **Ranges.** Unchanged (Part C). The existing methods keep the documented half-open meaning: the
    integer upper bound is exclusive and the floating results are in `[0, 1)`.
 8. **Allocation and performance.** Creating a generator allocates what it always did (one small
-   object; the stress counters show no string or array allocation). The entropy read costs roughly
-   40 ns per call in a release build (about 82 ms extra for two million generators on the development
-   machine, startup subtracted), paid once per generator. A hundred-million-number loop took the same
-   time for a seeded and an entropy-seeded generator (median 423 ms and 413 ms, startup included),
-   because the generator is the same object after construction. The MIR of `NextULong` and
-   `NextUInt` is unchanged: one `RandomMix` intrinsic and no call.
+   object; the stress counters show no string or array allocation). The OS read costs roughly 85 ns
+   per call in a release build on the development machine (Windows, `BCryptGenRandom`): 2 million
+   generators took about 265 ms against about 95 ms for explicitly seeded ones, startup included
+   (5 runs, medians), paid once per generator. A hundred-million-number loop took the same time for a
+   seeded and an entropy-seeded generator (413 ms and 412 ms), because the generator is the same
+   object after construction. The MIR of `NextULong` and `NextUInt` is unchanged: one `RandomMix`
+   intrinsic and no call.
 
 Implementation, in the same layers as the clock reads: the stdlib placeholder and static factory, the
-`RandomEntropySeed` HIR and MIR intrinsic, the lowering arms, backend shape validation (a nullary call
-returning `ulong`), Cranelift dispatch to the runtime function, the registry entry, and the worker host
-operation list. No unrelated compiler feature changed.
+`RandomEntropySeed` HIR and MIR intrinsic, the lowering arms, backend shape validation (a call with no
+source arguments that returns `ulong`), Cranelift dispatch to the runtime function with the hidden
+context, the registry entry, and the worker host operation list. No unrelated compiler feature changed.
 
 ## 4. Part B — static `Random.Range` / `Random.Value` (proposed, not implemented)
 
