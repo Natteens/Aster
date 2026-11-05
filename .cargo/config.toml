@@ -1,0 +1,18 @@
+# Local build footprint. These match the settings CI already exports
+# (CARGO_INCREMENTAL=0, CARGO_PROFILE_TEST_DEBUG=0), so local builds produce the
+# same artifacts and a configuration change no longer leaves a second set of
+# ~115 multi-hundred-megabyte test executables behind.
+
+[build]
+# Incremental caches grew to 7 GB here and CI disables them.
+incremental = false
+
+[profile.test]
+# A test executable shrinks from 152 MB to 37 MB without DWARF. Panic messages and
+# backtrace frame names are unaffected; only line-level debugger info is lost.
+debug = 0
+
+[profile.dev]
+# The `aster` dev binary and the examples keep file and line information for
+# backtraces at about 40% of the size of full debug info.
+debug = "line-tables-only"

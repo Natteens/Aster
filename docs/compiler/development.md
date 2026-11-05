@@ -24,6 +24,35 @@ On Windows, project validation uses the tested GNU toolchain:
 cargo +stable-gnu test --workspace --all-targets
 ```
 
+## Build directory size
+
+Every test and example executable statically links the compiler and the JIT, so a full
+`target/debug` for one configuration was 13.4 GB before the checked-in `.cargo/config.toml` and is about
+3 GB with it (test executables without DWARF, no incremental cache; CI uses the same settings). Cargo names
+each executable `<name>-<hash>` and never deletes the old ones, and the hash changes with
+`--all-features`, `RUSTFLAGS`, the debug-info and incremental settings, and the toolchain
+(`+stable-gnu` versus the pinned `stable`). Each switch leaves another full set behind, which is how
+`target/debug` reached 66 GB.
+
+- Use the commands above as written. Run `cargo test` without `--all-features` (only Clippy uses it:
+  it produces no executables), and avoid mixing toolchains or exporting `RUSTFLAGS` or `CARGO_*`
+  profile variables locally.
+- Check the size with `du -sh target/debug` or Explorer. If it has grown well past one set, close
+  editors that run `cargo check` (rust-analyzer) and run the maintenance script with no build in
+  progress:
+
+```powershell
+scripts\prune-build-artifacts.ps1          # dry run: counts and sizes
+scripts\prune-build-artifacts.ps1 -Apply   # delete stale executables and the incremental cache
+```
+
+The script first builds, or confirms, the executables for
+`cargo test --workspace --all-targets` with the current settings, then deletes only the other
+hashed executables in `target/debug/deps` and `target/debug/examples`, plus `target/debug/incremental`.
+It never touches libraries, fingerprints, the `release` profile or `~/.cargo`, and it refuses to run
+while `cargo` or `rustc` is running. Deleted files are rebuilt by Cargo on demand. `cargo clean`
+remains available but discards everything and costs a full rebuild.
+
 Run the local CLI without installing it:
 
 ```console
