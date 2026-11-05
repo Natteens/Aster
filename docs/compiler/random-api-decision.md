@@ -65,6 +65,10 @@ Answers to the required decisions:
    through the `libc` and `windows-sys` dependencies the runtime already has, so **no new dependency
    is added**. Both calls fill the eight seed bytes directly: nothing is hashed or derived (a
    randomized hash builder such as `RandomState` is not a documented entropy API and is not used).
+   Each call is an independent 64-bit sample, so two generators can in principle receive the same
+   seed (probability about 2^-64 per pair); the contract is a fresh OS sample per generator, not a
+   guarantee of distinct seeds. A source that reports success with zero bytes while bytes remain is
+   treated as a failure rather than retried.
 
    *Why not the `getrandom` crate.* It is the established choice, and version 0.4.3 (MSRV 1.85) was
    evaluated. Both 0.4.3 and 0.3.4 import their Windows entry point with `raw-dylib`, which needs

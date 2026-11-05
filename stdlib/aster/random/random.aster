@@ -12,8 +12,9 @@ public class Random
 
     public Random(ulong seed) { state = seed; }
 
-    /// Creates a generator seeded from operating-system entropy. Each call draws a
-    /// fresh seed, so two generators created back to back differ. The seed is read
+    /// Creates a generator seeded from operating-system entropy. Each call reads a
+    /// fresh 64-bit sample from the OS (two samples can in principle be equal, with
+    /// negligible probability). The seed is read
     /// once here; later numbers cost the same as for any explicitly seeded generator.
     /// This is a host operation: it is rejected in `Task`/`Parallel` worker bodies,
     /// which receive explicit seeds instead.

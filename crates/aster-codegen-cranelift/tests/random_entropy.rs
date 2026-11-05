@@ -34,14 +34,12 @@ fn entropy_generators_differ_and_respect_the_documented_ranges() {
                  Random random = Random.FromEntropy();
                  firsts[i] = random.NextULong();
              }
-             for (int i = 0; i < 64; i++)
+             // Fresh samples may collide in principle; a source stuck on one value is the bug.
+             for (int i = 1; i < 64; i++)
              {
-                 for (int j = i + 1; j < 64; j++)
-                 {
-                     if (firsts[i] == firsts[j]) { return 1; }
-                 }
+                 if (firsts[i] != firsts[0]) { return 0; }
              }
-             return 0;
+             return 1;
          }
          public int Ranges()
          {

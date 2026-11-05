@@ -34,8 +34,9 @@ instance is not transferable or shared across Task/Parallel boundaries.
 
 `Random.FromEntropy()` creates a generator whose seed is 64 bits read from the operating system's
 random source (`getrandom(2)` on Linux, `BCryptGenRandom` on Windows), through the runtime, which owns
-this host read. Each call reads a fresh seed, so two generators created back to back differ, and no
-global state is involved:
+this host read. Each call reads a fresh sample, so generators created back to back are independent. Two samples can
+collide, with probability about 2^-64 per pair, so equal seeds are possible but negligible. No global
+state is involved:
 
 ```aster
 using aster.random;

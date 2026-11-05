@@ -102,27 +102,39 @@ fn windows_entropy(bytes: &mut [u8]) -> Result<(), String> {
     }
 }
 
+/// Fills `bytes` by calling `read` until nothing remains. `read` returns how many
+/// bytes it wrote. A zero-byte success while bytes remain is an error, never a
+/// retry, so a misbehaving source cannot make this loop forever; an interrupted
+/// call is retried.
+#[cfg(any(target_os = "linux", test))]
+fn fill_completely(
+    bytes: &mut [u8],
+    mut read: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
+) -> Result<(), String> {
+    let mut filled = 0;
+    while filled < bytes.len() {
+        match read(&mut bytes[filled..]) {
+            Ok(0) => {
+                return Err("getrandom returned no bytes while more were requested".to_owned());
+            }
+            Ok(count) => filled += count.min(bytes.len() - filled),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(format!("getrandom failed: {error}")),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn linux_entropy(bytes: &mut [u8]) -> Result<(), String> {
-    let mut filled = 0;
-    while filled < bytes.len() {
-        let remaining = &mut bytes[filled..];
+    fill_completely(bytes, |remaining| {
         // SAFETY: `remaining` is a live, writable buffer of `remaining.len()` bytes.
         // Flag 0 waits until the kernel entropy pool is initialized, so the bytes are
         // never drawn from an unseeded pool.
         let read = unsafe { libc::getrandom(remaining.as_mut_ptr().cast(), remaining.len(), 0) };
-        if read < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(format!("getrandom failed: {error}"));
-        }
-        filled +=
-            usize::try_from(read).map_err(|_| "getrandom returned a bad length".to_owned())?;
-    }
-    Ok(())
+        usize::try_from(read).map_err(|_| std::io::Error::last_os_error())
+    })
 }
 
 /// A fresh 64-bit seed from the operating system's random source, for
@@ -309,7 +321,8 @@ mod tests {
     use super::{
         aster_rt_integer_arithmetic_error, aster_rt_math_domain_error, aster_rt_math_pow_double,
         aster_rt_math_pow_float, aster_rt_math_unary_double, aster_rt_math_unary_float,
-        aster_rt_random_entropy_seed, aster_rt_random_mix, entropy_seed_with, seed_or_fail,
+        aster_rt_random_entropy_seed, aster_rt_random_mix, entropy_seed_with, fill_completely,
+        seed_or_fail,
     };
 
     #[test]
@@ -365,19 +378,60 @@ mod tests {
         let mut context = ExecutionContext::new();
         let mut drawn = std::collections::HashSet::new();
         for _ in 0..256 {
-            assert!(
-                drawn.insert(aster_rt_random_entropy_seed(&raw mut context)),
-                "consecutive 64-bit entropy draws must differ"
-            );
+            drawn.insert(aster_rt_random_entropy_seed(&raw mut context));
         }
+        // Fresh samples may collide in principle; a source stuck on one value is the bug.
+        assert!(drawn.len() > 1, "the entropy source returned a constant");
         assert_eq!(context.take_error(), None);
-        let other = std::thread::spawn(|| {
-            let mut context = ExecutionContext::new();
-            aster_rt_random_entropy_seed(&raw mut context)
+    }
+
+    #[test]
+    fn a_zero_byte_success_is_an_error_not_a_loop() {
+        let mut bytes = [0_u8; 8];
+        let mut calls = 0;
+        let result = fill_completely(&mut bytes, |_| {
+            calls += 1;
+            Ok(0)
+        });
+        assert!(result.expect_err("zero bytes").contains("no bytes"));
+        assert_eq!(calls, 1);
+
+        let mut calls = 0;
+        let result = fill_completely(&mut bytes, |buffer| {
+            calls += 1;
+            if calls == 1 {
+                buffer[..3].fill(1);
+                Ok(3)
+            } else {
+                Ok(0)
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn partial_reads_and_interruptions_are_completed() {
+        let mut bytes = [0_u8; 8];
+        let mut calls = 0;
+        fill_completely(&mut bytes, |buffer| {
+            calls += 1;
+            match calls {
+                1 => Err(std::io::ErrorKind::Interrupted.into()),
+                2 => {
+                    buffer[..5].fill(7);
+                    Ok(5)
+                }
+                _ => {
+                    buffer.fill(9);
+                    Ok(buffer.len())
+                }
+            }
         })
-        .join()
-        .expect("thread");
-        assert!(!drawn.contains(&other));
+        .expect("completes");
+        assert_eq!(bytes, [7, 7, 7, 7, 7, 9, 9, 9]);
+        let failed = fill_completely(&mut bytes, |_| Err(std::io::ErrorKind::Other.into()));
+        assert!(failed.is_err());
     }
 
     #[test]
