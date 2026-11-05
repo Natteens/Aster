@@ -19,9 +19,41 @@ double unit = random.NextDouble();
 
 `NextULong`, `NextUInt`, and `NextBool` produce scalar values. `NextInt(minInclusive,
 maxExclusive)` and `NextLong` use rejection sampling, so awkward ranges have no modulo bias; an
-empty or reversed range is a controlled contract failure. `NextFloat` and `NextDouble` are always
-in `[0, 1)`. Each call advances the same instance, and equal seeds/call sequences produce equal
+empty or reversed range is a controlled contract failure. The zero-argument `NextFloat` and
+`NextDouble` are always in `[0, 1)`. Each call advances the same instance, and equal seeds/call sequences produce equal
 results on Windows and Linux.
+
+## Floating-point ranges
+
+```aster
+using aster.random;
+
+Random random = new Random(7UL);
+float speed = random.NextFloat(5.0f, 8.0f);     // 5.0 up to, but not including, 8.0
+double scale = random.NextDouble(0.5d, 2.0d);   // 0.5 up to, but not including, 2.0
+```
+
+`NextFloat(minInclusive, maxExclusive)` and `NextDouble(minInclusive, maxExclusive)` return a value in
+the half-open interval `[minInclusive, maxExclusive)`; the zero-argument forms are unchanged and still
+cover `[0, 1)`.
+
+- **Errors.** Both bounds must be finite and `minInclusive < maxExclusive`. NaN, either infinity, equal
+  bounds, and reversed bounds are the same controlled runtime error as an empty integer range.
+- **The upper bound is never returned.** The result is `minInclusive + unit * (maxExclusive -
+  minInclusive)` where `unit` is the same value the zero-argument method would return. If rounding
+  would reach `maxExclusive`, the call returns `minInclusive` instead. There is no redraw loop, so
+  every call finishes and consumes exactly one sample (`NextUInt` for `float`, `NextULong` for
+  `double`).
+- **Large intervals.** `NextFloat` computes in `double`, which cannot overflow for any two finite
+  `float` bounds. `NextDouble` takes the span in halves when `maxExclusive - minInclusive` would
+  overflow, so `NextDouble(-MaxValue, MaxValue)` is finite and in range.
+- **Precision limit.** The result has at most 24 (`float`) or 53 (`double`) random bits, so an interval
+  wider than the number of representable values cannot hit all of them, and an interval only a few
+  representable values wide yields only those values. For adjacent bounds the interval contains just
+  `minInclusive`, which is what is returned. The distribution is uniform over the scaled `unit`
+  values, not over every representable number in the interval.
+- **Reproducibility.** Equal seeds give equal sequences. Mixing ranged and unranged calls is fine: each
+  call advances the generator by exactly one sample.
 
 Bounded integers use rejection sampling against the exact 64-bit sample space, including ranges
 whose size is not a power of two. Floating results use the high 24 (`float`) or 53 (`double`) bits
