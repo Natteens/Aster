@@ -3,7 +3,9 @@
 **Status.** Direction B (nominal single class inheritance with polymorphism, native execution, no GC,
 no .NET dependency) is **ACCEPTED as the objective**. Every B1 contract in this document is
 **PROPOSED**. Nothing here is implemented, and no public documentation may describe inheritance as
-available until the pull request that implements a part of it lands.
+available until the pull request that implements a part of it lands. Section 11 separates design
+acceptance, experimental implementation, performance validation and the authorization of the later
+stages, so that no stage depends on a result that only a later stage can produce.
 
 | | |
 | --- | --- |
@@ -25,12 +27,16 @@ These were approved by the maintainer and are inputs to this proposal.
 
 1. **Uniform header.** Every class instance has a header, with a pointer to its dynamic descriptor at
    offset zero.
-2. **Immutable descriptors.** One descriptor per concrete class or generic specialization. It carries
-   the hierarchy, the virtual dispatch table and the interface tables.
+2. **Immutable descriptors.** One descriptor per specific class or generic specialization (here
+   "specific" means closed and fully specialized, not "non-abstract"; abstract classes have one too,
+   although no object header ever points to it). It carries the hierarchy, the virtual dispatch table
+   and the interface tables.
 3. **Constructors split.** B1 keeps one constructor per class and adds `base(...)`. B2 (separate
    record) adds constructor overloads and `this(...)`.
-4. **Concrete bases only.** A B1 base class is a concrete type. Inheriting from a base parameterized by
-   open type parameters is a later expansion that this design must not block.
+4. **Closed, fully specialized bases only.** A B1 base class is a closed, fully specialized type
+   (section 8): a non-generic class, or a generic class whose type arguments are all concrete types. The
+   base may be abstract. Inheriting from a base that mentions open type parameters is a later expansion
+   that this design must not block.
 5. **Identity-preserving upcast.** Upcasting never copies. Dispatch and conversions follow the dynamic
    type.
 
@@ -60,46 +66,100 @@ Verified in the repository at the baseline:
 
 ### 4.1 Header and offsets
 
-```text
-offset 0                 descriptor pointer (pointer-sized, naturally aligned)
-offset H                 base-class fields (H = pointer size, rounded up to the first field's alignment)
-offset after base        derived fields, each at its natural alignment
-```
+`P` is the pointer size of the target (8 on a 64-bit host). Layout is computed with checked 32-bit
+arithmetic; an overflow is a controlled error. The rules, for a class `C` with optional base `B`:
 
-- The base layout is a strict prefix of the derived layout. A field keeps the offset it has in the
-  base, so code compiled against `Base` works on any `Derived`. Derived fields start at the end of the
-  base's fields, not in the base's tail padding.
-- An upcast is the same pointer. No conversion code runs.
-- The descriptor pointer is written at allocation time, immediately after `aster_rt_object_new`, with
-  the descriptor of the **concrete** class. It is therefore valid from the first instruction after
-  allocation, including in an invocation that later records a controlled runtime error.
-- The layout is an internal ASTER contract, not a C or C# ABI.
+1. **Header.** Offset `0` holds the descriptor pointer: `P` bytes, aligned to `P`.
+2. **Start of the fields.** For a class with no base, the first field is placed at `align_up(P, field
+   alignment)`. For a class with a base, the first own field is placed at `align_up(size(B), field
+   alignment)`, where `size(B)` is the **complete** size of `B` including its tail padding. A derived
+   field never occupies the tail padding of a base: the derived layout begins where the complete base
+   object ends.
+3. **Own fields.** Each own field is placed in declaration order at `align_up(running offset, its
+   alignment)` and advances the running offset by its size, exactly as the layout code does for a class
+   today.
+4. **Alignment.** `align(C) = max(P, align(B), the alignment of every own field)`.
+5. **Size.** `size(C) = align_up(end of the last field, align(C))`.
+6. **Empty classes.** A class with no fields and no base has `size = P` and `align = P`; the header is
+   all of it. This replaces the current one-byte size of a field-less class. A derived class with no own
+   fields has `size(D) = size(B)` and `align(D) = align(B)`.
+7. **Preservation.** Every field inherited from `B` keeps in `D` exactly the offset and size it has in
+   `B`. Field symbols are shared, so code compiled against `B` is valid on any `D`. This is a property
+   that MIR validation recomputes from the class definitions and rejects if it does not hold; it is not
+   left to the backend.
+8. **Upcast.** The same pointer. No code runs.
+
+Worked example on a 64-bit host:
+
+| Class | Fields | Offsets | `size` / `align` |
+| --- | --- | --- | --- |
+| `Empty` | none | header at 0 | 8 / 8 |
+| `Base` | `long x; byte b` | `x` at 8, `b` at 16 | 24 / 8 (end 17, rounded up) |
+| `Derived : Base` | `byte d` | `x` at 8, `b` at 16, `d` at 24 | 32 / 8 (not 17: the tail padding of `Base` is not reused) |
+| `Leaf : Derived` | none | as `Derived` | 32 / 8 |
+| `Counter` | `int score` | `score` at 8 | 16 / 8 (today 4) |
+
+The descriptor pointer is written at allocation time, immediately after `aster_rt_object_new`, with the
+descriptor of the class being instantiated (necessarily non-abstract). It is valid from the first
+instruction after allocation, including in an invocation that later records a controlled runtime
+error. No generated code other than the allocation sequence stores to offset `0`; MIR validation
+rejects any other store there, so the header is never user-writable.
+
+The layout is an internal ASTER contract, not a C or C# ABI.
 
 ### 4.2 Descriptor contents (PROPOSED shape, not a binary format)
 
 | Field | Purpose |
 | --- | --- |
-| class identity | unique per concrete class or specialization; `Container<int>` and `Container<string>` differ |
-| base descriptor, depth, ancestor array | constant-time subtype test: `ancestors[target.depth] == target` |
+| class identity | unique per class or specialization; `Container<int>` and `Container<string>` differ |
+| base descriptor, depth, ancestor array | `depth` is the number of ancestors; `ancestors` has `depth + 1` entries and ends with the class itself; used by the bounds-safe subtype test of 4.5 |
 | flags | abstract, sealed |
 | instance size | for diagnostics and validation |
 | virtual table | one slot per introduced virtual method; overrides reuse the slot; an abstract slot holds a stub that records a controlled runtime error |
-| interface tables | for each implemented interface (declared or inherited), the table of concrete methods |
+| interface tables | a count and, for each implemented interface (declared or inherited), its identity and the table of concrete methods |
 
 ### 4.3 Lifetime
 
-Descriptors are immutable data owned by the JIT module, defined the same way interface tables are
-today. They live as long as the module, which outlives every invocation that uses it; objects and
-interface values hold raw pointers that never outlive their invocation. Class references do not cross
-workers, so descriptor identity is only compared inside one module. A watch rebuild creates a new
-module and never mixes descriptors. Nothing frees a descriptor.
+A descriptor is immutable data. It is written once when the JIT module is built, before any code of the
+module runs, and nothing writes to it during execution. It is retained by the JIT module, the same way
+interface tables are today, and it is released with the module. An object or interface value that
+points to a descriptor belongs to an invocation that completes before the module is released; this is
+the same invariant interface tables already rely on. Class references do not cross workers, so
+descriptor identity is only compared inside one module, and a watch rebuild creates a new module and
+never mixes descriptors. The acceptance criteria require confirming that no task or worker can still
+run module code after the module is released.
 
 ### 4.4 Cost
 
-Every object grows by one pointer, and by alignment. A class with one `int` field goes from 4 bytes to
-16. This affects allocation sizes in arena accounting, temporary-subregion size estimates and any test
-or benchmark that pins object sizes. The first implementation PR must measure allocation volume and
-time on the existing benchmarks before the cost is accepted.
+Every object grows by one pointer, and by alignment: the table in 4.1 shows a one-`int` class growing
+from 4 to 16 bytes. This affects allocation sizes in arena accounting, temporary-subregion size
+estimates, and any test or benchmark that pins an object size. The cost is measured in stage 3 of
+section 11 and the decision to continue depends on it; the measurement is not a precondition of the
+experimental implementation that produces it.
+
+### 4.5 Bounds-safe dynamic checks
+
+Dynamic type information is only useful if reading it cannot read out of bounds, so every check below
+is bounded by data stored in the descriptor and the descriptors themselves are validated.
+
+- **Subtype test** for a target class `T` against an object whose descriptor is `D`: `T.depth <=
+  D.depth && D.ancestors[T.depth] == T`. The comparison against `depth` happens first, so an unrelated
+  shallow class tested against a deeper target never indexes past the array.
+- **Descriptor validation when the module is built:** the base chain is acyclic; `depth` equals the
+  base's `depth + 1`; `ancestors` has exactly `depth + 1` entries, begins with the base's entries and
+  ends with the class itself; the virtual table has at least as many slots as the base's, and every
+  inherited slot is either the base's entry or an override with an exactly matching signature; an
+  abstract slot of a non-abstract class is an error; the interface list has no duplicate interface.
+- **Interface table lookup** (for a conversion from a non-sealed class type): the search is bounded by
+  the descriptor's interface count, or by the count when a fixed index is used (U3), and it compares
+  interface identities. The static conversion rule guarantees the interface is present, and the module
+  build verifies that every non-abstract class has a table, with exactly the interface's method count,
+  for every interface its static type system says it implements. If a lookup nevertheless finds no
+  table, the generated code records a controlled runtime error and does not read or call through
+  anything; it never reads past the count and never dereferences a null table.
+- **Virtual slot index** at a call site is a compile-time constant validated against the vtable length
+  of the call's static type; every descriptor derived from it has at least that many slots by the
+  validation above.
 
 ## 5. Inheritance and polymorphism
 
@@ -108,6 +168,9 @@ time on the existing benchmarks before the cost is accepted.
   first. Structs, enums, interfaces and static classes cannot be bases. Circular inheritance is an error.
 - Inherited members that are accessible are members of the derived class. A derived class does not
   duplicate base storage.
+- An abstract class can be inherited, and normally is. It cannot be instantiated, but it has fields,
+  a constructor that derived classes reach through `base(...)`, a layout and a descriptor, and it may
+  declare abstract members.
 - Methods are non-virtual by default. `virtual` introduces a slot. `override` replaces an inherited
   virtual or abstract method and needs an exactly matching signature (parameters and return type) and
   the same visibility. `abstract` declares a method without a body and makes the class abstract;
@@ -190,12 +253,33 @@ converted to a base class or interface, captured, or used as the receiver of a v
 interface or non-this-confined call. This covers direct calls, calls through helpers, interface
 conversions and indirect escape in one local rule.
 
-A method is **this-confined** if it is not virtual or abstract and, in its body, `this` is only used
-under the same rules as above and every method it calls on `this` is this-confined. The property is
-computed by the compiler for non-virtual methods (including property accessors) by a fixpoint over the
-statically known call graph; it needs no annotation. A method that is not this-confined can still be
-called on a fully constructed object. Existing code stays valid: the documented property use in a
-constructor, `Health -= damage`, touches only fields.
+A method is **this-confined** if it is not virtual or abstract, its body is visible to the compiler, and:
+
+- `this` is only used in its body under the rules above (field access, identity comparison, calls to
+  other this-confined methods), so the receiver cannot escape; and
+- every method it calls on `this` is this-confined.
+
+Preventing escape is not enough: a helper called on `this` can read a field that the constructor has
+not assigned yet. So for each this-confined method `M` the compiler also computes, flow-insensitively
+over the whole body and transitively through the this-confined methods it calls, the set `Reads(M)` of
+fields of `this` that it may read (property getters included) and requires:
+
+- A call to `M` on `this` from a constructor is allowed only if every field in `Reads(M)` that has no
+  zero default (class, interface, array, string and so on) is **definitely assigned at the call site**,
+  as computed by the constructor's own flow analysis. Reading a primitive field that has not been
+  assigned yields its zero default, as it does today.
+- Writes made by a helper are **not** counted as definite assignments in the constructor: only
+  assignments in the constructor body itself are. This is deliberately conservative.
+- If the compiler cannot compute `Reads(M)` or the this-confinement of `M` (a missing body, a
+  recursion that does not reach a fixpoint within the analysis, a construct that the analysis does not
+  model, an `async` method, which can suspend with `this` live), `M` is **not** this-confined. Unproven
+  means rejected.
+
+The properties are computed for non-virtual methods (including property accessors) by a fixpoint over
+the statically known call graph; no annotation is needed. A method that is not this-confined can still
+be called on a fully constructed object. Existing code stays valid: the documented property use in a
+constructor, `Health -= damage`, reads and writes a primitive field. A constructor that assigns every
+reference field before calling a helper that reads them is also valid.
 
 A runtime failure recorded during a constructor stops execution at the next check as it does today; the
 host discards the result, so a half-built object is never observed, and the header is valid regardless.
@@ -215,7 +299,7 @@ type, not the static one:
 - when the static type is `sealed`, or the compiler knows the exact class, the table is the static one,
   as today;
 - otherwise the conversion loads the table from the object's descriptor for that interface. The static
-  rule guarantees the descriptor has it. The mechanism for finding it is U3.
+  rule guarantees the descriptor has it. The mechanism for finding it is U3, and the lookup is bounded and validated (4.5).
 
 An override of a virtual method that implements an interface method is what the table points to, so a
 call through the interface runs the dynamic override. A derived class may not re-list an interface that
@@ -226,14 +310,19 @@ The `==` and `!=` operators keep comparing identity across all of these conversi
 
 ## 8. Generics
 
+- A **closed, fully specialized type** is a non-generic class, or a generic class instantiated only
+  with concrete type arguments (`Container<int>`), with no free type parameter anywhere in it. B1
+  bases are closed and fully specialized, and may be abstract. The older word "concrete base" is not
+  used because it suggests "non-abstract".
 - Monomorphization is unchanged. Every closed specialization is its own class symbol with its own
-  descriptor, layout and tables, and only concrete classes reach HIR, MIR and codegen.
-- B1 bases are concrete. `class IntContainer : Container<int>` names a closed specialization: U7 asks
-  whether it ships in B1 or in the first expansion, depending on whether the specialization of the base
-  can be requested before the derived layout.
-- Deferred, and not to be blocked by the design: a base parameterized by open type parameters
-  (`class Box<T> : Container<T>`), substitution of type parameters through the chain, detection of
-  infinitely expanding hierarchies, and `where T : BaseClass` constraints.
+  descriptor, layout and tables, and only closed, fully specialized classes reach HIR, MIR and codegen.
+- Whether `class IntContainer : Container<int>` ships in B1 is still the open scope decision U7: it names
+  a closed specialization, and it depends on whether the specialization of the base can be requested
+  before the derived layout is computed.
+- A base that mentions the derived class's own type parameters (`class Box<T> : Container<T>`) is
+  open and deferred, and so are substitution of type parameters through the chain, detection of
+  infinitely expanding hierarchies, and `where T : BaseClass` constraints. The design must not block
+  them.
 
 ## 9. Consequences for the compiler and runtime
 
@@ -254,33 +343,40 @@ The `==` and `!=` operators keep comparing identity across all of these conversi
 
 | ID | Question | Alternatives | Proposal |
 | --- | --- | --- | --- |
-| U1 | How to prevent observation of a partially initialized object | (A) no use of `this` for calls in constructors, which breaks the documented property use; (B) the this-confinement rule of 6.3; (C) B plus unrestricted use of `this` in a `sealed` class once its fields are definitely assigned | B; C may be added later |
+| U1 | How to prevent observation of a partially initialized object | (A) no use of `this` for calls in constructors, which breaks the documented property use; (B) the this-confinement rule of 6.3, with `Reads(M)` checking and rejection when safety cannot be proven; (C) B plus unrestricted use of `this` in a `sealed` class once its fields are definitely assigned | B; C may be added later |
 | U2 | Order of derived initializers and base construction | C# order (6.1); base construction first | C# order |
-| U3 | How the conversion finds the interface table | search the descriptor's interface list; a per-hierarchy fixed index assigned to each interface | search first; indexed form only if measurements justify it |
+| U3 | How the conversion finds the interface table | search the descriptor's interface list; a per-hierarchy fixed index assigned to each interface | search first; indexed form only if stage 3 measurements justify it; both are bounded and validated (4.5) |
 | U4 | Downcast syntax | `x as Derived` yielding `Option<Derived>`; a `TryFrom` style static call; a pattern form | decide with the downcast PR; the descriptor supports the test either way |
 | U5 | `base` as reserved or contextual | contextual with "a declared identifier named `base` wins" | reserved `base` (an identifier named `base` in user code is a migration item; none exists in the repository's own sources) |
-| U6 | Header elision for classes outside any hierarchy | keep the header uniform; elide when a class neither derives nor has derived classes nor virtuals | uniform; revisit with the measurements of 4.4 |
-| U7 | A closed generic base (`Container<int>`) in B1 | in B1; in the first expansion | decide in the base-class PR |
+| U6 | Header elision for classes outside any hierarchy | keep the header uniform; elide when a class neither derives nor has derived classes nor virtuals | uniform; revisit with the stage 3 measurements |
+| U7 | Whether a closed, fully specialized generic base (`Container<int>`) is in B1 scope | in B1; in the first expansion | unresolved scope decision, to be settled before the base-class PR |
 | U8 | Covariant return types and `sealed override` | exact signatures and no `sealed override` in B1 | exact |
 | U9 | `virtual`/`override`/`abstract` on properties | methods only; properties as accessors | methods only in B1 |
 | U10 | Re-listing a base's interface in a derived class | error; C#-style re-implementation | error |
 
-## 11. Sequence of future vertical pull requests
+## 11. Stages, authorization and the sequence of pull requests
 
-Each lands behind its own acceptance, with tests and documentation for exactly what it adds. No public
-page describes inheritance before the pull request that implements it.
+Design acceptance, experimental implementation, performance validation and authorization are separate
+stages. A stage never needs a result that only a later stage produces.
 
-1. **Acceptance.** Record the final contracts, resolve U1 to U10, and update the documents in section
-   12.
-2. **Header and descriptors.** Every class gets the header and a descriptor with its interface tables;
-   no hierarchy yet. Measure allocation size, allocation volume and time.
-3. **Single inheritance.** Base class, layout prefix, field inheritance, upcast, `base(...)`, `protected`,
-   construction order and the `this` rule.
-4. **Virtual dispatch.** `virtual`, `override`, `abstract`, `sealed`, `base.Method`, escape analysis and
-   object elimination updates.
-5. **Interfaces through hierarchies.** Conversion from a base type with the dynamic table.
-6. **Downcast** to `Option<Derived>`.
-7. **Generics in hierarchies**, in the order of section 8.
+| Stage | What it is | May merge to `main`? | Gate to the next stage |
+| --- | --- | --- | --- |
+| 1. Design acceptance | the maintainer accepts this record: U1 to U10 decided (U6 and the choice in U3 may be left to stage 3), contracts of sections 4 to 8 fixed, public documents prepared | documentation only | formal acceptance in writing |
+| 2. Experimental implementation | the minimum needed to measure: every class gets the header and a descriptor with its interface tables, no hierarchy and no user-visible syntax; semantics of existing programs unchanged, except sizes | only as a draft pull request or an unmerged branch; it merges only if stage 3 passes | a measurement report can be produced |
+| 3. Performance validation | measure allocation size, allocation volume, and time on the existing benchmarks and test suites, against thresholds that the maintainer records before the run | the stage 2 change, if the result is accepted | the maintainer accepts the measured cost or chooses U6 header elision or another mitigation |
+| 4. Authorization of the feature stages | the maintainer authorizes the pull requests below one by one | each one when authorized | per-pull-request review |
+
+Pull requests after stage 3, each with its own tests and documentation, and none before its
+authorization. No public page describes inheritance before the pull request that implements it.
+
+1. **Single inheritance.** Base class (abstract or not), layout of 4.1, field inheritance, upcast,
+   `base(...)`, `protected`, construction order and the `this` rule.
+2. **Virtual dispatch.** `virtual`, `override`, `abstract`, `sealed`, `base.Method`, escape analysis and
+   object elimination updates, descriptor validation.
+3. **Interfaces through hierarchies.** Conversion from a base type with the dynamic table and the
+   validated lookup.
+4. **Downcast** to `Option<Derived>`.
+5. **Generics in hierarchies**, in the order of section 8 (including U7 if it was left out).
 
 Constructor overloads and `this(...)` (B2) are independent and not part of this sequence.
 
@@ -309,6 +405,11 @@ Positive:
 | P8 | constructor with `Health -= damage` (property on `this`) | allowed: the accessors are this-confined |
 | P9 | initializer, `base(...)` argument and body each logging | the order of 6.1 |
 | P10 | `sealed class Leaf : Entity` | compiles; `Leaf` to an interface uses the static table |
+| P11 | `Base { long x; byte b }` and `Derived : Base { byte d }` | `x`, `b` keep offsets 8 and 16 in `Derived`; `d` is at 24 and `size(Derived)` is 32 |
+| P12 | a class with no fields, and a derived class with no own fields | sizes 8 and `size(Base)`; instantiable |
+| P13 | `abstract class Shape { protected int id; public Shape(int id) { this.id = id; } }`, `class Circle : Shape` with `: base(id)` | an abstract class is inherited; its constructor and field are reached |
+| P14 | a constructor assigns a reference field, then calls a this-confined helper that reads it | allowed: `Reads(M)` is assigned at the call site |
+| P15 | a helper that reads only a primitive field, called before the field is assigned | allowed: the zero default is read |
 
 Negative (each a controlled compile-time diagnostic):
 
@@ -331,19 +432,41 @@ Negative (each a controlled compile-time diagnostic):
 | N15 | `base(...)` in a class without a base class or outside a constructor; a base constructor that needs arguments with no `base(...)` |
 | N16 | two class bases; a class after an interface in the list; re-listing an interface the base already implements |
 | N17 | `abstract` and `sealed` together; an abstract method in a non-abstract class; `virtual` on a static, private or constructor member |
-| N18 | an open generic base (until the expansion) |
+| N18 | an open base: a base type that mentions the derived class's own type parameters (until the expansion) |
 | N19 | a class reference sent to a worker (still rejected) |
+| N20 | a constructor calls a helper (this-confined) that reads a reference field not yet definitely assigned |
+| N21 | a helper whose only assignment to a reference field is inside another helper, followed by a read of it in the constructor (helper writes do not count) |
+| N22 | a constructor calls a helper whose this-confinement or reads cannot be computed (an `async` method; a body that is not available) |
+
+Validator and descriptor cases (internal invariants, checked when the module is built and tested with
+hand-written MIR or descriptors; none of them is reachable from valid source):
+
+| ID | Case | Expected |
+| --- | --- | --- |
+| V1 | a derived layout whose inherited field offset differs from the base, or whose first own field is inside `size(B)` | rejected before code generation |
+| V2 | a store to offset `0` other than the allocation sequence | rejected |
+| V3 | a descriptor whose `depth` is not the base's plus one, or whose `ancestors` length or prefix is wrong | rejected |
+| V4 | a subtype test of a deep target against an object of a shallow class | `false`, with no read past the `ancestors` array |
+| V5 | a cycle in the base chain | rejected |
+| V6 | a non-abstract class with no table for an interface its static type implements, or with a table of the wrong method count | rejected |
+| V7 | an interface lookup that finds no table at run time (hand-built) | a controlled runtime error; no call through a missing or null table |
+| V8 | a virtual call whose slot index is not below the static type's vtable length | rejected |
 
 ## 14. Criteria for formal acceptance
 
-All of the following must hold before any implementation pull request:
+Formal acceptance (stage 1 of section 11) requires all of the following. None of them needs a
+measurement from an implementation.
 
-1. U1 to U10 are decided and recorded.
-2. The construction sequence, the `this` rule and the this-confinement computation are specified without
-   open edge cases, with the positive and negative cases above converted into planned regression tests.
-3. Header, offsets, descriptor contents and lifetime are fixed enough to implement and validate, and the
-   cost in 4.4 has been measured on the existing benchmarks and accepted.
-4. The interaction with interfaces, generic specialization and `where` constraints is specified for B1.
+1. U1 to U10 are decided and recorded, except U6 and the choice in U3, which stage 3 may settle.
+2. The construction sequence, the `this` rule, this-confinement and the `Reads(M)` check are specified
+   without open edge cases, and the positive and negative cases above are converted into planned
+   regression tests.
+3. Header, offsets (4.1), descriptor contents, validation (4.5) and lifetime (4.3) are fixed enough to
+   implement and to validate independently; it is confirmed that no task or worker can run module
+   code after the module is released. The measurement protocol for stage 3 (what is measured, on
+   which benchmarks, and who records the thresholds) is written down.
+4. The interaction with interfaces, generic specialization and `where` constraints is specified for B1,
+   including the definition of a closed, fully specialized base type and the decision on U7.
 5. The consequences for escape analysis, local object elimination and the lifetime proofs are written
    down per analysis.
 6. HIR and MIR shapes and their independent backend validation are specified.
@@ -352,3 +475,6 @@ All of the following must hold before any implementation pull request:
    word `base`; classes grow by the header).
 9. The documents in section 12 have a prepared update.
 10. The maintainer accepts this record.
+
+Stage 2 may then begin. Authorization of the feature pull requests (stage 4) additionally requires the
+accepted result of stage 3.
