@@ -50,7 +50,12 @@ The script first builds, or confirms, the executables for
 `cargo test --workspace --all-targets` with the current settings, then deletes only the other
 hashed executables in `target/debug/deps` and `target/debug/examples`, plus `target/debug/incremental`.
 It never touches libraries, fingerprints, the `release` profile or `~/.cargo`, and it refuses to run
-while `cargo` or `rustc` is running. Deleted files are rebuilt by Cargo on demand. `cargo clean`
+while `cargo` or `rustc` is running (checked at the start and again right before the first deletion).
+It deletes nothing unless Cargo reported a successful build with a non-empty list of executables that
+all exist under the target directory, and a relative `CARGO_TARGET_DIR` is resolved against the
+repository root. Deleted files are rebuilt by Cargo on demand. Its failure paths are covered by
+`powershell -NoProfile -File scripts\prune-build-artifacts.tests.ps1`, which only uses a temporary
+directory. `cargo clean`
 remains available but discards everything and costs a full rebuild.
 
 Run the local CLI without installing it:
