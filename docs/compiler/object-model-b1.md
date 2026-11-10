@@ -1,8 +1,10 @@
 # Architectural proposal: Object model B1 (single class inheritance)
 
-**Status.** Direction B (nominal single class inheritance with polymorphism, native execution, no GC,
-no .NET dependency) is **ACCEPTED as the objective**. Every B1 contract in this document is
-**PROPOSED**. Nothing here is implemented, and no public documentation may describe inheritance as
+**Status.** Direction B (nominal single class inheritance with polymorphism, ergonomics close to C#,
+and a native compiler and runtime independent of .NET) is **ACCEPTED as the objective**. It does not
+decide the long-term memory-recovery strategy: B1 introduces no GC and keeps the current per-invocation
+arena model, and the definitive strategy for reclaiming shared object graphs remains an open, separate
+decision. Every B1 contract in this document is **PROPOSED**. Nothing here is implemented, and no public documentation may describe inheritance as
 available until the pull request that implements a part of it lands. Section 11 separates design
 acceptance, experimental implementation, performance validation and the authorization of the later
 stages, so that no stage depends on a result that only a later stage can produce.
@@ -18,8 +20,10 @@ stages, so that no stage depends on a result that only a later stage can produce
 B1 adds single implementation inheritance, `virtual`/`override`/`abstract`/`sealed`, `base(...)`
 construction, `protected`, and class-to-base and class-to-interface conversions that respect the
 dynamic type. It does not add `object` as a universal root, boxing, reflection, attributes, static
-fields, delegates, events, GC, finalizers, multiple implementation inheritance, or .NET binary
-compatibility. Each of those needs its own record.
+fields, delegates, events, finalizers, multiple implementation inheritance, or .NET binary
+compatibility. Each of those needs its own record. B1 also introduces no GC and leaves the arena model
+as it is; this is a scope limit of B1, not a permanent decision about memory management, whose
+definitive strategy is a separate open decision.
 
 ## 2. Approved decisions
 
