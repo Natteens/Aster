@@ -643,16 +643,57 @@ Gates run (CARGO_BUILD_JOBS=2, RUST_TEST_THREADS=2, debug builds, so released bl
 poisoned with 0xDB):
 
 - `aster-codegen-cranelift --all-targets`: C0 1,443 passed, 0 failed; C4 1,443 passed, 0 failed;
-  C5 1,429 passed, 0 failed, 24 ignored (2 pre-existing, 22 region-reclamation tests ignored under
-  C5 with an explicit reason: C5 disables region rewinds).
+  C5 1,427 passed, 0 failed, 24 ignored (2 pre-existing, 22 region-reclamation tests ignored under
+  C5 with an explicit reason: C5 disables region rewinds). The checkpoint commit message says
+  1,429 passed; that figure was a counting error, corrected here.
 - `tests/mem_exp_c5.rs` (7): released blocks observed for loop field replacement, loop local
   reassignment, callee frames; shared objects survive; interface identity preserved.
 - `aster-runtime` 337 (default) and 346 (`mem-exp-rc`) passed; `aster-compiler` 707 passed;
   `aster-mir` 42 passed; clippy clean on the four crates (default and C5); rustfmt clean.
 
+### T-MEM-EXP-1 stage C, C6 elision — implemented (2026-11-11)
+
+Contract: §6 of [08-mem-exp-1-c5-design.md](08-mem-exp-1-c5-design.md). `insert_ownership_elided`
+applies E1 (null capture), E2 (move from a single-use lowering temporary), E3 (leaf-function
+parameters); the validator gained liveness-based holders, token-only balance at return, and a
+borrowed-parameter mode restricted to functions with no call and no non-parameter release.
+Feature `mem-exp-c6` = `mem-exp-c5` + elision. Report tool:
+`cargo +stable-gnu run -p aster-codegen-cranelift --example mem_exp_counts --features mem-exp-c6`.
+
+Gates: `aster-mir` 39 + 14 passed; `aster-codegen-cranelift --all-targets`: C6 1,427 passed,
+0 failed, 24 ignored; C5 rerun 1,427 passed, 0 failed, 24 ignored.
+
+Count report (debug build, deterministic; static = Retain + Release instructions in the module,
+executed = non-null, non-immortal runtime operations, `Run` entry):
+
+| Workload | Checksum C5 = C6 | Static C5 / C6 | Executed retains C5 / C6 | Executed releases C5 / C6 |
+| --- | --- | --- | --- | --- |
+| accessor_heavy | 2508936383 | 15 / 3 | 0 / 0 | 0 / 0 |
+| calls_and_interfaces | 300900000 | 26 / 8 | 800,006 / 400,002 | 800,008 / 400,004 |
+| generics | 300333 | 22 / 6 | 0 / 0 | 0 / 0 |
+| interface_dispatch | 7025000 | 33 / 21 | 600,090 / 300,060 | 600,090 / 300,060 |
+| longrun_frame | 16351259 | 20 / 12 | 648,206 / 260,103 | 648,206 / 260,103 |
+| longrun_request | 45498889 | 20 / 8 | 320,000 / 60,000 | 340,000 / 80,000 |
+| object_graph | 184230 | 36 / 19 | 245,600 / 163,720 | 245,620 / 163,740 |
+
+Workloads without class references (collections, cache_churn, collection_growth, numeric_loops,
+string_pipeline, strings) emit no count operation; all checksums equal C0's expected values.
+Executed operations, suite total: C6/C5 = 2,387,792 / 5,247,826 = 45.5% (soft gate ≤ 50%: met on
+the total; per workload object_graph is 66.7% and interface_dispatch 50.0%).
+
+Heap facts in C6 (`Run`): `longrun_request` reuses 19,998 of 20,000 released blocks (2 fresh), but
+its `used_bytes` still grows (2,079,156 at N, 20,798,521 at 10N) because strings and arrays are not
+counted. `longrun_frame` (4,103 fresh, 0 released) and `object_graph` (40,922 fresh, 20 released)
+keep their objects in arrays or lists, whose references are never released in this increment. The
+long-running gate therefore cannot pass yet; this is a measured consequence, not a verdict.
+
 Not done, so **no PASS for MEM-001 to MEM-003**:
 
-1. C6 elision and the C5/C6 comparison (count operations emitted, elided, executed).
-2. Region reclamation together with counting (H2 pins); C5 currently loses it.
-3. Collection, enum, and closure ownership (U8 glue); strings and arrays not counted.
-4. Class B timing protocol and the §4.C thresholds.
+1. Collection and array element ownership (U8 glue) and counted strings and arrays: required for
+   the long-running gate (`longrun_frame`, `longrun_request`, `cache_churn`) and for peak memory.
+2. Enum payload drop glue and closure environments (enums currently leak their references).
+3. Region reclamation together with counting (H2 pins); C5 and C6 currently lose it.
+4. Class B timing protocol (release builds, interleaved rounds) and the §4.C thresholds.
+
+Next action: item 1, starting with `List<T>` element glue for class elements (runtime release on
+overwrite, remove, clear) and array element release, then counted strings.

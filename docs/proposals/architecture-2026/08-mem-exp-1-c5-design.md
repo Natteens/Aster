@@ -118,3 +118,35 @@ Independent code. Symbolic token accounting per block, with a forward dataflow f
 - Released heap blocks return to size-class free lists, so `used_bytes` (arena accounting) does not
   fall when objects are released; reuse shows in `ObjectHeapStats.reused_blocks`. Live versus
   reserved memory must be reported from heap statistics, not from `used_bytes`.
+
+## 6. C6 elision (contract)
+
+`insert_ownership_elided` produces the C5 output and then removes count operations by three local
+rules. Each rule keeps every value's token balance; none relies on a callee summary.
+
+- **E1, null capture.** A capture `T = D.l` and its `Release(T)` are dropped when the destination
+  slot is a local leaf that is definitely null at that point (never written on any path from the
+  function entry). Releasing null is a no-op; the instruction pair only costs a call.
+- **E2, move from a single-use temporary.** For a lowering temporary `t` (`temporary: true`,
+  not created by the pass) that is written exactly once and whose only read is a copy into an
+  owning destination later in the same block, the `Retain` of that copy and the exit `Release` of
+  `t` are dropped: the count moves with the value.
+- **E3, leaf-function parameters.** When a function, after C5 insertion, contains no `Release`
+  other than parameter exit releases and no call of any kind, and never writes a parameter slot,
+  the entry `Retain` and exit `Release` of every parameter are dropped. Nothing in such a function
+  can release any object, so the caller's guarantee covers the whole call.
+
+Validator changes for C6 (independent code, still no sharing with the pass):
+
+- A slot counts as a holder at a block end only when it is live (read before any redefinition on
+  some path, exit releases included). A dead slot's bits are never read again, so it needs no
+  count.
+- At `Return`/`End` the check is token balance only: every value has 0 tokens, except the returned
+  value with 1. The rule "every Live slot was released" is dropped (it is implied for live slots).
+- A parameter's original value may be held without a count (tokens = holders − 1 at block ends,
+  0 at return unless returned) only when the function contains no `Release` of a non-parameter
+  slot and no call of any kind; otherwise the C5 rule (tokens = holders) applies, and a borrowed
+  parameter read after such an instruction is U2.
+
+Metrics: static `Retain`/`Release` counts emitted by C5 and C6 for the same module, the number
+removed by each rule, and executed counts from `ObjectHeapStats` (non-null, non-immortal).

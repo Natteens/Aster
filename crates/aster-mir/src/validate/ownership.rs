@@ -93,6 +93,8 @@ enum Provenance {
     Owned,
     HeapRead,
     Guaranteed,
+    /// A parameter's original value, before any count of this function.
+    Param,
     Region,
     Null,
 }
@@ -128,6 +130,8 @@ struct Frame<'a> {
     native: &'a [SymbolId],
     function: &'a Function,
     keys: Vec<(LocalId, Path)>,
+    /// C6 leaf-function mode: parameters are held without a count.
+    borrowed_params: bool,
 }
 
 fn extend(place: &Place, path: &[SymbolId]) -> Place {
@@ -260,15 +264,17 @@ impl Frame<'_> {
         }
     }
 
-    fn local_name(&self, id: LocalId) -> &str {
-        let function = self.function;
-        function
-            .parameters
-            .iter()
-            .chain(&function.locals)
-            .find(|local| local.id == id)
-            .map_or("?", |local| local.name.as_str())
+    fn is_parameter_slot(&self, index: usize) -> bool {
+        let local = self.keys[index].0;
+        self.function.parameters.iter().any(|p| p.id == local)
     }
+}
+
+/// Backward slot liveness of one block: slots read (including by a release)
+/// before being redefined, and slots redefined.
+struct Liveness {
+    live_in: Vec<bool>,
+    live_out: Vec<bool>,
 }
 
 struct Block<'a> {
@@ -280,10 +286,22 @@ struct Block<'a> {
     cache: Vec<(Place, ValueId)>,
     epoch: u32,
     findings: Vec<(&'static str, String)>,
+    /// Slots read before any redefinition in this block.
+    used: Vec<bool>,
+    /// Slots redefined in this block.
+    defined: Vec<bool>,
+    /// Slots that are live at the block end; `None` counts every slot.
+    live_out: Option<Vec<bool>>,
 }
 
 impl<'a> Block<'a> {
-    fn run(frame: &'a Frame<'a>, block: &BasicBlock, entry: &[SlotState], first: bool) -> Self {
+    fn run(
+        frame: &'a Frame<'a>,
+        block: &BasicBlock,
+        entry: &[SlotState],
+        first: bool,
+        liveness: Option<&Liveness>,
+    ) -> Self {
         let mut state = Self {
             frame,
             id: block.id,
@@ -293,13 +311,19 @@ impl<'a> Block<'a> {
             cache: Vec::new(),
             epoch: 0,
             findings: Vec::new(),
+            used: vec![false; entry.len()],
+            defined: vec![false; entry.len()],
+            live_out: liveness.map(|l| l.live_out.clone()),
         };
         for (index, slot) in entry.iter().enumerate() {
             if *slot == SlotState::Live {
-                let value = if first {
-                    state.value(0, Provenance::Guaranteed)
-                } else {
+                let value = if first || (frame.borrowed_params && frame.is_parameter_slot(index)) {
+                    state.value(0, Provenance::Param)
+                } else if liveness.is_none_or(|l| l.live_in[index]) {
                     state.value(1, Provenance::Slot)
+                } else {
+                    // The bits are never read again: no count is attributed.
+                    state.value(0, Provenance::Slot)
                 };
                 state.held[index] = Some(value);
             }
@@ -343,6 +367,12 @@ impl<'a> Block<'a> {
         }
     }
 
+    fn mark_used(&mut self, index: usize) {
+        if !self.defined[index] {
+            self.used[index] = true;
+        }
+    }
+
     fn invalidate(&mut self) {
         self.cache.clear();
         self.epoch += 1;
@@ -350,8 +380,12 @@ impl<'a> Block<'a> {
 
     fn check_stale(&mut self, value: ValueId) {
         let entry = &self.values[value];
-        if entry.provenance == Provenance::HeapRead && entry.tokens <= 0 && entry.epoch < self.epoch
-        {
+        let borrowed = match entry.provenance {
+            Provenance::HeapRead => true,
+            Provenance::Param => !self.frame.borrowed_params,
+            _ => false,
+        };
+        if borrowed && entry.tokens <= 0 && entry.epoch < self.epoch {
             self.flag(
                 "U2",
                 "borrowed heap value used after an invalidating instruction",
@@ -361,17 +395,20 @@ impl<'a> Block<'a> {
 
     fn read_leaf(&mut self, place: &Place) -> ValueId {
         match self.frame.home(place) {
-            Home::Slot(index) => match (self.slots[index], self.held[index]) {
-                (SlotState::Live, Some(value)) => {
-                    self.check_stale(value);
-                    value
+            Home::Slot(index) => {
+                self.mark_used(index);
+                match (self.slots[index], self.held[index]) {
+                    (SlotState::Live, Some(value)) => {
+                        self.check_stale(value);
+                        value
+                    }
+                    (SlotState::Dead, _) => {
+                        self.flag("U2", "use of a slot after its release");
+                        self.value(0, Provenance::Null)
+                    }
+                    _ => self.value(0, Provenance::Null),
                 }
-                (SlotState::Dead, _) => {
-                    self.flag("U2", "use of a slot after its release");
-                    self.value(0, Provenance::Null)
-                }
-                _ => self.value(0, Provenance::Null),
-            },
+            }
             home @ (Home::Heap | Home::Outside) => {
                 if let Some((_, value)) = self.cache.iter().find(|(cached, _)| cached == place) {
                     return *value;
@@ -430,6 +467,9 @@ impl<'a> Block<'a> {
                 Home::Slot(index) => Some(index),
                 _ => None,
             };
+            if let Some(index) = slot {
+                self.mark_used(index);
+            }
             let value = match slot {
                 Some(index) => match self.slots[index] {
                     SlotState::Dead => {
@@ -502,6 +542,7 @@ impl<'a> Block<'a> {
                         SlotState::Live
                     };
                     self.held[index] = Some(write.value);
+                    self.defined[index] = true;
                     let local = self.frame.keys[index].0;
                     self.cache.retain(|(place, _)| !mentions(place, local));
                 }
@@ -754,8 +795,15 @@ impl<'a> Block<'a> {
                     self.operand_values(condition);
                 }
                 let mut holders = vec![0; self.values.len()];
-                for (state, held) in self.slots.iter().zip(&self.held) {
-                    if let (SlotState::Live, Some(value)) = (state, held) {
+                for (index, (state, held)) in self.slots.iter().zip(&self.held).enumerate() {
+                    // A slot whose bits are never read again holds no count.
+                    let live = self.live_out.as_ref().is_none_or(|out| out[index]);
+                    let uncounted =
+                        self.frame.borrowed_params && self.frame.is_parameter_slot(index);
+                    if let (SlotState::Live, Some(value)) = (state, held)
+                        && live
+                        && !uncounted
+                    {
                         holders[*value] += 1;
                     }
                 }
@@ -768,8 +816,9 @@ impl<'a> Block<'a> {
     }
 
     fn returning(&mut self, operand: Option<&Operand>) {
+        // Token balance only: every value ends with 0 tokens, the returned one
+        // with 1. A live slot that still owned a count would leave tokens over.
         let mut returned = Vec::new();
-        let mut returned_slots = Vec::new();
         if let Some(Operand {
             type_,
             kind: OperandKind::Copy(place),
@@ -777,20 +826,7 @@ impl<'a> Block<'a> {
         {
             self.touch_place(place);
             for (_, leaf) in self.frame.leaf_places(place, type_) {
-                if let Home::Slot(index) = self.frame.home(&leaf) {
-                    returned_slots.push(index);
-                }
                 returned.push(self.read_leaf(&leaf));
-            }
-        }
-        for index in 0..self.slots.len() {
-            if self.slots[index] == SlotState::Live && !returned_slots.contains(&index) {
-                let (local, _) = &self.frame.keys[index];
-                let message = format!(
-                    "slot of `{}` still owns a count at return",
-                    self.frame.local_name(*local)
-                );
-                self.flag("U1", &message);
             }
         }
         let mut holders = vec![0; self.values.len()];
@@ -825,6 +861,7 @@ fn check_function(
         native,
         function,
         keys: Vec::new(),
+        borrowed_params: false,
     };
     let mut keys = Vec::new();
     for local in function.parameters.iter().chain(&function.locals) {
@@ -856,11 +893,62 @@ fn check_function(
         });
     }
     frame.keys = keys;
+    let mut found = analyse(&frame);
+    if !found.is_empty() && leaf_function(function) {
+        frame.borrowed_params = true;
+        if analyse(&frame).is_empty() {
+            found.clear();
+        }
+    }
+    findings.extend(
+        found
+            .into_iter()
+            .map(|(obligation, message)| OwnershipFinding {
+                function: function.name.clone(),
+                obligation,
+                message,
+            }),
+    );
+}
+
+/// A function that can release nothing but its own parameters: no call of
+/// any kind and no `Release` of anything but a parameter slot. Only there may
+/// a parameter's original value be held without a count (C6, rule E3).
+fn leaf_function(function: &Function) -> bool {
+    function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .all(|instruction| match instruction {
+            mir::Instruction::Call { .. }
+            | mir::Instruction::CallInterface { .. }
+            | mir::Instruction::ForeignCall { .. }
+            | mir::Instruction::CallIntrinsic { .. } => false,
+            mir::Instruction::Release { value } => {
+                let OperandKind::Copy(place) = &value.kind else {
+                    return true;
+                };
+                let mut root = place;
+                while let Place::Field { base, .. } = root {
+                    root = base;
+                }
+                matches!(root, Place::Local(id) if function.parameters.iter().any(|p| p.id == *id))
+            }
+            _ => true,
+        })
+}
+
+type RawFinding = (&'static str, String);
+
+/// Slot-state dataflow, slot liveness, and the per-block token check.
+#[allow(clippy::too_many_lines)]
+fn analyse(frame: &Frame<'_>) -> Vec<RawFinding> {
+    let function = frame.function;
     let blocks = &function.blocks;
     let index: HashMap<BasicBlockId, usize> =
         blocks.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
     let Some(&entry) = index.get(&function.entry) else {
-        return;
+        return Vec::new();
     };
     let initial: Vec<SlotState> = frame
         .keys
@@ -884,7 +972,7 @@ fn check_function(
             let Some(state) = states[i].clone() else {
                 continue;
             };
-            let run = Block::run(&frame, block, &state, i == entry && first);
+            let run = Block::run(frame, block, &state, i == entry && first, None);
             for target in successors(&block.terminator) {
                 let Some(&j) = index.get(&target) else {
                     continue;
@@ -910,21 +998,60 @@ fn check_function(
             break;
         }
     }
+    // Backward slot liveness from the per-block use/definition sets.
+    let slots = frame.keys.len();
+    let usage: Vec<Option<(Vec<bool>, Vec<bool>)>> = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, block)| {
+            states[i].as_ref().map(|state| {
+                let run = Block::run(frame, block, state, i == entry && first, None);
+                (run.used, run.defined)
+            })
+        })
+        .collect();
+    let mut liveness: Vec<Liveness> = (0..blocks.len())
+        .map(|_| Liveness {
+            live_in: vec![false; slots],
+            live_out: vec![false; slots],
+        })
+        .collect();
+    loop {
+        let mut changed = false;
+        for (i, block) in blocks.iter().enumerate().rev() {
+            let Some((used, defined)) = &usage[i] else {
+                continue;
+            };
+            let mut out = vec![false; slots];
+            for target in successors(&block.terminator) {
+                if let Some(&j) = index.get(&target) {
+                    for (slot, live) in out.iter_mut().zip(&liveness[j].live_in) {
+                        *slot |= *live;
+                    }
+                }
+            }
+            let live_in: Vec<bool> = (0..slots)
+                .map(|slot| used[slot] || (out[slot] && !defined[slot]))
+                .collect();
+            if live_in != liveness[i].live_in || out != liveness[i].live_out {
+                liveness[i].live_in = live_in;
+                liveness[i].live_out = out;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut found = Vec::new();
     for (i, block) in blocks.iter().enumerate() {
         let Some(state) = &states[i] else {
             continue;
         };
-        let run = Block::run(&frame, block, state, i == entry && first);
-        findings.extend(
-            run.findings
-                .into_iter()
-                .map(|(obligation, message)| OwnershipFinding {
-                    function: function.name.clone(),
-                    obligation,
-                    message,
-                }),
-        );
+        let run = Block::run(frame, block, state, i == entry && first, Some(&liveness[i]));
+        found.extend(run.findings);
     }
+    found
 }
 
 #[cfg(test)]
@@ -1000,6 +1127,15 @@ mod tests {
         locals: &[(u32, bool)],
         instructions: Vec<Instruction>,
     ) -> Vec<&'static str> {
+        obligations_ending(parameters, locals, instructions, Terminator::Return(None))
+    }
+
+    fn obligations_ending(
+        parameters: u32,
+        locals: &[(u32, bool)],
+        instructions: Vec<Instruction>,
+        terminator: Terminator,
+    ) -> Vec<&'static str> {
         let module = Module {
             structs: Vec::new(),
             classes: vec![mir::ClassDefinition {
@@ -1031,7 +1167,7 @@ mod tests {
                 blocks: vec![BasicBlock {
                     id: BasicBlockId(0),
                     instructions,
-                    terminator: Terminator::Return(None),
+                    terminator,
                 }],
                 temporary_subregion_candidates: Vec::new(),
             }],
@@ -1153,6 +1289,84 @@ mod tests {
                 release(lp(2)),
             ],
         );
+        assert!(found.contains(&"U1"), "{found:?}");
+    }
+
+    #[test]
+    fn move_out_of_a_temporary_that_is_not_read_again_validates() {
+        // t = this.f; x = t (the retain moved with the value); no release of t.
+        let found = obligations(
+            1,
+            &[(1, true), (2, false)],
+            vec![
+                retain(lp(0)),
+                retain(field(0)),
+                assign(lp(1), field(0)),
+                assign(lp(2), lp(1)),
+                release(lp(0)),
+                release(lp(2)),
+            ],
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn move_out_of_a_temporary_that_is_read_again_is_rejected() {
+        // The count moved to x, x is released, and t is read again: stale.
+        let found = obligations(
+            1,
+            &[(1, true), (2, false), (3, false)],
+            vec![
+                retain(lp(0)),
+                retain(field(0)),
+                assign(lp(1), field(0)),
+                assign(lp(2), lp(1)),
+                release(lp(2)),
+                retain(lp(1)),
+                assign(lp(3), lp(1)),
+                release(lp(3)),
+                release(lp(0)),
+            ],
+        );
+        assert!(found.contains(&"U1") || found.contains(&"U2"), "{found:?}");
+    }
+
+    #[test]
+    fn parameter_elision_in_a_leaf_function_validates() {
+        // return this.f with no entry retain and no exit release.
+        let found = obligations_ending(
+            1,
+            &[(1, true)],
+            vec![assign(lp(1), field(0)), retain(lp(1))],
+            Terminator::Return(Some(operand(lp(1)))),
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn parameter_elision_in_a_function_with_a_call_is_u2() {
+        // The call may release the object behind the parameter before it is read.
+        let found = obligations(
+            1,
+            &[(1, false)],
+            vec![
+                Instruction::Call {
+                    destination: None,
+                    function: SymbolId(2),
+                    arguments: Vec::new(),
+                    return_type: Type::Void,
+                },
+                retain(lp(0)),
+                assign(lp(1), lp(0)),
+                release(lp(1)),
+            ],
+        );
+        assert!(found.contains(&"U2"), "{found:?}");
+    }
+
+    #[test]
+    fn leaked_slot_at_return_is_u1() {
+        let found = obligations(1, &[(1, false)], vec![retain(lp(0)), assign(lp(1), lp(0))]);
         assert!(found.contains(&"U1"), "{found:?}");
     }
 

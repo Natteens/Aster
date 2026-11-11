@@ -74,10 +74,13 @@ pub(super) struct PreparedProgram {
     _descriptors: super::layouts::ObjectDescriptors,
 }
 
-/// MEM-EXP-1 C5: insert the ownership instructions and validate them before
-/// any code is generated.
+/// MEM-EXP-1 C5/C6: insert the ownership instructions (elided in C6) and
+/// validate them before any code is generated.
 #[cfg(feature = "mem-exp-c5")]
 fn prepare_ownership_module(module: &mir::Module) -> Result<mir::Module, BackendError> {
+    #[cfg(feature = "mem-exp-c6")]
+    let (transformed, _stats) = mir::ownership::insert_ownership_elided(module);
+    #[cfg(not(feature = "mem-exp-c6"))]
     let (transformed, _stats) = mir::ownership::insert_ownership(module);
     mir::validate::ownership::validate_ownership(&transformed).map_err(|findings| {
         BackendError::new(

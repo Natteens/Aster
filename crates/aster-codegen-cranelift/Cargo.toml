@@ -20,11 +20,18 @@ mem-exp-c4 = ["mem-exp-h12", "aster-runtime/mem-exp-heap"]
 # MEM-EXP-1 configuration C5: C4 plus the ownership pass, descriptors, and
 # reference-count lowering (naive counting, no elision).
 mem-exp-c5 = ["mem-exp-c4", "aster-runtime/mem-exp-rc"]
+# MEM-EXP-1 configuration C6: C5 plus retain/release elision.
+mem-exp-c6 = ["mem-exp-c5"]
 
 [[example]]
 name = "aarm_memory_matrix"
 path = "examples/aarm_memory_matrix.rs"
 required-features = ["aarm-telemetry"]
+
+[[example]]
+name = "mem_exp_counts"
+path = "examples/mem_exp_counts.rs"
+required-features = ["mem-exp-c5"]
 
 [[example]]
 name = "aarm_iteration_loop"
