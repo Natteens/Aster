@@ -17,6 +17,9 @@ mem-exp-h12 = []
 mem-exp-h16 = []
 # MEM-EXP-1 configuration C4: H12 header plus the size-class heap.
 mem-exp-c4 = ["mem-exp-h12", "aster-runtime/mem-exp-heap"]
+# MEM-EXP-1 configuration C5: C4 plus the ownership pass, descriptors, and
+# reference-count lowering (naive counting, no elision).
+mem-exp-c5 = ["mem-exp-c4", "aster-runtime/mem-exp-rc"]
 
 [[example]]
 name = "aarm_memory_matrix"

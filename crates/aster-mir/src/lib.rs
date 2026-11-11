@@ -5,6 +5,7 @@
 
 use std::fmt;
 
+pub mod ownership;
 pub mod validate;
 
 pub use aster_hir::{
@@ -426,6 +427,17 @@ pub enum Instruction {
         char_destination: Place,
         next_cursor_destination: Place,
         ok_destination: Place,
+    },
+    /// MEM-EXP-1 (C5/C6): add one strong count to `value`'s object word.
+    /// `value` is a class or interface operand. Inserted only by the
+    /// ownership pass ([`ownership`]); never produced by lowering.
+    Retain {
+        value: Operand,
+    },
+    /// MEM-EXP-1 (C5/C6): drop one strong count from `value`'s object word,
+    /// releasing every object whose count reaches zero. Runs no user code.
+    Release {
+        value: Operand,
     },
 }
 

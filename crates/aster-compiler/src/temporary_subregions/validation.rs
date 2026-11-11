@@ -904,6 +904,9 @@ pub(super) fn span_barrier_for_research(
 fn span_barrier(instructions: &[mir::Instruction]) -> Option<TemporarySubregionRejectionReason> {
     for instruction in instructions {
         let reason = match instruction {
+            mir::Instruction::Retain { .. } | mir::Instruction::Release { .. } => {
+                Some(TemporarySubregionRejectionReason::CallBarrier)
+            }
             mir::Instruction::TemporarySubregionEnter { .. }
             | mir::Instruction::TemporarySubregionExit { .. } => {
                 Some(TemporarySubregionRejectionReason::UnsupportedControlFlow)

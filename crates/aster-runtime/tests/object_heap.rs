@@ -53,6 +53,10 @@ fn a_released_block_is_reused_zeroed_and_classes_do_not_mix() {
     );
     let reused = context.allocate_heap_object(16);
     assert_eq!(reused, first, "the released 16-byte block is reused");
+    #[cfg(feature = "mem-exp-rc")]
+    unsafe {
+        set_count(reused, 0);
+    };
     let bytes = unsafe { std::slice::from_raw_parts(reused, 16) };
     assert!(
         bytes.iter().all(|byte| *byte == 0),
@@ -64,6 +68,7 @@ fn a_released_block_is_reused_zeroed_and_classes_do_not_mix() {
             fresh_blocks: 2,
             reused_blocks: 1,
             released_blocks: 1,
+            ..ObjectHeapStats::default()
         }
     );
 }

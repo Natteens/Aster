@@ -206,6 +206,9 @@ fn count_instruction_uses(instruction: &mir::Instruction, uses: &mut HashMap<mir
         count_place_input_uses(value, uses);
     };
     match instruction {
+        mir::Instruction::Retain { value } | mir::Instruction::Release { value } => {
+            operand(value, uses);
+        }
         mir::Instruction::OwnedRegionEnter { .. }
         | mir::Instruction::OwnedRegionExit { .. }
         | mir::Instruction::TemporarySubregionEnter { .. }
@@ -618,6 +621,9 @@ fn rewrite_instruction_operands(
     }
 
     match instruction {
+        mir::Instruction::Retain { value } | mir::Instruction::Release { value } => {
+            operand!(value);
+        }
         mir::Instruction::Assign { target, value } => {
             place!(target);
             rewrite_rvalue_operands(value, facts, copies);

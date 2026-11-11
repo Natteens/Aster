@@ -504,6 +504,8 @@ fn defines_direct_local(instruction: &mir::Instruction, local: mir::LocalId) -> 
         }
         mir::Instruction::OwnedRegionEnter { .. }
         | mir::Instruction::OwnedRegionExit { .. }
+        | mir::Instruction::Retain { .. }
+        | mir::Instruction::Release { .. }
         | mir::Instruction::TemporarySubregionEnter { .. }
         | mir::Instruction::TemporarySubregionExit { .. }
         | mir::Instruction::StringBuilderAppend { .. }

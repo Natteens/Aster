@@ -412,6 +412,9 @@ pub struct MemoryStats {
     pub reserved_bytes: u64,
     pub peak_used_bytes: u64,
     pub peak_reserved_bytes: u64,
+    /// MEM-EXP-1 heap counters, refreshed on every heap event.
+    #[cfg(feature = "mem-exp-heap")]
+    pub object_heap: crate::object_heap::ObjectHeapStats,
 }
 
 /// Experimental allocator event counters used by the AARM research matrix.
@@ -1220,6 +1223,7 @@ impl ExecutionContext {
             Ok(Some(pointer)) => {
                 self.refresh_memory_usage();
                 self.record_allocation(AllocationCategory::Object, bytes);
+                Self::mark_temporary_object_immortal(pointer, bytes);
                 return pointer;
             }
             Ok(None) => {}
@@ -1232,8 +1236,23 @@ impl ExecutionContext {
             return ptr::null_mut();
         };
         self.record_allocation(AllocationCategory::Object, bytes);
+        Self::mark_temporary_object_immortal(pointer, bytes);
         pointer
     }
+
+    #[cfg(feature = "mem-exp-rc")]
+    fn mark_temporary_object_immortal(pointer: *mut u8, bytes: usize) {
+        if bytes >= crate::object_heap::COUNT_OFFSET + 4 {
+            // SAFETY: the allocation holds at least the header.
+            #[allow(unsafe_code)]
+            unsafe {
+                crate::object_heap::set_count(pointer, crate::object_heap::IMMORTAL);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "mem-exp-rc"))]
+    fn mark_temporary_object_immortal(_pointer: *mut u8, _bytes: usize) {}
 
     fn allocate_array_in_region(
         &mut self,
@@ -3895,6 +3914,13 @@ impl ExecutionContext {
         }
     }
 
+    #[cfg(feature = "mem-exp-heap")]
+    fn sync_heap_stats(&mut self) {
+        if self.collect_stats {
+            self.stats.object_heap = self.object_heap.stats;
+        }
+    }
+
     /// MEM-EXP-1 heap counters.
     #[cfg(feature = "mem-exp-heap")]
     #[must_use]
@@ -3913,7 +3939,46 @@ impl ExecutionContext {
     #[allow(unsafe_code)]
     pub unsafe fn release_object(&mut self, object: *mut u8) -> u64 {
         // SAFETY: forwarded caller contract.
-        unsafe { crate::object_heap::release(&mut self.object_heap, object) }
+        let released = unsafe { crate::object_heap::release(&mut self.object_heap, object) };
+        self.sync_heap_stats();
+        released
+    }
+
+    /// Counted retain used by generated code; ignores immortal objects.
+    ///
+    /// # Safety
+    ///
+    /// `object` must be a non-null live H12 object of this context.
+    #[cfg(feature = "mem-exp-rc")]
+    #[allow(unsafe_code)]
+    pub unsafe fn retain_object(&mut self, object: *mut u8) {
+        // SAFETY: forwarded caller contract.
+        unsafe {
+            if crate::object_heap::strong_count(object) == crate::object_heap::IMMORTAL {
+                return;
+            }
+            crate::object_heap::retain(object);
+        }
+        self.object_heap.stats.retains += 1;
+        self.sync_heap_stats();
+    }
+
+    /// Counted release used by generated code; ignores immortal objects.
+    ///
+    /// # Safety
+    ///
+    /// `object` must be a non-null live H12 object of this context.
+    #[cfg(feature = "mem-exp-rc")]
+    #[allow(unsafe_code)]
+    pub unsafe fn release_counted_object(&mut self, object: *mut u8) {
+        // SAFETY: forwarded caller contract.
+        unsafe {
+            if crate::object_heap::strong_count(object) == crate::object_heap::IMMORTAL {
+                return;
+            }
+            self.object_heap.stats.releases += 1;
+            self.release_object(object);
+        }
     }
 
     /// Allocate one heap object (the generated-code path, for tests).
@@ -3942,12 +4007,29 @@ impl ExecutionContext {
                 pointer
             };
             self.record_allocation(AllocationCategory::Object, bytes);
+            #[cfg(feature = "mem-exp-rc")]
+            if bytes >= crate::object_heap::COUNT_OFFSET + 4 {
+                // SAFETY: the zeroed block holds at least the header.
+                #[allow(unsafe_code)]
+                unsafe {
+                    crate::object_heap::set_count(pointer, 1);
+                }
+            }
+            self.sync_heap_stats();
             return pointer;
         }
         let Some(pointer) = self.allocate_in_region(bytes, 8, false) else {
             return ptr::null_mut();
         };
         self.record_allocation(AllocationCategory::Object, bytes);
+        #[cfg(feature = "mem-exp-rc")]
+        if bytes >= crate::object_heap::COUNT_OFFSET + 4 {
+            // SAFETY: the allocation holds at least the header.
+            #[allow(unsafe_code)]
+            unsafe {
+                crate::object_heap::set_count(pointer, crate::object_heap::IMMORTAL);
+            }
+        }
         pointer
     }
 
@@ -8737,7 +8819,10 @@ mod tests {
         // SAFETY: pointer points to 16 bytes of zeroed memory owned by the arena.
         #[allow(unsafe_code)]
         let bytes = unsafe { std::slice::from_raw_parts(pointer, 16) };
-        assert!(bytes.iter().all(|&b| b == 0));
+        // The H12 count word is initialized by the allocator under MEM-EXP-1 C5.
+        assert!(bytes.iter().enumerate().all(
+            |(index, &b)| b == 0 || (cfg!(feature = "mem-exp-rc") && (8..12).contains(&index))
+        ));
     }
 
     #[test]
@@ -10434,7 +10519,8 @@ mod tests {
             // SAFETY: `allocation` is a live 64-byte object allocation.
             #[allow(unsafe_code)]
             let bytes = unsafe { std::slice::from_raw_parts(allocation, 64) };
-            assert!(bytes.iter().all(|byte| *byte == 0));
+            assert!(bytes.iter().enumerate().all(|(index, byte)| *byte == 0
+                || (cfg!(feature = "mem-exp-rc") && (8..12).contains(&index))));
             // SAFETY: the same live allocation is initialized before rewind.
             #[allow(unsafe_code)]
             unsafe {

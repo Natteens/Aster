@@ -59,6 +59,10 @@ fn execute(module: &mir::Module, expected: i32) {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "mem-exp-c5",
+    ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
+)]
 fn ordinary_source_v2_selects_three_guaranteed_arrays() {
     let source = |array_count: usize| {
         let arrays = (0..array_count).fold(String::new(), |mut source, index| {
@@ -90,6 +94,10 @@ fn ordinary_source_v2_selects_three_guaranteed_arrays() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "mem-exp-c5",
+    ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
+)]
 fn ordinary_source_v2_selects_three_guaranteed_runtime_sized_arrays() {
     let source = r"
         public int Run() {

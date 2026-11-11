@@ -556,6 +556,17 @@ fn validate_instruction(
         | mir::Instruction::OwnedRegionEnter { .. }
         | mir::Instruction::OwnedRegionExit { .. }
         | mir::Instruction::ForeignCall { .. } => Ok(()),
+        mir::Instruction::Retain { value } | mir::Instruction::Release { value } => {
+            if cfg!(feature = "mem-exp-c5")
+                && matches!(value.type_, mir::Type::Class(_) | mir::Type::Interface(_))
+            {
+                Ok(())
+            } else {
+                Err(BackendError::new(format!(
+                    "function `{function_name}` contains a reference-count instruction that is not a class or interface operand under MEM-EXP-1 C5"
+                )))
+            }
+        }
         mir::Instruction::Assign { target, value } => {
             validate_assign(target, value, function_name, locals, implementations)
         }

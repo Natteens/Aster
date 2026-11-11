@@ -59,6 +59,12 @@ pub struct ObjectHeapStats {
     pub fresh_blocks: u64,
     pub reused_blocks: u64,
     pub released_blocks: u64,
+    /// Retains that changed a count (non-null, non-immortal operand).
+    #[cfg(feature = "mem-exp-rc")]
+    pub retains: u64,
+    /// Releases that dropped a count (non-null, non-immortal operand).
+    #[cfg(feature = "mem-exp-rc")]
+    pub releases: u64,
 }
 
 #[derive(Default)]

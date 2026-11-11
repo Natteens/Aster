@@ -1751,11 +1751,17 @@ impl Codegen {
         let object = builder.inst_results(call)[0];
         self.continue_if_runtime_ok(builder, state)?;
         if super::layouts::OBJECT_HEADER_BYTES != 0 {
-            // MEM-EXP-1: the allocation sequence writes a non-zero
-            // descriptor word, standing in for the B1 descriptor pointer.
-            let descriptor = builder
-                .ins()
-                .iconst(types::I64, i64::from(class.0) | (1_i64 << 62));
+            // MEM-EXP-1: C1 to C4 write a non-zero stand-in for the B1
+            // descriptor pointer; C5 writes the real descriptor address.
+            #[cfg(feature = "mem-exp-c5")]
+            let descriptor_bits = self
+                .descriptors
+                .address(class)
+                .ok_or_else(|| BackendError::new("class has no object descriptor"))?
+                .cast_signed();
+            #[cfg(not(feature = "mem-exp-c5"))]
+            let descriptor_bits = i64::from(class.0) | (1_i64 << 62);
+            let descriptor = builder.ins().iconst(types::I64, descriptor_bits);
             builder.ins().store(
                 cranelift_codegen::ir::MemFlags::trusted(),
                 descriptor,
@@ -1764,6 +1770,52 @@ impl Codegen {
             );
         }
         self.store_scalar(builder, destination, object, state)
+    }
+
+    /// Lower `Retain`/`Release` (MEM-EXP-1 C5): the runtime ignores a null or
+    /// immortal object word, so no check or failure edge is emitted.
+    #[cfg_attr(not(feature = "mem-exp-c5"), allow(clippy::unused_self))]
+    pub(super) fn translate_reference_count(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        value: &mir::Operand,
+        retain: bool,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        #[cfg(feature = "mem-exp-c5")]
+        {
+            let operand = self.translate_operand(builder, value, state)?;
+            let object = if matches!(value.type_, mir::Type::Interface(_)) {
+                builder.ins().load(
+                    self.pointer_type,
+                    cranelift_codegen::ir::MemFlags::new(),
+                    operand,
+                    0,
+                )
+            } else {
+                operand
+            };
+            let symbol = if retain {
+                "aster_rt_object_retain"
+            } else {
+                "aster_rt_object_release"
+            };
+            let function_ref = self
+                .jit
+                .declare_func_in_func(self.runtime_ids[symbol], builder.func);
+            let context = state.execution_context.ok_or_else(|| {
+                BackendError::new("reference count is missing its ExecutionContext")
+            })?;
+            builder.ins().call(function_ref, &[context, object]);
+            Ok(())
+        }
+        #[cfg(not(feature = "mem-exp-c5"))]
+        {
+            let _ = (builder, value, retain, state);
+            Err(BackendError::new(
+                "ownership instructions require MEM-EXP-1 C5",
+            ))
+        }
     }
 
     pub(super) fn translate_list_allocation(

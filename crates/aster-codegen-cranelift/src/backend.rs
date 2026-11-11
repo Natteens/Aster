@@ -27,6 +27,7 @@ impl Codegen {
         }
         let (call_depth_guarded, runtime_fallible_functions, runtime_fallible_interface_methods) =
             analyze_calls(module);
+        let layouts = Layouts::new(module, pointer_bytes)?;
         let mut codegen = Self {
             jit,
             pointer_type,
@@ -49,7 +50,9 @@ impl Codegen {
             call_depth_guarded,
             runtime_fallible_functions,
             runtime_fallible_interface_methods,
-            layouts: Layouts::new(module, pointer_bytes)?,
+            #[cfg(feature = "mem-exp-c5")]
+            descriptors: super::layouts::ObjectDescriptors::build(&layouts, module)?,
+            layouts,
         };
         codegen.declare_task_functions()?;
         codegen.declare_async_functions()?;
@@ -181,6 +184,8 @@ fn instruction_can_fail_without_calling_aster(instruction: &mir::Instruction) ->
         | mir::Instruction::TemporarySubregionExit { .. }
         | mir::Instruction::OwnedRegionEnter { .. }
         | mir::Instruction::OwnedRegionExit { .. }
+        | mir::Instruction::Retain { .. }
+        | mir::Instruction::Release { .. }
         | mir::Instruction::CallIntrinsic { .. }
         | mir::Instruction::AllocateArray { .. }
         | mir::Instruction::AllocateObject { .. }

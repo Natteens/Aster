@@ -96,6 +96,8 @@ struct Codegen {
     runtime_fallible_functions: HashSet<mir::SymbolId>,
     runtime_fallible_interface_methods: HashSet<mir::SymbolId>,
     layouts: Layouts,
+    #[cfg(feature = "mem-exp-c5")]
+    descriptors: layouts::ObjectDescriptors,
 }
 
 struct FunctionState {

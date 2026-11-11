@@ -60,7 +60,7 @@ example, reference page. Gate: workspace tests; class A invariants unchanged or 
 | ID | Objective | Decision | Depends on | Gate | Risk | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | T-OBJ-B1-1 | B1 stage 1: update B1 record with closure answers and the constant `H` | OBJ-002..004 | — | review | low | todo |
-| T-MEM-EXP-1 | Branch with configurations C0 to C6, ownership pass and independent validator for class references; report | MEM-001..003, OBJ-001 | T-BENCH-1, T-ARCH-2b | closure §4.C thresholds | high | **in progress**: stage A done; stage B (C4) done; stage C runtime substrate done; stage C ownership pass and U1 to U8 validator **not started**; no overall verdict |
+| T-MEM-EXP-1 | Branch with configurations C0 to C6, ownership pass and independent validator for class references; report | MEM-001..003, OBJ-001 | T-BENCH-1, T-ARCH-2b | closure §4.C thresholds | high | **in progress**: stage A done; stage B (C4) done; stage C runtime substrate done; C5 first increment (class ownership pass and U1-U4 validator) done 2026-11-11; C6, collections, timing not done; no overall verdict |
 | T-MEM-2 | Merge the chosen header | MEM-002 or B1 H8 | T-MEM-EXP-1 | reinforced | medium | blocked (experiment) |
 | T-MEM-3a | Counting for class references; store sequence §4.B; failure contract §4.A | MEM-003 | T-MEM-2 | reinforced + negative MIR cases of §4.B | high | blocked (experiment) |
 | T-MEM-3b | Strings and arrays | MEM-003 | T-MEM-3a | reinforced | high | blocked |
@@ -609,3 +609,50 @@ Not started (stage C proper), and therefore **no PASS for MEM-001 to MEM-003**:
 5. A lower-noise class B protocol (hardware counters or more rounds) before the time gates.
 6. Strings, arrays, and collections: until they are counted, `longrun_request` and `cache_churn`
    cannot meet the long-running gate even with class objects counted.
+
+### T-MEM-EXP-1 stage C, C5 — first increment implemented (2026-11-11)
+
+Contract and recorded corrections: [08-mem-exp-1-c5-design.md](08-mem-exp-1-c5-design.md).
+Scope: counting for class and interface references in locals, parameters, returns, and class
+fields (including inline struct fields). References stored into arrays, collections, enums,
+statics, or runtime storage receive a count that is never released (leak, never early free).
+
+Implementation (feature `aster-codegen-cranelift/mem-exp-c5` = `mem-exp-c4` +
+`aster-runtime/mem-exp-rc`; C0 unchanged):
+
+- MIR `Retain`/`Release` (`crates/aster-mir/src/lib.rs`) with typed validation; conservative arms
+  in compiler passes (they run before insertion).
+- Ownership pass `crates/aster-mir/src/ownership.rs` (`insert_ownership`); independent validator
+  `crates/aster-mir/src/validate/ownership.rs` (`validate_ownership`, U1, U2, U3 marker check, U4
+  within a block). Both run in `PreparedProgram::prepare_timed_with_foreign_registry` under C5; any
+  finding is a `BackendError`.
+- Runtime: count initialization (1, or `IMMORTAL` for Temporary and above 2,048 bytes),
+  `aster_rt_object_retain`/`aster_rt_object_release`, retain/release counters in
+  `ObjectHeapStats`, exposed as `MemoryStats::object_heap`.
+- Codegen: per-class descriptors owned by the prepared program (`layouts::ObjectDescriptors`),
+  descriptor address written at allocation, `Retain`/`Release` lowering, zero-initialized
+  reference-bearing stack slots.
+- Defects found by integration and fixed: scalar returns read through a released `this` (U2);
+  `StringBuilder` values are `Type::Class` with a native header (now excluded from leaves and
+  descriptors); fine-subregion rewinds left counted locals pointing into rewound memory (test
+  aborted on "release of an object whose count is already zero"; region markers are now removed
+  and the validator rejects any that remain, U3); validator minted distinct values for repeated
+  reads of one array element.
+
+Gates run (CARGO_BUILD_JOBS=2, RUST_TEST_THREADS=2, debug builds, so released blocks are
+poisoned with 0xDB):
+
+- `aster-codegen-cranelift --all-targets`: C0 1,443 passed, 0 failed; C4 1,443 passed, 0 failed;
+  C5 1,429 passed, 0 failed, 24 ignored (2 pre-existing, 22 region-reclamation tests ignored under
+  C5 with an explicit reason: C5 disables region rewinds).
+- `tests/mem_exp_c5.rs` (7): released blocks observed for loop field replacement, loop local
+  reassignment, callee frames; shared objects survive; interface identity preserved.
+- `aster-runtime` 337 (default) and 346 (`mem-exp-rc`) passed; `aster-compiler` 707 passed;
+  `aster-mir` 42 passed; clippy clean on the four crates (default and C5); rustfmt clean.
+
+Not done, so **no PASS for MEM-001 to MEM-003**:
+
+1. C6 elision and the C5/C6 comparison (count operations emitted, elided, executed).
+2. Region reclamation together with counting (H2 pins); C5 currently loses it.
+3. Collection, enum, and closure ownership (U8 glue); strings and arrays not counted.
+4. Class B timing protocol and the §4.C thresholds.

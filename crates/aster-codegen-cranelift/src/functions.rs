@@ -156,6 +156,21 @@ impl Codegen {
         if is_aggregate(&function.return_type) {
             state.hidden_return = values.next();
         }
+        #[cfg(feature = "mem-exp-c5")]
+        for local in function.parameters.iter().chain(&function.locals) {
+            if self.layouts.type_has_references(&local.type_) {
+                // Releasing or capturing a never-assigned slot must see null.
+                let layout = self.layouts.type_layout(&local.type_)?;
+                let zero = builder.ins().iconst(types::I64, 0);
+                for word in 0..layout.size.div_ceil(8) {
+                    let offset = i32::try_from(word * 8)
+                        .map_err(|_| BackendError::new("stack slot is too large"))?;
+                    builder
+                        .ins()
+                        .stack_store(zero, state.slots[&local.id], offset);
+                }
+            }
+        }
         for parameter in &function.parameters {
             let value = values.next().ok_or_else(|| {
                 BackendError::new("missing Cranelift parameter for Aster function")
@@ -345,6 +360,12 @@ impl Codegen {
             mir::Instruction::TemporarySubregionExit { .. } => {
                 self.leave_temporary_subregion(builder, state)?;
                 self.continue_if_runtime_ok(builder, state)
+            }
+            mir::Instruction::Retain { value } => {
+                self.translate_reference_count(builder, value, true, state)
+            }
+            mir::Instruction::Release { value } => {
+                self.translate_reference_count(builder, value, false, state)
             }
             mir::Instruction::Assign { target, value } => {
                 self.assign_rvalue(builder, target, value, state)

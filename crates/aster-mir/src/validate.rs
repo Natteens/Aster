@@ -6,6 +6,7 @@
 
 #[doc(hidden)]
 pub mod executable;
+pub mod ownership;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -526,6 +527,17 @@ fn validate_typed_instruction(
             destination(char_destination, &mir::Type::Char)?;
             destination(next_cursor_destination, &mir::Type::Int)?;
             destination(ok_destination, &mir::Type::Bool)
+        }
+        mir::Instruction::Retain { value } | mir::Instruction::Release { value } => {
+            operand(value)?;
+            if matches!(value.type_, mir::Type::Class(_) | mir::Type::Interface(_)) {
+                Ok(())
+            } else {
+                Err(ValidationError::invalid(format!(
+                    "function `{function_name}` counts a non-reference value of type `{}`",
+                    type_name(&value.type_)
+                )))
+            }
         }
     }
 }

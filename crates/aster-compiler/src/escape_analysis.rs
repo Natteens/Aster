@@ -476,6 +476,9 @@ fn is_direct_local(operand: &mir::Operand, local: mir::LocalId) -> bool {
 
 fn instruction_uses_alias(instruction: &mir::Instruction, aliases: &HashSet<mir::LocalId>) -> bool {
     match instruction {
+        mir::Instruction::Retain { value } | mir::Instruction::Release { value } => {
+            direct_alias(value, aliases).is_some()
+        }
         mir::Instruction::Assign { target, value } => {
             matches!(target, mir::Place::Local(local) if aliases.contains(local))
                 || rvalue_uses_alias(value, aliases)
@@ -952,7 +955,9 @@ fn instruction_escape(
         | mir::Instruction::OwnedRegionEnter { .. }
         | mir::Instruction::OwnedRegionExit { .. }
         | mir::Instruction::TemporarySubregionEnter { .. }
-        | mir::Instruction::TemporarySubregionExit { .. } => None,
+        | mir::Instruction::TemporarySubregionExit { .. }
+        | mir::Instruction::Retain { .. }
+        | mir::Instruction::Release { .. } => None,
         // Storing a reference into a list's buffer is an aggregate store,
         // exactly like `Assign{target: Field/Index, value: Use(alias)}`
         // (`assignment_escape` above): conservatively persistent, regardless

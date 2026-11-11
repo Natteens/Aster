@@ -486,6 +486,9 @@ fn instruction_access(
 ) -> Option<Access> {
     let mut access = Access::empty(locals.len());
     match instruction {
+        mir::Instruction::Retain { value } | mir::Instruction::Release { value } => {
+            read_operand(value, locals, &mut access.uses)?;
+        }
         mir::Instruction::OwnedRegionEnter { .. }
         | mir::Instruction::OwnedRegionExit { .. }
         | mir::Instruction::TemporarySubregionEnter { .. }

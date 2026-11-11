@@ -748,6 +748,9 @@ pub fn owned_instruction_reads(instruction: &mir::Instruction, reads: &mut HashS
             owned_destination_reads(next_cursor_destination, reads);
             owned_destination_reads(ok_destination, reads);
         }
+        mir::Instruction::Retain { value } | mir::Instruction::Release { value } => {
+            owned_operand_reads(value, reads);
+        }
     }
 }
 
@@ -1542,7 +1545,9 @@ pub fn temporary_subregion_instruction_is_executable(instruction: &mir::Instruct
         | mir::Instruction::DictionaryKeys { .. }
         | mir::Instruction::DictionaryValues { .. }
         | mir::Instruction::ListToArray { .. }
-        | mir::Instruction::StringDecodeNext { .. } => false,
+        | mir::Instruction::StringDecodeNext { .. }
+        | mir::Instruction::Retain { .. }
+        | mir::Instruction::Release { .. } => false,
     }
 }
 

@@ -37,6 +37,70 @@ pub(super) const OBJECT_HEADER_BYTES: u32 = if cfg!(feature = "mem-exp-h16") {
     0
 };
 
+/// Per-class `ObjectDescriptor`s owned by the prepared program. Boxed so the
+/// addresses written into objects stay stable when the store is moved, and
+/// kept alive until the JIT module and every execution context are gone.
+#[cfg(feature = "mem-exp-c5")]
+#[derive(Default)]
+pub(super) struct ObjectDescriptors {
+    #[allow(dead_code, reason = "owns the offset tables the descriptors point at")]
+    offsets: Vec<Box<[u32]>>,
+    #[allow(
+        dead_code,
+        clippy::vec_box,
+        reason = "boxing keeps descriptor addresses stable"
+    )]
+    descriptors: Vec<Box<aster_runtime::object_heap::ObjectDescriptor>>,
+    by_class: HashMap<mir::SymbolId, *const aster_runtime::object_heap::ObjectDescriptor>,
+}
+
+#[cfg(feature = "mem-exp-c5")]
+impl ObjectDescriptors {
+    pub(super) fn build(layouts: &Layouts, module: &mir::Module) -> Result<Self, BackendError> {
+        let mut store = Self::default();
+        // `StringBuilder` objects have a native header without a count word,
+        // so a field holding one is never released through a descriptor.
+        let native = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| match instruction {
+                mir::Instruction::AllocateStringBuilder { class, .. }
+                | mir::Instruction::StringBuilderAppend { class, .. }
+                | mir::Instruction::StringBuilderToString { class, .. } => Some(*class),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        for class in &module.classes {
+            let size = layouts
+                .types
+                .get(&class.symbol)
+                .ok_or_else(|| BackendError::new("class has no computed object layout"))?
+                .size;
+            let offsets = layouts
+                .reference_offsets(class.symbol, &native)?
+                .into_boxed_slice();
+            let descriptor = Box::new(aster_runtime::object_heap::ObjectDescriptor {
+                size,
+                reference_count: u32::try_from(offsets.len())
+                    .map_err(|_| BackendError::new("class has too many reference fields"))?,
+                reference_offsets: offsets.as_ptr(),
+            });
+            store
+                .by_class
+                .insert(class.symbol, std::ptr::from_ref(&*descriptor));
+            store.offsets.push(offsets);
+            store.descriptors.push(descriptor);
+        }
+        Ok(store)
+    }
+
+    pub(super) fn address(&self, class: mir::SymbolId) -> Option<u64> {
+        self.by_class.get(&class).map(|pointer| *pointer as u64)
+    }
+}
+
 pub(super) struct Layouts {
     classes: std::collections::HashSet<mir::SymbolId>,
     pub(super) pointer_bytes: u32,
@@ -83,6 +147,65 @@ impl Layouts {
             layouts.compute_enum(symbol, &mut Vec::new())?;
         }
         Ok(layouts)
+    }
+
+    /// Whether a value of `type_` holds at least one counted reference leaf.
+    #[cfg(feature = "mem-exp-c5")]
+    pub(super) fn type_has_references(&self, type_: &mir::Type) -> bool {
+        match type_ {
+            mir::Type::Class(_) | mir::Type::Interface(_) => true,
+            mir::Type::User(symbol) => self.structs.get(symbol).is_some_and(|definition| {
+                definition
+                    .fields
+                    .iter()
+                    .any(|field| self.type_has_references(&field.type_))
+            }),
+            _ => false,
+        }
+    }
+
+    /// Byte offsets, from the object start, of every reference leaf of a
+    /// class, including leaves of inline struct fields.
+    #[cfg(feature = "mem-exp-c5")]
+    pub(super) fn reference_offsets(
+        &self,
+        class: mir::SymbolId,
+        native: &std::collections::HashSet<mir::SymbolId>,
+    ) -> Result<Vec<u32>, BackendError> {
+        let mut offsets = Vec::new();
+        self.collect_reference_offsets(class, 0, native, &mut offsets)?;
+        Ok(offsets)
+    }
+
+    #[cfg(feature = "mem-exp-c5")]
+    fn collect_reference_offsets(
+        &self,
+        aggregate: mir::SymbolId,
+        base: u32,
+        native: &std::collections::HashSet<mir::SymbolId>,
+        offsets: &mut Vec<u32>,
+    ) -> Result<(), BackendError> {
+        let definition = self
+            .structs
+            .get(&aggregate)
+            .ok_or_else(|| BackendError::new("unknown executable struct type"))?;
+        for field in &definition.fields {
+            let offset = base
+                + self
+                    .fields
+                    .get(&field.symbol)
+                    .ok_or_else(|| BackendError::new("field has no computed layout"))?
+                    .offset;
+            match &field.type_ {
+                mir::Type::Class(symbol) if native.contains(symbol) => {}
+                mir::Type::Class(_) | mir::Type::Interface(_) => offsets.push(offset),
+                mir::Type::User(inner) => {
+                    self.collect_reference_offsets(*inner, offset, native, offsets)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     fn compute_enum(

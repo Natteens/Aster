@@ -337,6 +337,9 @@ fn candidate_uses_are_scalarizable(function: &mir::Function, candidate: &Candida
 #[allow(clippy::too_many_lines)]
 fn instruction_is_legal(instruction: &mir::Instruction, candidate: &Candidate) -> bool {
     match instruction {
+        mir::Instruction::Retain { value } | mir::Instruction::Release { value } => {
+            operand_is_legal(value, candidate)
+        }
         mir::Instruction::Assign { target, value } => {
             place_is_legal(target, candidate) && rvalue_is_legal(value, candidate)
         }
@@ -668,6 +671,9 @@ fn rewrite_instruction(
     fields: &HashMap<(mir::LocalId, mir::SymbolId), mir::LocalId>,
 ) {
     match instruction {
+        mir::Instruction::Retain { value } | mir::Instruction::Release { value } => {
+            rewrite_operand(value, fields);
+        }
         mir::Instruction::Assign { target, value } => {
             rewrite_place(target, fields);
             rewrite_rvalue(value, fields);

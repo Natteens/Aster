@@ -68,6 +68,27 @@ pub(super) struct PreparedProgram {
     jit: Option<JITModule>,
     entries: HashMap<mir::SymbolId, (*const u8, mir::Type)>,
     task_entries: HashMap<mir::SymbolId, (*const u8, mir::Type)>,
+    /// Declared last: class descriptors must outlive the JIT code and every
+    /// object that points at them.
+    #[cfg(feature = "mem-exp-c5")]
+    _descriptors: super::layouts::ObjectDescriptors,
+}
+
+/// MEM-EXP-1 C5: insert the ownership instructions and validate them before
+/// any code is generated.
+#[cfg(feature = "mem-exp-c5")]
+fn prepare_ownership_module(module: &mir::Module) -> Result<mir::Module, BackendError> {
+    let (transformed, _stats) = mir::ownership::insert_ownership(module);
+    mir::validate::ownership::validate_ownership(&transformed).map_err(|findings| {
+        BackendError::new(
+            findings
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    })?;
+    Ok(transformed)
 }
 
 impl PreparedProgram {
@@ -94,6 +115,10 @@ impl PreparedProgram {
         registry: &aster_runtime::ForeignRegistry,
     ) -> Result<(Self, PrepareTimings), BackendError> {
         let codegen_started = Instant::now();
+        #[cfg(feature = "mem-exp-c5")]
+        let transformed = prepare_ownership_module(module)?;
+        #[cfg(feature = "mem-exp-c5")]
+        let module = &transformed;
         let mut builder = jit_builder()?;
         for function in runtime_functions() {
             builder.symbol(function.name, function.address);
@@ -154,6 +179,8 @@ impl PreparedProgram {
                 jit: Some(codegen.jit),
                 entries,
                 task_entries,
+                #[cfg(feature = "mem-exp-c5")]
+                _descriptors: codegen.descriptors,
             },
             PrepareTimings {
                 codegen: codegen_elapsed,
@@ -1651,7 +1678,9 @@ mod tests {
         assert_eq!(governor.telemetry().current_capacity_bytes, 0);
     }
 
+    // C5 removes owned regions: a failure leaves objects for the bulk domain release.
     #[test]
+    #[cfg(not(feature = "mem-exp-c5"))]
     fn generated_owned_region_runtime_failures_unwind_once_and_allow_context_reuse() {
         let cases = [
             (
