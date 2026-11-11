@@ -177,6 +177,16 @@ fn destination_places(instruction: &Instruction) -> Vec<&Place> {
     }
 }
 
+/// Whether a store to `place` writes an array element (it releases the old
+/// element, so it counts as a releasing instruction for E3).
+fn stores_into_array(place: &Place) -> bool {
+    match place {
+        Place::Index { .. } => true,
+        Place::Field { base, .. } => stores_into_array(base),
+        _ => false,
+    }
+}
+
 /// The local a place is stored in, when the place is a local or a field path
 /// of a local.
 fn root_local(place: &Place) -> Option<LocalId> {
@@ -279,7 +289,11 @@ fn string_builder_classes(module: &Module) -> HashSet<SymbolId> {
 fn leaves(module: &Module, native: &HashSet<SymbolId>, type_: &Type) -> Vec<Leaf> {
     match type_ {
         Type::Class(symbol) if native.contains(symbol) => Vec::new(),
-        Type::Class(_) | Type::Interface(_) => vec![(Vec::new(), type_.clone())],
+        // An array is one leaf whatever its element type: an `int[]` must still
+        // be released to free its blocks (design §8).
+        Type::Class(_) | Type::Interface(_) | Type::Array(_) => {
+            vec![(Vec::new(), type_.clone())]
+        }
         Type::User(symbol) => module
             .structs
             .iter()
@@ -315,9 +329,9 @@ fn copy(place: Place, type_: &Type) -> Operand {
 
 fn owning(place: &Place) -> bool {
     match place {
-        Place::Local(_) | Place::ObjectField { .. } => true,
+        Place::Local(_) | Place::ObjectField { .. } | Place::Index { .. } => true,
         Place::Field { base, .. } => owning(base),
-        Place::Symbol(_) | Place::Index { .. } | Place::EnumField { .. } => false,
+        Place::Symbol(_) | Place::EnumField { .. } => false,
     }
 }
 
@@ -459,13 +473,20 @@ impl Context<'_> {
             Instruction::CallIntrinsic {
                 destination: d,
                 arguments,
+                return_type,
                 ..
             } => {
                 destination = d.as_ref();
-                borrowed_result = true;
+                // An array result is a fresh object owned by the destination.
+                borrowed_result = !matches!(return_type, Type::Array(_));
                 sources.extend(arguments);
             }
-            Instruction::AllocateObject { destination: d, .. } => destination = Some(d),
+            Instruction::AllocateObject { destination: d, .. }
+            | Instruction::AllocateArray { destination: d, .. }
+            | Instruction::ListToArray { destination: d, .. }
+            | Instruction::DictionaryKeys { destination: d, .. }
+            | Instruction::DictionaryValues { destination: d, .. }
+            | Instruction::DictionaryEntries { destination: d, .. } => destination = Some(d),
             Instruction::ListAdd { value, .. } | Instruction::ListSet { value, .. } => {
                 sources.push(value);
             }
@@ -906,6 +927,9 @@ impl Context<'_> {
                             | Instruction::ListRemoveAt { .. }
                             | Instruction::ListClear { .. }
                     )
+                    && !destination_places(instruction)
+                        .into_iter()
+                        .any(stores_into_array)
                     && destination_places(instruction)
                         .iter()
                         .all(|place| root_local(place).is_none_or(|l| !parameters.contains(&l)))
@@ -969,6 +993,40 @@ mod tests {
         Type::User(SymbolId(20))
     }
 
+    fn int_array() -> Type {
+        Type::Array(Box::new(Type::Int))
+    }
+
+    fn class_array() -> Type {
+        Type::Array(Box::new(class()))
+    }
+
+    fn array_struct() -> Type {
+        Type::User(SymbolId(22))
+    }
+
+    fn element(array: u32, element_type: &Type) -> Place {
+        Place::Index {
+            array: Box::new(copy(
+                lp(array),
+                &Type::Array(Box::new(element_type.clone())),
+            )),
+            index: Box::new(zero()),
+            element_type: element_type.clone(),
+            bounds: mir::ArrayBounds::Checked,
+        }
+    }
+
+    fn allocate_array(destination: u32, element_type: &Type) -> Instruction {
+        Instruction::AllocateArray {
+            destination: lp(destination),
+            element_type: element_type.clone(),
+            length: zero(),
+            initialization: mir::ArrayInitialization::Default,
+            region: mir::AllocationRegion::Persistent,
+        }
+    }
+
     fn local(id: u32, type_: Type, temporary: bool) -> Local {
         Local {
             id: LocalId(id),
@@ -1029,11 +1087,18 @@ mod tests {
         return_type: Type,
     ) -> (Function, OwnershipStats) {
         let module = Module {
-            structs: vec![mir::StructDefinition {
-                symbol: SymbolId(20),
-                name: "S".into(),
-                fields: vec![field_definition(21, class())],
-            }],
+            structs: vec![
+                mir::StructDefinition {
+                    symbol: SymbolId(20),
+                    name: "S".into(),
+                    fields: vec![field_definition(21, class())],
+                },
+                mir::StructDefinition {
+                    symbol: SymbolId(22),
+                    name: "A".into(),
+                    fields: vec![field_definition(23, int_array())],
+                },
+            ],
             classes: vec![mir::ClassDefinition {
                 symbol: SymbolId(10),
                 name: "C".into(),
@@ -1116,11 +1181,18 @@ mod tests {
         return_type: Type,
     ) -> Both {
         let module = Module {
-            structs: vec![mir::StructDefinition {
-                symbol: SymbolId(20),
-                name: "S".into(),
-                fields: vec![field_definition(21, class())],
-            }],
+            structs: vec![
+                mir::StructDefinition {
+                    symbol: SymbolId(20),
+                    name: "S".into(),
+                    fields: vec![field_definition(21, class())],
+                },
+                mir::StructDefinition {
+                    symbol: SymbolId(22),
+                    name: "A".into(),
+                    fields: vec![field_definition(23, int_array())],
+                },
+            ],
             classes: vec![mir::ClassDefinition {
                 symbol: SymbolId(10),
                 name: "C".into(),
@@ -1624,5 +1696,200 @@ mod tests {
             class(),
         );
         assert_eq!(result.elided_stats.elided_parameters, 0);
+    }
+
+    fn is_capture_of(instruction: &Instruction, source: &Place) -> bool {
+        matches!(
+            instruction,
+            Instruction::Assign {
+                value: Rvalue {
+                    kind: RvalueKind::Use(Operand { kind: OperandKind::Copy(place), .. }),
+                    ..
+                },
+                ..
+            } if place == source
+        )
+    }
+
+    fn body(function: &Function) -> &[Instruction] {
+        &function.blocks.last().unwrap().instructions
+    }
+
+    #[test]
+    fn array_local_reassigned_in_a_loop_releases_the_old_array() {
+        let result = both(
+            Vec::new(),
+            vec![local(0, int_array(), false)],
+            vec![
+                block(0, Vec::new(), Terminator::Goto(BasicBlockId(1))),
+                block(1, vec![allocate_array(0, &Type::Int)], branch(1, 2)),
+                block(2, Vec::new(), Terminator::Return(None)),
+            ],
+            Type::Void,
+        );
+        // capture, allocate, release the capture; the exit releases the local.
+        let loop_body = &result.c5.blocks[1].instructions;
+        assert!(is_capture_of(&loop_body[0], &lp(0)), "{loop_body:#?}");
+        assert_eq!(loop_body[1], allocate_array(0, &Type::Int));
+        assert_eq!(loop_body[2], release(lp(1), &int_array()));
+        // Fresh result: no retain anywhere.
+        assert_eq!(counts(&result.c5).0, 0);
+        assert_eq!(result.c5_stats.releases, 2);
+    }
+
+    #[test]
+    fn array_element_overwrite_with_a_new_object_releases_the_old_element() {
+        let target = element(0, &class());
+        let (function, stats) = run_void(
+            vec![local(0, class_array(), false)],
+            vec![local(1, class(), false)],
+            vec![
+                Instruction::AllocateObject {
+                    destination: lp(1),
+                    class: SymbolId(10),
+                    region: mir::AllocationRegion::Persistent,
+                },
+                assign(target.clone(), &class(), copy(lp(1), &class())),
+            ],
+        );
+        let instructions = body(&function);
+        // The allocation is owned (capture of the null slot, no retain); the
+        // store retains the borrowed source, captures the old element, stores
+        // and releases the capture.
+        let store = instructions
+            .iter()
+            .position(|i| *i == assign(target.clone(), &class(), copy(lp(1), &class())))
+            .unwrap();
+        assert_eq!(instructions[store - 2], retain(lp(1), &class()));
+        assert!(is_capture_of(&instructions[store - 1], &target));
+        assert!(matches!(
+            instructions[store + 1],
+            Instruction::Release { .. }
+        ));
+        assert_eq!(stats.retains, 2);
+    }
+
+    #[test]
+    fn struct_containing_an_array_copy_counts_the_array_leaf() {
+        let (function, _) = run_void(
+            vec![local(0, array_struct(), false)],
+            vec![local(1, array_struct(), false)],
+            vec![assign(lp(1), &array_struct(), copy(lp(0), &array_struct()))],
+        );
+        let leaf = |id: u32| Place::Field {
+            base: Box::new(lp(id)),
+            field: SymbolId(23),
+        };
+        assert_eq!(
+            function.blocks[0].instructions,
+            vec![retain(leaf(0), &int_array())]
+        );
+        assert!(body(&function).contains(&release(leaf(1), &int_array())));
+    }
+
+    #[test]
+    fn list_to_array_result_reassigned_captures_and_releases_the_old_array() {
+        let list = Type::List(Box::new(class()));
+        let to_array = || Instruction::ListToArray {
+            destination: lp(1),
+            list: copy(lp(0), &list),
+            element_type: class(),
+            region: mir::AllocationRegion::Persistent,
+        };
+        let (function, stats) = run_void(
+            vec![local(0, list.clone(), false)],
+            vec![local(1, class_array(), false)],
+            vec![to_array(), to_array()],
+        );
+        let instructions = body(&function);
+        assert!(is_capture_of(&instructions[0], &lp(1)));
+        assert_eq!(instructions[1], to_array());
+        assert_eq!(instructions[2], release(lp(2), &class_array()));
+        assert!(is_capture_of(&instructions[3], &lp(1)));
+        assert_eq!(instructions[4], to_array());
+        assert_eq!(instructions[5], release(lp(3), &class_array()));
+        assert_eq!(stats.retains, 0);
+    }
+
+    #[test]
+    fn dictionary_snapshots_are_owned_destination_writers() {
+        let dictionary = Type::Dictionary(Box::new(Type::Int), Box::new(Type::Int));
+        let keys = Instruction::DictionaryKeys {
+            destination: lp(1),
+            dictionary: copy(lp(0), &dictionary),
+            key_type: Type::Int,
+            region: mir::AllocationRegion::Persistent,
+        };
+        let values = Instruction::DictionaryValues {
+            destination: lp(1),
+            dictionary: copy(lp(0), &dictionary),
+            value_type: Type::Int,
+            region: mir::AllocationRegion::Persistent,
+        };
+        let (function, stats) = run_void(
+            vec![local(0, dictionary, false)],
+            vec![local(1, int_array(), false)],
+            vec![keys.clone(), values.clone()],
+        );
+        let instructions = body(&function);
+        assert!(is_capture_of(&instructions[0], &lp(1)));
+        assert_eq!(instructions[1], keys);
+        assert!(is_capture_of(&instructions[3], &lp(1)));
+        assert_eq!(instructions[4], values);
+        assert_eq!(stats.retains, 0);
+    }
+
+    #[test]
+    fn intrinsic_returning_an_array_is_owned() {
+        let chars = Type::Array(Box::new(Type::Char));
+        let intrinsic = |destination: u32, return_type: Type| Instruction::CallIntrinsic {
+            destination: Some(lp(destination)),
+            intrinsic: mir::Intrinsic::StringToChars,
+            arguments: Vec::new(),
+            return_type,
+        };
+        let (function, stats) = run_void(
+            Vec::new(),
+            vec![local(0, chars.clone(), false)],
+            vec![intrinsic(0, chars.clone()), intrinsic(0, chars.clone())],
+        );
+        let instructions = &function.blocks[0].instructions;
+        assert!(is_capture_of(&instructions[0], &lp(0)));
+        assert_eq!(instructions[1], intrinsic(0, chars.clone()));
+        // Fresh result: the capture release follows directly, no retain.
+        assert_eq!(instructions[2], release(lp(1), &chars));
+        assert!(is_capture_of(&instructions[3], &lp(0)));
+        assert_eq!(stats.retains, 0);
+    }
+
+    #[test]
+    fn e3_does_not_apply_to_a_function_with_an_array_element_store() {
+        let result = both(
+            vec![local(0, int_array(), false)],
+            Vec::new(),
+            vec![block(
+                0,
+                vec![assign(element(0, &Type::Int), &Type::Int, zero())],
+                Terminator::Return(None),
+            )],
+            Type::Void,
+        );
+        assert_eq!(result.elided_stats.elided_parameters, 0);
+        // A read-only array parameter still qualifies.
+        let result = both(
+            vec![local(0, int_array(), false)],
+            vec![local(1, Type::Int, false)],
+            vec![block(
+                0,
+                vec![assign(
+                    lp(1),
+                    &Type::Int,
+                    copy(element(0, &Type::Int), &Type::Int),
+                )],
+                Terminator::Return(None),
+            )],
+            Type::Void,
+        );
+        assert_eq!(result.elided_stats.elided_parameters, 2);
     }
 }

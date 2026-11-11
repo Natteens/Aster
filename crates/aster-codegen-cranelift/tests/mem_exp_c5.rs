@@ -184,3 +184,61 @@ fn foreach_over_a_list_reads_every_element() {
         45,
     );
 }
+
+// ---- Counted arrays (design section 8) ----
+
+#[test]
+fn a_tree_rebuilt_in_a_loop_releases_its_nodes() {
+    let stats = run(
+        &format!(
+            "{NODE} public class Tree {{ public Node[] nodes; \
+             public Tree(Node[] nodes) {{ this.nodes = nodes; }} }} \
+             internal Tree Build(int seed) {{ Node[] nodes = [Make(seed), Make(seed + 1), Make(seed + 2), Make(seed + 3)]; \
+             return new Tree(nodes); }} \
+             public int Run() {{ int checksum = 0; \
+             for (int round = 0; round < 50; round += 1) {{ Tree tree = Build(round); \
+             checksum += tree.nodes[3].value; }} \
+             return checksum; }}"
+        ),
+        // sum(round + 3) for round in 0..50
+        1_225 + 150,
+    );
+    assert!(
+        stats.object_heap.released_blocks > 0,
+        "no block released: {:?}",
+        stats.object_heap
+    );
+}
+
+#[test]
+fn overwriting_array_elements_in_a_loop_releases_old_objects() {
+    let stats = run(
+        &format!(
+            "{NODE} public int Run() {{ Node[] nodes = [Make(0), Make(0)]; \
+             for (int i = 0; i < 100; i += 1) {{ nodes[i % 2] = Make(i); }} \
+             return nodes[0].value + nodes[1].value; }}"
+        ),
+        98 + 99,
+    );
+    assert!(
+        stats.object_heap.released_blocks > 90,
+        "old elements were not released: {:?}",
+        stats.object_heap
+    );
+}
+
+#[test]
+fn int_arrays_allocated_in_a_loop_are_reclaimed() {
+    let stats = run(
+        "internal int[] Fill(int i) { int[] values = new int[8]; values[7] = i; return values; } \
+         public int Run() { int total = 0; \
+         for (int i = 0; i < 100; i += 1) { int[] values = Fill(i); total += values[7]; } \
+         return total; }",
+        4_950,
+    );
+    assert!(
+        stats.object_heap.reused_blocks > 0,
+        "no block reused: {:?}",
+        stats.object_heap
+    );
+}

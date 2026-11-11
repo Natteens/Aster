@@ -1720,7 +1720,44 @@ impl Codegen {
         let call = builder.ins().call(function_ref, &[context, length, size]);
         let array = builder.inst_results(call)[0];
         self.continue_if_runtime_ok(builder, state)?;
+        #[cfg(feature = "mem-exp-c5")]
+        self.set_array_element_descriptor(builder, array, element_type, false, state)?;
         self.store_scalar(builder, destination, array, state)
+    }
+
+    /// MEM-EXP-1 C5 (design section 8): the array owns one count per leaf of
+    /// each element, so the runtime needs the element descriptor. `adopt`
+    /// also retains the elements the producer already wrote.
+    #[cfg(feature = "mem-exp-c5")]
+    fn set_array_element_descriptor(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        array: cranelift_codegen::ir::Value,
+        element_type: &mir::Type,
+        adopt: bool,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let Some(address) = self.descriptors.element_address(element_type) else {
+            return Ok(());
+        };
+        let symbol = if adopt {
+            "aster_rt_array_adopt_elements"
+        } else {
+            "aster_rt_array_set_element_descriptor"
+        };
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids[symbol], builder.func);
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("array ownership is missing its ExecutionContext"))?;
+        let descriptor = builder
+            .ins()
+            .iconst(self.pointer_type, address.cast_signed());
+        builder
+            .ins()
+            .call(function_ref, &[context, array, descriptor]);
+        Ok(())
     }
 
     pub(super) fn translate_object_allocation(
@@ -1853,7 +1890,7 @@ impl Codegen {
         let list = builder.inst_results(call)[0];
         self.continue_if_runtime_ok(builder, state)?;
         #[cfg(feature = "mem-exp-c5")]
-        if let Some(address) = self.descriptors.list_element_address(element_type) {
+        if let Some(address) = self.descriptors.element_address(element_type) {
             // MEM-EXP-1 C5 (design section 7): the list owns one count per
             // reference leaf of each element; the runtime needs the leaves.
             let set_descriptor = self.jit.declare_func_in_func(
@@ -2346,6 +2383,8 @@ impl Codegen {
         let call = builder.ins().call(function_ref, &arguments);
         let entries = builder.inst_results(call)[0];
         self.continue_if_runtime_ok(builder, state)?;
+        #[cfg(feature = "mem-exp-c5")]
+        self.set_array_element_descriptor(builder, entries, entry_type, true, state)?;
         self.store_scalar(builder, destination, entries, state)
     }
 
@@ -2420,6 +2459,8 @@ impl Codegen {
         let call = builder.ins().call(function_ref, &arguments);
         let result = builder.inst_results(call)[0];
         self.continue_if_runtime_ok(builder, state)?;
+        #[cfg(feature = "mem-exp-c5")]
+        self.set_array_element_descriptor(builder, result, component_type, true, state)?;
         self.store_scalar(builder, destination, result, state)
     }
 

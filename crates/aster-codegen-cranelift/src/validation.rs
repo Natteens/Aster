@@ -558,7 +558,10 @@ fn validate_instruction(
         | mir::Instruction::ForeignCall { .. } => Ok(()),
         mir::Instruction::Retain { value } | mir::Instruction::Release { value } => {
             if cfg!(feature = "mem-exp-c5")
-                && matches!(value.type_, mir::Type::Class(_) | mir::Type::Interface(_))
+                && matches!(
+                    value.type_,
+                    mir::Type::Class(_) | mir::Type::Interface(_) | mir::Type::Array(_)
+                )
             {
                 Ok(())
             } else {

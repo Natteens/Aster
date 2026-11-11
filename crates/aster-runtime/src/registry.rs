@@ -6,7 +6,10 @@
 //! adding entries here — never special cases inside a backend.
 
 #[cfg(feature = "mem-exp-rc")]
-use crate::context::aster_rt_list_set_element_descriptor;
+use crate::context::{
+    aster_rt_array_adopt_elements, aster_rt_array_set_element_descriptor,
+    aster_rt_list_set_element_descriptor,
+};
 use crate::context::{
     aster_rt_array_element, aster_rt_array_length, aster_rt_array_new,
     aster_rt_array_new_temporary, aster_rt_call_enter, aster_rt_call_leave,
@@ -184,6 +187,32 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             address: aster_rt_object_release as *const u8,
             signature: RuntimeSignature {
                 parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: None,
+            },
+        },
+        #[cfg(feature = "mem-exp-rc")]
+        RuntimeFunction {
+            name: "aster_rt_array_set_element_descriptor",
+            address: aster_rt_array_set_element_descriptor as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                ],
+                result: None,
+            },
+        },
+        #[cfg(feature = "mem-exp-rc")]
+        RuntimeFunction {
+            name: "aster_rt_array_adopt_elements",
+            address: aster_rt_array_adopt_elements as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                ],
                 result: None,
             },
         },

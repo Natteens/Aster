@@ -36,11 +36,26 @@ fn checked_allocation_size(count: usize, element_size: usize) -> Option<usize> {
 }
 
 /// Stable array header visible to generated code only through runtime calls.
+#[cfg(not(feature = "mem-exp-rc"))]
 #[repr(C)]
 pub struct AsterArray {
     data: *mut u8,
     length: i32,
     element_size: u32,
+}
+
+/// Counted array header (MEM-EXP-1 U8): the uniform object header (descriptor
+/// word, count word) followed by the array fields. The descriptor word names
+/// the immutable element descriptor, or is null when elements have no leaves.
+#[cfg(feature = "mem-exp-rc")]
+#[repr(C)]
+pub struct AsterArray {
+    descriptor: *const crate::object_heap::ObjectDescriptor,
+    #[allow(dead_code, reason = "read and written through the object header ABI")]
+    count_word: u32,
+    length: i32,
+    element_size: u32,
+    data: *mut u8,
 }
 
 /// Offsets in the private array header ABI shared with generated code.
@@ -50,6 +65,9 @@ pub struct AsterArray {
 /// foreign-function interface.
 pub const ASTER_ARRAY_DATA_OFFSET: usize = std::mem::offset_of!(AsterArray, data);
 pub const ASTER_ARRAY_LENGTH_OFFSET: usize = std::mem::offset_of!(AsterArray, length);
+/// Offset of the count word inside a counted array header.
+#[cfg(feature = "mem-exp-rc")]
+pub const ASTER_ARRAY_COUNT_OFFSET: usize = std::mem::offset_of!(AsterArray, count_word);
 
 /// Offset of the one-byte error flag inside an [`ExecutionContext`], read
 /// directly by generated code after fallible runtime calls instead of calling
@@ -98,6 +116,21 @@ impl AsterArray {
     #[must_use]
     pub fn element_size(&self) -> u32 {
         self.element_size
+    }
+
+    #[cfg(feature = "mem-exp-rc")]
+    pub(crate) fn element_descriptor(&self) -> *const crate::object_heap::ObjectDescriptor {
+        self.descriptor
+    }
+
+    #[cfg(feature = "mem-exp-rc")]
+    pub(crate) fn length(&self) -> i32 {
+        self.length
+    }
+
+    #[cfg(feature = "mem-exp-rc")]
+    pub(crate) fn data_ptr(&self) -> *mut u8 {
+        self.data
     }
 }
 
@@ -1282,6 +1315,11 @@ impl ExecutionContext {
             return ptr::null_mut();
         };
 
+        #[cfg(feature = "mem-exp-rc")]
+        if !temporary {
+            return self.allocate_counted_array(valid_length, valid_size, bytes);
+        }
+
         let allocation_align = align_of::<AsterArray>().max(8);
         let Some(header) = self.allocate_in_region(allocation_bytes, allocation_align, temporary)
         else {
@@ -1299,8 +1337,74 @@ impl ExecutionContext {
             (*header_ptr).data = data;
             (*header_ptr).length = valid_length;
             (*header_ptr).element_size = valid_size;
+            // Temporary arrays are region-owned: never counted, never released.
+            #[cfg(feature = "mem-exp-rc")]
+            {
+                (*header_ptr).count_word =
+                    crate::object_heap::IMMORTAL | crate::object_heap::ARRAY_FLAG;
+            }
         }
         self.record_allocation(AllocationCategory::Array, bytes);
+        header_ptr
+    }
+
+    /// A block of `size` bytes from the size-class heap when one fits, else a
+    /// fresh Persistent arena block. The block is zeroed.
+    #[cfg(feature = "mem-exp-rc")]
+    fn allocate_heap_block(&mut self, size: usize) -> Option<*mut u8> {
+        let size = size.max(1);
+        let class = u32::try_from(size)
+            .ok()
+            .and_then(crate::object_heap::ObjectHeap::class_of);
+        let Some(class) = class else {
+            return self.allocate_in_region(size, 8, false);
+        };
+        if let Some(block) = self.object_heap.take_free(class) {
+            return Some(block);
+        }
+        let block =
+            self.allocate_in_region(crate::object_heap::SIZE_CLASSES[class] as usize, 8, false)?;
+        self.object_heap.stats.fresh_blocks += 1;
+        Some(block)
+    }
+
+    /// Persistent counted array: the header is a size-class block with count 1,
+    /// the data block comes from the heap when it fits a class, else the arena.
+    #[cfg(feature = "mem-exp-rc")]
+    fn allocate_counted_array(
+        &mut self,
+        length: i32,
+        element_size: u32,
+        bytes: usize,
+    ) -> *mut AsterArray {
+        // The payload goes first: an oversized request then fails before any
+        // storage is published.
+        let Some(data) = self.allocate_heap_block(bytes) else {
+            return ptr::null_mut();
+        };
+        let Some(header) = self.allocate_heap_block(size_of::<AsterArray>()) else {
+            if let Some(class) = u32::try_from(bytes.max(1))
+                .ok()
+                .and_then(crate::object_heap::ObjectHeap::class_of)
+            {
+                self.object_heap.release(data, class);
+                self.sync_heap_stats();
+            }
+            return ptr::null_mut();
+        };
+        #[allow(clippy::cast_ptr_alignment)]
+        let header_ptr = header.cast::<AsterArray>();
+        // SAFETY: `header_ptr` is a zeroed, 8-byte aligned block of at least
+        // `size_of::<AsterArray>()` bytes owned by this context.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*header_ptr).data = data;
+            (*header_ptr).length = length;
+            (*header_ptr).element_size = element_size;
+            (*header_ptr).count_word = 1 | crate::object_heap::ARRAY_FLAG;
+        }
+        self.record_allocation(AllocationCategory::Array, bytes);
+        self.sync_heap_stats();
         header_ptr
     }
 
@@ -3509,6 +3613,12 @@ impl ExecutionContext {
             self.fail("List.ToArray byte count overflow");
             return ptr::null_mut();
         };
+        #[cfg(feature = "mem-exp-rc")]
+        // SAFETY: `array` was just allocated and is not shared yet.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*array).descriptor = Self::list_element_descriptor(list);
+        }
         if bytes > 0 {
             // SAFETY: each header was validated and the array allocation has
             // exactly one slot per source element of the same concrete size.
@@ -3855,6 +3965,12 @@ impl ExecutionContext {
         let array = self.allocate_array_in_region(count, size, temporary);
         if array.is_null() {
             return ptr::null_mut();
+        }
+        #[cfg(feature = "mem-exp-rc")]
+        // SAFETY: `array` was just allocated and is not shared yet.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*array).descriptor = Self::list_element_descriptor(list);
         }
         if count != 0 {
             let Some(source_offset) = usize::try_from(index)
@@ -4532,6 +4648,51 @@ pub extern "C" fn aster_rt_list_set_element_descriptor(
     unsafe {
         (*list).element_descriptor = descriptor;
     }
+}
+
+/// Record the element descriptor of a freshly allocated array without
+/// retaining anything (MEM-EXP-1 U8). The elements are zero or are stored by an
+/// explicit literal sequence whose pass already retained them.
+#[cfg(feature = "mem-exp-rc")]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_array_set_element_descriptor(
+    context: *mut ExecutionContext,
+    array: *mut AsterArray,
+    descriptor: *const crate::object_heap::ObjectDescriptor,
+) {
+    if context.is_null() || array.is_null() {
+        return;
+    }
+    // SAFETY: generated code passes its live context and an array it just allocated.
+    #[allow(unsafe_code)]
+    unsafe {
+        (*array).descriptor = descriptor;
+    }
+}
+
+/// Record the element descriptor of an array filled by the runtime and retain
+/// every leaf of every element it already holds (MEM-EXP-1 U8).
+#[cfg(feature = "mem-exp-rc")]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_array_adopt_elements(
+    context: *mut ExecutionContext,
+    array: *mut AsterArray,
+    descriptor: *const crate::object_heap::ObjectDescriptor,
+) {
+    if context.is_null() || array.is_null() {
+        return;
+    }
+    // SAFETY: generated code passes its live context and an array it just received.
+    #[allow(unsafe_code)]
+    let (context, array) = unsafe { (&mut *context, &mut *array) };
+    array.descriptor = descriptor;
+    let words = ExecutionContext::collect_leaf_words(
+        descriptor,
+        array.data,
+        array.element_size as usize,
+        usize::try_from(array.length).unwrap_or(0),
+    );
+    context.retain_leaf_words(&words);
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -9033,6 +9194,7 @@ mod tests {
         assert!(stats.reserved_bytes >= stats.used_bytes);
     }
 
+    #[cfg(not(feature = "mem-exp-rc"))]
     #[test]
     fn array_allocation_preflights_the_complete_header_and_payload() {
         let data_offset = checked_align_up(size_of::<AsterArray>(), 8).expect("array data offset");
@@ -9087,6 +9249,9 @@ mod tests {
                 .is_null()
         );
         assert_eq!(first.take_error().as_deref(), Some("earlier failure"));
+        // Counted arrays serve the payload and the header separately: a payload
+        // that exactly fills the page is committed before the header fails.
+        #[cfg(not(feature = "mem-exp-rc"))]
         assert_eq!(first.memory_stats(), &MemoryStats::default());
     }
 

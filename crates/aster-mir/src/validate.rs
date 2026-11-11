@@ -530,7 +530,10 @@ fn validate_typed_instruction(
         }
         mir::Instruction::Retain { value } | mir::Instruction::Release { value } => {
             operand(value)?;
-            if matches!(value.type_, mir::Type::Class(_) | mir::Type::Interface(_)) {
+            if matches!(
+                value.type_,
+                mir::Type::Class(_) | mir::Type::Interface(_) | mir::Type::Array(_)
+            ) {
                 Ok(())
             } else {
                 Err(ValidationError::invalid(format!(

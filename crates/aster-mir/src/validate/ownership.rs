@@ -166,7 +166,10 @@ impl Frame<'_> {
         while let Some((path, current)) = pending.pop() {
             match current {
                 Type::Class(symbol) if self.native.contains(&symbol) => {}
-                Type::Class(_) | Type::Interface(_) => found.push((path, current)),
+                // An array is one leaf whatever its element type.
+                Type::Class(_) | Type::Interface(_) | Type::Array(_) => {
+                    found.push((path, current));
+                }
                 Type::User(symbol) => {
                     if let Some(definition) =
                         self.module.structs.iter().find(|d| d.symbol == symbol)
@@ -259,7 +262,7 @@ impl Frame<'_> {
                 .iter()
                 .position(|(local, slot_path)| local == id && *slot_path == path)
                 .map_or(Home::Outside, Home::Slot),
-            Place::ObjectField { .. } => Home::Heap,
+            Place::ObjectField { .. } | Place::Index { .. } => Home::Heap,
             _ => Home::Outside,
         }
     }
@@ -413,8 +416,8 @@ impl<'a> Block<'a> {
                 if let Some((_, value)) = self.cache.iter().find(|(cached, _)| cached == place) {
                     return *value;
                 }
-                // List element reads are `HeapRead` (ListGet products); array
-                // (`Index`) reads stay Guaranteed because arrays still leak (§1).
+                // Object-field and array-element reads are borrowed `HeapRead`
+                // values; other non-owning storage stays Guaranteed (it leaks).
                 let provenance = if matches!(home, Home::Heap) {
                     Provenance::HeapRead
                 } else {
@@ -702,16 +705,46 @@ impl<'a> Block<'a> {
             I::CallIntrinsic {
                 destination,
                 arguments,
+                return_type,
                 ..
             } => {
                 let consumed: Vec<&Operand> = arguments.iter().collect();
-                self.effect(
-                    &[],
-                    &consumed,
-                    destination.as_ref(),
-                    Product::Borrowed,
-                    true,
-                );
+                // An array result is a fresh object: one count, owned.
+                let product = if matches!(return_type, Type::Array(_)) {
+                    Product::Owned
+                } else {
+                    Product::Borrowed
+                };
+                self.effect(&[], &consumed, destination.as_ref(), product, true);
+            }
+            I::AllocateArray {
+                destination,
+                length,
+                ..
+            } => {
+                self.effect(&[length], &[], Some(destination), Product::Owned, false);
+            }
+            I::ListToArray {
+                destination, list, ..
+            } => {
+                self.effect(&[list], &[], Some(destination), Product::Owned, false);
+            }
+            I::DictionaryKeys {
+                destination,
+                dictionary,
+                ..
+            }
+            | I::DictionaryValues {
+                destination,
+                dictionary,
+                ..
+            }
+            | I::DictionaryEntries {
+                destination,
+                dictionary,
+                ..
+            } => {
+                self.effect(&[dictionary], &[], Some(destination), Product::Owned, false);
             }
             I::AllocateObject {
                 destination,
@@ -920,6 +953,48 @@ fn check_function(
     );
 }
 
+/// Whether a store to `place` writes an array element, possibly through
+/// struct fields of the element.
+fn stores_element(place: &Place) -> bool {
+    let mut current = place;
+    while let Place::Field { base, .. } = current {
+        current = base;
+    }
+    matches!(current, Place::Index { .. })
+}
+
+/// Every place an instruction writes (call destinations excluded: calls
+/// already disqualify a leaf function).
+fn written_places(instruction: &mir::Instruction) -> Vec<&Place> {
+    use mir::Instruction as I;
+    match instruction {
+        I::Assign { target, .. } => vec![target],
+        I::AllocateArray { destination, .. }
+        | I::AllocateObject { destination, .. }
+        | I::AllocateList { destination, .. }
+        | I::AllocateDictionary { destination, .. }
+        | I::AllocateStringBuilder { destination, .. }
+        | I::StringBuilderToString { destination, .. }
+        | I::DictionaryAdd { destination, .. }
+        | I::DictionarySet { destination, .. }
+        | I::DictionaryTryGet { destination, .. }
+        | I::DictionaryContainsKey { destination, .. }
+        | I::DictionaryRemove { destination, .. }
+        | I::DictionaryEntries { destination, .. }
+        | I::DictionaryKeys { destination, .. }
+        | I::DictionaryValues { destination, .. }
+        | I::ListGet { destination, .. }
+        | I::ListToArray { destination, .. } => vec![destination],
+        I::StringDecodeNext {
+            char_destination,
+            next_cursor_destination,
+            ok_destination,
+            ..
+        } => vec![char_destination, next_cursor_destination, ok_destination],
+        _ => Vec::new(),
+    }
+}
+
 /// A function that can release nothing but its own parameters: no call of
 /// any kind and no `Release` of anything but a parameter slot. Only there may
 /// a parameter's original value be held without a count (C6, rule E3).
@@ -936,6 +1011,7 @@ fn leaf_function(function: &Function) -> bool {
             | mir::Instruction::ListSet { .. }
             | mir::Instruction::ListRemoveAt { .. }
             | mir::Instruction::ListClear { .. } => false,
+            instruction if written_places(instruction).into_iter().any(stores_element) => false,
             mir::Instruction::Release { value } => {
                 let OperandKind::Copy(place) = &value.kind else {
                     return true;
@@ -1530,6 +1606,222 @@ mod tests {
         ] {
             let found = list_obligations(vec![list_get(1), invalidating, use_call(1)]);
             assert!(found.contains(&"U2"), "{found:?}");
+        }
+    }
+
+    fn array_type() -> Type {
+        Type::Array(Box::new(class()))
+    }
+
+    fn array_operand(place: Place) -> Operand {
+        Operand {
+            type_: array_type(),
+            kind: OperandKind::Copy(place),
+        }
+    }
+
+    fn element() -> Place {
+        Place::Index {
+            array: Box::new(array_operand(lp(1))),
+            index: Box::new(zero()),
+            element_type: class(),
+            bounds: mir::ArrayBounds::Checked,
+        }
+    }
+
+    fn allocate_array(id: u32) -> Instruction {
+        Instruction::AllocateArray {
+            destination: lp(id),
+            element_type: class(),
+            length: zero(),
+            initialization: mir::ArrayInitialization::Default,
+            region: AllocationRegion::Persistent,
+        }
+    }
+
+    /// Parameter 0 is a class, parameter 1 an array of classes, local 2 and
+    /// temporary local 3 are classes, local 4 is an array, local 5 a list and
+    /// local 6 a dictionary.
+    fn array_obligations(instructions: Vec<Instruction>) -> Vec<&'static str> {
+        let typed = |id: u32, type_: Type, temporary: bool| {
+            let mut found = local(id, temporary);
+            found.type_ = type_;
+            found
+        };
+        let module = Module {
+            structs: Vec::new(),
+            classes: vec![mir::ClassDefinition {
+                symbol: SymbolId(10),
+                name: "C".into(),
+                fields: vec![mir::FieldDefinition {
+                    symbol: SymbolId(11),
+                    name: "f".into(),
+                    type_: class(),
+                }],
+            }],
+            interfaces: Vec::new(),
+            enums: Vec::new(),
+            interface_implementations: Vec::new(),
+            foreign_functions: Vec::new(),
+            functions: vec![Function {
+                constructor: false,
+                symbol: SymbolId(1),
+                owner: None,
+                name: "f".into(),
+                visibility: Visibility::Public,
+                parameters: vec![typed(0, class(), false), typed(1, array_type(), false)],
+                locals: vec![
+                    typed(2, class(), false),
+                    typed(3, class(), true),
+                    typed(4, array_type(), false),
+                    typed(5, Type::List(Box::new(class())), false),
+                    typed(
+                        6,
+                        Type::Dictionary(Box::new(class()), Box::new(class())),
+                        false,
+                    ),
+                ],
+                return_type: Type::Void,
+                entry: BasicBlockId(0),
+                blocks: vec![BasicBlock {
+                    id: BasicBlockId(0),
+                    instructions,
+                    terminator: Terminator::Return(None),
+                }],
+                temporary_subregion_candidates: Vec::new(),
+            }],
+        };
+        match validate_ownership(&module) {
+            Ok(()) => Vec::new(),
+            Err(findings) => findings.iter().map(|finding| finding.obligation).collect(),
+        }
+    }
+
+    fn array_release(id: u32) -> Instruction {
+        Instruction::Release {
+            value: array_operand(lp(id)),
+        }
+    }
+
+    fn array_retain(id: u32) -> Instruction {
+        Instruction::Retain {
+            value: array_operand(lp(id)),
+        }
+    }
+
+    fn array_entry() -> Vec<Instruction> {
+        vec![retain(lp(0)), array_retain(1)]
+    }
+
+    fn array_exit() -> Vec<Instruction> {
+        vec![release(lp(0)), array_release(1)]
+    }
+
+    #[test]
+    fn array_element_overwrite_with_capture_validates() {
+        let mut instructions = array_entry();
+        instructions.extend([
+            retain(lp(0)),
+            assign(lp(3), element()),
+            assign(element(), lp(0)),
+            release(lp(3)),
+        ]);
+        instructions.extend(array_exit());
+        let found = array_obligations(instructions);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn array_element_overwrite_without_retain_is_u1() {
+        let mut instructions = array_entry();
+        instructions.extend([
+            assign(lp(3), element()),
+            assign(element(), lp(0)),
+            release(lp(3)),
+        ]);
+        instructions.extend(array_exit());
+        assert!(array_obligations(instructions).contains(&"U1"));
+    }
+
+    #[test]
+    fn element_value_used_after_a_store_to_the_same_array_is_u2() {
+        let mut instructions = array_entry();
+        instructions.extend([
+            // l2 borrows the element without a retain.
+            assign(lp(2), element()),
+            retain(lp(0)),
+            assign(lp(3), element()),
+            assign(element(), lp(0)),
+            release(lp(3)),
+            // The store released the old element: l2 may dangle.
+            retain(lp(2)),
+        ]);
+        let found = array_obligations(instructions);
+        assert!(found.contains(&"U2"), "{found:?}");
+    }
+
+    #[test]
+    fn double_release_of_an_array_local_is_u1() {
+        let found = array_obligations(vec![allocate_array(4), array_release(4), array_release(4)]);
+        assert!(found.contains(&"U1"), "{found:?}");
+    }
+
+    #[test]
+    fn fresh_array_producers_hold_one_count_that_must_be_released() {
+        let dictionary = |id: u32| Operand {
+            type_: Type::Dictionary(Box::new(class()), Box::new(class())),
+            kind: OperandKind::Copy(lp(id)),
+        };
+        let producers = [
+            allocate_array(4),
+            Instruction::ListToArray {
+                destination: lp(4),
+                list: Operand {
+                    type_: Type::List(Box::new(class())),
+                    kind: OperandKind::Copy(lp(5)),
+                },
+                element_type: class(),
+                region: AllocationRegion::Persistent,
+            },
+            Instruction::DictionaryKeys {
+                destination: lp(4),
+                dictionary: dictionary(6),
+                key_type: class(),
+                region: AllocationRegion::Persistent,
+            },
+            Instruction::DictionaryValues {
+                destination: lp(4),
+                dictionary: dictionary(6),
+                value_type: class(),
+                region: AllocationRegion::Persistent,
+            },
+            Instruction::CallIntrinsic {
+                destination: Some(lp(4)),
+                intrinsic: mir::Intrinsic::StringToChars,
+                arguments: Vec::new(),
+                return_type: array_type(),
+            },
+        ];
+        for producer in producers {
+            let mut balanced = array_entry();
+            balanced.extend([producer.clone(), array_release(4)]);
+            balanced.extend(array_exit());
+            let found = array_obligations(balanced);
+            assert!(found.is_empty(), "{producer:?}: {found:?}");
+            let mut leaked = array_entry();
+            leaked.push(producer.clone());
+            leaked.extend(array_exit());
+            assert!(
+                array_obligations(leaked).contains(&"U1"),
+                "{producer:?} must leave a count to release"
+            );
+            let mut extra = array_entry();
+            extra.extend([producer.clone(), array_retain(4), array_release(4)]);
+            extra.extend(array_exit());
+            assert!(
+                array_obligations(extra).contains(&"U1"),
+                "{producer:?} must not be retained after the call"
+            );
         }
     }
 }

@@ -52,9 +52,9 @@ pub(super) struct ObjectDescriptors {
     )]
     descriptors: Vec<Box<aster_runtime::object_heap::ObjectDescriptor>>,
     by_class: HashMap<mir::SymbolId, *const aster_runtime::object_heap::ObjectDescriptor>,
-    /// Element descriptors of `List<T>` types with reference leaves, keyed by
-    /// `mir::type_key(T)` (design section 7).
-    by_list_element: HashMap<u64, *const aster_runtime::object_heap::ObjectDescriptor>,
+    /// Element descriptors of `List<T>` and `T[]` types with reference leaves,
+    /// keyed by `mir::type_key(T)` (design sections 7 and 8).
+    by_element: HashMap<u64, *const aster_runtime::object_heap::ObjectDescriptor>,
 }
 
 #[cfg(feature = "mem-exp-c5")]
@@ -102,12 +102,16 @@ impl ObjectDescriptors {
             .flat_map(|function| &function.blocks)
             .flat_map(|block| &block.instructions)
             .filter_map(|instruction| match instruction {
-                mir::Instruction::AllocateList { element_type, .. } => Some(element_type),
+                mir::Instruction::AllocateList { element_type, .. }
+                | mir::Instruction::AllocateArray { element_type, .. } => Some(element_type),
+                mir::Instruction::DictionaryKeys { key_type, .. } => Some(key_type),
+                mir::Instruction::DictionaryValues { value_type, .. } => Some(value_type),
+                mir::Instruction::DictionaryEntries { entry_type, .. } => Some(entry_type),
                 _ => None,
             });
         for element_type in element_types {
             let key = mir::type_key(element_type);
-            if store.by_list_element.contains_key(&key) {
+            if store.by_element.contains_key(&key) {
                 continue;
             }
             let mut offsets = Vec::new();
@@ -119,11 +123,11 @@ impl ObjectDescriptors {
             let descriptor = Box::new(aster_runtime::object_heap::ObjectDescriptor {
                 size: layouts.type_layout(element_type)?.size,
                 reference_count: u32::try_from(offsets.len())
-                    .map_err(|_| BackendError::new("list element has too many reference leaves"))?,
+                    .map_err(|_| BackendError::new("element has too many reference leaves"))?,
                 reference_offsets: offsets.as_ptr(),
             });
             store
-                .by_list_element
+                .by_element
                 .insert(key, std::ptr::from_ref(&*descriptor));
             store.offsets.push(offsets);
             store.descriptors.push(descriptor);
@@ -131,10 +135,11 @@ impl ObjectDescriptors {
         Ok(store)
     }
 
-    /// Element descriptor address for `List<element_type>`, or `None` when the
-    /// element type has no reference leaves.
-    pub(super) fn list_element_address(&self, element_type: &mir::Type) -> Option<u64> {
-        self.by_list_element
+    /// Element descriptor address for `List<element_type>` or
+    /// `element_type[]`, or `None` when the element type has no reference
+    /// leaves.
+    pub(super) fn element_address(&self, element_type: &mir::Type) -> Option<u64> {
+        self.by_element
             .get(&mir::type_key(element_type))
             .map(|pointer| *pointer as u64)
     }
@@ -196,7 +201,7 @@ impl Layouts {
     #[cfg(feature = "mem-exp-c5")]
     pub(super) fn type_has_references(&self, type_: &mir::Type) -> bool {
         match type_ {
-            mir::Type::Class(_) | mir::Type::Interface(_) => true,
+            mir::Type::Class(_) | mir::Type::Interface(_) | mir::Type::Array(_) => true,
             mir::Type::User(symbol) => self.structs.get(symbol).is_some_and(|definition| {
                 definition
                     .fields
@@ -244,8 +249,8 @@ impl Layouts {
         Ok(())
     }
 
-    /// Leaf offsets of one value of `type_` placed at `offset`: a class or
-    /// interface is one leaf (its object word), an inline struct contributes
+    /// Leaf offsets of one value of `type_` placed at `offset`: a class,
+    /// interface or array is one leaf (its object word), an inline struct contributes
     /// its fields' leaves, everything else has none.
     #[cfg(feature = "mem-exp-c5")]
     pub(super) fn collect_type_offsets(
@@ -257,7 +262,9 @@ impl Layouts {
     ) -> Result<(), BackendError> {
         match type_ {
             mir::Type::Class(symbol) if native.contains(symbol) => {}
-            mir::Type::Class(_) | mir::Type::Interface(_) => offsets.push(offset),
+            mir::Type::Class(_) | mir::Type::Interface(_) | mir::Type::Array(_) => {
+                offsets.push(offset);
+            }
             mir::Type::User(inner) if self.structs.contains_key(inner) => {
                 self.collect_reference_offsets(*inner, offset, native, offsets)?;
             }

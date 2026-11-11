@@ -179,3 +179,30 @@ list's length). Arrays, dictionaries, and enums keep the leak rule of §1 for no
   until the next invalidating instruction, which now also includes `ListSet`, `ListRemoveAt`,
   `ListClear`, and every intrinsic call. **E3** must treat `ListSet`, `ListRemoveAt`, and
   `ListClear` as releasing instructions (a function containing one does not qualify).
+
+## 8. Counted arrays (U8, second collection)
+
+Arrays become counted objects with the uniform header (B1 U6): under `mem-exp-rc` the
+`AsterArray` header is `{ descriptor word @0, count word @8, length, element_size, data }`;
+codegen keeps reading `length`/`data` through `ASTER_ARRAY_*_OFFSET`, so it follows the new layout.
+
+- **Kind flag.** One of the three reserved count-word bits marks an array. The release work list
+  checks it: for an array, the descriptor word points at the **element** descriptor (or is null),
+  every leaf of every element is pushed, then the data block and the header block go back to the
+  heap (a block above 2,048 bytes is not returned: it stays reserved, and is reported as such).
+- **Count initialization.** Every array the runtime creates (`aster_rt_array_new`, copies, string
+  and dictionary snapshots) starts at 1 when its header is served by a size class and Persistent,
+  otherwise `IMMORTAL` (Temporary arrays).
+- **Arrays own their elements.** The element descriptor is set by codegen right after
+  `AllocateArray` and after every instruction that produces an array whose elements have leaves
+  and whose producer did not already retain them (`DictionaryKeys`, `DictionaryValues`,
+  `DictionaryEntries`): `aster_rt_array_adopt_elements(array, descriptor)` sets the descriptor
+  and retains every leaf. `ListToArray` and `ListGetRange` set it from the list's descriptor and
+  retain (they already retain).
+- **Pass.** `Type::Array(_)` is a leaf (whatever its element type: an array of `int` must still be
+  released to free its blocks). `Index` places are owning (store sequence with capture and release).
+  Fresh producers are owned sources: `AllocateArray`, `ListToArray`, `DictionaryKeys`,
+  `DictionaryValues`, `DictionaryEntries`, and every `CallIntrinsic` whose result type is an array.
+- **Validator.** `Index` places are owning heap places (cache, adoption, U2 window); array reads are
+  borrowed, no longer guaranteed. Array element stores invalidate. E3 treats `Index` stores as
+  releasing (they release the old element).

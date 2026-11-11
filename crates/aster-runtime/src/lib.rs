@@ -27,27 +27,31 @@ pub mod string;
 pub mod time;
 
 #[cfg(feature = "mem-exp-rc")]
-pub use context::aster_rt_list_set_element_descriptor;
+pub use context::{
+    ASTER_ARRAY_COUNT_OFFSET, aster_rt_array_adopt_elements, aster_rt_array_set_element_descriptor,
+    aster_rt_list_set_element_descriptor,
+};
 pub use context::{
     ASTER_ARRAY_DATA_OFFSET, ASTER_ARRAY_LENGTH_OFFSET, ASTER_CALL_DEPTH_LIMIT,
     AarmAllocatorEvents, AarmMemoryTelemetry, AarmRegionTelemetry, AarmRewindTelemetry, AsterArray,
     AsterDictionary, AsterList, AsterStringBuilder, DictionaryKeyKind,
     EXECUTION_CONTEXT_ERROR_FLAG_OFFSET, ExecutionContext, ListRegion, MemoryStats,
-    TaskCancellation, aster_rt_array_element, aster_rt_array_length, aster_rt_call_enter,
-    aster_rt_call_leave, aster_rt_dictionary_add, aster_rt_dictionary_capacity,
-    aster_rt_dictionary_clear, aster_rt_dictionary_contains_key,
-    aster_rt_dictionary_ensure_capacity, aster_rt_dictionary_entries, aster_rt_dictionary_get_or,
-    aster_rt_dictionary_keys, aster_rt_dictionary_length, aster_rt_dictionary_new,
-    aster_rt_dictionary_new_temporary, aster_rt_dictionary_remove, aster_rt_dictionary_set,
-    aster_rt_dictionary_try_get, aster_rt_dictionary_values, aster_rt_has_error, aster_rt_list_add,
-    aster_rt_list_add_range, aster_rt_list_capacity, aster_rt_list_clear,
-    aster_rt_list_ensure_capacity, aster_rt_list_get, aster_rt_list_get_range,
-    aster_rt_list_insert, aster_rt_list_length, aster_rt_list_new, aster_rt_list_new_temporary,
-    aster_rt_list_remove_at, aster_rt_list_remove_range, aster_rt_list_reverse, aster_rt_list_set,
-    aster_rt_list_to_array, aster_rt_list_version, aster_rt_list_version_mismatch,
-    aster_rt_string_builder_append, aster_rt_string_builder_clear, aster_rt_string_builder_length,
-    aster_rt_string_builder_new, aster_rt_string_builder_new_temporary,
-    aster_rt_string_builder_to_string, aster_rt_string_builder_to_string_temporary,
+    TaskCancellation, aster_rt_array_element, aster_rt_array_length, aster_rt_array_new,
+    aster_rt_array_new_temporary, aster_rt_call_enter, aster_rt_call_leave,
+    aster_rt_dictionary_add, aster_rt_dictionary_capacity, aster_rt_dictionary_clear,
+    aster_rt_dictionary_contains_key, aster_rt_dictionary_ensure_capacity,
+    aster_rt_dictionary_entries, aster_rt_dictionary_get_or, aster_rt_dictionary_keys,
+    aster_rt_dictionary_length, aster_rt_dictionary_new, aster_rt_dictionary_new_temporary,
+    aster_rt_dictionary_remove, aster_rt_dictionary_set, aster_rt_dictionary_try_get,
+    aster_rt_dictionary_values, aster_rt_has_error, aster_rt_list_add, aster_rt_list_add_range,
+    aster_rt_list_capacity, aster_rt_list_clear, aster_rt_list_ensure_capacity, aster_rt_list_get,
+    aster_rt_list_get_range, aster_rt_list_insert, aster_rt_list_length, aster_rt_list_new,
+    aster_rt_list_new_temporary, aster_rt_list_remove_at, aster_rt_list_remove_range,
+    aster_rt_list_reverse, aster_rt_list_set, aster_rt_list_to_array, aster_rt_list_version,
+    aster_rt_list_version_mismatch, aster_rt_string_builder_append, aster_rt_string_builder_clear,
+    aster_rt_string_builder_length, aster_rt_string_builder_new,
+    aster_rt_string_builder_new_temporary, aster_rt_string_builder_to_string,
+    aster_rt_string_builder_to_string_temporary, aster_rt_temporary_scope_enter,
 };
 pub use filesystem::{
     FailingFileSystemBackend, FileSystemBackend, FileSystemError, MAX_FILE_BYTES, MAX_LIST_FILES,

@@ -32,6 +32,9 @@ pub const COUNT_OFFSET: usize = 8;
 pub const COUNT_MASK: u32 = (1 << 29) - 1;
 /// Count value meaning "never counted, never released".
 pub const IMMORTAL: u32 = COUNT_MASK;
+/// Kind flag in the count word's reserved high bits: the object is an array
+/// header whose descriptor word names the element descriptor (MEM-EXP-1 U8).
+pub const ARRAY_FLAG: u32 = 1 << 29;
 
 #[cfg(debug_assertions)]
 const POISON: u8 = 0xDB;
@@ -65,6 +68,13 @@ pub struct ObjectHeapStats {
     /// Releases that dropped a count (non-null, non-immortal operand).
     #[cfg(feature = "mem-exp-rc")]
     pub releases: u64,
+    /// Arrays whose header (and heap-served data block) were released.
+    #[cfg(feature = "mem-exp-rc")]
+    pub released_arrays: u64,
+    /// Array data blocks above the largest size class: never returned to the
+    /// heap, they stay reserved until the context drops.
+    #[cfg(feature = "mem-exp-rc")]
+    pub unreturned_array_blocks: u64,
 }
 
 #[derive(Default)]
@@ -190,6 +200,14 @@ pub(crate) unsafe fn release(heap: &mut ObjectHeap, object: *mut u8) -> u64 {
             unsafe { set_count(current, count - 1) };
             continue;
         }
+        #[cfg(feature = "mem-exp-rc")]
+        // SAFETY: the count word carries the kind flag by the layout contract.
+        if unsafe { count_word(current).read() } & ARRAY_FLAG != 0 {
+            // SAFETY: a flagged object is an array header of this heap.
+            unsafe { release_array(heap, current, &mut work) };
+            released += 1;
+            continue;
+        }
         // SAFETY: offset 0 holds the descriptor pointer by the layout
         // contract, and the descriptor and its offset table are immutable.
         let descriptor = unsafe { &*current.cast::<*const ObjectDescriptor>().read() };
@@ -207,4 +225,50 @@ pub(crate) unsafe fn release(heap: &mut ObjectHeap, object: *mut u8) -> u64 {
         released += 1;
     }
     released
+}
+
+/// Free a counted array whose count reached zero: push every leaf of every
+/// element, return the data block (when heap-served) and the header block.
+///
+/// # Safety
+///
+/// `array` must be a counted array header allocated by `heap` whose element
+/// descriptor is null or valid and whose storage holds `length` live elements.
+#[cfg(feature = "mem-exp-rc")]
+#[allow(unsafe_code)]
+unsafe fn release_array(heap: &mut ObjectHeap, array: *mut u8, work: &mut Vec<*mut u8>) {
+    use crate::context::AsterArray;
+    // SAFETY: the caller's contract.
+    let (descriptor, length, element_size, data) = unsafe {
+        let header = &*array.cast::<AsterArray>();
+        (
+            header.element_descriptor(),
+            usize::try_from(header.length()).unwrap_or(0),
+            header.element_size() as usize,
+            header.data_ptr(),
+        )
+    };
+    if !descriptor.is_null() && !data.is_null() {
+        // SAFETY: the descriptor is immutable program data and every offset
+        // lies inside one of the `length` elements.
+        unsafe {
+            let descriptor = &*descriptor;
+            for element in 0..length {
+                let base = data.add(element * element_size);
+                for index in 0..descriptor.reference_count as usize {
+                    let offset = descriptor.reference_offsets.add(index).read() as usize;
+                    work.push(base.add(offset).cast::<*mut u8>().read_unaligned());
+                }
+            }
+        }
+    }
+    let bytes = length.saturating_mul(element_size).max(1);
+    match u32::try_from(bytes).ok().and_then(ObjectHeap::class_of) {
+        Some(class) => heap.release(data, class),
+        None => heap.stats.unreturned_array_blocks += 1,
+    }
+    let header_class = ObjectHeap::class_of(u32::try_from(size_of::<AsterArray>()).unwrap_or(0))
+        .expect("array headers fit a size class");
+    heap.release(array, header_class);
+    heap.stats.released_arrays += 1;
 }

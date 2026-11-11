@@ -708,13 +708,36 @@ and arrays), `cache_churn` still grows (dictionary and strings), `object_graph` 
 40,922 objects (children in `Node[]` arrays). Checksums identical in C5 and C6; executed count
 operations C6/C5 = 2,391,831 / 5,251,865 = 45.5%.
 
+### T-MEM-EXP-1 stage C, counted arrays (U8, second collection) — implemented (2026-11-11)
+
+Contract: §8 of [08-mem-exp-1-c5-design.md](08-mem-exp-1-c5-design.md). Under `mem-exp-rc` arrays
+use the uniform header (descriptor @0, count @8 with `ARRAY_FLAG`, length, element size, data @24;
+32-byte header), Persistent headers and data blocks up to 2,048 bytes come from the size-class heap,
+larger data blocks stay reserved (`unreturned_array_blocks`). Arrays own their elements; the
+release work list releases element leaves and both blocks. Pass and validator: `Array` is a leaf,
+`Index` is owning, fresh array producers are owned sources, E3 excludes functions with element
+stores. Two existing runtime tests that pinned the single-allocation array layout are gated off
+under `mem-exp-rc` (`array_allocation_preflights_the_complete_header_and_payload`, and the final
+stats assertion of `array_layout_overflow_and_preflight_errors_are_fail_closed_and_first_wins`).
+
+Gates: `aster-codegen-cranelift --all-targets` C0 1,443 and C4 1,443 passed; C5 and C6 1,435
+passed, 0 failed, 24 ignored; `aster-runtime` 337 (default) and 362 (`mem-exp-rc`, incl. 9
+`array_rc`); `aster-mir` 70; `aster-compiler` 707; clippy and rustfmt clean.
+
+Measured (C6, debug, deterministic): `object_graph` releases 122,820 objects and arrays and reuses
+110,538 blocks; used bytes 294,768 (was 1,964,528 before arrays were counted). `longrun_frame`
+unchanged (flat at 1,584). `longrun_request` still grows (strings). Checksums identical in C5 and
+C6; executed count operations C6/C5 = 2,760,271 / 5,579,385 = 49.5% (soft gate ≤ 50%, close).
+
+Known leaks by design in this increment: arrays passed to intrinsics (consumed operand), Temporary
+arrays' elements, dictionary contents, enum payloads, a dropped list's elements.
+
 Not done, so **no PASS for MEM-001 to MEM-003**:
 
-1. Counted arrays (header count, element release on drop) for `object_graph` and peak memory;
-   dictionary element glue and counted strings for `longrun_request` and `cache_churn`.
+1. Counted strings and dictionary glue for `longrun_request` and `cache_churn`.
 2. Enum payload drop glue and closure environments (enums currently leak their references).
 3. Region reclamation together with counting (H2 pins); C5 and C6 currently lose it.
 4. Class B timing protocol (release builds, interleaved rounds) and the §4.C thresholds.
 
-Next action: item 1, counted arrays (array header with count word, element drop glue), then
-dictionary glue and counted strings.
+Next action: item 1, counted strings (string header count word, intrinsic results owned), then
+dictionary glue.
