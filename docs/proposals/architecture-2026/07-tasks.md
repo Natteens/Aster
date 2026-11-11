@@ -822,10 +822,79 @@ The long-running gate shape (final live bytes at 10N ≤ N + 64 KiB) holds for `
 `longrun_request`, and `cache_churn` in this debug measurement; `bench_workload_memory` asserts it
 for all four workloads. Checksums identical; executed count operations C6/C5 = 51.6%.
 
+### T-MEM-EXP-1 class B, first C0/C6 measurement (2026-11-11)
+
+Protocol: release `perf_baseline` built once per configuration (C0 default, C6 `mem-exp-c6`),
+4 rounds alternating order, `--samples 7 --warmup 2`, median of 28 `execution_warm` samples per
+workload, on the notebook (first class B run on this machine).
+
+| Workload | C0 ms | C6/C0 |
+| --- | ---: | ---: |
+| numeric_loops (control) | 6.093 | 0.998 |
+| strings | 5.728 | 1.394 |
+| collections | 4.648 | 0.978 |
+| calls_and_interfaces | 2.742 | 10.642 |
+| generics | 3.959 | 0.751 |
+| allocation_mixed | 8.225 | 7.509 |
+| longrun_frame | 1.812 | 11.202 |
+| longrun_request | 7.445 | 2.904 |
+| cache_churn | 3.927 | 0.985 |
+| object_graph | 2.168 | 12.599 |
+| accessor_heavy | 5.582 | 1.046 |
+| interface_dispatch | 4.242 | 6.569 |
+| collection_growth | 2.064 | 0.824 |
+| string_pipeline | 9.123 | 1.051 |
+
+Geometric mean 2.287. Compile time on `frontend_generated`: front end 1.001; front end + backend
+validation (which includes the ownership pass and validator under C6) + codegen 1.114 (gate ≤ 1.20:
+met, conservatively, since codegen is included). **As built, C6 fails the execution-time gate**
+(≤ 1.15 per object workload, ≤ 1.10 geometric mean). Cause identified in the implementation, not
+in counting as such: every `Retain`/`Release` is an out-of-line call into the runtime, and
+`release` allocates a work-list `Vec` on every call; list and dictionary glue allocate a `Vec` per
+mutation. No verdict is recorded yet: the closure asks for the correct implementation to be
+measured, and the inline fast path below is part of the C5/C6 design (§3 calls retain and release
+"test the sentinel"), not a threshold change.
+
+### T-MEM-EXP-1 inline count fast paths and second class B measurement (2026-11-11)
+
+Contract: §13 of [08-mem-exp-1-c5-design.md](08-mem-exp-1-c5-design.md). Generated code now
+retains and releases inline (load, sentinel test, store) and calls `aster_rt_object_release_last`
+only when a count reaches zero; counters are incremented inline at exported context offsets, so
+executed counts are unchanged (C6 total 2,960,322). The release work list reuses a heap-owned
+buffer; glue collects leaf words into an 8-slot inline buffer.
+
+Gates: C5 and C6 `--all-targets` 1,449 passed, 0 failed, 25 ignored; C0 and C4 1,443 passed;
+`aster-runtime` 337 / 399 (`mem-exp-rc`); `aster-mir` 104; clippy clean.
+
+Class B (same protocol as the first run):
+
+| Workload | C0 ms | C6/C0 first | C6/C0 now |
+| --- | ---: | ---: | ---: |
+| numeric_loops (control) | 6.157 | 0.998 | 0.997 |
+| strings | 5.804 | 1.394 | 1.115 |
+| collections | 4.701 | 0.978 | 1.005 |
+| calls_and_interfaces | 2.774 | 10.642 | 1.291 |
+| generics | 4.032 | 0.751 | 0.738 |
+| allocation_mixed | 8.288 | 7.509 | 1.385 |
+| longrun_frame | 1.839 | 11.202 | 1.400 |
+| longrun_request | 7.434 | 2.904 | 1.057 |
+| cache_churn | 3.927 | 0.985 | 1.037 |
+| object_graph | 2.191 | 12.599 | 1.551 |
+| accessor_heavy | 5.574 | 1.046 | 1.065 |
+| interface_dispatch | 4.247 | 6.569 | 1.173 |
+| collection_growth | 2.086 | 0.907 | 0.907 |
+| string_pipeline | 9.087 | 1.077 | 1.077 |
+
+Geometric mean 1.116. Against the hard gate (≤ 1.15 per object-heavy workload, ≤ 1.10 geometric
+mean): `longrun_request` 1.057 and `accessor_heavy` 1.065 meet it; `longrun_frame` 1.400,
+`object_graph` 1.551, `interface_dispatch` 1.173 and the mean do not. The C6 measured here
+implements only part of the elision the design specifies (§5.5 borrow windows and G1 callee
+summaries are missing), so the next step implements them (§14) before the verdict.
+
 Not done, so **no PASS for MEM-001 to MEM-003**:
 
-1. Class B timing (release builds, interleaved C0/C6) and the time, compile-time, and peak-memory
-   gates of §4.C; tier-1 preservation check of `benchmarks/memory`.
+1. E4 borrow windows and E5 non-releasing call summaries (§14); then remeasure class B, measure
+   the ownership pass and validator time directly for the compile-time gate, and apply §4.C.
 2. Enum payload drop glue and closure environments (enums currently leak their references).
 3. Region reclamation together with counting (H2 pins); C5 and C6 currently lose it.
 4. Class B timing protocol (release builds, interleaved rounds) and the §4.C thresholds.

@@ -284,3 +284,39 @@ Persistent arena on first use and returned to its class's free list on release o
 like small blocks (zeroed on reuse, poisoned on release in debug builds). Blocks above 1 MiB stay
 reserved and are reported. Rounding up to a power of two wastes at most half a large block; the
 peak-memory gate of §4.C measures that cost.
+
+## 13. Inline count fast paths
+
+- **Retain** in generated code: skip null; load the count word; skip if the count is `IMMORTAL`;
+  store the word plus one (the kind bits are untouched; a count of `IMMORTAL - 1` becomes
+  `IMMORTAL`, which is the saturation rule).
+- **Release** in generated code: skip null; load the word; skip `IMMORTAL`; if the count is above
+  one, store the word minus one; otherwise call the runtime slow path, which releases the object
+  and everything that reaches zero.
+- The executed-operation counters stay exact: generated code increments them in the execution
+  context at fixed offsets exported by the runtime.
+- The runtime work list and the collection glue reuse a scratch buffer owned by the heap instead of
+  allocating per call.
+
+## 14. C6 elision, second round: borrow windows and call summaries (master plan §5.5, G1)
+
+- **Non-releasing summary.** A function is *non-releasing* when, after elision, it contains no
+  `Release` other than its own parameter exit releases, no releasing instruction (`Index` or
+  owning heap store, `ListSet`/`ListRemoveAt`/`ListClear`, dictionary mutations), no releasing
+  intrinsic (anything outside an explicit whitelist of intrinsics that only read or allocate), no
+  `ForeignCall`, writes no parameter slot, and every `Call` targets a non-releasing function and
+  every `CallInterface` has only non-releasing implementations. Computed as a greatest fixpoint
+  over the call graph (a cycle of functions that release nothing releases nothing).
+- **E5, parameters of non-releasing functions.** E3 generalized: in a non-releasing function the
+  parameter entry retains and exit releases are dropped. A call to a non-releasing function is
+  **not** an invalidating instruction for the caller (nothing can be freed during it).
+- **E4, borrow windows.** A local whose every write is a borrowed load (heap field, array or list
+  element, dictionary read) and whose every read happens inside the window of the load that wrote
+  it (same block, before the next invalidating instruction), and which is never stored, consumed,
+  or returned, is a **borrowed local**: its load `Retain`, its captures, and its exit release are
+  dropped. Passing it as a call argument is a use at the call; it is allowed only when the callee is
+  non-releasing (G1: a load is not a guarantor otherwise).
+- **Validator.** It computes the non-releasing summary independently (its own fixpoint) and uses it
+  in three places: a borrowed-parameter function must be non-releasing; a call to a non-releasing
+  function does not invalidate; a borrowed (0-token heap-read) value may be passed as an argument
+  only to a non-releasing callee (U2/G1). Everything else is the existing token and window logic.

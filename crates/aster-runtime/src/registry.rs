@@ -55,7 +55,9 @@ use crate::math::{
 };
 use crate::object::{aster_rt_object_new, aster_rt_object_new_temporary};
 #[cfg(feature = "mem-exp-rc")]
-use crate::object::{aster_rt_object_release, aster_rt_object_retain};
+use crate::object::{
+    aster_rt_object_release, aster_rt_object_release_last, aster_rt_object_retain,
+};
 use crate::string::{
     aster_rt_string_byte_length, aster_rt_string_concat, aster_rt_string_concat_array,
     aster_rt_string_concat_array_temporary, aster_rt_string_concat_temporary,
@@ -185,6 +187,15 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
         RuntimeFunction {
             name: "aster_rt_object_release",
             address: aster_rt_object_release as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: None,
+            },
+        },
+        #[cfg(feature = "mem-exp-rc")]
+        RuntimeFunction {
+            name: "aster_rt_object_release_last",
+            address: aster_rt_object_release_last as *const u8,
             signature: RuntimeSignature {
                 parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
                 result: None,

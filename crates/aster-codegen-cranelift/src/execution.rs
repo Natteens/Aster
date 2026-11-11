@@ -300,6 +300,8 @@ impl PreparedProgram {
         }
         let value = invoke_finalized(*pointer, return_type, &mut execution_context);
         let runtime_error = execution_context.take_error();
+        #[cfg(feature = "mem-exp-c5")]
+        execution_context.refresh_object_heap_stats();
         let stats = execution_context.memory_stats().clone();
         let telemetry = execution_context.aarm_memory_telemetry();
         if let Some(error) = runtime_error {
@@ -368,6 +370,8 @@ impl PreparedProgram {
             invoke_task_finalized(*pointer, return_type, payload.as_ptr(), &mut context)
         };
         let runtime_error = context.take_error();
+        #[cfg(feature = "mem-exp-c5")]
+        context.refresh_object_heap_stats();
         let stats = context.memory_stats().clone();
         let telemetry = context.aarm_memory_telemetry();
         let outcome = match runtime_error {
@@ -422,6 +426,8 @@ impl PreparedProgram {
         let function: extern "C" fn(*mut aster_runtime::ExecutionContext, i64) -> i32 =
             unsafe { std::mem::transmute(*pointer) };
         let move_next_status = function(&raw mut context, handle);
+        #[cfg(feature = "mem-exp-c5")]
+        context.refresh_object_heap_stats();
         let stats = context.memory_stats().clone();
         let result = match context.take_error() {
             Some(error) => Err(BackendError::new(format!("Aster runtime error: {error}"))),

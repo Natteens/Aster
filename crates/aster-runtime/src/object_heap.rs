@@ -158,6 +158,10 @@ pub struct ObjectHeapStats {
 pub(crate) struct ObjectHeap {
     free: [Vec<*mut u8>; SIZE_CLASSES.len()],
     pub(crate) stats: ObjectHeapStats,
+    /// Reused release work list: taken, cleared and restored by [`release`],
+    /// so steady-state releases allocate nothing. Release never runs user
+    /// code, so no nested use can observe the taken (empty) buffer.
+    work: Vec<*mut u8>,
 }
 
 impl ObjectHeap {
@@ -269,7 +273,9 @@ pub unsafe fn retain(object: *mut u8) {
 /// `heap` when they are counted.
 #[allow(unsafe_code)]
 pub(crate) unsafe fn release(heap: &mut ObjectHeap, object: *mut u8) -> u64 {
-    let mut work = vec![object];
+    let mut work = std::mem::take(&mut heap.work);
+    work.clear();
+    work.push(object);
     let mut released = 0;
     while let Some(current) = work.pop() {
         if current.is_null() {
@@ -344,6 +350,7 @@ pub(crate) unsafe fn release(heap: &mut ObjectHeap, object: *mut u8) -> u64 {
         heap.release(current, class);
         released += 1;
     }
+    heap.work = work;
     released
 }
 

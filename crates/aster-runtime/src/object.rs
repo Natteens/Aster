@@ -68,3 +68,21 @@ pub extern "C" fn aster_rt_object_release(context: *mut ExecutionContext, object
         context.release_counted_object(object);
     }
 }
+
+/// Slow path of inline generated Release for an object whose count is one
+/// (MEM-EXP-1 section 13). The generated code already incremented the executed
+/// `releases` counter, so this does not count again.
+#[cfg(feature = "mem-exp-rc")]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_object_release_last(context: *mut ExecutionContext, object: *mut u8) {
+    if context.is_null() || object.is_null() {
+        return;
+    }
+    // SAFETY: as in `aster_rt_object_retain`.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    #[allow(unsafe_code)]
+    unsafe {
+        context.release_last_object(object);
+    }
+}

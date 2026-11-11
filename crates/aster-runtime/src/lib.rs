@@ -55,6 +55,8 @@ pub use context::{
     aster_rt_string_builder_new_temporary, aster_rt_string_builder_to_string,
     aster_rt_string_builder_to_string_temporary, aster_rt_temporary_scope_enter,
 };
+#[cfg(feature = "mem-exp-rc")]
+pub use context::{EXECUTION_CONTEXT_RELEASES_OFFSET, EXECUTION_CONTEXT_RETAINS_OFFSET};
 pub use filesystem::{
     FailingFileSystemBackend, FileSystemBackend, FileSystemError, MAX_FILE_BYTES, MAX_LIST_FILES,
     MAX_LIST_PATH_BYTES, MemoryFileSystemBackend, PartialWriteFailureFileSystemBackend,

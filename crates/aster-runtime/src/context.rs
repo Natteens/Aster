@@ -91,6 +91,22 @@ pub const ASTER_DICTIONARY_DESCRIPTOR_OFFSET: usize =
 pub const EXECUTION_CONTEXT_ERROR_FLAG_OFFSET: usize =
     std::mem::offset_of!(ExecutionContext, error_flag);
 
+/// Offset of the executed-`retains` counter (a `u64`) inside an
+/// [`ExecutionContext`], incremented directly by inline generated Retain.
+#[cfg(feature = "mem-exp-rc")]
+pub const EXECUTION_CONTEXT_RETAINS_OFFSET: usize =
+    std::mem::offset_of!(ExecutionContext, object_heap)
+        + std::mem::offset_of!(crate::object_heap::ObjectHeap, stats)
+        + std::mem::offset_of!(crate::object_heap::ObjectHeapStats, retains);
+
+/// Offset of the executed-`releases` counter (a `u64`) inside an
+/// [`ExecutionContext`], incremented directly by inline generated Release.
+#[cfg(feature = "mem-exp-rc")]
+pub const EXECUTION_CONTEXT_RELEASES_OFFSET: usize =
+    std::mem::offset_of!(ExecutionContext, object_heap)
+        + std::mem::offset_of!(crate::object_heap::ObjectHeap, stats)
+        + std::mem::offset_of!(crate::object_heap::ObjectHeapStats, releases);
+
 /// Copies one list element of `size` bytes. Behaves exactly like
 /// `ptr::copy_nonoverlapping(source, destination, size)`; the common element
 /// sizes use constant-length copies so they compile to plain moves instead of
@@ -379,7 +395,7 @@ impl AsterDictionary {
             let entry = ExecutionContext::dictionary_entry_pointer(header.entries, index, layout)?;
             // SAFETY: `index < entry_count <= entry_capacity`.
             if unsafe { ExecutionContext::dictionary_entry_live(entry) } == 1 {
-                work.extend(ExecutionContext::dictionary_leaf_words(
+                work.extend_from_slice(&ExecutionContext::dictionary_leaf_words(
                     this,
                     entry.wrapping_add(layout.key_offset),
                     entry.wrapping_add(layout.value_offset),
@@ -784,6 +800,63 @@ impl TaskCancellation {
     }
 }
 
+/// Leaf object words copied out of collection storage before release or
+/// retain. Up to [`LeafWords::INLINE`] words are stored inline so the common
+/// single-element and entry glue allocates nothing; larger sets spill to a
+/// `Vec`. Each value is local to one glue call, so there is no shared scratch
+/// state and nested glue cannot corrupt another call's words.
+#[cfg(feature = "mem-exp-rc")]
+struct LeafWords {
+    inline: [*mut u8; Self::INLINE],
+    length: usize,
+    spill: Vec<*mut u8>,
+}
+
+#[cfg(feature = "mem-exp-rc")]
+impl LeafWords {
+    const INLINE: usize = 8;
+
+    fn new() -> Self {
+        Self {
+            inline: [std::ptr::null_mut(); Self::INLINE],
+            length: 0,
+            spill: Vec::new(),
+        }
+    }
+
+    fn extend_from(&mut self, words: &[*mut u8]) {
+        for &word in words {
+            self.push(word);
+        }
+    }
+
+    fn push(&mut self, word: *mut u8) {
+        if self.spill.is_empty() && self.length < Self::INLINE {
+            self.inline[self.length] = word;
+            self.length += 1;
+            return;
+        }
+        if self.spill.is_empty() {
+            self.spill.extend_from_slice(&self.inline[..self.length]);
+        }
+        self.spill.push(word);
+        self.length += 1;
+    }
+}
+
+#[cfg(feature = "mem-exp-rc")]
+impl std::ops::Deref for LeafWords {
+    type Target = [*mut u8];
+
+    fn deref(&self) -> &[*mut u8] {
+        if self.spill.is_empty() {
+            &self.inline[..self.length]
+        } else {
+            &self.spill
+        }
+    }
+}
+
 /// Owns every dynamic allocation made by one JIT invocation.
 /// Persistent allocations live in `arena`; function-local objects, arrays,
 /// and strings can use `temporary_arena`. Both arenas are released in bulk
@@ -1038,6 +1111,14 @@ impl ExecutionContext {
     pub fn take_error(&mut self) -> Option<String> {
         self.error_flag = 0;
         self.error.take()
+    }
+
+    /// Publish the object-heap counters into [`Self::memory_stats`]. Inline
+    /// generated Retain/Release update the heap counters without a runtime
+    /// call, so a snapshot must be refreshed before it is read.
+    #[cfg(feature = "mem-exp-rc")]
+    pub fn refresh_object_heap_stats(&mut self) {
+        self.sync_heap_stats();
     }
 
     #[must_use]
@@ -2528,10 +2609,12 @@ impl ExecutionContext {
         dictionary: *const AsterDictionary,
         key: *const u8,
         value: *const u8,
-    ) -> Vec<*mut u8> {
+    ) -> LeafWords {
         let (key_descriptor, value_descriptor) = Self::dictionary_descriptor_pair(dictionary);
         let mut words = Self::collect_leaf_words(key_descriptor, key, 0, 1);
-        words.extend(Self::collect_leaf_words(value_descriptor, value, 0, 1));
+        for &word in &*Self::collect_leaf_words(value_descriptor, value, 0, 1) {
+            words.push(word);
+        }
         words
     }
 
@@ -2827,7 +2910,7 @@ impl ExecutionContext {
                         ptr::null(),
                         entry.wrapping_add(layout.value_offset),
                     );
-                    words.extend(Self::dictionary_leaf_words(dictionary, key, ptr::null()));
+                    words.extend_from(&Self::dictionary_leaf_words(dictionary, key, ptr::null()));
                     words
                 };
                 #[allow(unsafe_code)]
@@ -3246,14 +3329,14 @@ impl ExecutionContext {
         let former = {
             #[allow(unsafe_code)]
             let entry_count = unsafe { (*dictionary).entry_count };
-            let mut words = Vec::new();
+            let mut words = LeafWords::new();
             for index in 0..entry_count {
                 let Some(entry) = Self::dictionary_entry_pointer(entries, index, layout) else {
                     break;
                 };
                 #[allow(unsafe_code)]
                 if unsafe { Self::dictionary_entry_live(entry) } == 1 {
-                    words.extend(Self::dictionary_leaf_words(
+                    words.extend_from(&Self::dictionary_leaf_words(
                         dictionary,
                         entry.wrapping_add(layout.key_offset),
                         entry.wrapping_add(layout.value_offset),
@@ -3526,16 +3609,18 @@ impl ExecutionContext {
 
     /// Reads the object word of every leaf of `count` consecutive elements of
     /// `element_size` bytes starting at `base`. The words are copied out so the
-    /// storage may be reused before they are released.
+    /// storage may be reused before they are released. Small results live
+    /// inline (no allocation); only large ones spill to the heap.
     #[cfg(feature = "mem-exp-rc")]
     fn collect_leaf_words(
         descriptor: *const crate::object_heap::ObjectDescriptor,
         base: *const u8,
         element_size: usize,
         count: usize,
-    ) -> Vec<*mut u8> {
+    ) -> LeafWords {
+        let mut words = LeafWords::new();
         if descriptor.is_null() || base.is_null() || count == 0 {
-            return Vec::new();
+            return words;
         }
         // SAFETY: the descriptor is immutable program data; `base` covers
         // `count` live elements and every offset lies inside one element.
@@ -3543,7 +3628,6 @@ impl ExecutionContext {
         unsafe {
             let reference_count = (*descriptor).reference_count as usize;
             let offsets = (*descriptor).reference_offsets;
-            let mut words = Vec::with_capacity(reference_count * count);
             for element in 0..count {
                 let element_base = base.add(element * element_size);
                 for index in 0..reference_count {
@@ -3551,8 +3635,8 @@ impl ExecutionContext {
                     words.push(element_base.add(offset).cast::<*mut u8>().read_unaligned());
                 }
             }
-            words
         }
+        words
     }
 
     #[cfg(feature = "mem-exp-rc")]
@@ -4652,6 +4736,19 @@ impl ExecutionContext {
             self.object_heap.stats.releases += 1;
             self.release_object(object);
         }
+    }
+
+    /// Slow path of an inline Release whose count was one: the caller already
+    /// counted the operation, so this only releases the object graph.
+    ///
+    /// # Safety
+    ///
+    /// `object` must be a non-null live counted H12 object of this context.
+    #[cfg(feature = "mem-exp-rc")]
+    #[allow(unsafe_code)]
+    pub unsafe fn release_last_object(&mut self, object: *mut u8) {
+        // SAFETY: forwarded caller contract.
+        unsafe { self.release_object(object) };
     }
 
     /// Allocate one heap object (the generated-code path, for tests).

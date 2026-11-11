@@ -1809,8 +1809,8 @@ impl Codegen {
         self.store_scalar(builder, destination, object, state)
     }
 
-    /// Lower `Retain`/`Release` (MEM-EXP-1 C5): the runtime ignores a null or
-    /// immortal object word, so no check or failure edge is emitted.
+    /// Lower `Retain`/`Release` (MEM-EXP-1 C5): inline count fast paths with a
+    /// cold runtime slow path for the last release; no failure edge is emitted.
     #[cfg_attr(not(feature = "mem-exp-c5"), allow(clippy::unused_self))]
     pub(super) fn translate_reference_count(
         &mut self,
@@ -1832,18 +1832,10 @@ impl Codegen {
             } else {
                 operand
             };
-            let symbol = if retain {
-                "aster_rt_object_retain"
-            } else {
-                "aster_rt_object_release"
-            };
-            let function_ref = self
-                .jit
-                .declare_func_in_func(self.runtime_ids[symbol], builder.func);
             let context = state.execution_context.ok_or_else(|| {
                 BackendError::new("reference count is missing its ExecutionContext")
             })?;
-            builder.ins().call(function_ref, &[context, object]);
+            self.emit_inline_reference_count(builder, context, object, retain)?;
             Ok(())
         }
         #[cfg(not(feature = "mem-exp-c5"))]
@@ -1853,6 +1845,85 @@ impl Codegen {
                 "ownership instructions require MEM-EXP-1 C5",
             ))
         }
+    }
+
+    /// Inline fast paths of `Retain`/`Release` (MEM-EXP-1 design section 13).
+    /// Null and immortal operands are skipped; the executed-operation counters
+    /// in the context are updated in place; the last release of an object
+    /// takes a cold call to the runtime slow path, which does not count again.
+    #[cfg(feature = "mem-exp-c5")]
+    fn emit_inline_reference_count(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        context: cranelift_codegen::ir::Value,
+        object: cranelift_codegen::ir::Value,
+        retain: bool,
+    ) -> Result<(), BackendError> {
+        use aster_runtime::object_heap::{COUNT_MASK, COUNT_OFFSET, IMMORTAL};
+        use aster_runtime::{EXECUTION_CONTEXT_RELEASES_OFFSET, EXECUTION_CONTEXT_RETAINS_OFFSET};
+        use cranelift_codegen::ir::MemFlags;
+        let count_offset = i32::try_from(COUNT_OFFSET)
+            .map_err(|_| BackendError::new("count word offset is too large"))?;
+        let counter_offset = i32::try_from(if retain {
+            EXECUTION_CONTEXT_RETAINS_OFFSET
+        } else {
+            EXECUTION_CONTEXT_RELEASES_OFFSET
+        })
+        .map_err(|_| BackendError::new("counter offset is too large"))?;
+        let inspect = builder.create_block();
+        let update = builder.create_block();
+        let continuation = builder.create_block();
+        builder.ins().brif(object, inspect, &[], continuation, &[]);
+
+        builder.switch_to_block(inspect);
+        let word = builder
+            .ins()
+            .load(types::I32, MemFlags::new(), object, count_offset);
+        let count = builder.ins().band_imm(word, i64::from(COUNT_MASK));
+        let immortal = builder
+            .ins()
+            .icmp_imm(IntCC::Equal, count, i64::from(IMMORTAL));
+        builder.ins().brif(immortal, continuation, &[], update, &[]);
+
+        builder.switch_to_block(update);
+        let counter = builder
+            .ins()
+            .load(types::I64, MemFlags::new(), context, counter_offset);
+        let counter = builder.ins().iadd_imm(counter, 1);
+        builder
+            .ins()
+            .store(MemFlags::new(), counter, context, counter_offset);
+        if retain {
+            // The kind bits are untouched; IMMORTAL - 1 saturates to IMMORTAL.
+            let next = builder.ins().iadd_imm(word, 1);
+            builder
+                .ins()
+                .store(MemFlags::new(), next, object, count_offset);
+            builder.ins().jump(continuation, &[]);
+        } else {
+            let decrement = builder.create_block();
+            let last = builder.create_block();
+            builder.set_cold_block(last);
+            let shared = builder.ins().icmp_imm(IntCC::UnsignedGreaterThan, count, 1);
+            builder.ins().brif(shared, decrement, &[], last, &[]);
+
+            builder.switch_to_block(decrement);
+            let next = builder.ins().iadd_imm(word, -1);
+            builder
+                .ins()
+                .store(MemFlags::new(), next, object, count_offset);
+            builder.ins().jump(continuation, &[]);
+
+            builder.switch_to_block(last);
+            let function_ref = self.jit.declare_func_in_func(
+                self.runtime_ids["aster_rt_object_release_last"],
+                builder.func,
+            );
+            builder.ins().call(function_ref, &[context, object]);
+            builder.ins().jump(continuation, &[]);
+        }
+        builder.switch_to_block(continuation);
+        Ok(())
     }
 
     pub(super) fn translate_list_allocation(
