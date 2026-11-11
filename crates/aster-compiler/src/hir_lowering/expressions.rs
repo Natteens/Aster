@@ -8,7 +8,7 @@ impl Lowerer<'_> {
     fn binary_expression(&mut self, expression: &ast::Expression) -> hir::Expression {
         enum Work<'a> {
             Visit(&'a ast::Expression),
-            Combine(ast::BinaryOperator),
+            Combine(ast::BinaryOperator, aster_diagnostics::Span),
         }
 
         let mut work = vec![Work::Visit(expression)];
@@ -22,35 +22,39 @@ impl Lowerer<'_> {
                         right,
                     } = &expression.kind
                     {
-                        work.push(Work::Combine(*operator));
+                        work.push(Work::Combine(*operator, expression.span));
                         work.push(Work::Visit(right));
                         work.push(Work::Visit(left));
                     } else {
                         values.push(self.expression(expression));
                     }
                 }
-                Work::Combine(operator) => {
+                Work::Combine(operator, span) => {
                     let mut right = values.pop().expect("binary right operand was lowered");
                     let mut left = values.pop().expect("binary left operand was lowered");
-                    if matches!(
-                        operator,
-                        ast::BinaryOperator::ShiftLeft
-                            | ast::BinaryOperator::ShiftRight
-                            | ast::BinaryOperator::UnsignedShiftRight
-                    ) {
-                        // Only the left operand is promoted. The count is converted to
-                        // the same type: widening or reinterpreting an `int` preserves
-                        // the low bits that the shift masks, so negative counts keep
-                        // their specified meaning while both MIR operands share a type.
-                        if let Some(promoted) = unary_promoted(&left.type_) {
-                            left = convert(left, &promoted);
-                            right = convert(right, &promoted);
-                        }
-                    } else if let Some(promoted) = promoted(&left.type_, &right.type_) {
-                        left = convert(left, &promoted);
-                        right = convert(right, &promoted);
+                    let key = self.model.node_key(&self.model_context, span);
+                    // Semantic analysis chose the operand type. For a shift the count is
+                    // converted to the promoted left type too: widening or reinterpreting
+                    // an `int` preserves the low bits the shift masks, so negative counts
+                    // keep their specified meaning while both MIR operands share a type.
+                    let operand = self
+                        .model
+                        .binary_operand_types
+                        .get(&key)
+                        .cloned()
+                        .map(|name| self.resolve_type(&ast::TypeRef::new(name, span)));
+                    // Agreement check over every compiled program in debug builds: the
+                    // semantic decision must equal the central promotion table.
+                    debug_assert_eq!(
+                        operand,
+                        table_operand_type(operator, &left.type_, &right.type_),
+                        "semantic analysis and the promotion table disagree on a binary operand type"
+                    );
+                    if let Some(operand) = &operand {
+                        left = convert(left, operand);
+                        right = convert(right, operand);
                     }
-                    let type_ = binary_type(operator, &left.type_, &right.type_);
+                    let type_ = binary_type(operator, operand.as_ref(), &left.type_);
                     values.push(hir::Expression {
                         type_,
                         kind: hir::ExpressionKind::Binary {
@@ -69,10 +73,7 @@ impl Lowerer<'_> {
 
     #[allow(clippy::too_many_lines)]
     pub(super) fn expression(&mut self, expression: &ast::Expression) -> hir::Expression {
-        let model_key = crate::semantic::ModelNodeKey {
-            context: self.model_context.clone(),
-            span: expression.span,
-        };
+        let model_key = self.model.node_key(&self.model_context, expression.span);
         if let Some(resolved) = self.model.enum_values.get(&model_key).cloned() {
             let enum_symbol = self.types[&resolved.enum_name];
             let (case_symbol, field_symbols) =
@@ -1138,10 +1139,7 @@ impl Lowerer<'_> {
                 prefix,
                 operand,
             } => {
-                let operand_key = crate::semantic::ModelNodeKey {
-                    context: self.model_context.clone(),
-                    span: operand.span,
-                };
+                let operand_key = self.model.node_key(&self.model_context, operand.span);
                 if self.model.list_indexes.contains(&operand_key) {
                     let ast::ExpressionKind::Index { array, index } = &operand.kind else {
                         unreachable!("a list index model entry belongs to an index expression")
@@ -1321,10 +1319,7 @@ impl Lowerer<'_> {
                 operator,
                 value,
             } => {
-                let target_key = crate::semantic::ModelNodeKey {
-                    context: self.model_context.clone(),
-                    span: target.span,
-                };
+                let target_key = self.model.node_key(&self.model_context, target.span);
                 if self.model.list_indexes.contains(&target_key) {
                     let ast::ExpressionKind::Index { array, index } = &target.kind else {
                         unreachable!("a list index model entry belongs to an index expression")
@@ -1584,3 +1579,19 @@ convert_operator!(
         UnsignedShiftRightAssign
     ]
 );
+
+/// The operand type the central promotion table yields, used only by the
+/// debug agreement check against the semantic decision.
+fn table_operand_type(
+    operator: ast::BinaryOperator,
+    left: &hir::Type,
+    right: &hir::Type,
+) -> Option<hir::Type> {
+    match operator {
+        ast::BinaryOperator::LogicalAnd | ast::BinaryOperator::LogicalOr => None,
+        ast::BinaryOperator::ShiftLeft
+        | ast::BinaryOperator::ShiftRight
+        | ast::BinaryOperator::UnsignedShiftRight => unary_promoted(left),
+        _ => promoted(left, right),
+    }
+}

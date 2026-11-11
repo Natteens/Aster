@@ -1,0 +1,43 @@
+// Task swarm: 16 `Task.Run` workers per round, joined with `Task.WaitAll`, for 20
+// rounds. Each worker does independent integer work from its scalar argument.
+
+public int Work(int seed)
+{
+    int total = seed;
+    for (int index = 0; index < 20000; index++)
+    {
+        total = (total * 7 + seed + index) % 1000003;
+    }
+    return total;
+}
+
+public long Run()
+{
+    long sum = 0L;
+    for (int round = 0; round < 20; round++)
+    {
+        int seed = round * 16;
+        Task<int> t0 = Task.Run(Work, seed);
+        Task<int> t1 = Task.Run(Work, seed + 1);
+        Task<int> t2 = Task.Run(Work, seed + 2);
+        Task<int> t3 = Task.Run(Work, seed + 3);
+        Task<int> t4 = Task.Run(Work, seed + 4);
+        Task<int> t5 = Task.Run(Work, seed + 5);
+        Task<int> t6 = Task.Run(Work, seed + 6);
+        Task<int> t7 = Task.Run(Work, seed + 7);
+        Task<int> t8 = Task.Run(Work, seed + 8);
+        Task<int> t9 = Task.Run(Work, seed + 9);
+        Task<int> t10 = Task.Run(Work, seed + 10);
+        Task<int> t11 = Task.Run(Work, seed + 11);
+        Task<int> t12 = Task.Run(Work, seed + 12);
+        Task<int> t13 = Task.Run(Work, seed + 13);
+        Task<int> t14 = Task.Run(Work, seed + 14);
+        Task<int> t15 = Task.Run(Work, seed + 15);
+        int[] values = Task.WaitAll([t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15]);
+        foreach (int value in values)
+        {
+            sum = sum + (long)value;
+        }
+    }
+    return sum;
+}

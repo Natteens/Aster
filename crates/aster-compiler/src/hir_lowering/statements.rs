@@ -155,10 +155,7 @@ impl Lowerer<'_> {
         span: aster_diagnostics::Span,
         names: &[String],
     ) -> (hir::SymbolId, u32, Vec<hir::Parameter>) {
-        let key = crate::semantic::ModelNodeKey {
-            context: self.model_context.clone(),
-            span,
-        };
+        let key = self.model.node_key(&self.model_context, span);
         let resolved = &self.model.switch_cases[&key];
         let (case_symbol, field_symbols) =
             self.enum_cases[&(resolved.enum_name.clone(), resolved.case_index)].clone();

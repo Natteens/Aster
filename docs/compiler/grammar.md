@@ -5,8 +5,8 @@ It is intentionally narrower than `docs/specification/`.
 
 Source files are UTF-8. Whitespace and `//` line comments are ignored. Identifiers begin
 with `_` or a Unicode alphabetic character and continue with `_` or Unicode alphanumeric
-characters. Decimal integer and decimal-point literals, strings, characters, and booleans
-are implemented. Strings and characters support `\\n`, `\\r`, `\\t`, `\\\\`, `\\"`, and `\\'`.
+characters. Decimal, hexadecimal (`0x`), and binary (`0b`) integer literals, decimal-point
+literals, strings, characters, and booleans are implemented. Strings and characters support `\\n`, `\\r`, `\\t`, `\\\\`, `\\"`, and `\\'`.
 
 ```ebnf
 compilation-unit    = [ namespace-declaration ] , { using-declaration } ,
@@ -122,6 +122,7 @@ unary               = ( "!" | "-" | "~" | "++" | "--" | "await" ) , unary | cast
 cast                = "(" , value-type , ")" , unary ;
 value-type          = "sbyte" | "byte" | "short" | "ushort" | "int" | "uint"
                     | "long" | "ulong" | "float" | "double" | "decimal" | "char" ;
+                      (* "decimal" parses but is rejected by semantic analysis as reserved *)
 postfix             = primary , { "." , identifier | "[" , expression , "]"
                                 | call-suffix | "++" | "--" | try-propagation } ;
 call-suffix         = [ type-arguments ] , arguments ;

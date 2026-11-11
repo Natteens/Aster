@@ -476,7 +476,15 @@ impl Analyzer<'_> {
             } => {
                 let left_type = self.expression(left);
                 let right_type = self.expression(right);
-                self.binary(*operator, &left_type, &right_type, expression.span)
+                let result = self.binary(*operator, &left_type, &right_type, expression.span);
+                if result != Type::Unknown
+                    && let Some(operand) = binary_operand_type(*operator, &left_type, &right_type)
+                {
+                    self.model
+                        .binary_operand_types
+                        .insert(self.model_key(expression.span), operand.display());
+                }
+                result
             }
             ExpressionKind::Assignment {
                 target,
@@ -1958,4 +1966,19 @@ fn is_shift_count(type_: &Type) -> bool {
     type_
         .primitive()
         .is_some_and(|primitive| crate::primitives::implicit_converts(primitive, Primitive::Int))
+}
+
+/// The numeric type both operands are converted to, from the central promotion
+/// table: the left operand alone decides for shifts (the count follows it), and
+/// the common promoted type decides for every other numeric pair.
+fn binary_operand_type(operator: BinaryOperator, left: &Type, right: &Type) -> Option<Type> {
+    use BinaryOperator::{LogicalAnd, LogicalOr, ShiftLeft, ShiftRight, UnsignedShiftRight};
+    match operator {
+        LogicalAnd | LogicalOr => None,
+        ShiftLeft | ShiftRight | UnsignedShiftRight => left
+            .primitive()
+            .and_then(crate::primitives::promote_unary)
+            .map(Type::from_primitive),
+        _ => promoted_numeric(left, right),
+    }
 }

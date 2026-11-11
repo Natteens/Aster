@@ -15,8 +15,9 @@ Behavior:
 
 - Polls file metadata every 150 ms; a rebuild fires only after two consecutive identical
   observations of a changed file, so one editor save produces one rebuild (debounce).
-- Compile errors are printed and the watcher keeps running; when a later save compiles again
-  it prints `[watch] compilation succeeded again`.
+- The first build must succeed: if it fails, the command reports the errors and exits. After a
+  successful first build, compile errors are printed and the watcher keeps running; when a later
+  save compiles again it prints `[watch] compilation succeeded again`.
 - Each successful run prints the ASTER frontend time and JIT+execution time separately
   (Cargo build time is not part of either) plus the function result.
 - Every rebuild uses a fresh JIT session and ExecutionContext. The previous session is freed after

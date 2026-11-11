@@ -9,6 +9,8 @@ description = "Execution runtime boundary and ABI for JIT-compiled Aster program
 
 [features]
 aarm-telemetry = []
+# MEM-EXP-1 experiment only: size-class heap for escaping class objects.
+mem-exp-heap = []
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59.0", features = [

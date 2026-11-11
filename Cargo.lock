@@ -68,6 +68,7 @@ name = "aster-mir"
 version = "0.71.0"
 dependencies = [
  "aster-hir",
+ "aster-types",
 ]
 
 [[package]]

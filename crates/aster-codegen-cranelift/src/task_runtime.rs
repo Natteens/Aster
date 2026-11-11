@@ -14,11 +14,11 @@
 //!
 //! ## Populations and borrow discipline
 //!
-//! Three `PreparedProgram`s never overlap: the top-level `prepared_main` that
-//! runs `Main` (in `execution`), the `driver` here that runs every `MoveNext`,
-//! and one worker `PreparedProgram` per pool thread. `MoveNext` runs only on
-//! the host, only through `driver`; workers only run `Task.Run` and `Parallel`
-//! chunks and never touch this runtime.
+//! One finalized program serves the whole execution: the program that runs
+//! `Main` (in `execution`) is shared as a `SharedProgram`, adopted by the pool,
+//! run by every worker thread, and is also the `driver` here that runs every
+//! `MoveNext`. `MoveNext` runs only on the host, only through `driver`; workers
+//! only run `Task.Run` and `Parallel` chunks and never touch this runtime.
 //!
 //! The pump must never hold a Rust borrow of the runtime across a JIT call
 //! that can call back into the runtime. [`TaskRuntime::pump`] therefore takes
@@ -30,7 +30,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use super::completion_queue::{CompletionQueue, CompletionToken};
-use super::execution::PreparedProgram;
+use super::execution::{PreparedProgram, SharedProgram};
 use super::worker_pool::{
     AsyncInnerPhaseGate, AsyncMemoryDomain, ChunkOutcome, ExecutionPool, JobKind,
     ParallelMemoryBudget, ReduceChunkOutcome, TaskControl, TaskHandle, TaskMemoryDomain,
@@ -169,9 +169,10 @@ struct AsyncTask {
 /// shuts the pool and completion queue down and releases every entry.
 pub(super) struct TaskRuntime {
     pool: ExecutionPool,
-    /// Host-only program for `MoveNext` steps. `Option` so the pump can take
-    /// exclusive ownership across a step without holding a runtime borrow.
-    driver: Option<PreparedProgram>,
+    /// The pool's shared program, used on the host for `MoveNext` steps.
+    /// `Option` so the pump can take exclusive ownership across a step without
+    /// holding a runtime borrow; taking it also rejects nested pumping.
+    driver: Option<Arc<SharedProgram>>,
     completion: Arc<CompletionQueue>,
     entries: HashMap<TaskHandleId, TaskEntry>,
     async_tasks: HashMap<TaskHandleId, AsyncTask>,
@@ -202,7 +203,7 @@ pub(super) struct TaskRuntime {
 /// stack-bounded runtime contract.
 struct DriverRestore {
     runtime: *mut TaskRuntime,
-    driver: Option<PreparedProgram>,
+    driver: Option<Arc<SharedProgram>>,
 }
 
 impl Drop for DriverRestore {
@@ -221,6 +222,9 @@ impl Drop for DriverRestore {
 }
 
 impl TaskRuntime {
+    // Production paths share their program through `with_program`; these
+    // prepare their own and remain for tests and research entry points.
+    #[cfg_attr(not(any(test, feature = "aarm-telemetry")), allow(dead_code))]
     pub(super) fn new(
         module: &Arc<mir::Module>,
         worker_count: usize,
@@ -232,12 +236,43 @@ impl TaskRuntime {
         )
     }
 
+    // Production paths share their program through `with_program`; these
+    // prepare their own and remain for tests and research entry points.
+    #[cfg_attr(not(any(test, feature = "aarm-telemetry")), allow(dead_code))]
     pub(super) fn new_with_foreign_registry(
         module: &Arc<mir::Module>,
         worker_count: usize,
         foreign_registry: &Arc<aster_runtime::ForeignRegistry>,
     ) -> Result<Self, BackendError> {
-        Self::with_governors(module, worker_count, None, None, None, foreign_registry)
+        Self::with_governors(
+            module,
+            worker_count,
+            None,
+            None,
+            None,
+            foreign_registry,
+            None,
+        )
+    }
+
+    /// Runtime whose pool and async driver reuse `program`, the caller's
+    /// already finalized program for the same module and foreign registry, so
+    /// one execution compiles the module once.
+    pub(super) fn with_program(
+        module: &Arc<mir::Module>,
+        worker_count: usize,
+        foreign_registry: &Arc<aster_runtime::ForeignRegistry>,
+        program: Arc<SharedProgram>,
+    ) -> Result<Self, BackendError> {
+        Self::with_governors(
+            module,
+            worker_count,
+            None,
+            None,
+            None,
+            foreign_registry,
+            Some(program),
+        )
     }
 
     fn with_governors(
@@ -247,14 +282,18 @@ impl TaskRuntime {
         task_governor: Option<Arc<aster_runtime::MemoryGovernor>>,
         async_governor: Option<Arc<aster_runtime::MemoryGovernor>>,
         foreign_registry: &Arc<aster_runtime::ForeignRegistry>,
+        program: Option<Arc<SharedProgram>>,
     ) -> Result<Self, BackendError> {
         let pool = ExecutionPool::new_with_foreign_registry(
             Arc::clone(module),
             worker_count,
             Arc::clone(foreign_registry),
         )?;
+        if let Some(program) = program {
+            pool.adopt_program(program);
+        }
         let driver = module_uses_async(module)
-            .then(|| PreparedProgram::prepare_with_foreign_registry(module, foreign_registry))
+            .then(|| pool.shared_program())
             .transpose()?;
         let task_worker_count = module_task_call_sites(module).min(worker_count).max(1);
         Ok(Self {
@@ -299,6 +338,7 @@ impl TaskRuntime {
             None,
             None,
             &Arc::new(aster_runtime::ForeignRegistry::new()),
+            None,
         )
     }
 
@@ -315,6 +355,7 @@ impl TaskRuntime {
             Some(governor),
             None,
             &Arc::new(aster_runtime::ForeignRegistry::new()),
+            None,
         )
     }
 
@@ -331,6 +372,7 @@ impl TaskRuntime {
             None,
             Some(governor),
             &Arc::new(aster_runtime::ForeignRegistry::new()),
+            None,
         )
     }
 
@@ -2512,6 +2554,23 @@ mod tests {
         assert!(runtime.async_load_slot(outer, 0).is_err());
         assert!(runtime.async_set_state(outer, 7).is_err());
         assert!(runtime.on_completion(99).is_err());
+    }
+
+    #[test]
+    fn async_driver_reuses_the_callers_program() {
+        let module = Arc::new(compile(
+            "public int Compute() { return 1; } public async Task<int> Run() { return await Task.Run(Compute); }",
+        ));
+        let program = SharedProgram::new(PreparedProgram::prepare(&module).expect("prepares"));
+        let runtime = TaskRuntime::with_program(
+            &module,
+            2,
+            &Arc::new(aster_runtime::ForeignRegistry::new()),
+            Arc::clone(&program),
+        )
+        .expect("runtime starts");
+        let driver = runtime.driver.as_ref().expect("async module has a driver");
+        assert!(Arc::ptr_eq(driver, &program));
     }
 
     #[test]

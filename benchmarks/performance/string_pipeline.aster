@@ -1,0 +1,28 @@
+// String pipeline: interpolate a record, scan its Unicode scalars, and build a
+// tagged copy. The single-source harness does not load `aster.text`, so split,
+// replace, and join are measured only once a project-mode harness exists.
+
+internal int Process(int index)
+{
+    string line = $"{index},{index * 2},name{index % 10}";
+    int separators = 0;
+    foreach (char scalar in line)
+    {
+        if (scalar == ',')
+        {
+            separators = separators + 1;
+        }
+    }
+    string tagged = "[" + line + "]";
+    return separators + tagged.Length;
+}
+
+public long Run()
+{
+    long total = 0L;
+    for (int index = 0; index < 20000; index++)
+    {
+        total = total + (long)Process(index);
+    }
+    return total;
+}

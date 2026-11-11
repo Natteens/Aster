@@ -9,6 +9,7 @@ description = "Typed mid-level intermediate representation for Aster"
 
 [dependencies]
 aster-hir = { path = "../aster-hir", version = "0.71.0" }
+aster-types = { path = "../aster-types", version = "0.71.0" }
 
 [lints]
 workspace = true

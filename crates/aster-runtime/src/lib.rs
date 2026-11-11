@@ -20,6 +20,8 @@ pub mod log;
 mod math;
 mod memory_governor;
 mod object;
+#[cfg(feature = "mem-exp-heap")]
+pub mod object_heap;
 pub mod registry;
 pub mod string;
 pub mod time;

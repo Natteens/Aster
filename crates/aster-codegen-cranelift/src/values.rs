@@ -556,58 +556,7 @@ pub(super) fn scalar_from_bits(
     })
 }
 
-pub(super) fn type_name(type_: &mir::Type) -> &'static str {
-    primitive(type_).map_or_else(
-        || match type_ {
-            mir::Type::Void => "void",
-            mir::Type::User(_) => "user type",
-            mir::Type::Class(_) => "class",
-            mir::Type::Interface(_) => "interface",
-            mir::Type::Enum(_) => "enum",
-            mir::Type::Array(_) => "array",
-            mir::Type::Task(_) => "task",
-            mir::Type::List(_) => "list",
-            mir::Type::Dictionary(_, _) => "dictionary",
-            mir::Type::Unknown => "unknown",
-            _ => unreachable!("every primitive MIR type has an aster-types adapter"),
-        },
-        Primitive::name,
-    )
-}
-
-/// The single adapter between MIR's resolved type representation and the
-/// backend-neutral primitive model. Cranelift-specific representation choices
-/// remain local to this crate.
-pub(super) fn primitive(type_: &mir::Type) -> Option<Primitive> {
-    Some(match type_ {
-        mir::Type::Bool => Primitive::Bool,
-        mir::Type::Char => Primitive::Char,
-        mir::Type::SByte => Primitive::SByte,
-        mir::Type::Byte => Primitive::Byte,
-        mir::Type::Short => Primitive::Short,
-        mir::Type::UShort => Primitive::UShort,
-        mir::Type::Int => Primitive::Int,
-        mir::Type::UInt => Primitive::UInt,
-        mir::Type::Long => Primitive::Long,
-        mir::Type::ULong => Primitive::ULong,
-        mir::Type::Float => Primitive::Float,
-        mir::Type::Double => Primitive::Double,
-        mir::Type::Decimal => Primitive::Decimal,
-        mir::Type::String => Primitive::String,
-        mir::Type::Void
-        | mir::Type::User(_)
-        | mir::Type::Class(_)
-        | mir::Type::Interface(_)
-        | mir::Type::Enum(_)
-        | mir::Type::Array(_)
-        | mir::Type::Task(_)
-        | mir::Type::List(_)
-        | mir::Type::Dictionary(_, _)
-        | mir::Type::Unknown => {
-            return None;
-        }
-    })
-}
+pub(super) use mir::{primitive, type_name};
 
 pub(super) fn is_aggregate(type_: &mir::Type) -> bool {
     matches!(

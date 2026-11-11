@@ -45,8 +45,8 @@ handles repeat the cached result, and `result[i]` always corresponds to `tasks[i
 Composition waits every relevant task to a terminal state. If tasks failed, the failure at the
 lowest input index is reported. Otherwise, if tasks were cancelled, the cancellation at the lowest
 input index is reported. Worker completion order never selects the public failure. The result array
-is allocated through the caller's `ExecutionContext` and `MemoryGovernor` only after every task
-succeeds, and is fully initialized before publication.
+is allocated through the caller's `ExecutionContext` (and its memory governor, when one is
+configured) only after every task succeeds, and is fully initialized before publication.
 
 ## Cooperative cancellation
 
@@ -94,8 +94,9 @@ complete in a different order, so programs cannot depend on worker scheduling or
 
 ## Isolation and deliberate limits
 
-Every worker has its own `ExecutionContext`, arenas, memory-governor domain, task-control view, and
-host-resource boundary. No ASTER object graph, collection backing, interface table, or owned-region
+Every worker has its own `ExecutionContext`, arenas, allocation limit, task-control view, and
+host-resource boundary. Default execution gives each worker context its own 1 GiB limit; a shared
+memory governor exists only in research configurations. No ASTER object graph, collection backing, interface table, or owned-region
 pointer crosses workers. Non-transferable values may be created and consumed entirely inside one
 worker when they do not escape or reach a prohibited operation.
 

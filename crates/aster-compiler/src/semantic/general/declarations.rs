@@ -172,7 +172,13 @@ pub(super) fn collect_declarations(
                     visibility: function.visibility,
                     is_static: true,
                     is_foreign: function.is_foreign,
-                    key: callable_key(&function.name, function.span.start, None, None),
+                    key: callable_key(
+                        &function.name,
+                        function.span.start,
+                        &function.parameters,
+                        None,
+                        None,
+                    ),
                 };
                 validate_foreign_declaration(function, &callable.signature, diagnostics);
                 let overloads = context.functions.entry(function.name.clone()).or_default();
@@ -328,6 +334,7 @@ fn collect_type_members(
                         key: callable_key(
                             &method.name,
                             method.span.start,
+                            &method.parameters,
                             None,
                             Some(&declaration.name),
                         ),
@@ -362,6 +369,7 @@ fn collect_type_members(
                     key: callable_key(
                         &method.name,
                         method.span.start,
+                        &method.parameters,
                         None,
                         Some(&declaration.name),
                     ),
@@ -444,6 +452,7 @@ fn collect_type_members(
                     key: callable_key(
                         &property.name,
                         property.span.start,
+                        &[],
                         Some(AccessorKind::Get),
                         Some(&declaration.name),
                     ),
@@ -461,6 +470,7 @@ fn collect_type_members(
                     key: callable_key(
                         &property.name,
                         property.span.start,
+                        &[],
                         Some(AccessorKind::Set),
                         Some(&declaration.name),
                     ),
@@ -921,7 +931,11 @@ fn validate_field_initializer(
         false,
         false,
         &HashSet::new(),
-        crate::semantic::field_context(owner, &field.name, field.span.start),
+        {
+            let context = crate::semantic::field_context(owner, &field.name);
+            model.register_expression(&context, initializer);
+            context
+        },
         model,
     );
     let expected = resolve_type_readonly(&field.type_ref, context);
@@ -993,7 +1007,11 @@ fn validate_function_with_initialized_fields(
         function.constructor,
         !function.is_static && owner.is_some(),
         initialized_fields,
-        crate::semantic::function_context(function, owner),
+        {
+            let context = crate::semantic::function_context(function, owner);
+            model.register_function(&context, function);
+            context
+        },
         model,
     );
     if function.is_async {
@@ -1068,7 +1086,11 @@ fn validate_parameter_defaults(
         false,
         false,
         &HashSet::new(),
-        crate::semantic::function_context(function, owner),
+        {
+            let context = crate::semantic::function_context(function, owner);
+            model.register_function(&context, function);
+            context
+        },
         model,
     );
     let generic_parameters = function

@@ -608,6 +608,8 @@ impl TaskCancellation {
 /// and strings can use `temporary_arena`. Both arenas are released in bulk
 /// when the context is dropped, while temporary scopes rewind on return.
 pub struct ExecutionContext {
+    #[cfg(feature = "mem-exp-heap")]
+    object_heap: crate::object_heap::ObjectHeap,
     arena: PagedArena,
     temporary_arena: PagedArena,
     /// Compiler-authorized fine-grained checkpoint nested inside the current
@@ -721,6 +723,8 @@ impl ExecutionContext {
             fine_temporary_subregion: None,
             temporary_scopes: Vec::new(),
             owned_regions: Vec::new(),
+            #[cfg(feature = "mem-exp-heap")]
+            object_heap: crate::object_heap::ObjectHeap::default(),
             allocation_limit_bytes,
             allocation_limit_kind: AllocationLimitKind::Execution,
             call_depth: 0,
@@ -3891,8 +3895,55 @@ impl ExecutionContext {
         }
     }
 
+    /// MEM-EXP-1 heap counters.
+    #[cfg(feature = "mem-exp-heap")]
+    #[must_use]
+    pub fn object_heap_stats(&self) -> crate::object_heap::ObjectHeapStats {
+        self.object_heap.stats
+    }
+
+    /// Drop one strong reference to `object` (MEM-EXP-1 stage C) and return
+    /// the number of objects released.
+    ///
+    /// # Safety
+    ///
+    /// See [`crate::object_heap::release`]: `object` and everything reachable
+    /// from it must be live counted or immortal objects of this context.
+    #[cfg(feature = "mem-exp-heap")]
+    #[allow(unsafe_code)]
+    pub unsafe fn release_object(&mut self, object: *mut u8) -> u64 {
+        // SAFETY: forwarded caller contract.
+        unsafe { crate::object_heap::release(&mut self.object_heap, object) }
+    }
+
+    /// Allocate one heap object (the generated-code path, for tests).
+    #[cfg(feature = "mem-exp-heap")]
+    #[must_use]
+    pub fn allocate_heap_object(&mut self, size: u32) -> *mut u8 {
+        self.allocate_object(size)
+    }
+
     pub(crate) fn allocate_object(&mut self, size: u32) -> *mut u8 {
         let bytes = usize::try_from(size.max(1)).unwrap_or(1);
+        #[cfg(feature = "mem-exp-heap")]
+        if let Some(class) = crate::object_heap::ObjectHeap::class_of(size.max(1)) {
+            // MEM-EXP-1 C4: a released block of the same class is reused;
+            // otherwise a fresh block of the class size comes from the
+            // Persistent arena. Owned-region rewinds must not run in a
+            // configuration that releases blocks (stage C disables them).
+            let pointer = if let Some(pointer) = self.object_heap.take_free(class) {
+                pointer
+            } else {
+                let class_bytes = crate::object_heap::SIZE_CLASSES[class] as usize;
+                let Some(pointer) = self.allocate_in_region(class_bytes, 8, false) else {
+                    return ptr::null_mut();
+                };
+                self.object_heap.stats.fresh_blocks += 1;
+                pointer
+            };
+            self.record_allocation(AllocationCategory::Object, bytes);
+            return pointer;
+        }
         let Some(pointer) = self.allocate_in_region(bytes, 8, false) else {
             return ptr::null_mut();
         };

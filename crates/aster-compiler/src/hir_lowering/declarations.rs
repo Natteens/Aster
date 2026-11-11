@@ -50,6 +50,7 @@ impl Lowerer<'_> {
                         crate::semantic::callable_key(
                             &function.name,
                             function.span.start,
+                            &function.parameters,
                             None,
                             None,
                         ),
@@ -169,6 +170,7 @@ impl Lowerer<'_> {
                         crate::semantic::callable_key(
                             &method.name,
                             method.span.start,
+                            &method.parameters,
                             None,
                             Some(&declaration.name),
                         ),
@@ -204,6 +206,7 @@ impl Lowerer<'_> {
             crate::semantic::callable_key(
                 &property.name,
                 property.span.start,
+                &[],
                 Some(kind),
                 Some(owner_name),
             ),
@@ -324,13 +327,28 @@ impl Lowerer<'_> {
         owner: Option<&ast::TypeDeclaration>,
         accessor: Option<crate::semantic::AccessorKind>,
     ) -> hir::Function {
-        let previous_model_context = std::mem::replace(
-            &mut self.model_context,
-            crate::semantic::function_context(function, owner),
-        );
+        let context = match (accessor, owner) {
+            (Some(kind), Some(owner)) => {
+                // A setter's property type is its `value` parameter.
+                let property_type = function
+                    .parameters
+                    .first()
+                    .map_or(&function.return_type.name, |parameter| {
+                        &parameter.type_ref.name
+                    });
+                crate::semantic::accessor_context(&owner.name, &function.name, kind, property_type)
+            }
+            _ => crate::semantic::function_context(function, owner),
+        };
+        let previous_model_context = std::mem::replace(&mut self.model_context, context);
         let symbol = self.callable_symbols[&crate::semantic::callable_key(
             &function.name,
             function.span.start,
+            if accessor.is_some() {
+                &[]
+            } else {
+                &function.parameters
+            },
             accessor,
             owner.map(|owner| owner.name.as_str()),
         )];
@@ -538,7 +556,7 @@ impl Lowerer<'_> {
     ) -> hir::Expression {
         let previous_context = std::mem::replace(
             &mut self.model_context,
-            crate::semantic::field_context(&owner.name, &field.name, field.span.start),
+            crate::semantic::field_context(&owner.name, &field.name),
         );
         let initializer = self.expression(initializer);
         self.model_context = previous_context;

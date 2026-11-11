@@ -214,10 +214,7 @@ impl<'a> Analyzer<'a> {
     }
 
     fn model_key(&self, span: Span) -> crate::semantic::ModelNodeKey {
-        crate::semantic::ModelNodeKey {
-            context: self.model_context.clone(),
-            span,
-        }
+        self.model.node_key(&self.model_context, span)
     }
 }
 

@@ -20,17 +20,52 @@ pub(crate) enum AccessorKind {
     Set,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// Identity of a callable declaration within one compilation: owner, name,
+/// parameter type spelling, and accessor kind. `declaration_start` is kept
+/// only to order candidates deterministically for diagnostics; it is not part
+/// of the identity, so the key does not change when the source moves.
+#[derive(Clone, Debug)]
 pub(crate) struct CallableKey {
     pub owner: Option<String>,
     pub declaration_start: usize,
     pub name: String,
+    pub signature: String,
     pub accessor: Option<AccessorKind>,
+}
+
+impl PartialEq for CallableKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner == other.owner
+            && self.name == other.name
+            && self.signature == other.signature
+            && self.accessor == other.accessor
+    }
+}
+
+impl Eq for CallableKey {}
+
+impl std::hash::Hash for CallableKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.owner.hash(state);
+        self.name.hash(state);
+        self.signature.hash(state);
+        self.accessor.hash(state);
+    }
+}
+
+/// Parameter type spelling that distinguishes overloads, e.g. `int,string`.
+pub(crate) fn parameter_signature(parameters: &[aster_syntax::Parameter]) -> String {
+    parameters
+        .iter()
+        .map(|parameter| parameter.type_ref.name.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub(crate) fn callable_key(
     name: &str,
     declaration_start: usize,
+    parameters: &[aster_syntax::Parameter],
     accessor: Option<AccessorKind>,
     owner: Option<&str>,
 ) -> CallableKey {
@@ -38,6 +73,7 @@ pub(crate) fn callable_key(
         owner: owner.map(str::to_owned),
         declaration_start,
         name: name.to_owned(),
+        signature: parameter_signature(parameters),
         accessor,
     }
 }
@@ -178,6 +214,14 @@ pub(crate) struct Model {
     /// switch expression. HIR lowering materializes this decision instead of
     /// independently repeating promotion or compatibility rules.
     pub switch_expression_types: HashMap<ModelNodeKey, String>,
+    /// Numeric type to which both operands of a binary expression are
+    /// converted before the operation (the promoted common type, or the
+    /// promoted left operand of a shift). Absent when no numeric conversion
+    /// applies. HIR lowering consumes this decision instead of repeating the
+    /// promotion rules.
+    pub binary_operand_types: HashMap<ModelNodeKey, String>,
+    /// Node ordinals per model context; see [`Model::node_key`].
+    pub node_indexes: HashMap<String, HashMap<Span, u32>>,
     /// Exact element type supplied by an explicit variable declaration for
     /// an otherwise untyped empty array literal. This is deliberately narrow:
     /// ordinary expression inference remains one-way.
@@ -209,10 +253,136 @@ pub(crate) struct Model {
     pub format_primitives: HashSet<ModelNodeKey>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// A syntax node within one model context. `Ordinal` is the node's pre-order
+/// position among the indexed nodes of its context, so it does not change
+/// when whitespace or other declarations move. `Position` is the fallback for
+/// a node the index does not cover; it keeps lookups consistent but is not
+/// stable across edits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum NodeRef {
+    Ordinal(u32),
+    Position(Span),
+}
+
+/// Identity is `(context, node)`. `span` is the node's current source position,
+/// kept for diagnostics and deterministic report order only.
+#[derive(Clone, Debug)]
 pub(crate) struct ModelNodeKey {
     pub context: String,
+    pub node: NodeRef,
     pub span: Span,
+}
+
+impl PartialEq for ModelNodeKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.context == other.context && self.node == other.node
+    }
+}
+
+impl Eq for ModelNodeKey {}
+
+impl std::hash::Hash for ModelNodeKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.context.hash(state);
+        self.node.hash(state);
+    }
+}
+
+/// Pre-order ordinals of the expressions, statements, blocks, switch cases,
+/// and variable declarations of one context. A span shared by several nodes
+/// takes its first ordinal, so two nodes share an ordinal exactly when they
+/// share a span: the key equivalence of positional keys is preserved.
+#[derive(Default)]
+struct NodeIndexer {
+    ordinals: HashMap<Span, u32>,
+}
+
+impl NodeIndexer {
+    fn record(&mut self, span: Span) {
+        let next = u32::try_from(self.ordinals.len()).unwrap_or(u32::MAX);
+        self.ordinals.entry(span).or_insert(next);
+    }
+}
+
+impl aster_syntax::visit::AstVisitorMut for NodeIndexer {
+    fn visit_block_mut(&mut self, block: &mut aster_syntax::Block) {
+        self.record(block.span);
+        aster_syntax::visit::walk_block_mut(self, block);
+    }
+
+    fn visit_statement_mut(&mut self, statement: &mut aster_syntax::Statement) {
+        self.record(statement.span());
+        aster_syntax::visit::walk_statement_mut(self, statement);
+    }
+
+    fn visit_variable_declaration_mut(
+        &mut self,
+        declaration: &mut aster_syntax::VariableDeclaration,
+    ) {
+        self.record(declaration.span);
+        aster_syntax::visit::walk_variable_declaration_mut(self, declaration);
+    }
+
+    fn visit_switch_case_mut(&mut self, case: &mut aster_syntax::SwitchCase) {
+        self.record(case.span);
+        aster_syntax::visit::walk_switch_case_mut(self, case);
+    }
+
+    fn visit_switch_expression_case_mut(&mut self, case: &mut aster_syntax::SwitchExpressionCase) {
+        self.record(case.span);
+        aster_syntax::visit::walk_switch_expression_case_mut(self, case);
+    }
+
+    fn visit_expression_mut(&mut self, expression: &mut aster_syntax::Expression) {
+        self.record(expression.span);
+        aster_syntax::visit::walk_expression_mut(self, expression);
+    }
+}
+
+impl Model {
+    /// Index the nodes of a function body (and parameter defaults) under
+    /// `context`. Semantic analysis registers every context it analyzes.
+    pub(crate) fn register_function(
+        &mut self,
+        context: &str,
+        function: &aster_syntax::FunctionDeclaration,
+    ) {
+        let mut indexer = NodeIndexer::default();
+        let mut copy = function.clone();
+        aster_syntax::visit::AstVisitorMut::visit_function_declaration_mut(&mut indexer, &mut copy);
+        self.node_indexes
+            .insert(context.to_owned(), indexer.ordinals);
+    }
+
+    /// Index the nodes of one expression (a field initializer) under `context`.
+    pub(crate) fn register_expression(
+        &mut self,
+        context: &str,
+        expression: &aster_syntax::Expression,
+    ) {
+        let mut indexer = NodeIndexer::default();
+        let mut copy = expression.clone();
+        aster_syntax::visit::AstVisitorMut::visit_expression_mut(&mut indexer, &mut copy);
+        self.node_indexes
+            .insert(context.to_owned(), indexer.ordinals);
+    }
+
+    /// The single constructor of model keys, used by semantic analysis and
+    /// HIR lowering alike.
+    pub(crate) fn node_key(&self, context: &str, span: Span) -> ModelNodeKey {
+        let node = self
+            .node_indexes
+            .get(context)
+            .and_then(|ordinals| ordinals.get(&span))
+            .map_or(NodeRef::Position(span), |ordinal| {
+                NodeRef::Ordinal(*ordinal)
+            });
+        ModelNodeKey {
+            context: context.to_owned(),
+            node,
+            span,
+        }
+    }
 }
 
 pub(crate) fn function_context(
@@ -220,15 +390,30 @@ pub(crate) fn function_context(
     owner: Option<&aster_syntax::TypeDeclaration>,
 ) -> String {
     format!(
-        "{}::{}@{}",
+        "{}::{}({})",
         owner.map_or("#module", |owner| owner.name.as_str()),
         function.name,
-        function.span.start
+        parameter_signature(&function.parameters)
     )
 }
 
-pub(crate) fn field_context(owner: &str, field: &str, start: usize) -> String {
-    format!("{owner}::#field:{field}@{start}")
+/// Model context of a property accessor body. Equals [`function_context`] of
+/// the `get_`/`set_` function that `validate_property` synthesizes for it, so
+/// HIR lowering finds every decision semantic analysis recorded in the body.
+pub(crate) fn accessor_context(
+    owner: &str,
+    property: &str,
+    kind: AccessorKind,
+    property_type: &str,
+) -> String {
+    match kind {
+        AccessorKind::Get => format!("{owner}::get_{property}()"),
+        AccessorKind::Set => format!("{owner}::set_{property}({property_type})"),
+    }
+}
+
+pub(crate) fn field_context(owner: &str, field: &str) -> String {
+    format!("{owner}::#field:{field}")
 }
 
 pub(super) fn validate(module: &Module) -> (Vec<Diagnostic>, Model) {
@@ -379,5 +564,297 @@ fn item_name(item: &Item) -> (&str, Span) {
         Item::Enum(item) => (&item.name, item.span),
         Item::Function(item) => (&item.name, item.span),
         Item::Variable(item) => (&item.name, item.span),
+    }
+}
+
+#[cfg(test)]
+impl Model {
+    /// Every key of every decision table, with the values that are plain
+    /// type or callable names. Positions are excluded by construction.
+    pub(crate) fn key_fingerprint(&self) -> Vec<String> {
+        fn key(table: &str, key: &ModelNodeKey) -> String {
+            format!("{table} {} {:?}", key.context, key.node)
+        }
+        fn callable(key: &CallableKey) -> String {
+            format!(
+                "{:?}::{:?}({}) {:?}",
+                key.owner, key.name, key.signature, key.accessor
+            )
+        }
+        let mut out = Vec::new();
+        macro_rules! keys {
+            ($($field:ident),*) => {
+                $(for k in self.$field.keys() { out.push(key(stringify!($field), k)); })*
+            };
+        }
+        macro_rules! members {
+            ($($field:ident),*) => {
+                $(for k in &self.$field { out.push(key(stringify!($field), k)); })*
+            };
+        }
+        keys!(
+            calls,
+            call_arguments,
+            property_assignments,
+            enum_values,
+            task_runs,
+            parallel_for,
+            parallel_for_each,
+            parallel_reduce,
+            switch_cases,
+            propagations,
+            string_operations,
+            dictionary_operations,
+            string_builder_operations
+        );
+        members!(
+            foreign_calls,
+            list_indexes,
+            zero_length_new_arrays,
+            string_builder_constructions,
+            format_primitives
+        );
+        for (k, v) in &self.calls {
+            out.push(format!(
+                "{} -> {}",
+                key("call target", k),
+                callable(&v.callable)
+            ));
+        }
+        for (k, v) in &self.constructors {
+            out.push(format!("{} -> {}", key("constructors", k), callable(v)));
+        }
+        for (k, v) in &self.property_reads {
+            out.push(format!("{} -> {}", key("property_reads", k), callable(v)));
+        }
+        for (table, map) in [
+            ("switch_expression_types", &self.switch_expression_types),
+            ("binary_operand_types", &self.binary_operand_types),
+            (
+                "contextual_empty_array_elements",
+                &self.contextual_empty_array_elements,
+            ),
+            ("contextual_new_types", &self.contextual_new_types),
+        ] {
+            for (k, v) in map {
+                out.push(format!("{} -> {v}", key(table, k)));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    pub(crate) fn position_fallbacks(&self) -> usize {
+        self.key_fingerprint()
+            .iter()
+            .filter(|line| line.contains("Position("))
+            .count()
+    }
+}
+
+#[cfg(test)]
+mod structural_identity_tests {
+    use super::Model;
+
+    fn model_of(source: &str) -> Model {
+        let tokens = aster_syntax::lex(source).expect("lexes");
+        let mut module = aster_syntax::parse(tokens).expect("parses");
+        assert_eq!(super::validate_deferred_language_surfaces(&mut module), []);
+        crate::synthesize_default_constructors(&mut module);
+        assert_eq!(crate::generics::monomorphize(&mut module), []);
+        let (diagnostics, model) = super::validate(&module);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| d.severity != aster_diagnostics::Severity::Error),
+            "{diagnostics:?}"
+        );
+        model
+    }
+
+    const ORIGINAL: &str = r#"
+public enum Shape { Circle(int radius), Square(int side) }
+
+public class Box<T>
+{
+    private T item;
+    public Box(T item) { this.item = item; }
+    public T Get() { return item; }
+}
+
+public class Meter
+{
+    private int total = 1 + 2;
+    private byte small;
+    public int Total
+    {
+        get { return total + small; }
+        set { total = value * 2; }
+    }
+    public int Add(int value) { total += value; return total; }
+    public long Add(long value) { return (long)total + value; }
+}
+
+public int Square(int value) { return value * value; }
+
+public int Area(Shape shape)
+{
+    switch (shape)
+    {
+        case Circle(radius):
+            return radius * radius * 3;
+        case Square(side):
+            return side * side;
+    }
+}
+
+public int Run()
+{
+    Box<int> ints = new Box<int>(4);
+    Box<string> words = new Box<string>("ab");
+    Meter meter = new Meter();
+    meter.Total = 3;
+    meter.Add(2);
+    long wide = meter.Add(5L);
+    List<int> values = new List<int>();
+    values.Add(ints.Get());
+    values[0] += 1;
+    Task<int> task = Task.Run(Square, 6);
+    string text = $"{values[0]}:{words.Get().Length}";
+    return Area(Shape.Circle(2)) + meter.Total + task.Wait() + text.Length + (int)wide;
+}
+"#;
+
+    /// Same declarations: different whitespace, comments, a new unrelated
+    /// function first, and `Square`/`Area` swapped.
+    const MOVED: &str = r#"
+// a leading comment shifts every position
+public int Unrelated() { return 0; }
+
+public enum Shape { Circle(int radius),    Square(int side) }
+
+public class Box<T>
+{
+
+    private T item;
+    public Box(T item)
+    {
+        this.item = item;
+    }
+    public T Get() {   return item;   }
+}
+
+public class Meter
+{
+    private int total = 1   +   2;
+    private byte small;
+    public int Total
+    {
+        get
+        {
+            return total + small;
+        }
+        set { total = value * 2; }
+    }
+    public int Add(int value) { total += value;
+        return total; }
+    public long Add(long value) { return (long)total + value; }
+}
+
+public int Area(Shape shape)
+{
+    switch (shape)
+    {
+        case Circle(radius):
+            return radius * radius * 3;
+        case Square(side):
+            return side * side;
+    }
+}
+
+public int Square(int value) {
+    return value * value;
+}
+
+public int Run()
+{
+    Box<int> ints = new Box<int>(4);
+    Box<string> words = new Box<string>("ab");
+    Meter meter = new Meter();
+    meter.Total = 3;
+    meter.Add(2);
+    long wide = meter.Add(5L);
+    List<int> values = new List<int>();
+    values.Add(ints.Get());
+    values[0] += 1;
+    Task<int> task = Task.Run(Square, 6);
+    string text = $"{values[0]}:{words.Get().Length}";
+    return Area(Shape.Circle(2))  +  meter.Total + task.Wait() + text.Length + (int)wide;
+}
+"#;
+
+    #[test]
+    fn every_key_survives_whitespace_comment_and_position_edits() {
+        let original = model_of(ORIGINAL);
+        let moved = model_of(MOVED);
+        assert_eq!(
+            original.position_fallbacks(),
+            0,
+            "{:#?}",
+            original.key_fingerprint()
+        );
+        let unrelated: Vec<_> = moved
+            .key_fingerprint()
+            .into_iter()
+            .filter(|line| !line.contains("::Unrelated("))
+            .collect();
+        assert_eq!(original.key_fingerprint(), unrelated);
+    }
+
+    #[test]
+    fn the_fingerprint_covers_generics_overloads_properties_and_calls() {
+        let fingerprint = model_of(ORIGINAL).key_fingerprint().join("\n");
+        for expected in [
+            "Box<int>",
+            "Box<string>",
+            "\"Add\"(int)",
+            "\"Add\"(long)",
+            "Some(Get)",
+            "property_assignments",
+            "::get_Total()",
+            "::set_Total(int)",
+            "#field:total",
+            "task_runs",
+            "switch_cases",
+            "list_indexes",
+        ] {
+            assert!(
+                fingerprint.contains(expected),
+                "missing `{expected}` in\n{fingerprint}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_structural_body_edit_changes_only_the_edited_context() {
+        let edited = ORIGINAL.replace(
+            "public int Square(int value) { return value * value; }",
+            "public int Square(int value) { int doubled = value + value; return value * value; }",
+        );
+        let original = model_of(ORIGINAL).key_fingerprint();
+        let changed = model_of(&edited).key_fingerprint();
+        assert_ne!(original, changed);
+        let outside: Vec<_> = original
+            .iter()
+            .filter(|line| !line.contains("#module::Square("))
+            .collect();
+        let outside_changed: Vec<_> = changed
+            .iter()
+            .filter(|line| !line.contains("#module::Square("))
+            .collect();
+        assert_eq!(
+            outside, outside_changed,
+            "keys outside the edited body must not move"
+        );
     }
 }

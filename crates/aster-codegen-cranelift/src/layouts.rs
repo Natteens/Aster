@@ -18,7 +18,27 @@ pub(super) struct TaskArgumentLayout {
     pub(super) size: u32,
 }
 
+#[cfg(any(
+    all(feature = "mem-exp-h8", feature = "mem-exp-h12"),
+    all(feature = "mem-exp-h8", feature = "mem-exp-h16"),
+    all(feature = "mem-exp-h12", feature = "mem-exp-h16"),
+))]
+compile_error!("enable at most one MEM-EXP-1 header feature");
+
+/// MEM-EXP-1 header configuration: bytes before a class object's first field.
+/// Zero (C0) is the production layout.
+pub(super) const OBJECT_HEADER_BYTES: u32 = if cfg!(feature = "mem-exp-h16") {
+    16
+} else if cfg!(feature = "mem-exp-h12") {
+    12
+} else if cfg!(feature = "mem-exp-h8") {
+    8
+} else {
+    0
+};
+
 pub(super) struct Layouts {
+    classes: std::collections::HashSet<mir::SymbolId>,
     pub(super) pointer_bytes: u32,
     pub(super) structs: HashMap<mir::SymbolId, mir::StructDefinition>,
     pub(super) enums: HashMap<mir::SymbolId, mir::EnumDefinition>,
@@ -29,6 +49,7 @@ pub(super) struct Layouts {
 impl Layouts {
     pub(super) fn new(module: &mir::Module, pointer_bytes: u32) -> Result<Self, BackendError> {
         let mut layouts = Self {
+            classes: module.classes.iter().map(|class| class.symbol).collect(),
             pointer_bytes,
             structs: module
                 .structs
@@ -139,8 +160,13 @@ impl Layouts {
             BackendError::new(format!("user type {symbol:?} is not an executable struct"))
         })?;
         visiting.push(symbol);
-        let mut offset = 0_u32;
-        let mut alignment = 1_u32;
+        let header = if self.classes.contains(&symbol) {
+            OBJECT_HEADER_BYTES
+        } else {
+            0
+        };
+        let mut offset = header;
+        let mut alignment = if header == 0 { 1_u32 } else { 8 };
         for field in definition.fields {
             let field_layout = self.layout_of(&field.type_, visiting)?;
             let field_alignment = 1_u32 << field_layout.align_shift;
@@ -421,9 +447,13 @@ mod layout_tests {
             functions: Vec::new(),
         };
         let layouts = Layouts::new(&module, 8).expect("class layout");
-        assert_eq!(layouts.fields[&value].offset, 0);
-        assert_eq!(layouts.fields[&next].offset, 8);
-        assert_eq!(layouts.types[&class].size, 16);
+        // Exact per MEM-EXP-1 configuration: C0 (no header) 0/8/16, H8 8/16/24,
+        // H12 12/16/24, H16 16/24/32.
+        let header = super::OBJECT_HEADER_BYTES;
+        let next_offset = (header + 4).next_multiple_of(8);
+        assert_eq!(layouts.fields[&value].offset, header);
+        assert_eq!(layouts.fields[&next].offset, next_offset);
+        assert_eq!(layouts.types[&class].size, next_offset + 8);
     }
 
     fn empty_module() -> mir::Module {

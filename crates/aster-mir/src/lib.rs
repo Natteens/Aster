@@ -5,6 +5,8 @@
 
 use std::fmt;
 
+pub mod validate;
+
 pub use aster_hir::{
     DictionaryEntryLayout, DictionaryOptionLayout, FileIoResultLayout, SymbolId, Type, Visibility,
 };
@@ -1213,6 +1215,62 @@ pub fn type_key(type_: &Type) -> u64 {
     }
 
     walk(type_, FNV_OFFSET)
+}
+
+/// Source spelling of a MIR type category, for diagnostics.
+#[must_use]
+pub fn type_name(type_: &Type) -> &'static str {
+    primitive(type_).map_or_else(
+        || match type_ {
+            Type::Void => "void",
+            Type::User(_) => "user type",
+            Type::Class(_) => "class",
+            Type::Interface(_) => "interface",
+            Type::Enum(_) => "enum",
+            Type::Array(_) => "array",
+            Type::Task(_) => "task",
+            Type::List(_) => "list",
+            Type::Dictionary(_, _) => "dictionary",
+            Type::Unknown => "unknown",
+            _ => unreachable!("every primitive MIR type has an aster-types adapter"),
+        },
+        aster_types::Primitive::name,
+    )
+}
+
+/// The single adapter between MIR's resolved type representation and the
+/// backend-neutral primitive model. Backend representation choices stay in
+/// each backend.
+#[must_use]
+pub fn primitive(type_: &Type) -> Option<aster_types::Primitive> {
+    Some(match type_ {
+        Type::Bool => aster_types::Primitive::Bool,
+        Type::Char => aster_types::Primitive::Char,
+        Type::SByte => aster_types::Primitive::SByte,
+        Type::Byte => aster_types::Primitive::Byte,
+        Type::Short => aster_types::Primitive::Short,
+        Type::UShort => aster_types::Primitive::UShort,
+        Type::Int => aster_types::Primitive::Int,
+        Type::UInt => aster_types::Primitive::UInt,
+        Type::Long => aster_types::Primitive::Long,
+        Type::ULong => aster_types::Primitive::ULong,
+        Type::Float => aster_types::Primitive::Float,
+        Type::Double => aster_types::Primitive::Double,
+        Type::Decimal => aster_types::Primitive::Decimal,
+        Type::String => aster_types::Primitive::String,
+        Type::Void
+        | Type::User(_)
+        | Type::Class(_)
+        | Type::Interface(_)
+        | Type::Enum(_)
+        | Type::Array(_)
+        | Type::Task(_)
+        | Type::List(_)
+        | Type::Dictionary(_, _)
+        | Type::Unknown => {
+            return None;
+        }
+    })
 }
 
 #[cfg(test)]

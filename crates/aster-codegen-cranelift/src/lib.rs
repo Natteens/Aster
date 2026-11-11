@@ -198,11 +198,23 @@ impl fmt::Display for BackendError {
 
 impl Error for BackendError {}
 
+impl From<mir::validate::ValidationError> for BackendError {
+    fn from(error: mir::validate::ValidationError) -> Self {
+        match error {
+            mir::validate::ValidationError::Invalid(message)
+            | mir::validate::ValidationError::Rejected(message) => Self::new(message),
+            mir::validate::ValidationError::Unsupported { function, feature } => Self::new(
+                format!("Cranelift JIT does not yet support {feature} in function `{function}`"),
+            ),
+        }
+    }
+}
+
 /// One validated module prepared once for sequential root-package tests.
 /// Machine code is reused, but every invocation receives an independent
 /// execution context and caller-owned console backend.
 pub struct PreparedTestProgram {
-    program: execution::PreparedProgram,
+    program: std::sync::Arc<execution::SharedProgram>,
     module: std::sync::Arc<mir::Module>,
     uses_tasks: bool,
 }
@@ -230,7 +242,7 @@ impl PreparedTestProgram {
                 ));
             }
         }
-        let program = execution::PreparedProgram::prepare(module)?;
+        let program = execution::SharedProgram::new(execution::PreparedProgram::prepare(module)?);
         Ok(Self {
             program,
             module: std::sync::Arc::new(module.clone()),
@@ -257,7 +269,12 @@ impl PreparedTestProgram {
             .then(|| {
                 let workers =
                     std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-                task_runtime::TaskRuntime::new(&self.module, workers)
+                task_runtime::TaskRuntime::with_program(
+                    &self.module,
+                    workers,
+                    &std::sync::Arc::new(aster_runtime::ForeignRegistry::new()),
+                    std::sync::Arc::clone(&self.program),
+                )
             })
             .transpose()?;
         let task_runtime = task_runtime
@@ -474,6 +491,28 @@ pub fn execute_with_stats(
     validate_module(module)?;
     let entry = select_entry(module, function_name)?;
     execute_resolved(module, entry, true, None, None)
+}
+
+/// Execute one entry with memory statistics on an explicit number of task
+/// workers instead of `available_parallelism()`. Benchmark seam only: the
+/// language and CLI expose no worker count.
+///
+/// # Errors
+///
+/// Returns an error for a zero worker count, and otherwise the same controlled
+/// validation, preparation, and runtime errors as [`execute_with_stats`].
+#[doc(hidden)]
+pub fn execute_with_worker_count(
+    module: &mir::Module,
+    function_name: &str,
+    worker_count: usize,
+) -> Result<(ExecutionValue, MemoryStats), BackendError> {
+    if worker_count == 0 {
+        return Err(BackendError::new("worker count must be at least 1"));
+    }
+    validate_module(module)?;
+    let entry = select_entry(module, function_name)?;
+    execution::execute_resolved_with_worker_count(module, entry, worker_count)
 }
 
 /// Execute one entry with the opt-in experimental AARM allocator telemetry.

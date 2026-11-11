@@ -72,6 +72,13 @@ overload, and callable identity resolution. A foreign call is accepted only insi
 After validation succeeds, the compiler lowers general-language AST nodes to typed HIR and then lowers
 HIR to control-flow-explicit MIR.
 
+Semantic analysis also records the numeric operand type of every binary expression (the promoted
+common type, or the promoted left operand of a shift). HIR lowering converts both operands to that
+recorded type and derives the result from it instead of re-applying the promotion table; debug
+builds assert that the recorded type equals the table's answer for every compiled program. Property
+accessor bodies are looked up under the same model context semantic analysis used for them, so
+every decision recorded inside a getter or setter reaches HIR.
+
 After the narrow loop-concat representation rewrite, one general MIR optimizer simplifies the
 already-typed control and scalar data flow. Its fixed, deterministic cycle propagates exact primitive
 constants and direct scalar copies, folds constant primitive operations, converts known branches to
@@ -100,6 +107,19 @@ as a fully typed `PropagateResult` node. MIR reuses the same tag test, payload p
 construction, and return machinery to evaluate the operand once, continue on `Ok`, and early-return
 the enclosing `Result`'s `Error` — so Cranelift sees only concrete branches and enum data
 (`docs/reference/result-propagation.md`).
+
+### Semantic model identity (internal)
+
+Semantic analysis records its decisions in side tables that HIR lowering consumes. Their keys are
+structural. A model context names a function by owner, name, and parameter type spelling (an
+accessor as `get_`/`set_` plus the property, a field initializer by owner and field), so overloads
+and generic specializations have distinct contexts and none depends on a source position. Within a
+context a node is identified by its pre-order ordinal among the context's expressions, statements,
+blocks, switch cases, and variable declarations; semantic analysis registers that index for every
+context it analyzes and HIR lowering obtains every key from the same constructor. A node shares an
+ordinal with another exactly when the two share a source span, so lookups behave as the earlier
+span keys did. Keys still carry the node's span, outside their identity, for diagnostics and report
+order. Editing whitespace, comments, or the position or order of declarations changes no key.
 
 ### Source declaration identity (internal)
 
@@ -134,6 +154,21 @@ fallthrough from `void` functions.
 `if`/`else`, `while`, `for`, and `switch` no longer exist as structured MIR nodes. Their behavior is expressed as
 edges between basic blocks. MIR remains backend-independent: it does not select machine instructions,
 define an ABI, invoke Cranelift, or execute programs.
+
+`aster_mir::validate` holds the backend-neutral checks: the nominal type index (unique type,
+field, and enum-case symbols); the typing of every instruction, rvalue, operand, place, and
+constant; and, in `validate::executable`, interface metadata, CFG structure (unique blocks, an
+existing entry, declared terminator targets), enum and struct construction shapes, worker
+host-operation reachability, and fine Temporary subregion and owned-region executability.
+Outcomes distinguish invalid MIR, a well-formed construct no backend supports yet, and a
+policy rejection (a host operation reachable from a worker).
+
+Debug builds of the compiler run the checks that apply at each phase after every MIR pass: typing,
+interface metadata, CFG, shapes, and worker reachability from MIR lowering on; subregion
+executability from the AARM pass on; owned-region executability after owned-region lowering. A
+pass that produces invalid or non-executable MIR stops compilation and names the pass; policy
+rejections are left to the backend. Release builds skip the per-pass checks. Backends run the same
+checks before code generation and keep their own checks for what they can lower.
 
 MIR has a typed foreign-declaration table and an opaque, effectful `ForeignCall` instruction. It
 contains no raw pointer, Cranelift signature, library path, or dynamic symbol name.
@@ -172,7 +207,10 @@ calls with an explicit object receiver. An interface value is two pointer-sized 
 object reference and a pointer to a read-only method table owned by the JIT module. Interface calls
 load the concrete function from that table and use the checked ASTER calling convention. The backend
 frees each JIT session after
-its result is copied out. The JIT module remains alive during the call.
+its result is copied out. The JIT module remains alive during the call. An execution that uses
+tasks compiles its module once: the main thread's finalized program is shared, through reference
+counting, with the async driver and every worker thread, and its JIT memory is freed when the last
+holder releases it, after the pool has joined its workers.
 
 Semantic analysis owns overload selection and records a stable callable identity for every call.
 HIR receives an already resolved static, instance, interface, constructor, getter, or setter target;

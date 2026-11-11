@@ -1750,6 +1750,19 @@ impl Codegen {
         let call = builder.ins().call(function_ref, &[context, size]);
         let object = builder.inst_results(call)[0];
         self.continue_if_runtime_ok(builder, state)?;
+        if super::layouts::OBJECT_HEADER_BYTES != 0 {
+            // MEM-EXP-1: the allocation sequence writes a non-zero
+            // descriptor word, standing in for the B1 descriptor pointer.
+            let descriptor = builder
+                .ins()
+                .iconst(types::I64, i64::from(class.0) | (1_i64 << 62));
+            builder.ins().store(
+                cranelift_codegen::ir::MemFlags::trusted(),
+                descriptor,
+                object,
+                0,
+            );
+        }
         self.store_scalar(builder, destination, object, state)
     }
 

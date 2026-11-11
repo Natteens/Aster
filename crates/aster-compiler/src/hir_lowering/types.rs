@@ -203,10 +203,12 @@ pub(super) fn unary_promoted(type_: &hir::Type) -> Option<hir::Type> {
     primitives::promote_unary(primitives::of_hir(type_)?).map(primitives::to_hir)
 }
 
+/// Result type of a binary expression whose operand type semantic analysis
+/// already selected (`operand`, absent when no numeric conversion applies).
 pub(super) fn binary_type(
     operator: ast::BinaryOperator,
+    operand: Option<&hir::Type>,
     left: &hir::Type,
-    right: &hir::Type,
 ) -> hir::Type {
     use ast::BinaryOperator::{
         Equal, Greater, GreaterEqual, Less, LessEqual, LogicalAnd, LogicalOr, NotEqual,
@@ -217,7 +219,5 @@ pub(super) fn binary_type(
     ) {
         return hir::Type::Bool;
     }
-    // Equal operand types still go through the central table: two equal small
-    // integers promote to `int`.
-    promoted(left, right).unwrap_or_else(|| left.clone())
+    operand.unwrap_or(left).clone()
 }

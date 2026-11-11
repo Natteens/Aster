@@ -41,7 +41,7 @@ pub(super) fn lower(module: &hir::Module) -> mir::Module {
                     .collect(),
             })
         })
-        .collect();
+        .collect::<Vec<_>>();
     let classes = module
         .items
         .iter()
@@ -145,6 +145,7 @@ pub(super) fn lower(module: &hir::Module) -> mir::Module {
             hir::Item::Interface(_) | hir::Item::Enum(_) | hir::Item::Variable(_) => {}
         }
     }
+    order_struct_aggregates(&mut functions, &structs);
     mir::Module {
         structs,
         classes,
@@ -254,5 +255,42 @@ fn push_function(
             FunctionLowerer::new(function, intrinsics.clone(), Arc::clone(enum_cases))
                 .lower(function, owner),
         );
+    }
+}
+
+/// A struct literal's fields are lowered in source order so their
+/// expressions keep left-to-right evaluation; MIR's `Aggregate` contract is
+/// declaration order. The operands are already evaluated when the `Aggregate`
+/// runs, so permuting them changes no evaluation order (the same rule enum
+/// payloads follow).
+fn order_struct_aggregates(functions: &mut [mir::Function], structs: &[mir::StructDefinition]) {
+    let order = structs
+        .iter()
+        .map(|definition| {
+            let positions = definition
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(position, field)| (field.symbol, position))
+                .collect::<HashMap<_, _>>();
+            (definition.symbol, positions)
+        })
+        .collect::<HashMap<_, _>>();
+    for function in functions {
+        for block in &mut function.blocks {
+            for instruction in &mut block.instructions {
+                let mir::Instruction::Assign { value, .. } = instruction else {
+                    continue;
+                };
+                let (mir::Type::User(symbol), mir::RvalueKind::Aggregate(fields)) =
+                    (&value.type_, &mut value.kind)
+                else {
+                    continue;
+                };
+                if let Some(positions) = order.get(symbol) {
+                    fields.sort_by_key(|field| positions.get(&field.field).copied());
+                }
+            }
+        }
     }
 }

@@ -71,6 +71,7 @@ pub struct Workload {
     pub expected: i64,
 }
 
+#[allow(clippy::too_many_lines, reason = "one literal table of workloads")]
 pub fn workloads() -> Vec<Workload> {
     vec![
         Workload {
@@ -115,7 +116,120 @@ pub fn workloads() -> Vec<Workload> {
             entry: "Run",
             expected: 4_200_000,
         },
+        Workload {
+            name: "longrun_frame",
+            category: "long_running",
+            source: include_str!("../../../benchmarks/performance/longrun_frame.aster"),
+            entry: "Run",
+            expected: 16_351_259,
+        },
+        Workload {
+            name: "longrun_request",
+            category: "long_running",
+            source: include_str!("../../../benchmarks/performance/longrun_request.aster"),
+            entry: "Run",
+            expected: 45_498_889,
+        },
+        Workload {
+            name: "cache_churn",
+            category: "long_running",
+            source: include_str!("../../../benchmarks/performance/cache_churn.aster"),
+            entry: "Run",
+            expected: 9_703_250,
+        },
+        Workload {
+            name: "object_graph",
+            category: "objects",
+            source: include_str!("../../../benchmarks/performance/object_graph.aster"),
+            entry: "Run",
+            expected: 184_230,
+        },
+        Workload {
+            name: "accessor_heavy",
+            category: "objects",
+            source: include_str!("../../../benchmarks/performance/accessor_heavy.aster"),
+            entry: "Run",
+            expected: 2_508_936_383,
+        },
+        Workload {
+            name: "interface_dispatch",
+            category: "objects",
+            source: include_str!("../../../benchmarks/performance/interface_dispatch.aster"),
+            entry: "Run",
+            expected: 7_025_000,
+        },
+        Workload {
+            name: "collection_growth",
+            category: "collections",
+            source: include_str!("../../../benchmarks/performance/collection_growth.aster"),
+            entry: "Run",
+            expected: 56_269,
+        },
+        Workload {
+            name: "string_pipeline",
+            category: "strings",
+            source: include_str!("../../../benchmarks/performance/string_pipeline.aster"),
+            entry: "Run",
+            expected: 403_335,
+        },
+        generated_frontend_workload(),
     ]
+}
+
+/// Number of generated units in the `frontend_generated` workload. Each unit is
+/// one class with a constructor and a method plus one free function, so the
+/// source has about 33 lines per unit.
+pub const GENERATED_UNITS: usize = 400;
+
+/// Deterministic generated program for front-end and code-generation cost.
+///
+/// Returns the source and its checksum. The checksum is computed here from the
+/// same arithmetic the generated ASTER code performs, independently of the
+/// compiler: for unit `n` with `input = n % 17`, `total = n + 6 * input`, then
+/// halved when even or incremented when odd, then reduced modulo 1000.
+///
+/// # Panics
+///
+/// Panics if `units` does not fit in an `i64`.
+pub fn generate_large_program(units: usize) -> (String, i64) {
+    let mut source = String::new();
+    let mut expected = 0_i64;
+    for unit in 0..units {
+        let _ = write!(
+            source,
+            "public class Unit{unit}\n{{\n    private int seed;\n\n    public Unit{unit}(int seed)\n    {{\n        this.seed = seed;\n    }}\n\n    public int Value(int input)\n    {{\n        int total = seed;\n        for (int step = 0; step < 3; step++)\n        {{\n            total = total + input * (step + 1);\n        }}\n        if (total % 2 == 0)\n        {{\n            total = total / 2;\n        }}\n        else\n        {{\n            total = total + 1;\n        }}\n        return total % 1000;\n    }}\n}}\n\ninternal int Call{unit}(int input)\n{{\n    Unit{unit} unit = new Unit{unit}({unit});\n    return unit.Value(input);\n}}\n\n"
+        );
+        let n = i64::try_from(unit).expect("unit count fits i64");
+        let input = n % 17;
+        let mut total = n + 6 * input;
+        total = if total % 2 == 0 { total / 2 } else { total + 1 };
+        expected += total % 1000;
+    }
+    source.push_str("public long Run()\n{\n    long total = 0L;\n");
+    for unit in 0..units {
+        let _ = writeln!(
+            source,
+            "    total = total + (long)Call{unit}({});",
+            unit % 17
+        );
+    }
+    source.push_str("    return total;\n}\n");
+    (source, expected)
+}
+
+fn generated_frontend_workload() -> Workload {
+    static GENERATED: std::sync::OnceLock<(&'static str, i64)> = std::sync::OnceLock::new();
+    let (source, expected) = *GENERATED.get_or_init(|| {
+        let (source, expected) = generate_large_program(GENERATED_UNITS);
+        (Box::leak(source.into_boxed_str()), expected)
+    });
+    Workload {
+        name: "frontend_generated",
+        category: "frontend",
+        source,
+        entry: "Run",
+        expected,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

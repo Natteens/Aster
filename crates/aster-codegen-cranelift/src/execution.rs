@@ -861,6 +861,47 @@ fn invoke_binary_scalar(
     Ok(result)
 }
 
+/// One finalized program shared by the main thread, the async driver, and
+/// every worker of an execution. The JIT memory is freed once, when the last
+/// holder drops its `Arc`.
+pub(super) struct SharedProgram(PreparedProgram);
+
+impl SharedProgram {
+    pub(super) fn new(program: PreparedProgram) -> Arc<Self> {
+        Arc::new(Self(program))
+    }
+}
+
+impl std::ops::Deref for SharedProgram {
+    type Target = PreparedProgram;
+
+    fn deref(&self) -> &PreparedProgram {
+        &self.0
+    }
+}
+
+// SAFETY (audited for T-CONC-2; see docs/proposals/architecture-2026/07-tasks.md):
+// - After `finalize_definitions`, nothing reads or writes the `JITModule`
+//   through `&PreparedProgram`: it is touched only in `prepare` and `Drop`
+//   (its `RefCell` symbol table is the reason it is not `Sync` itself).
+//   Every `&self` method reads only the immutable `entries`/`task_entries`
+//   maps, whose raw pointers are addresses of finalized code.
+// - cranelift-jit 0.123 makes code pages read+execute and read-only data
+//   pages read-only at finalization (with a multi-thread pipeline flush), and
+//   this backend declares data only through `declare_anonymous_data(false,
+//   false)`: no writable data and no thread-local storage exist.
+// - Every invocation creates its own `ExecutionContext`; runtime entry
+//   points share no mutable state except atomics.
+// - Cross-thread publication happens through `Arc` passed to `thread::spawn`,
+//   which orders the finalized writes before any use on the worker.
+// - Drop runs once, on whichever thread releases the last `Arc`, after every
+//   invocation through it has returned; pool shutdown joins every worker.
+#[allow(unsafe_code)]
+unsafe impl Send for SharedProgram {}
+// SAFETY: see `Send` above; shared access is read-only.
+#[allow(unsafe_code)]
+unsafe impl Sync for SharedProgram {}
+
 impl Drop for PreparedProgram {
     fn drop(&mut self) {
         let Some(jit) = self.jit.take() else {
@@ -900,8 +941,14 @@ pub(super) fn execute_resolved(
             filesystem_backend,
         );
     }
+    let prepared = SharedProgram::new(prepared);
     let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let mut runtime = TaskRuntime::new(&Arc::new(module.clone()), worker_count)?;
+    let mut runtime = TaskRuntime::with_program(
+        &Arc::new(module.clone()),
+        worker_count,
+        &Arc::new(aster_runtime::ForeignRegistry::new()),
+        Arc::clone(&prepared),
+    )?;
     // SAFETY-relevant only in spirit: this is a plain pointer value, not a
     // live borrow held across the call. `runtime` is not read or written by
     // name again until after `invoke` returns, so nothing aliases it while
@@ -918,6 +965,27 @@ pub(super) fn execute_resolved(
     )
 }
 
+pub(super) fn execute_resolved_with_worker_count(
+    module: &mir::Module,
+    entry: &mir::Function,
+    worker_count: usize,
+) -> Result<(ExecutionValue, super::MemoryStats), BackendError> {
+    let prepared = PreparedProgram::prepare(module)?;
+    if !module_uses_tasks(module) {
+        return prepared.invoke(entry.symbol, true, None, None, None);
+    }
+    let prepared = SharedProgram::new(prepared);
+    let mut runtime = TaskRuntime::with_program(
+        &Arc::new(module.clone()),
+        worker_count,
+        &Arc::new(aster_runtime::ForeignRegistry::new()),
+        Arc::clone(&prepared),
+    )?;
+    // Same pointer discipline as `execute_resolved`: `runtime` outlives the call.
+    let pointer = std::ptr::from_mut(&mut runtime).cast::<()>();
+    prepared.invoke(entry.symbol, true, Some(pointer), None, None)
+}
+
 pub(super) fn execute_resolved_with_foreign_registry(
     module: &mir::Module,
     entry: &mir::Function,
@@ -931,8 +999,13 @@ pub(super) fn execute_resolved_with_foreign_registry(
     let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let module = Arc::new(module.clone());
     let foreign_registry = Arc::new(registry.clone());
-    let mut runtime =
-        TaskRuntime::new_with_foreign_registry(&module, worker_count, &foreign_registry)?;
+    let prepared = SharedProgram::new(prepared);
+    let mut runtime = TaskRuntime::with_program(
+        &module,
+        worker_count,
+        &foreign_registry,
+        Arc::clone(&prepared),
+    )?;
     let pointer = std::ptr::from_mut(&mut runtime).cast::<()>();
     prepared.invoke(entry.symbol, collect_stats, Some(pointer), None, None)
 }

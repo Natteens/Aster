@@ -20,9 +20,57 @@ exists; the only backend change is a timing split inside preparation.
 | `calls_and_interfaces` | calls | static calls, interface dispatch, class state |
 | `generics` | generics | specialized generic function and `Box<T>` |
 | `allocation_mixed` | allocation | reuses `benchmarks/memory/persistent.aster` (object + array + string per iteration) |
+| `longrun_frame` | long_running | 64 entities updated per frame; expired entities replaced by new objects stored into a `List<Entity>` |
+| `longrun_request` | long_running | per-request object with a `List<int>` and an interpolated string, processed and dropped |
+| `cache_churn` | long_running | `Dictionary<int, int>` sliding window of 1,000 live keys: set, remove, lookup |
+| `object_graph` | objects | complete binary tree of class nodes (depth 10) built and summed recursively, 20 times |
+| `accessor_heavy` | objects | property getter and setter calls in a hot loop |
+| `interface_dispatch` | objects | three interface implementations in a `List<IShape>`, dispatched 300,000 times |
+| `collection_growth` | collections | `List<int>` grown to 1,024 and `Dictionary<int, int>` to 256 entries from empty, per round |
+| `string_pipeline` | strings | interpolation, scalar `foreach`, concatenation |
+| `frontend_generated` | frontend | deterministic generated program (`GENERATED_UNITS` = 400 classes and functions, about 13,000 lines); measures front end and code generation |
 
 Each `Run()` returns a checksum derived independently of ASTER; a wrong value
 fails the benchmark. Memory-specific measurement stays in `benchmarks/memory`.
+
+## Long-running memory facts (BENCH-001)
+
+`longrun_frame`, `longrun_request`, `cache_churn`, and `collection_growth` also expose `RunLong`,
+which performs ten times the iterations of `Run`. The test
+`crates/aster-codegen-cranelift/tests/bench_workload_memory.rs` runs both entries with memory
+statistics and checks independent checksums and deterministic statistics. Run it with
+`-- --nocapture` to print allocation counts and live, peak, and reserved bytes for the baseline
+procedure.
+
+Under the current region model every value these workloads stop using has escaped its function, so
+live bytes grow with the iteration count; the test records that as current behavior. It is the
+measurement the memory-model experiment (MEM-EXP-1 in `docs/proposals/architecture-2026/`) uses.
+
+Not covered by this suite, because the feature or the harness support does not exist yet: virtual
+dispatch, closures, general `async`, native FFI calls, AOT size and startup, and standard-library
+text helpers such as `String.Split` (this harness compiles one source string without the standard
+library). No workload in this directory stands in for them.
+
+## Concurrency baseline
+
+`perf_baseline` rejects `Task.Run`, so task and parallel workloads use a separate example:
+
+```console
+cargo run --release -p aster-codegen-cranelift --example concurrency_baseline
+cargo run --release -p aster-codegen-cranelift --example concurrency_baseline -- --workers 1,2,4,8 --samples 7
+```
+
+| Workload | Exercises |
+| --- | --- |
+| `task_swarm` | 20 rounds of 16 `Task.Run` workers with scalar arguments, joined by `Task.WaitAll` |
+| `parallel_scaling` | `Parallel.Reduce` over 200,000 `int` elements with per-element work and an associative combine |
+
+Each sample is one complete execution at an explicit worker count (main and worker JIT
+preparation, run, teardown) through the hidden `execute_with_worker_count` seam; phases are not
+separated. Checksums are independent of ASTER and must not depend on the worker count; the test
+`tests/concurrency_baseline.rs` checks that at 1, 2, and 4 workers. Medians are informative and
+comparable only on one machine. Suspended-task memory is not measurable with the current
+restricted `async`.
 
 ## Running
 
