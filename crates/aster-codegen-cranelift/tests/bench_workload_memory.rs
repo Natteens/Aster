@@ -105,6 +105,11 @@ fn memory_statistics_are_deterministic_across_runs() {
 #[test]
 fn live_memory_grows_with_iteration_count_under_the_current_region_model() {
     for workload in &WORKLOADS {
+        // MEM-EXP-1 C5/C6 counts `List<Entity>` elements: the replaced entities
+        // are released and their blocks reused, so this workload stays flat.
+        if cfg!(feature = "mem-exp-c5") && workload.name == "longrun_frame" {
+            continue;
+        }
         let short = run(workload, "Run").1.used_bytes;
         let long = run(workload, "RunLong").1.used_bytes;
         assert!(
@@ -114,6 +119,23 @@ fn live_memory_grows_with_iteration_count_under_the_current_region_model() {
             workload.name
         );
     }
+}
+
+/// MEM-EXP-1 long-running gate shape (closure §4.C), for the one workload whose
+/// discarded values are all counted in C5/C6.
+#[cfg(feature = "mem-exp-c5")]
+#[test]
+fn counted_frame_workload_stays_flat_between_n_and_ten_n() {
+    let workload = WORKLOADS
+        .iter()
+        .find(|workload| workload.name == "longrun_frame")
+        .expect("longrun_frame workload");
+    let short = run(workload, "Run").1.used_bytes;
+    let long = run(workload, "RunLong").1.used_bytes;
+    assert!(
+        long <= short + 64 * 1024,
+        "used {short} at N and {long} at 10N"
+    );
 }
 
 #[test]

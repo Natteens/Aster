@@ -687,13 +687,34 @@ counted. `longrun_frame` (4,103 fresh, 0 released) and `object_graph` (40,922 fr
 keep their objects in arrays or lists, whose references are never released in this increment. The
 long-running gate therefore cannot pass yet; this is a measured consequence, not a verdict.
 
+### T-MEM-EXP-1 stage C, `List<T>` element ownership (U8, first collection) — implemented (2026-11-11)
+
+Contract: §7 of [08-mem-exp-1-c5-design.md](08-mem-exp-1-c5-design.md). Lists with reference
+elements own one count per leaf; the runtime releases on `Set`, `RemoveAt`, `RemoveRange`, `Clear`
+and retains on `ToArray`, `GetRange`, `AddRange`, using a per-element-type descriptor set after
+`AllocateList`. The list header itself is still uncounted (its elements leak when it dies).
+Validator: list reads are borrowed until `ListSet`/`ListRemoveAt`/`ListClear` or any call; E3 does
+not apply to functions with those instructions.
+
+Gates: `aster-codegen-cranelift --all-targets` C0 1,443 and C4 1,443 passed, 0 failed; C5 and C6
+1,432 passed, 0 failed, 24 ignored (including 4 new end-to-end list tests and the new
+`counted_frame_workload_stays_flat_between_n_and_ten_n`); `aster-runtime` 337 (default) and 354
+(`mem-exp-rc`, including 8 `list_rc` tests); `aster-mir` 58; clippy and rustfmt clean.
+
+Measured (C6, debug, deterministic): `longrun_frame` used bytes 1,584 at N and 1,584 at 10N
+(peak 2,632), 40,759 objects released and 40,757 blocks reused at 10N: **the long-running gate
+shape holds for this workload**. `longrun_request` still grows (2,239,071 → 22,397,708: strings
+and arrays), `cache_churn` still grows (dictionary and strings), `object_graph` releases 20 of
+40,922 objects (children in `Node[]` arrays). Checksums identical in C5 and C6; executed count
+operations C6/C5 = 2,391,831 / 5,251,865 = 45.5%.
+
 Not done, so **no PASS for MEM-001 to MEM-003**:
 
-1. Collection and array element ownership (U8 glue) and counted strings and arrays: required for
-   the long-running gate (`longrun_frame`, `longrun_request`, `cache_churn`) and for peak memory.
+1. Counted arrays (header count, element release on drop) for `object_graph` and peak memory;
+   dictionary element glue and counted strings for `longrun_request` and `cache_churn`.
 2. Enum payload drop glue and closure environments (enums currently leak their references).
 3. Region reclamation together with counting (H2 pins); C5 and C6 currently lose it.
 4. Class B timing protocol (release builds, interleaved rounds) and the §4.C thresholds.
 
-Next action: item 1, starting with `List<T>` element glue for class elements (runtime release on
-overwrite, remove, clear) and array element release, then counted strings.
+Next action: item 1, counted arrays (array header with count word, element drop glue), then
+dictionary glue and counted strings.

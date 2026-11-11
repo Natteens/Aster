@@ -123,3 +123,64 @@ fn an_object_dropped_by_a_callee_frame_is_released() {
         stats.object_heap
     );
 }
+
+#[test]
+fn list_set_in_a_loop_releases_replaced_objects() {
+    let stats = run(
+        &format!(
+            "{NODE} public int Run() {{ List<Node> list = new List<Node>(); list.Add(Make(0));              for (int i = 1; i < 100; i += 1) {{ list[0] = Make(i); }}              return list[0].value; }}"
+        ),
+        99,
+    );
+    assert!(
+        stats.object_heap.released_blocks >= 99,
+        "replaced list elements were not released: {:?}",
+        stats.object_heap
+    );
+    assert!(
+        stats.object_heap.reused_blocks > 0,
+        "{:?}",
+        stats.object_heap
+    );
+}
+
+#[test]
+fn list_remove_at_and_clear_release_their_elements() {
+    let stats = run(
+        &format!(
+            "{NODE} public int Run() {{ int total = 0;              for (int round = 0; round < 20; round += 1) {{              List<Node> list = new List<Node>();              for (int i = 0; i < 5; i += 1) {{ list.Add(Make(i)); }}              list.RemoveAt(0); total += list[0].value;              list.Clear(); total += list.Length; }}              return total; }}"
+        ),
+        20,
+    );
+    // Each round allocates 5 nodes and releases all of them through the list.
+    assert!(
+        stats.object_heap.released_blocks >= 100,
+        "removed list elements were not released: {:?}",
+        stats.object_heap
+    );
+    assert!(
+        stats.object_heap.reused_blocks > 0,
+        "{:?}",
+        stats.object_heap
+    );
+}
+
+#[test]
+fn to_array_copy_survives_the_list_replacing_the_element() {
+    run(
+        &format!(
+            "{NODE} public int Run() {{ List<Node> list = new List<Node>(); list.Add(Make(41));              Node[] copy = list.ToArray();              list[0] = Make(1); Node scratch = Make(2);              return copy[0].value + list[0].value + scratch.value - 2; }}"
+        ),
+        42,
+    );
+}
+
+#[test]
+fn foreach_over_a_list_reads_every_element() {
+    run(
+        &format!(
+            "{NODE} public int Run() {{ List<Node> list = new List<Node>();              for (int i = 0; i < 10; i += 1) {{ list.Add(Make(i)); }}              int total = 0;              foreach (Node node in list) {{ total += node.value; Node other = Make(100); total += other.value - 100; }}              return total; }}"
+        ),
+        45,
+    );
+}

@@ -52,6 +52,9 @@ pub(super) struct ObjectDescriptors {
     )]
     descriptors: Vec<Box<aster_runtime::object_heap::ObjectDescriptor>>,
     by_class: HashMap<mir::SymbolId, *const aster_runtime::object_heap::ObjectDescriptor>,
+    /// Element descriptors of `List<T>` types with reference leaves, keyed by
+    /// `mir::type_key(T)` (design section 7).
+    by_list_element: HashMap<u64, *const aster_runtime::object_heap::ObjectDescriptor>,
 }
 
 #[cfg(feature = "mem-exp-c5")]
@@ -93,7 +96,47 @@ impl ObjectDescriptors {
             store.offsets.push(offsets);
             store.descriptors.push(descriptor);
         }
+        let element_types = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| match instruction {
+                mir::Instruction::AllocateList { element_type, .. } => Some(element_type),
+                _ => None,
+            });
+        for element_type in element_types {
+            let key = mir::type_key(element_type);
+            if store.by_list_element.contains_key(&key) {
+                continue;
+            }
+            let mut offsets = Vec::new();
+            layouts.collect_type_offsets(element_type, 0, &native, &mut offsets)?;
+            if offsets.is_empty() {
+                continue;
+            }
+            let offsets = offsets.into_boxed_slice();
+            let descriptor = Box::new(aster_runtime::object_heap::ObjectDescriptor {
+                size: layouts.type_layout(element_type)?.size,
+                reference_count: u32::try_from(offsets.len())
+                    .map_err(|_| BackendError::new("list element has too many reference leaves"))?,
+                reference_offsets: offsets.as_ptr(),
+            });
+            store
+                .by_list_element
+                .insert(key, std::ptr::from_ref(&*descriptor));
+            store.offsets.push(offsets);
+            store.descriptors.push(descriptor);
+        }
         Ok(store)
+    }
+
+    /// Element descriptor address for `List<element_type>`, or `None` when the
+    /// element type has no reference leaves.
+    pub(super) fn list_element_address(&self, element_type: &mir::Type) -> Option<u64> {
+        self.by_list_element
+            .get(&mir::type_key(element_type))
+            .map(|pointer| *pointer as u64)
     }
 
     pub(super) fn address(&self, class: mir::SymbolId) -> Option<u64> {
@@ -196,14 +239,29 @@ impl Layouts {
                     .get(&field.symbol)
                     .ok_or_else(|| BackendError::new("field has no computed layout"))?
                     .offset;
-            match &field.type_ {
-                mir::Type::Class(symbol) if native.contains(symbol) => {}
-                mir::Type::Class(_) | mir::Type::Interface(_) => offsets.push(offset),
-                mir::Type::User(inner) => {
-                    self.collect_reference_offsets(*inner, offset, native, offsets)?;
-                }
-                _ => {}
+            self.collect_type_offsets(&field.type_, offset, native, offsets)?;
+        }
+        Ok(())
+    }
+
+    /// Leaf offsets of one value of `type_` placed at `offset`: a class or
+    /// interface is one leaf (its object word), an inline struct contributes
+    /// its fields' leaves, everything else has none.
+    #[cfg(feature = "mem-exp-c5")]
+    pub(super) fn collect_type_offsets(
+        &self,
+        type_: &mir::Type,
+        offset: u32,
+        native: &std::collections::HashSet<mir::SymbolId>,
+        offsets: &mut Vec<u32>,
+    ) -> Result<(), BackendError> {
+        match type_ {
+            mir::Type::Class(symbol) if native.contains(symbol) => {}
+            mir::Type::Class(_) | mir::Type::Interface(_) => offsets.push(offset),
+            mir::Type::User(inner) if self.structs.contains_key(inner) => {
+                self.collect_reference_offsets(*inner, offset, native, offsets)?;
             }
+            _ => {}
         }
         Ok(())
     }

@@ -413,6 +413,8 @@ impl<'a> Block<'a> {
                 if let Some((_, value)) = self.cache.iter().find(|(cached, _)| cached == place) {
                     return *value;
                 }
+                // List element reads are `HeapRead` (ListGet products); array
+                // (`Index`) reads stay Guaranteed because arrays still leak (§1).
                 let provenance = if matches!(home, Home::Heap) {
                     Provenance::HeapRead
                 } else {
@@ -729,7 +731,14 @@ impl<'a> Block<'a> {
                 self.effect(&[list], &[value], None, Product::Owned, false);
             }
             I::ListSet { list, index, value } => {
-                self.effect(&[list, index], &[value], None, Product::Owned, false);
+                // The runtime releases the old element: borrowed list reads die.
+                self.effect(&[list, index], &[value], None, Product::Owned, true);
+            }
+            I::ListRemoveAt { list, index } => {
+                self.effect(&[list, index], &[], None, Product::Owned, true);
+            }
+            I::ListClear { list } => {
+                self.effect(&[list], &[], None, Product::Owned, true);
             }
             I::DictionaryAdd {
                 dictionary,
@@ -923,7 +932,10 @@ fn leaf_function(function: &Function) -> bool {
             mir::Instruction::Call { .. }
             | mir::Instruction::CallInterface { .. }
             | mir::Instruction::ForeignCall { .. }
-            | mir::Instruction::CallIntrinsic { .. } => false,
+            | mir::Instruction::CallIntrinsic { .. }
+            | mir::Instruction::ListSet { .. }
+            | mir::Instruction::ListRemoveAt { .. }
+            | mir::Instruction::ListClear { .. } => false,
             mir::Instruction::Release { value } => {
                 let OperandKind::Copy(place) = &value.kind else {
                     return true;
@@ -1386,5 +1398,138 @@ mod tests {
             ],
         );
         assert_eq!(found, vec!["U4"]);
+    }
+
+    fn list_type() -> Type {
+        Type::List(Box::new(class()))
+    }
+
+    fn list_operand() -> Operand {
+        Operand {
+            type_: list_type(),
+            kind: OperandKind::Copy(lp(3)),
+        }
+    }
+
+    fn zero() -> Operand {
+        Operand {
+            type_: Type::Int,
+            kind: OperandKind::Constant(mir::Constant::Integer("0".into())),
+        }
+    }
+
+    fn list_get(destination: u32) -> Instruction {
+        Instruction::ListGet {
+            destination: lp(destination),
+            list: list_operand(),
+            index: zero(),
+            element_type: class(),
+        }
+    }
+
+    fn use_call(id: u32) -> Instruction {
+        Instruction::Call {
+            destination: None,
+            function: SymbolId(2),
+            arguments: vec![operand(lp(id))],
+            return_type: Type::Void,
+        }
+    }
+
+    /// Parameter 0 is a class, local 1 receives list reads, parameter 2 is
+    /// another class, and local 3 is the list.
+    fn list_obligations(instructions: Vec<Instruction>) -> Vec<&'static str> {
+        let mut list = local(3, false);
+        list.type_ = list_type();
+        let module = Module {
+            structs: Vec::new(),
+            classes: vec![mir::ClassDefinition {
+                symbol: SymbolId(10),
+                name: "C".into(),
+                fields: vec![mir::FieldDefinition {
+                    symbol: SymbolId(11),
+                    name: "f".into(),
+                    type_: class(),
+                }],
+            }],
+            interfaces: Vec::new(),
+            enums: Vec::new(),
+            interface_implementations: Vec::new(),
+            foreign_functions: Vec::new(),
+            functions: vec![Function {
+                constructor: false,
+                symbol: SymbolId(1),
+                owner: None,
+                name: "f".into(),
+                visibility: Visibility::Public,
+                parameters: vec![local(0, false), local(2, false)],
+                locals: vec![local(1, false), list],
+                return_type: Type::Void,
+                entry: BasicBlockId(0),
+                blocks: vec![BasicBlock {
+                    id: BasicBlockId(0),
+                    instructions,
+                    terminator: Terminator::Return(None),
+                }],
+                temporary_subregion_candidates: Vec::new(),
+            }],
+        };
+        match validate_ownership(&module) {
+            Ok(()) => Vec::new(),
+            Err(findings) => findings.iter().map(|finding| finding.obligation).collect(),
+        }
+    }
+
+    fn list_set() -> Instruction {
+        Instruction::ListSet {
+            list: list_operand(),
+            index: zero(),
+            value: operand(lp(2)),
+        }
+    }
+
+    #[test]
+    fn list_read_used_after_list_set_without_retain_is_rejected() {
+        let found = list_obligations(vec![
+            retain(lp(2)),
+            list_get(1),
+            retain(lp(2)),
+            list_set(),
+            use_call(1),
+            release(lp(2)),
+        ]);
+        assert!(found.contains(&"U1") || found.contains(&"U2"), "{found:?}");
+        assert!(found.contains(&"U2"), "{found:?}");
+    }
+
+    #[test]
+    fn list_read_retained_survives_list_set() {
+        let found = list_obligations(vec![
+            retain(lp(2)),
+            list_get(1),
+            retain(lp(1)),
+            retain(lp(2)),
+            list_set(),
+            use_call(1),
+            release(lp(1)),
+            release(lp(2)),
+        ]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn list_remove_at_and_clear_invalidate_list_reads() {
+        for invalidating in [
+            Instruction::ListRemoveAt {
+                list: list_operand(),
+                index: zero(),
+            },
+            Instruction::ListClear {
+                list: list_operand(),
+            },
+        ] {
+            let found = list_obligations(vec![list_get(1), invalidating, use_call(1)]);
+            assert!(found.contains(&"U2"), "{found:?}");
+        }
     }
 }

@@ -191,6 +191,10 @@ pub struct AsterList {
     /// inside a deeper nested scope (i.e. a helper function) are promoted to
     /// the permanent arena so they survive the helper's temp-scope rewind.
     birth_scope_depth: u32,
+    /// MEM-EXP-1 C5/C6 (design section 7): immutable descriptor of the
+    /// element type's reference leaves; null when the element has none.
+    #[cfg(feature = "mem-exp-rc")]
+    element_descriptor: *const crate::object_heap::ObjectDescriptor,
 }
 
 /// Native mutable UTF-8 construction header. The header and every backing
@@ -1374,6 +1378,10 @@ impl ExecutionContext {
             } else {
                 0
             };
+            #[cfg(feature = "mem-exp-rc")]
+            {
+                (*header_ptr).element_descriptor = ptr::null();
+            }
         }
         self.record_allocation(AllocationCategory::Object, size_of::<AsterList>());
         header_ptr
@@ -3041,6 +3049,75 @@ impl ExecutionContext {
         Some((new_data, new_capacity))
     }
 
+    /// Element descriptor of `list` (null when the element has no leaves).
+    #[cfg(feature = "mem-exp-rc")]
+    fn list_element_descriptor(
+        list: *const AsterList,
+    ) -> *const crate::object_heap::ObjectDescriptor {
+        // SAFETY: callers pass a validated list header.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*list).element_descriptor
+        }
+    }
+
+    /// Reads the object word of every leaf of `count` consecutive elements of
+    /// `element_size` bytes starting at `base`. The words are copied out so the
+    /// storage may be reused before they are released.
+    #[cfg(feature = "mem-exp-rc")]
+    fn collect_leaf_words(
+        descriptor: *const crate::object_heap::ObjectDescriptor,
+        base: *const u8,
+        element_size: usize,
+        count: usize,
+    ) -> Vec<*mut u8> {
+        if descriptor.is_null() || base.is_null() || count == 0 {
+            return Vec::new();
+        }
+        // SAFETY: the descriptor is immutable program data; `base` covers
+        // `count` live elements and every offset lies inside one element.
+        #[allow(unsafe_code)]
+        unsafe {
+            let reference_count = (*descriptor).reference_count as usize;
+            let offsets = (*descriptor).reference_offsets;
+            let mut words = Vec::with_capacity(reference_count * count);
+            for element in 0..count {
+                let element_base = base.add(element * element_size);
+                for index in 0..reference_count {
+                    let offset = offsets.add(index).read() as usize;
+                    words.push(element_base.add(offset).cast::<*mut u8>().read_unaligned());
+                }
+            }
+            words
+        }
+    }
+
+    #[cfg(feature = "mem-exp-rc")]
+    fn retain_leaf_words(&mut self, words: &[*mut u8]) {
+        for &word in words {
+            if !word.is_null() {
+                // SAFETY: a non-null leaf word is a live H12 object of this context.
+                #[allow(unsafe_code)]
+                unsafe {
+                    self.retain_object(word);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "mem-exp-rc")]
+    fn release_leaf_words(&mut self, words: &[*mut u8]) {
+        for &word in words {
+            if !word.is_null() {
+                // SAFETY: as in `retain_leaf_words`; immortal objects are ignored.
+                #[allow(unsafe_code)]
+                unsafe {
+                    self.release_counted_object(word);
+                }
+            }
+        }
+    }
+
     /// Appends one element to `list`'s buffer, growing it geometrically
     /// (`0 -> 4`, then doubling) when full. Every failure is reported
     /// through `self.fail` and leaves the header exactly as it was before
@@ -3300,6 +3377,15 @@ impl ExecutionContext {
             self.fail("List.Set index * element size overflow");
             return;
         };
+        #[cfg(feature = "mem-exp-rc")]
+        #[allow(unsafe_code)]
+        let old_words = Self::collect_leaf_words(
+            Self::list_element_descriptor(list),
+            // SAFETY: `offset` lies inside the live prefix.
+            unsafe { data.add(offset) },
+            usize::try_from(element_size).unwrap_or(0),
+            1,
+        );
         // SAFETY: validation proved the selected slot and source are valid for
         // one concrete element representation. Replacing a value is not a
         // structural change, so the list version intentionally stays stable.
@@ -3311,6 +3397,8 @@ impl ExecutionContext {
                 usize::try_from(element_size).unwrap_or(0),
             );
         }
+        #[cfg(feature = "mem-exp-rc")]
+        self.release_leaf_words(&old_words);
     }
 
     fn list_clear(
@@ -3354,6 +3442,13 @@ impl ExecutionContext {
             self.fail("List.Clear byte count overflow");
             return;
         };
+        #[cfg(feature = "mem-exp-rc")]
+        let old_words = Self::collect_leaf_words(
+            Self::list_element_descriptor(list),
+            data,
+            usize::try_from(element_size).unwrap_or(0),
+            usize::try_from(length).unwrap_or(0),
+        );
         // SAFETY: `bytes` covers exactly the currently live prefix. Clearing
         // it releases logical reachability while retaining reusable capacity.
         #[allow(unsafe_code)]
@@ -3364,6 +3459,8 @@ impl ExecutionContext {
             (*list).length = 0;
             (*list).version = (*list).version.wrapping_add(1);
         }
+        #[cfg(feature = "mem-exp-rc")]
+        self.release_leaf_words(&old_words);
     }
 
     fn list_to_array(
@@ -3419,6 +3516,16 @@ impl ExecutionContext {
             unsafe {
                 ptr::copy_nonoverlapping(data, (*array).data, bytes);
             };
+            #[cfg(feature = "mem-exp-rc")]
+            {
+                let words = Self::collect_leaf_words(
+                    Self::list_element_descriptor(list),
+                    data,
+                    usize::try_from(element_size).unwrap_or(0),
+                    usize::try_from(length).unwrap_or(0),
+                );
+                self.retain_leaf_words(&words);
+            }
         }
         array
     }
@@ -3549,6 +3656,16 @@ impl ExecutionContext {
             (*list).length = new_length;
             (*list).version = (*list).version.wrapping_add(1);
         }
+        #[cfg(feature = "mem-exp-rc")]
+        {
+            let words = Self::collect_leaf_words(
+                Self::list_element_descriptor(list),
+                source,
+                element_size as usize,
+                usize::try_from(count).unwrap_or(0),
+            );
+            self.retain_leaf_words(&words);
+        }
         true
     }
 
@@ -3653,6 +3770,18 @@ impl ExecutionContext {
             self.fail("List.RemoveRange clear byte count overflow");
             return false;
         };
+        #[cfg(feature = "mem-exp-rc")]
+        #[allow(unsafe_code)]
+        let old_words = {
+            // SAFETY: `destination_offset` lies inside the live prefix.
+            let data = unsafe { (*list).data };
+            Self::collect_leaf_words(
+                Self::list_element_descriptor(list),
+                unsafe { data.add(destination_offset) },
+                size,
+                usize::try_from(count).unwrap_or(0),
+            )
+        };
         #[allow(unsafe_code)]
         unsafe {
             let data = (*list).data;
@@ -3665,6 +3794,8 @@ impl ExecutionContext {
             (*list).length = new_length;
             (*list).version = (*list).version.wrapping_add(1);
         }
+        #[cfg(feature = "mem-exp-rc")]
+        self.release_leaf_words(&old_words);
         true
     }
 
@@ -3743,6 +3874,17 @@ impl ExecutionContext {
             #[allow(unsafe_code)]
             unsafe {
                 ptr::copy_nonoverlapping(data.add(source_offset), (*array).data, copy_bytes);
+            }
+            #[cfg(feature = "mem-exp-rc")]
+            {
+                #[allow(unsafe_code)]
+                let words = Self::collect_leaf_words(
+                    Self::list_element_descriptor(list),
+                    unsafe { data.add(source_offset) },
+                    usize::try_from(size).unwrap_or(0),
+                    usize::try_from(count).unwrap_or(0),
+                );
+                self.retain_leaf_words(&words);
             }
         }
         array
@@ -3883,6 +4025,15 @@ impl ExecutionContext {
             return;
         };
 
+        #[cfg(feature = "mem-exp-rc")]
+        #[allow(unsafe_code)]
+        let old_words = Self::collect_leaf_words(
+            Self::list_element_descriptor(list),
+            // SAFETY: `index_offset` lies inside the live prefix.
+            unsafe { data.add(index_offset) },
+            element_size_usize,
+            1,
+        );
         if move_bytes > 0 {
             // SAFETY: `source_offset..source_offset+move_bytes` and
             // `index_offset..index_offset+move_bytes` both lie within the
@@ -3912,6 +4063,8 @@ impl ExecutionContext {
             (*list).length = new_length;
             (*list).version = (*list).version.wrapping_add(1);
         }
+        #[cfg(feature = "mem-exp-rc")]
+        self.release_leaf_words(&old_words);
     }
 
     #[cfg(feature = "mem-exp-heap")]
@@ -4361,6 +4514,24 @@ pub extern "C" fn aster_rt_list_new_temporary(
     #[allow(clippy::cast_sign_loss)]
     let type_key = element_type_key as u64;
     context.allocate_list_in_region(size, align, type_key, ListRegion::Temporary)
+}
+
+/// Record the element descriptor of a freshly allocated list (MEM-EXP-1 C5).
+#[cfg(feature = "mem-exp-rc")]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_list_set_element_descriptor(
+    context: *mut ExecutionContext,
+    list: *mut AsterList,
+    descriptor: *const crate::object_heap::ObjectDescriptor,
+) {
+    if context.is_null() || list.is_null() {
+        return;
+    }
+    // SAFETY: generated code passes its live context and a list it just allocated.
+    #[allow(unsafe_code)]
+    unsafe {
+        (*list).element_descriptor = descriptor;
+    }
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]

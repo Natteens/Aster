@@ -900,6 +900,12 @@ impl Context<'_> {
             .flat_map(|block| &block.instructions)
             .all(|instruction| {
                 !is_call(instruction)
+                    && !matches!(
+                        instruction,
+                        Instruction::ListSet { .. }
+                            | Instruction::ListRemoveAt { .. }
+                            | Instruction::ListClear { .. }
+                    )
                     && destination_places(instruction)
                         .iter()
                         .all(|place| root_local(place).is_none_or(|l| !parameters.contains(&l)))
@@ -1559,5 +1565,64 @@ mod tests {
             }],
         );
         assert_eq!(function.blocks[1].instructions.len(), 2);
+    }
+
+    fn list_instructions(ints: Operand) -> (Instruction, Instruction) {
+        let list = Type::List(Box::new(class()));
+        (
+            Instruction::ListGet {
+                destination: lp(2),
+                list: copy(lp(0), &list),
+                index: ints.clone(),
+                element_type: class(),
+            },
+            Instruction::ListSet {
+                list: copy(lp(0), &list),
+                index: ints,
+                value: copy(lp(1), &class()),
+            },
+        )
+    }
+
+    fn zero() -> Operand {
+        Operand {
+            type_: Type::Int,
+            kind: OperandKind::Constant(mir::Constant::Integer("0".into())),
+        }
+    }
+
+    #[test]
+    fn list_get_is_retained_right_after_the_read_and_survives_list_set() {
+        let list = Type::List(Box::new(class()));
+        let (get, set) = list_instructions(zero());
+        let (function, _) = run_void(
+            vec![local(0, list, false), local(1, class(), false)],
+            vec![local(2, class(), false)],
+            vec![get.clone(), set, call(None, Type::Void)],
+        );
+        let all: Vec<&Instruction> = function
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .collect();
+        let at = all.iter().position(|i| **i == get).unwrap();
+        assert_eq!(*all[at + 1], retain(lp(2), &class()));
+    }
+
+    #[test]
+    fn e3_does_not_apply_to_a_function_with_list_set() {
+        let list = Type::List(Box::new(class()));
+        let (_, set) = list_instructions(zero());
+        let result = both(
+            vec![local(0, list, false), local(1, class(), false)],
+            Vec::new(),
+            vec![block(
+                0,
+                vec![set],
+                Terminator::Return(Some(copy(field(1), &class()))),
+            )],
+            class(),
+        );
+        assert_eq!(result.elided_stats.elided_parameters, 0);
     }
 }

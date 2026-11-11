@@ -1852,6 +1852,21 @@ impl Codegen {
             .call(function_ref, &[context, size, align, type_key]);
         let list = builder.inst_results(call)[0];
         self.continue_if_runtime_ok(builder, state)?;
+        #[cfg(feature = "mem-exp-c5")]
+        if let Some(address) = self.descriptors.list_element_address(element_type) {
+            // MEM-EXP-1 C5 (design section 7): the list owns one count per
+            // reference leaf of each element; the runtime needs the leaves.
+            let set_descriptor = self.jit.declare_func_in_func(
+                self.runtime_ids["aster_rt_list_set_element_descriptor"],
+                builder.func,
+            );
+            let descriptor = builder
+                .ins()
+                .iconst(self.pointer_type, address.cast_signed());
+            builder
+                .ins()
+                .call(set_descriptor, &[context, list, descriptor]);
+        }
         self.store_scalar(builder, destination, list, state)
     }
 

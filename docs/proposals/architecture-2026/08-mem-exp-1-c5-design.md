@@ -150,3 +150,32 @@ Validator changes for C6 (independent code, still no sharing with the pass):
 
 Metrics: static `Retain`/`Release` counts emitted by C5 and C6 for the same module, the number
 removed by each rule, and executed counts from `ObjectHeapStats` (non-null, non-immortal).
+
+## 7. `List<T>` element ownership (U8, first collection)
+
+A `List<T>` whose element type has leaves **owns one count per leaf of each live element**. The
+list header itself is still not counted: when the list dies, its elements leak (bounded by the
+list's length). Arrays, dictionaries, and enums keep the leak rule of §1 for now.
+
+- **Element descriptor.** Under C5/C6 the list header carries a pointer to an immutable
+  `ObjectDescriptor` for the element type (`size` = element size, `reference_offsets` = leaf
+  offsets inside one element; native-header classes excluded). Null when the element type has no
+  leaves. Codegen sets it right after `AllocateList` (`aster_rt_list_set_element_descriptor`);
+  every runtime path that creates a list from another list copies it.
+- **Runtime glue** (no user code runs; the element's count operations use the list's context):
+  - `ListAdd`, `ListInsert`: the caller transfers one count per leaf (the pass already retains the
+    value as a consumed operand). Growth moves bits.
+  - `ListSet`: store the new element, then release the old element's leaves (store sequence §4.B,
+    steps 4 to 6 in the runtime).
+  - `ListRemoveAt`, `ListRemoveRange`: restore length and shift first, then release the removed
+    elements.
+  - `ListClear`: set the length to zero first, then release every former element.
+  - `ListToArray`, `ListGetRange`, `ListAddRange`: retain every leaf of every copied element (the
+    copy is a new holder; an array copy then leaks under §1).
+  - `ListReverse`, growth, and shifts: permutations; no count change.
+- **Pass.** Unchanged: values read by `ListGet` are retained into their owning destination right
+  after the read, and stored values are retained before the store.
+- **Validator.** A value read from a list element is borrowed, not guaranteed: it is valid only
+  until the next invalidating instruction, which now also includes `ListSet`, `ListRemoveAt`,
+  `ListClear`, and every intrinsic call. **E3** must treat `ListSet`, `ListRemoveAt`, and
+  `ListClear` as releasing instructions (a function containing one does not qualify).

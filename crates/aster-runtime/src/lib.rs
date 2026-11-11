@@ -26,6 +26,8 @@ pub mod registry;
 pub mod string;
 pub mod time;
 
+#[cfg(feature = "mem-exp-rc")]
+pub use context::aster_rt_list_set_element_descriptor;
 pub use context::{
     ASTER_ARRAY_DATA_OFFSET, ASTER_ARRAY_LENGTH_OFFSET, ASTER_CALL_DEPTH_LIMIT,
     AarmAllocatorEvents, AarmMemoryTelemetry, AarmRegionTelemetry, AarmRewindTelemetry, AsterArray,
