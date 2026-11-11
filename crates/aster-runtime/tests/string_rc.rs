@@ -230,23 +230,41 @@ fn split_array_releases_its_strings() {
 }
 
 #[test]
-fn long_strings_are_immortal_and_never_returned() {
+fn strings_above_one_mib_are_immortal_and_never_returned() {
     let mut cx = ExecutionContext::with_stats();
-    let big = aligned(&"x".repeat(1200));
     let empty = aligned("");
-    let long = aster_rt_string_concat(&raw mut cx, ptr_of(&big), ptr_of(&big));
-    assert_eq!(text(long).len(), 2400);
-    assert_eq!(count(long), IMMORTAL);
-    assert_eq!(word(long) & STRING_FLAG, STRING_FLAG);
-    let before = cx.object_heap_stats();
-    release(&mut cx, long);
-    assert_eq!(cx.object_heap_stats(), before);
-    // The boundary: header plus payload of exactly 2,048 bytes is still counted.
-    let payload = "y".repeat(2048 - ASTER_STR_PAYLOAD_OFFSET);
+    // The boundary: header plus payload of exactly 1 MiB is still counted.
+    let payload = "y".repeat(1_048_576 - ASTER_STR_PAYLOAD_OFFSET);
     let at_limit = aligned(&payload);
     let counted = aster_rt_string_concat(&raw mut cx, ptr_of(&at_limit), ptr_of(&empty));
     assert_eq!(count(counted), 1);
     let beyond = aligned(&format!("{payload}y"));
     let over = aster_rt_string_concat(&raw mut cx, ptr_of(&beyond), ptr_of(&empty));
     assert_eq!(count(over), IMMORTAL);
+    assert_eq!(word(over) & STRING_FLAG, STRING_FLAG);
+    let before = cx.object_heap_stats();
+    release(&mut cx, over);
+    assert_eq!(cx.object_heap_stats(), before);
+}
+
+#[test]
+fn long_strings_are_counted_and_reused() {
+    let mut cx = ExecutionContext::with_stats();
+    let empty = aligned("");
+    let body = aligned(&"z".repeat(10 * 1024));
+    let long = aster_rt_string_concat(&raw mut cx, ptr_of(&body), ptr_of(&empty));
+    assert_eq!(text(long).len(), 10 * 1024);
+    assert_eq!(count(long), 1);
+    assert_eq!(word(long) & STRING_FLAG, STRING_FLAG);
+    let fresh = cx.object_heap_stats().fresh_blocks;
+    release(&mut cx, long);
+    let stats = cx.object_heap_stats();
+    assert_eq!(stats.released_strings, 1);
+    assert_eq!(stats.released_blocks, 1);
+    // The next string of the same class reuses the 16 KiB block, zeroed.
+    let again = aster_rt_string_concat(&raw mut cx, ptr_of(&body), ptr_of(&empty));
+    assert_eq!(text(again), "z".repeat(10 * 1024));
+    let stats = cx.object_heap_stats();
+    assert_eq!(stats.fresh_blocks, fresh);
+    assert_eq!(stats.reused_blocks, 1);
 }

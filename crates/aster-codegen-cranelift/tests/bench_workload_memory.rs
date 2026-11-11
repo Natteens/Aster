@@ -105,8 +105,8 @@ fn memory_statistics_are_deterministic_across_runs() {
 #[test]
 fn live_memory_grows_with_iteration_count_under_the_current_region_model() {
     for workload in &WORKLOADS {
-        // MEM-EXP-1 C5/C6 counts every value these two workloads discard
-        // (objects, strings, lists), so they stay flat instead.
+        // MEM-EXP-1 C5/C6 counts every value these workloads discard
+        // (objects, strings, lists, dictionaries), so they stay flat instead.
         if cfg!(feature = "mem-exp-c5") && COUNTED_FLAT.contains(&workload.name) {
             continue;
         }
@@ -121,8 +121,14 @@ fn live_memory_grows_with_iteration_count_under_the_current_region_model() {
     }
 }
 
-/// Workloads whose discarded values are all counted in MEM-EXP-1 C5/C6.
-const COUNTED_FLAT: [&str; 2] = ["longrun_frame", "longrun_request"];
+/// Workloads whose discarded values are all counted in MEM-EXP-1 C5/C6
+/// (`cache_churn` and `collection_growth` since the large block classes of design section 12).
+const COUNTED_FLAT: [&str; 4] = [
+    "longrun_frame",
+    "longrun_request",
+    "cache_churn",
+    "collection_growth",
+];
 
 /// MEM-EXP-1 long-running gate shape (closure §4.C) for those workloads.
 #[cfg(feature = "mem-exp-c5")]

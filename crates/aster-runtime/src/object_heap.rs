@@ -21,9 +21,23 @@
 
 use std::ptr;
 
+/// Number of small classes (16 B to 2 KiB): the only ones class objects and
+/// collection headers use.
+pub(crate) const SMALL_CLASS_COUNT: usize = 15;
+
 /// Block sizes, in bytes. A larger object is not managed by the heap.
-pub(crate) const SIZE_CLASSES: [u32; 15] = [
+#[cfg(not(feature = "mem-exp-rc"))]
+pub(crate) const SIZE_CLASSES: [u32; SMALL_CLASS_COUNT] = [
     16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048,
+];
+
+/// Block sizes, in bytes: the small classes, then (design section 12) the
+/// power-of-two large classes 4 KiB to 1 MiB that serve buffers and strings
+/// only. A larger block is not managed by the heap.
+#[cfg(feature = "mem-exp-rc")]
+pub(crate) const SIZE_CLASSES: [u32; SMALL_CLASS_COUNT + 9] = [
+    16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 4096, 8192, 16_384,
+    32_768, 65_536, 131_072, 262_144, 524_288, 1_048_576,
 ];
 
 /// Offset of the count word in a counted object.
@@ -147,8 +161,20 @@ pub(crate) struct ObjectHeap {
 }
 
 impl ObjectHeap {
-    /// Index of the smallest size class that holds `size` bytes.
+    /// Index of the smallest small size class that holds `size` bytes (class
+    /// objects and collection headers).
     pub(crate) fn class_of(size: u32) -> Option<usize> {
+        SIZE_CLASSES[..SMALL_CLASS_COUNT]
+            .iter()
+            .position(|&class| class >= size)
+    }
+
+    /// Index of the smallest size class, large ones included, that holds a
+    /// buffer or string block of `size` bytes. The single lookup every
+    /// buffer allocation, growth and release decision goes through.
+    #[cfg(feature = "mem-exp-rc")]
+    pub(crate) fn buffer_class_of(size: usize) -> Option<usize> {
+        let size = u32::try_from(size.max(1)).ok()?;
         SIZE_CLASSES.iter().position(|&class| class >= size)
     }
 
@@ -294,9 +320,7 @@ pub(crate) unsafe fn release(heap: &mut ObjectHeap, object: *mut u8) -> u64 {
                             .cast::<usize>()
                             .read()
                 };
-                let class = u32::try_from(bytes)
-                    .ok()
-                    .and_then(ObjectHeap::class_of)
+                let class = ObjectHeap::buffer_class_of(bytes)
                     .expect("counted strings are allocated from a size class");
                 heap.release(current, class);
                 heap.stats.released_strings += 1;
@@ -359,7 +383,7 @@ unsafe fn release_array(heap: &mut ObjectHeap, array: *mut u8, work: &mut Vec<*m
         }
     }
     let bytes = length.saturating_mul(element_size).max(1);
-    match u32::try_from(bytes).ok().and_then(ObjectHeap::class_of) {
+    match ObjectHeap::buffer_class_of(bytes) {
         Some(class) => heap.release(data, class),
         None => heap.stats.unreturned_array_blocks += 1,
     }
@@ -410,9 +434,7 @@ unsafe fn release_list(heap: &mut ObjectHeap, list: *mut u8, work: &mut Vec<*mut
         // SAFETY: the caller's contract.
         let align = unsafe { (*list.cast::<AsterList>()).element_align() };
         if AsterList::buffer_is_heap_served(capacity * element_size, align) {
-            let class = u32::try_from(capacity * element_size)
-                .ok()
-                .and_then(ObjectHeap::class_of)
+            let class = ObjectHeap::buffer_class_of(capacity * element_size)
                 .expect("heap-served list buffers fit a size class");
             heap.release(data, class);
         } else {
@@ -442,9 +464,7 @@ unsafe fn release_dictionary(heap: &mut ObjectHeap, dictionary: *mut u8, work: &
         unsafe { AsterDictionary::drain_children(dictionary.cast::<AsterDictionary>(), work) };
     if let Some(storage) = storage {
         if crate::context::AsterList::buffer_is_heap_served(storage.bytes, storage.align) {
-            let class = u32::try_from(storage.bytes)
-                .ok()
-                .and_then(ObjectHeap::class_of)
+            let class = ObjectHeap::buffer_class_of(storage.bytes)
                 .expect("heap-served dictionary storage fits a size class");
             heap.release(storage.block, class);
         } else {

@@ -574,11 +574,7 @@ impl AsterList {
     /// served by the size-class heap (otherwise it stays arena-reserved).
     #[cfg(feature = "mem-exp-rc")]
     pub(crate) fn buffer_is_heap_served(bytes: usize, align: u32) -> bool {
-        align <= 8
-            && u32::try_from(bytes)
-                .ok()
-                .and_then(crate::object_heap::ObjectHeap::class_of)
-                .is_some()
+        align <= 8 && crate::object_heap::ObjectHeap::buffer_class_of(bytes).is_some()
     }
 }
 
@@ -1498,9 +1494,7 @@ impl ExecutionContext {
     #[cfg(feature = "mem-exp-rc")]
     fn allocate_heap_block(&mut self, size: usize) -> Option<*mut u8> {
         let size = size.max(1);
-        let class = u32::try_from(size)
-            .ok()
-            .and_then(crate::object_heap::ObjectHeap::class_of);
+        let class = crate::object_heap::ObjectHeap::buffer_class_of(size);
         let Some(class) = class else {
             return self.allocate_in_region(size, 8, false);
         };
@@ -1528,10 +1522,7 @@ impl ExecutionContext {
             return ptr::null_mut();
         };
         let Some(header) = self.allocate_heap_block(size_of::<AsterArray>()) else {
-            if let Some(class) = u32::try_from(bytes.max(1))
-                .ok()
-                .and_then(crate::object_heap::ObjectHeap::class_of)
-            {
+            if let Some(class) = crate::object_heap::ObjectHeap::buffer_class_of(bytes) {
                 self.object_heap.release(data, class);
                 self.sync_heap_stats();
             }
@@ -2502,10 +2493,7 @@ impl ExecutionContext {
         if !AsterList::buffer_is_heap_served(bytes, align) {
             return;
         }
-        if let Some(class) = u32::try_from(bytes)
-            .ok()
-            .and_then(crate::object_heap::ObjectHeap::class_of)
-        {
+        if let Some(class) = crate::object_heap::ObjectHeap::buffer_class_of(bytes) {
             self.object_heap.release(buckets.cast::<u8>(), class);
             self.sync_heap_stats();
         }
@@ -4037,10 +4025,7 @@ impl ExecutionContext {
         if !AsterList::buffer_is_heap_served(bytes, element_align) {
             return;
         }
-        if let Some(class) = u32::try_from(bytes)
-            .ok()
-            .and_then(crate::object_heap::ObjectHeap::class_of)
-        {
+        if let Some(class) = crate::object_heap::ObjectHeap::buffer_class_of(bytes) {
             self.object_heap.release(buffer, class);
             self.sync_heap_stats();
         }
@@ -4741,10 +4726,7 @@ impl ExecutionContext {
         // (never heap-served, so never returned), is IMMORTAL.
         #[cfg(feature = "mem-exp-rc")]
         let (pointer, count_word) = if !temporary
-            && u32::try_from(total_bytes)
-                .ok()
-                .and_then(crate::object_heap::ObjectHeap::class_of)
-                .is_some()
+            && crate::object_heap::ObjectHeap::buffer_class_of(total_bytes).is_some()
         {
             let Some(block) = self.allocate_heap_block(total_bytes) else {
                 return ptr::null_mut();

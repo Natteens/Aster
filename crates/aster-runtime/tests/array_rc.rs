@@ -197,7 +197,7 @@ fn temporary_arrays_are_immortal() {
 #[test]
 fn data_above_the_largest_size_class_stays_reserved() {
     let mut fx = Fixture::new();
-    let array = fx.array(1024, 4); // 4,096 bytes of data
+    let array = fx.array(262_145, 4); // 1 MiB + 4 bytes of data
     assert_eq!(
         fx.context.object_heap_stats().fresh_blocks,
         1,
@@ -208,7 +208,7 @@ fn data_above_the_largest_size_class_stays_reserved() {
     assert_eq!(stats.released_blocks, 1, "only the header returns");
     assert_eq!(stats.released_arrays, 1);
     assert_eq!(stats.unreturned_array_blocks, 1);
-    // A 2,048-byte payload is the largest heap-served data block.
+    // A 2,048-byte payload is heap-served from a small class.
     let small = fx.array(512, 4);
     fx.release(small.cast());
     let stats = fx.context.object_heap_stats();
@@ -223,4 +223,30 @@ fn zero_length_arrays_are_counted_and_freed() {
     assert_eq!(count(array.cast()), 1);
     fx.release(array.cast());
     assert_eq!(fx.context.object_heap_stats().released_blocks, 2);
+}
+
+#[test]
+fn large_array_data_is_returned_and_reused() {
+    let mut fx = Fixture::new();
+    let first = fx.array(2048, 4); // 8 KiB data: a large class
+    let fresh = fx.context.object_heap_stats().fresh_blocks;
+    assert_eq!(fresh, 2, "header and data block");
+    fx.release(first.cast());
+    let stats = fx.context.object_heap_stats();
+    assert_eq!(stats.released_blocks, 2);
+    assert_eq!(stats.unreturned_array_blocks, 0);
+    // The same size again reuses both blocks and sees zeroed data.
+    let second = fx.array(2000, 4);
+    let stats = fx.context.object_heap_stats();
+    assert_eq!(stats.fresh_blocks, fresh);
+    assert_eq!(stats.reused_blocks, 2);
+    let data = unsafe {
+        second
+            .cast::<u8>()
+            .add(ASTER_ARRAY_DATA_OFFSET)
+            .cast::<*const u8>()
+            .read()
+    };
+    let bytes = unsafe { std::slice::from_raw_parts(data, 8000) };
+    assert!(bytes.iter().all(|&byte| byte == 0));
 }

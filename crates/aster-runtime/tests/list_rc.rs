@@ -353,8 +353,8 @@ fn growth_returns_the_old_buffer_to_the_heap() {
 fn buffers_above_the_largest_size_class_stay_reserved() {
     let mut context = Box::new(ExecutionContext::with_stats());
     let list = leaf_list(&mut context);
-    // 512 elements x 8 bytes = 4,096 bytes: above the largest class.
-    for _ in 0..512 {
+    // 131,073 elements x 8 bytes: the buffer grows past the 1 MiB class.
+    for _ in 0..131_073 {
         push(&mut context, list, std::ptr::null_mut());
     }
     let grown = context.object_heap_stats();
@@ -396,4 +396,31 @@ fn temporary_lists_are_immortal() {
     assert_eq!(count(list.cast()), IMMORTAL);
     push(&mut context, list, std::ptr::null_mut());
     assert_eq!(context.object_heap_stats().released_blocks, 0);
+}
+
+#[test]
+fn growth_across_the_small_classes_returns_and_reuses_large_buffers() {
+    let mut context = Box::new(ExecutionContext::with_stats());
+    let list = leaf_list(&mut context);
+    // 1,000 x 8 bytes: capacity 1,024 = 8 KiB, grown through 4 KiB.
+    for _ in 0..1000 {
+        push(&mut context, list, std::ptr::null_mut());
+    }
+    let grown = context.object_heap_stats();
+    // Every replaced buffer went back (4..2048 bytes through the 4 KiB one).
+    assert_eq!(grown.released_blocks, 8);
+    assert_eq!(grown.unreturned_list_buffers, 0);
+    release(&mut context, list.cast());
+    let stats = context.object_heap_stats();
+    assert_eq!(stats.unreturned_list_buffers, 0);
+    assert_eq!(stats.released_blocks, grown.released_blocks + 2);
+    // A second list of the same size is served entirely by reused blocks.
+    let fresh = stats.fresh_blocks;
+    let second = leaf_list(&mut context);
+    for _ in 0..1000 {
+        push(&mut context, second, std::ptr::null_mut());
+    }
+    let stats = context.object_heap_stats();
+    assert_eq!(stats.fresh_blocks, fresh, "no new arena blocks");
+    assert!(stats.reused_blocks >= 9);
 }

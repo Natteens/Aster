@@ -795,13 +795,39 @@ needs a storage block above 2,048 bytes, and each rehash or compaction leaves th
 reserved. `collection_growth` grows for the same reason (large list buffers). Checksums identical;
 executed count operations C6/C5 = 2,960,322 / 5,739,436 = 51.6%.
 
+### T-MEM-EXP-1 stage C, large block classes — implemented (2026-11-11)
+
+Contract: §12 of [08-mem-exp-1-c5-design.md](08-mem-exp-1-c5-design.md). Nine power-of-two classes
+from 4 KiB to 1 MiB serve buffers (array data, list buffers, dictionary storage) and strings
+through one lookup (`ObjectHeap::buffer_class_of`); objects and headers keep the small classes.
+Strings up to 1 MiB are counted. One lib test that calibrates a one-page AARM budget for the
+single-block array layout is ignored under C5
+(`task_abi::tests::wait_all_allocation_denial_exposes_no_partial_result_and_keeps_handles_valid`).
+
+Gates: `aster-codegen-cranelift --all-targets` C0 1,443 and C4 1,443 passed; C5 and C6 1,449
+passed, 0 failed, 25 ignored; `aster-runtime` 337 (default), 343 (`mem-exp-heap`), and the
+`mem-exp-rc` suites (336 unit, 10 `array_rc`, 18 `dictionary_rc`, 16 `list_rc`, 6 `object_heap`,
+3 `object_rc`, 10 `string_rc`); clippy and rustfmt clean.
+
+Measured (C6, debug, deterministic; used bytes at N / 10N):
+
+| Workload | Used N | Used 10N | Peak N | Peak 10N |
+| --- | ---: | ---: | ---: | ---: |
+| `longrun_frame` | 1,584 | 1,584 | 2,640 | 2,640 |
+| `longrun_request` | 448 | 448 | 477 | 478 |
+| `cache_churn` | 261,728 | 261,728 | 261,728 | 261,728 |
+| `collection_growth` | 32,448 | 32,448 | 444,448 | 4,152,448 |
+
+The long-running gate shape (final live bytes at 10N ≤ N + 64 KiB) holds for `longrun_frame`,
+`longrun_request`, and `cache_churn` in this debug measurement; `bench_workload_memory` asserts it
+for all four workloads. Checksums identical; executed count operations C6/C5 = 51.6%.
+
 Not done, so **no PASS for MEM-001 to MEM-003**:
 
-1. Reuse of blocks above 2,048 bytes (large size classes) for buffers and long strings, for
-   `cache_churn` and `collection_growth`.
+1. Class B timing (release builds, interleaved C0/C6) and the time, compile-time, and peak-memory
+   gates of §4.C; tier-1 preservation check of `benchmarks/memory`.
 2. Enum payload drop glue and closure environments (enums currently leak their references).
 3. Region reclamation together with counting (H2 pins); C5 and C6 currently lose it.
 4. Class B timing protocol (release builds, interleaved rounds) and the §4.C thresholds.
 
-Next action: item 1, large block classes; then improve elision so the soft gate is met again;
-then the class B timing protocol.
+Next action: item 1 (class B timing and the §4.C verdict); improve elision for the soft gate.

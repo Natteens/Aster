@@ -274,3 +274,13 @@ H4 holds and their counts stay single-domain.
   and `DictionaryGetOrAdd` are borrowed until the next invalidating instruction, which now includes
   `DictionaryAdd`, `DictionarySet`, `DictionaryRemove`, and `DictionaryClear`. E3 does not apply to
   functions containing any of these four instructions.
+
+## 12. Large block classes
+
+The size-class heap gains power-of-two classes above 2,048 bytes: 4 KiB, 8 KiB, ... up to 1 MiB.
+They serve **buffers only** (array data, list buffers, dictionary storage) and strings; class
+objects and collection headers stay within the small classes. A large block is carved from the
+Persistent arena on first use and returned to its class's free list on release or growth, exactly
+like small blocks (zeroed on reuse, poisoned on release in debug builds). Blocks above 1 MiB stay
+reserved and are reported. Rounding up to a power of two wastes at most half a large block; the
+peak-memory gate of §4.C measures that cost.

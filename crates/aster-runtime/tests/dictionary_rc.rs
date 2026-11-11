@@ -529,8 +529,8 @@ fn growth_returns_the_old_storage_block_and_it_is_reused() {
 #[test]
 fn storage_above_the_largest_class_stays_reserved() {
     let mut d = Dict::ints(None);
-    // 100 entries need 256 buckets + 128 entries: above 2,048 bytes.
-    for key in 0..100 {
+    // 100,000 entries need storage above the 1 MiB class.
+    for key in 0..100_000 {
         assert!(d.add_int(key, std::ptr::null_mut()));
     }
     let grown = d.context.object_heap_stats();
@@ -721,4 +721,49 @@ fn a_dictionary_of_dictionaries_is_released_without_recursion() {
     unsafe { context.release_counted_object(inner.cast()) };
     let stats = context.object_heap_stats();
     assert_eq!(stats.released_dictionaries, depth + 1);
+}
+
+#[test]
+fn a_churning_dictionary_of_1000_keys_keeps_memory_bounded() {
+    let mut d = Dict::ints(None);
+    for key in 0..1000 {
+        assert!(d.add_int(key, std::ptr::null_mut()));
+    }
+    let mut window_start = 0;
+    let mut next = 1000;
+    let slide = |d: &mut Dict, window_start: &mut i32, next: &mut i32, rounds: i32| {
+        for _ in 0..rounds {
+            assert!(d.add_int(*next, std::ptr::null_mut()));
+            assert!(d.remove_int(*window_start));
+            *next += 1;
+            *window_start += 1;
+        }
+    };
+    // Warm up: let the table settle through several compactions.
+    slide(&mut d, &mut window_start, &mut next, 20_000);
+    let warm = d.context.object_heap_stats();
+    let warm_memory = d.context.memory_stats().clone();
+    slide(&mut d, &mut window_start, &mut next, 200_000);
+    assert_eq!(d.length(), 1000);
+    let after = d.context.object_heap_stats();
+    let memory = d.context.memory_stats().clone();
+    // Fresh blocks may not grow with the number of operations.
+    assert!(
+        after.fresh_blocks <= warm.fresh_blocks + 2,
+        "fresh blocks grew from {} to {}",
+        warm.fresh_blocks,
+        after.fresh_blocks
+    );
+    assert_eq!(after.unreturned_dictionary_blocks, 0);
+    assert!(memory.reserved_bytes <= warm_memory.reserved_bytes + 65_536);
+    assert!(memory.used_bytes <= warm_memory.used_bytes + 65_536);
+    // Every key is still present.
+    for key in window_start..next {
+        assert!(!d.add_int(key, std::ptr::null_mut()));
+    }
+    d.drop_dictionary();
+    assert_eq!(
+        d.context.object_heap_stats().unreturned_dictionary_blocks,
+        0
+    );
 }
