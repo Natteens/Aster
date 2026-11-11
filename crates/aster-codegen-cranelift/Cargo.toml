@@ -29,6 +29,10 @@ path = "examples/aarm_memory_matrix.rs"
 required-features = ["aarm-telemetry"]
 
 [[example]]
+name = "mem_exp_pass_time"
+path = "examples/mem_exp_pass_time.rs"
+
+[[example]]
 name = "mem_exp_counts"
 path = "examples/mem_exp_counts.rs"
 required-features = ["mem-exp-c5"]

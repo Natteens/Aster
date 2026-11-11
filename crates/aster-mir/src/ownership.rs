@@ -32,15 +32,34 @@ pub struct OwnershipStats {
     pub elided_moves: usize,
     /// E3: entry retains and exit releases of leaf-function parameters.
     pub elided_parameters: usize,
+    /// E4: retains, capture releases and exit releases of borrowed locals.
+    pub elided_borrows: usize,
+    /// E5: entry retains and exit releases of the parameters of non-releasing
+    /// functions that E3 did not already cover.
+    pub elided_summary_parameters: usize,
 }
 
 /// Return a copy of `module` with ownership operations inserted and then
 /// reduced by the local rules E1 (null capture), E2 (move from a single-use
-/// lowering temporary) and E3 (leaf-function parameters) of the C6 contract.
+/// lowering temporary) and E3 (leaf-function parameters) of the C6 contract,
+/// and by the summary rules E4 (borrow windows) and E5 (parameters of
+/// non-releasing functions) of design section 14.
 #[must_use]
 pub fn insert_ownership_elided(module: &mir::Module) -> (mir::Module, OwnershipStats) {
+    let (output, stats, _) = insert_ownership_elided_with_rounds(module);
+    (output, stats)
+}
+
+/// [`insert_ownership_elided`], also reporting how many rounds the joint
+/// fixpoint of the non-releasing summary and the borrowed-local set needed.
+#[doc(hidden)]
+#[must_use]
+pub fn insert_ownership_elided_with_rounds(
+    module: &mir::Module,
+) -> (mir::Module, OwnershipStats, usize) {
     let (mut output, mut stats) = insert_ownership(module);
     let native = string_builder_classes(module);
+    let mut all_captures = Vec::with_capacity(output.functions.len());
     for (function, original) in output.functions.iter_mut().zip(&module.functions) {
         let mut scratch = OwnershipStats::default();
         let context = Context {
@@ -75,8 +94,10 @@ pub fn insert_ownership_elided(module: &mir::Module) -> (mir::Module, OwnershipS
         stats.retains -= parameters.retains;
         stats.releases -= parameters.releases;
         stats.elided_parameters += parameters.retains + parameters.releases;
+        all_captures.push(captures);
     }
-    (output, stats)
+    let rounds = elide_with_summaries(module, &native, &mut output, &all_captures, &mut stats);
+    (output, stats, rounds)
 }
 
 #[derive(Default)]
@@ -1026,6 +1047,672 @@ impl Context<'_> {
     }
 }
 
+/// Intrinsics that only read their arguments or allocate fresh objects: they
+/// run no user code and release no object that existed before the call
+/// (design section 14). Every intrinsic outside this list is releasing.
+fn non_releasing_intrinsic(intrinsic: &Intrinsic) -> bool {
+    use Intrinsic as N;
+    matches!(
+        intrinsic,
+        N::Log
+            | N::LogWarning
+            | N::LogError
+            | N::StringEquals
+            | N::StringConcat
+            | N::StringConcatTemporary
+            | N::StringLength
+            | N::StringContains
+            | N::StringStartsWith
+            | N::StringEndsWith
+            | N::StringIndexOf
+            | N::StringLastIndexOf
+            | N::StringSubstringFrom
+            | N::StringSubstringFromTemporary
+            | N::StringSubstringRange
+            | N::StringSubstringRangeTemporary
+            | N::StringTrim
+            | N::StringTrimTemporary
+            | N::StringTrimStart
+            | N::StringTrimStartTemporary
+            | N::StringTrimEnd
+            | N::StringTrimEndTemporary
+            | N::StringJoinArray
+            | N::StringJoinArrayTemporary
+            | N::StringConcatArray
+            | N::StringConcatArrayTemporary
+            | N::StringRepeat
+            | N::StringRepeatTemporary
+            | N::StringToChars
+            | N::StringToCharsTemporary
+            | N::StringFromChars
+            | N::StringFromCharsTemporary
+            | N::StringReplace
+            | N::StringReplaceTemporary
+            | N::StringSplit
+            | N::StringSplitTemporary
+            | N::StringFromLong
+            | N::StringFromLongTemporary
+            | N::StringFromULong
+            | N::StringFromULongTemporary
+            | N::StringFromDouble
+            | N::StringFromDoubleTemporary
+            | N::StringFromFloat
+            | N::StringFromFloatTemporary
+            | N::StringFromBool
+            | N::StringFromBoolTemporary
+            | N::StringFromChar
+            | N::StringFromCharTemporary
+            | N::StringJoin
+            | N::StringJoinTemporary
+            | N::StringBuilderLength
+            | N::StringBuilderClear
+            | N::StringTryParseBool
+            | N::StringTryParseChar
+            | N::StringTryParseSByte
+            | N::StringTryParseByte
+            | N::StringTryParseShort
+            | N::StringTryParseUShort
+            | N::StringTryParseInt
+            | N::StringTryParseUInt
+            | N::StringTryParseLong
+            | N::StringTryParseULong
+            | N::StringTryParseFloat
+            | N::StringTryParseDouble
+            | N::ListCapacity
+            | N::ListEnsureCapacity
+            | N::ListAddRange
+            | N::ListInsert
+            | N::ListReverse
+            | N::ListGetRange
+            | N::ListGetRangeTemporary
+            | N::ListVersionMismatch
+            | N::DictionaryCapacity
+            | N::DictionaryEnsureCapacity
+            | N::DictionaryGetOr
+            | N::MathUnaryFloat
+            | N::MathUnaryDouble
+            | N::MathBinaryFloat
+            | N::MathBinaryDouble
+            | N::MathPredicateFloat
+            | N::MathPredicateDouble
+            | N::MathPowFloat
+            | N::MathPowDouble
+            | N::TimeMonotonicMilliseconds
+            | N::TimeUnixMilliseconds
+            | N::RandomMix
+            | N::RandomEntropySeed
+            | N::ConsoleWrite
+            | N::ConsoleWriteLine
+            | N::ReportRuntimeError(_)
+    )
+}
+
+/// Instructions that release objects that existed before them.
+fn is_releasing_instruction(instruction: &Instruction) -> bool {
+    match instruction {
+        Instruction::ListSet { .. }
+        | Instruction::ListRemoveAt { .. }
+        | Instruction::ListClear { .. }
+        | Instruction::DictionaryAdd { .. }
+        | Instruction::DictionarySet { .. }
+        | Instruction::DictionaryRemove { .. }
+        | Instruction::DictionaryClear { .. }
+        | Instruction::ForeignCall { .. } => true,
+        Instruction::CallIntrinsic { intrinsic, .. } => !non_releasing_intrinsic(intrinsic),
+        _ => false,
+    }
+}
+
+/// Every concrete method an interface method can dispatch to.
+fn interface_targets(module: &Module) -> HashMap<SymbolId, Vec<SymbolId>> {
+    let mut targets = HashMap::new();
+    for interface in &module.interfaces {
+        for (slot, method) in interface.methods.iter().enumerate() {
+            let found = module
+                .interface_implementations
+                .iter()
+                .filter(|implementation| implementation.interface == interface.symbol)
+                .filter_map(|implementation| implementation.methods.get(slot).copied())
+                .collect();
+            targets.insert(method.symbol, found);
+        }
+    }
+    targets
+}
+
+/// Whether `instruction` is not a call into Aster code, or every function it
+/// can reach is in `non_releasing`. An unknown or unimplemented target is not.
+fn calls_only_non_releasing(
+    instruction: &Instruction,
+    non_releasing: &HashSet<SymbolId>,
+    targets: &HashMap<SymbolId, Vec<SymbolId>>,
+) -> bool {
+    match instruction {
+        Instruction::Call { function, .. } => non_releasing.contains(function),
+        Instruction::CallInterface { method, .. } => targets.get(method).is_some_and(|found| {
+            !found.is_empty() && found.iter().all(|target| non_releasing.contains(target))
+        }),
+        _ => true,
+    }
+}
+
+/// A place whose root is an object field or array element.
+fn heap_place(place: &Place) -> bool {
+    match place {
+        Place::Field { base, .. } => heap_place(base),
+        Place::ObjectField { .. } | Place::Index { .. } => true,
+        Place::Local(_) | Place::Symbol(_) | Place::EnumField { .. } => false,
+    }
+}
+
+/// A local that E4 may leave uncounted, with every instruction E4 removes.
+struct Borrow {
+    local: LocalId,
+    /// `(block, instruction)` of each borrowed load that writes the local.
+    loads: Vec<(usize, usize)>,
+    /// `(block, instruction)` of the load retains, captures, capture releases
+    /// and exit releases of the local.
+    removable: Vec<(usize, usize)>,
+}
+
+/// How one instruction mentions a local.
+#[derive(Default)]
+struct Usage {
+    any: bool,
+    /// The local's value is stored, consumed or otherwise kept.
+    kept: bool,
+    /// The local's value is a direct argument or receiver of an Aster call.
+    call_argument: bool,
+}
+
+fn usage_of(instruction: &Instruction, local: LocalId) -> Usage {
+    let mut reads = HashSet::new();
+    owned_instruction_reads(instruction, &mut reads);
+    if !reads.contains(&local) {
+        return Usage::default();
+    }
+    let direct = |operand: &Operand| matches!(&operand.kind, OperandKind::Copy(Place::Local(id)) if *id == local);
+    let mut usage = Usage {
+        any: true,
+        ..Usage::default()
+    };
+    match instruction {
+        Instruction::Assign { value, .. } => match &value.kind {
+            RvalueKind::Use(operand)
+            | RvalueKind::Cast(operand)
+            | RvalueKind::MakeInterface {
+                object: operand, ..
+            } => usage.kept = direct(operand),
+            RvalueKind::Aggregate(fields) | RvalueKind::EnumConstruct { fields, .. } => {
+                usage.kept = fields.iter().any(|field| direct(&field.value));
+            }
+            _ => {}
+        },
+        Instruction::Call { arguments, .. } => {
+            usage.call_argument = arguments.iter().any(direct);
+        }
+        Instruction::CallInterface {
+            receiver,
+            arguments,
+            ..
+        } => usage.call_argument = direct(receiver) || arguments.iter().any(direct),
+        Instruction::ForeignCall { arguments, .. } => {
+            usage.kept = arguments.iter().any(direct);
+        }
+        Instruction::CallIntrinsic {
+            intrinsic,
+            arguments,
+            ..
+        } => {
+            usage.kept = arguments.iter().enumerate().any(|(position, argument)| {
+                stores_argument(intrinsic, position) && direct(argument)
+            });
+        }
+        Instruction::ListAdd { value, .. }
+        | Instruction::ListSet { value, .. }
+        | Instruction::Retain { value }
+        | Instruction::Release { value } => usage.kept = direct(value),
+        Instruction::DictionaryAdd { key, value, .. }
+        | Instruction::DictionarySet { key, value, .. } => {
+            usage.kept = direct(key) || direct(value);
+        }
+        _ => {}
+    }
+    usage
+}
+
+/// The instructions around a borrowed load of `local` at `at` that E4 removes:
+/// the retain of the loaded value, the capture of the old value and its
+/// release. `None` when the instruction is not a borrowed load in the shape
+/// the C5 pass emits.
+fn load_pattern(
+    instructions: &[Instruction],
+    at: usize,
+    local: LocalId,
+    captures: &HashSet<LocalId>,
+) -> Option<Vec<usize>> {
+    // `Some(source)`: a field or element copy retained before the capture;
+    // `None`: a runtime read retained after the instruction.
+    let source = match &instructions[at] {
+        Instruction::Assign {
+            target: Place::Local(id),
+            value:
+                Rvalue {
+                    kind:
+                        RvalueKind::Use(
+                            operand @ Operand {
+                                kind: OperandKind::Copy(place),
+                                ..
+                            },
+                        ),
+                    ..
+                },
+        } if *id == local && heap_place(place) => Some(operand),
+        Instruction::ListGet {
+            destination: Place::Local(id),
+            ..
+        }
+        | Instruction::CallIntrinsic {
+            destination: Some(Place::Local(id)),
+            intrinsic: Intrinsic::DictionaryGetOr,
+            ..
+        } if *id == local => None,
+        _ => return None,
+    };
+    let capture = at
+        .checked_sub(1)
+        .and_then(|index| match &instructions[index] {
+            Instruction::Assign {
+                target: Place::Local(temporary),
+                value:
+                    Rvalue {
+                        kind:
+                            RvalueKind::Use(Operand {
+                                kind: OperandKind::Copy(Place::Local(id)),
+                                ..
+                            }),
+                        ..
+                    },
+            } if *id == local && captures.contains(temporary) => Some((index, *temporary)),
+            _ => None,
+        });
+    let mut removable = Vec::new();
+    let tail = if let Some(source) = source {
+        let retain = capture.map_or(at, |(index, _)| index).checked_sub(1)?;
+        if !matches!(&instructions[retain], Instruction::Retain { value } if value == source) {
+            return None;
+        }
+        removable.push(retain);
+        at + 1
+    } else {
+        if !matches!(
+            instructions.get(at + 1),
+            Some(Instruction::Retain {
+                value: Operand { kind: OperandKind::Copy(Place::Local(id)), .. }
+            }) if *id == local
+        ) {
+            return None;
+        }
+        removable.push(at + 1);
+        at + 2
+    };
+    if let Some((index, temporary)) = capture {
+        if !instructions
+            .get(tail)
+            .is_some_and(|instruction| is_release_of(instruction, temporary))
+        {
+            return None;
+        }
+        removable.extend([index, tail]);
+    }
+    Some(removable)
+}
+
+impl Context<'_> {
+    /// Locals of the pre-pass function that qualify structurally as borrowed
+    /// (E4): one leaf, every write a borrowed load in the C5 shape. Windows
+    /// are checked separately against the summary.
+    fn find_borrows(&self, original: &Function, captures: &HashSet<LocalId>) -> Vec<Borrow> {
+        let mut found = Vec::new();
+        'locals: for local in &original.locals {
+            let shape = leaves(self.module, self.native, &local.type_);
+            if !matches!(&shape[..], [(path, _)] if path.is_empty()) {
+                continue;
+            }
+            let mut loads = Vec::new();
+            let mut removable = Vec::new();
+            for (block_index, block) in self.function.blocks.iter().enumerate() {
+                for (index, instruction) in block.instructions.iter().enumerate() {
+                    if destination_places(instruction)
+                        .iter()
+                        .any(|place| root_local(place) == Some(local.id))
+                    {
+                        let Some(around) =
+                            load_pattern(&block.instructions, index, local.id, captures)
+                        else {
+                            continue 'locals;
+                        };
+                        loads.push((block_index, index));
+                        removable.extend(around.into_iter().map(|at| (block_index, at)));
+                    } else if is_release_of(instruction, local.id) {
+                        removable.push((block_index, index));
+                    }
+                }
+            }
+            if !loads.is_empty() {
+                found.push(Borrow {
+                    local: local.id,
+                    loads,
+                    removable,
+                });
+            }
+        }
+        found
+    }
+
+    /// Whether a write to `place` by `instruction` may release an object: a
+    /// store of reference-bearing data into an element or object field.
+    fn heap_store_releases(&self, instruction: &Instruction, place: &Place) -> bool {
+        if !heap_place(place) {
+            return false;
+        }
+        let stored = match instruction {
+            Instruction::Assign { value, .. } => Some(value.type_.clone()),
+            _ => self.place_type(place),
+        };
+        stored.is_none_or(|type_| !leaves(self.module, self.native, &type_).is_empty())
+    }
+
+    /// Whether the instruction invalidates borrowed heap reads (design 14).
+    fn invalidates(
+        &self,
+        instruction: &Instruction,
+        non_releasing: &HashSet<SymbolId>,
+        targets: &HashMap<SymbolId, Vec<SymbolId>>,
+    ) -> bool {
+        if matches!(instruction, Instruction::Release { .. })
+            || is_releasing_instruction(instruction)
+            || !calls_only_non_releasing(instruction, non_releasing, targets)
+        {
+            return true;
+        }
+        destination_places(instruction).into_iter().any(|place| {
+            root_local(place).is_none()
+                && match instruction {
+                    Instruction::Assign { value, .. } => {
+                        !leaves(self.module, self.native, &value.type_).is_empty()
+                    }
+                    _ => self
+                        .place_type(place)
+                        .is_none_or(|type_| !leaves(self.module, self.native, &type_).is_empty()),
+                }
+        })
+    }
+
+    /// Whether every read of the borrowed local happens inside the window of
+    /// the load that wrote it, and the local is never kept.
+    fn window_holds(
+        &self,
+        borrow: &Borrow,
+        non_releasing: &HashSet<SymbolId>,
+        dropped: &HashSet<(usize, usize)>,
+        targets: &HashMap<SymbolId, Vec<SymbolId>>,
+    ) -> bool {
+        let own: HashSet<(usize, usize)> = borrow.removable.iter().copied().collect();
+        let loads: HashSet<(usize, usize)> = borrow.loads.iter().copied().collect();
+        for (block_index, block) in self.function.blocks.iter().enumerate() {
+            let mut open = false;
+            for (index, instruction) in block.instructions.iter().enumerate() {
+                let at = (block_index, index);
+                if own.contains(&at) {
+                    continue;
+                }
+                let usage = usage_of(instruction, borrow.local);
+                if usage.any
+                    && (!open
+                        || usage.kept
+                        || (usage.call_argument
+                            && !calls_only_non_releasing(instruction, non_releasing, targets)))
+                {
+                    return false;
+                }
+                if !dropped.contains(&at) && self.invalidates(instruction, non_releasing, targets) {
+                    open = false;
+                }
+                if loads.contains(&at) {
+                    open = true;
+                }
+            }
+            let mut reads = HashSet::new();
+            match &block.terminator {
+                Terminator::Branch { condition, .. } => owned_operand_reads(condition, &mut reads),
+                Terminator::Return(Some(operand)) => owned_operand_reads(operand, &mut reads),
+                _ => {}
+            }
+            if reads.contains(&borrow.local) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether the function, with the `dropped` instructions removed, can
+    /// release an object other than through its own parameter exit releases.
+    fn releases_locally(&self, dropped: &HashSet<(usize, usize)>) -> bool {
+        let parameters: HashSet<LocalId> = self.function.parameters.iter().map(|p| p.id).collect();
+        let parameter_root =
+            |place: &Place| root_local(place).is_some_and(|l| parameters.contains(&l));
+        for (block_index, block) in self.function.blocks.iter().enumerate() {
+            for (index, instruction) in block.instructions.iter().enumerate() {
+                if dropped.contains(&(block_index, index)) {
+                    continue;
+                }
+                if is_releasing_instruction(instruction) {
+                    return true;
+                }
+                if let Instruction::Release { value } = instruction
+                    && let OperandKind::Copy(place) = &value.kind
+                    && !parameter_root(place)
+                {
+                    return true;
+                }
+                if destination_places(instruction).into_iter().any(|place| {
+                    parameter_root(place)
+                        || stores_into_array(place)
+                        || self.heap_store_releases(instruction, place)
+                }) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Greatest fixpoint of the non-releasing summary over the call graph.
+fn non_releasing_summary(
+    contexts: &[Context<'_>],
+    dropped: &[HashSet<(usize, usize)>],
+    targets: &HashMap<SymbolId, Vec<SymbolId>>,
+) -> HashSet<SymbolId> {
+    let mut summary: HashSet<SymbolId> = contexts
+        .iter()
+        .zip(dropped)
+        .filter(|(context, dropped)| !context.releases_locally(dropped))
+        .map(|(context, _)| context.function.symbol)
+        .collect();
+    loop {
+        let doomed: Vec<SymbolId> = contexts
+            .iter()
+            .map(|context| context.function)
+            .filter(|function| summary.contains(&function.symbol))
+            .filter(|function| {
+                !function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.instructions)
+                    .all(|instruction| calls_only_non_releasing(instruction, &summary, targets))
+            })
+            .map(|function| function.symbol)
+            .collect();
+        if doomed.is_empty() {
+            return summary;
+        }
+        for symbol in doomed {
+            summary.remove(&symbol);
+        }
+    }
+}
+
+/// E4 and E5. The non-releasing summary and the set of borrowed locals depend
+/// on each other (a recursive function releases nothing only if its borrowed
+/// locals are not released, and a local may be borrowed only if the calls in
+/// its window release nothing), so both start optimistic and shrink together
+/// until stable: every round removes at least one borrowed local, so the loop
+/// ends after at most `locals + 1` rounds. Returns the number of rounds.
+fn elide_with_summaries(
+    module: &Module,
+    native: &HashSet<SymbolId>,
+    output: &mut Module,
+    captures: &[HashSet<LocalId>],
+    stats: &mut OwnershipStats,
+) -> usize {
+    let targets = interface_targets(module);
+    let mut scratch = vec![OwnershipStats::default(); output.functions.len()];
+    let (mut borrows, summary, rounds) = {
+        let contexts: Vec<Context<'_>> = output
+            .functions
+            .iter()
+            .zip(scratch.iter_mut())
+            .map(|(function, stats)| Context {
+                module,
+                native,
+                function,
+                next_local: 0,
+                new_locals: Vec::new(),
+                stats,
+            })
+            .collect();
+        let mut borrows: Vec<Vec<Borrow>> = contexts
+            .iter()
+            .zip(&module.functions)
+            .zip(captures)
+            .map(|((context, original), captures)| context.find_borrows(original, captures))
+            .collect();
+        let mut rounds = 0;
+        loop {
+            rounds += 1;
+            let dropped: Vec<HashSet<(usize, usize)>> = borrows
+                .iter()
+                .map(|list| {
+                    list.iter()
+                        .flat_map(|borrow| borrow.removable.iter().copied())
+                        .collect()
+                })
+                .collect();
+            let summary = non_releasing_summary(&contexts, &dropped, &targets);
+            let mut shrunk = false;
+            for ((context, list), dropped) in contexts.iter().zip(&mut borrows).zip(&dropped) {
+                let before = list.len();
+                list.retain(|borrow| context.window_holds(borrow, &summary, dropped, &targets));
+                shrunk |= list.len() != before;
+            }
+            if !shrunk {
+                break (borrows, summary, rounds);
+            }
+        }
+    };
+    for ((function, borrows), original) in output
+        .functions
+        .iter_mut()
+        .zip(&mut borrows)
+        .zip(&module.functions)
+    {
+        let removed = remove_borrows(function, borrows);
+        stats.retains -= removed.retains;
+        stats.releases -= removed.releases;
+        stats.elided_borrows += removed.retains + removed.releases;
+        if summary.contains(&function.symbol) {
+            let removed = drop_parameter_counts(function, original.entry);
+            stats.retains -= removed.retains;
+            stats.releases -= removed.releases;
+            stats.elided_summary_parameters += removed.retains + removed.releases;
+        }
+    }
+    rounds
+}
+
+/// Remove every instruction of the borrowed locals; returns the count
+/// operations removed (a removed capture assignment is not one).
+fn remove_borrows(function: &mut Function, borrows: &[Borrow]) -> Removed {
+    let mut removed = Removed::default();
+    let positions: HashSet<(usize, usize)> = borrows
+        .iter()
+        .flat_map(|borrow| borrow.removable.iter().copied())
+        .collect();
+    if positions.is_empty() {
+        return removed;
+    }
+    for (block_index, block) in function.blocks.iter_mut().enumerate() {
+        let mut index = 0;
+        block.instructions.retain(|instruction| {
+            let drop = positions.contains(&(block_index, index));
+            index += 1;
+            if drop {
+                match instruction {
+                    Instruction::Retain { .. } => removed.retains += 1,
+                    Instruction::Release { .. } => removed.releases += 1,
+                    _ => {}
+                }
+            }
+            !drop
+        });
+    }
+    removed
+}
+
+/// E5: in a non-releasing function, drop the entry block the pass added (the
+/// retains of the parameters) and the parameter exit releases. Nothing is
+/// removed unless the entry has exactly the shape the pass emits.
+fn drop_parameter_counts(function: &mut Function, original_entry: BasicBlockId) -> Removed {
+    let mut removed = Removed::default();
+    if function.entry == original_entry {
+        return removed;
+    }
+    let Some(position) = function
+        .blocks
+        .iter()
+        .position(|block| block.id == function.entry)
+    else {
+        return removed;
+    };
+    let entry = &function.blocks[position];
+    if entry.terminator != Terminator::Goto(original_entry)
+        || !entry
+            .instructions
+            .iter()
+            .all(|instruction| matches!(instruction, Instruction::Retain { .. }))
+    {
+        return removed;
+    }
+    removed.retains += entry.instructions.len();
+    function.entry = original_entry;
+    function.blocks.remove(position);
+    let parameters: HashSet<LocalId> = function.parameters.iter().map(|p| p.id).collect();
+    for block in &mut function.blocks {
+        let before = block.instructions.len();
+        block.instructions.retain(|instruction| {
+            !matches!(
+                instruction,
+                Instruction::Release { value: Operand { kind: OperandKind::Copy(place), .. } }
+                    if root_local(place).is_some_and(|local| parameters.contains(&local))
+            )
+        });
+        removed.releases += before - block.instructions.len();
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1338,6 +2025,8 @@ mod tests {
                 + elided_stats.elided_null_captures
                 + elided_stats.elided_moves
                 + elided_stats.elided_parameters
+                + elided_stats.elided_borrows
+                + elided_stats.elided_summary_parameters
         );
         Both {
             c5,
@@ -1491,6 +2180,7 @@ mod tests {
                 elided_null_captures: 2,
                 elided_moves: 2,
                 elided_parameters: 0,
+                ..OwnershipStats::default()
             }
         );
         assert_eq!(
@@ -2547,5 +3237,564 @@ mod tests {
             assert_eq!(result.elided_stats.elided_parameters, 0);
             assert_eq!(counts(&result.elided), (1, 1));
         }
+    }
+
+    // ---- E4 borrow windows and E5 non-releasing summaries (design 14) ----
+
+    const NODE: u32 = 60;
+    const VALUE: u32 = 61;
+    const CHILDREN: u32 = 62;
+    const NEXT: u32 = 63;
+    const SINK: u32 = 64;
+    const ITEMS: u32 = 65;
+    const SUM: u32 = 1;
+    const GET_VALUE: u32 = 2;
+    const STORE: u32 = 3;
+    const RUNNER: u32 = 4;
+    const CLEAR_ITEMS: u32 = 6;
+
+    fn node() -> Type {
+        Type::Class(SymbolId(NODE))
+    }
+
+    fn nodes() -> Type {
+        Type::Array(Box::new(node()))
+    }
+
+    fn node_list() -> Type {
+        Type::List(Box::new(node()))
+    }
+
+    fn sink() -> Type {
+        Type::Interface(SymbolId(30))
+    }
+
+    fn node_field(local: u32, field: u32) -> Place {
+        Place::ObjectField {
+            object: Box::new(copy(lp(local), &node())),
+            field: SymbolId(field),
+        }
+    }
+
+    fn int_constant(value: &str) -> Operand {
+        Operand {
+            type_: Type::Int,
+            kind: OperandKind::Constant(mir::Constant::Integer(value.into())),
+        }
+    }
+
+    fn compute(
+        target: u32,
+        type_: &Type,
+        left: Operand,
+        operator: mir::BinaryOperator,
+        right: Operand,
+    ) -> Instruction {
+        Instruction::Assign {
+            target: lp(target),
+            value: Rvalue {
+                type_: type_.clone(),
+                kind: RvalueKind::Binary {
+                    left,
+                    operator,
+                    right,
+                },
+            },
+        }
+    }
+
+    fn add(target: u32, left: u32, right: u32) -> Instruction {
+        compute(
+            target,
+            &Type::Int,
+            copy(lp(left), &Type::Int),
+            mir::BinaryOperator::Add,
+            copy(lp(right), &Type::Int),
+        )
+    }
+
+    fn call_of(
+        function: u32,
+        destination: Option<u32>,
+        arguments: Vec<Operand>,
+        return_type: &Type,
+    ) -> Instruction {
+        Instruction::Call {
+            destination: destination.map(lp),
+            function: SymbolId(function),
+            arguments,
+            return_type: return_type.clone(),
+        }
+    }
+
+    fn function(
+        symbol: u32,
+        parameters: Vec<Local>,
+        locals: Vec<Local>,
+        blocks: Vec<BasicBlock>,
+        return_type: Type,
+    ) -> Function {
+        Function {
+            constructor: false,
+            symbol: SymbolId(symbol),
+            owner: None,
+            name: format!("f{symbol}"),
+            visibility: Visibility::Public,
+            parameters,
+            locals,
+            return_type,
+            entry: BasicBlockId(0),
+            blocks,
+            temporary_subregion_candidates: Vec::new(),
+        }
+    }
+
+    /// `int GetValue(Node this) { return this.value; }`
+    fn get_value() -> Function {
+        function(
+            GET_VALUE,
+            vec![local(0, node(), false)],
+            Vec::new(),
+            vec![block(
+                0,
+                Vec::new(),
+                Terminator::Return(Some(copy(node_field(0, VALUE), &Type::Int))),
+            )],
+            Type::Int,
+        )
+    }
+
+    /// `void Store(Node this, Node other) { this.next = other; }`: releases the
+    /// object `this.next` held.
+    fn store() -> Function {
+        function(
+            STORE,
+            vec![local(0, node(), false), local(1, node(), false)],
+            Vec::new(),
+            vec![block(
+                0,
+                vec![assign(node_field(0, NEXT), &node(), copy(lp(1), &node()))],
+                Terminator::Return(None),
+            )],
+            Type::Void,
+        )
+    }
+
+    /// `int ClearItems(Node this) { this.items.Clear(); return 0; }`
+    fn clear_items() -> Function {
+        function(
+            CLEAR_ITEMS,
+            vec![local(0, node(), false)],
+            Vec::new(),
+            vec![block(
+                0,
+                vec![Instruction::ListClear {
+                    list: copy(node_field(0, ITEMS), &node_list()),
+                }],
+                Terminator::Return(Some(int_constant("0"))),
+            )],
+            Type::Int,
+        )
+    }
+
+    fn graph(implementation: u32, functions: Vec<Function>) -> Module {
+        Module {
+            structs: Vec::new(),
+            classes: vec![mir::ClassDefinition {
+                symbol: SymbolId(NODE),
+                name: "Node".into(),
+                fields: vec![
+                    field_definition(VALUE, Type::Int),
+                    field_definition(CHILDREN, nodes()),
+                    field_definition(NEXT, node()),
+                    field_definition(SINK, sink()),
+                    field_definition(ITEMS, node_list()),
+                ],
+            }],
+            interfaces: vec![mir::InterfaceDefinition {
+                symbol: SymbolId(30),
+                name: "ISink".into(),
+                methods: vec![mir::InterfaceMethodDefinition {
+                    symbol: SymbolId(31),
+                    name: "Read".into(),
+                    parameters: Vec::new(),
+                    return_type: Type::Int,
+                }],
+            }],
+            enums: Vec::new(),
+            interface_implementations: vec![mir::InterfaceImplementation {
+                class: SymbolId(NODE),
+                interface: SymbolId(30),
+                methods: vec![SymbolId(implementation)],
+            }],
+            foreign_functions: Vec::new(),
+            functions,
+        }
+    }
+
+    struct Graph {
+        c5: Module,
+        c6: Module,
+        c5_stats: OwnershipStats,
+        c6_stats: OwnershipStats,
+    }
+
+    /// C5 and C6 output of a whole module; both must validate and the C6
+    /// accounting must add up.
+    fn elide_graph(module: &Module) -> Graph {
+        let (c5, c5_stats) = insert_ownership(module);
+        assert_eq!(validate_ownership(&c5), Ok(()), "C5: {c5:#?}");
+        let (c6, c6_stats) = insert_ownership_elided(module);
+        assert_eq!(validate_ownership(&c6), Ok(()), "C6: {c6:#?}");
+        for (module, stats) in [(&c5, c5_stats), (&c6, c6_stats)] {
+            let total = module
+                .functions
+                .iter()
+                .map(counts)
+                .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+            assert_eq!(total, (stats.retains, stats.releases));
+        }
+        assert_eq!(
+            c5_stats.retains + c5_stats.releases,
+            c6_stats.retains
+                + c6_stats.releases
+                + c6_stats.elided_null_captures
+                + c6_stats.elided_moves
+                + c6_stats.elided_parameters
+                + c6_stats.elided_borrows
+                + c6_stats.elided_summary_parameters
+        );
+        Graph {
+            c5,
+            c6,
+            c5_stats,
+            c6_stats,
+        }
+    }
+
+    fn function_counts(module: &Module, symbol: u32) -> (usize, usize) {
+        counts(
+            module
+                .functions
+                .iter()
+                .find(|function| function.symbol == SymbolId(symbol))
+                .unwrap(),
+        )
+    }
+
+    fn cond_branch(local_id: u32, then_block: u32, else_block: u32) -> Terminator {
+        Terminator::Branch {
+            condition: copy(lp(local_id), &Type::Bool),
+            then_block: BasicBlockId(then_block),
+            else_block: BasicBlockId(else_block),
+        }
+    }
+
+    /// `int Sum(Node this)`: `total = this.value; foreach child in
+    /// this.children { total += Sum(child); }`, with the array and the element
+    /// loaded inside one block (a loop body that reloads the field).
+    fn tree_sum() -> Function {
+        function(
+            SUM,
+            vec![local(0, node(), false)],
+            vec![
+                local(1, Type::Int, false),
+                local(2, Type::Int, false),
+                local(3, nodes(), true),
+                local(4, Type::Int, true),
+                local(5, Type::Bool, true),
+                local(6, nodes(), true),
+                local(7, node(), false),
+                local(8, Type::Int, true),
+            ],
+            vec![
+                block(
+                    0,
+                    vec![
+                        assign(lp(1), &Type::Int, copy(node_field(0, VALUE), &Type::Int)),
+                        assign(lp(2), &Type::Int, int_constant("0")),
+                    ],
+                    Terminator::Goto(BasicBlockId(1)),
+                ),
+                block(
+                    1,
+                    vec![
+                        assign(lp(3), &nodes(), copy(node_field(0, CHILDREN), &nodes())),
+                        Instruction::Assign {
+                            target: lp(4),
+                            value: Rvalue {
+                                type_: Type::Int,
+                                kind: RvalueKind::ArrayLength(copy(lp(3), &nodes())),
+                            },
+                        },
+                        compute(
+                            5,
+                            &Type::Bool,
+                            copy(lp(2), &Type::Int),
+                            mir::BinaryOperator::Less,
+                            copy(lp(4), &Type::Int),
+                        ),
+                    ],
+                    cond_branch(5, 2, 3),
+                ),
+                block(
+                    2,
+                    vec![
+                        assign(lp(6), &nodes(), copy(node_field(0, CHILDREN), &nodes())),
+                        assign(lp(7), &node(), copy(element(6, &node()), &node())),
+                        call_of(SUM, Some(8), vec![copy(lp(7), &node())], &Type::Int),
+                        add(1, 1, 8),
+                        compute(
+                            2,
+                            &Type::Int,
+                            copy(lp(2), &Type::Int),
+                            mir::BinaryOperator::Add,
+                            int_constant("1"),
+                        ),
+                    ],
+                    Terminator::Goto(BasicBlockId(1)),
+                ),
+                block(
+                    3,
+                    Vec::new(),
+                    Terminator::Return(Some(copy(lp(1), &Type::Int))),
+                ),
+            ],
+            Type::Int,
+        )
+    }
+
+    #[test]
+    fn recursive_tree_sum_has_no_count_operations_in_c6() {
+        let result = elide_graph(&graph(GET_VALUE, vec![tree_sum(), get_value()]));
+        assert_ne!(function_counts(&result.c5, SUM), (0, 0));
+        assert_eq!(function_counts(&result.c6, SUM), (0, 0));
+        assert!(result.c6_stats.elided_borrows > 0, "{:?}", result.c6_stats);
+        assert!(
+            result.c6_stats.elided_summary_parameters > 0,
+            "{:?}",
+            result.c6_stats
+        );
+        assert_eq!(result.c5_stats.elided_borrows, 0);
+    }
+
+    /// `int Run(Node a)`: `x = a.next; v = GetValue(x); y = x.next; w =
+    /// GetValue(y); return v + w;` with `x` read after a call.
+    fn getter_chain() -> Function {
+        function(
+            RUNNER,
+            vec![local(0, node(), false)],
+            vec![
+                local(1, node(), false),
+                local(2, Type::Int, false),
+                local(3, node(), false),
+                local(4, Type::Int, false),
+                local(5, Type::Int, true),
+            ],
+            vec![block(
+                0,
+                vec![
+                    assign(lp(1), &node(), copy(node_field(0, NEXT), &node())),
+                    call_of(GET_VALUE, Some(2), vec![copy(lp(1), &node())], &Type::Int),
+                    assign(lp(3), &node(), copy(node_field(1, NEXT), &node())),
+                    call_of(GET_VALUE, Some(4), vec![copy(lp(3), &node())], &Type::Int),
+                    add(5, 2, 4),
+                ],
+                Terminator::Return(Some(copy(lp(5), &Type::Int))),
+            )],
+            Type::Int,
+        )
+    }
+
+    #[test]
+    fn getter_chain_through_non_releasing_getters_has_no_count_operations() {
+        let result = elide_graph(&graph(GET_VALUE, vec![getter_chain(), get_value()]));
+        assert_ne!(function_counts(&result.c5, RUNNER), (0, 0));
+        assert_eq!(function_counts(&result.c6, RUNNER), (0, 0));
+        assert_eq!(function_counts(&result.c6, GET_VALUE), (0, 0));
+        assert!(result.c6_stats.elided_borrows >= 4);
+    }
+
+    /// `int Run(Node a)`: `s = a.sink; v = s.Read(); w = s.Read();
+    /// return v + w;`
+    fn interface_reader() -> Function {
+        let read = |destination: u32| Instruction::CallInterface {
+            destination: Some(lp(destination)),
+            receiver: copy(lp(1), &sink()),
+            method: SymbolId(31),
+            arguments: Vec::new(),
+            return_type: Type::Int,
+        };
+        function(
+            RUNNER,
+            vec![local(0, node(), false)],
+            vec![
+                local(1, sink(), false),
+                local(2, Type::Int, false),
+                local(3, Type::Int, false),
+                local(4, Type::Int, true),
+            ],
+            vec![block(
+                0,
+                vec![
+                    assign(lp(1), &sink(), copy(node_field(0, SINK), &sink())),
+                    read(2),
+                    read(3),
+                    add(4, 2, 3),
+                ],
+                Terminator::Return(Some(copy(lp(4), &Type::Int))),
+            )],
+            Type::Int,
+        )
+    }
+
+    #[test]
+    fn interface_call_with_one_non_releasing_implementation_keeps_the_receiver_borrowed() {
+        let result = elide_graph(&graph(GET_VALUE, vec![interface_reader(), get_value()]));
+        assert_ne!(function_counts(&result.c5, RUNNER), (0, 0));
+        assert_eq!(function_counts(&result.c6, RUNNER), (0, 0));
+        assert!(result.c6_stats.elided_borrows > 0);
+    }
+
+    #[test]
+    fn interface_call_with_a_releasing_implementation_counts_the_receiver() {
+        let result = elide_graph(&graph(CLEAR_ITEMS, vec![interface_reader(), clear_items()]));
+        assert_eq!(result.c6_stats.elided_borrows, 0);
+        assert_eq!(result.c6_stats.elided_summary_parameters, 0);
+        assert_eq!(function_counts(&result.c6, RUNNER), (2, 2));
+    }
+
+    #[test]
+    fn borrowed_local_passed_to_a_callee_that_stores_into_its_source_field_stays_counted() {
+        // x = a.next; Store(a, x); v = GetValue(x): Store releases a.next.
+        let caller = function(
+            RUNNER,
+            vec![local(0, node(), false)],
+            vec![local(1, node(), false), local(2, Type::Int, false)],
+            vec![block(
+                0,
+                vec![
+                    assign(lp(1), &node(), copy(node_field(0, NEXT), &node())),
+                    call_of(
+                        STORE,
+                        None,
+                        vec![copy(lp(0), &node()), copy(lp(1), &node())],
+                        &Type::Void,
+                    ),
+                    call_of(GET_VALUE, Some(2), vec![copy(lp(1), &node())], &Type::Int),
+                ],
+                Terminator::Return(Some(copy(lp(2), &Type::Int))),
+            )],
+            Type::Int,
+        );
+        let result = elide_graph(&graph(GET_VALUE, vec![caller, store(), get_value()]));
+        assert_eq!(result.c6_stats.elided_borrows, 0, "{:?}", result.c6_stats);
+        // The parameter and the loaded local are both still counted (the
+        // only difference to C5 is the E1 null capture).
+        assert_eq!(function_counts(&result.c6, RUNNER), (2, 2));
+    }
+
+    fn list_reader(with_set: bool) -> Function {
+        let mut instructions = vec![Instruction::ListGet {
+            destination: lp(2),
+            list: copy(lp(0), &node_list()),
+            index: zero(),
+            element_type: node(),
+        }];
+        if with_set {
+            instructions.push(Instruction::ListSet {
+                list: copy(lp(0), &node_list()),
+                index: zero(),
+                value: copy(lp(1), &node()),
+            });
+        }
+        instructions.push(call_of(
+            GET_VALUE,
+            Some(3),
+            vec![copy(lp(2), &node())],
+            &Type::Int,
+        ));
+        function(
+            RUNNER,
+            vec![local(0, node_list(), false), local(1, node(), false)],
+            vec![local(2, node(), false), local(3, Type::Int, false)],
+            vec![block(
+                0,
+                instructions,
+                Terminator::Return(Some(copy(lp(3), &Type::Int))),
+            )],
+            Type::Int,
+        )
+    }
+
+    #[test]
+    fn borrowed_local_used_after_a_list_set_stays_counted() {
+        let result = elide_graph(&graph(GET_VALUE, vec![list_reader(true), get_value()]));
+        assert_eq!(result.c6_stats.elided_borrows, 0, "{:?}", result.c6_stats);
+    }
+
+    #[test]
+    fn list_element_read_used_before_any_invalidation_is_borrowed() {
+        let result = elide_graph(&graph(GET_VALUE, vec![list_reader(false), get_value()]));
+        assert!(result.c6_stats.elided_borrows > 0);
+        assert!(function_counts(&result.c6, RUNNER) < function_counts(&result.c5, RUNNER));
+    }
+
+    #[test]
+    fn a_function_that_calls_a_releasing_function_keeps_its_parameter_counts() {
+        // void Run(Node this) { Store(this, this); }
+        let caller = function(
+            RUNNER,
+            vec![local(0, node(), false)],
+            Vec::new(),
+            vec![block(
+                0,
+                vec![call_of(
+                    STORE,
+                    None,
+                    vec![copy(lp(0), &node()), copy(lp(0), &node())],
+                    &Type::Void,
+                )],
+                Terminator::Return(None),
+            )],
+            Type::Void,
+        );
+        let result = elide_graph(&graph(GET_VALUE, vec![caller, store()]));
+        assert_eq!(result.c6_stats.elided_summary_parameters, 0);
+        assert_eq!(
+            function_counts(&result.c6, RUNNER),
+            function_counts(&result.c5, RUNNER)
+        );
+        assert_ne!(function_counts(&result.c6, RUNNER), (0, 0));
+    }
+
+    #[test]
+    fn a_borrowed_local_read_in_another_block_stays_counted() {
+        // x = a.next in block 0, v = GetValue(x) in block 1.
+        let caller = function(
+            RUNNER,
+            vec![local(0, node(), false)],
+            vec![local(1, node(), false), local(2, Type::Int, false)],
+            vec![
+                block(
+                    0,
+                    vec![assign(lp(1), &node(), copy(node_field(0, NEXT), &node()))],
+                    Terminator::Goto(BasicBlockId(1)),
+                ),
+                block(
+                    1,
+                    vec![call_of(
+                        GET_VALUE,
+                        Some(2),
+                        vec![copy(lp(1), &node())],
+                        &Type::Int,
+                    )],
+                    Terminator::Return(Some(copy(lp(2), &Type::Int))),
+                ),
+            ],
+            Type::Int,
+        );
+        let result = elide_graph(&graph(GET_VALUE, vec![caller, get_value()]));
+        assert_eq!(result.c6_stats.elided_borrows, 0);
     }
 }

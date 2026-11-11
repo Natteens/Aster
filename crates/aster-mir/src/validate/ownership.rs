@@ -2,7 +2,7 @@
 //! (obligations U1, U2, U4 of master plan §5.6). Shares no code with
 //! [`crate::ownership`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate as mir;
@@ -37,8 +37,9 @@ impl fmt::Display for OwnershipFinding {
 pub fn validate_ownership(module: &mir::Module) -> Result<(), Vec<OwnershipFinding>> {
     let mut findings = Vec::new();
     let native = native_header_classes(module);
+    let summary = Summary::compute(module, &native);
     for function in &module.functions {
-        check_function(module, &native, function, &mut findings);
+        check_function(module, &native, &summary, function, &mut findings);
     }
     if findings.is_empty() {
         Ok(())
@@ -128,10 +129,193 @@ struct Write {
 struct Frame<'a> {
     module: &'a Module,
     native: &'a [SymbolId],
+    summary: &'a Summary,
     function: &'a Function,
     keys: Vec<(LocalId, Path)>,
-    /// C6 leaf-function mode: parameters are held without a count.
+    /// Non-releasing-function mode (C6, E3/E5): parameters are held without a
+    /// count.
     borrowed_params: bool,
+}
+
+/// Which functions are non-releasing (design section 14): after the pass they
+/// contain no `Release` other than their own parameter exit releases, no
+/// releasing instruction or intrinsic, no foreign call, write no parameter
+/// slot, and call only non-releasing functions. Nothing can be freed while
+/// such a function runs. Computed here, from the module alone, as a greatest
+/// fixpoint over the call graph.
+#[derive(Default)]
+struct Summary {
+    non_releasing: HashSet<SymbolId>,
+    /// Concrete methods behind each interface method symbol.
+    targets: HashMap<SymbolId, Vec<SymbolId>>,
+}
+
+impl Summary {
+    fn compute(module: &Module, native: &[SymbolId]) -> Self {
+        let mut targets = HashMap::new();
+        for interface in &module.interfaces {
+            for (slot, method) in interface.methods.iter().enumerate() {
+                let found: Vec<SymbolId> = module
+                    .interface_implementations
+                    .iter()
+                    .filter(|implementation| implementation.interface == interface.symbol)
+                    .filter_map(|implementation| implementation.methods.get(slot).copied())
+                    .collect();
+                targets.insert(method.symbol, found);
+            }
+        }
+        let empty = Self::default();
+        let non_releasing = module
+            .functions
+            .iter()
+            .filter(|function| !releases_locally(module, native, &empty, function))
+            .map(|function| function.symbol)
+            .collect();
+        let mut summary = Self {
+            non_releasing,
+            targets,
+        };
+        loop {
+            let doomed: Vec<SymbolId> = module
+                .functions
+                .iter()
+                .filter(|function| summary.non_releasing.contains(&function.symbol))
+                .filter(|function| {
+                    function
+                        .blocks
+                        .iter()
+                        .flat_map(|block| &block.instructions)
+                        .any(|instruction| !summary.call_is_safe(instruction))
+                })
+                .map(|function| function.symbol)
+                .collect();
+            if doomed.is_empty() {
+                return summary;
+            }
+            for symbol in doomed {
+                summary.non_releasing.remove(&symbol);
+            }
+        }
+    }
+
+    fn interface_is_safe(&self, method: SymbolId) -> bool {
+        self.targets.get(&method).is_some_and(|found| {
+            !found.is_empty()
+                && found
+                    .iter()
+                    .all(|target| self.non_releasing.contains(target))
+        })
+    }
+
+    /// Whether `instruction` is not an Aster call, or reaches only
+    /// non-releasing functions (an unknown target is releasing).
+    fn call_is_safe(&self, instruction: &mir::Instruction) -> bool {
+        match instruction {
+            mir::Instruction::Call { function, .. } => self.non_releasing.contains(function),
+            mir::Instruction::CallInterface { method, .. } => self.interface_is_safe(*method),
+            _ => true,
+        }
+    }
+}
+
+/// Intrinsics that only read their arguments or allocate fresh objects: no
+/// user code runs and no previously existing object is released. Everything
+/// else is treated as releasing.
+fn intrinsic_is_read_only(intrinsic: &mir::Intrinsic) -> bool {
+    use mir::Intrinsic as N;
+    matches!(
+        intrinsic,
+        N::Log
+            | N::LogWarning
+            | N::LogError
+            | N::StringEquals
+            | N::StringConcat
+            | N::StringConcatTemporary
+            | N::StringLength
+            | N::StringContains
+            | N::StringStartsWith
+            | N::StringEndsWith
+            | N::StringIndexOf
+            | N::StringLastIndexOf
+            | N::StringSubstringFrom
+            | N::StringSubstringFromTemporary
+            | N::StringSubstringRange
+            | N::StringSubstringRangeTemporary
+            | N::StringTrim
+            | N::StringTrimTemporary
+            | N::StringTrimStart
+            | N::StringTrimStartTemporary
+            | N::StringTrimEnd
+            | N::StringTrimEndTemporary
+            | N::StringJoinArray
+            | N::StringJoinArrayTemporary
+            | N::StringConcatArray
+            | N::StringConcatArrayTemporary
+            | N::StringRepeat
+            | N::StringRepeatTemporary
+            | N::StringToChars
+            | N::StringToCharsTemporary
+            | N::StringFromChars
+            | N::StringFromCharsTemporary
+            | N::StringReplace
+            | N::StringReplaceTemporary
+            | N::StringSplit
+            | N::StringSplitTemporary
+            | N::StringFromLong
+            | N::StringFromLongTemporary
+            | N::StringFromULong
+            | N::StringFromULongTemporary
+            | N::StringFromDouble
+            | N::StringFromDoubleTemporary
+            | N::StringFromFloat
+            | N::StringFromFloatTemporary
+            | N::StringFromBool
+            | N::StringFromBoolTemporary
+            | N::StringFromChar
+            | N::StringFromCharTemporary
+            | N::StringJoin
+            | N::StringJoinTemporary
+            | N::StringBuilderLength
+            | N::StringBuilderClear
+            | N::StringTryParseBool
+            | N::StringTryParseChar
+            | N::StringTryParseSByte
+            | N::StringTryParseByte
+            | N::StringTryParseShort
+            | N::StringTryParseUShort
+            | N::StringTryParseInt
+            | N::StringTryParseUInt
+            | N::StringTryParseLong
+            | N::StringTryParseULong
+            | N::StringTryParseFloat
+            | N::StringTryParseDouble
+            | N::ListCapacity
+            | N::ListEnsureCapacity
+            | N::ListAddRange
+            | N::ListInsert
+            | N::ListReverse
+            | N::ListGetRange
+            | N::ListGetRangeTemporary
+            | N::ListVersionMismatch
+            | N::DictionaryCapacity
+            | N::DictionaryEnsureCapacity
+            | N::DictionaryGetOr
+            | N::MathUnaryFloat
+            | N::MathUnaryDouble
+            | N::MathBinaryFloat
+            | N::MathBinaryDouble
+            | N::MathPredicateFloat
+            | N::MathPredicateDouble
+            | N::MathPowFloat
+            | N::MathPowDouble
+            | N::TimeMonotonicMilliseconds
+            | N::TimeUnixMilliseconds
+            | N::RandomMix
+            | N::RandomEntropySeed
+            | N::ConsoleWrite
+            | N::ConsoleWriteLine
+            | N::ReportRuntimeError(_)
+    )
 }
 
 fn extend(place: &Place, path: &[SymbolId]) -> Place {
@@ -692,19 +876,31 @@ impl<'a> Block<'a> {
             I::Call {
                 destination,
                 arguments,
+                function,
                 ..
             } => {
+                // A call that releases nothing does not invalidate (E5); to
+                // any other callee a borrowed local is not a guarantor (G1).
+                let safe = self.frame.summary.non_releasing.contains(function);
                 let plain: Vec<&Operand> = arguments.iter().collect();
-                self.effect(&plain, &[], destination.as_ref(), Product::Owned, true);
+                if !safe {
+                    self.require_guarantor(&plain);
+                }
+                self.effect(&plain, &[], destination.as_ref(), Product::Owned, !safe);
             }
             I::CallInterface {
                 destination,
                 receiver,
+                method,
                 arguments,
                 ..
             } => {
+                let safe = self.frame.summary.interface_is_safe(*method);
                 let plain: Vec<&Operand> = std::iter::once(receiver).chain(arguments).collect();
-                self.effect(&plain, &[], destination.as_ref(), Product::Owned, true);
+                if !safe {
+                    self.require_guarantor(&plain);
+                }
+                self.effect(&plain, &[], destination.as_ref(), Product::Owned, !safe);
             }
             I::ForeignCall {
                 destination,
@@ -740,7 +936,9 @@ impl<'a> Block<'a> {
                 } else {
                     Product::Borrowed
                 };
-                self.effect(&plain, &consumed, destination.as_ref(), product, true);
+                // A read-only or allocating intrinsic frees nothing.
+                let clobber = !intrinsic_is_read_only(intrinsic);
+                self.effect(&plain, &consumed, destination.as_ref(), product, clobber);
             }
             I::StringBuilderToString {
                 destination,
@@ -869,6 +1067,30 @@ impl<'a> Block<'a> {
         }
     }
 
+    /// G1: a local that holds a borrowed heap read without a count is not a
+    /// guarantor for a callee that may release; only the caller's direct
+    /// heap reads (which the callee retains on entry) may be passed to it.
+    fn require_guarantor(&mut self, arguments: &[&Operand]) {
+        for operand in arguments {
+            let OperandKind::Copy(place) = &operand.kind else {
+                continue;
+            };
+            for (_, leaf) in self.frame.leaf_places(place, &operand.type_) {
+                if let Home::Slot(index) = self.frame.home(&leaf)
+                    && self.slots[index] == SlotState::Live
+                    && let Some(value) = self.held[index]
+                    && self.values[value].provenance == Provenance::HeapRead
+                    && self.values[value].tokens <= 0
+                {
+                    self.flag(
+                        "U2",
+                        "borrowed local passed to a callee that may release (no guarantor)",
+                    );
+                }
+            }
+        }
+    }
+
     fn balance(&mut self, holders: &[usize]) {
         for (value, held) in holders.iter().enumerate() {
             if self.counted(value)
@@ -971,12 +1193,14 @@ fn successors(terminator: &mir::Terminator) -> Vec<BasicBlockId> {
 fn check_function(
     module: &Module,
     native: &[SymbolId],
+    summary: &Summary,
     function: &Function,
     findings: &mut Vec<OwnershipFinding>,
 ) {
     let mut frame = Frame {
         module,
         native,
+        summary,
         function,
         keys: Vec::new(),
         borrowed_params: false,
@@ -1012,7 +1236,7 @@ fn check_function(
     }
     frame.keys = keys;
     let mut found = analyse(&frame);
-    if !found.is_empty() && leaf_function(function) {
+    if !found.is_empty() && summary.non_releasing.contains(&function.symbol) {
         frame.borrowed_params = true;
         if analyse(&frame).is_empty() {
             found.clear();
@@ -1039,8 +1263,20 @@ fn stores_element(place: &Place) -> bool {
     matches!(current, Place::Index { .. })
 }
 
-/// Every place an instruction writes (call destinations excluded: calls
-/// already disqualify a leaf function).
+/// The local a place is stored in, when the place is a local or a field path
+/// of a local.
+fn local_root(place: &Place) -> Option<LocalId> {
+    let mut current = place;
+    while let Place::Field { base, .. } = current {
+        current = base;
+    }
+    match current {
+        Place::Local(id) => Some(*id),
+        _ => None,
+    }
+}
+
+/// Every place an instruction writes, call destinations included.
 fn written_places(instruction: &mir::Instruction) -> Vec<&Place> {
     use mir::Instruction as I;
     match instruction {
@@ -1061,6 +1297,10 @@ fn written_places(instruction: &mir::Instruction) -> Vec<&Place> {
         | I::DictionaryValues { destination, .. }
         | I::ListGet { destination, .. }
         | I::ListToArray { destination, .. } => vec![destination],
+        I::Call { destination, .. }
+        | I::CallInterface { destination, .. }
+        | I::ForeignCall { destination, .. }
+        | I::CallIntrinsic { destination, .. } => destination.iter().collect(),
         I::StringDecodeNext {
             char_destination,
             next_cursor_destination,
@@ -1071,38 +1311,60 @@ fn written_places(instruction: &mir::Instruction) -> Vec<&Place> {
     }
 }
 
-/// A function that can release nothing but its own parameters: no call of
-/// any kind and no `Release` of anything but a parameter slot. Only there may
-/// a parameter's original value be held without a count (C6, rule E3).
-fn leaf_function(function: &Function) -> bool {
+/// Whether `function` can release an object other than through its own
+/// parameter exit releases (so it is not non-releasing, ignoring its calls).
+fn releases_locally(
+    module: &Module,
+    native: &[SymbolId],
+    summary: &Summary,
+    function: &Function,
+) -> bool {
+    use mir::Instruction as I;
+    let frame = Frame {
+        module,
+        native,
+        summary,
+        function,
+        keys: Vec::new(),
+        borrowed_params: false,
+    };
+    let is_parameter = |place: &Place| {
+        local_root(place).is_some_and(|id| function.parameters.iter().any(|p| p.id == id))
+    };
     function
         .blocks
         .iter()
         .flat_map(|block| &block.instructions)
-        .all(|instruction| match instruction {
-            mir::Instruction::Call { .. }
-            | mir::Instruction::CallInterface { .. }
-            | mir::Instruction::ForeignCall { .. }
-            | mir::Instruction::CallIntrinsic { .. }
-            | mir::Instruction::ListSet { .. }
-            | mir::Instruction::ListRemoveAt { .. }
-            | mir::Instruction::ListClear { .. }
-            | mir::Instruction::DictionaryAdd { .. }
-            | mir::Instruction::DictionarySet { .. }
-            | mir::Instruction::DictionaryRemove { .. }
-            | mir::Instruction::DictionaryClear { .. } => false,
-            instruction if written_places(instruction).into_iter().any(stores_element) => false,
-            mir::Instruction::Release { value } => {
-                let OperandKind::Copy(place) = &value.kind else {
-                    return true;
-                };
-                let mut root = place;
-                while let Place::Field { base, .. } = root {
-                    root = base;
-                }
-                matches!(root, Place::Local(id) if function.parameters.iter().any(|p| p.id == *id))
-            }
-            _ => true,
+        .any(|instruction| {
+            let releasing = match instruction {
+                I::ListSet { .. }
+                | I::ListRemoveAt { .. }
+                | I::ListClear { .. }
+                | I::DictionaryAdd { .. }
+                | I::DictionarySet { .. }
+                | I::DictionaryRemove { .. }
+                | I::DictionaryClear { .. }
+                | I::ForeignCall { .. } => true,
+                I::CallIntrinsic { intrinsic, .. } => !intrinsic_is_read_only(intrinsic),
+                I::Release { value } => match &value.kind {
+                    OperandKind::Copy(place) => !is_parameter(place),
+                    _ => false,
+                },
+                _ => false,
+            };
+            releasing
+                || written_places(instruction).into_iter().any(|place| {
+                    // A write to a parameter slot, an array element, or a
+                    // reference-bearing object field may release.
+                    let stored = match instruction {
+                        I::Assign { value, .. } => Some(value.type_.clone()),
+                        _ => frame.place_type(place),
+                    };
+                    is_parameter(place)
+                        || stores_element(place)
+                        || (matches!(frame.home(place), Home::Heap)
+                            && stored.is_none_or(|type_| !frame.leaf_types(&type_).is_empty()))
+                })
         })
 }
 
@@ -2433,6 +2695,293 @@ mod tests {
                 count_of_parameter(),
             ],
         );
+        assert!(found.contains(&"U2"), "{found:?}");
+    }
+
+    // ---- borrow windows and call summaries (design section 14) ----
+
+    fn function_of(
+        symbol: u32,
+        parameters: u32,
+        locals: &[(u32, bool)],
+        instructions: Vec<Instruction>,
+    ) -> Function {
+        Function {
+            constructor: false,
+            symbol: SymbolId(symbol),
+            owner: None,
+            name: format!("f{symbol}"),
+            visibility: Visibility::Public,
+            parameters: (0..parameters).map(|id| local(id, false)).collect(),
+            locals: locals
+                .iter()
+                .map(|(id, temporary)| local(*id, *temporary))
+                .collect(),
+            return_type: Type::Void,
+            entry: BasicBlockId(0),
+            blocks: vec![BasicBlock {
+                id: BasicBlockId(0),
+                instructions,
+                terminator: Terminator::Return(None),
+            }],
+            temporary_subregion_candidates: Vec::new(),
+        }
+    }
+
+    fn call_to(symbol: u32, arguments: &[u32]) -> Instruction {
+        Instruction::Call {
+            destination: None,
+            function: SymbolId(symbol),
+            arguments: arguments.iter().map(|id| operand(lp(*id))).collect(),
+            return_type: Type::Void,
+        }
+    }
+
+    fn interface_call(receiver: u32) -> Instruction {
+        Instruction::CallInterface {
+            destination: None,
+            receiver: operand(lp(receiver)),
+            method: SymbolId(31),
+            arguments: Vec::new(),
+            return_type: Type::Void,
+        }
+    }
+
+    /// Function 2: reads nothing, releases nothing (non-releasing).
+    fn safe_function() -> Function {
+        function_of(2, 1, &[], Vec::new())
+    }
+
+    /// Function 3: releases a local copy of its parameter (releasing).
+    fn releasing_function() -> Function {
+        function_of(
+            3,
+            1,
+            &[(1, false)],
+            vec![
+                retain(lp(0)),
+                retain(lp(0)),
+                assign(lp(1), lp(0)),
+                release(lp(1)),
+                release(lp(0)),
+            ],
+        )
+    }
+
+    /// Function 4: stores its second parameter into a field of the first and
+    /// releases the old field value (releasing).
+    fn storing_function() -> Function {
+        function_of(
+            4,
+            2,
+            &[(2, true)],
+            vec![
+                retain(lp(0)),
+                retain(lp(1)),
+                retain(lp(1)),
+                assign(lp(2), field(0)),
+                assign(field(0), lp(1)),
+                release(lp(2)),
+                release(lp(0)),
+                release(lp(1)),
+            ],
+        )
+    }
+
+    /// Validate a module of the given functions; the interface method 31 of
+    /// class 10 dispatches to function `implementation`.
+    fn module_obligations(functions: Vec<Function>, implementation: u32) -> Vec<&'static str> {
+        let module = Module {
+            structs: Vec::new(),
+            classes: vec![mir::ClassDefinition {
+                symbol: SymbolId(10),
+                name: "C".into(),
+                fields: vec![mir::FieldDefinition {
+                    symbol: SymbolId(11),
+                    name: "f".into(),
+                    type_: class(),
+                }],
+            }],
+            interfaces: vec![mir::InterfaceDefinition {
+                symbol: SymbolId(30),
+                name: "I".into(),
+                methods: vec![mir::InterfaceMethodDefinition {
+                    symbol: SymbolId(31),
+                    name: "m".into(),
+                    parameters: Vec::new(),
+                    return_type: Type::Void,
+                }],
+            }],
+            enums: Vec::new(),
+            interface_implementations: vec![mir::InterfaceImplementation {
+                class: SymbolId(10),
+                interface: SymbolId(30),
+                methods: vec![SymbolId(implementation)],
+            }],
+            foreign_functions: Vec::new(),
+            functions,
+        };
+        match validate_ownership(&module) {
+            Ok(()) => Vec::new(),
+            Err(findings) => findings.iter().map(|finding| finding.obligation).collect(),
+        }
+    }
+
+    #[test]
+    fn helper_functions_validate_on_their_own() {
+        let found = module_obligations(
+            vec![safe_function(), releasing_function(), storing_function()],
+            2,
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn borrowed_local_survives_calls_to_non_releasing_functions() {
+        // l1 = this.f (no retain); g(l1); g(l1)
+        let caller = function_of(
+            1,
+            1,
+            &[(1, false)],
+            vec![
+                retain(lp(0)),
+                assign(lp(1), field(0)),
+                call_to(2, &[1]),
+                call_to(2, &[1]),
+                release(lp(0)),
+            ],
+        );
+        let found = module_obligations(vec![caller, safe_function()], 2);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn borrowed_local_passed_to_a_releasing_callee_is_u2() {
+        let caller = function_of(
+            1,
+            1,
+            &[(1, false)],
+            vec![
+                retain(lp(0)),
+                assign(lp(1), field(0)),
+                call_to(4, &[1, 0]),
+                release(lp(0)),
+            ],
+        );
+        let found = module_obligations(vec![caller, storing_function()], 2);
+        assert!(found.contains(&"U2"), "{found:?}");
+    }
+
+    #[test]
+    fn borrowed_local_read_after_a_releasing_call_is_u2() {
+        let caller = function_of(
+            1,
+            1,
+            &[(1, false)],
+            vec![
+                retain(lp(0)),
+                assign(lp(1), field(0)),
+                call_to(3, &[0]),
+                call_to(2, &[1]),
+                release(lp(0)),
+            ],
+        );
+        let found = module_obligations(vec![caller, safe_function(), releasing_function()], 2);
+        assert!(found.contains(&"U2"), "{found:?}");
+    }
+
+    #[test]
+    fn borrowed_local_through_an_interface_needs_every_implementation_non_releasing() {
+        let caller = || {
+            function_of(
+                1,
+                1,
+                &[(1, false)],
+                vec![
+                    retain(lp(0)),
+                    assign(lp(1), field(0)),
+                    interface_call(1),
+                    interface_call(1),
+                    release(lp(0)),
+                ],
+            )
+        };
+        let safe = module_obligations(vec![caller(), safe_function()], 2);
+        assert!(safe.is_empty(), "{safe:?}");
+        let releasing = module_obligations(vec![caller(), releasing_function()], 3);
+        assert!(releasing.contains(&"U2"), "{releasing:?}");
+    }
+
+    #[test]
+    fn borrowed_local_read_after_a_list_set_is_u2() {
+        let found = list_obligations(vec![
+            list_get(1),
+            retain(lp(2)),
+            list_set(),
+            retain(lp(1)),
+            release(lp(1)),
+            release(lp(2)),
+        ]);
+        assert!(found.contains(&"U2"), "{found:?}");
+    }
+
+    #[test]
+    fn recursive_function_without_parameter_counts_is_non_releasing() {
+        // f(p) { f(p); l = p.f; f(l); }: nothing in the cycle releases.
+        let recursive = function_of(
+            1,
+            1,
+            &[(1, false)],
+            vec![call_to(1, &[0]), assign(lp(1), field(0)), call_to(1, &[1])],
+        );
+        let found = module_obligations(vec![recursive], 1);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn parameter_elision_in_a_function_calling_a_releasing_function_is_u2() {
+        let caller = function_of(
+            1,
+            1,
+            &[(1, false)],
+            vec![
+                call_to(3, &[0]),
+                retain(lp(0)),
+                assign(lp(1), lp(0)),
+                release(lp(1)),
+            ],
+        );
+        let found = module_obligations(vec![caller, releasing_function()], 3);
+        assert!(found.contains(&"U2"), "{found:?}");
+    }
+
+    #[test]
+    fn parameter_elision_through_a_cycle_that_releases_is_u2() {
+        // f calls g, g calls f, and g releases a local: neither is non-releasing.
+        let f = function_of(
+            1,
+            1,
+            &[(2, false)],
+            vec![
+                call_to(5, &[0]),
+                retain(lp(0)),
+                assign(lp(2), lp(0)),
+                release(lp(2)),
+            ],
+        );
+        let g = function_of(
+            5,
+            1,
+            &[(1, false)],
+            vec![
+                retain(lp(0)),
+                assign(lp(1), lp(0)),
+                release(lp(1)),
+                call_to(1, &[0]),
+                release(lp(0)),
+            ],
+        );
+        let found = module_obligations(vec![f, g], 1);
         assert!(found.contains(&"U2"), "{found:?}");
     }
 }

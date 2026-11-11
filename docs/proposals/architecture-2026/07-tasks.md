@@ -891,10 +891,43 @@ mean): `longrun_request` 1.057 and `accessor_heavy` 1.065 meet it; `longrun_fram
 implements only part of the elision the design specifies (§5.5 borrow windows and G1 callee
 summaries are missing), so the next step implements them (§14) before the verdict.
 
+### T-MEM-EXP-1 C6 round 2 (E4 borrow windows, E5 call summaries) and third class B (2026-11-11)
+
+Contract: §14 of [08-mem-exp-1-c5-design.md](08-mem-exp-1-c5-design.md). Pass and validator
+compute the non-releasing summary independently (greatest fixpoint; whitelist of read-only or
+allocating intrinsics listed in `ownership.rs`); calls to non-releasing functions do not
+invalidate; borrowed locals (single block windows) carry no count.
+
+Gates: C5 and C6 `--all-targets` 1,452 passed, 0 failed, 25 ignored; `aster-mir` 122; clippy
+clean. Executed count operations (`Run` entries): C6 1,480,322 vs C5 5,739,436 = **25.8%**
+(soft elision gate ≤ 50%: met). Checksums identical.
+
+Class B (third run, same protocol):
+
+| Workload | C6/C0 run 2 | C6/C0 run 3 | Gate |
+| --- | ---: | ---: | --- |
+| longrun_frame | 1.400 | 1.392 | ≤ 1.15: not met |
+| longrun_request | 1.057 | 0.986 | met |
+| object_graph | 1.551 | 1.536 | ≤ 1.15: not met |
+| interface_dispatch | 1.173 | 1.032 | met |
+| accessor_heavy | 1.065 | 1.058 | met |
+| geometric mean | 1.116 | 1.086 | ≤ 1.10: met |
+
+Compile time, measured directly (`mem_exp_pass_time`, release, median of 15 on
+`frontend_generated`): front end 249.98 ms, MIR validation 2.19 ms, ownership pass + validator
+53.41 ms: **1.212** (gate ≤ 1.20: not met, by 1.2 points).
+
+Causes of the remaining gaps, identified: `longrun_frame` keeps all 260,103 retains because the
+`ListGet` result is lowered into a temporary that is then copied into `entity`, which E4 does not
+follow; `object_graph` loads `children` before the loop and reads it in the loop body, which a
+single-block window does not cover; the pass and validator use linear searches (places, locals,
+cache) that dominate their time.
+
 Not done, so **no PASS for MEM-001 to MEM-003**:
 
-1. E4 borrow windows and E5 non-releasing call summaries (§14); then remeasure class B, measure
-   the ownership pass and validator time directly for the compile-time gate, and apply §4.C.
+1. Final round: E4 through single-use temporaries and across blocks by dominance with no
+   invalidating instruction on any path; faster pass and validator. Then class B and the §4.C
+   verdict, recorded whatever the result.
 2. Enum payload drop glue and closure environments (enums currently leak their references).
 3. Region reclamation together with counting (H2 pins); C5 and C6 currently lose it.
 4. Class B timing protocol (release builds, interleaved rounds) and the §4.C thresholds.
