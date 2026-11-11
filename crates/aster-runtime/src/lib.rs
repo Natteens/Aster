@@ -28,7 +28,8 @@ pub mod time;
 
 #[cfg(feature = "mem-exp-rc")]
 pub use context::{
-    ASTER_ARRAY_COUNT_OFFSET, aster_rt_array_adopt_elements, aster_rt_array_set_element_descriptor,
+    ASTER_ARRAY_COUNT_OFFSET, ASTER_LIST_COUNT_OFFSET, ASTER_LIST_DESCRIPTOR_OFFSET,
+    aster_rt_array_adopt_elements, aster_rt_array_set_element_descriptor,
     aster_rt_list_set_element_descriptor,
 };
 pub use context::{

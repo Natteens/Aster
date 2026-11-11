@@ -32,13 +32,28 @@ pub const COUNT_OFFSET: usize = 8;
 pub const COUNT_MASK: u32 = (1 << 29) - 1;
 /// Count value meaning "never counted, never released".
 pub const IMMORTAL: u32 = COUNT_MASK;
-/// Kind flag in the count word's reserved high bits: the object is an array
-/// header whose descriptor word names the element descriptor (MEM-EXP-1 U8).
-pub const ARRAY_FLAG: u32 = 1 << 29;
-/// Kind flag in the count word's reserved high bits: the object is an ABI
-/// string (no children; its block size follows from its length). Distinct from
-/// [`ARRAY_FLAG`] (MEM-EXP-1 U8, design section 9).
-pub const STRING_FLAG: u32 = 1 << 30;
+/// Bit position of the 3-bit object kind inside the count word (bits 29-31).
+pub const KIND_SHIFT: u32 = 29;
+/// Mask of the kind field inside the count word.
+pub const KIND_MASK: u32 = 0b111 << KIND_SHIFT;
+/// Kind 0: class object (descriptor word names the class descriptor).
+pub const KIND_OBJECT: u32 = 0;
+/// Kind 1: array header whose descriptor word names the element descriptor
+/// (MEM-EXP-1 U8).
+pub const KIND_ARRAY: u32 = 1;
+/// Kind 2: ABI string (no children; its block size follows from its length).
+pub const KIND_STRING: u32 = 2;
+/// Kind 3: list header whose descriptor word names the element descriptor
+/// (design section 10).
+pub const KIND_LIST: u32 = 3;
+/// Kind 4: dictionary header (reserved, design section 11).
+pub const KIND_DICTIONARY: u32 = 4;
+/// Count-word bits of an array header.
+pub const ARRAY_FLAG: u32 = KIND_ARRAY << KIND_SHIFT;
+/// Count-word bits of a counted string.
+pub const STRING_FLAG: u32 = KIND_STRING << KIND_SHIFT;
+/// Count-word bits of a list header.
+pub const LIST_FLAG: u32 = KIND_LIST << KIND_SHIFT;
 
 #[cfg(feature = "mem-exp-rc")]
 static STRING_LEAF_OFFSETS: [u32; 1] = [0];
@@ -94,6 +109,12 @@ pub struct ObjectHeapStats {
     /// Counted strings whose block went back to the heap.
     #[cfg(feature = "mem-exp-rc")]
     pub released_strings: u64,
+    /// Lists whose header (and heap-served buffer) were released.
+    #[cfg(feature = "mem-exp-rc")]
+    pub released_lists: u64,
+    /// List buffers above the largest size class: never returned to the heap.
+    #[cfg(feature = "mem-exp-rc")]
+    pub unreturned_list_buffers: u64,
 }
 
 #[derive(Default)]
@@ -220,32 +241,39 @@ pub(crate) unsafe fn release(heap: &mut ObjectHeap, object: *mut u8) -> u64 {
             continue;
         }
         #[cfg(feature = "mem-exp-rc")]
-        // SAFETY: the count word carries the kind flag by the layout contract.
-        if unsafe { count_word(current).read() } & ARRAY_FLAG != 0 {
-            // SAFETY: a flagged object is an array header of this heap.
-            unsafe { release_array(heap, current, &mut work) };
-            released += 1;
-            continue;
-        }
-        #[cfg(feature = "mem-exp-rc")]
-        // SAFETY: as above.
-        if unsafe { count_word(current).read() } & STRING_FLAG != 0 {
-            // SAFETY: a flagged object is a counted string header of this heap.
-            let bytes = unsafe {
-                crate::string::ASTER_STR_PAYLOAD_OFFSET
-                    + current
-                        .add(crate::string::ASTER_STR_LEN_OFFSET)
-                        .cast::<usize>()
-                        .read()
-            };
-            let class = u32::try_from(bytes)
-                .ok()
-                .and_then(ObjectHeap::class_of)
-                .expect("counted strings are allocated from a size class");
-            heap.release(current, class);
-            heap.stats.released_strings += 1;
-            released += 1;
-            continue;
+        {
+            // SAFETY: the count word carries the kind field by the layout contract.
+            let kind = unsafe { count_word(current).read() } >> KIND_SHIFT;
+            if kind == KIND_ARRAY {
+                // SAFETY: a kind 1 object is an array header of this heap.
+                unsafe { release_array(heap, current, &mut work) };
+                released += 1;
+                continue;
+            }
+            if kind == KIND_LIST {
+                // SAFETY: a kind 3 object is a list header of this heap.
+                unsafe { release_list(heap, current, &mut work) };
+                released += 1;
+                continue;
+            }
+            if kind == KIND_STRING {
+                // SAFETY: a kind 2 object is a counted string header of this heap.
+                let bytes = unsafe {
+                    crate::string::ASTER_STR_PAYLOAD_OFFSET
+                        + current
+                            .add(crate::string::ASTER_STR_LEN_OFFSET)
+                            .cast::<usize>()
+                            .read()
+                };
+                let class = u32::try_from(bytes)
+                    .ok()
+                    .and_then(ObjectHeap::class_of)
+                    .expect("counted strings are allocated from a size class");
+                heap.release(current, class);
+                heap.stats.released_strings += 1;
+                released += 1;
+                continue;
+            }
         }
         // SAFETY: offset 0 holds the descriptor pointer by the layout
         // contract, and the descriptor and its offset table are immutable.
@@ -310,4 +338,60 @@ unsafe fn release_array(heap: &mut ObjectHeap, array: *mut u8, work: &mut Vec<*m
         .expect("array headers fit a size class");
     heap.release(array, header_class);
     heap.stats.released_arrays += 1;
+}
+
+/// Free a counted list whose count reached zero: push every leaf of every live
+/// element, return the buffer when it is heap-served, then the header block.
+///
+/// # Safety
+///
+/// `list` must be a counted Persistent list header allocated by `heap` whose
+/// element descriptor is null or valid and whose buffer holds `length` live
+/// elements.
+#[cfg(feature = "mem-exp-rc")]
+#[allow(unsafe_code)]
+unsafe fn release_list(heap: &mut ObjectHeap, list: *mut u8, work: &mut Vec<*mut u8>) {
+    use crate::context::AsterList;
+    // SAFETY: the caller's contract.
+    let (descriptor, length, capacity, element_size, data) = unsafe {
+        let header = &*list.cast::<AsterList>();
+        (
+            header.element_descriptor(),
+            usize::try_from(header.length()).unwrap_or(0),
+            usize::try_from(header.capacity()).unwrap_or(0),
+            header.element_size() as usize,
+            header.data_ptr(),
+        )
+    };
+    if !descriptor.is_null() && !data.is_null() {
+        // SAFETY: the descriptor is immutable program data and every offset
+        // lies inside one of the `length` elements.
+        unsafe {
+            let descriptor = &*descriptor;
+            for element in 0..length {
+                let base = data.add(element * element_size);
+                for index in 0..descriptor.reference_count as usize {
+                    let offset = descriptor.reference_offsets.add(index).read() as usize;
+                    work.push(base.add(offset).cast::<*mut u8>().read_unaligned());
+                }
+            }
+        }
+    }
+    if !data.is_null() {
+        // SAFETY: the caller's contract.
+        let align = unsafe { (*list.cast::<AsterList>()).element_align() };
+        if AsterList::buffer_is_heap_served(capacity * element_size, align) {
+            let class = u32::try_from(capacity * element_size)
+                .ok()
+                .and_then(ObjectHeap::class_of)
+                .expect("heap-served list buffers fit a size class");
+            heap.release(data, class);
+        } else {
+            heap.stats.unreturned_list_buffers += 1;
+        }
+    }
+    let header_class = ObjectHeap::class_of(u32::try_from(size_of::<AsterList>()).unwrap_or(0))
+        .expect("list headers fit a size class");
+    heap.release(list, header_class);
+    heap.stats.released_lists += 1;
 }

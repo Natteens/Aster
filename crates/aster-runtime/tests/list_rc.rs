@@ -6,12 +6,15 @@
     clippy::many_single_char_names
 )]
 
-use aster_runtime::object_heap::{IMMORTAL, ObjectDescriptor, strong_count};
+use aster_runtime::object_heap::{
+    IMMORTAL, KIND_LIST, KIND_MASK, KIND_SHIFT, LIST_FLAG, ObjectDescriptor, strong_count,
+};
 use aster_runtime::{
-    ASTER_ARRAY_DATA_OFFSET, AsterArray, AsterList, ExecutionContext, aster_rt_list_add,
-    aster_rt_list_add_range, aster_rt_list_clear, aster_rt_list_get_range, aster_rt_list_new,
+    ASTER_ARRAY_DATA_OFFSET, ASTER_LIST_COUNT_OFFSET, ASTER_LIST_DESCRIPTOR_OFFSET, AsterArray,
+    AsterList, ExecutionContext, aster_rt_list_add, aster_rt_list_add_range, aster_rt_list_clear,
+    aster_rt_list_get_range, aster_rt_list_new, aster_rt_list_new_temporary,
     aster_rt_list_remove_at, aster_rt_list_remove_range, aster_rt_list_set,
-    aster_rt_list_set_element_descriptor, aster_rt_list_to_array,
+    aster_rt_list_set_element_descriptor, aster_rt_list_to_array, aster_rt_temporary_scope_enter,
 };
 
 static LEAF: ObjectDescriptor = ObjectDescriptor {
@@ -221,4 +224,176 @@ fn list_without_descriptor_does_no_counting() {
     );
     assert_eq!(aster_rt_list_clear(cx, list, 8, 8, KEY), 1);
     assert_eq!(count(object), 1);
+}
+
+// ---- Counted list headers (design section 10) ----
+
+fn count_word(object: *mut u8) -> u32 {
+    unsafe { object.add(ASTER_LIST_COUNT_OFFSET).cast::<u32>().read() }
+}
+
+fn release(context: &mut ExecutionContext, object: *mut u8) {
+    unsafe { context.release_counted_object(object) };
+}
+
+// One element = one leaf at offset 0 (a class object or another list).
+static ONE_OFFSET: [u32; 1] = [0];
+static ONE_LEAF: ObjectDescriptor = ObjectDescriptor {
+    size: 8,
+    reference_count: 1,
+    reference_offsets: ONE_OFFSET.as_ptr(),
+};
+
+fn leaf_list(context: &mut ExecutionContext) -> *mut AsterList {
+    let cx: *mut ExecutionContext = &raw mut *context;
+    let list = aster_rt_list_new(cx, 8, 8, KEY);
+    aster_rt_list_set_element_descriptor(cx, list, &raw const ONE_LEAF);
+    list
+}
+
+fn push(context: &mut ExecutionContext, list: *mut AsterList, value: *mut u8) {
+    let cx: *mut ExecutionContext = &raw mut *context;
+    let element = [value];
+    assert_eq!(
+        aster_rt_list_add(cx, list, 8, 8, KEY, element.as_ptr().cast()),
+        1
+    );
+}
+
+#[test]
+fn list_header_has_the_uniform_prefix_and_kind() {
+    assert_eq!(ASTER_LIST_DESCRIPTOR_OFFSET, 0);
+    assert_eq!(ASTER_LIST_COUNT_OFFSET, 8);
+    assert_eq!(KIND_LIST, 3);
+    assert_eq!(KIND_SHIFT, 29);
+    assert_eq!(LIST_FLAG, 3 << 29);
+    assert_eq!(KIND_MASK, 0b111 << 29);
+    let mut context = Box::new(ExecutionContext::with_stats());
+    let list = leaf_list(&mut context);
+    let descriptor = unsafe { list.cast::<*const ObjectDescriptor>().read() };
+    assert_eq!(descriptor, &raw const ONE_LEAF);
+}
+
+#[test]
+fn persistent_list_starts_at_one_with_the_list_kind() {
+    let mut context = Box::new(ExecutionContext::with_stats());
+    let list = leaf_list(&mut context);
+    assert_eq!(count_word(list.cast()), 1 | LIST_FLAG);
+    assert_eq!(count(list.cast()), 1);
+    unsafe { context.retain_object(list.cast()) };
+    assert_eq!(count(list.cast()), 2);
+    assert_eq!(count_word(list.cast()) & KIND_MASK, LIST_FLAG);
+    // The header is served by a size class.
+    assert_eq!(context.object_heap_stats().fresh_blocks, 1);
+}
+
+#[test]
+fn release_frees_elements_buffer_and_header_and_blocks_are_reused() {
+    let mut context = Box::new(ExecutionContext::with_stats());
+    let list = leaf_list(&mut context);
+    let objects: Vec<*mut u8> = (0..3)
+        .map(|_| {
+            let object = context.allocate_heap_object(16);
+            unsafe {
+                object
+                    .cast::<*const ObjectDescriptor>()
+                    .write(&raw const LEAF);
+            }
+            object
+        })
+        .collect();
+    for object in &objects {
+        push(&mut context, list, *object);
+    }
+    // header + buffer (4 elements x 8 bytes) + 3 objects.
+    assert_eq!(context.object_heap_stats().fresh_blocks, 5);
+    // A second holder of the middle object survives the list.
+    unsafe { context.retain_object(objects[1]) };
+    release(&mut context, list.cast());
+    let stats = context.object_heap_stats();
+    assert_eq!(stats.released_lists, 1);
+    // header + buffer + two objects.
+    assert_eq!(stats.released_blocks, 4);
+    assert_eq!(count(objects[1]), 1);
+    release(&mut context, objects[1]);
+    assert_eq!(context.object_heap_stats().released_blocks, 5);
+
+    // The same classes are served again without fresh arena blocks.
+    let second = leaf_list(&mut context);
+    push(&mut context, second, std::ptr::null_mut());
+    let stats = context.object_heap_stats();
+    assert_eq!(stats.fresh_blocks, 5);
+    assert_eq!(stats.reused_blocks, 2);
+    assert_eq!(count(second.cast()), 1);
+}
+
+#[test]
+fn growth_returns_the_old_buffer_to_the_heap() {
+    let mut context = Box::new(ExecutionContext::with_stats());
+    let list = leaf_list(&mut context);
+    for _ in 0..4 {
+        push(&mut context, list, std::ptr::null_mut());
+    }
+    let before = context.object_heap_stats();
+    assert_eq!(before.released_blocks, 0);
+    // The fifth element doubles 32 bytes to 64: the old buffer returns.
+    push(&mut context, list, std::ptr::null_mut());
+    let after = context.object_heap_stats();
+    assert_eq!(after.released_blocks, 1);
+    assert_eq!(after.fresh_blocks, before.fresh_blocks + 1);
+    // A new list's 32-byte buffer reuses the returned block.
+    let other = leaf_list(&mut context);
+    push(&mut context, other, std::ptr::null_mut());
+    assert_eq!(context.object_heap_stats().reused_blocks, 1);
+    release(&mut context, list.cast());
+    assert_eq!(context.object_heap_stats().released_lists, 1);
+}
+
+#[test]
+fn buffers_above_the_largest_size_class_stay_reserved() {
+    let mut context = Box::new(ExecutionContext::with_stats());
+    let list = leaf_list(&mut context);
+    // 512 elements x 8 bytes = 4,096 bytes: above the largest class.
+    for _ in 0..512 {
+        push(&mut context, list, std::ptr::null_mut());
+    }
+    let grown = context.object_heap_stats();
+    release(&mut context, list.cast());
+    let stats = context.object_heap_stats();
+    assert_eq!(stats.unreturned_list_buffers, 1);
+    assert_eq!(stats.released_lists, 1);
+    // Only the header returns for the final buffer.
+    assert_eq!(stats.released_blocks, grown.released_blocks + 1);
+}
+
+#[test]
+fn list_of_lists_is_released_without_recursion() {
+    let mut context = Box::new(ExecutionContext::with_stats());
+    let depth = 100_000_u64;
+    let mut inner = leaf_list(&mut context);
+    for _ in 0..depth {
+        let outer = leaf_list(&mut context);
+        push(&mut context, outer, inner.cast());
+        inner = outer;
+    }
+    release(&mut context, inner.cast());
+    let stats = context.object_heap_stats();
+    assert_eq!(stats.released_lists, depth + 1);
+    // Every list but the innermost frees a header and a buffer.
+    assert_eq!(stats.released_blocks, depth * 2 + 1);
+}
+
+#[test]
+fn temporary_lists_are_immortal() {
+    let mut context = Box::new(ExecutionContext::with_stats());
+    let cx: *mut ExecutionContext = &raw mut *context;
+    aster_rt_temporary_scope_enter(cx);
+    let list = aster_rt_list_new_temporary(cx, 8, 8, KEY);
+    assert_eq!(count(list.cast()), IMMORTAL);
+    assert_eq!(count_word(list.cast()), IMMORTAL | LIST_FLAG);
+    unsafe { context.retain_object(list.cast()) };
+    release(&mut context, list.cast());
+    assert_eq!(count(list.cast()), IMMORTAL);
+    push(&mut context, list, std::ptr::null_mut());
+    assert_eq!(context.object_heap_stats().released_blocks, 0);
 }

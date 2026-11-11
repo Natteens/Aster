@@ -410,3 +410,112 @@ fn split_arrays_release_their_strings() {
         stats.object_heap
     );
 }
+
+// Counted lists (design section 10): the header, the element buffer and the
+// elements are released with the last holder.
+
+const REQUEST: &str = "public class Request { public int id; public List<int> items; \
+    public Request(int id, List<int> items) { this.id = id; this.items = items; } } \
+    internal Request Build(int id) { List<int> items = new List<int>(); \
+    int count = id % 8 + 1; \
+    for (int index = 0; index < count; index += 1) { items.Add(id + index); } \
+    return new Request(id, items); } ";
+
+fn request_loop(requests: i32) -> MemoryStats {
+    let expected: i32 = (0..requests).map(|id| id + (id % 8 + 1)).sum();
+    run(
+        &format!(
+            "{REQUEST} public int Run() {{ int total = 0; \
+             for (int i = 0; i < {requests}; i += 1) {{ Request request = Build(i); \
+             total += request.id + request.items.Length; }} return total; }}"
+        ),
+        expected,
+    )
+}
+
+#[test]
+fn request_like_list_per_iteration_is_reclaimed() {
+    let small = request_loop(200);
+    let large = request_loop(2_000);
+    assert!(
+        large.object_heap.reused_blocks > small.object_heap.reused_blocks,
+        "reuse did not grow: {:?} vs {:?}",
+        small.object_heap,
+        large.object_heap
+    );
+    assert!(
+        large.object_heap.released_lists >= 1_900,
+        "list headers were not released: {:?}",
+        large.object_heap
+    );
+    // Ten times the requests must not need ten times the memory.
+    assert!(
+        large.used_bytes < small.used_bytes.saturating_mul(3),
+        "used bytes grew with the request count: {} vs {}",
+        small.used_bytes,
+        large.used_bytes
+    );
+    assert!(
+        large.object_heap.fresh_blocks < 40,
+        "{:?}",
+        large.object_heap
+    );
+}
+
+#[test]
+fn list_fields_are_released_with_their_owner() {
+    let stats = run(
+        "public class Bag { public List<int> values; \
+         public Bag() { this.values = new List<int>(); } } \
+         internal Bag MakeBag(int n) { Bag bag = new Bag(); \
+         for (int i = 0; i < n; i += 1) { bag.values.Add(i); } return bag; } \
+         public int Run() { int total = 0; \
+         for (int i = 0; i < 100; i += 1) { Bag bag = MakeBag(6); total += bag.values.Length; } \
+         return total; }",
+        600,
+    );
+    assert!(
+        stats.object_heap.released_lists >= 95,
+        "field lists were not released with their owner: {:?}",
+        stats.object_heap
+    );
+}
+
+#[test]
+fn a_list_replaced_in_a_field_releases_the_old_list() {
+    let stats = run(
+        "public class Bag { public List<int> values; \
+         public Bag(List<int> values) { this.values = values; } } \
+         internal List<int> Fresh(int n) { List<int> list = new List<int>(); \
+         list.Add(n); return list; } \
+         public int Run() { Bag bag = new Bag(Fresh(0)); \
+         for (int i = 1; i < 100; i += 1) { bag.values = Fresh(i); } \
+         return bag.values[0]; }",
+        99,
+    );
+    assert!(
+        stats.object_heap.released_lists >= 98,
+        "replaced lists were not released: {:?}",
+        stats.object_heap
+    );
+}
+
+#[test]
+fn lists_of_lists_release_their_inner_lists() {
+    let stats = run(
+        "internal List<int> Row(int n) { List<int> row = new List<int>(); \
+         row.Add(n); row.Add(n + 1); return row; } \
+         internal List<List<int>> Grid(int n) { List<List<int>> grid = new List<List<int>>(); \
+         for (int i = 0; i < 3; i += 1) { grid.Add(Row(n + i)); } return grid; } \
+         public int Run() { int total = 0; \
+         for (int i = 0; i < 50; i += 1) { List<List<int>> grid = Grid(i); \
+         total += grid[2][1]; } return total; }",
+        (0..50).map(|i| i + 3).sum(),
+    );
+    // Each grid owns three rows: four lists per iteration.
+    assert!(
+        stats.object_heap.released_lists >= 4 * 45,
+        "nested lists were not released: {:?}",
+        stats.object_heap
+    );
+}

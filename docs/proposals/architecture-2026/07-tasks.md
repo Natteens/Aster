@@ -758,13 +758,33 @@ are not counted. Checksums identical in C5 and C6; executed count operations C6/
 5,659,385 = 50.9% (**soft elision gate ≤ 50% now missed** by 0.9 points, because strings added
 operations that E1 to E3 do not remove). The string header grows from 8 to 24 bytes.
 
+### T-MEM-EXP-1 stage C, counted `List<T>` headers — implemented (2026-11-11)
+
+Contract: §10 of [08-mem-exp-1-c5-design.md](08-mem-exp-1-c5-design.md). The count word's three
+reserved bits are now one kind field (0 object, 1 array, 2 string, 3 list, 4 dictionary reserved).
+`AsterList` under `mem-exp-rc`: element descriptor @0, count @8 (kind 3); Persistent headers and
+buffers up to 2,048 bytes are heap-served, growth returns the old buffer, release frees elements,
+buffer, and header. Pass and validator: `List` is a leaf, `AllocateList` is owned, list operands are
+borrowed.
+
+Gates: `aster-codegen-cranelift --all-targets` C0 1,443 and C4 1,443 passed; C5 and C6 1,446
+passed, 0 failed, 24 ignored; `aster-runtime` 337 (default) and 378 (`mem-exp-rc`); `aster-mir` 93;
+clippy and rustfmt clean. The recorded-fact test now lists `longrun_frame` and `longrun_request`
+as counted-flat and asserts the 64 KiB gate shape for both
+(`counted_workloads_stay_flat_between_n_and_ten_n`).
+
+Measured (C6, debug, deterministic): `longrun_request` used bytes **448 at N and 448 at 10N**
+(peak 478), 900,000 blocks reused at 10N; `longrun_frame` 1,584 at both; `object_graph` 294,768.
+`cache_churn` still grows (dictionaries). Checksums identical in C5 and C6; executed count
+operations C6/C5 = 2,960,271 / 5,739,385 = 51.6% (soft elision gate ≤ 50% missed).
+
 Not done, so **no PASS for MEM-001 to MEM-003**:
 
-1. Counted list and dictionary headers (header count, buffer and element release on drop) for
-   `longrun_request` and `cache_churn`.
+1. Counted dictionaries (kind 4: header, buckets and entries blocks, key and value ownership with
+   release on `Set`, `Remove`, `Clear`, drop) for `cache_churn`.
 2. Enum payload drop glue and closure environments (enums currently leak their references).
 3. Region reclamation together with counting (H2 pins); C5 and C6 currently lose it.
 4. Class B timing protocol (release builds, interleaved rounds) and the §4.C thresholds.
 
-Next action: item 1, counted `List<T>` headers (uniform header, buffer release, element release on
-drop), then dictionaries; then improve elision so the soft gate is met again.
+Next action: item 1, counted dictionaries; then improve elision so the soft gate is met again;
+then the class B timing protocol.

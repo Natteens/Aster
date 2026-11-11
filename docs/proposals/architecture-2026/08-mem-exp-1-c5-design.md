@@ -232,3 +232,20 @@ H4 holds and their counts stay single-domain.
 - **Element descriptors.** String leaves appear in class, struct, list-element, and array-element
   descriptors. Arrays the runtime builds with string elements (split, command-line arguments) get a
   runtime-owned string element descriptor.
+
+## 10. Counted `List<T>` headers
+
+- **Kind field.** The three reserved count-word bits become one 3-bit kind: 0 class object,
+  1 array, 2 string, 3 list, 4 dictionary (reserved for §11). Every flag test becomes a kind test.
+- **Header.** Under `mem-exp-rc`, `AsterList` starts with the uniform prefix: element descriptor
+  @0 (moved from the trailing field of §7), count word @8 with kind 3, then the existing fields.
+  Codegen reaches list fields only through runtime calls, so nothing else moves.
+- **Blocks.** A Persistent list header comes from a size class (count 1); a Temporary list is
+  `IMMORTAL`. Element buffers up to 2,048 bytes come from the size-class heap; growth returns the
+  old buffer to the heap after copying (bit move, no count change). Larger buffers stay reserved
+  and are reported.
+- **Release** of a list: release every leaf of every live element (by the element descriptor),
+  return the buffer, then the header.
+- **Pass and validator.** `Type::List(_)` is a leaf. `AllocateList` is an owned source. Every
+  intrinsic or instruction that receives a list operand borrows it. A list stored into a class
+  field, struct, array, or another list follows the existing store rules.

@@ -319,7 +319,8 @@ fn leaves(module: &Module, native: &HashSet<SymbolId>, type_: &Type) -> Vec<Leaf
         // An array is one leaf whatever its element type: an `int[]` must still
         // be released to free its blocks (design §8). A string is a leaf too
         // (design §9); string constants are immortal and never counted.
-        Type::Class(_) | Type::Interface(_) | Type::Array(_) | Type::String => {
+        // A list is one leaf whatever its element type (design §10).
+        Type::Class(_) | Type::Interface(_) | Type::Array(_) | Type::String | Type::List(_) => {
             vec![(Vec::new(), type_.clone())]
         }
         Type::User(symbol) => module
@@ -522,6 +523,7 @@ impl Context<'_> {
             }
             Instruction::AllocateObject { destination: d, .. }
             | Instruction::AllocateArray { destination: d, .. }
+            | Instruction::AllocateList { destination: d, .. }
             | Instruction::ListToArray { destination: d, .. }
             | Instruction::DictionaryKeys { destination: d, .. }
             | Instruction::DictionaryValues { destination: d, .. }
@@ -1037,6 +1039,25 @@ mod tests {
         Type::Array(Box::new(Type::Int))
     }
 
+    fn int_list() -> Type {
+        Type::List(Box::new(Type::Int))
+    }
+
+    fn list_field(id: u32) -> Place {
+        Place::ObjectField {
+            object: Box::new(copy(lp(id), &class())),
+            field: SymbolId(13),
+        }
+    }
+
+    fn allocate_list(destination: u32) -> Instruction {
+        Instruction::AllocateList {
+            destination: lp(destination),
+            element_type: Type::Int,
+            region: mir::AllocationRegion::Persistent,
+        }
+    }
+
     fn class_array() -> Type {
         Type::Array(Box::new(class()))
     }
@@ -1145,6 +1166,7 @@ mod tests {
                 fields: vec![
                     field_definition(11, class()),
                     field_definition(12, Type::String),
+                    field_definition(13, int_list()),
                 ],
             }],
             interfaces: Vec::new(),
@@ -1242,6 +1264,7 @@ mod tests {
                 fields: vec![
                     field_definition(11, class()),
                     field_definition(12, Type::String),
+                    field_definition(13, int_list()),
                 ],
             }],
             interfaces: Vec::new(),
@@ -1854,7 +1877,8 @@ mod tests {
         assert!(is_capture_of(&instructions[3], &lp(1)));
         assert_eq!(instructions[4], to_array());
         assert_eq!(instructions[5], release(lp(3), &class_array()));
-        assert_eq!(stats.retains, 0);
+        // Only the entry retain of the list parameter (a list is a leaf).
+        assert_eq!(stats.retains, 1);
     }
 
     #[test]
@@ -2140,5 +2164,161 @@ mod tests {
         assert!(is_capture_of(&instructions[2], &lp(2)));
         assert_eq!(instructions[3], get_or_add);
         assert_eq!(instructions[4], retain(lp(2), &Type::String));
+    }
+
+    #[test]
+    fn list_local_reassigned_in_a_loop_releases_the_old_list_without_retains() {
+        let result = both(
+            Vec::new(),
+            vec![local(0, int_list(), false)],
+            vec![
+                block(0, Vec::new(), Terminator::Goto(BasicBlockId(1))),
+                block(1, vec![allocate_list(0)], branch(1, 2)),
+                block(2, Vec::new(), Terminator::Return(None)),
+            ],
+            Type::Void,
+        );
+        let loop_block = result.c5.blocks.iter().find(|b| b.id == BasicBlockId(1));
+        let instructions = &loop_block.unwrap().instructions;
+        assert_eq!(retains_in(instructions), 0);
+        assert!(
+            instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Release { .. })),
+            "{instructions:#?}"
+        );
+        assert_eq!(counts(&result.c5), (0, 2));
+    }
+
+    #[test]
+    fn list_stored_in_a_class_field_is_retained_and_the_old_list_released() {
+        let (function, _) = run_void(
+            vec![local(0, class(), false)],
+            vec![local(1, int_list(), false)],
+            vec![
+                allocate_list(1),
+                assign(list_field(0), &int_list(), copy(lp(1), &int_list())),
+                assign(list_field(0), &int_list(), copy(lp(1), &int_list())),
+            ],
+        );
+        let instructions = body(&function);
+        // Each store keeps its own count (retain), captures and releases the
+        // previous field value.
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|i| matches!(i, Instruction::Retain { value } if value.type_ == int_list()))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn list_passed_to_a_callee_is_borrowed() {
+        let (function, _) = run_void(
+            vec![local(0, int_list(), false)],
+            Vec::new(),
+            vec![Instruction::Call {
+                destination: None,
+                function: SymbolId(2),
+                arguments: vec![copy(lp(0), &int_list())],
+                return_type: Type::Void,
+            }],
+        );
+        // Only the entry retain of the parameter; the call adds none.
+        assert_eq!(retains_in(body(&function)), 0);
+        assert_eq!(counts(&function), (1, 1));
+    }
+
+    #[test]
+    fn list_instructions_borrow_the_list_and_retain_only_the_stored_value() {
+        let list = int_list();
+        let strings = Type::List(Box::new(Type::String));
+        let (function, _) = run_void(
+            vec![local(0, strings.clone(), false), string_local(1)],
+            Vec::new(),
+            vec![
+                Instruction::ListAdd {
+                    list: copy(lp(0), &strings),
+                    value: copy(lp(1), &Type::String),
+                },
+                Instruction::ListClear {
+                    list: copy(lp(0), &strings),
+                },
+            ],
+        );
+        let instructions = body(&function);
+        assert_eq!(retains_in(instructions), 1);
+        assert!(instructions.contains(&retain(lp(1), &Type::String)));
+        assert!(!instructions.contains(&retain(lp(0), &list)));
+    }
+
+    #[test]
+    fn list_in_a_lowering_temporary_can_be_moved_to_a_local() {
+        // t = new List; x = t
+        let result = both(
+            Vec::new(),
+            vec![local(0, int_list(), true), local(1, int_list(), false)],
+            vec![block(
+                0,
+                vec![
+                    allocate_list(0),
+                    assign(lp(1), &int_list(), copy(lp(0), &int_list())),
+                ],
+                Terminator::Return(None),
+            )],
+            Type::Void,
+        );
+        assert!(
+            result.elided_stats.elided_moves > 0,
+            "{:?}",
+            result.elided_stats
+        );
+    }
+
+    #[test]
+    fn e3_getter_over_a_list_field_length_keeps_elision() {
+        let length = Instruction::Assign {
+            target: lp(1),
+            value: Rvalue {
+                type_: Type::Int,
+                kind: RvalueKind::ListLength(copy(list_field(0), &int_list())),
+            },
+        };
+        let result = both(
+            vec![local(0, class(), false)],
+            vec![local(1, Type::Int, false)],
+            vec![block(
+                0,
+                vec![length],
+                Terminator::Return(Some(copy(lp(1), &Type::Int))),
+            )],
+            Type::Int,
+        );
+        assert_eq!(counts(&result.elided), (0, 0));
+        assert!(result.elided_stats.elided_parameters > 0);
+    }
+
+    #[test]
+    fn e3_applies_to_a_list_parameter_that_is_only_read() {
+        let length = Instruction::Assign {
+            target: lp(1),
+            value: Rvalue {
+                type_: Type::Int,
+                kind: RvalueKind::ListLength(copy(lp(0), &int_list())),
+            },
+        };
+        let result = both(
+            vec![local(0, int_list(), false)],
+            vec![local(1, Type::Int, false)],
+            vec![block(
+                0,
+                vec![length],
+                Terminator::Return(Some(copy(lp(1), &Type::Int))),
+            )],
+            Type::Int,
+        );
+        assert_eq!(counts(&result.c5), (1, 1));
+        assert_eq!(counts(&result.elided), (0, 0));
     }
 }

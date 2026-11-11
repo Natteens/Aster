@@ -168,7 +168,12 @@ impl Frame<'_> {
                 Type::Class(symbol) if self.native.contains(&symbol) => {}
                 // An array is one leaf whatever its element type; so is a string
                 // (constants are immortal and carry no value here).
-                Type::Class(_) | Type::Interface(_) | Type::Array(_) | Type::String => {
+                // A list is one leaf whatever its element type (design §10).
+                Type::Class(_)
+                | Type::Interface(_)
+                | Type::Array(_)
+                | Type::String
+                | Type::List(_) => {
                     found.push((path, current));
                 }
                 Type::User(symbol) => {
@@ -748,6 +753,9 @@ impl<'a> Block<'a> {
                 ..
             } => {
                 self.effect(&[length], &[], Some(destination), Product::Owned, false);
+            }
+            I::AllocateList { destination, .. } => {
+                self.effect(&[], &[], Some(destination), Product::Owned, false);
             }
             I::ListToArray {
                 destination, list, ..
@@ -1658,6 +1666,89 @@ mod tests {
             let found = list_obligations(vec![list_get(1), invalidating, use_call(1)]);
             assert!(found.contains(&"U2"), "{found:?}");
         }
+    }
+
+    fn allocate_list() -> Instruction {
+        Instruction::AllocateList {
+            destination: lp(3),
+            element_type: class(),
+            region: AllocationRegion::Persistent,
+        }
+    }
+
+    fn list_release() -> Instruction {
+        Instruction::Release {
+            value: list_operand(),
+        }
+    }
+
+    fn list_retain() -> Instruction {
+        Instruction::Retain {
+            value: list_operand(),
+        }
+    }
+
+    #[test]
+    fn allocated_list_is_an_owned_leaf_released_once() {
+        let found = list_obligations(vec![
+            retain(lp(0)),
+            retain(lp(2)),
+            allocate_list(),
+            list_get(1),
+            retain(lp(1)),
+            list_release(),
+            release(lp(1)),
+            release(lp(0)),
+            release(lp(2)),
+        ]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn missing_release_of_an_allocated_list_is_u1() {
+        let found = list_obligations(vec![
+            retain(lp(0)),
+            retain(lp(2)),
+            allocate_list(),
+            release(lp(0)),
+            release(lp(2)),
+        ]);
+        assert!(found.contains(&"U1"), "{found:?}");
+    }
+
+    #[test]
+    fn retain_after_allocate_list_is_u1() {
+        let found = list_obligations(vec![
+            retain(lp(0)),
+            retain(lp(2)),
+            allocate_list(),
+            list_retain(),
+            list_release(),
+            release(lp(0)),
+            release(lp(2)),
+        ]);
+        assert!(found.contains(&"U1"), "{found:?}");
+    }
+
+    #[test]
+    fn list_instructions_borrow_the_list_operand() {
+        let found = list_obligations(vec![
+            retain(lp(0)),
+            retain(lp(2)),
+            allocate_list(),
+            retain(lp(2)),
+            Instruction::ListAdd {
+                list: list_operand(),
+                value: operand(lp(2)),
+            },
+            Instruction::ListClear {
+                list: list_operand(),
+            },
+            list_release(),
+            release(lp(0)),
+            release(lp(2)),
+        ]);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     fn array_type() -> Type {

@@ -69,6 +69,13 @@ pub const ASTER_ARRAY_LENGTH_OFFSET: usize = std::mem::offset_of!(AsterArray, le
 #[cfg(feature = "mem-exp-rc")]
 pub const ASTER_ARRAY_COUNT_OFFSET: usize = std::mem::offset_of!(AsterArray, count_word);
 
+/// Offset of the count word inside a counted list header.
+#[cfg(feature = "mem-exp-rc")]
+pub const ASTER_LIST_COUNT_OFFSET: usize = std::mem::offset_of!(AsterList, count_word);
+/// Offset of the element descriptor word inside a counted list header.
+#[cfg(feature = "mem-exp-rc")]
+pub const ASTER_LIST_DESCRIPTOR_OFFSET: usize = std::mem::offset_of!(AsterList, element_descriptor);
+
 /// Offset of the one-byte error flag inside an [`ExecutionContext`], read
 /// directly by generated code after fallible runtime calls instead of calling
 /// [`aster_rt_has_error`]. Derived from the struct, not duplicated in a
@@ -199,6 +206,7 @@ fn dictionary_key_kind_size(kind: DictionaryKeyKind) -> usize {
 /// allocated list has `capacity == 0`, and `data` is `null` in that case â€”
 /// an internal detail of this header, never a value observable from Aster
 /// (`List<T>` itself is never `null`; only this empty-buffer sentinel is).
+#[cfg(not(feature = "mem-exp-rc"))]
 #[repr(C)]
 pub struct AsterList {
     data: *mut u8,
@@ -224,10 +232,41 @@ pub struct AsterList {
     /// inside a deeper nested scope (i.e. a helper function) are promoted to
     /// the permanent arena so they survive the helper's temp-scope rewind.
     birth_scope_depth: u32,
-    /// MEM-EXP-1 C5/C6 (design section 7): immutable descriptor of the
-    /// element type's reference leaves; null when the element has none.
-    #[cfg(feature = "mem-exp-rc")]
+}
+
+/// Counted list header (MEM-EXP-1, design section 10): the uniform object
+/// prefix (element descriptor word @0, count word @8 with kind 3) followed by
+/// the list fields. The descriptor is immutable program data naming the
+/// element type's reference leaves; null when the element has none.
+#[cfg(feature = "mem-exp-rc")]
+#[repr(C)]
+pub struct AsterList {
     element_descriptor: *const crate::object_heap::ObjectDescriptor,
+    #[allow(dead_code, reason = "read and written through the object header ABI")]
+    count_word: u32,
+    data: *mut u8,
+    length: i32,
+    capacity: i32,
+    element_size: u32,
+    element_align: u32,
+    /// Deterministic structural identity of the concrete element type `T`
+    /// (see `aster_mir::type_key`), computed once by the compiler and never
+    /// recomputed or reinterpreted by this crate.
+    element_type_key: u64,
+    /// Structural-modification counter, incremented after every successful
+    /// `Add`/`RemoveAt` (never on a failed operation, never on `Length`/
+    /// `Get`). `foreach` captures this once and compares before each element
+    /// read to fail fast on structural mutation during iteration -- never
+    /// exposed as an Aster-level property. 64 bits wide so overflow within
+    /// one valid execution is not a practical concern; a wrapping increment
+    /// is safe because equality (not ordering) is all iteration ever checks.
+    version: u64,
+    region: ListRegion,
+    /// Depth of `temporary_scopes` when this header was allocated, or 0 for
+    /// Persistent lists. Buffer allocations in `grow_list_buffer` that happen
+    /// inside a deeper nested scope (i.e. a helper function) are promoted to
+    /// the permanent arena so they survive the helper's temp-scope rewind.
+    birth_scope_depth: u32,
 }
 
 /// Native mutable UTF-8 construction header. The header and every backing
@@ -434,6 +473,27 @@ impl AsterList {
     #[must_use]
     pub fn region(&self) -> ListRegion {
         self.region
+    }
+
+    #[cfg(feature = "mem-exp-rc")]
+    pub(crate) fn element_descriptor(&self) -> *const crate::object_heap::ObjectDescriptor {
+        self.element_descriptor
+    }
+
+    #[cfg(feature = "mem-exp-rc")]
+    pub(crate) fn data_ptr(&self) -> *mut u8 {
+        self.data
+    }
+
+    /// Whether a Persistent list buffer of `bytes` with alignment `align` is
+    /// served by the size-class heap (otherwise it stays arena-reserved).
+    #[cfg(feature = "mem-exp-rc")]
+    pub(crate) fn buffer_is_heap_served(bytes: usize, align: u32) -> bool {
+        align <= 8
+            && u32::try_from(bytes)
+                .ok()
+                .and_then(crate::object_heap::ObjectHeap::class_of)
+                .is_some()
     }
 }
 
@@ -1454,11 +1514,19 @@ impl ExecutionContext {
             return ptr::null_mut();
         }
 
-        let Some(header) = self.allocate_in_region(
+        #[cfg(feature = "mem-exp-rc")]
+        let header = if region == ListRegion::Persistent {
+            self.allocate_heap_block(size_of::<AsterList>())
+        } else {
+            self.allocate_in_region(size_of::<AsterList>(), align_of::<AsterList>(), true)
+        };
+        #[cfg(not(feature = "mem-exp-rc"))]
+        let header = self.allocate_in_region(
             size_of::<AsterList>(),
             align_of::<AsterList>(),
             region == ListRegion::Temporary,
-        ) else {
+        );
+        let Some(header) = header else {
             return ptr::null_mut();
         };
         #[allow(clippy::cast_ptr_alignment)]
@@ -1485,9 +1553,19 @@ impl ExecutionContext {
             #[cfg(feature = "mem-exp-rc")]
             {
                 (*header_ptr).element_descriptor = ptr::null();
+                // Persistent headers are size-class blocks with count 1;
+                // Temporary headers are region-owned and never counted.
+                (*header_ptr).count_word = crate::object_heap::LIST_FLAG
+                    | if region == ListRegion::Persistent {
+                        1
+                    } else {
+                        crate::object_heap::IMMORTAL
+                    };
             }
         }
         self.record_allocation(AllocationCategory::Object, size_of::<AsterList>());
+        #[cfg(feature = "mem-exp-rc")]
+        self.sync_heap_stats();
         header_ptr
     }
 
@@ -3136,6 +3214,15 @@ impl ExecutionContext {
         let use_temporary = region == ListRegion::Temporary
             && self.temporary_scopes.len() == birth_scope_depth as usize;
         let align = usize::try_from(element_align).unwrap_or(1);
+        #[cfg(feature = "mem-exp-rc")]
+        let new_data = if region == ListRegion::Persistent
+            && AsterList::buffer_is_heap_served(byte_size, element_align)
+        {
+            self.allocate_heap_block(byte_size)?
+        } else {
+            self.allocate_in_region(byte_size, align, use_temporary)?
+        };
+        #[cfg(not(feature = "mem-exp-rc"))]
         let new_data = self.allocate_in_region(byte_size, align, use_temporary)?;
         let old_byte_len =
             usize::try_from(length).unwrap_or(0) * usize::try_from(element_size).unwrap_or(0);
@@ -3150,6 +3237,8 @@ impl ExecutionContext {
             }
         }
         self.record_allocation(AllocationCategory::Object, byte_size);
+        #[cfg(feature = "mem-exp-rc")]
+        self.sync_heap_stats();
         Some((new_data, new_capacity))
     }
 
@@ -3292,6 +3381,8 @@ impl ExecutionContext {
             return;
         }
 
+        #[cfg(feature = "mem-exp-rc")]
+        let old_data = data;
         let (data, capacity) = if length == capacity {
             let Some(grown) = self.grow_list_buffer(
                 data,
@@ -3338,6 +3429,10 @@ impl ExecutionContext {
             (*list).capacity = capacity;
             (*list).length = new_length;
             (*list).version = (*list).version.wrapping_add(1);
+        }
+        #[cfg(feature = "mem-exp-rc")]
+        if old_data != data {
+            self.return_list_buffer(old_data, length, element_size, element_align, region);
         }
     }
 
@@ -3640,6 +3735,35 @@ impl ExecutionContext {
         array
     }
 
+    /// Return a replaced Persistent list buffer to the size-class heap after
+    /// its elements were bit-moved to the new buffer. Buffers the heap did not
+    /// serve (null, Temporary, over-aligned, or above the largest class) are
+    /// left alone.
+    #[cfg(feature = "mem-exp-rc")]
+    fn return_list_buffer(
+        &mut self,
+        buffer: *mut u8,
+        capacity: i32,
+        element_size: u32,
+        element_align: u32,
+        region: ListRegion,
+    ) {
+        if buffer.is_null() || region != ListRegion::Persistent {
+            return;
+        }
+        let bytes = usize::try_from(capacity).unwrap_or(0) * element_size as usize;
+        if !AsterList::buffer_is_heap_served(bytes, element_align) {
+            return;
+        }
+        if let Some(class) = u32::try_from(bytes)
+            .ok()
+            .and_then(crate::object_heap::ObjectHeap::class_of)
+        {
+            self.object_heap.release(buffer, class);
+            self.sync_heap_stats();
+        }
+    }
+
     fn list_capacity(&mut self, list: *const AsterList) -> i32 {
         if self.error.is_some() || !self.validate_list_header(list) {
             return 0;
@@ -3696,6 +3820,15 @@ impl ExecutionContext {
         }
         let use_temporary = region == ListRegion::Temporary
             && self.temporary_scopes.len() == birth_scope_depth as usize;
+        #[cfg(feature = "mem-exp-rc")]
+        let new_data = if region == ListRegion::Persistent
+            && AsterList::buffer_is_heap_served(bytes, element_align)
+        {
+            self.allocate_heap_block(bytes)?
+        } else {
+            self.allocate_in_region(bytes, element_align as usize, use_temporary)?
+        };
+        #[cfg(not(feature = "mem-exp-rc"))]
         let new_data = self.allocate_in_region(bytes, element_align as usize, use_temporary)?;
         let Some(live_bytes) = usize::try_from(length)
             .ok()
@@ -3711,11 +3844,15 @@ impl ExecutionContext {
             }
         }
         self.record_allocation(AllocationCategory::Object, bytes);
+        #[cfg(feature = "mem-exp-rc")]
+        self.sync_heap_stats();
         #[allow(unsafe_code)]
         unsafe {
             (*list).data = new_data;
             (*list).capacity = target;
         }
+        #[cfg(feature = "mem-exp-rc")]
+        self.return_list_buffer(data, capacity, element_size, element_align, region);
         Some(target)
     }
 

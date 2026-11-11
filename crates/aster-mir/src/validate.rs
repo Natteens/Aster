@@ -536,6 +536,7 @@ fn validate_typed_instruction(
                     | mir::Type::Interface(_)
                     | mir::Type::Array(_)
                     | mir::Type::String
+                    | mir::Type::List(_)
             ) {
                 Ok(())
             } else {

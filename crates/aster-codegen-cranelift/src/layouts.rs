@@ -204,6 +204,7 @@ impl Layouts {
             mir::Type::Class(_)
             | mir::Type::Interface(_)
             | mir::Type::Array(_)
+            | mir::Type::List(_)
             | mir::Type::String => true,
             mir::Type::User(symbol) => self.structs.get(symbol).is_some_and(|definition| {
                 definition
@@ -253,7 +254,7 @@ impl Layouts {
     }
 
     /// Leaf offsets of one value of `type_` placed at `offset`: a class,
-    /// interface, array or string is one leaf (its object word), an inline struct contributes
+    /// interface, array, list or string is one leaf (its object word), an inline struct contributes
     /// its fields' leaves, everything else has none.
     #[cfg(feature = "mem-exp-c5")]
     pub(super) fn collect_type_offsets(
@@ -268,6 +269,7 @@ impl Layouts {
             mir::Type::Class(_)
             | mir::Type::Interface(_)
             | mir::Type::Array(_)
+            | mir::Type::List(_)
             | mir::Type::String => {
                 offsets.push(offset);
             }
