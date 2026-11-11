@@ -1,5 +1,5 @@
 //! MEM-EXP-1 C5: ownership pass, descriptors, and reference-count lowering.
-#![cfg(feature = "mem-exp-c5")]
+#![cfg(feature = "mem-exp-rc-core")]
 
 use aster_codegen_cranelift::{ExecutionValue, MemoryStats, execute_with_stats};
 use aster_compiler::{compile, compile_project};

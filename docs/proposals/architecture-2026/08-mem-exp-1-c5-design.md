@@ -320,3 +320,17 @@ peak-memory gate of §4.C measures that cost.
   in three places: a borrowed-parameter function must be non-releasing; a call to a non-releasing
   function does not invalidate; a borrowed (0-token heap-read) value may be passed as an argument
   only to a non-releasing callee (U2/G1). Everything else is the existing token and window logic.
+
+## 15. C6 elision, final round
+
+- **E4 through temporaries.** A borrowed local may be written by a copy from a single-use lowering
+  temporary that was itself written by a borrowed load in the same block (the `ListGet` →
+  temporary → local shape that lowering produces); the temporary is then borrowed too.
+- **E4 across blocks.** A borrowed local's reads may be in other blocks when the load's block
+  dominates every read and no path from the load to any read contains an invalidating instruction
+  or another write of the local (forward must-dataflow of "window open"). The validator checks the
+  same property with its own dataflow and accepts a live-out 0-token heap read only when the window
+  is open on every path to each use; anything else stays U1/U2.
+- **Cost.** Pass and validator use indexed lookups (locals, struct and class fields, interface
+  implementations, window caches) instead of linear scans; the compile-time gate is measured with
+  `mem_exp_pass_time`.

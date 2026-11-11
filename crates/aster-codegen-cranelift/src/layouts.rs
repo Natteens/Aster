@@ -40,7 +40,7 @@ pub(super) const OBJECT_HEADER_BYTES: u32 = if cfg!(feature = "mem-exp-h16") {
 /// Per-class `ObjectDescriptor`s owned by the prepared program. Boxed so the
 /// addresses written into objects stay stable when the store is moved, and
 /// kept alive until the JIT module and every execution context are gone.
-#[cfg(feature = "mem-exp-c5")]
+#[cfg(feature = "mem-exp-rc-core")]
 #[derive(Default)]
 pub(super) struct ObjectDescriptors {
     #[allow(dead_code, reason = "owns the offset tables the descriptors point at")]
@@ -66,7 +66,7 @@ pub(super) struct ObjectDescriptors {
     by_dictionary: HashMap<(u64, u64), *const aster_runtime::object_heap::DictionaryDescriptors>,
 }
 
-#[cfg(feature = "mem-exp-c5")]
+#[cfg(feature = "mem-exp-rc-core")]
 impl ObjectDescriptors {
     #[allow(clippy::too_many_lines)]
     pub(super) fn build(layouts: &Layouts, module: &mir::Module) -> Result<Self, BackendError> {
@@ -257,7 +257,7 @@ impl Layouts {
     }
 
     /// Whether a value of `type_` holds at least one counted reference leaf.
-    #[cfg(feature = "mem-exp-c5")]
+    #[cfg(feature = "mem-exp-rc-core")]
     pub(super) fn type_has_references(&self, type_: &mir::Type) -> bool {
         match type_ {
             mir::Type::Class(_)
@@ -278,7 +278,7 @@ impl Layouts {
 
     /// Byte offsets, from the object start, of every reference leaf of a
     /// class, including leaves of inline struct fields.
-    #[cfg(feature = "mem-exp-c5")]
+    #[cfg(feature = "mem-exp-rc-core")]
     pub(super) fn reference_offsets(
         &self,
         class: mir::SymbolId,
@@ -289,7 +289,7 @@ impl Layouts {
         Ok(offsets)
     }
 
-    #[cfg(feature = "mem-exp-c5")]
+    #[cfg(feature = "mem-exp-rc-core")]
     fn collect_reference_offsets(
         &self,
         aggregate: mir::SymbolId,
@@ -316,7 +316,7 @@ impl Layouts {
     /// Leaf offsets of one value of `type_` placed at `offset`: a class,
     /// interface, array, list, dictionary or string is one leaf (its object word), an inline struct contributes
     /// its fields' leaves, everything else has none.
-    #[cfg(feature = "mem-exp-c5")]
+    #[cfg(feature = "mem-exp-rc-core")]
     pub(super) fn collect_type_offsets(
         &self,
         type_: &mir::Type,

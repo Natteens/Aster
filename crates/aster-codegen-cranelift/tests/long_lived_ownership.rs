@@ -8,7 +8,7 @@ fn run(source: &str) -> (ExecutionValue, MemoryStats) {
 
 #[test]
 #[cfg_attr(
-    feature = "mem-exp-c5",
+    feature = "mem-exp-rc-core",
     ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
 )]
 fn returned_overwritten_arrays_are_bounded_by_the_live_working_set() {
@@ -40,7 +40,7 @@ fn returned_overwritten_arrays_are_bounded_by_the_live_working_set() {
 
 #[test]
 #[cfg_attr(
-    feature = "mem-exp-c5",
+    feature = "mem-exp-rc-core",
     ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
 )]
 fn loop_break_and_continue_keep_owned_cleanup_balanced() {
@@ -65,7 +65,7 @@ fn loop_break_and_continue_keep_owned_cleanup_balanced() {
 
 #[test]
 #[cfg_attr(
-    feature = "mem-exp-c5",
+    feature = "mem-exp-rc-core",
     ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
 )]
 fn independent_objects_strings_lists_and_dictionaries_reclaim() {
@@ -117,7 +117,7 @@ fn independent_objects_strings_lists_and_dictionaries_reclaim() {
 
 #[test]
 #[cfg_attr(
-    feature = "mem-exp-c5",
+    feature = "mem-exp-rc-core",
     ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
 )]
 fn a_live_alias_prevents_the_overlapping_family_from_reclaiming() {
@@ -206,7 +206,7 @@ fn generic_pass_through_cannot_disguise_a_shared_reference() {
 
 #[test]
 #[cfg_attr(
-    feature = "mem-exp-c5",
+    feature = "mem-exp-rc-core",
     ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
 )]
 fn persistent_owned_region_composes_with_temporary_callee_storage() {
@@ -258,7 +258,7 @@ fn worker_local_owned_regions_are_isolated_and_reusable() {
 
 #[test]
 #[cfg_attr(
-    feature = "mem-exp-c5",
+    feature = "mem-exp-rc-core",
     ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
 )]
 fn closed_generic_producers_keep_region_identity_function_local() {

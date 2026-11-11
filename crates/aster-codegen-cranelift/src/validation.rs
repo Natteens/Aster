@@ -557,7 +557,7 @@ fn validate_instruction(
         | mir::Instruction::OwnedRegionExit { .. }
         | mir::Instruction::ForeignCall { .. } => Ok(()),
         mir::Instruction::Retain { value } | mir::Instruction::Release { value } => {
-            if cfg!(feature = "mem-exp-c5")
+            if cfg!(feature = "mem-exp-rc-core")
                 && matches!(
                     value.type_,
                     mir::Type::Class(_)

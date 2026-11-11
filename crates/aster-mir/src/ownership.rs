@@ -58,28 +58,22 @@ pub fn insert_ownership_elided_with_rounds(
     module: &mir::Module,
 ) -> (mir::Module, OwnershipStats, usize) {
     let (mut output, mut stats) = insert_ownership(module);
-    let native = string_builder_classes(module);
+    let shape = Shape::new(module);
     let mut all_captures = Vec::with_capacity(output.functions.len());
     for (function, original) in output.functions.iter_mut().zip(&module.functions) {
         let mut scratch = OwnershipStats::default();
         let context = Context {
-            module,
-            native: &native,
+            shape: &shape,
             function: original,
+            locals: local_types(original),
             next_local: 0,
             new_locals: Vec::new(),
             stats: &mut scratch,
         };
-        let known: HashSet<LocalId> = original
-            .parameters
+        // The pass appended its own locals after the original ones.
+        let captures: HashSet<LocalId> = function.locals[original.locals.len()..]
             .iter()
-            .chain(&original.locals)
-            .map(|local| local.id)
-            .collect();
-        let captures: HashSet<LocalId> = function
-            .locals
-            .iter()
-            .filter(|local| !known.contains(&local.id) && local.name.starts_with("$own.old"))
+            .filter(|local| local.name.starts_with("$own.old"))
             .map(|local| local.id)
             .collect();
         let null = elide_null_captures(function, &captures);
@@ -96,7 +90,7 @@ pub fn insert_ownership_elided_with_rounds(
         stats.elided_parameters += parameters.retains + parameters.releases;
         all_captures.push(captures);
     }
-    let rounds = elide_with_summaries(module, &native, &mut output, &all_captures, &mut stats);
+    let rounds = elide_with_summaries(module, &shape, &mut output, &all_captures, &mut stats);
     (output, stats, rounds)
 }
 
@@ -117,8 +111,8 @@ fn is_call(instruction: &Instruction) -> bool {
 }
 
 /// Every place an instruction writes.
-fn destination_places(instruction: &Instruction) -> Vec<&Place> {
-    match instruction {
+fn destination_places(instruction: &Instruction) -> impl Iterator<Item = &Place> {
+    let places: [Option<&Place>; 3] = match instruction {
         Instruction::Assign { target, .. }
         | Instruction::AllocateArray {
             destination: target,
@@ -183,19 +177,24 @@ fn destination_places(instruction: &Instruction) -> Vec<&Place> {
         | Instruction::ListToArray {
             destination: target,
             ..
-        } => vec![target],
+        } => [Some(target), None, None],
         Instruction::Call { destination, .. }
         | Instruction::CallInterface { destination, .. }
         | Instruction::ForeignCall { destination, .. }
-        | Instruction::CallIntrinsic { destination, .. } => destination.iter().collect(),
+        | Instruction::CallIntrinsic { destination, .. } => [destination.as_ref(), None, None],
         Instruction::StringDecodeNext {
             char_destination,
             next_cursor_destination,
             ok_destination,
             ..
-        } => vec![char_destination, next_cursor_destination, ok_destination],
-        _ => Vec::new(),
-    }
+        } => [
+            Some(char_destination),
+            Some(next_cursor_destination),
+            Some(ok_destination),
+        ],
+        _ => [None, None, None],
+    };
+    places.into_iter().flatten()
 }
 
 /// Whether a store to `place` writes an array element (it releases the old
@@ -263,13 +262,12 @@ fn copy_target(instruction: &Instruction, local: LocalId) -> Option<&Place> {
 pub fn insert_ownership(module: &mir::Module) -> (mir::Module, OwnershipStats) {
     let mut stats = OwnershipStats::default();
     let mut output = module.clone();
-    let native = string_builder_classes(module);
-    for function in &mut output.functions {
-        let original = function.clone();
+    let shape = Shape::new(module);
+    for (function, original) in output.functions.iter_mut().zip(&module.functions) {
         let mut context = Context {
-            module,
-            native: &native,
-            function: &original,
+            shape: &shape,
+            function: original,
+            locals: local_types(original),
             next_local: next_id(
                 function
                     .parameters
@@ -334,9 +332,79 @@ fn string_builder_classes(module: &Module) -> HashSet<SymbolId> {
         .collect()
 }
 
-fn leaves(module: &Module, native: &HashSet<SymbolId>, type_: &Type) -> Vec<Leaf> {
+/// Indexed view of the module's type definitions, built once per pass.
+struct Shape<'a> {
+    native: HashSet<SymbolId>,
+    structs: HashMap<SymbolId, &'a mir::StructDefinition>,
+    /// Field types of structs and classes by `(owner, field)`.
+    field_types: HashMap<(SymbolId, SymbolId), &'a Type>,
+    /// Field types of enum cases by `(case, field)`.
+    case_fields: HashMap<(SymbolId, SymbolId), &'a Type>,
+}
+
+impl<'a> Shape<'a> {
+    fn new(module: &'a Module) -> Self {
+        let mut field_types = HashMap::new();
+        for (owner, fields) in module
+            .structs
+            .iter()
+            .map(|definition| (definition.symbol, &definition.fields))
+            .chain(
+                module
+                    .classes
+                    .iter()
+                    .map(|definition| (definition.symbol, &definition.fields)),
+            )
+        {
+            for field in fields {
+                field_types
+                    .entry((owner, field.symbol))
+                    .or_insert(&field.type_);
+            }
+        }
+        let mut case_fields = HashMap::new();
+        for case in module.enums.iter().flat_map(|definition| &definition.cases) {
+            for field in &case.fields {
+                case_fields
+                    .entry((case.symbol, field.symbol))
+                    .or_insert(&field.type_);
+            }
+        }
+        Shape {
+            native: string_builder_classes(module),
+            structs: module
+                .structs
+                .iter()
+                .rev()
+                .map(|definition| (definition.symbol, definition))
+                .collect(),
+            field_types,
+            case_fields,
+        }
+    }
+}
+
+fn has_leaves(shape: &Shape<'_>, type_: &Type) -> bool {
     match type_ {
-        Type::Class(symbol) if native.contains(symbol) => Vec::new(),
+        Type::Class(symbol) => !shape.native.contains(symbol),
+        Type::Interface(_)
+        | Type::Array(_)
+        | Type::String
+        | Type::List(_)
+        | Type::Dictionary(_, _) => true,
+        Type::User(symbol) => shape.structs.get(symbol).is_some_and(|definition| {
+            definition
+                .fields
+                .iter()
+                .any(|field| has_leaves(shape, &field.type_))
+        }),
+        _ => false,
+    }
+}
+
+fn leaves(shape: &Shape<'_>, type_: &Type) -> Vec<Leaf> {
+    match type_ {
+        Type::Class(symbol) if shape.native.contains(symbol) => Vec::new(),
         // An array is one leaf whatever its element type: an `int[]` must still
         // be released to free its blocks (design §8). A string is a leaf too
         // (design §9); string constants are immortal and never counted.
@@ -348,14 +416,13 @@ fn leaves(module: &Module, native: &HashSet<SymbolId>, type_: &Type) -> Vec<Leaf
         | Type::String
         | Type::List(_)
         | Type::Dictionary(_, _) => vec![(Vec::new(), type_.clone())],
-        Type::User(symbol) => module
+        Type::User(symbol) => shape
             .structs
-            .iter()
-            .find(|definition| definition.symbol == *symbol)
+            .get(symbol)
             .into_iter()
             .flat_map(|definition| &definition.fields)
             .flat_map(|field| {
-                leaves(module, native, &field.type_)
+                leaves(shape, &field.type_)
                     .into_iter()
                     .map(move |(mut path, leaf)| {
                         path.insert(0, field.symbol);
@@ -390,17 +457,32 @@ fn owning(place: &Place) -> bool {
 }
 
 struct Context<'a> {
-    module: &'a Module,
-    native: &'a HashSet<SymbolId>,
+    shape: &'a Shape<'a>,
     function: &'a Function,
+    /// Types of the function's parameters and locals by id.
+    locals: Vec<Option<&'a Type>>,
     next_local: u32,
     new_locals: Vec<Local>,
     stats: &'a mut OwnershipStats,
 }
 
+/// Types of the parameters and locals, indexed by local id (the first
+/// declaration of an id wins).
+fn local_types(function: &Function) -> Vec<Option<&Type>> {
+    let mut types: Vec<Option<&Type>> = Vec::new();
+    for local in function.parameters.iter().chain(&function.locals) {
+        let id = local.id.0 as usize;
+        if types.len() <= id {
+            types.resize(id + 1, None);
+        }
+        types[id].get_or_insert(&local.type_);
+    }
+    types
+}
+
 impl Context<'_> {
     fn leaf_operands(&self, place: &Place, type_: &Type) -> Vec<Operand> {
-        leaves(self.module, self.native, type_)
+        leaves(self.shape, type_)
             .into_iter()
             .map(|(path, leaf)| copy(leaf_place(place, &path), &leaf))
             .collect()
@@ -416,46 +498,34 @@ impl Context<'_> {
     fn place_type(&self, place: &Place) -> Option<Type> {
         match place {
             Place::Local(id) => self
-                .function
-                .parameters
-                .iter()
-                .chain(&self.function.locals)
-                .find(|local| local.id == *id)
-                .map(|local| local.type_.clone()),
+                .locals
+                .get(id.0 as usize)
+                .and_then(|type_| type_.cloned()),
             Place::Symbol(_) => None,
             Place::Field { base, field } => {
                 let Type::User(symbol) = self.place_type(base)? else {
                     return None;
                 };
-                let definition = self.module.structs.iter().find(|d| d.symbol == symbol)?;
-                definition
-                    .fields
-                    .iter()
-                    .find(|f| f.symbol == *field)
-                    .map(|f| f.type_.clone())
+                self.shape
+                    .field_types
+                    .get(&(symbol, *field))
+                    .map(|type_| (*type_).clone())
             }
             Place::Index { element_type, .. } => Some(element_type.clone()),
             Place::ObjectField { object, field } => {
                 let Type::Class(symbol) = &object.type_ else {
                     return None;
                 };
-                let definition = self.module.classes.iter().find(|d| d.symbol == *symbol)?;
-                definition
-                    .fields
-                    .iter()
-                    .find(|f| f.symbol == *field)
-                    .map(|f| f.type_.clone())
+                self.shape
+                    .field_types
+                    .get(&(*symbol, *field))
+                    .map(|type_| (*type_).clone())
             }
             Place::EnumField { case, field, .. } => self
-                .module
-                .enums
-                .iter()
-                .flat_map(|definition| &definition.cases)
-                .find(|candidate| candidate.symbol == *case)?
-                .fields
-                .iter()
-                .find(|f| f.symbol == *field)
-                .map(|f| f.type_.clone()),
+                .shape
+                .case_fields
+                .get(&(*case, *field))
+                .map(|type_| (*type_).clone()),
         }
     }
 
@@ -637,7 +707,7 @@ impl Context<'_> {
             // scalar such as `this.value` reads through a reference.
             Terminator::Return(Some(operand))
                 if matches!(operand.kind, OperandKind::Copy(_))
-                    || !leaves(self.module, self.native, &operand.type_).is_empty() =>
+                    || !leaves(self.shape, &operand.type_).is_empty() =>
             {
                 let result = self.fresh(&operand.type_, "$own.ret");
                 out.push(Instruction::Assign {
@@ -703,43 +773,66 @@ impl Context<'_> {
     }
 }
 
-/// Forward "definitely null" analysis: for each block (by index) the locals
-/// that were never written on any path from the function entry. `None`
-/// marks a block unreachable from the entry.
-fn null_entry_states(function: &Function) -> Vec<Option<HashSet<LocalId>>> {
-    let index: HashMap<BasicBlockId, usize> = function
-        .blocks
-        .iter()
-        .enumerate()
-        .map(|(position, block)| (block.id, position))
-        .collect();
-    let parameters: HashSet<LocalId> = function.parameters.iter().map(|p| p.id).collect();
-    let mut states: Vec<Option<HashSet<LocalId>>> = vec![None; function.blocks.len()];
-    if let Some(&entry) = index.get(&function.entry) {
-        states[entry] = Some(
-            function
-                .locals
-                .iter()
-                .map(|local| local.id)
-                .filter(|id| !parameters.contains(id))
-                .collect(),
-        );
+/// Dense lookup of a function's blocks by id.
+fn block_positions(function: &Function) -> Vec<usize> {
+    let mut positions: Vec<usize> = Vec::new();
+    for (position, block) in function.blocks.iter().enumerate() {
+        let id = block.id.0 as usize;
+        if positions.len() <= id {
+            positions.resize(id + 1, usize::MAX);
+        }
+        if positions[id] == usize::MAX {
+            positions[id] = position;
+        }
     }
+    positions
+}
+
+fn block_position(positions: &[usize], id: BasicBlockId) -> Option<usize> {
+    positions
+        .get(id.0 as usize)
+        .copied()
+        .filter(|position| *position != usize::MAX)
+}
+
+/// Forward "definitely null" analysis: for each block (by index) the locals
+/// that were never written on any path from the function entry, as flags
+/// indexed by `slots` (non-parameter local id to flag index, `usize::MAX`
+/// otherwise). `None` marks a block unreachable from the entry.
+fn null_entry_states(
+    function: &Function,
+    slots: &[usize],
+    slot_count: usize,
+) -> Vec<Option<Vec<bool>>> {
+    let positions = block_positions(function);
+    let slot_of = |place: &Place| {
+        root_local(place)
+            .and_then(|local| slots.get(local.0 as usize))
+            .copied()
+            .filter(|slot| *slot != usize::MAX)
+    };
+    let mut states: Vec<Option<Vec<bool>>> = vec![None; function.blocks.len()];
+    if let Some(entry) = block_position(&positions, function.entry) {
+        states[entry] = Some(vec![true; slot_count]);
+    }
+    let mut state: Vec<bool> = Vec::with_capacity(slot_count);
     loop {
         let mut changed = false;
         for (position, block) in function.blocks.iter().enumerate() {
-            let Some(mut state) = states[position].clone() else {
+            let Some(entering) = &states[position] else {
                 continue;
             };
+            state.clear();
+            state.extend_from_slice(entering);
             for instruction in &block.instructions {
                 for place in destination_places(instruction) {
-                    if let Some(local) = root_local(place) {
-                        state.remove(&local);
+                    if let Some(slot) = slot_of(place) {
+                        state[slot] = false;
                     }
                 }
             }
             for target in successor_blocks(&block.terminator) {
-                let Some(&next) = index.get(&target) else {
+                let Some(next) = block_position(&positions, target) else {
                     continue;
                 };
                 match &mut states[next] {
@@ -748,9 +841,12 @@ fn null_entry_states(function: &Function) -> Vec<Option<HashSet<LocalId>>> {
                         changed = true;
                     }
                     Some(existing) => {
-                        let before = existing.len();
-                        existing.retain(|local| state.contains(local));
-                        changed |= existing.len() != before;
+                        for (old, new) in existing.iter_mut().zip(&state) {
+                            if *old && !*new {
+                                *old = false;
+                                changed = true;
+                            }
+                        }
                     }
                 }
             }
@@ -763,13 +859,37 @@ fn null_entry_states(function: &Function) -> Vec<Option<HashSet<LocalId>>> {
 
 /// E1: drop a capture of a local leaf that is definitely null, and its release.
 fn elide_null_captures(function: &mut Function, captures: &HashSet<LocalId>) -> Removed {
-    let states = null_entry_states(function);
+    let mut slots: Vec<usize> = Vec::new();
+    let mut slot_count = 0;
+    for local in &function.locals {
+        let id = local.id.0 as usize;
+        if slots.len() <= id {
+            slots.resize(id + 1, usize::MAX);
+        }
+        if slots[id] == usize::MAX {
+            slots[id] = slot_count;
+            slot_count += 1;
+        }
+    }
+    // Parameters are written on entry, never null.
+    for parameter in &function.parameters {
+        if let Some(slot) = slots.get_mut(parameter.id.0 as usize) {
+            *slot = usize::MAX;
+        }
+    }
+    let states = null_entry_states(function, &slots, slot_count);
+    let slot_of = |place: &Place| {
+        root_local(place)
+            .and_then(|local| slots.get(local.0 as usize))
+            .copied()
+            .filter(|slot| *slot != usize::MAX)
+    };
     let mut removed = Removed::default();
     for (block, entry) in function.blocks.iter_mut().zip(states) {
-        let mut state = entry.unwrap_or_default();
-        let mut elided = HashSet::new();
-        let mut kept = Vec::with_capacity(block.instructions.len());
-        for instruction in std::mem::take(&mut block.instructions) {
+        let mut state = entry.unwrap_or_else(|| vec![false; slot_count]);
+        let mut elided: Vec<LocalId> = Vec::new();
+        let mut dropped: Vec<usize> = Vec::new();
+        for (index, instruction) in block.instructions.iter().enumerate() {
             if let Instruction::Assign {
                 target: Place::Local(temporary),
                 value:
@@ -781,72 +901,91 @@ fn elide_null_captures(function: &mut Function, captures: &HashSet<LocalId>) -> 
                             }),
                         ..
                     },
-            } = &instruction
+            } = instruction
                 && captures.contains(temporary)
-                && root_local(source).is_some_and(|local| state.contains(&local))
+                && slot_of(source).is_some_and(|slot| state[slot])
             {
-                elided.insert(*temporary);
+                elided.push(*temporary);
+                dropped.push(index);
                 continue;
             }
             if elided
                 .iter()
-                .any(|temporary| is_release_of(&instruction, *temporary))
+                .any(|temporary| is_release_of(instruction, *temporary))
             {
                 removed.releases += 1;
+                dropped.push(index);
                 continue;
             }
-            for place in destination_places(&instruction) {
-                if let Some(local) = root_local(place) {
-                    state.remove(&local);
+            for place in destination_places(instruction) {
+                if let Some(slot) = slot_of(place) {
+                    state[slot] = false;
                 }
             }
-            kept.push(instruction);
         }
-        block.instructions = kept;
+        if !dropped.is_empty() {
+            let mut index = 0;
+            block.instructions.retain(|_| {
+                index += 1;
+                dropped.binary_search(&(index - 1)).is_err()
+            });
+        }
     }
     removed
 }
 
 impl Context<'_> {
-    /// Shape check on the pre-pass function: `local` is written once, read
-    /// once, and the read is a copy into an owning place that does not itself
-    /// mention `local`.
-    fn single_use_temporary(&self, local: LocalId) -> bool {
-        let mut writes = 0;
-        let mut readers = 0;
-        let mut owning_copy = false;
+    /// The locals of the pre-pass function that are written once and read
+    /// once, where the read is a copy into an owning place that does not
+    /// itself mention the local (the shape E2 needs). One pass over the
+    /// function.
+    fn single_use_temporaries(&self) -> HashSet<LocalId> {
+        #[derive(Default)]
+        struct Use {
+            writes: usize,
+            readers: usize,
+            owning_copy: bool,
+            blocked: bool,
+        }
+        let mut uses: HashMap<LocalId, Use> = HashMap::new();
+        let mut reads = HashSet::new();
         for block in &self.function.blocks {
             for instruction in &block.instructions {
-                if destination_places(instruction)
-                    .iter()
-                    .any(|place| root_local(place) == Some(local))
-                {
-                    writes += 1;
+                for place in destination_places(instruction) {
+                    if let Some(local) = root_local(place) {
+                        uses.entry(local).or_default().writes += 1;
+                    }
                 }
-                let mut reads = HashSet::new();
+                reads.clear();
                 owned_instruction_reads(instruction, &mut reads);
-                if reads.contains(&local) {
-                    readers += 1;
-                    if let Some(target) = copy_target(instruction, local)
+                for local in &reads {
+                    let entry = uses.entry(*local).or_default();
+                    entry.readers += 1;
+                    if let Some(target) = copy_target(instruction, *local)
                         && owning(target)
                     {
                         let mut target_reads = HashSet::new();
                         owned_place_reads(target, &mut target_reads);
-                        owning_copy = !target_reads.contains(&local);
+                        entry.owning_copy = !target_reads.contains(local);
                     }
                 }
             }
-            let mut reads = HashSet::new();
+            reads.clear();
             match &block.terminator {
                 Terminator::Branch { condition, .. } => owned_operand_reads(condition, &mut reads),
                 Terminator::Return(Some(operand)) => owned_operand_reads(operand, &mut reads),
                 _ => {}
             }
-            if reads.contains(&local) {
-                return false;
+            for local in &reads {
+                uses.entry(*local).or_default().blocked = true;
             }
         }
-        writes == 1 && readers == 1 && owning_copy
+        uses.into_iter()
+            .filter(|(_, usage)| {
+                !usage.blocked && usage.writes == 1 && usage.readers == 1 && usage.owning_copy
+            })
+            .map(|(local, _)| local)
+            .collect()
     }
 
     /// E2: for a single-use lowering temporary `t` copied into an owning
@@ -854,12 +993,11 @@ impl Context<'_> {
     /// exit releases of `t` and the capture of `t` at its write.
     fn elide_moves(&self, function: &mut Function, captures: &HashSet<LocalId>) -> Removed {
         let mut removed = Removed::default();
+        let single_use = self.single_use_temporaries();
         for candidate in &self.function.locals {
-            let found = leaves(self.module, self.native, &candidate.type_);
             if !candidate.temporary
-                || found.len() != 1
-                || !found[0].0.is_empty()
-                || !self.single_use_temporary(candidate.id)
+                || !single_use.contains(&candidate.id)
+                || !self.single_leaf(&candidate.type_)
             {
                 continue;
             }
@@ -885,10 +1023,7 @@ impl Context<'_> {
         let mut retains = Vec::new();
         for (block_index, block) in function.blocks.iter().enumerate() {
             for (index, instruction) in block.instructions.iter().enumerate() {
-                if destination_places(instruction)
-                    .iter()
-                    .any(|place| root_local(place) == Some(local))
-                {
+                if destination_places(instruction).any(|place| root_local(place) == Some(local)) {
                     if writer.is_some() {
                         return;
                     }
@@ -979,7 +1114,7 @@ impl Context<'_> {
         if !function
             .parameters
             .iter()
-            .any(|p| !leaves(self.module, self.native, &p.type_).is_empty())
+            .any(|p| !leaves(self.shape, &p.type_).is_empty())
         {
             return removed;
         }
@@ -999,11 +1134,8 @@ impl Context<'_> {
                             | Instruction::DictionaryRemove { .. }
                             | Instruction::DictionaryClear { .. }
                     )
-                    && !destination_places(instruction)
-                        .into_iter()
-                        .any(stores_into_array)
+                    && !destination_places(instruction).any(stores_into_array)
                     && destination_places(instruction)
-                        .iter()
                         .all(|place| root_local(place).is_none_or(|l| !parameters.contains(&l)))
                     && match instruction {
                         Instruction::Release { value } => matches!(
@@ -1165,19 +1297,35 @@ fn is_releasing_instruction(instruction: &Instruction) -> bool {
 
 /// Every concrete method an interface method can dispatch to.
 fn interface_targets(module: &Module) -> HashMap<SymbolId, Vec<SymbolId>> {
+    let mut implementations: HashMap<SymbolId, Vec<&mir::InterfaceImplementation>> = HashMap::new();
+    for implementation in &module.interface_implementations {
+        implementations
+            .entry(implementation.interface)
+            .or_default()
+            .push(implementation);
+    }
     let mut targets = HashMap::new();
     for interface in &module.interfaces {
+        let found = implementations.get(&interface.symbol);
         for (slot, method) in interface.methods.iter().enumerate() {
-            let found = module
-                .interface_implementations
-                .iter()
-                .filter(|implementation| implementation.interface == interface.symbol)
+            let methods = found
+                .into_iter()
+                .flatten()
                 .filter_map(|implementation| implementation.methods.get(slot).copied())
                 .collect();
-            targets.insert(method.symbol, found);
+            targets.insert(method.symbol, methods);
         }
     }
     targets
+}
+
+fn is_retain_of(instruction: &Instruction, local: LocalId) -> bool {
+    matches!(
+        instruction,
+        Instruction::Retain {
+            value: Operand { kind: OperandKind::Copy(Place::Local(id)), .. }
+        } if *id == local
+    )
 }
 
 /// Whether `instruction` is not a call into Aster code, or every function it
@@ -1208,34 +1356,180 @@ fn heap_place(place: &Place) -> bool {
 /// A local that E4 may leave uncounted, with every instruction E4 removes.
 struct Borrow {
     local: LocalId,
-    /// `(block, instruction)` of each borrowed load that writes the local.
-    loads: Vec<(usize, usize)>,
-    /// `(block, instruction)` of the load retains, captures, capture releases
-    /// and exit releases of the local.
-    removable: Vec<(usize, usize)>,
+    /// Single-use lowering temporaries whose borrowed value is copied into
+    /// `local` (design 15, E4 through temporaries). They are borrowed with it.
+    sources: Vec<LocalId>,
+    /// Position of each borrowed load that writes the local or a source: the
+    /// instructions that open the window.
+    loads: Vec<At>,
+    /// Position of each copy `local = source`.
+    links: Vec<At>,
+    /// Position of the load retains, captures, capture releases, link
+    /// retains and exit releases of the local and its sources.
+    removable: Vec<At>,
+}
+
+impl Borrow {
+    fn members(&self) -> impl Iterator<Item = LocalId> + '_ {
+        std::iter::once(self.local).chain(self.sources.iter().copied())
+    }
+}
+
+/// `(block index, instruction index)`.
+type At = (usize, usize);
+
+/// Per-function lookup tables for E4, built once from the post-E3 function.
+/// Each list is sorted by local id, so one local's entries are a slice.
+struct Facts {
+    /// Instructions that read a local.
+    reads: Vec<(u32, At)>,
+    /// Instructions that write a local (or a field of it).
+    writes: Vec<(u32, At)>,
+    /// `Release` instructions of a local.
+    releases: Vec<(u32, At)>,
+    /// Locals read by a terminator.
+    terminator_reads: HashSet<LocalId>,
+}
+
+/// The entries of `local` in a list sorted by local id.
+fn entries_of(list: &[(u32, At)], local: LocalId) -> &[(u32, At)] {
+    let start = list.partition_point(|(id, _)| *id < local.0);
+    let end = start + list[start..].partition_point(|(id, _)| *id == local.0);
+    &list[start..end]
+}
+
+impl Facts {
+    fn new(function: &Function) -> Self {
+        let mut facts = Facts {
+            reads: Vec::new(),
+            writes: Vec::new(),
+            releases: Vec::new(),
+            terminator_reads: HashSet::new(),
+        };
+        let mut reads = HashSet::new();
+        for (block_index, block) in function.blocks.iter().enumerate() {
+            for (at, instruction) in block.instructions.iter().enumerate() {
+                let position = (block_index, at);
+                reads.clear();
+                owned_instruction_reads(instruction, &mut reads);
+                for local in &reads {
+                    facts.reads.push((local.0, position));
+                }
+                for place in destination_places(instruction) {
+                    if let Some(local) = root_local(place) {
+                        let entry = (local.0, position);
+                        if facts.writes.last() != Some(&entry) {
+                            facts.writes.push(entry);
+                        }
+                    }
+                }
+                if let Instruction::Release {
+                    value:
+                        Operand {
+                            kind: OperandKind::Copy(Place::Local(local)),
+                            ..
+                        },
+                } = instruction
+                {
+                    facts.releases.push((local.0, position));
+                }
+            }
+            match &block.terminator {
+                Terminator::Branch { condition, .. } => {
+                    owned_operand_reads(condition, &mut facts.terminator_reads);
+                }
+                Terminator::Return(Some(operand)) => {
+                    owned_operand_reads(operand, &mut facts.terminator_reads);
+                }
+                _ => {}
+            }
+        }
+        facts.reads.sort_unstable();
+        facts.writes.sort_unstable();
+        facts.releases.sort_unstable();
+        facts
+    }
+}
+
+/// Per block, whether the window of a borrow is open at the block entry on
+/// every path from the function entry. `loads` are the borrow's load
+/// positions per block, `invalidations` the invalidating positions per block.
+/// The entry block starts closed; blocks unreachable from the entry are
+/// closed.
+fn entry_windows(
+    function: &Function,
+    loads: &HashMap<usize, Vec<usize>>,
+    invalidations: &[Vec<usize>],
+) -> Vec<bool> {
+    let count = function.blocks.len();
+    let positions = block_positions(function);
+    let entry = block_position(&positions, function.entry);
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); count];
+    for (block, contents) in function.blocks.iter().enumerate() {
+        for target in successor_blocks(&contents.terminator) {
+            if let Some(next) = block_position(&positions, target) {
+                preds[next].push(block);
+            }
+        }
+    }
+    let mut reachable = vec![false; count];
+    let mut pending: Vec<usize> = entry.into_iter().collect();
+    while let Some(block) = pending.pop() {
+        if std::mem::replace(&mut reachable[block], true) {
+            continue;
+        }
+        pending.extend(
+            successor_blocks(&function.blocks[block].terminator)
+                .into_iter()
+                .filter_map(|target| block_position(&positions, target)),
+        );
+    }
+    let mut open: Vec<bool> = (0..count)
+        .map(|block| reachable[block] && Some(block) != entry)
+        .collect();
+    let leaving = |block: usize, entering: bool| match (
+        loads.get(&block).and_then(|list| list.last()),
+        invalidations[block].last(),
+    ) {
+        (None, None) => entering,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (Some(load), Some(invalidation)) => load >= invalidation,
+    };
+    loop {
+        let mut changed = false;
+        for block in 0..count {
+            if !reachable[block] || Some(block) == entry {
+                continue;
+            }
+            let now = preds[block]
+                .iter()
+                .filter(|pred| reachable[**pred])
+                .all(|pred| leaving(*pred, open[*pred]));
+            if now != open[block] {
+                open[block] = now;
+                changed = true;
+            }
+        }
+        if !changed {
+            return open;
+        }
+    }
 }
 
 /// How one instruction mentions a local.
 #[derive(Default)]
 struct Usage {
-    any: bool,
     /// The local's value is stored, consumed or otherwise kept.
     kept: bool,
     /// The local's value is a direct argument or receiver of an Aster call.
     call_argument: bool,
 }
 
+/// Usage of `local` by an instruction known to read it.
 fn usage_of(instruction: &Instruction, local: LocalId) -> Usage {
-    let mut reads = HashSet::new();
-    owned_instruction_reads(instruction, &mut reads);
-    if !reads.contains(&local) {
-        return Usage::default();
-    }
     let direct = |operand: &Operand| matches!(&operand.kind, OperandKind::Copy(Place::Local(id)) if *id == local);
-    let mut usage = Usage {
-        any: true,
-        ..Usage::default()
-    };
+    let mut usage = Usage::default();
     match instruction {
         Instruction::Assign { value, .. } => match &value.kind {
             RvalueKind::Use(operand)
@@ -1369,45 +1663,173 @@ fn load_pattern(
 }
 
 impl Context<'_> {
+    /// Whether `type_` is exactly one counted leaf with an empty path.
+    fn single_leaf(&self, type_: &Type) -> bool {
+        match type_ {
+            Type::Class(symbol) => !self.shape.native.contains(symbol),
+            Type::Interface(_)
+            | Type::Array(_)
+            | Type::String
+            | Type::List(_)
+            | Type::Dictionary(_, _) => true,
+            _ => false,
+        }
+    }
+
     /// Locals of the pre-pass function that qualify structurally as borrowed
-    /// (E4): one leaf, every write a borrowed load in the C5 shape. Windows
-    /// are checked separately against the summary.
-    fn find_borrows(&self, original: &Function, captures: &HashSet<LocalId>) -> Vec<Borrow> {
+    /// (E4): one leaf, every write a borrowed load in the C5 shape or a copy
+    /// of a single-use temporary that a borrowed load wrote earlier in the
+    /// same block. Windows are checked separately against the summary.
+    fn find_borrows(
+        &self,
+        original: &Function,
+        facts: &Facts,
+        captures: &HashSet<LocalId>,
+    ) -> Vec<Borrow> {
         let mut found = Vec::new();
         'locals: for local in &original.locals {
-            let shape = leaves(self.module, self.native, &local.type_);
-            if !matches!(&shape[..], [(path, _)] if path.is_empty()) {
+            if !self.single_leaf(&local.type_) {
                 continue;
             }
-            let mut loads = Vec::new();
-            let mut removable = Vec::new();
-            for (block_index, block) in self.function.blocks.iter().enumerate() {
-                for (index, instruction) in block.instructions.iter().enumerate() {
-                    if destination_places(instruction)
-                        .iter()
-                        .any(|place| root_local(place) == Some(local.id))
-                    {
-                        let Some(around) =
-                            load_pattern(&block.instructions, index, local.id, captures)
-                        else {
-                            continue 'locals;
-                        };
-                        loads.push((block_index, index));
-                        removable.extend(around.into_iter().map(|at| (block_index, at)));
-                    } else if is_release_of(instruction, local.id) {
-                        removable.push((block_index, index));
-                    }
+            let writes = entries_of(&facts.writes, local.id);
+            if writes.is_empty() {
+                continue;
+            }
+            let mut borrow = Borrow {
+                local: local.id,
+                sources: Vec::new(),
+                loads: Vec::new(),
+                links: Vec::new(),
+                removable: Vec::new(),
+            };
+            for &(_, (block, at)) in writes {
+                let instructions = &self.function.blocks[block].instructions;
+                if let Some(around) = load_pattern(instructions, at, local.id, captures) {
+                    borrow.loads.push((block, at));
+                    borrow
+                        .removable
+                        .extend(around.into_iter().map(|index| (block, index)));
+                } else if !self.link_pattern(original, facts, captures, (block, at), &mut borrow) {
+                    continue 'locals;
                 }
             }
-            if !loads.is_empty() {
-                found.push(Borrow {
-                    local: local.id,
-                    loads,
-                    removable,
-                });
+            borrow.removable.extend(
+                entries_of(&facts.releases, local.id)
+                    .iter()
+                    .map(|(_, at)| *at),
+            );
+            if !borrow.loads.is_empty() {
+                found.push(borrow);
             }
         }
         found
+    }
+
+    /// The write `local = source` at `at`, where `source` is a lowering
+    /// temporary of one counted leaf written exactly once, by a borrowed load
+    /// earlier in the same block, and read only by this copy and the
+    /// instructions around the load and the copy. Records the link, the
+    /// source and every instruction E4 then removes; `false` when the write is
+    /// not in that shape.
+    fn link_pattern(
+        &self,
+        original: &Function,
+        facts: &Facts,
+        captures: &HashSet<LocalId>,
+        at: At,
+        borrow: &mut Borrow,
+    ) -> bool {
+        let (block, index) = at;
+        let instructions = &self.function.blocks[block].instructions;
+        let Instruction::Assign {
+            target: Place::Local(target),
+            value:
+                Rvalue {
+                    kind:
+                        RvalueKind::Use(Operand {
+                            kind: OperandKind::Copy(Place::Local(source)),
+                            ..
+                        }),
+                    ..
+                },
+        } = &instructions[index]
+        else {
+            return false;
+        };
+        let source = *source;
+        if *target != borrow.local
+            || source == borrow.local
+            || captures.contains(&source)
+            || borrow.sources.contains(&source)
+        {
+            return false;
+        }
+        let Some(declared) = original.locals.iter().find(|local| local.id == source) else {
+            return false;
+        };
+        if !declared.temporary || !self.single_leaf(&declared.type_) {
+            return false;
+        }
+        let [(_, (source_block, source_at))] = entries_of(&facts.writes, source) else {
+            return false;
+        };
+        let (source_block, source_at) = (*source_block, *source_at);
+        if source_block != block || source_at >= index {
+            return false;
+        }
+        let Some(mut around) = load_pattern(instructions, source_at, source, captures) else {
+            return false;
+        };
+        let mut first = index;
+        if let Some(previous) = index.checked_sub(1)
+            && let Instruction::Assign {
+                target: Place::Local(old),
+                value:
+                    Rvalue {
+                        kind:
+                            RvalueKind::Use(Operand {
+                                kind: OperandKind::Copy(Place::Local(read)),
+                                ..
+                            }),
+                        ..
+                    },
+            } = &instructions[previous]
+            && *read == borrow.local
+            && captures.contains(old)
+            && instructions
+                .get(index + 1)
+                .is_some_and(|next| is_release_of(next, *old))
+        {
+            around.extend([previous, index + 1]);
+            first = previous;
+        }
+        if let Some(previous) = first.checked_sub(1)
+            && is_retain_of(&instructions[previous], source)
+        {
+            around.push(previous);
+        }
+        let exits: Vec<At> = entries_of(&facts.releases, source)
+            .iter()
+            .map(|(_, at)| *at)
+            .collect();
+        let accounted = |position: &At| {
+            exits.contains(position)
+                || (position.0 == block && (position.1 == index || around.contains(&position.1)))
+        };
+        if !entries_of(&facts.reads, source)
+            .iter()
+            .all(|(_, at)| accounted(at))
+        {
+            return false;
+        }
+        borrow.sources.push(source);
+        borrow.loads.push((block, source_at));
+        borrow.links.push(at);
+        borrow
+            .removable
+            .extend(around.into_iter().map(|position| (block, position)));
+        borrow.removable.extend(exits.iter().copied());
+        true
     }
 
     /// Whether a write to `place` by `instruction` may release an object: a
@@ -1420,7 +1842,7 @@ impl Context<'_> {
             Instruction::Assign { value, .. } => Some(value.type_.clone()),
             _ => self.place_type(place),
         };
-        stored.is_none_or(|type_| !leaves(self.module, self.native, &type_).is_empty())
+        stored.is_none_or(|type_| has_leaves(self.shape, &type_))
     }
 
     /// Whether the instruction invalidates borrowed heap reads (design 14).
@@ -1436,61 +1858,104 @@ impl Context<'_> {
         {
             return true;
         }
-        destination_places(instruction).into_iter().any(|place| {
+        destination_places(instruction).any(|place| {
             root_local(place).is_none()
                 && match instruction {
-                    Instruction::Assign { value, .. } => {
-                        !leaves(self.module, self.native, &value.type_).is_empty()
-                    }
+                    Instruction::Assign { value, .. } => has_leaves(self.shape, &value.type_),
                     _ => self
                         .place_type(place)
-                        .is_none_or(|type_| !leaves(self.module, self.native, &type_).is_empty()),
+                        .is_none_or(|type_| has_leaves(self.shape, &type_)),
                 }
         })
     }
 
-    /// Whether every read of the borrowed local happens inside the window of
-    /// the load that wrote it, and the local is never kept.
+    /// The invalidating instructions of the function, per block in ascending
+    /// order, leaving out the `dropped` ones (design 15).
+    fn invalidations(
+        &self,
+        non_releasing: &HashSet<SymbolId>,
+        dropped: &HashSet<At>,
+        targets: &HashMap<SymbolId, Vec<SymbolId>>,
+    ) -> Vec<Vec<usize>> {
+        self.function
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(block, contents)| {
+                contents
+                    .instructions
+                    .iter()
+                    .enumerate()
+                    .filter(|(at, instruction)| {
+                        !dropped.contains(&(block, *at))
+                            && self.invalidates(instruction, non_releasing, targets)
+                    })
+                    .map(|(at, _)| at)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Whether every read of the borrowed local (and of its sources) happens
+    /// with the window open on every path from the function entry (design
+    /// 15), and the local is never kept. A load opens the window, an
+    /// invalidating instruction closes it, and a write of the local that is
+    /// not a load makes the local ineligible before this check.
     fn window_holds(
         &self,
+        facts: &Facts,
+        invalidations: &[Vec<usize>],
         borrow: &Borrow,
         non_releasing: &HashSet<SymbolId>,
-        dropped: &HashSet<(usize, usize)>,
         targets: &HashMap<SymbolId, Vec<SymbolId>>,
     ) -> bool {
-        let own: HashSet<(usize, usize)> = borrow.removable.iter().copied().collect();
-        let loads: HashSet<(usize, usize)> = borrow.loads.iter().copied().collect();
-        for (block_index, block) in self.function.blocks.iter().enumerate() {
-            let mut open = false;
-            for (index, instruction) in block.instructions.iter().enumerate() {
-                let at = (block_index, index);
-                if own.contains(&at) {
+        if borrow
+            .members()
+            .any(|member| facts.terminator_reads.contains(&member))
+        {
+            return false;
+        }
+        let own: HashSet<At> = borrow.removable.iter().copied().collect();
+        let mut loads: HashMap<usize, Vec<usize>> = HashMap::new();
+        for &(block, at) in &borrow.loads {
+            loads.entry(block).or_default().push(at);
+        }
+        for list in loads.values_mut() {
+            list.sort_unstable();
+        }
+        let mut entering: Option<Vec<bool>> = None;
+        for member in borrow.members() {
+            for &(_, (block, at)) in entries_of(&facts.reads, member) {
+                if own.contains(&(block, at)) {
                     continue;
                 }
-                let usage = usage_of(instruction, borrow.local);
-                if usage.any
-                    && (!open
-                        || usage.kept
+                let instruction = &self.function.blocks[block].instructions[at];
+                if member == borrow.local || !borrow.links.contains(&(block, at)) {
+                    let usage = usage_of(instruction, member);
+                    if usage.kept
                         || (usage.call_argument
-                            && !calls_only_non_releasing(instruction, non_releasing, targets)))
-                {
+                            && !calls_only_non_releasing(instruction, non_releasing, targets))
+                    {
+                        return false;
+                    }
+                }
+                let last_load = loads
+                    .get(&block)
+                    .and_then(|list| list[..list.partition_point(|load| *load < at)].last());
+                let last_invalidation = invalidations[block]
+                    [..invalidations[block].partition_point(|position| *position < at)]
+                    .last();
+                let open = match (last_load, last_invalidation) {
+                    (None, None) => entering
+                        .get_or_insert_with(|| entry_windows(self.function, &loads, invalidations))
+                        [block],
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (Some(load), Some(invalidation)) => load >= invalidation,
+                };
+                if !open {
                     return false;
                 }
-                if !dropped.contains(&at) && self.invalidates(instruction, non_releasing, targets) {
-                    open = false;
-                }
-                if loads.contains(&at) {
-                    open = true;
-                }
-            }
-            let mut reads = HashSet::new();
-            match &block.terminator {
-                Terminator::Branch { condition, .. } => owned_operand_reads(condition, &mut reads),
-                Terminator::Return(Some(operand)) => owned_operand_reads(operand, &mut reads),
-                _ => {}
-            }
-            if reads.contains(&borrow.local) {
-                return false;
             }
         }
         true
@@ -1516,7 +1981,7 @@ impl Context<'_> {
                 {
                     return true;
                 }
-                if destination_places(instruction).into_iter().any(|place| {
+                if destination_places(instruction).any(|place| {
                     parameter_root(place)
                         || stores_into_array(place)
                         || self.heap_store_releases(instruction, place)
@@ -1572,7 +2037,7 @@ fn non_releasing_summary(
 /// ends after at most `locals + 1` rounds. Returns the number of rounds.
 fn elide_with_summaries(
     module: &Module,
-    native: &HashSet<SymbolId>,
+    shape: &Shape<'_>,
     output: &mut Module,
     captures: &[HashSet<LocalId>],
     stats: &mut OwnershipStats,
@@ -1585,19 +2050,23 @@ fn elide_with_summaries(
             .iter()
             .zip(scratch.iter_mut())
             .map(|(function, stats)| Context {
-                module,
-                native,
+                shape,
                 function,
+                locals: local_types(function),
                 next_local: 0,
                 new_locals: Vec::new(),
                 stats,
             })
             .collect();
+        let facts: Vec<Facts> = output.functions.iter().map(Facts::new).collect();
         let mut borrows: Vec<Vec<Borrow>> = contexts
             .iter()
             .zip(&module.functions)
             .zip(captures)
-            .map(|((context, original), captures)| context.find_borrows(original, captures))
+            .zip(&facts)
+            .map(|(((context, original), captures), facts)| {
+                context.find_borrows(original, facts, captures)
+            })
             .collect();
         let mut rounds = 0;
         loop {
@@ -1612,9 +2081,17 @@ fn elide_with_summaries(
                 .collect();
             let summary = non_releasing_summary(&contexts, &dropped, &targets);
             let mut shrunk = false;
-            for ((context, list), dropped) in contexts.iter().zip(&mut borrows).zip(&dropped) {
+            for (((context, list), dropped), facts) in
+                contexts.iter().zip(&mut borrows).zip(&dropped).zip(&facts)
+            {
+                if list.is_empty() {
+                    continue;
+                }
+                let invalidations = context.invalidations(&summary, dropped, &targets);
                 let before = list.len();
-                list.retain(|borrow| context.window_holds(borrow, &summary, dropped, &targets));
+                list.retain(|borrow| {
+                    context.window_holds(facts, &invalidations, borrow, &summary, &targets)
+                });
                 shrunk |= list.len() != before;
             }
             if !shrunk {
@@ -2150,7 +2627,9 @@ mod tests {
 
     #[test]
     fn e2_move_from_a_lowering_temporary_drops_retain_and_exit_release() {
-        // t = this.f; x = t
+        // t = this.f; x = t; Unknown(x). The call is to a function the module
+        // does not define, so it may release: `x` is not borrowable (E4) and
+        // only E2 applies.
         let result = both(
             vec![local(0, class(), false)],
             vec![local(1, class(), true), local(2, class(), false)],
@@ -2159,6 +2638,12 @@ mod tests {
                 vec![
                     assign(lp(1), &class(), copy(field(0), &class())),
                     assign(lp(2), &class(), copy(lp(1), &class())),
+                    Instruction::Call {
+                        destination: None,
+                        function: SymbolId(2),
+                        arguments: vec![copy(lp(2), &class())],
+                        return_type: Type::Void,
+                    },
                 ],
                 Terminator::Return(None),
             )],
@@ -2189,6 +2674,12 @@ mod tests {
                 retain(field(0), &class()),
                 assign(lp(1), &class(), copy(field(0), &class())),
                 assign(lp(2), &class(), copy(lp(1), &class())),
+                Instruction::Call {
+                    destination: None,
+                    function: SymbolId(2),
+                    arguments: vec![copy(lp(2), &class())],
+                    return_type: Type::Void,
+                },
                 release(lp(0), &class()),
                 release(lp(2), &class()),
             ]
@@ -3769,8 +4260,9 @@ mod tests {
     }
 
     #[test]
-    fn a_borrowed_local_read_in_another_block_stays_counted() {
-        // x = a.next in block 0, v = GetValue(x) in block 1.
+    fn a_borrowed_local_read_in_another_block_is_borrowed_while_the_window_stays_open() {
+        // x = a.next in block 0, v = GetValue(x) in block 1: block 0 dominates
+        // block 1 and nothing between them invalidates (design 15).
         let caller = function(
             RUNNER,
             vec![local(0, node(), false)],
@@ -3795,6 +4287,334 @@ mod tests {
             Type::Int,
         );
         let result = elide_graph(&graph(GET_VALUE, vec![caller, get_value()]));
-        assert_eq!(result.c6_stats.elided_borrows, 0);
+        assert!(result.c6_stats.elided_borrows > 0, "{:?}", result.c6_stats);
+        assert_eq!(function_counts(&result.c6, RUNNER), (0, 0));
+    }
+
+    // ---- E4 across blocks and through temporaries (design 15) ----
+
+    fn bool_constant(value: bool) -> Operand {
+        Operand {
+            type_: Type::Bool,
+            kind: OperandKind::Constant(mir::Constant::Boolean(value)),
+        }
+    }
+
+    /// `int Sum(Node this)` with the array loaded once before the loop:
+    /// `total = this.value; i = 0; children = this.children; while (i <
+    /// children.Length) { child = children[0]; total += Sum(child); [Store];
+    /// i += 1; } return total;`
+    fn tree_sum_hoisted(releasing_in_loop: bool) -> Function {
+        let mut body = vec![
+            assign(lp(7), &node(), copy(element(3, &node()), &node())),
+            call_of(SUM, Some(8), vec![copy(lp(7), &node())], &Type::Int),
+            add(1, 1, 8),
+        ];
+        if releasing_in_loop {
+            body.push(call_of(
+                STORE,
+                None,
+                vec![copy(lp(0), &node()), copy(lp(0), &node())],
+                &Type::Void,
+            ));
+        }
+        body.push(compute(
+            2,
+            &Type::Int,
+            copy(lp(2), &Type::Int),
+            mir::BinaryOperator::Add,
+            int_constant("1"),
+        ));
+        function(
+            SUM,
+            vec![local(0, node(), false)],
+            vec![
+                local(1, Type::Int, false),
+                local(2, Type::Int, false),
+                local(3, nodes(), false),
+                local(4, Type::Int, true),
+                local(5, Type::Bool, true),
+                local(7, node(), false),
+                local(8, Type::Int, true),
+            ],
+            vec![
+                block(
+                    0,
+                    vec![
+                        assign(lp(1), &Type::Int, copy(node_field(0, VALUE), &Type::Int)),
+                        assign(lp(2), &Type::Int, int_constant("0")),
+                        assign(lp(3), &nodes(), copy(node_field(0, CHILDREN), &nodes())),
+                    ],
+                    Terminator::Goto(BasicBlockId(1)),
+                ),
+                block(
+                    1,
+                    vec![
+                        Instruction::Assign {
+                            target: lp(4),
+                            value: Rvalue {
+                                type_: Type::Int,
+                                kind: RvalueKind::ArrayLength(copy(lp(3), &nodes())),
+                            },
+                        },
+                        compute(
+                            5,
+                            &Type::Bool,
+                            copy(lp(2), &Type::Int),
+                            mir::BinaryOperator::Less,
+                            copy(lp(4), &Type::Int),
+                        ),
+                    ],
+                    cond_branch(5, 2, 3),
+                ),
+                block(2, body, Terminator::Goto(BasicBlockId(1))),
+                block(
+                    3,
+                    Vec::new(),
+                    Terminator::Return(Some(copy(lp(1), &Type::Int))),
+                ),
+            ],
+            Type::Int,
+        )
+    }
+
+    #[test]
+    fn array_loaded_before_a_loop_and_read_inside_has_no_count_operations() {
+        let result = elide_graph(&graph(
+            GET_VALUE,
+            vec![tree_sum_hoisted(false), get_value()],
+        ));
+        assert_ne!(function_counts(&result.c5, SUM), (0, 0));
+        assert_eq!(function_counts(&result.c6, SUM), (0, 0));
+        assert!(result.c6_stats.elided_borrows > 0, "{:?}", result.c6_stats);
+    }
+
+    #[test]
+    fn array_loaded_before_a_loop_stays_counted_when_the_loop_releases() {
+        // `Store` releases `this.next` on every iteration: the window of
+        // `children` is closed on the back edge, so the header read is not
+        // covered.
+        let result = elide_graph(&graph(
+            GET_VALUE,
+            vec![tree_sum_hoisted(true), store(), get_value()],
+        ));
+        assert_eq!(result.c6_stats.elided_borrows, 0, "{:?}", result.c6_stats);
+        assert_ne!(function_counts(&result.c6, SUM), (0, 0));
+    }
+
+    /// `int Run(Node a, Node b)`: `x = a.next; if (true) { <branch> }
+    /// return GetValue(x);` where the branch is empty on the other path.
+    fn diamond(branch: Vec<Instruction>) -> Function {
+        function(
+            RUNNER,
+            vec![local(0, node(), false), local(4, node(), false)],
+            vec![
+                local(1, node(), false),
+                local(2, Type::Int, false),
+                local(3, Type::Bool, true),
+            ],
+            vec![
+                block(
+                    0,
+                    vec![
+                        assign(lp(1), &node(), copy(node_field(0, NEXT), &node())),
+                        assign(lp(3), &Type::Bool, bool_constant(true)),
+                    ],
+                    cond_branch(3, 1, 2),
+                ),
+                block(1, branch, Terminator::Goto(BasicBlockId(3))),
+                block(2, Vec::new(), Terminator::Goto(BasicBlockId(3))),
+                block(
+                    3,
+                    vec![call_of(
+                        GET_VALUE,
+                        Some(2),
+                        vec![copy(lp(1), &node())],
+                        &Type::Int,
+                    )],
+                    Terminator::Return(Some(copy(lp(2), &Type::Int))),
+                ),
+            ],
+            Type::Int,
+        )
+    }
+
+    #[test]
+    fn borrowed_local_read_after_a_join_is_borrowed_when_both_paths_stay_open() {
+        let result = elide_graph(&graph(
+            GET_VALUE,
+            vec![
+                diamond(vec![call_of(
+                    GET_VALUE,
+                    None,
+                    vec![copy(lp(0), &node())],
+                    &Type::Int,
+                )]),
+                get_value(),
+            ],
+        ));
+        assert!(result.c6_stats.elided_borrows > 0, "{:?}", result.c6_stats);
+        assert_eq!(function_counts(&result.c6, RUNNER), (0, 0));
+    }
+
+    #[test]
+    fn cross_block_window_with_a_releasing_call_on_one_path_stays_counted() {
+        let result = elide_graph(&graph(
+            GET_VALUE,
+            vec![
+                diamond(vec![call_of(
+                    STORE,
+                    None,
+                    vec![copy(lp(0), &node()), copy(lp(4), &node())],
+                    &Type::Void,
+                )]),
+                store(),
+                get_value(),
+            ],
+        ));
+        assert_eq!(result.c6_stats.elided_borrows, 0, "{:?}", result.c6_stats);
+        assert_ne!(function_counts(&result.c6, RUNNER), (0, 0));
+    }
+
+    #[test]
+    fn cross_block_window_with_a_list_set_on_one_path_stays_counted() {
+        let result = elide_graph(&graph(
+            GET_VALUE,
+            vec![
+                diamond(vec![Instruction::ListSet {
+                    list: copy(node_field(0, ITEMS), &node_list()),
+                    index: zero(),
+                    value: copy(lp(4), &node()),
+                }]),
+                get_value(),
+            ],
+        ));
+        assert_eq!(result.c6_stats.elided_borrows, 0, "{:?}", result.c6_stats);
+        assert_ne!(function_counts(&result.c6, RUNNER), (0, 0));
+    }
+
+    #[test]
+    fn cross_block_window_broken_by_a_write_of_the_source_field_on_one_path_stays_counted() {
+        // `a.next = b` on one branch releases the object `x` borrowed.
+        let result = elide_graph(&graph(
+            GET_VALUE,
+            vec![
+                diamond(vec![assign(
+                    node_field(0, NEXT),
+                    &node(),
+                    copy(lp(4), &node()),
+                )]),
+                get_value(),
+            ],
+        ));
+        assert_eq!(result.c6_stats.elided_borrows, 0, "{:?}", result.c6_stats);
+        assert_ne!(function_counts(&result.c6, RUNNER), (0, 0));
+    }
+
+    /// `int Run(List<Node> list)`: `Node entity = list[0]` lowered through
+    /// the temporary, then `GetValue(entity)`; with `looped`, inside a loop
+    /// as in `longrun_frame`; with `releasing`, `Store(entity, entity)` is
+    /// called afterwards.
+    fn entity_from_list(looped: bool, releasing: bool) -> Function {
+        let mut body = vec![
+            Instruction::ListGet {
+                destination: lp(2),
+                list: copy(lp(0), &node_list()),
+                index: zero(),
+                element_type: node(),
+            },
+            assign(lp(1), &node(), copy(lp(2), &node())),
+            call_of(GET_VALUE, Some(3), vec![copy(lp(1), &node())], &Type::Int),
+        ];
+        if releasing {
+            body.push(call_of(
+                STORE,
+                None,
+                vec![copy(lp(1), &node()), copy(lp(1), &node())],
+                &Type::Void,
+            ));
+        }
+        let locals = vec![
+            local(1, node(), false),
+            local(2, node(), true),
+            local(3, Type::Int, false),
+            local(5, Type::Int, false),
+            local(6, Type::Bool, true),
+        ];
+        let blocks = if looped {
+            body.push(compute(
+                5,
+                &Type::Int,
+                copy(lp(5), &Type::Int),
+                mir::BinaryOperator::Add,
+                int_constant("1"),
+            ));
+            vec![
+                block(
+                    0,
+                    vec![assign(lp(5), &Type::Int, int_constant("0"))],
+                    Terminator::Goto(BasicBlockId(1)),
+                ),
+                block(
+                    1,
+                    vec![compute(
+                        6,
+                        &Type::Bool,
+                        copy(lp(5), &Type::Int),
+                        mir::BinaryOperator::Less,
+                        int_constant("3"),
+                    )],
+                    cond_branch(6, 2, 3),
+                ),
+                block(2, body, Terminator::Goto(BasicBlockId(1))),
+                block(
+                    3,
+                    Vec::new(),
+                    Terminator::Return(Some(copy(lp(3), &Type::Int))),
+                ),
+            ]
+        } else {
+            vec![block(
+                0,
+                body,
+                Terminator::Return(Some(copy(lp(3), &Type::Int))),
+            )]
+        };
+        function(
+            RUNNER,
+            vec![local(0, node_list(), false)],
+            locals,
+            blocks,
+            Type::Int,
+        )
+    }
+
+    #[test]
+    fn list_element_copied_through_a_temporary_is_borrowed() {
+        for looped in [false, true] {
+            let result = elide_graph(&graph(
+                GET_VALUE,
+                vec![entity_from_list(looped, false), get_value()],
+            ));
+            assert_ne!(function_counts(&result.c5, RUNNER), (0, 0));
+            assert_eq!(
+                function_counts(&result.c6, RUNNER),
+                (0, 0),
+                "looped {looped}"
+            );
+            assert!(result.c6_stats.elided_borrows > 0, "{:?}", result.c6_stats);
+        }
+    }
+
+    #[test]
+    fn list_element_copied_through_a_temporary_stays_counted_across_a_releasing_call() {
+        for looped in [false, true] {
+            let result = elide_graph(&graph(
+                GET_VALUE,
+                vec![entity_from_list(looped, true), store(), get_value()],
+            ));
+            assert_eq!(result.c6_stats.elided_borrows, 0, "{:?}", result.c6_stats);
+            assert_ne!(function_counts(&result.c6, RUNNER), (0, 0));
+        }
     }
 }

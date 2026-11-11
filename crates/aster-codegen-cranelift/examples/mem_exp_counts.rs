@@ -64,7 +64,7 @@ const WORKLOADS: [(&str, &str); 13] = [
 ];
 
 fn main() {
-    let configuration = if cfg!(feature = "mem-exp-c6") {
+    let configuration = if cfg!(feature = "mem-exp-elide") {
         "C6"
     } else {
         "C5"

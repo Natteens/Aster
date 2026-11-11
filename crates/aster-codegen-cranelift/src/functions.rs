@@ -156,7 +156,7 @@ impl Codegen {
         if is_aggregate(&function.return_type) {
             state.hidden_return = values.next();
         }
-        #[cfg(feature = "mem-exp-c5")]
+        #[cfg(feature = "mem-exp-rc-core")]
         for local in function.parameters.iter().chain(&function.locals) {
             if self.layouts.type_has_references(&local.type_) {
                 // Releasing or capturing a never-assigned slot must see null.

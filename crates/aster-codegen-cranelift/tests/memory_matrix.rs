@@ -25,7 +25,7 @@ fn expected_categories(case: &str) -> (u64, u64, u64) {
 
 #[test]
 #[cfg_attr(
-    feature = "mem-exp-c5",
+    feature = "mem-exp-rc-core",
     ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
 )]
 fn all_eight_cases_pass_at_small_scale() {
@@ -99,7 +99,7 @@ fn temporary_cases_reclaim_all_used_bytes() {
 
 #[test]
 #[cfg_attr(
-    feature = "mem-exp-c5",
+    feature = "mem-exp-rc-core",
     ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
 )]
 fn persistent_cases_follow_owned_or_conservative_lifetime() {

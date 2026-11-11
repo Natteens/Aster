@@ -312,6 +312,10 @@ B interleaved, at least seven samples.
 If a hard gate fails for H12 and H16, apply the Q-MEM-0 fallback. The report is a document in
 `docs/proposals/` with the raw class A values and the class B medians and spreads.
 
+**Outcome (2026-11-11): FAIL** for H12 and H16 (execution time on `object_graph`, tier-1
+preservation); the Q-MEM-0 fallback applies. Report:
+[09-mem-exp-1-report.md](09-mem-exp-1-report.md).
+
 ### 4.D ARCH-005 and CONC-002 are independent
 
 Revision 2 listed ARCH-005 as needing CONC-002. That is wrong. Today a worker calls

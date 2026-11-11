@@ -60,20 +60,21 @@ example, reference page. Gate: workspace tests; class A invariants unchanged or 
 | ID | Objective | Decision | Depends on | Gate | Risk | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | T-OBJ-B1-1 | B1 stage 1: update B1 record with closure answers and the constant `H` | OBJ-002..004 | — | review | low | todo |
-| T-MEM-EXP-1 | Branch with configurations C0 to C6, ownership pass and independent validator for class references; report | MEM-001..003, OBJ-001 | T-BENCH-1, T-ARCH-2b | closure §4.C thresholds | high | **in progress**: stage A done; stage B (C4) done; stage C runtime substrate done; C5 first increment (class ownership pass and U1-U4 validator) done 2026-11-11; C6, collections, timing not done; no overall verdict |
-| T-MEM-2 | Merge the chosen header | MEM-002 or B1 H8 | T-MEM-EXP-1 | reinforced | medium | blocked (experiment) |
-| T-MEM-3a | Counting for class references; store sequence §4.B; failure contract §4.A | MEM-003 | T-MEM-2 | reinforced + negative MIR cases of §4.B | high | blocked (experiment) |
-| T-MEM-3b | Strings and arrays | MEM-003 | T-MEM-3a | reinforced | high | blocked |
-| T-MEM-7 | Collections own and free buffers; element glue | MEM-007 | T-MEM-3b | reinforced | medium | blocked |
-| T-MEM-3c | Aggregates and interface values | MEM-003 | T-MEM-3b | reinforced | medium | blocked |
-| T-MEM-4 | `weak`, teardown report, `DetectCycles` | MEM-004 | T-MEM-3c | reinforced | medium | blocked |
+| T-MEM-EXP-1 | Branch with configurations C0 to C6, ownership pass and independent validator for class references; report | MEM-001..003, OBJ-001 | T-BENCH-1, T-ARCH-2b | closure §4.C thresholds | high | **done 2026-11-11, verdict FAIL** (execution time on `object_graph` and tier-1 preservation, for H12 and H16): [09-mem-exp-1-report.md](09-mem-exp-1-report.md); Q-MEM-0 fallback applies |
+| T-MEM-2 | Merge the chosen header: **B1 with H8** (Q-MEM-0 fallback after MEM-EXP-1 FAIL) | MEM-002 or B1 H8 | T-MEM-EXP-1 | reinforced | medium | todo |
+| T-MEM-3a | Counting for class references; store sequence §4.B; failure contract §4.A | MEM-003 | T-MEM-2 | reinforced + negative MIR cases of §4.B | high | superseded: Q-MEM-0 fallback after MEM-EXP-1 FAIL (no counting in the default build); experiment code stays behind `mem-exp-*` features |
+| T-MEM-3b | Strings and arrays | MEM-003 | T-MEM-3a | reinforced | high | superseded: Q-MEM-0 fallback after MEM-EXP-1 FAIL (no counting in the default build); experiment code stays behind `mem-exp-*` features |
+| T-MEM-7 | Collections own and free buffers; element glue | MEM-007 | T-MEM-3b | reinforced | medium | superseded: Q-MEM-0 fallback after MEM-EXP-1 FAIL (no counting in the default build); experiment code stays behind `mem-exp-*` features |
+| T-MEM-3c | Aggregates and interface values | MEM-003 | T-MEM-3b | reinforced | medium | superseded: Q-MEM-0 fallback after MEM-EXP-1 FAIL (no counting in the default build); experiment code stays behind `mem-exp-*` features |
+| T-MEM-4 | `weak`, teardown report, `DetectCycles` | MEM-004 | T-MEM-3c | reinforced | medium | superseded: Q-MEM-0 fallback after MEM-EXP-1 FAIL (no counting in the default build); experiment code stays behind `mem-exp-*` features |
 | T-MEM-5 | `IDisposable`, `using`, handle table, safety-net close, lint | MEM-005 | — (`using`); T-MEM-3a for the safety net | reinforced | medium | todo |
 | T-MEM-6 | Governor and page return by default | MEM-006 | MEM-EXP-2 | reinforced | medium | todo |
+| T-MEM-ARENA | Explicit `Arena` scope type for long-running memory (Q-MEM-0 fallback): record the new decision (syntax, escape rule checked by escape analysis, teardown), then implement | new decision (to record) | T-MEM-EXP-1 | reinforced | medium | todo (decision record first) |
 | T-OBJ-2 | Single inheritance (B1 PR 1) | OBJ-002 | T-MEM-2 or B1 H8 | B1 cases | medium | blocked |
 | T-OBJ-3 | Virtual methods and properties | OBJ-003 | T-OBJ-2 | B1 cases | medium | blocked |
 | T-OBJ-4 | Interfaces through hierarchies; `is`/`as` | OBJ-004 | T-OBJ-3, T-LANG-4b | B1 cases | low | blocked |
 | T-LANG-1a | Non-capturing lambdas and method groups | LANG-001 | — | workspace | medium | todo |
-| T-LANG-1b | Capturing closures (region environments; counted when escaping) | LANG-001 | T-LANG-1a; T-MEM-3c for escaping | reinforced | high | blocked |
+| T-LANG-1b | Capturing closures (region environments; counted when escaping) | LANG-001 | T-LANG-1a; T-MEM-3c for escaping | reinforced | high | blocked: its escaping-environment rule assumed counting (T-MEM-3c, superseded); needs a revised rule under the fallback (Persistent or `Arena` environments) |
 | T-PERF-2 | MIR inliner then devirtualization (PERF-EXP-1 first) | PERF-002 | T-ARCH-2b | experiment threshold | medium | todo |
 | T-OBJ-6 | Generics in hierarchies | OBJ-006 | T-OBJ-3 | B1 cases | medium | blocked |
 
@@ -923,13 +924,25 @@ follow; `object_graph` loads `children` before the loop and reads it in the loop
 single-block window does not cover; the pass and validator use linear searches (places, locals,
 cache) that dominate their time.
 
-Not done, so **no PASS for MEM-001 to MEM-003**:
+### T-MEM-EXP-1 final round and verdict (2026-11-11)
 
-1. Final round: E4 through single-use temporaries and across blocks by dominance with no
-   invalidating instruction on any path; faster pass and validator. Then class B and the §4.C
-   verdict, recorded whatever the result.
+Final elision round (§15: E4 through temporaries and across blocks, indexed pass and validator):
+executed count operations C6/C5 = 722,722 / 5,739,436 = 12.6%; `longrun_frame` retains
+260,103 → 4,103. Feature wiring split so the counting machinery is independent of the header
+(`mem-exp-rc-core`, `mem-exp-elide`); new configuration `mem-exp-c6-h16`. C6 and C6-H16
+`--all-targets` 1,452 passed, 0 failed, 25 ignored; checksums identical.
+
+**Verdict: FAIL** for H12 and H16 — execution time on `object_graph` (1.353 and 1.344, gate
+≤ 1.15) and tier-1 preservation (single-case persistent `memory_matrix` workloads keep one
+reusable block as used bytes). All other gates met (long-running memory, compile time 1.166,
+peak memory 0.18×, geometric mean 1.062, elision 12.6%). Report with raw class A values and class
+B medians and spreads: [09-mem-exp-1-report.md](09-mem-exp-1-report.md).
+
+Decisions applied: Q-MEM-0 fallback — no counting in the default build (C0 unchanged), B1 with
+H8 (T-MEM-2 unblocked), explicit `Arena` scope as a new decision (T-MEM-ARENA). T-MEM-3a, 3b, 3c,
+7, and 4 are superseded; T-LANG-1b needs a revised escaping-environment rule.
 2. Enum payload drop glue and closure environments (enums currently leak their references).
 3. Region reclamation together with counting (H2 pins); C5 and C6 currently lose it.
 4. Class B timing protocol (release builds, interleaved rounds) and the §4.C thresholds.
 
-Next action: item 1 (class B timing and the §4.C verdict); improve elision for the soft gate.
+

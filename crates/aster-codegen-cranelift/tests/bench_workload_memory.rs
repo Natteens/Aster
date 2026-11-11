@@ -107,7 +107,7 @@ fn live_memory_grows_with_iteration_count_under_the_current_region_model() {
     for workload in &WORKLOADS {
         // MEM-EXP-1 C5/C6 counts every value these workloads discard
         // (objects, strings, lists, dictionaries), so they stay flat instead.
-        if cfg!(feature = "mem-exp-c5") && COUNTED_FLAT.contains(&workload.name) {
+        if cfg!(feature = "mem-exp-rc-core") && COUNTED_FLAT.contains(&workload.name) {
             continue;
         }
         let short = run(workload, "Run").1.used_bytes;
@@ -131,7 +131,7 @@ const COUNTED_FLAT: [&str; 4] = [
 ];
 
 /// MEM-EXP-1 long-running gate shape (closure §4.C) for those workloads.
-#[cfg(feature = "mem-exp-c5")]
+#[cfg(feature = "mem-exp-rc-core")]
 #[test]
 fn counted_workloads_stay_flat_between_n_and_ten_n() {
     for workload in WORKLOADS

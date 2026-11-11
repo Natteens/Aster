@@ -36,10 +36,10 @@ impl fmt::Display for OwnershipFinding {
 /// Returns every finding, in deterministic function and block order.
 pub fn validate_ownership(module: &mir::Module) -> Result<(), Vec<OwnershipFinding>> {
     let mut findings = Vec::new();
-    let native = native_header_classes(module);
-    let summary = Summary::compute(module, &native);
+    let index = Index::new(module);
+    let summary = Summary::compute(module, &index);
     for function in &module.functions {
-        check_function(module, &native, &summary, function, &mut findings);
+        check_function(&index, &summary, function, &mut findings);
     }
     if findings.is_empty() {
         Ok(())
@@ -49,8 +49,8 @@ pub fn validate_ownership(module: &mir::Module) -> Result<(), Vec<OwnershipFindi
 }
 
 /// Classes whose objects carry a runtime-native header (no count word).
-fn native_header_classes(module: &Module) -> Vec<SymbolId> {
-    let mut native = Vec::new();
+fn native_header_classes(module: &Module) -> HashSet<SymbolId> {
+    let mut native = HashSet::new();
     for instruction in module
         .functions
         .iter()
@@ -60,9 +60,8 @@ fn native_header_classes(module: &Module) -> Vec<SymbolId> {
         if let mir::Instruction::AllocateStringBuilder { class, .. }
         | mir::Instruction::StringBuilderAppend { class, .. }
         | mir::Instruction::StringBuilderToString { class, .. } = instruction
-            && !native.contains(class)
         {
-            native.push(*class);
+            native.insert(*class);
         }
     }
     native
@@ -126,12 +125,25 @@ struct Write {
     borrowed: bool,
 }
 
+/// Lookup tables over the module's definitions, built once per validation.
+struct Index<'a> {
+    native: HashSet<SymbolId>,
+    structs: HashMap<SymbolId, &'a mir::StructDefinition>,
+    /// Field types of structs and classes by `(owner, field)`.
+    field_types: HashMap<(SymbolId, SymbolId), &'a Type>,
+    /// Field types of enum cases by `(case, field)`.
+    case_fields: HashMap<(SymbolId, SymbolId), &'a Type>,
+}
+
 struct Frame<'a> {
-    module: &'a Module,
-    native: &'a [SymbolId],
+    index: &'a Index<'a>,
     summary: &'a Summary,
     function: &'a Function,
+    local_types: HashMap<LocalId, &'a Type>,
+    parameters: HashSet<LocalId>,
     keys: Vec<(LocalId, Path)>,
+    /// Slot numbers of each local's leaves in `keys`.
+    key_slots: HashMap<LocalId, Vec<usize>>,
     /// Non-releasing-function mode (C6, E3/E5): parameters are held without a
     /// count.
     borrowed_params: bool,
@@ -151,14 +163,22 @@ struct Summary {
 }
 
 impl Summary {
-    fn compute(module: &Module, native: &[SymbolId]) -> Self {
+    fn compute(module: &Module, index: &Index<'_>) -> Self {
+        let mut by_interface: HashMap<SymbolId, Vec<&mir::InterfaceImplementation>> =
+            HashMap::new();
+        for implementation in &module.interface_implementations {
+            by_interface
+                .entry(implementation.interface)
+                .or_default()
+                .push(implementation);
+        }
         let mut targets = HashMap::new();
         for interface in &module.interfaces {
+            let implementations = by_interface.get(&interface.symbol);
             for (slot, method) in interface.methods.iter().enumerate() {
-                let found: Vec<SymbolId> = module
-                    .interface_implementations
-                    .iter()
-                    .filter(|implementation| implementation.interface == interface.symbol)
+                let found: Vec<SymbolId> = implementations
+                    .into_iter()
+                    .flatten()
                     .filter_map(|implementation| implementation.methods.get(slot).copied())
                     .collect();
                 targets.insert(method.symbol, found);
@@ -168,7 +188,7 @@ impl Summary {
         let non_releasing = module
             .functions
             .iter()
-            .filter(|function| !releases_locally(module, native, &empty, function))
+            .filter(|function| !releases_locally(index, &empty, function))
             .map(|function| function.symbol)
             .collect();
         let mut summary = Self {
@@ -343,13 +363,92 @@ fn mentions(place: &Place, local: LocalId) -> bool {
     }
 }
 
-impl Frame<'_> {
+impl<'a> Index<'a> {
+    fn new(module: &'a Module) -> Self {
+        let mut field_types = HashMap::new();
+        for (owner, fields) in module
+            .structs
+            .iter()
+            .map(|definition| (definition.symbol, &definition.fields))
+            .chain(
+                module
+                    .classes
+                    .iter()
+                    .map(|definition| (definition.symbol, &definition.fields)),
+            )
+        {
+            for field in fields {
+                field_types
+                    .entry((owner, field.symbol))
+                    .or_insert(&field.type_);
+            }
+        }
+        let mut case_fields = HashMap::new();
+        for case in module.enums.iter().flat_map(|e| &e.cases) {
+            for field in &case.fields {
+                case_fields
+                    .entry((case.symbol, field.symbol))
+                    .or_insert(&field.type_);
+            }
+        }
+        Self {
+            native: native_header_classes(module),
+            structs: module
+                .structs
+                .iter()
+                .rev()
+                .map(|definition| (definition.symbol, definition))
+                .collect(),
+            field_types,
+            case_fields,
+        }
+    }
+}
+
+impl<'a> Frame<'a> {
+    fn new(index: &'a Index<'a>, summary: &'a Summary, function: &'a Function) -> Self {
+        let mut local_types = HashMap::new();
+        for local in function.parameters.iter().chain(&function.locals) {
+            local_types.entry(local.id).or_insert(&local.type_);
+        }
+        Self {
+            index,
+            summary,
+            function,
+            local_types,
+            parameters: function.parameters.iter().map(|p| p.id).collect(),
+            keys: Vec::new(),
+            key_slots: HashMap::new(),
+            borrowed_params: false,
+        }
+    }
+
+    fn set_keys(&mut self, keys: Vec<(LocalId, Path)>) {
+        self.key_slots.clear();
+        for (slot, (local, _)) in keys.iter().enumerate() {
+            self.key_slots.entry(*local).or_default().push(slot);
+        }
+        self.keys = keys;
+    }
+
     fn leaf_types(&self, type_: &Type) -> Vec<(Path, Type)> {
+        // Scalars and the like carry no counted leaf: no allocation.
+        match type_ {
+            Type::Class(symbol) if self.index.native.contains(symbol) => return Vec::new(),
+            Type::Class(_)
+            | Type::Interface(_)
+            | Type::Array(_)
+            | Type::String
+            | Type::List(_)
+            | Type::Dictionary(_, _) => return vec![(Vec::new(), type_.clone())],
+            Type::User(_) => {}
+            _ => return Vec::new(),
+        }
         let mut found = Vec::new();
         let mut pending = vec![(Vec::new(), type_.clone())];
         while let Some((path, current)) = pending.pop() {
             match current {
-                Type::Class(symbol) if self.native.contains(&symbol) => {}
+                Type::Class(symbol) if self.index.native.contains(&symbol) => {}
                 // An array is one leaf whatever its element type; so is a string
                 // (constants are immortal and carry no value here).
                 // A list is one leaf whatever its element type (design §10);
@@ -363,9 +462,7 @@ impl Frame<'_> {
                     found.push((path, current));
                 }
                 Type::User(symbol) => {
-                    if let Some(definition) =
-                        self.module.structs.iter().find(|d| d.symbol == symbol)
-                    {
+                    if let Some(definition) = self.index.structs.get(&symbol) {
                         for field in definition.fields.iter().rev() {
                             let mut inner = path.clone();
                             inner.push(field.symbol);
@@ -391,52 +488,30 @@ impl Frame<'_> {
 
     fn place_type(&self, place: &Place) -> Option<Type> {
         match place {
-            Place::Local(id) => {
-                let function = self.function;
-                function
-                    .parameters
-                    .iter()
-                    .chain(&function.locals)
-                    .find(|local| local.id == *id)
-                    .map(|local| local.type_.clone())
-            }
+            Place::Local(id) => self.local_types.get(id).map(|type_| (*type_).clone()),
             Place::Symbol(_) => None,
             Place::Field { base, field } => match self.place_type(base)? {
-                Type::User(symbol) => {
-                    let definition = self.module.structs.iter().find(|d| d.symbol == symbol)?;
-                    definition
-                        .fields
-                        .iter()
-                        .find(|f| f.symbol == *field)
-                        .map(|f| f.type_.clone())
-                }
+                Type::User(symbol) => self
+                    .index
+                    .field_types
+                    .get(&(symbol, *field))
+                    .map(|type_| (*type_).clone()),
                 _ => None,
             },
             Place::Index { element_type, .. } => Some(element_type.clone()),
             Place::ObjectField { object, field } => match &object.type_ {
-                Type::Class(symbol) => {
-                    let definition = self.module.classes.iter().find(|d| d.symbol == *symbol)?;
-                    definition
-                        .fields
-                        .iter()
-                        .find(|f| f.symbol == *field)
-                        .map(|f| f.type_.clone())
-                }
+                Type::Class(symbol) => self
+                    .index
+                    .field_types
+                    .get(&(*symbol, *field))
+                    .map(|type_| (*type_).clone()),
                 _ => None,
             },
-            Place::EnumField { case, field, .. } => {
-                let found = self
-                    .module
-                    .enums
-                    .iter()
-                    .flat_map(|e| &e.cases)
-                    .find(|c| c.symbol == *case)?;
-                found
-                    .fields
-                    .iter()
-                    .find(|f| f.symbol == *field)
-                    .map(|f| f.type_.clone())
-            }
+            Place::EnumField { case, field, .. } => self
+                .index
+                .case_fields
+                .get(&(*case, *field))
+                .map(|type_| (*type_).clone()),
         }
     }
 
@@ -450,9 +525,14 @@ impl Frame<'_> {
         path.reverse();
         match current {
             Place::Local(id) => self
-                .keys
-                .iter()
-                .position(|(local, slot_path)| local == id && *slot_path == path)
+                .key_slots
+                .get(id)
+                .and_then(|slots| {
+                    slots
+                        .iter()
+                        .copied()
+                        .find(|slot| self.keys[*slot].1 == path)
+                })
                 .map_or(Home::Outside, Home::Slot),
             Place::ObjectField { .. } | Place::Index { .. } => Home::Heap,
             _ => Home::Outside,
@@ -460,8 +540,7 @@ impl Frame<'_> {
     }
 
     fn is_parameter_slot(&self, index: usize) -> bool {
-        let local = self.keys[index].0;
-        self.function.parameters.iter().any(|p| p.id == local)
+        self.parameters.contains(&self.keys[index].0)
     }
 }
 
@@ -487,6 +566,11 @@ struct Block<'a> {
     defined: Vec<bool>,
     /// Slots that are live at the block end; `None` counts every slot.
     live_out: Option<Vec<bool>>,
+    /// Slots that may leave the block holding an open borrowed read without a
+    /// count: every successor that reads the slot expects exactly that.
+    accepted_out: Option<&'a [bool]>,
+    /// Slots holding an open borrowed read at the block end.
+    borrowed_out: Vec<bool>,
 }
 
 impl<'a> Block<'a> {
@@ -496,6 +580,8 @@ impl<'a> Block<'a> {
         entry: &[SlotState],
         first: bool,
         liveness: Option<&Liveness>,
+        borrowed_in: &'a [bool],
+        accepted_out: Option<&'a [bool]>,
     ) -> Self {
         let mut state = Self {
             frame,
@@ -509,11 +595,15 @@ impl<'a> Block<'a> {
             used: vec![false; entry.len()],
             defined: vec![false; entry.len()],
             live_out: liveness.map(|l| l.live_out.clone()),
+            accepted_out,
+            borrowed_out: Vec::new(),
         };
         for (index, slot) in entry.iter().enumerate() {
             if *slot == SlotState::Live {
                 let value = if first || (frame.borrowed_params && frame.is_parameter_slot(index)) {
                     state.value(0, Provenance::Param)
+                } else if borrowed_in[index] {
+                    state.value(0, Provenance::HeapRead)
                 } else if liveness.is_none_or(|l| l.live_in[index]) {
                     state.value(1, Provenance::Slot)
                 } else {
@@ -527,7 +617,24 @@ impl<'a> Block<'a> {
             state.step(instruction);
         }
         state.finish(&block.terminator);
+        state.borrowed_out = (0..entry.len())
+            .map(|slot| state.borrowed_open(slot))
+            .collect();
         state
+    }
+
+    /// Whether the slot holds an uncounted heap read that no invalidating
+    /// instruction has touched since it was made.
+    fn borrowed_open(&self, slot: usize) -> bool {
+        match (self.slots[slot], self.held[slot]) {
+            (SlotState::Live, Some(value)) => {
+                let entry = &self.values[value];
+                entry.provenance == Provenance::HeapRead
+                    && entry.tokens == 0
+                    && entry.epoch == self.epoch
+            }
+            _ => false,
+        }
     }
 
     fn flag(&mut self, obligation: &'static str, message: &str) {
@@ -1112,8 +1219,10 @@ impl<'a> Block<'a> {
                 for (index, (state, held)) in self.slots.iter().zip(&self.held).enumerate() {
                     // A slot whose bits are never read again holds no count.
                     let live = self.live_out.as_ref().is_none_or(|out| out[index]);
-                    let uncounted =
-                        self.frame.borrowed_params && self.frame.is_parameter_slot(index);
+                    let uncounted = (self.frame.borrowed_params
+                        && self.frame.is_parameter_slot(index))
+                        || (self.accepted_out.is_some_and(|accepted| accepted[index])
+                            && self.borrowed_open(index));
                     if let (SlotState::Live, Some(value)) = (state, held)
                         && live
                         && !uncounted
@@ -1191,20 +1300,12 @@ fn successors(terminator: &mir::Terminator) -> Vec<BasicBlockId> {
 
 #[allow(clippy::too_many_lines)]
 fn check_function(
-    module: &Module,
-    native: &[SymbolId],
+    index: &Index<'_>,
     summary: &Summary,
     function: &Function,
     findings: &mut Vec<OwnershipFinding>,
 ) {
-    let mut frame = Frame {
-        module,
-        native,
-        summary,
-        function,
-        keys: Vec::new(),
-        borrowed_params: false,
-    };
+    let mut frame = Frame::new(index, summary, function);
     let mut keys = Vec::new();
     for local in function.parameters.iter().chain(&function.locals) {
         for (path, _) in frame.leaf_types(&local.type_) {
@@ -1234,7 +1335,7 @@ fn check_function(
             message: "a region rewind inside a function with counted references".to_owned(),
         });
     }
-    frame.keys = keys;
+    frame.set_keys(keys);
     let mut found = analyse(&frame);
     if !found.is_empty() && summary.non_releasing.contains(&function.symbol) {
         frame.borrowed_params = true;
@@ -1313,21 +1414,9 @@ fn written_places(instruction: &mir::Instruction) -> Vec<&Place> {
 
 /// Whether `function` can release an object other than through its own
 /// parameter exit releases (so it is not non-releasing, ignoring its calls).
-fn releases_locally(
-    module: &Module,
-    native: &[SymbolId],
-    summary: &Summary,
-    function: &Function,
-) -> bool {
+fn releases_locally(index: &Index<'_>, summary: &Summary, function: &Function) -> bool {
     use mir::Instruction as I;
-    let frame = Frame {
-        module,
-        native,
-        summary,
-        function,
-        keys: Vec::new(),
-        borrowed_params: false,
-    };
+    let frame = Frame::new(index, summary, function);
     let is_parameter = |place: &Place| {
         local_root(place).is_some_and(|id| function.parameters.iter().any(|p| p.id == id))
     };
@@ -1396,13 +1485,31 @@ fn analyse(frame: &Frame<'_>) -> Vec<RawFinding> {
         .any(|b| successors(&b.terminator).contains(&function.entry));
     let mut states: Vec<Option<Vec<SlotState>>> = vec![None; blocks.len()];
     states[entry] = Some(initial);
+    // Use and definition sets of each block from the last sweep, which ran with
+    // the final entry states.
+    let mut usage: Vec<Option<(Vec<bool>, Vec<bool>)>> = vec![None; blocks.len()];
+    let slots = frame.keys.len();
+    let no_borrows = vec![false; slots];
+    // Slots that leave some block holding an open borrowed read.
+    let mut candidates = vec![false; slots];
     loop {
         let mut changed = false;
         for (i, block) in blocks.iter().enumerate() {
             let Some(state) = states[i].clone() else {
                 continue;
             };
-            let run = Block::run(frame, block, &state, i == entry && first, None);
+            let run = Block::run(
+                frame,
+                block,
+                &state,
+                i == entry && first,
+                None,
+                &no_borrows,
+                None,
+            );
+            for (candidate, open) in candidates.iter_mut().zip(&run.borrowed_out) {
+                *candidate |= *open;
+            }
             for target in successors(&block.terminator) {
                 let Some(&j) = index.get(&target) else {
                     continue;
@@ -1423,23 +1530,13 @@ fn analyse(frame: &Frame<'_>) -> Vec<RawFinding> {
                     }
                 }
             }
+            usage[i] = Some((run.used, run.defined));
         }
         if !changed {
             break;
         }
     }
     // Backward slot liveness from the per-block use/definition sets.
-    let slots = frame.keys.len();
-    let usage: Vec<Option<(Vec<bool>, Vec<bool>)>> = blocks
-        .iter()
-        .enumerate()
-        .map(|(i, block)| {
-            states[i].as_ref().map(|state| {
-                let run = Block::run(frame, block, state, i == entry && first, None);
-                (run.used, run.defined)
-            })
-        })
-        .collect();
     let mut liveness: Vec<Liveness> = (0..blocks.len())
         .map(|_| Liveness {
             live_in: vec![false; slots],
@@ -1473,12 +1570,76 @@ fn analyse(frame: &Frame<'_>) -> Vec<RawFinding> {
             break;
         }
     }
+    // Borrowed-window dataflow (design 15): a slot may enter a block holding an
+    // open borrowed read only when every predecessor leaves it so. Greatest
+    // fixpoint from "every candidate slot", the entry block starting empty;
+    // only functions with a candidate pay for it.
+    let mut borrowed_in: Vec<Vec<bool>> = vec![vec![false; slots]; blocks.len()];
+    if candidates.iter().any(|candidate| *candidate) {
+        for (i, open) in borrowed_in.iter_mut().enumerate() {
+            if states[i].is_some() && i != entry {
+                open.clone_from(&candidates);
+            }
+        }
+        loop {
+            let mut next: Vec<Vec<bool>> = (0..blocks.len())
+                .map(|i| vec![states[i].is_some() && i != entry; slots])
+                .collect();
+            for (i, block) in blocks.iter().enumerate() {
+                let Some(state) = &states[i] else {
+                    continue;
+                };
+                let run = Block::run(
+                    frame,
+                    block,
+                    state,
+                    i == entry && first,
+                    None,
+                    &borrowed_in[i],
+                    None,
+                );
+                for target in successors(&block.terminator) {
+                    if let Some(&j) = index.get(&target)
+                        && states[j].is_some()
+                        && j != entry
+                    {
+                        for (slot, open) in next[j].iter_mut().zip(&run.borrowed_out) {
+                            *slot &= *open;
+                        }
+                    }
+                }
+            }
+            if next == borrowed_in {
+                break;
+            }
+            borrowed_in = next;
+        }
+    }
     let mut found = Vec::new();
     for (i, block) in blocks.iter().enumerate() {
         let Some(state) = &states[i] else {
             continue;
         };
-        let run = Block::run(frame, block, state, i == entry && first, Some(&liveness[i]));
+        // A slot may leave the block uncounted only when every successor that
+        // reads it expects an open borrowed read.
+        let accepted: Vec<bool> = (0..slots)
+            .map(|slot| {
+                successors(&block.terminator)
+                    .iter()
+                    .filter_map(|target| index.get(target))
+                    .filter(|&&j| liveness[j].live_in[slot])
+                    .all(|&j| borrowed_in[j][slot])
+            })
+            .collect();
+        let run = Block::run(
+            frame,
+            block,
+            state,
+            i == entry && first,
+            Some(&liveness[i]),
+            &borrowed_in[i],
+            Some(&accepted),
+        );
         found.extend(run.findings);
     }
     found
@@ -2983,5 +3144,148 @@ mod tests {
         );
         let found = module_obligations(vec![f, g], 1);
         assert!(found.contains(&"U2"), "{found:?}");
+    }
+
+    // ---- borrowed windows across blocks (design 15) ----
+
+    fn goto(block: u32) -> Terminator {
+        Terminator::Goto(BasicBlockId(block))
+    }
+
+    fn branch_to(then_block: u32, else_block: u32) -> Terminator {
+        Terminator::Branch {
+            condition: Operand {
+                type_: Type::Bool,
+                kind: OperandKind::Constant(mir::Constant::Boolean(true)),
+            },
+            then_block: BasicBlockId(then_block),
+            else_block: BasicBlockId(else_block),
+        }
+    }
+
+    /// Release of a scratch slot: an invalidating instruction that keeps the
+    /// counts balanced and makes the function releasing.
+    fn invalidating() -> Vec<Instruction> {
+        vec![retain(lp(0)), assign(lp(3), lp(0)), release(lp(3))]
+    }
+
+    /// Parameter 0, borrowed local 1, reader 2, scratch 3, temporary 4.
+    fn windows(blocks: Vec<(Vec<Instruction>, Terminator)>) -> Vec<&'static str> {
+        let mut function = function_of(
+            1,
+            1,
+            &[(1, false), (2, false), (3, true), (4, true)],
+            Vec::new(),
+        );
+        function.blocks = blocks
+            .into_iter()
+            .enumerate()
+            .map(|(id, (instructions, terminator))| BasicBlock {
+                id: BasicBlockId(u32::try_from(id).unwrap()),
+                instructions,
+                terminator,
+            })
+            .collect();
+        module_obligations(vec![function], 2)
+    }
+
+    /// Entry: the parameter count, one invalidation, then `x = a.f`.
+    fn entry_with_load(mut tail: Vec<Instruction>) -> Vec<Instruction> {
+        let mut instructions = vec![retain(lp(0))];
+        instructions.extend(invalidating());
+        instructions.append(&mut tail);
+        instructions
+    }
+
+    fn load_x() -> Vec<Instruction> {
+        vec![assign(lp(1), field(0))]
+    }
+
+    fn read_x_and_return() -> (Vec<Instruction>, Terminator) {
+        (
+            vec![assign(lp(2), field(1)), release(lp(0))],
+            Terminator::Return(None),
+        )
+    }
+
+    #[test]
+    fn borrowed_local_live_across_a_join_with_an_open_window_validates() {
+        let found = windows(vec![
+            (entry_with_load(load_x()), branch_to(1, 2)),
+            (Vec::new(), goto(3)),
+            (Vec::new(), goto(3)),
+            read_x_and_return(),
+        ]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn borrowed_local_live_across_a_join_with_one_path_invalidating_is_u1() {
+        let found = windows(vec![
+            (entry_with_load(load_x()), branch_to(1, 2)),
+            (invalidating(), goto(3)),
+            (Vec::new(), goto(3)),
+            read_x_and_return(),
+        ]);
+        assert!(found.contains(&"U1"), "{found:?}");
+    }
+
+    #[test]
+    fn borrowed_local_read_after_an_invalidation_in_a_later_block_is_u2() {
+        let mut second = invalidating();
+        second.push(assign(lp(2), field(1)));
+        let found = windows(vec![
+            (entry_with_load(load_x()), goto(1)),
+            (second, goto(2)),
+            (vec![release(lp(0))], Terminator::Return(None)),
+        ]);
+        assert!(found.contains(&"U2"), "{found:?}");
+    }
+
+    #[test]
+    fn borrowed_local_read_in_a_loop_with_an_open_window_validates() {
+        let found = windows(vec![
+            (entry_with_load(load_x()), goto(1)),
+            (vec![assign(lp(2), field(1))], branch_to(2, 3)),
+            (Vec::new(), goto(1)),
+            (vec![release(lp(0))], Terminator::Return(None)),
+        ]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn borrowed_local_read_in_a_loop_that_invalidates_is_u1() {
+        let found = windows(vec![
+            (entry_with_load(load_x()), goto(1)),
+            (vec![assign(lp(2), field(1))], branch_to(2, 3)),
+            (invalidating(), goto(1)),
+            (vec![release(lp(0))], Terminator::Return(None)),
+        ]);
+        assert!(found.contains(&"U1"), "{found:?}");
+    }
+
+    #[test]
+    fn a_reload_in_the_loop_starts_a_new_window() {
+        let mut body = invalidating();
+        body.extend(load_x());
+        let found = windows(vec![
+            (entry_with_load(load_x()), goto(1)),
+            (vec![assign(lp(2), field(1))], branch_to(2, 3)),
+            (body, goto(1)),
+            (vec![release(lp(0))], Terminator::Return(None)),
+        ]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn borrowed_local_copied_from_a_temporary_validates_across_blocks() {
+        let found = windows(vec![
+            (
+                entry_with_load(vec![assign(lp(4), field(0)), assign(lp(1), lp(4))]),
+                goto(1),
+            ),
+            read_x_and_return(),
+        ]);
+        assert!(found.is_empty(), "{found:?}");
     }
 }

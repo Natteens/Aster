@@ -257,7 +257,7 @@ fn searches_do_not_allocate_and_local_substrings_are_reclaimed() {
     let aster_bytes = aster_runtime::ASTER_STR_PAYLOAD_OFFSET as u64 + 5;
     assert_eq!(stats.requested_bytes, aster_bytes);
     // MEM-EXP-1 serves counted strings from the 32-byte size class.
-    let used = if cfg!(feature = "mem-exp-c5") {
+    let used = if cfg!(feature = "mem-exp-rc-core") {
         32
     } else {
         aster_bytes

@@ -70,17 +70,17 @@ pub(super) struct PreparedProgram {
     task_entries: HashMap<mir::SymbolId, (*const u8, mir::Type)>,
     /// Declared last: class descriptors must outlive the JIT code and every
     /// object that points at them.
-    #[cfg(feature = "mem-exp-c5")]
+    #[cfg(feature = "mem-exp-rc-core")]
     _descriptors: super::layouts::ObjectDescriptors,
 }
 
 /// MEM-EXP-1 C5/C6: insert the ownership instructions (elided in C6) and
 /// validate them before any code is generated.
-#[cfg(feature = "mem-exp-c5")]
+#[cfg(feature = "mem-exp-rc-core")]
 fn prepare_ownership_module(module: &mir::Module) -> Result<mir::Module, BackendError> {
-    #[cfg(feature = "mem-exp-c6")]
+    #[cfg(feature = "mem-exp-elide")]
     let (transformed, _stats) = mir::ownership::insert_ownership_elided(module);
-    #[cfg(not(feature = "mem-exp-c6"))]
+    #[cfg(not(feature = "mem-exp-elide"))]
     let (transformed, _stats) = mir::ownership::insert_ownership(module);
     mir::validate::ownership::validate_ownership(&transformed).map_err(|findings| {
         BackendError::new(
@@ -118,9 +118,9 @@ impl PreparedProgram {
         registry: &aster_runtime::ForeignRegistry,
     ) -> Result<(Self, PrepareTimings), BackendError> {
         let codegen_started = Instant::now();
-        #[cfg(feature = "mem-exp-c5")]
+        #[cfg(feature = "mem-exp-rc-core")]
         let transformed = prepare_ownership_module(module)?;
-        #[cfg(feature = "mem-exp-c5")]
+        #[cfg(feature = "mem-exp-rc-core")]
         let module = &transformed;
         let mut builder = jit_builder()?;
         for function in runtime_functions() {
@@ -182,7 +182,7 @@ impl PreparedProgram {
                 jit: Some(codegen.jit),
                 entries,
                 task_entries,
-                #[cfg(feature = "mem-exp-c5")]
+                #[cfg(feature = "mem-exp-rc-core")]
                 _descriptors: codegen.descriptors,
             },
             PrepareTimings {
@@ -300,7 +300,7 @@ impl PreparedProgram {
         }
         let value = invoke_finalized(*pointer, return_type, &mut execution_context);
         let runtime_error = execution_context.take_error();
-        #[cfg(feature = "mem-exp-c5")]
+        #[cfg(feature = "mem-exp-rc-core")]
         execution_context.refresh_object_heap_stats();
         let stats = execution_context.memory_stats().clone();
         let telemetry = execution_context.aarm_memory_telemetry();
@@ -370,7 +370,7 @@ impl PreparedProgram {
             invoke_task_finalized(*pointer, return_type, payload.as_ptr(), &mut context)
         };
         let runtime_error = context.take_error();
-        #[cfg(feature = "mem-exp-c5")]
+        #[cfg(feature = "mem-exp-rc-core")]
         context.refresh_object_heap_stats();
         let stats = context.memory_stats().clone();
         let telemetry = context.aarm_memory_telemetry();
@@ -426,7 +426,7 @@ impl PreparedProgram {
         let function: extern "C" fn(*mut aster_runtime::ExecutionContext, i64) -> i32 =
             unsafe { std::mem::transmute(*pointer) };
         let move_next_status = function(&raw mut context, handle);
-        #[cfg(feature = "mem-exp-c5")]
+        #[cfg(feature = "mem-exp-rc-core")]
         context.refresh_object_heap_stats();
         let stats = context.memory_stats().clone();
         let result = match context.take_error() {
@@ -1689,7 +1689,7 @@ mod tests {
 
     // C5 removes owned regions: a failure leaves objects for the bulk domain release.
     #[test]
-    #[cfg(not(feature = "mem-exp-c5"))]
+    #[cfg(not(feature = "mem-exp-rc-core"))]
     fn generated_owned_region_runtime_failures_unwind_once_and_allow_context_reuse() {
         let cases = [
             (

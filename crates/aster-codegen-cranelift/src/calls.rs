@@ -1720,7 +1720,7 @@ impl Codegen {
         let call = builder.ins().call(function_ref, &[context, length, size]);
         let array = builder.inst_results(call)[0];
         self.continue_if_runtime_ok(builder, state)?;
-        #[cfg(feature = "mem-exp-c5")]
+        #[cfg(feature = "mem-exp-rc-core")]
         self.set_array_element_descriptor(builder, array, element_type, false, state)?;
         self.store_scalar(builder, destination, array, state)
     }
@@ -1728,7 +1728,7 @@ impl Codegen {
     /// MEM-EXP-1 C5 (design section 8): the array owns one count per leaf of
     /// each element, so the runtime needs the element descriptor. `adopt`
     /// also retains the elements the producer already wrote.
-    #[cfg(feature = "mem-exp-c5")]
+    #[cfg(feature = "mem-exp-rc-core")]
     fn set_array_element_descriptor(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
@@ -1790,13 +1790,13 @@ impl Codegen {
         if super::layouts::OBJECT_HEADER_BYTES != 0 {
             // MEM-EXP-1: C1 to C4 write a non-zero stand-in for the B1
             // descriptor pointer; C5 writes the real descriptor address.
-            #[cfg(feature = "mem-exp-c5")]
+            #[cfg(feature = "mem-exp-rc-core")]
             let descriptor_bits = self
                 .descriptors
                 .address(class)
                 .ok_or_else(|| BackendError::new("class has no object descriptor"))?
                 .cast_signed();
-            #[cfg(not(feature = "mem-exp-c5"))]
+            #[cfg(not(feature = "mem-exp-rc-core"))]
             let descriptor_bits = i64::from(class.0) | (1_i64 << 62);
             let descriptor = builder.ins().iconst(types::I64, descriptor_bits);
             builder.ins().store(
@@ -1811,7 +1811,7 @@ impl Codegen {
 
     /// Lower `Retain`/`Release` (MEM-EXP-1 C5): inline count fast paths with a
     /// cold runtime slow path for the last release; no failure edge is emitted.
-    #[cfg_attr(not(feature = "mem-exp-c5"), allow(clippy::unused_self))]
+    #[cfg_attr(not(feature = "mem-exp-rc-core"), allow(clippy::unused_self))]
     pub(super) fn translate_reference_count(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
@@ -1819,7 +1819,7 @@ impl Codegen {
         retain: bool,
         state: &FunctionState,
     ) -> Result<(), BackendError> {
-        #[cfg(feature = "mem-exp-c5")]
+        #[cfg(feature = "mem-exp-rc-core")]
         {
             let operand = self.translate_operand(builder, value, state)?;
             let object = if matches!(value.type_, mir::Type::Interface(_)) {
@@ -1838,7 +1838,7 @@ impl Codegen {
             self.emit_inline_reference_count(builder, context, object, retain)?;
             Ok(())
         }
-        #[cfg(not(feature = "mem-exp-c5"))]
+        #[cfg(not(feature = "mem-exp-rc-core"))]
         {
             let _ = (builder, value, retain, state);
             Err(BackendError::new(
@@ -1851,7 +1851,7 @@ impl Codegen {
     /// Null and immortal operands are skipped; the executed-operation counters
     /// in the context are updated in place; the last release of an object
     /// takes a cold call to the runtime slow path, which does not count again.
-    #[cfg(feature = "mem-exp-c5")]
+    #[cfg(feature = "mem-exp-rc-core")]
     fn emit_inline_reference_count(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
@@ -1960,7 +1960,7 @@ impl Codegen {
             .call(function_ref, &[context, size, align, type_key]);
         let list = builder.inst_results(call)[0];
         self.continue_if_runtime_ok(builder, state)?;
-        #[cfg(feature = "mem-exp-c5")]
+        #[cfg(feature = "mem-exp-rc-core")]
         if let Some(address) = self.descriptors.element_address(element_type) {
             // MEM-EXP-1 C5 (design section 7): the list owns one count per
             // reference leaf of each element; the runtime needs the leaves.
@@ -2136,7 +2136,7 @@ impl Codegen {
         );
         let dictionary = builder.inst_results(call)[0];
         self.continue_if_runtime_ok(builder, state)?;
-        #[cfg(feature = "mem-exp-c5")]
+        #[cfg(feature = "mem-exp-rc-core")]
         if let Some(address) = self.descriptors.dictionary_address(key_type, value_type) {
             // MEM-EXP-1 C5 (design section 11): the dictionary owns one count
             // per reference leaf of every live key and value; the runtime
@@ -2470,7 +2470,7 @@ impl Codegen {
         let call = builder.ins().call(function_ref, &arguments);
         let entries = builder.inst_results(call)[0];
         self.continue_if_runtime_ok(builder, state)?;
-        #[cfg(feature = "mem-exp-c5")]
+        #[cfg(feature = "mem-exp-rc-core")]
         self.set_array_element_descriptor(builder, entries, entry_type, true, state)?;
         self.store_scalar(builder, destination, entries, state)
     }
@@ -2546,7 +2546,7 @@ impl Codegen {
         let call = builder.ins().call(function_ref, &arguments);
         let result = builder.inst_results(call)[0];
         self.continue_if_runtime_ok(builder, state)?;
-        #[cfg(feature = "mem-exp-c5")]
+        #[cfg(feature = "mem-exp-rc-core")]
         self.set_array_element_descriptor(builder, result, component_type, true, state)?;
         self.store_scalar(builder, destination, result, state)
     }
