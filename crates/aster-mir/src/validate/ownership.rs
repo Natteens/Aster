@@ -168,12 +168,14 @@ impl Frame<'_> {
                 Type::Class(symbol) if self.native.contains(&symbol) => {}
                 // An array is one leaf whatever its element type; so is a string
                 // (constants are immortal and carry no value here).
-                // A list is one leaf whatever its element type (design §10).
+                // A list is one leaf whatever its element type (design §10);
+                // so is a dictionary (design §11).
                 Type::Class(_)
                 | Type::Interface(_)
                 | Type::Array(_)
                 | Type::String
-                | Type::List(_) => {
+                | Type::List(_)
+                | Type::Dictionary(_, _) => {
                     found.push((path, current));
                 }
                 Type::User(symbol) => {
@@ -754,7 +756,7 @@ impl<'a> Block<'a> {
             } => {
                 self.effect(&[length], &[], Some(destination), Product::Owned, false);
             }
-            I::AllocateList { destination, .. } => {
+            I::AllocateList { destination, .. } | I::AllocateDictionary { destination, .. } => {
                 self.effect(&[], &[], Some(destination), Product::Owned, false);
             }
             I::ListToArray {
@@ -818,7 +820,22 @@ impl<'a> Block<'a> {
                 value,
                 ..
             } => {
-                self.effect(&[dictionary], &[key, value], None, Product::Owned, false);
+                // The dictionary may release replaced or rejected entries:
+                // borrowed dictionary reads die.
+                self.effect(&[dictionary], &[key, value], None, Product::Owned, true);
+            }
+            I::DictionaryRemove {
+                dictionary, key, ..
+            } => {
+                self.effect(&[dictionary, key], &[], None, Product::Owned, true);
+            }
+            I::DictionaryClear { dictionary } => {
+                self.effect(&[dictionary], &[], None, Product::Owned, true);
+            }
+            I::DictionaryContainsKey {
+                dictionary, key, ..
+            } => {
+                self.effect(&[dictionary, key], &[], None, Product::Owned, false);
             }
             I::ListGet {
                 destination,
@@ -1069,7 +1086,11 @@ fn leaf_function(function: &Function) -> bool {
             | mir::Instruction::CallIntrinsic { .. }
             | mir::Instruction::ListSet { .. }
             | mir::Instruction::ListRemoveAt { .. }
-            | mir::Instruction::ListClear { .. } => false,
+            | mir::Instruction::ListClear { .. }
+            | mir::Instruction::DictionaryAdd { .. }
+            | mir::Instruction::DictionarySet { .. }
+            | mir::Instruction::DictionaryRemove { .. }
+            | mir::Instruction::DictionaryClear { .. } => false,
             instruction if written_places(instruction).into_iter().any(stores_element) => false,
             mir::Instruction::Release { value } => {
                 let OperandKind::Copy(place) = &value.kind else {
@@ -2182,5 +2203,236 @@ mod tests {
             vec![get_or(), string_release(1)],
         );
         assert!(missing.contains(&"U1"), "{missing:?}");
+    }
+
+    fn dict_type() -> Type {
+        Type::Dictionary(Box::new(class()), Box::new(class()))
+    }
+
+    fn dict_local(id: u32) -> mir::Local {
+        let mut dictionary = local(id, false);
+        dictionary.type_ = dict_type();
+        dictionary
+    }
+
+    fn dict_operand(id: u32) -> Operand {
+        Operand {
+            type_: dict_type(),
+            kind: OperandKind::Copy(lp(id)),
+        }
+    }
+
+    fn bool_local(id: u32) -> mir::Local {
+        let mut flag = local(id, false);
+        flag.type_ = Type::Bool;
+        flag
+    }
+
+    fn int_local(id: u32) -> mir::Local {
+        let mut number = local(id, false);
+        number.type_ = Type::Int;
+        number
+    }
+
+    /// Parameters 0 and 2 are classes, local 1 receives reads, local 3 is the
+    /// dictionary and local 4 a boolean.
+    fn dict_obligations(instructions: Vec<Instruction>) -> Vec<&'static str> {
+        string_obligations(
+            vec![local(0, false), local(2, false)],
+            vec![local(1, false), dict_local(3), bool_local(4)],
+            instructions,
+        )
+    }
+
+    fn dict_try_get() -> Instruction {
+        Instruction::DictionaryTryGet {
+            destination: lp(1),
+            dictionary: dict_operand(3),
+            key: operand(lp(0)),
+            value_type: class(),
+            option_layout: mir::DictionaryOptionLayout {
+                some_case: SymbolId(50),
+                some_field: SymbolId(51),
+                some_tag: 1,
+                none_case: SymbolId(52),
+                none_tag: 0,
+            },
+        }
+    }
+
+    fn dict_set() -> Instruction {
+        Instruction::DictionarySet {
+            destination: lp(4),
+            dictionary: dict_operand(3),
+            key: operand(lp(0)),
+            value: operand(lp(2)),
+        }
+    }
+
+    fn allocate_dictionary() -> Instruction {
+        Instruction::AllocateDictionary {
+            destination: lp(3),
+            key_type: class(),
+            value_type: class(),
+            region: AllocationRegion::Persistent,
+        }
+    }
+
+    fn dict_release() -> Instruction {
+        Instruction::Release {
+            value: dict_operand(3),
+        }
+    }
+
+    #[test]
+    fn allocated_dictionary_is_an_owned_leaf_released_once() {
+        let found = dict_obligations(vec![
+            retain(lp(0)),
+            retain(lp(2)),
+            allocate_dictionary(),
+            retain(lp(0)),
+            retain(lp(2)),
+            dict_set(),
+            dict_release(),
+            release(lp(0)),
+            release(lp(2)),
+        ]);
+        assert!(found.is_empty(), "{found:?}");
+        let leaked = dict_obligations(vec![
+            retain(lp(0)),
+            retain(lp(2)),
+            allocate_dictionary(),
+            release(lp(0)),
+            release(lp(2)),
+        ]);
+        assert!(leaked.contains(&"U1"), "{leaked:?}");
+        let extra = dict_obligations(vec![
+            retain(lp(0)),
+            retain(lp(2)),
+            allocate_dictionary(),
+            Instruction::Retain {
+                value: dict_operand(3),
+            },
+            dict_release(),
+            release(lp(0)),
+            release(lp(2)),
+        ]);
+        assert!(extra.contains(&"U1"), "{extra:?}");
+    }
+
+    #[test]
+    fn dictionary_read_retained_survives_set() {
+        let found = dict_obligations(vec![
+            retain(lp(0)),
+            retain(lp(2)),
+            allocate_dictionary(),
+            dict_try_get(),
+            retain(lp(1)),
+            retain(lp(0)),
+            retain(lp(2)),
+            dict_set(),
+            use_call(1),
+            release(lp(1)),
+            dict_release(),
+            release(lp(0)),
+            release(lp(2)),
+        ]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn dictionary_read_used_after_set_without_retain_is_u2() {
+        let found = dict_obligations(vec![
+            retain(lp(0)),
+            retain(lp(2)),
+            allocate_dictionary(),
+            dict_try_get(),
+            retain(lp(0)),
+            retain(lp(2)),
+            dict_set(),
+            use_call(1),
+            dict_release(),
+            release(lp(0)),
+            release(lp(2)),
+        ]);
+        assert!(found.contains(&"U2"), "{found:?}");
+    }
+
+    #[test]
+    fn dictionary_remove_and_clear_invalidate_reads() {
+        for invalidating in [
+            Instruction::DictionaryRemove {
+                destination: lp(4),
+                dictionary: dict_operand(3),
+                key: operand(lp(0)),
+            },
+            Instruction::DictionaryClear {
+                dictionary: dict_operand(3),
+            },
+            dict_set(),
+        ] {
+            let found = dict_obligations(vec![
+                retain(lp(0)),
+                retain(lp(2)),
+                allocate_dictionary(),
+                dict_try_get(),
+                invalidating,
+                use_call(1),
+            ]);
+            assert!(found.contains(&"U2"), "{found:?}");
+        }
+    }
+
+    fn int_dictionary() -> Type {
+        Type::Dictionary(Box::new(Type::Int), Box::new(Type::Int))
+    }
+
+    fn int_dictionary_parameter() -> mir::Local {
+        let mut dictionary = local(0, false);
+        dictionary.type_ = int_dictionary();
+        dictionary
+    }
+
+    fn count_of_parameter() -> Instruction {
+        Instruction::Assign {
+            target: lp(1),
+            value: Rvalue {
+                type_: Type::Int,
+                kind: RvalueKind::DictionaryLength(Operand {
+                    type_: int_dictionary(),
+                    kind: OperandKind::Copy(lp(0)),
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn dictionary_getter_parameter_elision_validates() {
+        let found = string_obligations(
+            vec![int_dictionary_parameter()],
+            vec![int_local(1)],
+            vec![count_of_parameter()],
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn dictionary_parameter_elision_with_remove_is_u2() {
+        let found = string_obligations(
+            vec![int_dictionary_parameter()],
+            vec![int_local(1), bool_local(2)],
+            vec![
+                Instruction::DictionaryRemove {
+                    destination: lp(2),
+                    dictionary: Operand {
+                        type_: int_dictionary(),
+                        kind: OperandKind::Copy(lp(0)),
+                    },
+                    key: zero(),
+                },
+                count_of_parameter(),
+            ],
+        );
+        assert!(found.contains(&"U2"), "{found:?}");
     }
 }

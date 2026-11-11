@@ -519,3 +519,142 @@ fn lists_of_lists_release_their_inner_lists() {
         stats.object_heap
     );
 }
+
+// Counted dictionaries (design section 11): the dictionary owns the key and
+// the value of every live entry and is released with its last holder.
+
+const ENTRY: &str = "using aster.core; \
+    public class Entry { public int id; public Entry(int id) { this.id = id; } } ";
+
+/// A sliding window of 20 live keys (storage stays within the size classes)
+/// with steady `Set`, `Remove` and `TryGet`.
+fn cache_churn(operations: i32) -> MemoryStats {
+    let expected: i32 = (10..operations).map(|key| (key - 10) % 7).sum::<i32>() + 20;
+    run_project(
+        &format!(
+            "{ENTRY} internal int Churn(int operations) {{ \
+             Dictionary<int, Entry> cache = new Dictionary<int, Entry>(); int total = 0; \
+             for (int key = 0; key < operations; key += 1) {{ \
+             cache.Set(key, new Entry(key)); \
+             if (key >= 20) {{ cache.Remove(key - 20); }} \
+             switch (cache.TryGet(key - 10)) {{ \
+             case Some(entry): total += entry.id % 7; case None: }} }} \
+             return total + cache.Length; }} \
+             public int Run() {{ return Churn({operations}); }}"
+        ),
+        expected,
+    )
+}
+
+#[test]
+fn dictionary_cache_churn_stays_bounded_between_200_and_2000_iterations() {
+    let small = cache_churn(200);
+    let large = cache_churn(2_000);
+    assert!(
+        large.object_heap.released_blocks > small.object_heap.released_blocks,
+        "{:?} vs {:?}",
+        small.object_heap,
+        large.object_heap
+    );
+    assert!(
+        large.object_heap.reused_blocks > small.object_heap.reused_blocks,
+        "reuse did not grow: {:?} vs {:?}",
+        small.object_heap,
+        large.object_heap
+    );
+    // Ten times the iterations must not need ten times the memory.
+    assert!(
+        large.used_bytes < small.used_bytes.saturating_mul(3),
+        "used bytes grew with the iteration count: {} vs {}",
+        small.used_bytes,
+        large.used_bytes
+    );
+    assert!(
+        large.object_heap.fresh_blocks < 80,
+        "{:?}",
+        large.object_heap
+    );
+}
+
+#[test]
+fn dictionary_fields_are_released_with_their_owner() {
+    let stats = run_project(
+        &format!(
+            "{ENTRY} public class Registry {{ public Dictionary<int, Entry> map; \
+             public Registry() {{ this.map = new Dictionary<int, Entry>(); }} }} \
+             internal Registry Make(int n) {{ Registry registry = new Registry(); \
+             for (int i = 0; i < n; i += 1) {{ registry.map.Add(i, new Entry(i)); }} \
+             return registry; }} \
+             public int Run() {{ int total = 0; \
+             for (int i = 0; i < 60; i += 1) {{ Registry registry = Make(5); \
+             total += registry.map.Length; }} return total; }}"
+        ),
+        300,
+    );
+    assert!(
+        stats.object_heap.released_dictionaries >= 55,
+        "field dictionaries were not released with their owner: {:?}",
+        stats.object_heap
+    );
+    // Five entries per registry were released with their dictionary.
+    assert!(
+        stats.object_heap.released_blocks >= 55 * 7,
+        "{:?}",
+        stats.object_heap
+    );
+}
+
+#[test]
+fn try_get_value_is_valid_until_set_replaces_the_key() {
+    let stats = run_project(
+        &format!(
+            "{ENTRY} public int Run() {{ \
+             Dictionary<int, Entry> map = new Dictionary<int, Entry>(); \
+             map.Add(1, new Entry(10)); int total = 0; \
+             switch (map.TryGet(1)) {{ case Some(entry): total += entry.id; case None: return -1; }} \
+             map.Set(1, new Entry(20)); \
+             switch (map.TryGet(1)) {{ case Some(entry): total += entry.id; case None: return -2; }} \
+             Entry fallback = new Entry(7); \
+             total += map.GetOr(2, fallback).id; \
+             total += map.GetOrAdd(2, new Entry(3)).id; \
+             total += map.GetOrAdd(2, new Entry(100)).id; \
+             return total * 100 + map.Length; }}"
+        ),
+        (10 + 20 + 7 + 3 + 3) * 100 + 2,
+    );
+    // The replaced value and the rejected GetOrAdd value are released.
+    assert!(
+        stats.object_heap.released_blocks >= 2,
+        "{:?}",
+        stats.object_heap
+    );
+}
+
+#[test]
+fn string_keys_and_values_are_released_by_set_remove_and_clear() {
+    let stats = run_project(
+        &format!(
+            "{ENTRY} public int Run() {{ \
+             Dictionary<string, Entry> map = new Dictionary<string, Entry>(); int total = 0; \
+             for (int i = 0; i < 50; i += 1) {{ map.Set($\"key {{i % 5}}\", new Entry(i)); }} \
+             for (int i = 0; i < 50; i += 1) {{ map.Add($\"key {{i % 5}}\", new Entry(i)); }} \
+             total += map.Length; \
+             if (map.Remove(\"key 0\")) {{ total += 1; }} \
+             switch (map.TryGet(\"key 4\")) {{ case Some(entry): total += entry.id; case None: }} \
+             map.Clear(); total += map.Length; \
+             return total; }}"
+        ),
+        5 + 1 + 49,
+    );
+    // 45 passed keys on Set and 50 on Add are released, plus the stored keys.
+    assert!(
+        stats.object_heap.released_strings >= 95,
+        "{:?}",
+        stats.object_heap
+    );
+    assert!(
+        stats.object_heap.released_blocks >= 150,
+        "{:?}",
+        stats.object_heap
+    );
+}

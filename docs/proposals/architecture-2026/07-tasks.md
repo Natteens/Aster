@@ -778,13 +778,30 @@ Measured (C6, debug, deterministic): `longrun_request` used bytes **448 at N and
 `cache_churn` still grows (dictionaries). Checksums identical in C5 and C6; executed count
 operations C6/C5 = 2,960,271 / 5,739,385 = 51.6% (soft elision gate ≤ 50% missed).
 
+### T-MEM-EXP-1 stage C, counted dictionaries — implemented (2026-11-11)
+
+Contract: §11 of [08-mem-exp-1-c5-design.md](08-mem-exp-1-c5-design.md). `AsterDictionary` under
+`mem-exp-rc`: `{key, value}` descriptor pair @0, count @8 (kind 4); the dictionary owns live keys
+and values (glue on `Add`, `Set`, `GetOrAdd`, `Remove`, `Clear`, drop); heap-served header and
+storage up to 2,048 bytes. Pass and validator: `Dictionary` is a leaf, `AllocateDictionary` owned,
+dictionary mutations invalidate borrowed reads and exclude E3.
+
+Gates: `aster-codegen-cranelift --all-targets` C0 1,443 and C4 1,443 passed; C5 and C6 1,450
+passed, 0 failed, 24 ignored; `aster-runtime` 337 (default) and 395 (`mem-exp-rc`, incl. 17
+`dictionary_rc`); `aster-mir` 104; clippy and rustfmt clean.
+
+Measured (C6): `cache_churn` still grows (1,212,512 → 11,018,336 used bytes): its 1,000-key window
+needs a storage block above 2,048 bytes, and each rehash or compaction leaves the old large block
+reserved. `collection_growth` grows for the same reason (large list buffers). Checksums identical;
+executed count operations C6/C5 = 2,960,322 / 5,739,436 = 51.6%.
+
 Not done, so **no PASS for MEM-001 to MEM-003**:
 
-1. Counted dictionaries (kind 4: header, buckets and entries blocks, key and value ownership with
-   release on `Set`, `Remove`, `Clear`, drop) for `cache_churn`.
+1. Reuse of blocks above 2,048 bytes (large size classes) for buffers and long strings, for
+   `cache_churn` and `collection_growth`.
 2. Enum payload drop glue and closure environments (enums currently leak their references).
 3. Region reclamation together with counting (H2 pins); C5 and C6 currently lose it.
 4. Class B timing protocol (release builds, interleaved rounds) and the §4.C thresholds.
 
-Next action: item 1, counted dictionaries; then improve elision so the soft gate is met again;
+Next action: item 1, large block classes; then improve elision so the soft gate is met again;
 then the class B timing protocol.

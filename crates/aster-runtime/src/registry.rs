@@ -8,7 +8,7 @@
 #[cfg(feature = "mem-exp-rc")]
 use crate::context::{
     aster_rt_array_adopt_elements, aster_rt_array_set_element_descriptor,
-    aster_rt_list_set_element_descriptor,
+    aster_rt_dictionary_set_descriptors, aster_rt_list_set_element_descriptor,
 };
 use crate::context::{
     aster_rt_array_element, aster_rt_array_length, aster_rt_array_new,
@@ -207,6 +207,19 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
         RuntimeFunction {
             name: "aster_rt_array_adopt_elements",
             address: aster_rt_array_adopt_elements as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                ],
+                result: None,
+            },
+        },
+        #[cfg(feature = "mem-exp-rc")]
+        RuntimeFunction {
+            name: "aster_rt_dictionary_set_descriptors",
+            address: aster_rt_dictionary_set_descriptors as *const u8,
             signature: RuntimeSignature {
                 parameters: &[
                     RuntimeType::Pointer,

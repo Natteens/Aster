@@ -76,6 +76,14 @@ pub const ASTER_LIST_COUNT_OFFSET: usize = std::mem::offset_of!(AsterList, count
 #[cfg(feature = "mem-exp-rc")]
 pub const ASTER_LIST_DESCRIPTOR_OFFSET: usize = std::mem::offset_of!(AsterList, element_descriptor);
 
+/// Offset of the count word inside a counted dictionary header.
+#[cfg(feature = "mem-exp-rc")]
+pub const ASTER_DICTIONARY_COUNT_OFFSET: usize = std::mem::offset_of!(AsterDictionary, count_word);
+/// Offset of the descriptor-pair word inside a counted dictionary header.
+#[cfg(feature = "mem-exp-rc")]
+pub const ASTER_DICTIONARY_DESCRIPTOR_OFFSET: usize =
+    std::mem::offset_of!(AsterDictionary, descriptors);
+
 /// Offset of the one-byte error flag inside an [`ExecutionContext`], read
 /// directly by generated code after fallible runtime calls instead of calling
 /// [`aster_rt_has_error`]. Derived from the struct, not duplicated in a
@@ -297,6 +305,14 @@ fn string_builder_growth_capacity(required: usize) -> Option<usize> {
 /// Hash seeds remain per-context; snapshots need no iterator/version state.
 #[repr(C)]
 pub struct AsterDictionary {
+    /// MEM-EXP-1 (design section 11): the uniform object prefix. The descriptor
+    /// word names an immutable `{ key, value }` descriptor pair (or is null
+    /// when neither type has reference leaves); the count word carries kind 4.
+    #[cfg(feature = "mem-exp-rc")]
+    descriptors: *const crate::object_heap::DictionaryDescriptors,
+    #[cfg(feature = "mem-exp-rc")]
+    #[allow(dead_code, reason = "read and written through the object header ABI")]
+    count_word: u32,
     buckets: *mut u32,
     entries: *mut u8,
     length: i32,
@@ -322,6 +338,59 @@ impl AsterDictionary {
     #[must_use]
     pub fn region(&self) -> ListRegion {
         self.region
+    }
+}
+
+/// The single combined bucket/entry block of a dictionary.
+#[cfg(feature = "mem-exp-rc")]
+pub(crate) struct DictionaryStorage {
+    pub(crate) block: *mut u8,
+    pub(crate) bytes: usize,
+    pub(crate) align: u32,
+}
+
+#[cfg(feature = "mem-exp-rc")]
+impl AsterDictionary {
+    /// Pushes the key and value leaves of every live entry onto `work` and
+    /// describes the storage block, for the release work list. Tombstones own
+    /// nothing.
+    ///
+    /// # Safety
+    ///
+    /// `this` must be a valid counted dictionary header whose descriptor pair
+    /// is null or valid and whose entry buffer holds `entry_count` entries.
+    #[allow(unsafe_code)]
+    pub(crate) unsafe fn drain_children(
+        this: *mut Self,
+        work: &mut Vec<*mut u8>,
+    ) -> Option<DictionaryStorage> {
+        // SAFETY: the caller's contract.
+        let header = unsafe { &*this };
+        if header.buckets.is_null() {
+            return None;
+        }
+        let layout = dictionary_entry_layout(
+            header.key_size,
+            header.key_align,
+            header.value_size,
+            header.value_align,
+        )?;
+        for index in 0..header.entry_count {
+            let entry = ExecutionContext::dictionary_entry_pointer(header.entries, index, layout)?;
+            // SAFETY: `index < entry_count <= entry_capacity`.
+            if unsafe { ExecutionContext::dictionary_entry_live(entry) } == 1 {
+                work.extend(ExecutionContext::dictionary_leaf_words(
+                    this,
+                    entry.wrapping_add(layout.key_offset),
+                    entry.wrapping_add(layout.value_offset),
+                ));
+            }
+        }
+        Some(DictionaryStorage {
+            block: header.buckets.cast::<u8>(),
+            bytes: dictionary_storage_bytes(header.bucket_capacity, header.entry_capacity, layout)?,
+            align: u32::try_from(layout.align).ok()?,
+        })
     }
 }
 
@@ -376,6 +445,22 @@ fn dictionary_entry_layout(
         stride,
         align,
     })
+}
+
+/// Size of the one block holding the buckets and the entries.
+#[cfg(feature = "mem-exp-rc")]
+fn dictionary_storage_bytes(
+    bucket_capacity: i32,
+    entry_capacity: i32,
+    layout: DictionaryEntryLayout,
+) -> Option<usize> {
+    let bucket_bytes = usize::try_from(bucket_capacity)
+        .ok()?
+        .checked_mul(size_of::<u32>())?;
+    let entry_bytes = usize::try_from(entry_capacity)
+        .ok()?
+        .checked_mul(layout.stride)?;
+    checked_align_up(bucket_bytes, layout.align)?.checked_add(entry_bytes)
 }
 
 fn dictionary_storage_fits(
@@ -1813,11 +1898,25 @@ impl ExecutionContext {
             self.fail("temporary dictionary allocation requires an active temporary scope");
             return ptr::null_mut();
         }
-        let Some(header) = self.allocate_in_region(
+        // Persistent counted headers are size-class blocks (count 1); Temporary
+        // headers are region-owned and never counted.
+        #[cfg(feature = "mem-exp-rc")]
+        let header = if region == ListRegion::Persistent {
+            self.allocate_heap_block(size_of::<AsterDictionary>())
+        } else {
+            self.allocate_in_region(
+                size_of::<AsterDictionary>(),
+                align_of::<AsterDictionary>(),
+                true,
+            )
+        };
+        #[cfg(not(feature = "mem-exp-rc"))]
+        let header = self.allocate_in_region(
             size_of::<AsterDictionary>(),
             align_of::<AsterDictionary>(),
             region == ListRegion::Temporary,
-        ) else {
+        );
+        let Some(header) = header else {
             return ptr::null_mut();
         };
         #[allow(clippy::cast_ptr_alignment)]
@@ -1826,6 +1925,15 @@ impl ExecutionContext {
         #[allow(unsafe_code)]
         unsafe {
             *header = AsterDictionary {
+                #[cfg(feature = "mem-exp-rc")]
+                descriptors: ptr::null(),
+                #[cfg(feature = "mem-exp-rc")]
+                count_word: crate::object_heap::DICTIONARY_FLAG
+                    | if region == ListRegion::Persistent {
+                        1
+                    } else {
+                        crate::object_heap::IMMORTAL
+                    },
                 buckets: ptr::null_mut(),
                 entries: ptr::null_mut(),
                 length: 0,
@@ -1849,6 +1957,8 @@ impl ExecutionContext {
             };
         }
         self.record_allocation(AllocationCategory::Object, size_of::<AsterDictionary>());
+        #[cfg(feature = "mem-exp-rc")]
+        self.sync_heap_stats();
         header
     }
 
@@ -2099,6 +2209,19 @@ impl ExecutionContext {
             return None;
         };
         let allocation_align = align_of::<u32>().max(layout.align);
+        #[cfg(feature = "mem-exp-rc")]
+        let storage = if region == ListRegion::Persistent
+            && AsterList::buffer_is_heap_served(
+                allocation_bytes,
+                u32::try_from(allocation_align).unwrap_or(u32::MAX),
+            ) {
+            let block = self.allocate_heap_block(allocation_bytes)?;
+            self.sync_heap_stats();
+            block
+        } else {
+            self.allocate_in_region(allocation_bytes, allocation_align, use_temporary)?
+        };
+        #[cfg(not(feature = "mem-exp-rc"))]
         let storage = self.allocate_in_region(allocation_bytes, allocation_align, use_temporary)?;
         let entries = storage.wrapping_add(entries_offset);
         #[allow(clippy::cast_ptr_alignment)]
@@ -2236,6 +2359,7 @@ impl ExecutionContext {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn dictionary_rebuild(
         &mut self,
         dictionary: *mut AsterDictionary,
@@ -2243,7 +2367,17 @@ impl ExecutionContext {
         new_entry_capacity: i32,
     ) -> bool {
         #[allow(unsafe_code)]
-        let (old_entries, old_count, length, region, birth_scope_depth, layout) = unsafe {
+        let (
+            old_entries,
+            old_count,
+            length,
+            region,
+            birth_scope_depth,
+            layout,
+            old_buckets,
+            old_bucket_capacity,
+            old_entry_capacity,
+        ) = unsafe {
             let Some(layout) = dictionary_entry_layout(
                 (*dictionary).key_size,
                 (*dictionary).key_align,
@@ -2260,6 +2394,9 @@ impl ExecutionContext {
                 (*dictionary).region,
                 (*dictionary).birth_scope_depth,
                 layout,
+                (*dictionary).buckets,
+                (*dictionary).bucket_capacity,
+                (*dictionary).entry_capacity,
             )
         };
         if new_bucket_capacity.count_ones() != 1
@@ -2329,7 +2466,85 @@ impl ExecutionContext {
             (*dictionary).entry_capacity = new_entry_capacity;
             (*dictionary).entry_count = new_count;
         }
+        // Entries were bit-moved (no count change); the old block is unreferenced.
+        #[cfg(feature = "mem-exp-rc")]
+        self.return_dictionary_storage(
+            old_buckets,
+            old_bucket_capacity,
+            old_entry_capacity,
+            layout,
+            region,
+        );
+        #[cfg(not(feature = "mem-exp-rc"))]
+        let _ = (old_buckets, old_bucket_capacity, old_entry_capacity);
         true
+    }
+
+    /// Return a replaced Persistent dictionary storage block to the size-class
+    /// heap. Blocks the heap did not serve (null, Temporary, over-aligned, or
+    /// above the largest class) are left alone.
+    #[cfg(feature = "mem-exp-rc")]
+    fn return_dictionary_storage(
+        &mut self,
+        buckets: *mut u32,
+        bucket_capacity: i32,
+        entry_capacity: i32,
+        layout: DictionaryEntryLayout,
+        region: ListRegion,
+    ) {
+        if buckets.is_null() || region != ListRegion::Persistent {
+            return;
+        }
+        let Some(bytes) = dictionary_storage_bytes(bucket_capacity, entry_capacity, layout) else {
+            return;
+        };
+        let align = u32::try_from(layout.align).unwrap_or(u32::MAX);
+        if !AsterList::buffer_is_heap_served(bytes, align) {
+            return;
+        }
+        if let Some(class) = u32::try_from(bytes)
+            .ok()
+            .and_then(crate::object_heap::ObjectHeap::class_of)
+        {
+            self.object_heap.release(buckets.cast::<u8>(), class);
+            self.sync_heap_stats();
+        }
+    }
+
+    /// Descriptor pair of `dictionary`, each null when the type has no leaves.
+    #[cfg(feature = "mem-exp-rc")]
+    fn dictionary_descriptor_pair(
+        dictionary: *const AsterDictionary,
+    ) -> (
+        *const crate::object_heap::ObjectDescriptor,
+        *const crate::object_heap::ObjectDescriptor,
+    ) {
+        // SAFETY: callers pass a validated dictionary header whose pair, when
+        // set, is immutable program data.
+        #[allow(unsafe_code)]
+        unsafe {
+            let pair = (*dictionary).descriptors;
+            if pair.is_null() {
+                (ptr::null(), ptr::null())
+            } else {
+                ((*pair).key, (*pair).value)
+            }
+        }
+    }
+
+    /// Reads the object word of every leaf of one key (at `key`) and one value
+    /// (at `value`); a null address contributes nothing. The words are copied
+    /// out so the storage may be reused before they are released.
+    #[cfg(feature = "mem-exp-rc")]
+    fn dictionary_leaf_words(
+        dictionary: *const AsterDictionary,
+        key: *const u8,
+        value: *const u8,
+    ) -> Vec<*mut u8> {
+        let (key_descriptor, value_descriptor) = Self::dictionary_descriptor_pair(dictionary);
+        let mut words = Self::collect_leaf_words(key_descriptor, key, 0, 1);
+        words.extend(Self::collect_leaf_words(value_descriptor, value, 0, 1));
+        words
     }
 
     fn dictionary_prepare_insert(&mut self, dictionary: *mut AsterDictionary) -> bool {
@@ -2520,6 +2735,13 @@ impl ExecutionContext {
                     value_size as usize,
                 );
             }
+            // GetOrAdd consumed a count per leaf of the passed key and value;
+            // the entry keeps its own, so the passed ones are dropped.
+            #[cfg(feature = "mem-exp-rc")]
+            if add_missing {
+                let words = Self::dictionary_leaf_words(dictionary, key, supplied);
+                self.release_leaf_words(&words);
+            }
             return true;
         }
         if add_missing
@@ -2608,6 +2830,18 @@ impl ExecutionContext {
                     self.fail("Dictionary.Set entry offset overflow");
                     return 0;
                 };
+                // The old value and the passed key are read out before the
+                // store; they are released once the new value is in place.
+                #[cfg(feature = "mem-exp-rc")]
+                let dropped = {
+                    let mut words = Self::dictionary_leaf_words(
+                        dictionary,
+                        ptr::null(),
+                        entry.wrapping_add(layout.value_offset),
+                    );
+                    words.extend(Self::dictionary_leaf_words(dictionary, key, ptr::null()));
+                    words
+                };
                 #[allow(unsafe_code)]
                 unsafe {
                     ptr::copy(
@@ -2616,11 +2850,25 @@ impl ExecutionContext {
                         usize::try_from(value_size).unwrap_or(0),
                     );
                 }
+                #[cfg(feature = "mem-exp-rc")]
+                self.release_leaf_words(&dropped);
                 return 1;
+            }
+            // Add on an existing key inserts nothing: the passed key and
+            // value are dropped.
+            #[cfg(feature = "mem-exp-rc")]
+            {
+                let words = Self::dictionary_leaf_words(dictionary, key, value);
+                self.release_leaf_words(&words);
             }
             return 0;
         }
         if !self.dictionary_prepare_insert(dictionary) {
+            #[cfg(feature = "mem-exp-rc")]
+            {
+                let words = Self::dictionary_leaf_words(dictionary, key, value);
+                self.release_leaf_words(&words);
+            }
             return 0;
         }
         #[allow(unsafe_code)]
@@ -2721,6 +2969,14 @@ impl ExecutionContext {
         let entry =
             Self::dictionary_entry_pointer(entries, i32::try_from(index).unwrap_or(-1), layout)
                 .expect("validated index");
+        // The removed key and value are read out first and released after the
+        // table invariants are restored.
+        #[cfg(feature = "mem-exp-rc")]
+        let removed = Self::dictionary_leaf_words(
+            dictionary,
+            entry.wrapping_add(layout.key_offset),
+            entry.wrapping_add(layout.value_offset),
+        );
         #[allow(unsafe_code)]
         let next = unsafe { Self::dictionary_entry_next(entry) };
         #[allow(unsafe_code)]
@@ -2739,6 +2995,8 @@ impl ExecutionContext {
             ptr::write(entry.add(12), 0);
             (*dictionary).length = length - 1;
         }
+        #[cfg(feature = "mem-exp-rc")]
+        self.release_leaf_words(&removed);
         1
     }
 
@@ -2994,6 +3252,28 @@ impl ExecutionContext {
             self.fail("Dictionary.Clear entry byte count overflow");
             return;
         };
+        // Every live key and value is read out before the table is emptied and
+        // released afterwards; tombstones own nothing.
+        #[cfg(feature = "mem-exp-rc")]
+        let former = {
+            #[allow(unsafe_code)]
+            let entry_count = unsafe { (*dictionary).entry_count };
+            let mut words = Vec::new();
+            for index in 0..entry_count {
+                let Some(entry) = Self::dictionary_entry_pointer(entries, index, layout) else {
+                    break;
+                };
+                #[allow(unsafe_code)]
+                if unsafe { Self::dictionary_entry_live(entry) } == 1 {
+                    words.extend(Self::dictionary_leaf_words(
+                        dictionary,
+                        entry.wrapping_add(layout.key_offset),
+                        entry.wrapping_add(layout.value_offset),
+                    ));
+                }
+            }
+            words
+        };
         // SAFETY: validated header capacities precisely bound both backing
         // buffers. Clearing leaves capacity and allocation ownership intact.
         #[allow(unsafe_code)]
@@ -3007,6 +3287,8 @@ impl ExecutionContext {
             (*dictionary).length = 0;
             (*dictionary).entry_count = 0;
         }
+        #[cfg(feature = "mem-exp-rc")]
+        self.release_leaf_words(&former);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4836,6 +5118,25 @@ pub extern "C" fn aster_rt_list_set_element_descriptor(
     #[allow(unsafe_code)]
     unsafe {
         (*list).element_descriptor = descriptor;
+    }
+}
+
+/// Record the `{ key, value }` descriptor pair of a freshly allocated
+/// dictionary (MEM-EXP-1 C5, design section 11).
+#[cfg(feature = "mem-exp-rc")]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_dictionary_set_descriptors(
+    context: *mut ExecutionContext,
+    dictionary: *mut AsterDictionary,
+    pair: *const crate::object_heap::DictionaryDescriptors,
+) {
+    if context.is_null() || dictionary.is_null() {
+        return;
+    }
+    // SAFETY: generated code passes its live context and a dictionary it just allocated.
+    #[allow(unsafe_code)]
+    unsafe {
+        (*dictionary).descriptors = pair;
     }
 }
 

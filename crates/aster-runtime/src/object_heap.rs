@@ -46,7 +46,8 @@ pub const KIND_STRING: u32 = 2;
 /// Kind 3: list header whose descriptor word names the element descriptor
 /// (design section 10).
 pub const KIND_LIST: u32 = 3;
-/// Kind 4: dictionary header (reserved, design section 11).
+/// Kind 4: dictionary header whose descriptor word names a
+/// [`DictionaryDescriptors`] pair (design section 11).
 pub const KIND_DICTIONARY: u32 = 4;
 /// Count-word bits of an array header.
 pub const ARRAY_FLAG: u32 = KIND_ARRAY << KIND_SHIFT;
@@ -54,6 +55,8 @@ pub const ARRAY_FLAG: u32 = KIND_ARRAY << KIND_SHIFT;
 pub const STRING_FLAG: u32 = KIND_STRING << KIND_SHIFT;
 /// Count-word bits of a list header.
 pub const LIST_FLAG: u32 = KIND_LIST << KIND_SHIFT;
+/// Count-word bits of a dictionary header.
+pub const DICTIONARY_FLAG: u32 = KIND_DICTIONARY << KIND_SHIFT;
 
 #[cfg(feature = "mem-exp-rc")]
 static STRING_LEAF_OFFSETS: [u32; 1] = [0];
@@ -87,6 +90,20 @@ pub struct ObjectDescriptor {
 #[allow(unsafe_code)]
 unsafe impl Sync for ObjectDescriptor {}
 
+/// Immutable `{ key, value }` pair of element descriptors a dictionary header
+/// points at (design section 11). Each side is null when its type has no
+/// reference leaves.
+#[repr(C)]
+pub struct DictionaryDescriptors {
+    pub key: *const ObjectDescriptor,
+    pub value: *const ObjectDescriptor,
+}
+
+// SAFETY: like `ObjectDescriptor`, the pair is immutable program data that is
+// only ever read.
+#[allow(unsafe_code)]
+unsafe impl Sync for DictionaryDescriptors {}
+
 /// Counters for the experiment report.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ObjectHeapStats {
@@ -115,6 +132,12 @@ pub struct ObjectHeapStats {
     /// List buffers above the largest size class: never returned to the heap.
     #[cfg(feature = "mem-exp-rc")]
     pub unreturned_list_buffers: u64,
+    /// Dictionaries whose header and heap-served storage were released.
+    #[cfg(feature = "mem-exp-rc")]
+    pub released_dictionaries: u64,
+    /// Dictionary storage blocks above the largest size class: never returned.
+    #[cfg(feature = "mem-exp-rc")]
+    pub unreturned_dictionary_blocks: u64,
 }
 
 #[derive(Default)]
@@ -256,6 +279,12 @@ pub(crate) unsafe fn release(heap: &mut ObjectHeap, object: *mut u8) -> u64 {
                 released += 1;
                 continue;
             }
+            if kind == KIND_DICTIONARY {
+                // SAFETY: a kind 4 object is a dictionary header of this heap.
+                unsafe { release_dictionary(heap, current, &mut work) };
+                released += 1;
+                continue;
+            }
             if kind == KIND_STRING {
                 // SAFETY: a kind 2 object is a counted string header of this heap.
                 let bytes = unsafe {
@@ -394,4 +423,37 @@ unsafe fn release_list(heap: &mut ObjectHeap, list: *mut u8, work: &mut Vec<*mut
         .expect("list headers fit a size class");
     heap.release(list, header_class);
     heap.stats.released_lists += 1;
+}
+
+/// Free a counted dictionary whose count reached zero: push the key and value
+/// leaves of every live entry, return the storage block when it is
+/// heap-served, then the header block.
+///
+/// # Safety
+///
+/// `dictionary` must be a counted Persistent dictionary header allocated by
+/// `heap` whose descriptor pair is null or valid.
+#[cfg(feature = "mem-exp-rc")]
+#[allow(unsafe_code)]
+unsafe fn release_dictionary(heap: &mut ObjectHeap, dictionary: *mut u8, work: &mut Vec<*mut u8>) {
+    use crate::context::AsterDictionary;
+    // SAFETY: the caller's contract.
+    let storage =
+        unsafe { AsterDictionary::drain_children(dictionary.cast::<AsterDictionary>(), work) };
+    if let Some(storage) = storage {
+        if crate::context::AsterList::buffer_is_heap_served(storage.bytes, storage.align) {
+            let class = u32::try_from(storage.bytes)
+                .ok()
+                .and_then(ObjectHeap::class_of)
+                .expect("heap-served dictionary storage fits a size class");
+            heap.release(storage.block, class);
+        } else {
+            heap.stats.unreturned_dictionary_blocks += 1;
+        }
+    }
+    let header_class =
+        ObjectHeap::class_of(u32::try_from(size_of::<AsterDictionary>()).unwrap_or(0))
+            .expect("dictionary headers fit a size class");
+    heap.release(dictionary, header_class);
+    heap.stats.released_dictionaries += 1;
 }

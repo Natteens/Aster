@@ -55,10 +55,20 @@ pub(super) struct ObjectDescriptors {
     /// Element descriptors of `List<T>` and `T[]` types with reference leaves,
     /// keyed by `mir::type_key(T)` (design sections 7 and 8).
     by_element: HashMap<u64, *const aster_runtime::object_heap::ObjectDescriptor>,
+    #[allow(
+        dead_code,
+        clippy::vec_box,
+        reason = "boxing keeps descriptor-pair addresses stable"
+    )]
+    pairs: Vec<Box<aster_runtime::object_heap::DictionaryDescriptors>>,
+    /// `{ key, value }` descriptor pairs of `Dictionary<K, V>` types with
+    /// reference leaves, keyed by the two `mir::type_key`s (design section 11).
+    by_dictionary: HashMap<(u64, u64), *const aster_runtime::object_heap::DictionaryDescriptors>,
 }
 
 #[cfg(feature = "mem-exp-c5")]
 impl ObjectDescriptors {
+    #[allow(clippy::too_many_lines)]
     pub(super) fn build(layouts: &Layouts, module: &mir::Module) -> Result<Self, BackendError> {
         let mut store = Self::default();
         // `StringBuilder` objects have a native header without a count word,
@@ -96,19 +106,38 @@ impl ObjectDescriptors {
             store.offsets.push(offsets);
             store.descriptors.push(descriptor);
         }
-        let element_types = module
+        let mut element_types = Vec::new();
+        let mut dictionaries = Vec::new();
+        for instruction in module
             .functions
             .iter()
             .flat_map(|function| &function.blocks)
             .flat_map(|block| &block.instructions)
-            .filter_map(|instruction| match instruction {
+        {
+            match instruction {
                 mir::Instruction::AllocateList { element_type, .. }
-                | mir::Instruction::AllocateArray { element_type, .. } => Some(element_type),
-                mir::Instruction::DictionaryKeys { key_type, .. } => Some(key_type),
-                mir::Instruction::DictionaryValues { value_type, .. } => Some(value_type),
-                mir::Instruction::DictionaryEntries { entry_type, .. } => Some(entry_type),
-                _ => None,
-            });
+                | mir::Instruction::AllocateArray { element_type, .. } => {
+                    element_types.push(element_type);
+                }
+                mir::Instruction::DictionaryKeys { key_type, .. } => element_types.push(key_type),
+                mir::Instruction::DictionaryValues { value_type, .. } => {
+                    element_types.push(value_type);
+                }
+                mir::Instruction::DictionaryEntries { entry_type, .. } => {
+                    element_types.push(entry_type);
+                }
+                mir::Instruction::AllocateDictionary {
+                    key_type,
+                    value_type,
+                    ..
+                } => {
+                    element_types.push(key_type);
+                    element_types.push(value_type);
+                    dictionaries.push((key_type, value_type));
+                }
+                _ => {}
+            }
+        }
         for element_type in element_types {
             let key = mir::type_key(element_type);
             if store.by_element.contains_key(&key) {
@@ -132,7 +161,37 @@ impl ObjectDescriptors {
             store.offsets.push(offsets);
             store.descriptors.push(descriptor);
         }
+        for (key_type, value_type) in dictionaries {
+            let key = (mir::type_key(key_type), mir::type_key(value_type));
+            if store.by_dictionary.contains_key(&key) {
+                continue;
+            }
+            let key_descriptor = store.by_element.get(&key.0).copied();
+            let value_descriptor = store.by_element.get(&key.1).copied();
+            if key_descriptor.is_none() && value_descriptor.is_none() {
+                continue;
+            }
+            let pair = Box::new(aster_runtime::object_heap::DictionaryDescriptors {
+                key: key_descriptor.unwrap_or(std::ptr::null()),
+                value: value_descriptor.unwrap_or(std::ptr::null()),
+            });
+            store.by_dictionary.insert(key, std::ptr::from_ref(&*pair));
+            store.pairs.push(pair);
+        }
         Ok(store)
+    }
+
+    /// Address of the `{ key, value }` descriptor pair of
+    /// `Dictionary<key_type, value_type>`, or `None` when neither type has
+    /// reference leaves.
+    pub(super) fn dictionary_address(
+        &self,
+        key_type: &mir::Type,
+        value_type: &mir::Type,
+    ) -> Option<u64> {
+        self.by_dictionary
+            .get(&(mir::type_key(key_type), mir::type_key(value_type)))
+            .map(|pointer| *pointer as u64)
     }
 
     /// Element descriptor address for `List<element_type>` or
@@ -205,6 +264,7 @@ impl Layouts {
             | mir::Type::Interface(_)
             | mir::Type::Array(_)
             | mir::Type::List(_)
+            | mir::Type::Dictionary(_, _)
             | mir::Type::String => true,
             mir::Type::User(symbol) => self.structs.get(symbol).is_some_and(|definition| {
                 definition
@@ -254,7 +314,7 @@ impl Layouts {
     }
 
     /// Leaf offsets of one value of `type_` placed at `offset`: a class,
-    /// interface, array, list or string is one leaf (its object word), an inline struct contributes
+    /// interface, array, list, dictionary or string is one leaf (its object word), an inline struct contributes
     /// its fields' leaves, everything else has none.
     #[cfg(feature = "mem-exp-c5")]
     pub(super) fn collect_type_offsets(
@@ -270,6 +330,7 @@ impl Layouts {
             | mir::Type::Interface(_)
             | mir::Type::Array(_)
             | mir::Type::List(_)
+            | mir::Type::Dictionary(_, _)
             | mir::Type::String => {
                 offsets.push(offset);
             }

@@ -2065,6 +2065,22 @@ impl Codegen {
         );
         let dictionary = builder.inst_results(call)[0];
         self.continue_if_runtime_ok(builder, state)?;
+        #[cfg(feature = "mem-exp-c5")]
+        if let Some(address) = self.descriptors.dictionary_address(key_type, value_type) {
+            // MEM-EXP-1 C5 (design section 11): the dictionary owns one count
+            // per reference leaf of every live key and value; the runtime
+            // needs the immutable `{ key, value }` descriptor pair.
+            let set_descriptors = self.jit.declare_func_in_func(
+                self.runtime_ids["aster_rt_dictionary_set_descriptors"],
+                builder.func,
+            );
+            let pair = builder
+                .ins()
+                .iconst(self.pointer_type, address.cast_signed());
+            builder
+                .ins()
+                .call(set_descriptors, &[context, dictionary, pair]);
+        }
         self.store_scalar(builder, destination, dictionary, state)
     }
 

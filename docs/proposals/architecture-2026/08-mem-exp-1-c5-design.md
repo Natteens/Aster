@@ -249,3 +249,28 @@ H4 holds and their counts stay single-domain.
 - **Pass and validator.** `Type::List(_)` is a leaf. `AllocateList` is an owned source. Every
   intrinsic or instruction that receives a list operand borrows it. A list stored into a class
   field, struct, array, or another list follows the existing store rules.
+
+## 11. Counted dictionaries
+
+- **Header.** Under `mem-exp-rc`, `AsterDictionary` starts with the uniform prefix: descriptor word
+  @0 pointing at an immutable `{ key, value }` pair of element descriptors (each may be null), count
+  word @8 with kind 4. Codegen sets the pair right after `AllocateDictionary` when the key or value
+  type has leaves. Persistent header, bucket, and entry blocks up to 2,048 bytes are heap-served;
+  growth returns old blocks; Temporary dictionaries are `IMMORTAL`.
+- **The dictionary owns the key and value of every live entry.** The caller transfers one count per
+  leaf of the key and the value it passes to `Add`, `Set`, and `GetOrAdd` (the pass already treats
+  them as consumed operands). The runtime then:
+  - `Add` on a new key, and `Set`/`GetOrAdd` inserting: keeps both counts.
+  - `Add` that does not insert (existing key or failure): releases the passed key and value.
+  - `Set` on an existing key: stores the new value, releases the old value, releases the passed key
+    (the entry keeps its original key).
+  - `GetOrAdd` on an existing key: releases the passed key and value.
+  - `Remove`: restores the table invariants first, then releases the removed key and value.
+  - `Clear`: empties the table first, then releases every former key and value.
+  - Drop (release of the dictionary): releases every live key and value, then returns the blocks.
+  - `Keys`/`Values`/`Entries` snapshots: unchanged (the produced array adopts and retains).
+- **Pass and validator.** `Type::Dictionary(_, _)` is a leaf. `AllocateDictionary` is an owned
+  source. Dictionary operands are borrowed. Values read by `DictionaryTryGet`, `DictionaryGetOr`,
+  and `DictionaryGetOrAdd` are borrowed until the next invalidating instruction, which now includes
+  `DictionaryAdd`, `DictionarySet`, `DictionaryRemove`, and `DictionaryClear`. E3 does not apply to
+  functions containing any of these four instructions.

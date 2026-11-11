@@ -319,10 +319,14 @@ fn leaves(module: &Module, native: &HashSet<SymbolId>, type_: &Type) -> Vec<Leaf
         // An array is one leaf whatever its element type: an `int[]` must still
         // be released to free its blocks (design §8). A string is a leaf too
         // (design §9); string constants are immortal and never counted.
-        // A list is one leaf whatever its element type (design §10).
-        Type::Class(_) | Type::Interface(_) | Type::Array(_) | Type::String | Type::List(_) => {
-            vec![(Vec::new(), type_.clone())]
-        }
+        // A list is one leaf whatever its element type (design §10), and so is
+        // a dictionary (design §11).
+        Type::Class(_)
+        | Type::Interface(_)
+        | Type::Array(_)
+        | Type::String
+        | Type::List(_)
+        | Type::Dictionary(_, _) => vec![(Vec::new(), type_.clone())],
         Type::User(symbol) => module
             .structs
             .iter()
@@ -524,6 +528,7 @@ impl Context<'_> {
             Instruction::AllocateObject { destination: d, .. }
             | Instruction::AllocateArray { destination: d, .. }
             | Instruction::AllocateList { destination: d, .. }
+            | Instruction::AllocateDictionary { destination: d, .. }
             | Instruction::ListToArray { destination: d, .. }
             | Instruction::DictionaryKeys { destination: d, .. }
             | Instruction::DictionaryValues { destination: d, .. }
@@ -968,6 +973,10 @@ impl Context<'_> {
                         Instruction::ListSet { .. }
                             | Instruction::ListRemoveAt { .. }
                             | Instruction::ListClear { .. }
+                            | Instruction::DictionaryAdd { .. }
+                            | Instruction::DictionarySet { .. }
+                            | Instruction::DictionaryRemove { .. }
+                            | Instruction::DictionaryClear { .. }
                     )
                     && !destination_places(instruction)
                         .into_iter()
@@ -1041,6 +1050,30 @@ mod tests {
 
     fn int_list() -> Type {
         Type::List(Box::new(Type::Int))
+    }
+
+    fn int_dictionary() -> Type {
+        Type::Dictionary(Box::new(Type::Int), Box::new(Type::Int))
+    }
+
+    fn class_dictionary() -> Type {
+        Type::Dictionary(Box::new(class()), Box::new(class()))
+    }
+
+    fn dictionary_field(id: u32) -> Place {
+        Place::ObjectField {
+            object: Box::new(copy(lp(id), &class())),
+            field: SymbolId(14),
+        }
+    }
+
+    fn allocate_dictionary(destination: u32) -> Instruction {
+        Instruction::AllocateDictionary {
+            destination: lp(destination),
+            key_type: Type::Int,
+            value_type: Type::Int,
+            region: mir::AllocationRegion::Persistent,
+        }
     }
 
     fn list_field(id: u32) -> Place {
@@ -1167,6 +1200,7 @@ mod tests {
                     field_definition(11, class()),
                     field_definition(12, Type::String),
                     field_definition(13, int_list()),
+                    field_definition(14, int_dictionary()),
                 ],
             }],
             interfaces: Vec::new(),
@@ -1265,6 +1299,7 @@ mod tests {
                     field_definition(11, class()),
                     field_definition(12, Type::String),
                     field_definition(13, int_list()),
+                    field_definition(14, int_dictionary()),
                 ],
             }],
             interfaces: Vec::new(),
@@ -1906,7 +1941,8 @@ mod tests {
         assert_eq!(instructions[1], keys);
         assert!(is_capture_of(&instructions[3], &lp(1)));
         assert_eq!(instructions[4], values);
-        assert_eq!(stats.retains, 0);
+        // Only the entry retain of the dictionary parameter (a dictionary is a leaf).
+        assert_eq!(stats.retains, 1);
     }
 
     #[test]
@@ -2320,5 +2356,196 @@ mod tests {
         );
         assert_eq!(counts(&result.c5), (1, 1));
         assert_eq!(counts(&result.elided), (0, 0));
+    }
+
+    #[test]
+    fn dictionary_local_reassigned_in_a_loop_releases_the_old_dictionary() {
+        let result = both(
+            Vec::new(),
+            vec![local(0, int_dictionary(), false)],
+            vec![
+                block(0, Vec::new(), Terminator::Goto(BasicBlockId(1))),
+                block(1, vec![allocate_dictionary(0)], branch(1, 2)),
+                block(2, Vec::new(), Terminator::Return(None)),
+            ],
+            Type::Void,
+        );
+        let loop_block = result.c5.blocks.iter().find(|b| b.id == BasicBlockId(1));
+        let instructions = &loop_block.unwrap().instructions;
+        assert_eq!(retains_in(instructions), 0);
+        assert!(
+            instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Release { .. })),
+            "{instructions:#?}"
+        );
+        assert_eq!(counts(&result.c5), (0, 2));
+    }
+
+    #[test]
+    fn dictionary_stored_in_a_class_field_is_retained_and_the_old_one_released() {
+        let (function, _) = run_void(
+            vec![local(0, class(), false)],
+            vec![local(1, int_dictionary(), false)],
+            vec![
+                allocate_dictionary(1),
+                assign(
+                    dictionary_field(0),
+                    &int_dictionary(),
+                    copy(lp(1), &int_dictionary()),
+                ),
+                assign(
+                    dictionary_field(0),
+                    &int_dictionary(),
+                    copy(lp(1), &int_dictionary()),
+                ),
+            ],
+        );
+        let instructions = body(&function);
+        let of_dictionary = |count: fn(&Instruction) -> Option<&Operand>| {
+            instructions
+                .iter()
+                .filter_map(count)
+                .filter(|value| value.type_ == int_dictionary())
+                .count()
+        };
+        assert_eq!(
+            of_dictionary(|i| match i {
+                Instruction::Retain { value } => Some(value),
+                _ => None,
+            }),
+            2
+        );
+        // Captures of the old local and of the two old field values, and the
+        // exit release of the local.
+        assert_eq!(
+            of_dictionary(|i| match i {
+                Instruction::Release { value } => Some(value),
+                _ => None,
+            }),
+            4
+        );
+    }
+
+    fn dictionary_try_get(destination: u32) -> Instruction {
+        Instruction::DictionaryTryGet {
+            destination: lp(destination),
+            dictionary: copy(lp(0), &class_dictionary()),
+            key: copy(lp(1), &class()),
+            value_type: class(),
+            option_layout: mir::DictionaryOptionLayout {
+                some_case: SymbolId(50),
+                some_field: SymbolId(51),
+                some_tag: 1,
+                none_case: SymbolId(52),
+                none_tag: 0,
+            },
+        }
+    }
+
+    fn dictionary_set() -> Instruction {
+        Instruction::DictionarySet {
+            destination: lp(4),
+            dictionary: copy(lp(0), &class_dictionary()),
+            key: copy(lp(1), &class()),
+            value: copy(lp(2), &class()),
+        }
+    }
+
+    #[test]
+    fn dictionary_try_get_is_retained_after_the_read_and_survives_a_set() {
+        let use_result = Instruction::Call {
+            destination: None,
+            function: SymbolId(2),
+            arguments: vec![copy(lp(3), &class())],
+            return_type: Type::Void,
+        };
+        let get = dictionary_try_get(3);
+        let (function, _) = run_void(
+            vec![
+                local(0, class_dictionary(), false),
+                local(1, class(), false),
+                local(2, class(), false),
+            ],
+            vec![local(3, class(), false), local(4, Type::Bool, false)],
+            vec![get.clone(), dictionary_set(), use_result],
+        );
+        let all: Vec<&Instruction> = function
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .collect();
+        let at = all.iter().position(|i| **i == get).unwrap();
+        assert_eq!(*all[at + 1], retain(lp(3), &class()));
+        // Key and value are consumed by the set; the dictionary is borrowed.
+        let set = all.iter().position(|i| **i == dictionary_set()).unwrap();
+        assert_eq!(*all[set - 1], retain(lp(2), &class()));
+        assert_eq!(*all[set - 2], retain(lp(1), &class()));
+        let dictionary_retains = all
+            .iter()
+            .filter(|i| matches!(i, Instruction::Retain { value } if matches!(value.type_, Type::Dictionary(..))))
+            .count();
+        // Only the entry retain of the dictionary parameter.
+        assert_eq!(dictionary_retains, 1);
+    }
+
+    #[test]
+    fn e3_applies_to_a_dictionary_getter_that_only_reads_the_count() {
+        let count = Instruction::Assign {
+            target: lp(1),
+            value: Rvalue {
+                type_: Type::Int,
+                kind: RvalueKind::DictionaryLength(copy(lp(0), &int_dictionary())),
+            },
+        };
+        let result = both(
+            vec![local(0, int_dictionary(), false)],
+            vec![local(1, Type::Int, false)],
+            vec![block(
+                0,
+                vec![count],
+                Terminator::Return(Some(copy(lp(1), &Type::Int))),
+            )],
+            Type::Int,
+        );
+        assert_eq!(counts(&result.c5), (1, 1));
+        assert_eq!(counts(&result.elided), (0, 0));
+        assert!(result.elided_stats.elided_parameters > 0);
+    }
+
+    #[test]
+    fn e3_does_not_apply_to_a_function_mutating_a_dictionary() {
+        let dictionary = || copy(lp(0), &int_dictionary());
+        for mutation in [
+            Instruction::DictionaryAdd {
+                destination: lp(1),
+                dictionary: dictionary(),
+                key: zero(),
+                value: zero(),
+            },
+            Instruction::DictionarySet {
+                destination: lp(1),
+                dictionary: dictionary(),
+                key: zero(),
+                value: zero(),
+            },
+            Instruction::DictionaryRemove {
+                destination: lp(1),
+                dictionary: dictionary(),
+                key: zero(),
+            },
+            Instruction::DictionaryClear {
+                dictionary: dictionary(),
+            },
+        ] {
+            let result = both(
+                vec![local(0, int_dictionary(), false)],
+                vec![local(1, Type::Bool, false)],
+                vec![block(0, vec![mutation], Terminator::Return(None))],
+                Type::Void,
+            );
+            assert_eq!(result.elided_stats.elided_parameters, 0);
+            assert_eq!(counts(&result.elided), (1, 1));
+        }
     }
 }

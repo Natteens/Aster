@@ -564,13 +564,14 @@ fn validate_instruction(
                         | mir::Type::Interface(_)
                         | mir::Type::Array(_)
                         | mir::Type::List(_)
+                        | mir::Type::Dictionary(_, _)
                         | mir::Type::String
                 )
             {
                 Ok(())
             } else {
                 Err(BackendError::new(format!(
-                    "function `{function_name}` contains a reference-count instruction that is not a class, interface, array, list or string operand under MEM-EXP-1 C5"
+                    "function `{function_name}` contains a reference-count instruction that is not a class, interface, array, list, dictionary or string operand under MEM-EXP-1 C5"
                 )))
             }
         }
