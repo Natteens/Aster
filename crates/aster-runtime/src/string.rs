@@ -15,20 +15,61 @@ use std::{fmt::Write, ptr};
 use crate::{ExecutionContext, aster_rt_array_element, aster_rt_array_length};
 
 /// Header preceding the UTF-8 bytes of an ABI string.
+///
+/// Under `mem-exp-rc` (MEM-EXP-1 stage C, design section 9) the header carries
+/// the uniform counted-object prefix: a descriptor word (always null for a
+/// string) at offset 0 and the count word at offset 8, then `len`.
 #[repr(C)]
 pub struct AsterStrHeader {
+    /// Descriptor word of the uniform object header; null for strings.
+    #[cfg(feature = "mem-exp-rc")]
+    #[allow(dead_code, reason = "part of the uniform object header ABI")]
+    descriptor: usize,
+    /// Strong count plus kind flags (`STRING_FLAG`).
+    #[cfg(feature = "mem-exp-rc")]
+    #[allow(dead_code, reason = "read and written through the object header ABI")]
+    count_word: u32,
     /// Length of the UTF-8 payload in bytes. Not a character count.
     pub len: usize,
 }
 
+/// Offset of the byte length inside an [`AsterStrHeader`].
+pub const ASTER_STR_LEN_OFFSET: usize = std::mem::offset_of!(AsterStrHeader, len);
+/// Offset of the first payload byte (the header size).
+pub const ASTER_STR_PAYLOAD_OFFSET: usize = size_of::<AsterStrHeader>();
+/// Offset of the count word inside a counted string header.
+#[cfg(feature = "mem-exp-rc")]
+pub const ASTER_STR_COUNT_OFFSET: usize = std::mem::offset_of!(AsterStrHeader, count_word);
+
+impl AsterStrHeader {
+    /// A stack-only empty string header, never published to Aster code.
+    #[must_use]
+    pub(crate) const fn empty_static() -> Self {
+        Self {
+            #[cfg(feature = "mem-exp-rc")]
+            descriptor: 0,
+            #[cfg(feature = "mem-exp-rc")]
+            count_word: crate::object_heap::IMMORTAL | crate::object_heap::STRING_FLAG,
+            len: 0,
+        }
+    }
+}
+
 /// Encode a Rust string into the ABI layout: header followed by UTF-8 bytes.
 ///
-/// The returned buffer must be placed at an 8-byte-aligned address before a
-/// pointer to it is handed to Aster code.
+/// Under `mem-exp-rc` the encoded string is static: its count is
+/// `IMMORTAL | STRING_FLAG`. The returned buffer must be placed at an
+/// 8-byte-aligned address before a pointer to it is handed to Aster code.
 #[must_use]
 pub fn encode_str(value: &str) -> Vec<u8> {
-    let mut buffer = Vec::with_capacity(size_of::<usize>() + value.len());
-    buffer.extend_from_slice(&value.len().to_ne_bytes());
+    let mut buffer = vec![0_u8; ASTER_STR_PAYLOAD_OFFSET];
+    #[cfg(feature = "mem-exp-rc")]
+    buffer[ASTER_STR_COUNT_OFFSET..ASTER_STR_COUNT_OFFSET + 4].copy_from_slice(
+        &(crate::object_heap::IMMORTAL | crate::object_heap::STRING_FLAG).to_ne_bytes(),
+    );
+    buffer[ASTER_STR_LEN_OFFSET..ASTER_STR_LEN_OFFSET + size_of::<usize>()]
+        .copy_from_slice(&value.len().to_ne_bytes());
+    buffer.reserve(value.len());
     buffer.extend_from_slice(value.as_bytes());
     buffer
 }
@@ -1010,7 +1051,7 @@ pub extern "C" fn aster_rt_string_concat_array(
     context: *mut ExecutionContext,
     values: *mut crate::context::AsterArray,
 ) -> *const AsterStrHeader {
-    let empty = AsterStrHeader { len: 0 };
+    let empty = AsterStrHeader::empty_static();
     string_join_array(context, &raw const empty, values, false)
 }
 
@@ -1019,7 +1060,7 @@ pub extern "C" fn aster_rt_string_concat_array_temporary(
     context: *mut ExecutionContext,
     values: *mut crate::context::AsterArray,
 ) -> *const AsterStrHeader {
-    let empty = AsterStrHeader { len: 0 };
+    let empty = AsterStrHeader::empty_static();
     string_join_array(context, &raw const empty, values, true)
 }
 
@@ -1430,6 +1471,9 @@ fn string_split(
     if output.is_null() {
         return ptr::null_mut();
     }
+    // Every element is a fresh owned string stored below: the array owns them.
+    #[cfg(feature = "mem-exp-rc")]
+    ExecutionContext::set_string_array_descriptor(output);
     for (index, segment) in value.split(separator).enumerate() {
         let item = if temporary {
             context.allocate_temporary_string_parts(&[segment])
@@ -1951,13 +1995,14 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        AsterStrHeader, aster_rt_string_concat, aster_rt_string_contains,
-        aster_rt_string_ends_with, aster_rt_string_eq, aster_rt_string_from_double,
-        aster_rt_string_from_float, aster_rt_string_index_of, aster_rt_string_join,
-        aster_rt_string_join_temporary, aster_rt_string_length, aster_rt_string_replace,
-        aster_rt_string_split, aster_rt_string_starts_with, aster_rt_string_substring_from,
-        aster_rt_string_substring_range, aster_rt_string_substring_range_temporary,
-        aster_rt_string_trim, aster_rt_string_try_parse_bool, aster_rt_string_try_parse_byte,
+        ASTER_STR_LEN_OFFSET, ASTER_STR_PAYLOAD_OFFSET, AsterStrHeader, aster_rt_string_concat,
+        aster_rt_string_contains, aster_rt_string_ends_with, aster_rt_string_eq,
+        aster_rt_string_from_double, aster_rt_string_from_float, aster_rt_string_index_of,
+        aster_rt_string_join, aster_rt_string_join_temporary, aster_rt_string_length,
+        aster_rt_string_replace, aster_rt_string_split, aster_rt_string_starts_with,
+        aster_rt_string_substring_from, aster_rt_string_substring_range,
+        aster_rt_string_substring_range_temporary, aster_rt_string_trim,
+        aster_rt_string_try_parse_bool, aster_rt_string_try_parse_byte,
         aster_rt_string_try_parse_char, aster_rt_string_try_parse_double,
         aster_rt_string_try_parse_float, aster_rt_string_try_parse_int,
         aster_rt_string_try_parse_long, aster_rt_string_try_parse_short,
@@ -2015,8 +2060,11 @@ mod tests {
     #[test]
     fn encodes_length_and_payload() {
         let encoded = encode_str("héllo");
-        assert_eq!(encoded[..size_of::<usize>()], 6_usize.to_ne_bytes());
-        assert_eq!(&encoded[size_of::<usize>()..], "héllo".as_bytes());
+        assert_eq!(
+            encoded[ASTER_STR_LEN_OFFSET..ASTER_STR_LEN_OFFSET + size_of::<usize>()],
+            6_usize.to_ne_bytes()
+        );
+        assert_eq!(&encoded[ASTER_STR_PAYLOAD_OFFSET..], "héllo".as_bytes());
     }
 
     #[test]
@@ -3013,7 +3061,7 @@ mod tests {
         assert_eq!((stats.total_allocations, stats.string_allocations), (1, 1));
         assert_eq!(
             stats.requested_bytes,
-            u64::try_from(size_of::<usize>() + "item-alpha-beta".len()).unwrap()
+            u64::try_from(ASTER_STR_PAYLOAD_OFFSET + "item-alpha-beta".len()).unwrap()
         );
         let persistent_used = stats.used_bytes;
 
@@ -3034,11 +3082,19 @@ mod tests {
         let valid_left = aligned("left");
         let valid_right = aligned("right");
         // Header says 2 bytes; the payload 0xC3 0x28 is not valid UTF-8.
-        let mut invalid = vec![0_u64; 2];
-        invalid[0] = 2;
-        #[allow(unsafe_code)]
+        let mut invalid = vec![0_u64; ASTER_STR_PAYLOAD_OFFSET / 8 + 1];
+        #[allow(unsafe_code, clippy::cast_ptr_alignment)]
         unsafe {
-            let bytes = invalid.as_mut_ptr().cast::<u8>().add(size_of::<usize>());
+            invalid
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(ASTER_STR_LEN_OFFSET)
+                .cast::<usize>()
+                .write(2);
+            let bytes = invalid
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(ASTER_STR_PAYLOAD_OFFSET);
             bytes.write(0xC3);
             bytes.add(1).write(0x28);
         }
@@ -3147,7 +3203,7 @@ mod tests {
     /// or not.
     fn aligned_bytes(bytes: &[u8]) -> Vec<u64> {
         let mut buffer = vec![0_u64; (size_of::<AsterStrHeader>() + bytes.len()).div_ceil(8)];
-        buffer[0] = bytes.len() as u64;
+        buffer[ASTER_STR_LEN_OFFSET / 8] = bytes.len() as u64;
         // SAFETY: the buffer owns the header word plus `bytes.len()` payload
         // bytes; only the payload region after the header is written.
         #[allow(unsafe_code)]

@@ -201,7 +201,10 @@ impl Layouts {
     #[cfg(feature = "mem-exp-c5")]
     pub(super) fn type_has_references(&self, type_: &mir::Type) -> bool {
         match type_ {
-            mir::Type::Class(_) | mir::Type::Interface(_) | mir::Type::Array(_) => true,
+            mir::Type::Class(_)
+            | mir::Type::Interface(_)
+            | mir::Type::Array(_)
+            | mir::Type::String => true,
             mir::Type::User(symbol) => self.structs.get(symbol).is_some_and(|definition| {
                 definition
                     .fields
@@ -250,7 +253,7 @@ impl Layouts {
     }
 
     /// Leaf offsets of one value of `type_` placed at `offset`: a class,
-    /// interface or array is one leaf (its object word), an inline struct contributes
+    /// interface, array or string is one leaf (its object word), an inline struct contributes
     /// its fields' leaves, everything else has none.
     #[cfg(feature = "mem-exp-c5")]
     pub(super) fn collect_type_offsets(
@@ -262,7 +265,10 @@ impl Layouts {
     ) -> Result<(), BackendError> {
         match type_ {
             mir::Type::Class(symbol) if native.contains(symbol) => {}
-            mir::Type::Class(_) | mir::Type::Interface(_) | mir::Type::Array(_) => {
+            mir::Type::Class(_)
+            | mir::Type::Interface(_)
+            | mir::Type::Array(_)
+            | mir::Type::String => {
                 offsets.push(offset);
             }
             mir::Type::User(inner) if self.structs.contains_key(inner) => {

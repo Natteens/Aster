@@ -732,12 +732,39 @@ C6; executed count operations C6/C5 = 2,760,271 / 5,579,385 = 49.5% (soft gate �
 Known leaks by design in this increment: arrays passed to intrinsics (consumed operand), Temporary
 arrays' elements, dictionary contents, enum payloads, a dropped list's elements.
 
+### T-MEM-EXP-1 stage C, counted strings — implemented (2026-11-11)
+
+Contract: §9 of [08-mem-exp-1-c5-design.md](08-mem-exp-1-c5-design.md). Under `mem-exp-rc` the
+string header is `{descriptor @0 (null), count @8 with STRING_FLAG, len @16, payload @24}`;
+`ExecutionContext::allocate_string_storage` is the only runtime construction path (count 1 for a
+Persistent size-class block; `IMMORTAL` for Temporary, constant, and above 2,048 bytes). No runtime
+entry point returns an existing string, so every string result is owned. Pass and validator:
+`String` is a leaf, string intrinsic results and `StringBuilderToString` are owned, intrinsic
+arguments are borrowed except stored operands (`ListInsert` element, `DictionaryGetOrAdd` key and
+value, `AsyncStoreSlot` value), and `DictionaryGetOr`/`DictionaryGetOrAdd`/`AsyncLoadSlot`/
+`AsyncAwaitResult`/`TaskWait` results are borrowed (this also corrects the array increment, which
+treated a `DictionaryGetOr` array result as owned). The validator no longer reports a false U2 for
+a borrowed intrinsic result retained right after the call. Two tests that pinned the 8-byte string
+header (`string_methods`, `jit::static_string_concat_chain_allocates_once`) now derive sizes from
+`ASTER_STR_PAYLOAD_OFFSET`.
+
+Gates: `aster-codegen-cranelift --all-targets` C0 1,443 and C4 1,443 passed; C5 and C6 1,442
+passed, 0 failed, 24 ignored; `aster-runtime` 337 (default) and 371 (`mem-exp-rc`, incl. 9
+`string_rc`); `aster-mir` 82; `aster-compiler` 707; clippy and rustfmt clean.
+
+Measured (C6): `longrun_request` releases and reuses 40,000 blocks at N (strings and requests), but
+used bytes still grow 1,760,224 → 17,600,224: the `List<int>` headers and buffers of each request
+are not counted. Checksums identical in C5 and C6; executed count operations C6/C5 = 2,880,271 /
+5,659,385 = 50.9% (**soft elision gate ≤ 50% now missed** by 0.9 points, because strings added
+operations that E1 to E3 do not remove). The string header grows from 8 to 24 bytes.
+
 Not done, so **no PASS for MEM-001 to MEM-003**:
 
-1. Counted strings and dictionary glue for `longrun_request` and `cache_churn`.
+1. Counted list and dictionary headers (header count, buffer and element release on drop) for
+   `longrun_request` and `cache_churn`.
 2. Enum payload drop glue and closure environments (enums currently leak their references).
 3. Region reclamation together with counting (H2 pins); C5 and C6 currently lose it.
 4. Class B timing protocol (release builds, interleaved rounds) and the §4.C thresholds.
 
-Next action: item 1, counted strings (string header count word, intrinsic results owned), then
-dictionary glue.
+Next action: item 1, counted `List<T>` headers (uniform header, buffer release, element release on
+drop), then dictionaries; then improve elision so the soft gate is met again.

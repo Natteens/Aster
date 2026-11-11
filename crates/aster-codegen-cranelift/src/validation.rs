@@ -560,13 +560,16 @@ fn validate_instruction(
             if cfg!(feature = "mem-exp-c5")
                 && matches!(
                     value.type_,
-                    mir::Type::Class(_) | mir::Type::Interface(_) | mir::Type::Array(_)
+                    mir::Type::Class(_)
+                        | mir::Type::Interface(_)
+                        | mir::Type::Array(_)
+                        | mir::Type::String
                 )
             {
                 Ok(())
             } else {
                 Err(BackendError::new(format!(
-                    "function `{function_name}` contains a reference-count instruction that is not a class or interface operand under MEM-EXP-1 C5"
+                    "function `{function_name}` contains a reference-count instruction that is not a class, interface, array or string operand under MEM-EXP-1 C5"
                 )))
             }
         }

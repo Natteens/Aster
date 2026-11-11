@@ -166,8 +166,9 @@ impl Frame<'_> {
         while let Some((path, current)) = pending.pop() {
             match current {
                 Type::Class(symbol) if self.native.contains(&symbol) => {}
-                // An array is one leaf whatever its element type.
-                Type::Class(_) | Type::Interface(_) | Type::Array(_) => {
+                // An array is one leaf whatever its element type; so is a string
+                // (constants are immortal and carry no value here).
+                Type::Class(_) | Type::Interface(_) | Type::Array(_) | Type::String => {
                     found.push((path, current));
                 }
                 Type::User(symbol) => {
@@ -536,6 +537,10 @@ impl<'a> Block<'a> {
             .collect();
         if clobber {
             self.invalidate();
+            // Results the call itself produced are valid after it.
+            for write in &writes {
+                self.values[write.value].epoch = self.epoch;
+            }
         }
         for (write, old) in writes.into_iter().zip(olds) {
             match self.frame.home(&write.place) {
@@ -706,16 +711,36 @@ impl<'a> Block<'a> {
                 destination,
                 arguments,
                 return_type,
-                ..
+                intrinsic,
             } => {
-                let consumed: Vec<&Operand> = arguments.iter().collect();
-                // An array result is a fresh object: one count, owned.
-                let product = if matches!(return_type, Type::Array(_)) {
+                // Arguments are borrowed (valid at the call, U2) except the
+                // operands the runtime stores.
+                let mut plain: Vec<&Operand> = Vec::new();
+                let mut consumed: Vec<&Operand> = Vec::new();
+                for (position, argument) in arguments.iter().enumerate() {
+                    if intrinsic_keeps(intrinsic, position) {
+                        consumed.push(argument);
+                    } else {
+                        plain.push(argument);
+                    }
+                }
+                // An array or string result is fresh: one count, owned, unless
+                // the intrinsic hands back a value that is already stored.
+                let fresh = matches!(return_type, Type::Array(_) | Type::String)
+                    && !intrinsic_returns_stored(intrinsic);
+                let product = if fresh {
                     Product::Owned
                 } else {
                     Product::Borrowed
                 };
-                self.effect(&[], &consumed, destination.as_ref(), product, true);
+                self.effect(&plain, &consumed, destination.as_ref(), product, true);
+            }
+            I::StringBuilderToString {
+                destination,
+                builder,
+                ..
+            } => {
+                self.effect(&[builder], &[], Some(destination), Product::Owned, false);
             }
             I::AllocateArray {
                 destination,
@@ -877,6 +902,32 @@ impl<'a> Block<'a> {
         }
         self.balance(&holders);
     }
+}
+
+/// Whether the runtime stores the argument at `position` of `intrinsic`
+/// (`ListInsert` element, `DictionaryGetOrAdd` key and value,
+/// `AsyncStoreSlot` value): that operand is consumed.
+fn intrinsic_keeps(intrinsic: &mir::Intrinsic, position: usize) -> bool {
+    use mir::Intrinsic as N;
+    match intrinsic {
+        N::ListInsert | N::AsyncStoreSlot => position == 2,
+        N::DictionaryGetOrAdd => matches!(position, 1 | 2),
+        _ => false,
+    }
+}
+
+/// Whether the intrinsic's result is a value already held elsewhere, so the
+/// destination must take its own count even for strings and arrays.
+fn intrinsic_returns_stored(intrinsic: &mir::Intrinsic) -> bool {
+    use mir::Intrinsic as N;
+    matches!(
+        intrinsic,
+        N::DictionaryGetOr
+            | N::DictionaryGetOrAdd
+            | N::AsyncLoadSlot
+            | N::AsyncAwaitResult
+            | N::TaskWait
+    )
 }
 
 fn successors(terminator: &mir::Terminator) -> Vec<BasicBlockId> {
@@ -1823,5 +1874,222 @@ mod tests {
                 "{producer:?} must not be retained after the call"
             );
         }
+    }
+
+    fn string_local(id: u32) -> mir::Local {
+        mir::Local {
+            id: LocalId(id),
+            symbol: None,
+            name: format!("s{id}"),
+            type_: Type::String,
+            mutable: true,
+            temporary: false,
+        }
+    }
+
+    fn string_operand(place: Place) -> Operand {
+        Operand {
+            type_: Type::String,
+            kind: OperandKind::Copy(place),
+        }
+    }
+
+    fn string_field(object: u32, field: u32) -> Place {
+        Place::ObjectField {
+            object: Box::new(operand(lp(object))),
+            field: SymbolId(field),
+        }
+    }
+
+    fn string_obligations(
+        parameters: Vec<mir::Local>,
+        locals: Vec<mir::Local>,
+        instructions: Vec<Instruction>,
+    ) -> Vec<&'static str> {
+        let field = |symbol: u32, type_: Type| mir::FieldDefinition {
+            symbol: SymbolId(symbol),
+            name: format!("f{symbol}"),
+            type_,
+        };
+        let module = Module {
+            structs: Vec::new(),
+            classes: vec![mir::ClassDefinition {
+                symbol: SymbolId(10),
+                name: "C".into(),
+                fields: vec![
+                    field(11, class()),
+                    field(12, Type::String),
+                    field(13, Type::String),
+                ],
+            }],
+            interfaces: Vec::new(),
+            enums: Vec::new(),
+            interface_implementations: Vec::new(),
+            foreign_functions: Vec::new(),
+            functions: vec![Function {
+                constructor: false,
+                symbol: SymbolId(1),
+                owner: None,
+                name: "f".into(),
+                visibility: Visibility::Public,
+                parameters,
+                locals,
+                return_type: Type::Void,
+                entry: BasicBlockId(0),
+                blocks: vec![BasicBlock {
+                    id: BasicBlockId(0),
+                    instructions,
+                    terminator: Terminator::Return(None),
+                }],
+                temporary_subregion_candidates: Vec::new(),
+            }],
+        };
+        match validate_ownership(&module) {
+            Ok(()) => Vec::new(),
+            Err(findings) => findings.iter().map(|finding| finding.obligation).collect(),
+        }
+    }
+
+    fn concat(destination: u32, argument: u32) -> Instruction {
+        Instruction::CallIntrinsic {
+            destination: Some(lp(destination)),
+            intrinsic: mir::Intrinsic::StringConcat,
+            arguments: vec![string_operand(lp(argument)), string_operand(lp(argument))],
+            return_type: Type::String,
+        }
+    }
+
+    fn string_retain(id: u32) -> Instruction {
+        Instruction::Retain {
+            value: string_operand(lp(id)),
+        }
+    }
+
+    fn string_release(id: u32) -> Instruction {
+        Instruction::Release {
+            value: string_operand(lp(id)),
+        }
+    }
+
+    #[test]
+    fn string_intrinsic_result_is_owned_and_arguments_are_borrowed() {
+        let found = string_obligations(
+            vec![string_local(0)],
+            vec![string_local(1)],
+            vec![
+                string_retain(0),
+                concat(1, 0),
+                string_release(1),
+                string_release(0),
+            ],
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn string_builder_to_string_result_is_owned() {
+        let builder = Type::Class(SymbolId(40));
+        let found = string_obligations(
+            Vec::new(),
+            vec![
+                mir::Local {
+                    id: LocalId(0),
+                    symbol: None,
+                    name: "b".into(),
+                    type_: builder.clone(),
+                    mutable: true,
+                    temporary: false,
+                },
+                string_local(1),
+            ],
+            vec![
+                Instruction::StringBuilderToString {
+                    destination: lp(1),
+                    builder: Operand {
+                        type_: builder,
+                        kind: OperandKind::Copy(lp(0)),
+                    },
+                    class: SymbolId(40),
+                    region: AllocationRegion::Persistent,
+                },
+                string_release(1),
+            ],
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn retain_after_an_owned_string_intrinsic_result_leaks_u1() {
+        let found = string_obligations(
+            vec![string_local(0)],
+            vec![string_local(1)],
+            vec![
+                string_retain(0),
+                concat(1, 0),
+                string_retain(1),
+                string_release(1),
+                string_release(0),
+            ],
+        );
+        assert!(found.contains(&"U1"), "{found:?}");
+    }
+
+    #[test]
+    fn string_read_from_a_class_field_stored_without_retain_is_u1() {
+        let found = string_obligations(
+            vec![local(0, false)],
+            Vec::new(),
+            vec![
+                retain(lp(0)),
+                Instruction::Assign {
+                    target: string_field(0, 12),
+                    value: Rvalue {
+                        type_: Type::String,
+                        kind: RvalueKind::Use(string_operand(string_field(0, 13))),
+                    },
+                },
+                release(lp(0)),
+            ],
+        );
+        assert!(found.contains(&"U1"), "{found:?}");
+    }
+
+    #[test]
+    fn dictionary_get_or_string_result_is_borrowed() {
+        let dictionary = Type::Dictionary(Box::new(Type::String), Box::new(Type::String));
+        let get_or = || Instruction::CallIntrinsic {
+            destination: Some(lp(1)),
+            intrinsic: mir::Intrinsic::DictionaryGetOr,
+            arguments: vec![
+                Operand {
+                    type_: dictionary.clone(),
+                    kind: OperandKind::Copy(lp(0)),
+                },
+                string_operand(lp(2)),
+                string_operand(lp(2)),
+            ],
+            return_type: Type::String,
+        };
+        let dictionary_local = mir::Local {
+            id: LocalId(0),
+            symbol: None,
+            name: "d".into(),
+            type_: dictionary.clone(),
+            mutable: true,
+            temporary: false,
+        };
+        let locals = || vec![string_local(1), string_local(2)];
+        let retained = string_obligations(
+            vec![dictionary_local.clone()],
+            locals(),
+            vec![get_or(), string_retain(1), string_release(1)],
+        );
+        assert!(retained.is_empty(), "{retained:?}");
+        let missing = string_obligations(
+            vec![dictionary_local],
+            locals(),
+            vec![get_or(), string_release(1)],
+        );
+        assert!(missing.contains(&"U1"), "{missing:?}");
     }
 }

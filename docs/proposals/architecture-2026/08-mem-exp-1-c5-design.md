@@ -206,3 +206,29 @@ codegen keeps reading `length`/`data` through `ASTER_ARRAY_*_OFFSET`, so it foll
 - **Validator.** `Index` places are owning heap places (cache, adoption, U2 window); array reads are
   borrowed, no longer guaranteed. Array element stores invalidate. E3 treats `Index` stores as
   releasing (they release the old element).
+
+## 9. Counted strings
+
+Strings are not worker-transferable (`Primitive::is_worker_transferable` requires a bit width), so
+H4 holds and their counts stay single-domain.
+
+- **Header.** Under `mem-exp-rc`, `AsterStrHeader` gets the uniform prefix: descriptor word @0
+  (always null for strings), count word @8 with a `STRING_FLAG` reserved bit, then `len`, then the
+  UTF-8 payload. Every reader goes through the struct or exported offset constants; `encode_str`
+  and codegen string constants emit the same layout with count `IMMORTAL | STRING_FLAG`.
+- **Every string header is created through one allocation path** that writes the count: 1 for a
+  Persistent string whose block is served by a size class, `IMMORTAL` for Temporary strings and
+  static or constant strings. Any other construction site is a defect.
+- **Release** of a `STRING_FLAG` object returns its block to the heap (no children).
+- **Owned results.** Every runtime entry point that returns a string returns it owned: a fresh
+  string has count 1; an entry point that returns one of its arguments (or another existing
+  string) retains it first.
+- **Pass and validator.** `Type::String` is a leaf. Owned sources add `StringBuilderToString` and
+  every `CallIntrinsic` whose result type is `String` (as for arrays). `CallIntrinsic` arguments are
+  **borrowed** (no retain) except for intrinsics that store an argument: `ListInsert` (element),
+  `DictionaryGetOrAdd` (key and value), `AsyncStoreSlot` (value). The runtime never keeps a
+  borrowed argument past the call and runs no user code; list and dictionary glue never releases an
+  argument of the same call. String constants are immortal: a constant operand needs no count.
+- **Element descriptors.** String leaves appear in class, struct, list-element, and array-element
+  descriptors. Arrays the runtime builds with string elements (split, command-line arguments) get a
+  runtime-owned string element descriptor.

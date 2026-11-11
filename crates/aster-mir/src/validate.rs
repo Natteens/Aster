@@ -532,7 +532,10 @@ fn validate_typed_instruction(
             operand(value)?;
             if matches!(
                 value.type_,
-                mir::Type::Class(_) | mir::Type::Interface(_) | mir::Type::Array(_)
+                mir::Type::Class(_)
+                    | mir::Type::Interface(_)
+                    | mir::Type::Array(_)
+                    | mir::Type::String
             ) {
                 Ok(())
             } else {

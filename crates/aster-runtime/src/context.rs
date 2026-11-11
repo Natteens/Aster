@@ -4311,11 +4311,39 @@ impl ExecutionContext {
             self.fail("temporary string allocation requires an active temporary scope");
             return ptr::null_mut();
         }
-        let Some(total_bytes) = size_of::<usize>().checked_add(payload_bytes) else {
+        let Some(total_bytes) = size_of::<AsterStrHeader>().checked_add(payload_bytes) else {
             self.fail("string allocation exceeds the addressable range");
             return ptr::null_mut();
         };
 
+        // MEM-EXP-1 stage C (design section 9): the one construction path of
+        // a counted string. A Persistent string served by a size class starts
+        // at count 1; a Temporary string, or one above the largest size class
+        // (never heap-served, so never returned), is IMMORTAL.
+        #[cfg(feature = "mem-exp-rc")]
+        let (pointer, count_word) = if !temporary
+            && u32::try_from(total_bytes)
+                .ok()
+                .and_then(crate::object_heap::ObjectHeap::class_of)
+                .is_some()
+        {
+            let Some(block) = self.allocate_heap_block(total_bytes) else {
+                return ptr::null_mut();
+            };
+            self.sync_heap_stats();
+            (block, 1 | crate::object_heap::STRING_FLAG)
+        } else {
+            let Some(pointer) =
+                self.allocate_in_region(total_bytes, align_of::<AsterStrHeader>(), temporary)
+            else {
+                return ptr::null_mut();
+            };
+            (
+                pointer,
+                crate::object_heap::IMMORTAL | crate::object_heap::STRING_FLAG,
+            )
+        };
+        #[cfg(not(feature = "mem-exp-rc"))]
         let Some(pointer) =
             self.allocate_in_region(total_bytes, align_of::<AsterStrHeader>(), temporary)
         else {
@@ -4323,16 +4351,40 @@ impl ExecutionContext {
         };
 
         // SAFETY: `pointer` points to `total_bytes` of zeroed, correctly aligned
-        // memory owned by the selected arena. The caller initializes exactly the
-        // following `payload_bytes` payload bytes before publishing this string.
-        #[allow(unsafe_code)]
-        let bytes = unsafe { std::slice::from_raw_parts_mut(pointer, total_bytes) };
-        bytes[..size_of::<usize>()].copy_from_slice(&payload_bytes.to_ne_bytes());
+        // memory owned by the selected arena or heap. The caller initializes
+        // exactly the following `payload_bytes` payload bytes before publishing
+        // this string.
+        #[allow(unsafe_code, clippy::cast_ptr_alignment)]
+        unsafe {
+            pointer
+                .add(crate::string::ASTER_STR_LEN_OFFSET)
+                .cast::<usize>()
+                .write(payload_bytes);
+            #[cfg(feature = "mem-exp-rc")]
+            pointer
+                .add(crate::string::ASTER_STR_COUNT_OFFSET)
+                .cast::<u32>()
+                .write(count_word);
+        }
         self.record_allocation(AllocationCategory::String, total_bytes);
         // The arena allocates with `align_of::<AsterStrHeader>()`, so the
         // pointer is correctly aligned for this cast.
         #[allow(clippy::cast_ptr_alignment)]
         pointer.cast::<AsterStrHeader>()
+    }
+
+    /// Record the runtime-owned string element descriptor on an array of
+    /// strings the runtime just filled with owned (count 1) strings.
+    #[cfg(feature = "mem-exp-rc")]
+    pub(crate) fn set_string_array_descriptor(array: *mut AsterArray) {
+        if array.is_null() {
+            return;
+        }
+        // SAFETY: `array` is a header this runtime just allocated.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*array).descriptor = &raw const crate::object_heap::STRING_ELEMENT_DESCRIPTOR;
+        }
     }
 
     fn allocate_string_parts_in_region(
@@ -9474,7 +9526,11 @@ mod tests {
         local.string_builder_append(builder, value);
         assert!(!local.string_builder_to_string(builder, true).is_null());
         aster_rt_temporary_scope_leave(&raw mut local);
-        assert_eq!(local.memory_stats().used_bytes, 13);
+        // Under mem-exp-rc the persistent string is a 32-byte size-class block.
+        assert_eq!(
+            local.memory_stats().used_bytes,
+            if cfg!(feature = "mem-exp-rc") { 32 } else { 13 }
+        );
     }
 
     #[test]

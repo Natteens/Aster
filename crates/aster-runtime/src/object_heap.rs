@@ -35,6 +35,22 @@ pub const IMMORTAL: u32 = COUNT_MASK;
 /// Kind flag in the count word's reserved high bits: the object is an array
 /// header whose descriptor word names the element descriptor (MEM-EXP-1 U8).
 pub const ARRAY_FLAG: u32 = 1 << 29;
+/// Kind flag in the count word's reserved high bits: the object is an ABI
+/// string (no children; its block size follows from its length). Distinct from
+/// [`ARRAY_FLAG`] (MEM-EXP-1 U8, design section 9).
+pub const STRING_FLAG: u32 = 1 << 30;
+
+#[cfg(feature = "mem-exp-rc")]
+static STRING_LEAF_OFFSETS: [u32; 1] = [0];
+
+/// Runtime-owned element descriptor for arrays of strings built by the runtime
+/// (split, directory listings): elements are 8 bytes with one leaf at offset 0.
+#[cfg(feature = "mem-exp-rc")]
+pub static STRING_ELEMENT_DESCRIPTOR: ObjectDescriptor = ObjectDescriptor {
+    size: 8,
+    reference_count: 1,
+    reference_offsets: STRING_LEAF_OFFSETS.as_ptr(),
+};
 
 #[cfg(debug_assertions)]
 const POISON: u8 = 0xDB;
@@ -75,6 +91,9 @@ pub struct ObjectHeapStats {
     /// heap, they stay reserved until the context drops.
     #[cfg(feature = "mem-exp-rc")]
     pub unreturned_array_blocks: u64,
+    /// Counted strings whose block went back to the heap.
+    #[cfg(feature = "mem-exp-rc")]
+    pub released_strings: u64,
 }
 
 #[derive(Default)]
@@ -205,6 +224,26 @@ pub(crate) unsafe fn release(heap: &mut ObjectHeap, object: *mut u8) -> u64 {
         if unsafe { count_word(current).read() } & ARRAY_FLAG != 0 {
             // SAFETY: a flagged object is an array header of this heap.
             unsafe { release_array(heap, current, &mut work) };
+            released += 1;
+            continue;
+        }
+        #[cfg(feature = "mem-exp-rc")]
+        // SAFETY: as above.
+        if unsafe { count_word(current).read() } & STRING_FLAG != 0 {
+            // SAFETY: a flagged object is a counted string header of this heap.
+            let bytes = unsafe {
+                crate::string::ASTER_STR_PAYLOAD_OFFSET
+                    + current
+                        .add(crate::string::ASTER_STR_LEN_OFFSET)
+                        .cast::<usize>()
+                        .read()
+            };
+            let class = u32::try_from(bytes)
+                .ok()
+                .and_then(ObjectHeap::class_of)
+                .expect("counted strings are allocated from a size class");
+            heap.release(current, class);
+            heap.stats.released_strings += 1;
             released += 1;
             continue;
         }

@@ -2288,7 +2288,11 @@ fn static_string_concat_chain_allocates_once() {
     assert_eq!(value, ExecutionValue::String("abcde".into()));
     assert_eq!(stats.string_allocations, 1);
     assert_eq!(stats.total_allocations, 1);
-    assert_eq!(stats.requested_bytes, 13);
+    // Header plus the five-byte payload (the header is wider under mem-exp-rc).
+    assert_eq!(
+        stats.requested_bytes,
+        u64::try_from(aster_runtime::ASTER_STR_PAYLOAD_OFFSET + 5).unwrap()
+    );
 }
 
 #[test]

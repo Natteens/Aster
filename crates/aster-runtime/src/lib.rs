@@ -72,4 +72,8 @@ pub use log::LogLevel;
 pub use math::{aster_rt_random_entropy_seed, aster_rt_random_mix};
 pub use memory_governor::{MemoryGovernor, MemoryGovernorTelemetry};
 pub use registry::{RuntimeFunction, RuntimeSignature, RuntimeType, runtime_functions};
-pub use string::{AsterStrHeader, decode_str, encode_str};
+#[cfg(feature = "mem-exp-rc")]
+pub use string::ASTER_STR_COUNT_OFFSET;
+pub use string::{
+    ASTER_STR_LEN_OFFSET, ASTER_STR_PAYLOAD_OFFSET, AsterStrHeader, decode_str, encode_str,
+};
