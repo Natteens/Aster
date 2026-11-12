@@ -1,4 +1,5 @@
 mod doctor;
+mod fmt;
 mod new_project;
 mod stdlib_discovery;
 mod watch;
@@ -53,6 +54,7 @@ fn run(mut arguments: impl Iterator<Item = String>) -> CliResult {
         Some("test") => run_test_command(&mut arguments),
         Some("run") => run_execute_command(&mut arguments),
         Some("watch") => run_watch_command(&mut arguments),
+        Some("fmt") => fmt::run(&mut arguments),
         Some("--version" | "-V") => {
             if let Some(argument) = arguments.next() {
                 return Err(usage_error(
@@ -429,7 +431,7 @@ fn reject_extra_argument(arguments: &mut impl Iterator<Item = String>, usage: &s
     Ok(())
 }
 
-fn usage_error(message: impl std::fmt::Display, usage: &str) -> CliError {
+pub(crate) fn usage_error(message: impl std::fmt::Display, usage: &str) -> CliError {
     eprintln!("error: {message}\nusage: {usage}");
     CliError::Usage
 }
@@ -676,11 +678,11 @@ fn print_memory_stats(stats: &aster_codegen_cranelift::MemoryStats) {
 
 fn print_help() {
     println!(
-        "Aster compiler\n\nUsage:\n  aster <command> [arguments]\n\nCommands:\n  new <NAME>       Create a new ASTER project\n  fetch            Fetch and lock Git dependencies\n  doctor           Diagnose the ASTER installation and environment\n  check [FILE]     Check a project or source file\n  run [FILE]       Run a project or source file\n  test             Run root-package tests\n  watch <FILE>     Watch and rerun a source file\n  dump-hir [FILE]  Print HIR\n  dump-mir [FILE]  Print MIR\n\nOptions:\n  -h, --help\n  -V, --version"
+        "Aster compiler\n\nUsage:\n  aster <command> [arguments]\n\nCommands:\n  new <NAME>       Create a new ASTER project\n  fetch            Fetch and lock Git dependencies\n  doctor           Diagnose the ASTER installation and environment\n  check [FILE]     Check a project or source file\n  run [FILE]       Run a project or source file\n  test             Run root-package tests\n  watch <FILE>     Watch and rerun a source file\n  fmt [FILE...]    Format source files (--check to verify)\n  dump-hir [FILE]  Print HIR\n  dump-mir [FILE]  Print MIR\n\nOptions:\n  -h, --help\n  -V, --version"
     );
 }
 
-fn print_command_help(command: &str) {
+pub(crate) fn print_command_help(command: &str) {
     let (usage, description) = match command {
         "new" => (
             "aster new <NAME>",
@@ -713,6 +715,10 @@ fn print_command_help(command: &str) {
         "watch" => (
             "aster watch <FILE> [--function <NAME>]",
             "Recompile and rerun when a loaded project file changes.",
+        ),
+        "fmt" => (
+            "aster fmt [--check] [FILE...]",
+            "Format Aster sources in place with the one canonical style; --check lists files that would change and exits 1.",
         ),
         _ => unreachable!("help requested for a known command"),
     };

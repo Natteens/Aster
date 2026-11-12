@@ -1,6 +1,7 @@
 //! Syntax front-end for Aster.
 
 mod ast;
+pub mod format;
 mod lexer;
 mod parser;
 mod token;

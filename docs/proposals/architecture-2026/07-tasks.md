@@ -104,7 +104,7 @@ example, reference page. Gate: workspace tests; class A invariants unchanged or 
 | ID | Objective | Decision | Depends on | Risk | Status |
 | --- | --- | --- | --- | --- | --- |
 | T-ARCH-7b | Semantic analysis after syntax errors | ARCH-007 | T-ARCH-7 | low | todo |
-| T-TOOL-1 | Formatter | TOOL-001 | — | low | todo |
+| T-TOOL-1 | Formatter | TOOL-001 | — | low | **done 2026-11-12**: token-based `aster_syntax::format` (comments recovered from token gaps, re-lex token equality safeguard), `aster fmt [--check]`; corpus test over 104 repository sources (idempotent, tokens and comments unchanged); workspace 3,067 passed |
 | T-ARCH-6a | Declaration fingerprints; front-end reuse | ARCH-006 | T-ARCH-1 | high | todo |
 | T-ARCH-6b | Machine-code reuse in the JIT | ARCH-006 | T-ARCH-6a | high | todo |
 | T-TOOL-2 | Language server | TOOL-002 | T-ARCH-6a, T-ARCH-7b | medium | todo |

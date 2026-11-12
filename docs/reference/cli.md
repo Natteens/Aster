@@ -11,6 +11,7 @@ and prints the compiler's typed intermediate representations.
 | `aster run [FILE]` | Compile and run an application. |
 | `aster test` | Compile and run root-package tests. |
 | `aster watch <FILE>` | Recompile and rerun when a loaded project file changes. |
+| `aster fmt [--check] [FILE...]` | Format sources in place with the single canonical style. |
 | `aster dump-hir [FILE]` | Print typed HIR after successful validation. |
 | `aster dump-mir [FILE]` | Print control-flow MIR after successful validation. |
 | `aster --help` | Print the command summary. |
@@ -41,6 +42,47 @@ For an explicit source, the nearest `Aster.toml` in that source file's ancestors
 project root and application entry. Without a manifest, `run` finds one conventional public static
 `Main` in the root namespace. `Main` is parameterless and returns `void` or `int`. See
 [application entry](application-entry.md) for the complete manifest and entry rules.
+
+## Formatting
+
+`aster fmt` rewrites `.aster` files in place. There is one style and no options.
+
+```console
+aster fmt                     # every .aster file of the nearest project
+aster fmt app/main.aster      # explicit files; directories are searched recursively
+aster fmt --check             # list files that would change, change nothing
+```
+
+`--check` prints each file that is not already formatted to stdout and exits `1`; otherwise it
+exits `0`. Without `--check`, the command prints `formatted <path>` for each rewritten file. A
+source with lexical errors is reported on stderr, left untouched, and makes the command exit `1`.
+Directories named `target` and hidden directories are skipped. A flag other than `--check` exits
+`2`.
+
+The formatter is token based. It only rewrites whitespace between tokens, so the token stream is
+never changed, and every comment is preserved. Formatting is idempotent. The result is re-lexed and
+compared with the original tokens before a file is written.
+
+### Style
+
+- Four-space indentation, no tabs, no trailing whitespace, one final newline. CRLF input keeps CRLF.
+- Allman braces: the `{` of a multi-line block, type, namespace, property accessor or `else` is on
+  its own line, and `else` starts a line after a multi-line `}`. A block written on one line
+  (`if (x) { return 1; }`), an object initializer (`Pair<int, string> { First: 1, Second: "a" }`) and
+  a single-line accessor (`get { return x; }`) keep their line. An empty block is `{}`.
+- `case` and `default` labels are indented inside the `switch` braces; their statements are indented
+  one level further. A statement continued on a later line is indented one extra level
+  (`+ rest` lines, a braceless `if` body).
+- Single spaces around binary operators, `=`, `=>` and the ternary `?` and `:`; one space after
+  `,` and `;`; none inside `()` and `[]`. One space after control keywords (`if (`, `while (`),
+  none before call parentheses, indexers or generic arguments (`List<int>`, `Foo(x)`, `v[0]`).
+  No space after a cast (`(long)x`), a prefix operator (`-x`, `!x`, `++i`) or before a postfix
+  one (`i++`, `Parse(text)?`). `class A : B` and `where T : Constraint` are spaced; named
+  initializer fields and arguments are `Name: value`.
+- Existing line breaks are kept. Runs of blank lines collapse to one, and blank lines directly
+  inside a brace pair or at the start and end of the file are removed. Interpolated strings and
+  comments are never altered; own-line comments are re-indented to the following code and a trailing
+  comment is separated from the code by one space.
 
 ## Development options
 
