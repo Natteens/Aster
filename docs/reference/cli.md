@@ -8,7 +8,7 @@ and prints the compiler's typed intermediate representations.
 | `aster new <NAME>` | Create a project in a new child directory. |
 | `aster doctor` | Diagnose the local toolchain and current project without modifying them. |
 | `aster check [FILE]` | Validate a project or source file without executing it. |
-| `aster run [FILE]` | Compile and run an application. |
+| `aster run [FILE] [-- ARGS...]` | Compile and run an application; `ARGS` go to `Main(string[] args)`. |
 | `aster test` | Compile and run root-package tests. |
 | `aster watch <FILE>` | Recompile and rerun when a loaded project file changes. |
 | `aster fmt [--check] [FILE...]` | Format sources in place with the single canonical style. |
@@ -40,8 +40,27 @@ aster run examples/hello.aster
 
 For an explicit source, the nearest `Aster.toml` in that source file's ancestors establishes the
 project root and application entry. Without a manifest, `run` finds one conventional public static
-`Main` in the root namespace. `Main` is parameterless and returns `void` or `int`. See
+`Main` in the root namespace. `Main` returns `void` or `int` and takes no parameters or one `string[] args`. See
 [application entry](application-entry.md) for the complete manifest and entry rules.
+
+## Running programs
+
+`aster run` starts the application entry. Arguments for the program go after a `--` separator and
+reach `Main(string[] args)` without the program name:
+
+```console
+aster run examples/greet.aster -- Ada Lovelace
+aster run -- Ada Lovelace              # nearest project, same arguments
+```
+
+Everything after the first `--` belongs to the program. Options of `run` itself must come before
+it, and a stray word without the separator is a usage error (exit `2`). Invalid Unicode in an
+argument is replaced with U+FFFD.
+
+The process exit status of `aster run` is the one of the program: the `int` returned by `Main`,
+passed to the operating system unchanged (Windows observes the whole value, POSIX the low 8 bits),
+or `0` for a `void` `Main`. The result is no longer printed. A compile, entry-selection or runtime
+failure still exits `1`.
 
 ## Formatting
 
@@ -94,7 +113,8 @@ aster run examples/expressions.aster --function Run
 
 The selected function takes precedence over the manifest and conventional `Main`, including when
 the relevant manifest is invalid. This option is intended for compiler development and focused
-examples. `--memory-stats` prints execution-context allocation metrics after a successful run.
+examples. Because it is not an application entry, it keeps printing a non-`void` result and exits
+`0`. `--memory-stats` prints execution-context allocation metrics after a successful run.
 
 `watch` accepts the same `--function <NAME>` selection but always requires a source file:
 
@@ -107,13 +127,17 @@ to stderr and the watcher keeps observing for a later valid edit. Press `Ctrl+C`
 
 ## Output and exit codes
 
-ASTER uses three process exit codes:
+Every command except `run` uses three process exit codes:
 
 | Code | Meaning |
 | --- | --- |
 | `0` | The command completed successfully. |
 | `1` | Valid command arguments led to an operational, compilation, or runtime failure. |
 | `2` | The command or its arguments were invalid. |
+
+`aster run` ends with the exit status of the program when it ran to completion (see
+[Running programs](#running-programs)), so `0`, `1` and other values then belong to the program;
+failures before or during execution use the codes above.
 
 Normal output, including program output and HIR/MIR dumps, goes to stdout. Usage, filesystem,
 compiler, runtime, manifest, and standard-library errors go to stderr. A failed dump does not emit

@@ -320,6 +320,12 @@ impl Codegen {
             }
             mir::Intrinsic::RandomMix => ("aster_rt_random_mix", None, false),
             mir::Intrinsic::RandomEntropySeed => ("aster_rt_random_entropy_seed", None, true),
+            mir::Intrinsic::ConsoleWriteError => ("aster_rt_io_write_error", None, true),
+            mir::Intrinsic::EnvironmentHasVariable => ("aster_rt_env_has", None, true),
+            mir::Intrinsic::EnvironmentGetVariable => ("aster_rt_env_get", None, true),
+            mir::Intrinsic::EnvironmentGetVariableTemporary => {
+                ("aster_rt_env_get_temporary", None, true)
+            }
             mir::Intrinsic::StringFromBool => ("aster_rt_string_from_bool", None, true),
             mir::Intrinsic::StringFromBoolTemporary => {
                 ("aster_rt_string_from_bool_temporary", None, true)

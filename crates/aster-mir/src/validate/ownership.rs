@@ -336,6 +336,10 @@ fn intrinsic_is_read_only(intrinsic: &mir::Intrinsic) -> bool {
             | N::RandomEntropySeed
             | N::ConsoleWrite
             | N::ConsoleWriteLine
+            | N::ConsoleWriteError
+            | N::EnvironmentHasVariable
+            | N::EnvironmentGetVariable
+            | N::EnvironmentGetVariableTemporary
             | N::ReportRuntimeError(_)
     )
 }
@@ -925,7 +929,11 @@ impl<'a> Block<'a> {
         use mir::RvalueKind as K;
         let mut sources: Vec<(Path, ValueId)> = Vec::new();
         match &value.kind {
-            K::Use(o) | K::Cast(o) | K::Upcast(o) | K::MakeInterface { object: o, .. } => {
+            K::Use(o)
+            | K::Cast(o)
+            | K::Upcast(o)
+            | K::Downcast(o)
+            | K::MakeInterface { object: o, .. } => {
                 sources = self.operand_values(o);
             }
             K::Aggregate(fields) => {
@@ -944,6 +952,7 @@ impl<'a> Block<'a> {
                 }
             }
             K::Discriminant(o)
+            | K::ClassTest { object: o, .. }
             | K::ArrayLength(o)
             | K::ListLength(o)
             | K::DictionaryLength(o)

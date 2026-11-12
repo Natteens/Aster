@@ -49,16 +49,23 @@ impl Lowerer<'_> {
             },
             ast::Statement::While {
                 condition, body, ..
-            } => hir::Statement::While {
-                condition: self.expression(condition),
-                body: self.block(body),
-            },
+            } => {
+                // Pattern variables of a loop condition are scoped to the loop.
+                self.scopes.push(HashMap::new());
+                let condition = self.expression(condition);
+                let body = self.block(body);
+                self.scopes.pop();
+                hir::Statement::While { condition, body }
+            }
             ast::Statement::DoWhile {
                 body, condition, ..
-            } => hir::Statement::DoWhile {
-                body: self.block(body),
-                condition: self.expression(condition),
-            },
+            } => {
+                let body = self.block(body);
+                self.scopes.push(HashMap::new());
+                let condition = self.expression(condition);
+                self.scopes.pop();
+                hir::Statement::DoWhile { body, condition }
+            }
             ast::Statement::For {
                 initializer,
                 condition,
@@ -141,6 +148,9 @@ impl Lowerer<'_> {
                             self.switch_pattern(case.span, &case.bindings);
                         (case_symbol, tag, bindings, None)
                     };
+                    // The guard sees the payload bindings, and its own pattern
+                    // variables stay visible in the body.
+                    let guard = case.guard.as_ref().map(|guard| self.expression(guard));
                     let body = self.block(&case.body);
                     self.scopes.pop();
                     lowered_cases.push(hir::SwitchCase {
@@ -148,6 +158,7 @@ impl Lowerer<'_> {
                         tag,
                         bindings,
                         label,
+                        guard,
                         body,
                     });
                 }

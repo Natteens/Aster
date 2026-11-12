@@ -4929,6 +4929,50 @@ impl ExecutionContext {
     ) -> *const AsterStrHeader {
         self.allocate_string_parts_in_region(parts, true)
     }
+
+    /// Allocate a persistent `string[]` whose elements are fresh strings, the
+    /// same representation `String.Split` and `ListFiles` produce. The host
+    /// uses it to build the `args` array of `Main(string[] args)`. Returns a
+    /// null pointer after recording a runtime error when allocation fails.
+    pub fn allocate_string_array(&mut self, values: &[String]) -> *mut AsterArray {
+        let Ok(length) = i32::try_from(values.len()) else {
+            self.fail("string array length exceeds the ABI range");
+            return ptr::null_mut();
+        };
+        let Ok(element_size) = u32::try_from(size_of::<*const AsterStrHeader>()) else {
+            self.fail("string array element size exceeds the ABI range");
+            return ptr::null_mut();
+        };
+        let array = self.allocate_array(length, element_size);
+        if array.is_null() {
+            return array;
+        }
+        // Every element is a fresh owned string stored below: the array owns them.
+        #[cfg(feature = "mem-exp-rc")]
+        Self::set_string_array_descriptor(array);
+        for (index, value) in values.iter().enumerate() {
+            let string = self.allocate_string_parts(&[value.as_str()]);
+            if string.is_null() {
+                return ptr::null_mut();
+            }
+            let Ok(index) = i32::try_from(index) else {
+                self.fail("string array index exceeds the ABI range");
+                return ptr::null_mut();
+            };
+            let element = aster_rt_array_element(ptr::from_mut(self), array, index);
+            if element.is_null() {
+                return ptr::null_mut();
+            }
+            // SAFETY: `array` was allocated above with exactly pointer-sized
+            // elements and `index` is inside its checked length; no ASTER code
+            // can observe the array before it is returned complete.
+            #[allow(unsafe_code)]
+            unsafe {
+                ptr::write_unaligned(element.cast::<*const AsterStrHeader>(), string);
+            }
+        }
+        array
+    }
 }
 
 fn sum_known_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {

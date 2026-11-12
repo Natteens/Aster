@@ -215,6 +215,84 @@ mod hierarchy {
         assert!(validate_types(&with(classes, reverse)).is_err());
     }
 
+    fn class_test(from: u32, target: u32, result: Type) -> Vec<Instruction> {
+        vec![Instruction::Assign {
+            target: Place::Local(LocalId(2)),
+            value: Rvalue {
+                type_: result,
+                kind: RvalueKind::ClassTest {
+                    object: Operand {
+                        type_: Type::Class(SymbolId(from)),
+                        kind: OperandKind::Copy(Place::Local(LocalId(0))),
+                    },
+                    class: SymbolId(target),
+                },
+            },
+        }]
+    }
+
+    fn with_test_local(
+        classes: Vec<ClassDefinition>,
+        from: u32,
+        instructions: Vec<Instruction>,
+    ) -> Module {
+        let mut m = with(classes, instructions);
+        m.functions[0].locals[0] = local(0, Type::Class(SymbolId(from)));
+        m.functions[0].locals.push(local(2, Type::Bool));
+        m
+    }
+
+    #[test]
+    fn class_test_requires_related_classes_and_a_bool_result() {
+        let classes = vec![class(10, None), class(11, Some(10)), class(12, None)];
+        // Downcast direction, upcast direction and the same class all can match.
+        for (from, target) in [(10, 11), (11, 10), (11, 11)] {
+            assert!(
+                validate_types(&with_test_local(
+                    classes.clone(),
+                    from,
+                    class_test(from, target, Type::Bool)
+                ))
+                .is_ok(),
+                "{from} tested against {target}"
+            );
+        }
+        // An unrelated class can never match.
+        assert!(
+            validate_types(&with_test_local(
+                classes.clone(),
+                11,
+                class_test(11, 12, Type::Bool)
+            ))
+            .is_err()
+        );
+        // The result must be `bool`.
+        assert!(
+            validate_types(&with_test_local(classes, 10, class_test(10, 11, Type::Int))).is_err()
+        );
+    }
+
+    #[test]
+    fn downcast_is_accepted_between_related_classes_only() {
+        let classes = vec![class(10, None), class(11, Some(10)), class(12, None)];
+        // Local 0 is `Class(11)`, local 1 is `Class(10)`.
+        let narrow = |operand_class: u32, result_class: u32, from: u32, to: u32| {
+            vec![Instruction::Assign {
+                target: Place::Local(LocalId(to)),
+                value: Rvalue {
+                    type_: Type::Class(SymbolId(result_class)),
+                    kind: RvalueKind::Downcast(Operand {
+                        type_: Type::Class(SymbolId(operand_class)),
+                        kind: OperandKind::Copy(Place::Local(LocalId(from))),
+                    }),
+                },
+            }]
+        };
+        assert!(validate_types(&with(classes.clone(), narrow(10, 11, 1, 0))).is_ok());
+        assert!(validate_types(&with(classes.clone(), narrow(11, 10, 0, 1))).is_ok());
+        assert!(validate_types(&with(classes, narrow(10, 12, 1, 0))).is_err());
+    }
+
     #[test]
     fn cycles_sealed_bases_and_abstract_allocation_are_rejected() {
         let cyclic = vec![class(10, Some(11)), class(11, Some(10))];

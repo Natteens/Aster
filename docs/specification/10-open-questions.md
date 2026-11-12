@@ -82,7 +82,7 @@ Build-profile filtering and its manifest schema remain `PROPOSED`; see `12-loggi
 - Enum construction names the enum and case; there is no implicit integer representation in source.
 - `switch` matches enum cases, evaluates its input once, has no fallthrough, and must be exhaustive
   or contain `default`.
-- Restricted enum switch expressions are accepted. General pattern matching, guards, and explicit
+- Restricted enum switch expressions and `when` guards are accepted. General pattern matching and explicit
   discriminants are not accepted.
 
 ### ECS direction — ACCEPTED

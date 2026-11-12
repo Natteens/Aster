@@ -524,6 +524,9 @@ fn rvalue_is_legal(value: &mir::Rvalue, candidate: &Candidate) -> bool {
     match &value.kind {
         mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Discriminant(operand)
+        | mir::RvalueKind::ClassTest {
+            object: operand, ..
+        }
         | mir::RvalueKind::ArrayLength(operand)
         | mir::RvalueKind::ListLength(operand)
         | mir::RvalueKind::DictionaryLength(operand)
@@ -531,6 +534,7 @@ fn rvalue_is_legal(value: &mir::Rvalue, candidate: &Candidate) -> bool {
         | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
         | mir::RvalueKind::Upcast(operand)
+        | mir::RvalueKind::Downcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => operand_is_legal(operand, candidate),
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             fields
@@ -887,6 +891,9 @@ fn rewrite_rvalue(
     match &mut value.kind {
         mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Discriminant(operand)
+        | mir::RvalueKind::ClassTest {
+            object: operand, ..
+        }
         | mir::RvalueKind::ArrayLength(operand)
         | mir::RvalueKind::ListLength(operand)
         | mir::RvalueKind::DictionaryLength(operand)
@@ -894,6 +901,7 @@ fn rewrite_rvalue(
         | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
         | mir::RvalueKind::Upcast(operand)
+        | mir::RvalueKind::Downcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => rewrite_operand(operand, fields),
         mir::RvalueKind::Aggregate(values)
         | mir::RvalueKind::EnumConstruct { fields: values, .. } => {

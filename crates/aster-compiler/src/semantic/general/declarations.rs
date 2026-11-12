@@ -1584,6 +1584,9 @@ pub(super) fn collect_statement_calls<'a>(statement: &'a Statement, out: &mut Ve
         } => {
             collect_expression_calls(value, out);
             for case in cases {
+                if let Some(guard) = &case.guard {
+                    collect_expression_calls(guard, out);
+                }
                 for statement in &case.body.statements {
                     collect_statement_calls(statement, out);
                 }
@@ -1646,6 +1649,7 @@ fn collect_expression_calls<'a>(expression: &'a Expression, out: &mut Vec<&'a Ex
         | ExpressionKind::Try { operand }
         | ExpressionKind::Await { operand }
         | ExpressionKind::Cast { operand, .. } => collect_expression_calls(operand, out),
+        ExpressionKind::TypePattern { value, .. } => collect_expression_calls(value, out),
         ExpressionKind::Conditional {
             condition,
             when_true,
@@ -1662,6 +1666,9 @@ fn collect_expression_calls<'a>(expression: &'a Expression, out: &mut Vec<&'a Ex
         } => {
             collect_expression_calls(value, out);
             for case in cases {
+                if let Some(guard) = &case.guard {
+                    collect_expression_calls(guard, out);
+                }
                 collect_expression_calls(&case.value, out);
             }
             if let Some(default) = default {
@@ -1732,6 +1739,7 @@ fn collect_expression_awaits<'a>(expression: &'a Expression, out: &mut Vec<&'a E
         | ExpressionKind::IncrementDecrement { operand, .. }
         | ExpressionKind::Try { operand }
         | ExpressionKind::Cast { operand, .. } => collect_expression_awaits(operand, out),
+        ExpressionKind::TypePattern { value, .. } => collect_expression_awaits(value, out),
         ExpressionKind::Binary { left, right, .. } => {
             collect_expression_awaits(left, out);
             collect_expression_awaits(right, out);
@@ -1756,6 +1764,9 @@ fn collect_expression_awaits<'a>(expression: &'a Expression, out: &mut Vec<&'a E
         } => {
             collect_expression_awaits(value, out);
             for case in cases {
+                if let Some(guard) = &case.guard {
+                    collect_expression_awaits(guard, out);
+                }
                 collect_expression_awaits(&case.value, out);
             }
             if let Some(default) = default {

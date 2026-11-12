@@ -812,6 +812,7 @@ impl FunctionLowerer {
             if case.label.is_none() {
                 self.bind_switch_case(value_local, case.case, &case.bindings);
             }
+            self.lower_switch_guard(case.guard.as_ref(), next);
             self.lower_block(&case.body);
             if let Some(block) = self.current.take() {
                 self.terminate(block, mir::Terminator::Goto(join));
@@ -921,6 +922,25 @@ impl FunctionLowerer {
         )
     }
 
+    /// A `when` guard, evaluated after the case pattern matched and its
+    /// payload bindings were assigned: when false, matching continues at
+    /// `next`, the test of the following case (or the default).
+    fn lower_switch_guard(&mut self, guard: Option<&hir::Expression>, next: mir::BasicBlockId) {
+        let Some(guard) = guard else {
+            return;
+        };
+        let condition = self
+            .lower_expression(guard)
+            .expect("validated switch guard produces a value");
+        let body = self.new_block();
+        self.terminate_current(mir::Terminator::Branch {
+            condition,
+            then_block: body,
+            else_block: next,
+        });
+        self.current = Some(body);
+    }
+
     fn bind_switch_case(
         &mut self,
         value_local: mir::LocalId,
@@ -986,6 +1006,7 @@ impl FunctionLowerer {
             if case.label.is_none() {
                 self.bind_switch_case(value_local, case.case, &case.bindings);
             }
+            self.lower_switch_guard(case.guard.as_ref(), next);
             let arm_value = self
                 .lower_expression(&case.value)
                 .expect("validated switch arm produces a value");

@@ -26,12 +26,36 @@ pub(super) fn validate_invocable_entry(
     function: &mir::Function,
     function_name: &str,
 ) -> Result<(), BackendError> {
+    validate_entry_shape(function, function_name, false)
+}
+
+/// Entry validation for `Main()` and `Main(string[] args)`: like
+/// [`validate_invocable_entry`], but one `string[]` parameter is allowed (the
+/// host passes it the program arguments).
+pub(super) fn validate_invocable_entry_with_arguments(
+    function: &mir::Function,
+    function_name: &str,
+) -> Result<(), BackendError> {
+    validate_entry_shape(function, function_name, true)
+}
+
+fn validate_entry_shape(
+    function: &mir::Function,
+    function_name: &str,
+    allow_arguments: bool,
+) -> Result<(), BackendError> {
     if function.visibility != mir::Visibility::Public {
         return Err(BackendError::new(format!(
             "function `{function_name}` is not public"
         )));
     }
-    if !function.parameters.is_empty() {
+    let takes_arguments = matches!(
+        function.parameters.as_slice(),
+        [parameter] if parameter.type_ == mir::Type::Array(Box::new(mir::Type::String))
+    );
+    let parameters_accepted =
+        function.parameters.is_empty() || (allow_arguments && takes_arguments);
+    if !parameters_accepted {
         return Err(BackendError::new(format!(
             "entry function `{function_name}` must have no parameters"
         )));
@@ -1665,6 +1689,10 @@ fn is_string_method_intrinsic(intrinsic: mir::Intrinsic) -> bool {
             | mir::Intrinsic::StringTryParseDouble
             | mir::Intrinsic::ConsoleWrite
             | mir::Intrinsic::ConsoleWriteLine
+            | mir::Intrinsic::ConsoleWriteError
+            | mir::Intrinsic::EnvironmentHasVariable
+            | mir::Intrinsic::EnvironmentGetVariable
+            | mir::Intrinsic::EnvironmentGetVariableTemporary
             | mir::Intrinsic::ConsoleReadLine
             | mir::Intrinsic::ConsoleReadLineTemporary
     )
@@ -2676,10 +2704,23 @@ fn validate_intrinsic_shape(
                 && matches!(return_type, mir::Type::Enum(_))
                 && matches!(arguments, [receiver] if receiver.type_ == mir::Type::String)
         }
-        mir::Intrinsic::ConsoleWrite | mir::Intrinsic::ConsoleWriteLine => {
+        mir::Intrinsic::ConsoleWrite
+        | mir::Intrinsic::ConsoleWriteLine
+        | mir::Intrinsic::ConsoleWriteError => {
             destination.is_none()
                 && *return_type == mir::Type::Void
                 && matches!(arguments, [value] if value.type_ == mir::Type::String)
+        }
+        mir::Intrinsic::EnvironmentHasVariable => {
+            destination.is_some()
+                && *return_type == mir::Type::Bool
+                && matches!(arguments, [name] if name.type_ == mir::Type::String)
+        }
+        mir::Intrinsic::EnvironmentGetVariable
+        | mir::Intrinsic::EnvironmentGetVariableTemporary => {
+            destination.is_some()
+                && *return_type == mir::Type::String
+                && matches!(arguments, [name] if name.type_ == mir::Type::String)
         }
         // `aster.io.ReadLine()`: aridade zero, a destination whose type is
         // *some* concrete enum. `validate_string_try_parse_targets` (reused
@@ -3062,10 +3103,20 @@ fn validate_rvalue(
             }
             validate_operand_with_proven_bounds(object, function_name, true)
         }
+        mir::RvalueKind::ClassTest { object, .. } => {
+            validate_operand_with_proven_bounds(object, function_name, true)?;
+            if !matches!(object.type_, mir::Type::Class(_)) || value.type_ != mir::Type::Bool {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` has a malformed class test"
+                )));
+            }
+            Ok(())
+        }
         mir::RvalueKind::Discriminant(operand)
         | mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Cast(operand)
         | mir::RvalueKind::Upcast(operand)
+        | mir::RvalueKind::Downcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => {
             validate_operand_with_proven_bounds(operand, function_name, true)
         }

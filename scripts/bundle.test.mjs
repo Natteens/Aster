@@ -400,8 +400,10 @@ test("two consecutive bundles produce identical manifests and file list", () => 
 
 // Relocatable proof — requires the real release binary
 
+// `Main` prints its result: an `int` returned from `Main` is the process exit status
+// (LANG-018), so a success value of 1 would be indistinguishable from a failure.
 const STDLIB_PROGRAM =
-    "using aster.math; public class Program { public static int Main() { return Math.Max(0, 1); } }";
+    "using aster.io; using aster.math; public class Program { public static void Main() { WriteLine(Math.Max(0, 1).ToString()); } }";
 
 test(
     "relocatable bundle: stdlib found via exe-relative path, not cwd or ASTER_STDLIB",

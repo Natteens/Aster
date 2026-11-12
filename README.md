@@ -59,7 +59,7 @@ aster check
 aster run
 ```
 
-The generated program prints `Hello from ASTER!` and returns `0`.
+The generated program prints `Hello from ASTER!` and exits with status `0`.
 
 ## A small ASTER program
 

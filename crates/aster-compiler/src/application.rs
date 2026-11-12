@@ -193,7 +193,7 @@ fn select_conventional_entry(
         return Err(vec![diagnostic(
             root_file,
             "no application entry was found in the root namespace",
-            "add `public static void Main()` or `public static int Main()` to a public class, or pass `--function NAME`",
+            "add `public static void Main()`, `public static int Main()` or the `string[] args` form to a public class, or pass `--function NAME`",
         )]);
     }
     let diagnostics = candidates
@@ -203,7 +203,7 @@ fn select_conventional_entry(
                 diagnostic(
                     root_file,
                     format!("`{}.Main` cannot be used as the application entry: {problem}", class.name),
-                    "use a public class and declare `public static void Main()` or `public static int Main()` with no parameters",
+                    "use a public class and declare `public static void Main()` or `public static int Main()`, optionally taking `string[] args`",
                 )
             })
         })
@@ -226,7 +226,7 @@ fn select_named_methods(
         return Err(vec![diagnostic(
             path,
             format!("entry method `{display_name}` was not found"),
-            "declare the configured method as `public static void Main()` or `public static int Main()`",
+            "declare the configured method as `public static void Main()` or `public static int Main()`, optionally taking `string[] args`",
         )]);
     }
     let valid = methods
@@ -243,7 +243,7 @@ fn select_named_methods(
         return Err(vec![diagnostic(
             path,
             format!("entry `{display_name}` resolves to more than one eligible method"),
-            "leave only one public static parameterless `Main` overload",
+            "leave only one eligible public static `Main` overload (`Main()` or `Main(string[] args)`)",
         )]);
     }
     Err(methods
@@ -253,7 +253,7 @@ fn select_named_methods(
                 diagnostic(
                     path,
                     format!("entry `{display_name}` is invalid: {problem}"),
-                    "use a public class and declare `public static void Main()` or `public static int Main()` with no parameters",
+                    "use a public class and declare `public static void Main()` or `public static int Main()`, optionally taking `string[] args`",
                 )
             })
         })
@@ -271,8 +271,10 @@ fn entry_problems(class: &hir::TypeDeclaration, method: &hir::Function) -> Vec<&
     if !method.is_static {
         problems.push("the method is not static");
     }
-    if !method.parameters.is_empty() {
-        problems.push("the method has parameters");
+    match method.parameters.as_slice() {
+        [] => {}
+        [parameter] if parameter.type_ == Type::Array(Box::new(Type::String)) => {}
+        _ => problems.push("the method has parameters other than a single `string[] args`"),
     }
     if !matches!(method.return_type, Type::Void | Type::Int) {
         problems.push("the return type is not `void` or `int`");

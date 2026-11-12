@@ -5,7 +5,7 @@ into the compiler repository, so run the commands below from the repository root
 
 ## Start with complete programs
 
-1. **Hello** prints a message and returns a visible result.
+1. **Hello** prints a message and returns an exit status.
 
    ```console
    aster run examples/hello.aster

@@ -251,6 +251,9 @@ impl Monomorphizer {
             } => {
                 self.expression(value, environment);
                 for case in cases {
+                    if let Some(guard) = &mut case.guard {
+                        self.expression(guard, environment);
+                    }
                     self.block(&mut case.body, &mut environment.clone());
                 }
                 if let Some(default) = default {
@@ -344,6 +347,10 @@ impl Monomorphizer {
                 self.expression(operand, environment);
                 target.name.clone()
             }
+            ExpressionKind::TypePattern { value, .. } => {
+                self.expression(value, environment);
+                "bool".to_owned()
+            }
             ExpressionKind::Binary {
                 left,
                 operator,
@@ -392,6 +399,9 @@ impl Monomorphizer {
         self.expression(value, environment);
         let mut result = String::new();
         for case in cases {
+            if let Some(guard) = &mut case.guard {
+                self.expression(guard, environment);
+            }
             let arm = self.expression(&mut case.value, environment);
             if result.is_empty() {
                 result = arm;

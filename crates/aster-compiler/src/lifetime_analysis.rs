@@ -795,6 +795,9 @@ fn read_rvalue(
     match &value.kind {
         mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Discriminant(operand)
+        | mir::RvalueKind::ClassTest {
+            object: operand, ..
+        }
         | mir::RvalueKind::ArrayLength(operand)
         | mir::RvalueKind::ListLength(operand)
         | mir::RvalueKind::DictionaryLength(operand)
@@ -802,6 +805,7 @@ fn read_rvalue(
         | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
         | mir::RvalueKind::Upcast(operand)
+        | mir::RvalueKind::Downcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => read_operand(operand, locals, uses)?,
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             for field in fields {

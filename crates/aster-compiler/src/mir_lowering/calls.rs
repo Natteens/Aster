@@ -203,7 +203,9 @@ impl FunctionLowerer {
                 });
                 None
             }
-            hir::Intrinsic::ConsoleWrite | hir::Intrinsic::ConsoleWriteLine => {
+            hir::Intrinsic::ConsoleWrite
+            | hir::Intrinsic::ConsoleWriteLine
+            | hir::Intrinsic::ConsoleWriteError => {
                 let value = self
                     .lower_expression(&arguments[0])
                     .expect("validated console write argument produces a value");
@@ -252,6 +254,8 @@ impl FunctionLowerer {
             | hir::Intrinsic::TimeUnixMilliseconds
             | hir::Intrinsic::RandomMix
             | hir::Intrinsic::RandomEntropySeed
+            | hir::Intrinsic::EnvironmentHasVariable
+            | hir::Intrinsic::EnvironmentGetVariable
             | hir::Intrinsic::StringBuilderLength
             | hir::Intrinsic::StringBuilderClear => {
                 let arguments = arguments

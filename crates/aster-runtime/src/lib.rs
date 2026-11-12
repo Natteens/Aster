@@ -15,6 +15,7 @@ pub mod context;
 pub mod descriptor;
 pub mod filesystem;
 pub mod foreign;
+mod host;
 pub mod io;
 pub mod io_error;
 pub mod log;
@@ -68,6 +69,9 @@ pub use filesystem::{
     aster_rt_io_read_all_text_temporary, aster_rt_io_write_all_text,
 };
 pub use foreign::{ForeignRegistry, ForeignRegistryError, ForeignSignature, ForeignType};
+pub use host::{
+    aster_rt_env_get, aster_rt_env_get_temporary, aster_rt_env_has, aster_rt_io_write_error,
+};
 pub use io::{
     ConsoleBackend, FailingConsoleBackend, MemoryConsoleBackend, StdConsoleBackend,
     aster_rt_io_read_line, aster_rt_io_read_line_temporary, aster_rt_io_write,

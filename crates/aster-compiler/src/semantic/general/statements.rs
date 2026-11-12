@@ -158,12 +158,19 @@ impl Analyzer<'_> {
                 else_block,
                 ..
             } => {
+                // Pattern variables declared by the condition belong to the
+                // enclosing scope (as in C#), but are definitely assigned only
+                // where the condition proves the test succeeded.
                 let condition_type = self.expression(condition);
                 self.require_bool_condition("if", &condition_type, condition.span);
+                let when_true = pattern_assigned(condition, true);
+                let when_false = pattern_assigned(condition, false);
                 let before = self.scopes.clone();
+                self.mark_assigned(&when_true);
                 let then_flow = self.block(then_block, true);
                 let then_scopes = self.scopes.clone();
                 self.scopes.clone_from(&before);
+                self.mark_assigned(&when_false);
                 let else_flow = else_block
                     .as_ref()
                     .map_or(Flow::CONTINUE, |block| self.block(block, true));
@@ -182,13 +189,17 @@ impl Analyzer<'_> {
             Statement::While {
                 condition, body, ..
             } => {
+                // Pattern variables of a loop condition are scoped to the loop.
+                self.scopes.push(HashMap::new());
                 let condition_type = self.expression(condition);
                 self.require_bool_condition("while", &condition_type, condition.span);
                 self.loop_depth += 1;
                 let before = self.scopes.clone();
+                self.mark_assigned(&pattern_assigned(condition, true));
                 self.block(body, true);
                 self.scopes = before;
                 self.loop_depth -= 1;
+                self.scopes.pop();
                 Flow::CONTINUE
             }
             Statement::DoWhile {
@@ -199,8 +210,10 @@ impl Analyzer<'_> {
                 self.block(body, true);
                 self.scopes = before;
                 self.loop_depth -= 1;
+                self.scopes.push(HashMap::new());
                 let condition_type = self.expression(condition);
                 self.require_bool_condition("do-while", &condition_type, condition.span);
+                self.scopes.pop();
                 Flow::CONTINUE
             }
             Statement::For {
@@ -214,10 +227,14 @@ impl Analyzer<'_> {
                 if let Some(initializer) = initializer {
                     self.statement(initializer);
                 }
+                let mut assigned = Vec::new();
                 if let Some(condition) = condition {
                     let condition_type = self.expression(condition);
                     self.require_bool_condition("for", &condition_type, condition.span);
+                    assigned = pattern_assigned(condition, true);
                 }
+                let before_update = self.scopes.clone();
+                self.mark_assigned(&assigned);
                 if let Some(update) = update {
                     self.expression(update);
                 }
@@ -225,6 +242,7 @@ impl Analyzer<'_> {
                 let before_body = self.scopes.clone();
                 self.block(body, true);
                 self.scopes = before_body;
+                self.scopes = before_update;
                 self.loop_depth -= 1;
                 self.scopes.pop();
                 Flow::CONTINUE
@@ -356,8 +374,24 @@ impl Analyzer<'_> {
             let mut seen = HashSet::new();
             let mut any_continues = false;
             for case in cases {
-                self.check_scalar_label(&selected, case.label.as_ref(), case.span, &mut seen);
+                // A guarded case can fall through, so its label is only checked
+                // against earlier unguarded cases and is not recorded.
+                if case.guard.is_some() {
+                    let mut scratch = seen.clone();
+                    self.check_scalar_label(
+                        &selected,
+                        case.label.as_ref(),
+                        case.span,
+                        &mut scratch,
+                    );
+                } else {
+                    self.check_scalar_label(&selected, case.label.as_ref(), case.span, &mut seen);
+                }
+                self.scopes.push(HashMap::new());
+                let assigned = self.analyze_guard(case.guard.as_ref());
+                self.mark_assigned(&assigned);
                 any_continues |= self.block(&case.body, true).can_continue;
+                self.scopes.pop();
             }
             if let Some(default) = default {
                 any_continues |= self.block(default, true).can_continue;
@@ -409,13 +443,20 @@ impl Analyzer<'_> {
         let mut covered = HashSet::new();
         let mut any_continues = false;
         for case in cases {
+            // A guarded case can fall through, so it never counts as covering
+            // its enum case; it is still checked against the unguarded cases.
+            let mut scratch = covered.clone();
             let Some(info) = self.resolve_switch_pattern(
                 case.enum_name.as_deref(),
                 &case.case_name,
                 &case.bindings,
                 case.span,
                 &resolved,
-                &mut covered,
+                if case.guard.is_some() {
+                    &mut scratch
+                } else {
+                    &mut covered
+                },
             ) else {
                 self.block(&case.body, true);
                 any_continues = true;
@@ -435,6 +476,8 @@ impl Analyzer<'_> {
                     },
                 );
             }
+            let assigned = self.analyze_guard(case.guard.as_ref());
+            self.mark_assigned(&assigned);
             let flow = self.block(&case.body, false);
             self.scopes.pop();
             any_continues |= flow.can_continue;
@@ -768,6 +811,17 @@ impl Analyzer<'_> {
         }
     }
 
+    /// A `when` guard: a `bool` expression evaluated after the pattern
+    /// matched. Returns the pattern variables assigned when it is true.
+    pub(super) fn analyze_guard(&mut self, guard: Option<&Expression>) -> Vec<String> {
+        let Some(guard) = guard else {
+            return Vec::new();
+        };
+        let guard_type = self.expression(guard);
+        self.require_bool_condition("when", &guard_type, guard.span);
+        pattern_assigned(guard, true)
+    }
+
     pub(super) fn declare(&mut self, name: &str, binding: Binding) {
         let scope = self
             .scopes
@@ -800,6 +854,47 @@ impl Analyzer<'_> {
             );
         }
         type_
+    }
+}
+
+/// Names of the pattern variables that are definitely assigned when
+/// `expression` evaluates to `when_true` (C# definite assignment for `is`
+/// patterns through `!`, `&&` and `||`).
+pub(super) fn pattern_assigned(expression: &Expression, when_true: bool) -> Vec<String> {
+    use aster_syntax::{BinaryOperator, ExpressionKind, UnaryOperator};
+    match &expression.kind {
+        ExpressionKind::TypePattern { binding, .. } => {
+            if when_true {
+                binding.iter().map(|binding| binding.name.clone()).collect()
+            } else {
+                Vec::new()
+            }
+        }
+        ExpressionKind::Unary {
+            operator: UnaryOperator::Not,
+            operand,
+        } => pattern_assigned(operand, !when_true),
+        ExpressionKind::Binary {
+            left,
+            operator: operator @ (BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr),
+            right,
+        } => {
+            let left = pattern_assigned(left, when_true);
+            let right = pattern_assigned(right, when_true);
+            // `a && b` is true only if both were, and `a || b` is false only
+            // if both were: the union. Otherwise either operand may have
+            // decided the result: the intersection.
+            if (*operator == BinaryOperator::LogicalAnd) == when_true {
+                let mut union = left;
+                union.extend(right);
+                union
+            } else {
+                left.into_iter()
+                    .filter(|name| right.contains(name))
+                    .collect()
+            }
+        }
+        _ => Vec::new(),
     }
 }
 

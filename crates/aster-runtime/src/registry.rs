@@ -41,6 +41,9 @@ use crate::filesystem::{
     aster_rt_io_read_all_text_temporary, aster_rt_io_write_all_text,
 };
 use crate::foreign::aster_rt_foreign_error;
+use crate::host::{
+    aster_rt_env_get, aster_rt_env_get_temporary, aster_rt_env_has, aster_rt_io_write_error,
+};
 use crate::io::{
     aster_rt_io_read_line, aster_rt_io_read_line_temporary, aster_rt_io_write,
     aster_rt_io_write_line,
@@ -1698,6 +1701,38 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             signature: RuntimeSignature {
                 parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
                 result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_io_write_error",
+            address: aster_rt_io_write_error as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_env_has",
+            address: aster_rt_env_has as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::I8),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_env_get",
+            address: aster_rt_env_get as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_env_get_temporary",
+            address: aster_rt_env_get_temporary as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::Pointer),
             },
         },
         RuntimeFunction {

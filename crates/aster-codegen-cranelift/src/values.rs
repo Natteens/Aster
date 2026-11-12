@@ -5,6 +5,84 @@ use super::{
 };
 
 impl Codegen {
+    /// The bounds-safe subtype test of object model B1 (section 4.5): for an
+    /// object whose descriptor is `D` and a target class `T`,
+    /// `D.depth >= T.depth && D.ancestors[T.depth] == T`. The depth comparison
+    /// comes first, so a shallow class tested against a deeper target never
+    /// indexes past its `ancestors` array. A null reference is never an
+    /// instance. `T.depth` and `T`'s address are compile-time constants.
+    fn translate_class_test(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        object: &mir::Operand,
+        class: mir::SymbolId,
+        state: &FunctionState,
+    ) -> Result<Value, BackendError> {
+        let target_address = self
+            .descriptors
+            .address(class)
+            .ok_or_else(|| BackendError::new("class test target has no object descriptor"))?
+            .cast_signed();
+        let target_depth = self
+            .descriptors
+            .depth(class)
+            .ok_or_else(|| BackendError::new("class test target has no object descriptor"))?;
+        let object = self.translate_operand(builder, object, state)?;
+        let depth_offset = i32::try_from(std::mem::offset_of!(
+            aster_runtime::descriptor::ClassDescriptor,
+            depth
+        ))
+        .map_err(|_| BackendError::new("descriptor depth offset is too large"))?;
+        let ancestors_offset = i32::try_from(std::mem::offset_of!(
+            aster_runtime::descriptor::ClassDescriptor,
+            ancestors
+        ))
+        .map_err(|_| BackendError::new("descriptor ancestors offset is too large"))?;
+        let entry_offset =
+            i32::try_from(u64::from(target_depth) * u64::from(self.pointer_type.bytes()))
+                .map_err(|_| BackendError::new("class test ancestor offset is too large"))?;
+
+        let inspect = builder.create_block();
+        let compare = builder.create_block();
+        let done = builder.create_block();
+        builder.append_block_param(done, types::I8);
+        let no = builder.ins().iconst(types::I8, 0);
+        builder.ins().brif(object, inspect, &[], done, &[no.into()]);
+
+        builder.switch_to_block(inspect);
+        let descriptor = builder
+            .ins()
+            .load(self.pointer_type, MemFlags::new(), object, 0);
+        let depth = builder
+            .ins()
+            .load(types::I32, MemFlags::new(), descriptor, depth_offset);
+        let deep_enough = builder.ins().icmp_imm(
+            IntCC::UnsignedGreaterThanOrEqual,
+            depth,
+            i64::from(target_depth),
+        );
+        let no = builder.ins().iconst(types::I8, 0);
+        builder
+            .ins()
+            .brif(deep_enough, compare, &[], done, &[no.into()]);
+
+        builder.switch_to_block(compare);
+        let ancestors = builder.ins().load(
+            self.pointer_type,
+            MemFlags::new(),
+            descriptor,
+            ancestors_offset,
+        );
+        let entry = builder
+            .ins()
+            .load(self.pointer_type, MemFlags::new(), ancestors, entry_offset);
+        let matches = builder.ins().icmp_imm(IntCC::Equal, entry, target_address);
+        builder.ins().jump(done, &[matches.into()]);
+
+        builder.switch_to_block(done);
+        Ok(builder.block_params(done)[0])
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(super) fn translate_rvalue(
         &mut self,
@@ -14,8 +92,11 @@ impl Codegen {
     ) -> Result<Value, BackendError> {
         match &value.kind {
             // An upcast is the same object pointer: no code runs.
-            mir::RvalueKind::Use(operand) | mir::RvalueKind::Upcast(operand) => {
-                self.translate_operand(builder, operand, state)
+            mir::RvalueKind::Use(operand)
+            | mir::RvalueKind::Upcast(operand)
+            | mir::RvalueKind::Downcast(operand) => self.translate_operand(builder, operand, state),
+            mir::RvalueKind::ClassTest { object, class } => {
+                self.translate_class_test(builder, object, *class, state)
             }
             mir::RvalueKind::Aggregate(_) => Err(BackendError::new(
                 "aggregate rvalue reached scalar translation",

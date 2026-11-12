@@ -61,7 +61,9 @@ use execution::execute_resolved_with_aarm_parallel_workers;
 use execution::execute_resolved_with_aarm_task_governor;
 #[cfg(feature = "aarm-telemetry")]
 use execution::execute_resolved_with_aarm_telemetry;
-use execution::{execute_resolved, execute_resolved_with_foreign_registry};
+use execution::{
+    execute_resolved, execute_resolved_with_arguments, execute_resolved_with_foreign_registry,
+};
 #[cfg(feature = "aarm-telemetry")]
 #[doc(hidden)]
 pub use host_memory::{
@@ -78,7 +80,10 @@ pub use task_runtime::{
     AarmAsyncMemoryDomainTelemetry, AarmParallelPlanningTelemetry, AarmTaskMemoryDomainTelemetry,
     parallel_chunk_budgets,
 };
-use validation::{select_entry, validate_invocable_entry, validate_module};
+use validation::{
+    select_entry, validate_invocable_entry, validate_invocable_entry_with_arguments,
+    validate_module,
+};
 use values::{
     cast_value, integer_constant_bits, is_aggregate, primitive, scalar_from_bits, scalar_kind,
     scalar_to_bits, type_name,
@@ -896,6 +901,35 @@ pub fn execute_symbol_with_foreign_registry(
         .ok_or_else(|| BackendError::new(format!("entry symbol {symbol:?} was not found")))?;
     validate_invocable_entry(entry, &entry.name)?;
     execute_resolved_with_foreign_registry(module, entry, registry, false).map(|(value, _)| value)
+}
+
+/// Compile validated MIR and invoke the application entry selected by the
+/// compiler (`Main()` or `Main(string[] args)`, returning `void` or `int`).
+/// An entry that declares `string[] args` receives `arguments` as a fresh
+/// array; an entry with no parameters ignores them. `console_backend`, when
+/// present, replaces the real stdin/stdout/stderr (for tests).
+///
+/// # Errors
+///
+/// Returns a controlled error if the symbol is missing, its signature is not
+/// an entry signature, or compilation or execution fails.
+pub fn execute_entry_with_arguments(
+    module: &mir::Module,
+    symbol: mir::SymbolId,
+    arguments: &[String],
+    console_backend: Option<Box<dyn aster_runtime::ConsoleBackend>>,
+) -> Result<(ExecutionValue, MemoryStats), BackendError> {
+    validate_module(module)?;
+    let entry = module
+        .functions
+        .iter()
+        .find(|function| function.symbol == symbol)
+        .ok_or_else(|| BackendError::new(format!("entry symbol {symbol:?} was not found")))?;
+    validate_invocable_entry_with_arguments(entry, &entry.name)?;
+    if entry.parameters.is_empty() {
+        return execute_resolved(module, entry, true, console_backend, None);
+    }
+    execute_resolved_with_arguments(module, entry, arguments, true, console_backend)
 }
 
 /// Like [`execute_symbol`], but also returns runtime allocation metrics.

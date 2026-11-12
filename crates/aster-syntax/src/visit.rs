@@ -327,6 +327,9 @@ pub fn walk_switch_case_mut<V: AstVisitorMut + ?Sized>(visitor: &mut V, case: &m
     if let Some(label) = &mut case.label {
         visitor.visit_expression_mut(label);
     }
+    if let Some(guard) = &mut case.guard {
+        visitor.visit_expression_mut(guard);
+    }
     visitor.visit_block_mut(&mut case.body);
 }
 
@@ -336,6 +339,9 @@ pub fn walk_switch_expression_case_mut<V: AstVisitorMut + ?Sized>(
 ) {
     if let Some(label) = &mut case.label {
         visitor.visit_expression_mut(label);
+    }
+    if let Some(guard) = &mut case.guard {
+        visitor.visit_expression_mut(guard);
     }
     visitor.visit_expression_mut(&mut case.value);
 }
@@ -415,6 +421,10 @@ pub fn walk_expression_mut<V: AstVisitorMut + ?Sized>(
         ExpressionKind::Cast { target, operand } => {
             visitor.visit_type_ref_mut(target);
             visitor.visit_expression_mut(operand);
+        }
+        ExpressionKind::TypePattern { value, target, .. } => {
+            visitor.visit_expression_mut(value);
+            visitor.visit_type_ref_mut(target);
         }
         ExpressionKind::Binary { left, right, .. } => {
             visitor.visit_expression_mut(left);

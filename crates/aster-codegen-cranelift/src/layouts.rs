@@ -446,6 +446,18 @@ impl ObjectDescriptors {
     pub(super) fn address(&self, class: mir::SymbolId) -> Option<u64> {
         self.by_class.get(&class).map(|pointer| *pointer as u64)
     }
+
+    /// Number of ancestors of `class` (`0` for a class without a base): the
+    /// index of the class itself in every derived descriptor's `ancestors`.
+    #[allow(unsafe_code)]
+    pub(super) fn depth(&self, class: mir::SymbolId) -> Option<u32> {
+        // SAFETY: every pointer in `by_class` refers to a descriptor owned by
+        // `self` (boxed in `classes`), fully built before codegen runs and
+        // never mutated afterwards.
+        self.by_class
+            .get(&class)
+            .map(|pointer| unsafe { (**pointer).depth })
+    }
 }
 
 #[cfg(feature = "mem-exp-rc-core")]

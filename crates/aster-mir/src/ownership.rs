@@ -578,6 +578,7 @@ impl Context<'_> {
                     RvalueKind::Use(operand)
                     | RvalueKind::Cast(operand)
                     | RvalueKind::Upcast(operand)
+                    | RvalueKind::Downcast(operand)
                     | RvalueKind::MakeInterface {
                         object: operand, ..
                     } => sources.push(operand),
@@ -1279,6 +1280,10 @@ fn non_releasing_intrinsic(intrinsic: &Intrinsic) -> bool {
             | N::RandomEntropySeed
             | N::ConsoleWrite
             | N::ConsoleWriteLine
+            | N::ConsoleWriteError
+            | N::EnvironmentHasVariable
+            | N::EnvironmentGetVariable
+            | N::EnvironmentGetVariableTemporary
             | N::ReportRuntimeError(_)
     )
 }
@@ -1558,6 +1563,7 @@ fn usage_of(instruction: &Instruction, local: LocalId) -> Usage {
             RvalueKind::Use(operand)
             | RvalueKind::Cast(operand)
             | RvalueKind::Upcast(operand)
+            | RvalueKind::Downcast(operand)
             | RvalueKind::MakeInterface {
                 object: operand, ..
             } => usage.kept = direct(operand),

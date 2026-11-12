@@ -738,6 +738,7 @@ fn alias_source(value: &mir::Rvalue, aliases: &HashSet<mir::LocalId>) -> Option<
         mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Cast(operand)
         | mir::RvalueKind::Upcast(operand)
+        | mir::RvalueKind::Downcast(operand)
             if is_tracked_reference_type(&value.type_) =>
         {
             direct_alias(operand, aliases)
@@ -917,6 +918,10 @@ fn instruction_escape(
                     | mir::Intrinsic::StringTryParseDouble
                     | mir::Intrinsic::ConsoleWrite
                     | mir::Intrinsic::ConsoleWriteLine
+                    | mir::Intrinsic::ConsoleWriteError
+                    | mir::Intrinsic::EnvironmentHasVariable
+                    | mir::Intrinsic::EnvironmentGetVariable
+                    | mir::Intrinsic::EnvironmentGetVariableTemporary
                     | mir::Intrinsic::FileReadAllText(_)
                     | mir::Intrinsic::FileReadAllTextTemporary(_)
                     | mir::Intrinsic::FileWriteAllText(_)
@@ -1016,7 +1021,9 @@ fn assignment_escape(
         // An upcast is an alias of the same object: it neither copies nor
         // stores, so it escapes exactly when its result does (the alias
         // closure of `alias_source` follows the result).
-        mir::RvalueKind::Cast(operand) | mir::RvalueKind::Upcast(operand)
+        mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
+        | mir::RvalueKind::Downcast(operand)
             if direct_alias(operand, aliases).is_some() =>
         {
             if matches!(target, mir::Place::Local(_)) && is_tracked_reference_type(&value.type_) {
@@ -1051,6 +1058,10 @@ fn assignment_escape(
         // own regardless of whether the enum escapes. Never observed before
         // an enum type was tracked at all (see `is_tracked_reference_type`).
         mir::RvalueKind::Discriminant(operand) if direct_alias(operand, aliases).is_some() => None,
+        // A class test only reads the object's header descriptor.
+        mir::RvalueKind::ClassTest { object, .. } if direct_alias(object, aliases).is_some() => {
+            None
+        }
         mir::RvalueKind::Equality { .. } => None,
         _ if rvalue_uses_alias(value, aliases) => Some(EscapeReason::UnsupportedUse),
         _ => None,
@@ -1061,6 +1072,9 @@ fn rvalue_uses_alias(value: &mir::Rvalue, aliases: &HashSet<mir::LocalId>) -> bo
     match &value.kind {
         mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Discriminant(operand)
+        | mir::RvalueKind::ClassTest {
+            object: operand, ..
+        }
         | mir::RvalueKind::ArrayLength(operand)
         | mir::RvalueKind::ListLength(operand)
         | mir::RvalueKind::DictionaryLength(operand)
@@ -1068,6 +1082,7 @@ fn rvalue_uses_alias(value: &mir::Rvalue, aliases: &HashSet<mir::LocalId>) -> bo
         | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
         | mir::RvalueKind::Upcast(operand)
+        | mir::RvalueKind::Downcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => direct_alias(operand, aliases).is_some(),
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             fields

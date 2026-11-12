@@ -6,8 +6,9 @@ use crate::{
     Accessor, Argument, AssignmentOperator, BaseCall, BinaryOperator, Block, EnumCase,
     EnumDeclaration, Expression, ExpressionKind, Field, FieldInitializer, FunctionDeclaration,
     IncrementOperator, InterpolatedPart, Item, Literal, Member, MemberDispatch, Module, Parameter,
-    Property, Statement, SwitchCase, SwitchExpressionCase, Token, TokenKind, TypeDeclaration,
-    TypeParameter, TypeRef, UnaryOperator, VariableDeclaration, VariableKind, Visibility,
+    PatternBinding, Property, Statement, SwitchCase, SwitchExpressionCase, Token, TokenKind,
+    TypeDeclaration, TypeParameter, TypeRef, UnaryOperator, VariableDeclaration, VariableKind,
+    Visibility,
 };
 
 /// Maximum recursive source/AST nesting accepted by the frontend. This is a
@@ -50,6 +51,7 @@ struct SwitchPattern {
     case_name: String,
     bindings: Vec<String>,
     label: Option<Expression>,
+    guard: Option<Expression>,
     end: usize,
 }
 
@@ -135,6 +137,7 @@ impl Parser {
                 | ExpressionKind::Cast {
                     operand: length, ..
                 }
+                | ExpressionKind::TypePattern { value: length, .. }
                 | ExpressionKind::Member { object: length, .. } => {
                     pending.push((length, nested));
                 }
@@ -177,6 +180,11 @@ impl Parser {
                 } => {
                     pending.push((value, nested));
                     pending.extend(cases.iter().map(|case| (&case.value, nested)));
+                    pending.extend(
+                        cases
+                            .iter()
+                            .filter_map(|case| case.guard.as_ref().map(|guard| (guard, nested))),
+                    );
                     if let Some(default) = default {
                         pending.push((default, nested));
                     }
@@ -1368,6 +1376,7 @@ impl Parser {
                     case_name: pattern.case_name,
                     bindings: pattern.bindings,
                     label: pattern.label,
+                    guard: pattern.guard,
                     span: Span::new(case_start, body.span.end.max(pattern.end)),
                     body,
                 });
@@ -1407,7 +1416,9 @@ impl Parser {
     fn switch_pattern(&mut self, terminator: &TokenKind) -> Option<SwitchPattern> {
         let is_name = |kind: &TokenKind| matches!(kind, TokenKind::Identifier(_));
         let ends = |kind: &TokenKind| {
-            discriminant(kind) == discriminant(terminator) || matches!(kind, TokenKind::LeftParen)
+            discriminant(kind) == discriminant(terminator)
+                || matches!(kind, TokenKind::LeftParen)
+                || matches!(kind, TokenKind::Identifier(name) if name == "when")
         };
         let enum_pattern = is_name(&self.peek(0).kind)
             && (ends(&self.peek(1).kind)
@@ -1417,11 +1428,17 @@ impl Parser {
         if !enum_pattern {
             let label = self.with_nesting(Self::logical_or)?;
             let end = label.span.end;
+            let guard = if self.at_identifier("when") {
+                Some(self.switch_guard()?)
+            } else {
+                None
+            };
             return Some(SwitchPattern {
                 enum_name: None,
                 case_name: String::new(),
                 bindings: Vec::new(),
                 label: Some(label),
+                guard,
                 end,
             });
         }
@@ -1459,13 +1476,26 @@ impl Parser {
             }
             self.expect(&TokenKind::RightParen)?;
         }
+        let guard = if self.at_identifier("when") {
+            Some(self.switch_guard()?)
+        } else {
+            None
+        };
         Some(SwitchPattern {
             enum_name,
             case_name,
             bindings,
             label: (!has_payload).then_some(label),
+            guard,
             end,
         })
+    }
+
+    /// The optional `when <condition>` guard after a switch label. `when` is a
+    /// contextual keyword: it is an ordinary identifier everywhere else.
+    fn switch_guard(&mut self) -> Option<Expression> {
+        self.advance();
+        self.with_nesting(Self::logical_or)
     }
 
     fn switch_case_body(&mut self) -> Block {
@@ -1612,6 +1642,7 @@ impl Parser {
                     case_name: pattern.case_name,
                     bindings: pattern.bindings,
                     label: pattern.label,
+                    guard: pattern.guard,
                     value: arm,
                     span: Span::new(case_start, end),
                 });
@@ -1684,7 +1715,13 @@ impl Parser {
     }
 
     fn comparison(&mut self) -> Option<Expression> {
-        self.binary_level_by(Self::shift, |parser| match parser.current().kind {
+        // Kept tiny: this frame is live for every parenthesis nesting level.
+        let operand = self.shift()?;
+        self.comparison_rest(operand)
+    }
+
+    fn comparison_rest(&mut self, operand: Expression) -> Option<Expression> {
+        let matcher = |parser: &Self| match parser.current().kind {
             TokenKind::Less => Some((BinaryOperator::Less, 1)),
             TokenKind::LessEqual => Some((BinaryOperator::LessEqual, 1)),
             // A lone `>` or `>=` only: a longer run of adjacent `>` is a shift.
@@ -1702,7 +1739,60 @@ impl Parser {
                 _ => None,
             },
             _ => None,
-        })
+        };
+        // Written out (instead of `binary_level_by`) so the `is` suffix is
+        // applied after each operand returns, without another recursion
+        // level in the precedence chain.
+        let mut expression = self.type_pattern_suffix(operand)?;
+        while let Some((operator, tokens)) = matcher(self) {
+            let operator_span = self.advance().span;
+            for _ in 1..tokens {
+                self.advance();
+            }
+            let right = self.shift()?;
+            let right = self.type_pattern_suffix(right)?;
+            let span = Span::new(expression.span.start, right.span.end);
+            expression = Expression {
+                kind: ExpressionKind::Binary {
+                    left: Box::new(expression),
+                    operator,
+                    right: Box::new(right),
+                },
+                span,
+            };
+            if !self.expression_within_limit(&expression, operator_span) {
+                return None;
+            }
+        }
+        Some(expression)
+    }
+
+    /// `value is Type` and `value is Type name`, at the relational level.
+    /// `is` is a contextual keyword recognized only in operator position.
+    fn type_pattern_suffix(&mut self, mut expression: Expression) -> Option<Expression> {
+        while self.at_identifier("is") {
+            self.advance();
+            let target = self.type_ref()?;
+            let mut end = target.span.end;
+            let binding = if let TokenKind::Identifier(name) = &self.current().kind {
+                let name = name.clone();
+                let span = self.advance().span;
+                end = span.end;
+                Some(Box::new(PatternBinding { name, span }))
+            } else {
+                None
+            };
+            let span = Span::new(expression.span.start, end);
+            expression = Expression {
+                kind: ExpressionKind::TypePattern {
+                    value: Box::new(expression),
+                    target: Box::new(target),
+                    binding,
+                },
+                span,
+            };
+        }
+        Some(expression)
     }
 
     /// `<<`, `>>`, and `>>>`. The lexer never merges `>` characters, because a

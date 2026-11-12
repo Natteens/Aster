@@ -92,6 +92,9 @@ pub struct SwitchCase {
     /// `case_name` is empty), and set for payload-free enum-style names so a
     /// constant name can label an integer, `char` or `string` switch.
     pub label: Option<Expression>,
+    /// `when` guard: the case is selected only when the pattern matches and
+    /// the guard is true; otherwise matching continues with later cases.
+    pub guard: Option<Expression>,
     pub body: Block,
     pub span: Span,
 }

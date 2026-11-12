@@ -38,14 +38,14 @@ example, reference page. Gate: workspace tests; class A invariants unchanged or 
 
 | ID | Objective | Decision | Depends on | Risk | Status |
 | --- | --- | --- | --- | --- | --- |
-| T-LANG-18 | `Main(string[] args)`, exit status, standard error, environment | LANG-018 | — | low | todo |
+| T-LANG-18 | `Main(string[] args)`, exit status, standard error, environment | LANG-018 | — | low | **done 2026-11-12**: `Main()`/`Main(string[] args)`, `int` is the exit status (no longer printed; `--function` still prints), U+FFFD for invalid arguments, `aster run FILE -- ARGS`, `aster.io.WriteError`/`WriteErrorLine`, `aster.io.Environment.GetVariable` → `Option<string>` (names chosen by the implementation: the decision names no API) |
 | T-LANG-17 | `do`-`while`, `%=`, block comments, exponents, digit separators | LANG-017 | — | low | **done 2026-11-11** (`e2ab68e`; workspace 2,923 passed) |
 | T-FIX-FREM | Floating-point `%` and `%=` execute in the JIT (today a controlled "not yet supported" error; found by T-LANG-17) | LANG-017, numeric conformance | — | low | **done 2026-11-11**: runtime `aster_rt_fmod_f32/f64` (IEEE fmod, C# semantics); tests `float_remainder` 6, `jit` 154, `numeric_conformance` 12 pass |
 | T-LANG-16 | Real literal defaults to `double` (breaking; migrate examples and stdlib) | LANG-016 | T-LANG-17 | low | todo |
 | T-OBJ-5 | Constructor overloads and `this(…)` (B2 record first) | OBJ-005 | — | low | todo |
 | T-LANG-5 | Auto-properties and `init` | LANG-005 | — | low | todo |
 | T-LANG-4a | `switch` on integers, chars, strings | LANG-004 | — | low | **done 2026-11-11** (`61ab237`; workspace 2,923 passed) |
-| T-LANG-4b | `is T x` patterns and `when` guards | LANG-004 | T-LANG-4a | low | todo |
+| T-LANG-4b | `is T x` patterns and `when` guards | LANG-004 | T-LANG-4a | low | **done 2026-11-12**: `is T` / `is T x` (class hierarchy, C# definite assignment, §4.5 bounds-safe `ClassTest`), `when` guards; interface targets and `Option` unwrap deferred to T-OBJ-4 / later ("not supported yet") |
 | T-LANG-3 | `T?`, `null`, `??`, `?.` | LANG-003 | T-LANG-4b | medium | todo |
 | T-LANG-6 | Static fields per domain | LANG-006 | — | medium | todo |
 | T-LANG-9 | Struct receiver by reference; `ref` parameters (breaking) | LANG-009 | — | medium | todo |

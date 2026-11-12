@@ -669,6 +669,18 @@ pub enum Intrinsic {
     ConsoleReadLine,
     /// Temporary-arena counterpart of [`Self::ConsoleReadLine`].
     ConsoleReadLineTemporary,
+    /// `aster.io.WriteError(string)`: writes the argument's UTF-8 bytes to the
+    /// standard error stream of the console backend and flushes. Argument:
+    /// `[value]`; `return_type` always `void`.
+    ConsoleWriteError,
+    /// Internal `Environment.GetVariable` helper: `[name]` -> `bool`, whether
+    /// the process environment defines `name`.
+    EnvironmentHasVariable,
+    /// Internal `Environment.GetVariable` helper: `[name]` -> `string`, the
+    /// variable's value (empty when absent or not valid Unicode-lossy text).
+    EnvironmentGetVariable,
+    /// Temporary-arena counterpart of [`Self::EnvironmentGetVariable`].
+    EnvironmentGetVariableTemporary,
     /// `aster.io.ReadAllText(string)`: reads an entire file via the host
     /// filesystem backend into a freshly allocated persistent
     /// `Result<string, IOError>`. Argument: `[path]` (a `string`, only ever
@@ -728,6 +740,7 @@ impl Intrinsic {
             | Self::StringReplace
             | Self::StringSplit
             | Self::ConsoleReadLine
+            | Self::EnvironmentGetVariable
             | Self::FileReadAllText(_)
             | Self::FileListDirectories(_)
             | Self::ListGetRange => Some(AllocationRegion::Persistent),
@@ -752,6 +765,7 @@ impl Intrinsic {
             | Self::StringReplaceTemporary
             | Self::StringSplitTemporary
             | Self::ConsoleReadLineTemporary
+            | Self::EnvironmentGetVariableTemporary
             | Self::FileReadAllTextTemporary(_)
             | Self::FileListDirectoriesTemporary(_)
             | Self::ListGetRangeTemporary => Some(AllocationRegion::Temporary),
@@ -822,6 +836,8 @@ impl Intrinsic {
             | Self::StringTryParseDouble
             | Self::ConsoleWrite
             | Self::ConsoleWriteLine
+            | Self::ConsoleWriteError
+            | Self::EnvironmentHasVariable
             | Self::FileWriteAllText(_)
             | Self::FileAppendAllText(_)
             | Self::FileExists(_)
@@ -1007,6 +1023,14 @@ impl Intrinsic {
                 AllocationRegion::Temporary,
             ) => Self::ConsoleReadLineTemporary,
             (
+                Self::EnvironmentGetVariable | Self::EnvironmentGetVariableTemporary,
+                AllocationRegion::Persistent,
+            ) => Self::EnvironmentGetVariable,
+            (
+                Self::EnvironmentGetVariable | Self::EnvironmentGetVariableTemporary,
+                AllocationRegion::Temporary,
+            ) => Self::EnvironmentGetVariableTemporary,
+            (
                 Self::FileReadAllText(layout) | Self::FileReadAllTextTemporary(layout),
                 AllocationRegion::Persistent,
             ) => Self::FileReadAllText(layout),
@@ -1154,6 +1178,18 @@ pub enum RvalueKind {
     /// rvalue's class and the result is the same object pointer. Validation
     /// rejects any pair that is not a declared base chain.
     Upcast(Operand),
+    /// Identity-preserving class narrowing that backs the binding of a class
+    /// type pattern: the result is the same object pointer, statically typed
+    /// as a class related to the operand's class (derived, equal or base).
+    /// It performs no check and is only produced for a binding that is read
+    /// where a dominating `ClassTest` proved the test succeeded.
+    Downcast(Operand),
+    /// Run-time class test of a class reference: `true` when the object's
+    /// class is `class` or derives from it. The result type is `bool`.
+    ClassTest {
+        object: Operand,
+        class: SymbolId,
+    },
     MakeInterface {
         object: Operand,
         class: SymbolId,

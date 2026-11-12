@@ -1354,6 +1354,7 @@ impl Lowerer<'_> {
                             self.switch_pattern(case.span, &case.bindings);
                         (case_symbol, tag, bindings, None)
                     };
+                    let guard = case.guard.as_ref().map(|guard| self.expression(guard));
                     let arm = self.expression(&case.value);
                     self.scopes.pop();
                     lowered_cases.push(hir::SwitchExpressionCase {
@@ -1361,6 +1362,7 @@ impl Lowerer<'_> {
                         tag,
                         bindings,
                         label,
+                        guard,
                         value: arm,
                     });
                 }
@@ -1449,6 +1451,41 @@ impl Lowerer<'_> {
                         target: Box::new(target),
                         operator: assignment(*operator),
                         value: Box::new(value),
+                    },
+                }
+            }
+            ast::ExpressionKind::TypePattern {
+                value,
+                target,
+                binding,
+            } => {
+                let value = self.expression(value);
+                let target_type = self.resolve_type(target);
+                let hir::Type::Class(class) = target_type else {
+                    unreachable!("semantic analysis accepts only class pattern targets")
+                };
+                let binding = binding.as_ref().map(|binding| {
+                    let symbol = self.allocate();
+                    self.symbol_types.insert(symbol, target_type.clone());
+                    self.scopes
+                        .last_mut()
+                        .expect("pattern scope")
+                        .insert(binding.name.clone(), symbol);
+                    Box::new(hir::Variable {
+                        symbol,
+                        name: binding.name.clone(),
+                        visibility: None,
+                        type_: target_type.clone(),
+                        mutable: true,
+                        initializer: None,
+                    })
+                });
+                hir::Expression {
+                    type_: hir::Type::Bool,
+                    kind: hir::ExpressionKind::ClassTest {
+                        value: Box::new(value),
+                        class,
+                        binding,
                     },
                 }
             }

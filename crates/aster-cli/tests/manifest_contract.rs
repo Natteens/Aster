@@ -38,8 +38,9 @@ fn no_file_commands_find_the_nearest_manifest_from_nested_directories() {
     }
 
     let output = aster(&nested, ["run"]);
-    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert_eq!(stdout(&output).trim(), "42");
+    // `Main`'s `int` is the exit status and is not printed (LANG-018).
+    assert_eq!(output.status.code(), Some(42), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "");
     assert_eq!(stderr(&output), "");
 
     fs::remove_dir_all(root).expect("remove nested project");
@@ -70,8 +71,8 @@ fn the_nearest_manifest_wins_when_ancestors_have_manifests() {
     .expect("write source");
 
     let output = aster(&nested, ["run"]);
-    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert_eq!(stdout(&output).trim(), "7");
+    assert_eq!(output.status.code(), Some(7), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "");
     assert_eq!(stderr(&output), "");
 
     fs::remove_dir_all(root).expect("remove nearest-manifest project");

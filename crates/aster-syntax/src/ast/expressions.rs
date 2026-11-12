@@ -98,6 +98,16 @@ pub enum ExpressionKind {
         cases: Vec<SwitchExpressionCase>,
         default: Option<Box<Expression>>,
     },
+    /// Type pattern: `value is Type` or `value is Type name`. A boolean
+    /// expression; the optional binding is definitely assigned where the test
+    /// is known to have succeeded.
+    TypePattern {
+        value: Box<Expression>,
+        // Boxed so this variant does not enlarge every `Expression` (the
+        // recursive-descent parser's stack frames scale with its size).
+        target: Box<super::TypeRef>,
+        binding: Option<Box<PatternBinding>>,
+    },
     /// Explicit conversion: `(type)expression`.
     Cast {
         target: super::TypeRef,
@@ -119,6 +129,13 @@ pub enum ExpressionKind {
     },
 }
 
+/// The variable declared by a type pattern: `name` in `value is Type name`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PatternBinding {
+    pub name: String,
+    pub span: Span,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SwitchExpressionCase {
     pub enum_name: Option<String>,
@@ -126,6 +143,9 @@ pub struct SwitchExpressionCase {
     pub bindings: Vec<String>,
     /// See `SwitchCase::label`.
     pub label: Option<Expression>,
+    /// `when` guard: the arm is selected only when the pattern matches and
+    /// the guard is true; otherwise matching continues with later arms.
+    pub guard: Option<Expression>,
     pub value: Expression,
     pub span: Span,
 }

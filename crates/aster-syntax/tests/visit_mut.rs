@@ -205,6 +205,7 @@ fn fixture() -> Module {
                     case_name: "Some".to_owned(),
                     bindings: vec!["binding".to_owned()],
                     label: None,
+                    guard: None,
                     body: nested_block(46),
                     span: span(48),
                 }],

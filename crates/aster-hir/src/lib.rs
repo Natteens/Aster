@@ -99,6 +99,12 @@ pub enum Intrinsic {
     ConsoleWriteLine,
     /// `aster.io.ReadLine()`: reads one line into `Option<string>`; `None` on EOF.
     ConsoleReadLine,
+    /// `aster.io.WriteError(string)`: emits its argument's UTF-8 bytes to the
+    /// standard error stream verbatim.
+    ConsoleWriteError,
+    /// Internal `aster.io` environment helpers behind `Environment.GetVariable`.
+    EnvironmentHasVariable,
+    EnvironmentGetVariable,
     /// `aster.io.ReadAllText(string) -> Result<string, IOError>`: reads an
     /// entire UTF-8 text file via the host filesystem backend. The payload
     /// is resolved once, here in HIR lowering (never by the backend), from
@@ -377,6 +383,9 @@ pub struct SwitchCase {
     /// converted to the subject type. Then `case`/`tag` are placeholders and
     /// `bindings` is empty; MIR compares the subject with this value.
     pub label: Option<Expression>,
+    /// `when` guard, evaluated in the scope of `bindings` after the pattern
+    /// matched; when false, matching continues with the next case.
+    pub guard: Option<Expression>,
     pub body: Block,
 }
 
@@ -389,6 +398,9 @@ pub struct SwitchExpressionCase {
     /// converted to the subject type. Then `case`/`tag` are placeholders and
     /// `bindings` is empty; MIR compares the subject with this value.
     pub label: Option<Expression>,
+    /// `when` guard, evaluated in the scope of `bindings` after the pattern
+    /// matched; when false, matching continues with the next case.
+    pub guard: Option<Expression>,
     pub value: Expression,
 }
 
@@ -712,6 +724,17 @@ pub enum ExpressionKind {
     /// Covers both implicit widening and explicit `(type)value` casts.
     Convert {
         operand: Box<Expression>,
+    },
+    /// `value is Class` / `value is Class name`: a `bool` run-time test that
+    /// the class reference `value` is an instance of `class` or of a class
+    /// derived from it. The optional `binding` is a local aliasing the same
+    /// object with the narrower static type `class` (no copy); it is meaningful
+    /// only where semantic analysis proved the test succeeded, and is assigned
+    /// unconditionally. Interface targets are not represented here.
+    ClassTest {
+        value: Box<Expression>,
+        class: SymbolId,
+        binding: Option<Box<Variable>>,
     },
     /// Identity-preserving implicit conversion from a class reference to one of
     /// its base classes: the same object, no copy. This expression's type is

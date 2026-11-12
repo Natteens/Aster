@@ -23,6 +23,8 @@ int result = calculate(10, 20);
   the operator is right-associative. Its precedence sits between assignment (lower) and `||`
   (higher).
 - `&&` and `||` short-circuit.
+- `value is Type [name]` is a `bool` class type test at relational precedence (see
+  [control flow](06-control-flow.md#type-patterns-and-when-guards)); `is` is contextual.
 - The bitwise operators `&`, `|`, `^`, unary `~`, and the shifts `<<`, `>>`, `>>>` are implemented
   with C# precedence and semantics (see [types](02-types.md#bitwise-and-shift-operators)). `&`, `|`,
   and `^` on `bool` operands are eager: both operands are evaluated, left to right. `a & b == 0`

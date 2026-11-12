@@ -119,6 +119,7 @@ pub(crate) fn evaluate(
         | ExpressionKind::Try { .. }
         | ExpressionKind::Await { .. }
         | ExpressionKind::Switch { .. }
+        | ExpressionKind::TypePattern { .. }
         | ExpressionKind::Assignment { .. }
         | ExpressionKind::InterpolatedString { .. } => Err(ConstError::NotConstant(span)),
     }

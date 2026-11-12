@@ -385,6 +385,13 @@ impl MirTypeIndex {
         false
     }
 
+    /// Whether `a` and `b` are the same class or one derives from the other:
+    /// the pairs for which a class type test can succeed.
+    #[must_use]
+    pub fn class_related(&self, a: mir::SymbolId, b: mir::SymbolId) -> bool {
+        a == b || self.class_derives_from(a, b) || self.class_derives_from(b, a)
+    }
+
     /// Whether `class` is declared abstract.
     #[must_use]
     pub fn is_abstract_class(&self, class: mir::SymbolId) -> bool {
@@ -877,6 +884,32 @@ fn validate_typed_rvalue(
                 }
                 _ => Err(ValidationError::invalid(format!(
                     "function `{function_name}` upcasts to a class that is not a base of its operand"
+                ))),
+            }
+        }
+        mir::RvalueKind::Downcast(input) => {
+            operand(input)?;
+            match (&input.type_, &value.type_) {
+                (mir::Type::Class(from), mir::Type::Class(to))
+                    if types.class_related(*from, *to) =>
+                {
+                    Ok(())
+                }
+                _ => Err(ValidationError::invalid(format!(
+                    "function `{function_name}` narrows a class reference to an unrelated class"
+                ))),
+            }
+        }
+        mir::RvalueKind::ClassTest { object, class } => {
+            operand(object)?;
+            match &object.type_ {
+                mir::Type::Class(from)
+                    if value.type_ == mir::Type::Bool && types.class_related(*from, *class) =>
+                {
+                    Ok(())
+                }
+                _ => Err(ValidationError::invalid(format!(
+                    "function `{function_name}` has a malformed class test"
                 ))),
             }
         }

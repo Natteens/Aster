@@ -57,7 +57,7 @@ The standard library uses this form for `aster.math.Math`.
 
 Assigning a class variable copies its reference. `==` and `!=` therefore compare object identity,
 not fields. Objects are non-null in the current language and live in the per-run ExecutionContext.
-There is no downcast, static fields, auto-properties, finalizers, independent freeing, or `null`.
+There is no downcast expression (`(Derived)value` or `as`), static fields, auto-properties, finalizers, independent freeing, or `null`.
 Single inheritance and virtual dispatch are described in the next sections.
 
 ## Single inheritance
@@ -92,7 +92,10 @@ public class Circle : Shape
   `base(...)`.
 - A `Derived` value converts implicitly to `Base` (and to an interface the base implements). The
   conversion keeps the same object: no copy, `==` compares identity, and field writes are visible
-  through both references. There is no implicit or explicit `Base` to `Derived` conversion.
+  through both references. There is no implicit or explicit `Base` to `Derived` conversion; a
+  `Base` reference is narrowed with a type pattern, `if (value is Derived derived)`, which tests the
+  object's run-time class and binds the same object as `Derived` (see
+  [Control flow](../specification/06-control-flow.md#type-patterns-and-when-guards)).
 - Construction order: the arguments of `new`, then the object is allocated, then the derived class's
   field initializers, then the arguments of `base(...)` (which cannot use `this` or fields), then the
   base constructor (running the same sequence up the chain), then the derived constructor's body. A
@@ -162,7 +165,8 @@ int total = shape.Describe();   // 25 + 20
 - An interface implemented through a virtual method dispatches dynamically: a `Base` reference whose
   object is a `Derived` converts to the interface and a call through it runs `Derived`'s override.
   The conversion from a base-typed value to an interface still needs the static class to implement
-  it; looking up an interface table from the dynamic type of a base-typed value is not available yet.
+  it; looking up an interface table from the dynamic type of a base-typed value is not available yet,
+  so `value is IShape s` is rejected as not supported yet.
 - A virtual call is an escape of its receiver for the memory analyses (the callee is unknown until
   devirtualized), so an object that receives one is never eliminated or kept in a temporary region.
 

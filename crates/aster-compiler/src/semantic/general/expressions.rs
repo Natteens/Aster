@@ -476,6 +476,11 @@ impl Analyzer<'_> {
                 default,
             } => self.switch_expression(value, cases, default.as_deref(), expression.span, None),
             ExpressionKind::Cast { target, operand } => self.cast(target, operand, expression.span),
+            ExpressionKind::TypePattern {
+                value,
+                target,
+                binding,
+            } => self.type_pattern(value, target, binding.as_deref(), expression.span),
             ExpressionKind::Binary {
                 left,
                 operator,
@@ -488,11 +493,21 @@ impl Analyzer<'_> {
                 } else {
                     self.expression(left)
                 };
+                // The right operand of `&&` runs only when the left was true
+                // and that of `||` only when it was false: pattern variables
+                // the left operand proves are definitely assigned there.
+                let assumed = match operator {
+                    BinaryOperator::LogicalAnd => super::statements::pattern_assigned(left, true),
+                    BinaryOperator::LogicalOr => super::statements::pattern_assigned(left, false),
+                    _ => Vec::new(),
+                };
+                let assumed = self.mark_assigned(&assumed);
                 let right_type = if identity {
                     self.expression_receiver(right)
                 } else {
                     self.expression(right)
                 };
+                self.unmark_assigned(&assumed);
                 let result = self.binary(*operator, &left_type, &right_type, expression.span);
                 if result != Type::Unknown
                     && let Some(operand) = binary_operand_type(*operator, &left_type, &right_type)
@@ -1044,6 +1059,149 @@ impl Analyzer<'_> {
         }
     }
 
+    /// `value is Type [name]`: a run-time class test. The target must be a class
+    /// related to the static class of the value (a derived class, or the same
+    /// or a base class, for which the test is always true); anything else can
+    /// never match and is an error. The binding is declared unassigned; the
+    /// definite-assignment rules mark it assigned where the test succeeded.
+    #[allow(clippy::too_many_lines)]
+    fn type_pattern(
+        &mut self,
+        value: &Expression,
+        target: &aster_syntax::TypeRef,
+        binding: Option<&aster_syntax::PatternBinding>,
+        span: Span,
+    ) -> Type {
+        let subject = if binding.is_some() {
+            self.expression(value)
+        } else {
+            self.expression_receiver(value)
+        };
+        let target_type = self.resolve_local_type(target);
+        let mut bound = Type::Unknown;
+        match (&subject, &target_type) {
+            (Type::Unknown, _) | (_, Type::Unknown) => {}
+            (_, Type::Interface(name)) => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!("a type pattern on interface `{name}` is not supported yet"),
+                        target.span,
+                    )
+                    .with_help("only class targets are supported; interface patterns need dynamic interface lookup"),
+                );
+            }
+            (Type::Interface(name), _) => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!("a type pattern on interface value `{name}` is not supported yet"),
+                        value.span,
+                    )
+                    .with_help("type patterns need a class-typed value"),
+                );
+            }
+            (Type::Enum(name), _) if self.is_official_option(name) => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "unwrapping an `Option<T>` with `is` is not supported yet",
+                        value.span,
+                    )
+                    .with_help("use a `switch` with `Some(value)` and `None` cases"),
+                );
+            }
+            (Type::Class(subject_class), Type::Class(target_class)) => {
+                if self.derives_from(target_class, subject_class)
+                    || self.derives_from(subject_class, target_class)
+                {
+                    bound = target_type.clone();
+                } else {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            format!(
+                                "pattern can never match: `{subject_class}` and `{target_class}` are unrelated classes"
+                            ),
+                            span,
+                        )
+                        .with_help("the target class must derive from, or be a base of, the value's class"),
+                    );
+                }
+            }
+            (Type::Class(_), other) => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "a type pattern target must be a class, found `{}`",
+                            other.display()
+                        ),
+                        target.span,
+                    )
+                    .with_help("name a class derived from the value's class"),
+                );
+            }
+            (other, _) => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "a type pattern requires a class-typed value, found `{}`",
+                            other.display()
+                        ),
+                        value.span,
+                    )
+                    .with_help("`is` tests the run-time class of a class reference"),
+                );
+            }
+        }
+        if let Some(binding) = binding {
+            // Same conservative rule as for an ordinary local: a class
+            // reference cannot cross the single `await` in this version.
+            if bound != Type::Unknown && self.async_state == super::AsyncAnalysisState::BeforeAwait
+            {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "a reference-typed local cannot be declared before `await` in this version",
+                        binding.span,
+                    )
+                    .with_help("only scalar locals may cross an `await`"),
+                );
+            }
+            self.declare(
+                &binding.name,
+                Binding {
+                    type_: bound,
+                    mutable: true,
+                    iteration_readonly: false,
+                    initialized: false,
+                    span: binding.span,
+                    value: None,
+                },
+            );
+        }
+        Type::Bool
+    }
+
+    /// Mark pattern variables definitely assigned; returns the ones that were
+    /// unassigned (and so must be restored by `unmark_assigned`).
+    pub(super) fn mark_assigned(&mut self, names: &[String]) -> Vec<String> {
+        let mut changed = Vec::new();
+        for name in names {
+            if let Some(binding) = self.binding_mut(name)
+                && !binding.initialized
+            {
+                binding.initialized = true;
+                changed.push(name.clone());
+            }
+        }
+        changed
+    }
+
+    pub(super) fn unmark_assigned(&mut self, names: &[String]) {
+        for name in names {
+            if let Some(binding) = self.binding_mut(name) {
+                binding.initialized = false;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn switch_expression(
         &mut self,
         value: &Expression,
@@ -1096,13 +1254,20 @@ impl Analyzer<'_> {
         let mut covered = HashSet::new();
         let mut result_type = None;
         for case in cases {
+            // A guarded arm can fall through, so it never counts as covering
+            // its case; it is still checked against the unguarded arms.
+            let mut scratch = covered.clone();
             let info = self.resolve_switch_pattern(
                 case.enum_name.as_deref(),
                 &case.case_name,
                 &case.bindings,
                 case.span,
                 &resolved,
-                &mut covered,
+                if case.guard.is_some() {
+                    &mut scratch
+                } else {
+                    &mut covered
+                },
             );
             self.scopes.push(HashMap::new());
             if let Some(info) = info {
@@ -1120,6 +1285,8 @@ impl Analyzer<'_> {
                     );
                 }
             }
+            let assigned = self.analyze_guard(case.guard.as_ref());
+            self.mark_assigned(&assigned);
             let arm_type = self.expression_expected(&case.value, expected);
             if let Some(expected) = expected {
                 self.require_assignable_value(expected, &arm_type, &case.value);
@@ -1166,11 +1333,22 @@ impl Analyzer<'_> {
         let mut seen = HashSet::new();
         let mut result_type = None;
         for case in cases {
-            self.check_scalar_label(selected, case.label.as_ref(), case.span, &mut seen);
+            // A guarded arm can fall through, so its label is only checked
+            // against earlier unguarded arms and is not recorded.
+            if case.guard.is_some() {
+                let mut scratch = seen.clone();
+                self.check_scalar_label(selected, case.label.as_ref(), case.span, &mut scratch);
+            } else {
+                self.check_scalar_label(selected, case.label.as_ref(), case.span, &mut seen);
+            }
+            self.scopes.push(HashMap::new());
+            let assigned = self.analyze_guard(case.guard.as_ref());
+            self.mark_assigned(&assigned);
             let arm_type = self.expression_expected(&case.value, expected);
             if let Some(expected) = expected {
                 self.require_assignable_value(expected, &arm_type, &case.value);
             }
+            self.scopes.pop();
             result_type = Some(self.switch_result_type(result_type, arm_type, case.value.span));
         }
         if let Some(default) = default {

@@ -793,6 +793,43 @@ impl FunctionLowerer {
                     .expect("validated class upcast has an object");
                 Some(self.temporary(expression.type_.clone(), mir::RvalueKind::Upcast(object)))
             }
+            hir::ExpressionKind::ClassTest {
+                value,
+                class,
+                binding,
+            } => {
+                let object = self
+                    .lower_expression(value)
+                    .expect("validated class test operand produces a value");
+                let test = self.temporary(
+                    mir::Type::Bool,
+                    mir::RvalueKind::ClassTest {
+                        object: object.clone(),
+                        class: *class,
+                    },
+                );
+                if let Some(binding) = binding {
+                    // The binding is the same object pointer with the narrower
+                    // static type. It is assigned unconditionally (no extra
+                    // control flow); semantic analysis guarantees it is read
+                    // only where the test succeeded.
+                    let local = self.source_local(
+                        binding.symbol,
+                        binding.name.clone(),
+                        binding.type_.clone(),
+                        binding.mutable,
+                    );
+                    self.locals.push(local.clone());
+                    self.assign(
+                        mir::Place::Local(local.id),
+                        mir::Rvalue {
+                            type_: binding.type_.clone(),
+                            kind: mir::RvalueKind::Downcast(object),
+                        },
+                    );
+                }
+                Some(test)
+            }
             hir::ExpressionKind::UpcastInterface {
                 object,
                 class,
@@ -1686,6 +1723,9 @@ pub(super) fn lower_intrinsic(intrinsic: hir::Intrinsic) -> mir::Intrinsic {
         hir::Intrinsic::AssertionEqual => mir::Intrinsic::AssertionEqual,
         hir::Intrinsic::ConsoleWrite => mir::Intrinsic::ConsoleWrite,
         hir::Intrinsic::ConsoleWriteLine => mir::Intrinsic::ConsoleWriteLine,
+        hir::Intrinsic::ConsoleWriteError => mir::Intrinsic::ConsoleWriteError,
+        hir::Intrinsic::EnvironmentHasVariable => mir::Intrinsic::EnvironmentHasVariable,
+        hir::Intrinsic::EnvironmentGetVariable => mir::Intrinsic::EnvironmentGetVariable,
         hir::Intrinsic::ConsoleReadLine => mir::Intrinsic::ConsoleReadLine,
         // `FileIoResultLayout` is the identical type re-exported by both
         // crates (`aster_mir::FileIoResultLayout` is `aster_hir`'s), so the

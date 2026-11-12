@@ -1253,6 +1253,9 @@ fn rvalue_mentions_fine_owned(value: &mir::Rvalue, owned: &BTreeMap<u32, FineOwn
     match &value.kind {
         mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Discriminant(operand)
+        | mir::RvalueKind::ClassTest {
+            object: operand, ..
+        }
         | mir::RvalueKind::ArrayLength(operand)
         | mir::RvalueKind::ListLength(operand)
         | mir::RvalueKind::DictionaryLength(operand)
@@ -1260,6 +1263,7 @@ fn rvalue_mentions_fine_owned(value: &mir::Rvalue, owned: &BTreeMap<u32, FineOwn
         | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
         | mir::RvalueKind::Upcast(operand)
+        | mir::RvalueKind::Downcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => operand_mentions_owned_builder(operand, owned),
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             fields
@@ -1351,6 +1355,7 @@ fn is_execution_safe_rvalue(value: &mir::Rvalue) -> bool {
         mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Cast(operand)
         | mir::RvalueKind::Upcast(operand)
+        | mir::RvalueKind::Downcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => is_execution_safe_operand(operand),
         mir::RvalueKind::Binary {
             left,
@@ -1374,6 +1379,7 @@ fn is_execution_safe_rvalue(value: &mir::Rvalue) -> bool {
         mir::RvalueKind::Aggregate(_)
         | mir::RvalueKind::EnumConstruct { .. }
         | mir::RvalueKind::Discriminant(_)
+        | mir::RvalueKind::ClassTest { .. }
         | mir::RvalueKind::ListLength(_)
         | mir::RvalueKind::DictionaryLength(_)
         | mir::RvalueKind::ListVersion(_)
@@ -1470,6 +1476,9 @@ fn rvalue_contains_type(value: &mir::Rvalue, predicate: fn(&mir::Type) -> bool) 
         || match &value.kind {
             mir::RvalueKind::Use(operand)
             | mir::RvalueKind::Discriminant(operand)
+            | mir::RvalueKind::ClassTest {
+                object: operand, ..
+            }
             | mir::RvalueKind::ArrayLength(operand)
             | mir::RvalueKind::ListLength(operand)
             | mir::RvalueKind::DictionaryLength(operand)
@@ -1477,6 +1486,7 @@ fn rvalue_contains_type(value: &mir::Rvalue, predicate: fn(&mir::Type) -> bool) 
             | mir::RvalueKind::StringByteLength(operand)
             | mir::RvalueKind::Cast(operand)
             | mir::RvalueKind::Upcast(operand)
+            | mir::RvalueKind::Downcast(operand)
             | mir::RvalueKind::Unary { operand, .. } => predicate(&operand.type_),
             mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
                 fields.iter().any(|field| predicate(&field.value.type_))

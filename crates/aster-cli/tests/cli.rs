@@ -72,8 +72,9 @@ fn conventional_main_and_explicit_function_remain_supported() {
     )
     .expect("write conventional entry");
     let main_output = aster(["run", main.to_str().expect("UTF-8 temporary path")]);
-    assert!(main_output.status.success());
-    assert_eq!(stdout(&main_output).trim(), "42");
+    // `Main`'s `int` is the exit status and is not printed (LANG-018).
+    assert_eq!(main_output.status.code(), Some(42));
+    assert_eq!(stdout(&main_output), "");
 
     let function = directory.join("function.aster");
     fs::write(&function, "public int Calculate() { return 42; }").expect("write explicit function");
@@ -170,8 +171,14 @@ fn field_initializer_construction_runs_without_panicking() {
     let run_output = aster(["run", main.to_str().expect("UTF-8 temporary path")]);
     fs::remove_dir_all(&directory).expect("remove temporary directory");
     assert!(check_output.status.success(), "{}", stderr(&check_output));
-    assert!(run_output.status.success(), "{}", stderr(&run_output));
-    assert_eq!(stdout(&run_output).trim(), "42");
+    // The `int` returned by `Main` is the exit status (LANG-018), not output.
+    assert_eq!(
+        run_output.status.code(),
+        Some(42),
+        "{}",
+        stderr(&run_output)
+    );
+    assert_eq!(stdout(&run_output), "");
 }
 
 #[test]
@@ -207,8 +214,8 @@ fn absolute_source_path_and_embedded_stdlib_work_outside_the_repository() {
         .output()
         .expect("run Aster binary outside repository");
     fs::remove_dir_all(&directory).expect("remove temporary directory");
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(stdout(&output).trim(), "42");
+    assert_eq!(output.status.code(), Some(42), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "");
 }
 
 #[test]

@@ -246,6 +246,29 @@ impl PreparedProgram {
             console_backend,
             filesystem_backend,
             None,
+            None,
+        )
+        .map(|(value, stats, _)| (value, stats))
+    }
+
+    /// Run an entry declared `Main(string[] args)` once, passing `arguments`
+    /// as a fresh persistent `string[]` allocated in the invocation's context.
+    pub(super) fn invoke_with_arguments(
+        &self,
+        symbol: mir::SymbolId,
+        collect_stats: bool,
+        task_runtime: Option<*mut ()>,
+        arguments: &[String],
+        console_backend: Option<Box<dyn aster_runtime::ConsoleBackend>>,
+    ) -> Result<(ExecutionValue, super::MemoryStats), BackendError> {
+        self.invoke_observed(
+            symbol,
+            collect_stats,
+            task_runtime,
+            console_backend,
+            None,
+            None,
+            Some(arguments),
         )
         .map(|(value, stats, _)| (value, stats))
     }
@@ -256,7 +279,7 @@ impl PreparedProgram {
         symbol: mir::SymbolId,
         task_runtime: Option<*mut ()>,
     ) -> Result<(ExecutionValue, aster_runtime::AarmMemoryTelemetry), BackendError> {
-        self.invoke_observed(symbol, true, task_runtime, None, None, None)
+        self.invoke_observed(symbol, true, task_runtime, None, None, None, None)
             .map(|(value, _, telemetry)| {
                 (
                     value,
@@ -272,7 +295,7 @@ impl PreparedProgram {
         task_runtime: Option<*mut ()>,
         governor: Arc<aster_runtime::MemoryGovernor>,
     ) -> Result<(ExecutionValue, aster_runtime::AarmMemoryTelemetry), BackendError> {
-        self.invoke_observed(symbol, true, task_runtime, None, None, Some(governor))
+        self.invoke_observed(symbol, true, task_runtime, None, None, Some(governor), None)
             .map(|(value, _, telemetry)| {
                 (
                     value,
@@ -281,6 +304,7 @@ impl PreparedProgram {
             })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn invoke_observed(
         &self,
         symbol: mir::SymbolId,
@@ -289,6 +313,7 @@ impl PreparedProgram {
         console_backend: Option<Box<dyn aster_runtime::ConsoleBackend>>,
         filesystem_backend: Option<Box<dyn aster_runtime::FileSystemBackend>>,
         governor: Option<Arc<aster_runtime::MemoryGovernor>>,
+        arguments: Option<&[String]>,
     ) -> Result<
         (
             ExecutionValue,
@@ -320,7 +345,22 @@ impl PreparedProgram {
         if let Some(backend) = filesystem_backend {
             execution_context.set_filesystem_backend(backend);
         }
-        let value = invoke_finalized(*pointer, return_type, &mut execution_context);
+        let value = match arguments {
+            None => invoke_finalized(*pointer, return_type, &mut execution_context),
+            Some(arguments) => {
+                let array = execution_context.allocate_string_array(arguments);
+                if array.is_null() {
+                    Ok(ExecutionValue::Void)
+                } else {
+                    invoke_finalized_with_arguments(
+                        *pointer,
+                        return_type,
+                        Some(array),
+                        &mut execution_context,
+                    )
+                }
+            }
+        };
         let runtime_error = execution_context.take_error();
         #[cfg(feature = "mem-exp-rc-core")]
         execution_context.refresh_object_heap_stats();
@@ -1023,6 +1063,44 @@ pub(super) fn execute_resolved(
     )
 }
 
+/// Counterpart of [`execute_resolved`] for an entry declared
+/// `Main(string[] args)`: `arguments` becomes that `string[]`.
+pub(super) fn execute_resolved_with_arguments(
+    module: &mir::Module,
+    entry: &mir::Function,
+    arguments: &[String],
+    collect_stats: bool,
+    console_backend: Option<Box<dyn aster_runtime::ConsoleBackend>>,
+) -> Result<(ExecutionValue, super::MemoryStats), BackendError> {
+    let prepared = PreparedProgram::prepare(module)?;
+    if !module_uses_tasks(module) {
+        return prepared.invoke_with_arguments(
+            entry.symbol,
+            collect_stats,
+            None,
+            arguments,
+            console_backend,
+        );
+    }
+    let prepared = SharedProgram::new(prepared);
+    let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let mut runtime = TaskRuntime::with_program(
+        &Arc::new(module.clone()),
+        worker_count,
+        &Arc::new(aster_runtime::ForeignRegistry::new()),
+        Arc::clone(&prepared),
+    )?;
+    // Same pointer discipline as `execute_resolved`: `runtime` outlives the call.
+    let pointer = std::ptr::from_mut(&mut runtime).cast::<()>();
+    prepared.invoke_with_arguments(
+        entry.symbol,
+        collect_stats,
+        Some(pointer),
+        arguments,
+        console_backend,
+    )
+}
+
 pub(super) fn execute_resolved_with_worker_count(
     module: &mir::Module,
     entry: &mir::Function,
@@ -1226,73 +1304,54 @@ fn invoke_finalized(
     return_type: &mir::Type,
     context: &mut aster_runtime::ExecutionContext,
 ) -> Result<ExecutionValue, BackendError> {
+    invoke_finalized_with_arguments(pointer, return_type, None, context)
+}
+
+/// Like [`invoke_finalized`], for an entry declared `Main(string[] args)`:
+/// `arguments` is the host-allocated `string[]` passed as the one visible
+/// parameter after the hidden context. `None` calls the zero-parameter ABI.
+#[allow(unsafe_code)]
+fn invoke_finalized_with_arguments(
+    pointer: *const u8,
+    return_type: &mir::Type,
+    arguments: Option<*mut aster_runtime::AsterArray>,
+    context: &mut aster_runtime::ExecutionContext,
+) -> Result<ExecutionValue, BackendError> {
+    // SAFETY (all arms): the function was declared and finalized with the
+    // ABI selected here: `(context) -> native` without arguments, or
+    // `(context, array) -> native` when the entry takes `string[] args`.
+    macro_rules! call {
+        ($native:ty) => {{
+            match arguments {
+                None => {
+                    let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> $native =
+                        unsafe { std::mem::transmute(pointer) };
+                    function(context)
+                }
+                Some(array) => {
+                    let function: extern "C" fn(
+                        *mut aster_runtime::ExecutionContext,
+                        *mut aster_runtime::AsterArray,
+                    ) -> $native = unsafe { std::mem::transmute(pointer) };
+                    function(context, array)
+                }
+            }
+        }};
+    }
     let value = match return_type {
-        mir::Type::SByte => {
-            // SAFETY: The function was declared and finalized as `() -> i8` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> i8 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::SByte(function(context))
-        }
-        mir::Type::Byte => {
-            // SAFETY: The function was declared and finalized as `() -> i8` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> u8 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::Byte(function(context))
-        }
-        mir::Type::Short => {
-            // SAFETY: The function was declared and finalized as `() -> i16` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> i16 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::Short(function(context))
-        }
-        mir::Type::UShort => {
-            // SAFETY: The function was declared and finalized as `() -> i16` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> u16 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::UShort(function(context))
-        }
-        mir::Type::UInt => {
-            // SAFETY: The function was declared and finalized as `() -> i32` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> u32 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::UInt(function(context))
-        }
-        mir::Type::ULong => {
-            // SAFETY: The function was declared and finalized as `() -> i64` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> u64 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::ULong(function(context))
-        }
-        mir::Type::Int => {
-            // SAFETY: The function was declared and finalized as `() -> i32` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> i32 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::Int(function(context))
-        }
-        mir::Type::Long => {
-            // SAFETY: The function was declared and finalized as `() -> i64` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> i64 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::Long(function(context))
-        }
-        mir::Type::Float => {
-            // SAFETY: The function was declared and finalized as `() -> f32` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> f32 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::float(function(context))
-        }
-        mir::Type::Double => {
-            // SAFETY: The function was declared and finalized as `() -> f64` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> f64 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::double(function(context))
-        }
+        mir::Type::SByte => ExecutionValue::SByte(call!(i8)),
+        mir::Type::Byte => ExecutionValue::Byte(call!(u8)),
+        mir::Type::Short => ExecutionValue::Short(call!(i16)),
+        mir::Type::UShort => ExecutionValue::UShort(call!(u16)),
+        mir::Type::UInt => ExecutionValue::UInt(call!(u32)),
+        mir::Type::ULong => ExecutionValue::ULong(call!(u64)),
+        mir::Type::Int => ExecutionValue::Int(call!(i32)),
+        mir::Type::Long => ExecutionValue::Long(call!(i64)),
+        mir::Type::Float => ExecutionValue::float(call!(f32)),
+        mir::Type::Double => ExecutionValue::double(call!(f64)),
         mir::Type::Char => {
-            // SAFETY: The function was declared and finalized as `() -> i32` above,
-            // holding a Unicode scalar value.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> u32 =
-                unsafe { std::mem::transmute(pointer) };
-            let value = function(context);
+            // The function returns a Unicode scalar value as `i32`.
+            let value = call!(u32);
             let value = char::from_u32(value).ok_or_else(|| {
                 BackendError::new(format!(
                     "Aster function returned invalid Unicode scalar value U+{value:08X} as `char`"
@@ -1300,20 +1359,11 @@ fn invoke_finalized(
             })?;
             ExecutionValue::Char(value)
         }
-        mir::Type::Bool => {
-            // SAFETY: The function was declared and finalized as `() -> i8` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> u8 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::Bool(function(context) != 0)
-        }
+        mir::Type::Bool => ExecutionValue::Bool(call!(u8) != 0),
         mir::Type::String => {
-            // SAFETY: The function was declared and finalized as `() -> ptr`,
-            // where the pointer follows the runtime string ABI and stays valid
+            // The pointer follows the runtime string ABI and stays valid
             // while the JIT module is alive.
-            let function: extern "C" fn(
-                *mut aster_runtime::ExecutionContext,
-            ) -> *const aster_runtime::AsterStrHeader = unsafe { std::mem::transmute(pointer) };
-            let result = function(context);
+            let result = call!(*const aster_runtime::AsterStrHeader);
             // SAFETY: the returned pointer originates from this module's data
             // section; the module is still alive here and `decode_str` copies
             // the payload before the module can be dropped.
@@ -1326,24 +1376,16 @@ fn invoke_finalized(
             }
         }
         mir::Type::Void => {
-            // SAFETY: The function was declared and finalized as `() -> ()` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) =
-                unsafe { std::mem::transmute(pointer) };
-            function(context);
+            call!(());
             ExecutionValue::Void
         }
-        mir::Type::Task(_) => {
-            // SAFETY: The function was declared and finalized as `() -> i64`
-            // above (`Task<T>` is always a plain handle, never a pointer).
-            // `execute`/`execute_symbol` themselves never reach this arm
-            // (`validate_invocable_entry` rejects a `Task<T>` entry with a
-            // controlled error first); this stays defensive for any other
-            // caller of `PreparedProgram::invoke`, such as internal tests
-            // that call an async wrapper directly.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> i64 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::Long(function(context))
-        }
+        // `Task<T>` is always a plain handle, never a pointer. `execute`/
+        // `execute_symbol` themselves never reach this arm
+        // (`validate_invocable_entry` rejects a `Task<T>` entry with a
+        // controlled error first); this stays defensive for any other
+        // caller of `PreparedProgram::invoke`, such as internal tests
+        // that call an async wrapper directly.
+        mir::Type::Task(_) => ExecutionValue::Long(call!(i64)),
         _ => unreachable!("entry return type was validated before code generation"),
     };
     Ok(value)

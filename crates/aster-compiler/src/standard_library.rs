@@ -288,6 +288,18 @@ impl StandardLibrary {
                 ),
                 ("aster.io::ReadLine".to_owned(), Intrinsic::ConsoleReadLine),
                 (
+                    "aster.io::WriteError".to_owned(),
+                    Intrinsic::ConsoleWriteError,
+                ),
+                (
+                    "aster.io::__EnvironmentHas".to_owned(),
+                    Intrinsic::EnvironmentHasVariable,
+                ),
+                (
+                    "aster.io::__EnvironmentGet".to_owned(),
+                    Intrinsic::EnvironmentGetVariable,
+                ),
+                (
                     // Marker only: `hir_lowering::declarations::function`
                     // replaces this placeholder payload with the real,
                     // symbol-resolved `FileIoResultLayout` once it can
