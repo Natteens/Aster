@@ -1,9 +1,9 @@
 use super::{
     AccessorKind, Analyzer, Binding, Callable, CallableKey, Context, Diagnostic, EnumCaseInfo,
     Expression, ExpressionKind, Field, FunctionDeclaration, HashMap, HashSet, InterpolatedPart,
-    Item, Member, Model, Module, Property, PropertyInfo, Signature, Span, Statement, Type,
-    TypeDeclaration, TypeInfo, TypeKind, TypeName, TypeRef, Visibility, callable_key, resolve_type,
-    resolve_type_readonly,
+    Item, Member, MemberDispatch, Model, Module, Property, PropertyInfo, Signature, Span,
+    Statement, Type, TypeDeclaration, TypeInfo, TypeKind, TypeName, TypeRef, Visibility,
+    callable_key, resolve_type, resolve_type_readonly,
 };
 
 pub(super) fn collect_type_names(module: &Module, context: &mut Context) {
@@ -174,6 +174,7 @@ pub(super) fn collect_declarations(
                     visibility: function.visibility,
                     is_static: true,
                     is_foreign: function.is_foreign,
+                    dispatch: MemberDispatch::None,
                     key: callable_key(
                         &function.name,
                         function.span.start,
@@ -333,6 +334,7 @@ fn collect_type_members(
                         visibility: method.visibility,
                         is_static: false,
                         is_foreign: false,
+                        dispatch: MemberDispatch::None,
                         key: callable_key(
                             &method.name,
                             method.span.start,
@@ -368,6 +370,7 @@ fn collect_type_members(
                     visibility: method.visibility,
                     is_static: method.is_static,
                     is_foreign: false,
+                    dispatch: method.dispatch,
                     key: callable_key(
                         &method.name,
                         method.span.start,
@@ -376,6 +379,19 @@ fn collect_type_members(
                         Some(&declaration.name),
                     ),
                 };
+                check_dispatch_modifier(
+                    method.dispatch,
+                    method.is_static,
+                    method.visibility,
+                    "method",
+                    method.span,
+                    declaration,
+                    kind,
+                    diagnostics,
+                );
+                if method.dispatch != MemberDispatch::None {
+                    context.virtual_callables.insert(callable.key.clone());
+                }
                 let overloads = methods.entry(method.name.clone()).or_default();
                 if overloads
                     .iter()
@@ -451,6 +467,7 @@ fn collect_type_members(
                     visibility: accessor.visibility,
                     is_static: false,
                     is_foreign: false,
+                    dispatch: property.dispatch,
                     key: callable_key(
                         &property.name,
                         property.span.start,
@@ -469,6 +486,7 @@ fn collect_type_members(
                     visibility: accessor.visibility,
                     is_static: false,
                     is_foreign: false,
+                    dispatch: property.dispatch,
                     key: callable_key(
                         &property.name,
                         property.span.start,
@@ -477,6 +495,32 @@ fn collect_type_members(
                         Some(&declaration.name),
                     ),
                 });
+                check_dispatch_modifier(
+                    property.dispatch,
+                    false,
+                    property.visibility,
+                    "property",
+                    property.span,
+                    declaration,
+                    kind,
+                    diagnostics,
+                );
+                if property.dispatch != MemberDispatch::None {
+                    for accessor in property.getter.iter().chain(property.setter.iter()) {
+                        if accessor.visibility == Visibility::Private {
+                            diagnostics.push(
+                                Diagnostic::error(
+                                    "an accessor of a `virtual`, `override` or `abstract` property cannot be private",
+                                    accessor.span,
+                                )
+                                .with_help("a derived class cannot see a private accessor; make it `protected` or `public`"),
+                            );
+                        }
+                    }
+                    for accessor in getter.iter().chain(setter.iter()) {
+                        context.virtual_callables.insert(accessor.key.clone());
+                    }
+                }
                 properties.insert(
                     property.name.clone(),
                     PropertyInfo {
@@ -1114,6 +1158,7 @@ fn validate_function_with_initialized_fields(
                         callable: call.callable,
                         span: call.span,
                         unassigned: call.unassigned,
+                        virtual_dispatch: call.virtual_dispatch,
                     });
             }
         } else if let Some(key) = summary_key {
@@ -1121,6 +1166,7 @@ fn validate_function_with_initialized_fields(
                 key,
                 super::ThisSummary {
                     escape: usage.escape,
+                    virtual_call: usage.virtual_call,
                     reads: usage.reads,
                     calls: usage.calls.into_iter().map(|call| call.callable).collect(),
                 },
@@ -1562,7 +1608,10 @@ fn collect_expression_calls<'a>(expression: &'a Expression, out: &mut Vec<&'a Ex
         out.push(expression);
     }
     match &expression.kind {
-        ExpressionKind::Literal(_) | ExpressionKind::Name(_) | ExpressionKind::This => {}
+        ExpressionKind::Literal(_)
+        | ExpressionKind::Name(_)
+        | ExpressionKind::This
+        | ExpressionKind::Base => {}
         ExpressionKind::StructLiteral { fields, .. } => {
             for field in fields {
                 collect_expression_calls(&field.value, out);
@@ -1749,7 +1798,10 @@ fn collect_expression_awaits<'a>(expression: &'a Expression, out: &mut Vec<&'a E
                 }
             }
         }
-        ExpressionKind::Literal(_) | ExpressionKind::Name(_) | ExpressionKind::This => {}
+        ExpressionKind::Literal(_)
+        | ExpressionKind::Name(_)
+        | ExpressionKind::This
+        | ExpressionKind::Base => {}
     }
 }
 
@@ -1760,6 +1812,10 @@ fn validate_property(
     diagnostics: &mut Vec<Diagnostic>,
     model: &mut Model,
 ) {
+    if property.dispatch == MemberDispatch::Abstract {
+        // Abstract accessors have no body to analyze.
+        return;
+    }
     let accessor_key = |kind: AccessorKind| {
         callable_key(
             &property.name,
@@ -1772,6 +1828,7 @@ fn validate_property(
     if let Some(getter) = &property.getter {
         let function = FunctionDeclaration {
             base_call: None,
+            dispatch: MemberDispatch::None,
             constructor: false,
             is_test: false,
             is_static: false,
@@ -1798,6 +1855,7 @@ fn validate_property(
     if let Some(setter) = &property.setter {
         let function = FunctionDeclaration {
             base_call: None,
+            dispatch: MemberDispatch::None,
             constructor: false,
             is_test: false,
             is_static: false,
@@ -1891,4 +1949,58 @@ fn duplicate_member(name: &str, span: Span, diagnostics: &mut Vec<Diagnostic>) {
         Diagnostic::error(format!("duplicate member `{name}`"), span)
             .with_help("rename or remove one of the members"),
     );
+}
+
+/// Declaration-time rules for `virtual`, `override` and `abstract` members
+/// (B1 N17): only instance members of a class, never private, and abstract
+/// members only in an abstract class. Whether an override matches an inherited
+/// member is decided later, once the hierarchy is merged.
+#[allow(clippy::too_many_arguments)]
+fn check_dispatch_modifier(
+    dispatch: MemberDispatch,
+    is_static: bool,
+    visibility: Visibility,
+    what: &str,
+    span: Span,
+    declaration: &TypeDeclaration,
+    kind: TypeKind,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let word = match dispatch {
+        MemberDispatch::None => return,
+        MemberDispatch::Virtual => "virtual",
+        MemberDispatch::Override => "override",
+        MemberDispatch::Abstract => "abstract",
+    };
+    if kind != TypeKind::Class {
+        diagnostics.push(
+            Diagnostic::error(format!("only a class {what} can be `{word}`"), span)
+                .with_help("remove the modifier"),
+        );
+    } else if is_static || declaration.is_static {
+        diagnostics.push(
+            Diagnostic::error(format!("a static {what} cannot be `{word}`"), span)
+                .with_help("static members are bound statically; remove `static` or the modifier"),
+        );
+    } else if visibility == Visibility::Private && dispatch != MemberDispatch::Override {
+        diagnostics.push(
+            Diagnostic::error(format!("a private {what} cannot be `{word}`"), span).with_help(
+                "a derived class cannot see a private member; make it `protected` or `public`",
+            ),
+        );
+    }
+    if dispatch == MemberDispatch::Abstract && !declaration.is_abstract && kind == TypeKind::Class {
+        diagnostics.push(
+            Diagnostic::error(
+                format!(
+                    "abstract {what} in class `{}`, which is not abstract",
+                    declaration.name
+                ),
+                span,
+            )
+            .with_help(
+                "declare the class `abstract`, or give the member a body and remove `abstract`",
+            ),
+        );
+    }
 }

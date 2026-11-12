@@ -271,6 +271,7 @@ impl Monomorphizer {
             ExpressionKind::Literal(value) => literal_type(value),
             ExpressionKind::Name(name) => environment.get(name).cloned().unwrap_or_default(),
             ExpressionKind::This => environment.get("this").cloned().unwrap_or_default(),
+            ExpressionKind::Base => String::new(),
             ExpressionKind::StructLiteral { type_name, fields } => {
                 for field in fields {
                     self.expression(&mut field.value, environment);

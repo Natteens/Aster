@@ -29,6 +29,7 @@ pub(super) fn rewrite(module: &mut mir::Module) {
             base: None,
             is_abstract: false,
             is_sealed: false,
+            vtable: Vec::new(),
             symbol: class,
             name: STRING_BUILDER_NAME.to_owned(),
             fields: Vec::new(),

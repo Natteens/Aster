@@ -38,8 +38,18 @@ enum-case           = identifier , [ parameters ] ;
 
 type-member         = [ visibility ] , [ "static" ] , [ "async" ] , type , identifier ,
                       ( field-tail | property-tail | function-tail ) ;
-class-member        = type-member | constructor ;
-constructor         = [ visibility ] , identifier , parameters , block ;
+class-member        = type-member | virtual-member | constructor ;
+(* `virtual`, `override` and `abstract` are contextual modifiers (an identifier of that
+   spelling stays usable as a name). A virtual member is a non-static, non-private method or
+   property of a class; `abstract` members have no body and only an `abstract class` declares
+   them. `sealed` applies to classes only, so `sealed override` is rejected. *)
+virtual-member      = [ visibility ] , ( "virtual" | "override" ) , type , identifier ,
+                      ( property-tail | function-tail )
+                    | [ visibility ] , "abstract" , type , identifier ,
+                      ( abstract-property-tail | parameters , ";" ) ;
+abstract-property-tail = "{" , ( "get" | "set" ) , ";" , [ ( "get" | "set" ) , ";" ] , "}" ;
+constructor         = [ visibility ] , identifier , parameters , [ base-call ] , block ;
+base-call           = ":" , "base" , "(" , [ argument , { "," , argument } ] , ")" ;
 interface-member    = [ visibility ] , type , identifier , parameters , ";" ;
 field-tail          = [ "=" , expression ] , ";" ;
 property-tail       = "{" , accessor , { accessor } , "}" ;
@@ -130,7 +140,9 @@ try-propagation     = "?" ;  (* Result propagation; see below *)
 arguments           = "(" , [ argument , { "," , argument } ] , ")" ;
 argument            = [ identifier , ":" ] , expression ;
 primary             = literal | enum-value | struct-literal | array-literal | new-array | new-object
-                    | "this" | identifier | "(" , expression , ")" ;
+                    | "this" | base-access | identifier | "(" , expression , ")" ;
+base-access         = "base" , "." , identifier ;  (* only as `base.Method(...)` or `base.Property`;
+                                                     a non-virtual use of the base member *)
 struct-literal      = named-type , "{" , field-value , { "," , field-value } , "}" ;
 field-value         = identifier , ":" , expression ;
 array-literal       = "[" , [ expression , { "," , expression } ] , "]" ;
@@ -250,7 +262,7 @@ visitors; it is not a general pattern-matching or expression-shape restriction.
 
 ## Unsupported language features
 
-Class inheritance is single and closed (see [classes](../reference/classes.md)); there is no virtual dispatch, interface inheritance, constructor/operator overloads, static
+Class inheritance is single and closed, with virtual dispatch (see [classes](../reference/classes.md)); there is no downcast, interface inheritance, constructor/operator overloads, static
 fields, auto-properties, general pattern matching, switch guards,
 exceptions, `goto`,
 or engine lifecycle syntax. Application entry selection is a tooling rule rather than grammar:

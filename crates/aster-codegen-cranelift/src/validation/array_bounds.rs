@@ -491,6 +491,7 @@ fn defines_direct_local(instruction: &mir::Instruction, local: mir::LocalId) -> 
         mir::Instruction::Call { destination, .. }
         | mir::Instruction::ForeignCall { destination, .. }
         | mir::Instruction::CallInterface { destination, .. }
+        | mir::Instruction::CallVirtual { destination, .. }
         | mir::Instruction::CallIntrinsic { destination, .. } => destination.as_ref(),
         mir::Instruction::StringDecodeNext {
             char_destination,

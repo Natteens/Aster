@@ -225,6 +225,7 @@ fn module(functions: Vec<mir::Function>) -> mir::Module {
                 base: None,
                 is_abstract: false,
                 is_sealed: false,
+                vtable: Vec::new(),
                 symbol: BOX_CLASS,
                 name: "Box".to_owned(),
                 fields: vec![mir::FieldDefinition {
@@ -237,6 +238,7 @@ fn module(functions: Vec<mir::Function>) -> mir::Module {
                 base: None,
                 is_abstract: false,
                 is_sealed: false,
+                vtable: Vec::new(),
                 symbol: STRING_BUILDER_CLASS,
                 name: "aster.core::StringBuilder".to_owned(),
                 fields: Vec::new(),

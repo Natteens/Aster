@@ -50,6 +50,7 @@ pub(super) fn lower(
     owner: Option<hir::SymbolId>,
     intrinsics: &HashMap<hir::SymbolId, hir::Intrinsic>,
     enum_cases: &Arc<HashMap<hir::SymbolId, mir::EnumCaseDefinition>>,
+    virtual_slots: &Arc<HashMap<hir::SymbolId, (u32, hir::SymbolId)>>,
     move_next_symbol: hir::SymbolId,
 ) -> (mir::Function, mir::Function) {
     let body = function
@@ -58,7 +59,14 @@ pub(super) fn lower(
         .expect("a validated async function has a body");
     let plan = AsyncPlan::new(body);
 
-    let move_next = lower_move_next(function, &plan, intrinsics, enum_cases, move_next_symbol);
+    let move_next = lower_move_next(
+        function,
+        &plan,
+        intrinsics,
+        enum_cases,
+        virtual_slots,
+        move_next_symbol,
+    );
     let wrapper = lower_wrapper(function, owner, move_next_symbol, plan.slots.len());
     (wrapper, move_next)
 }
@@ -145,9 +153,11 @@ fn lower_move_next(
     plan: &AsyncPlan<'_>,
     intrinsics: &HashMap<hir::SymbolId, hir::Intrinsic>,
     enum_cases: &Arc<HashMap<hir::SymbolId, mir::EnumCaseDefinition>>,
+    virtual_slots: &Arc<HashMap<hir::SymbolId, (u32, hir::SymbolId)>>,
     move_next_symbol: hir::SymbolId,
 ) -> mir::Function {
-    let mut lowerer = FunctionLowerer::new_bare(intrinsics.clone(), Arc::clone(enum_cases));
+    let mut lowerer = FunctionLowerer::new_bare(intrinsics.clone(), Arc::clone(enum_cases))
+        .with_virtual_slots(Arc::clone(virtual_slots));
 
     // Hidden scalar parameter carrying the outer async task's handle. It has
     // no source symbol, participates in no overload, and is validated

@@ -77,6 +77,10 @@ pub(super) struct ObjectDescriptors {
     /// descriptors point at these allocations.
     #[allow(dead_code, reason = "owns the arrays the descriptors point at")]
     ancestor_arrays: Vec<RawOwned<[*const aster_runtime::descriptor::ClassDescriptor]>>,
+    /// Virtual tables, one function address per slot (null until
+    /// [`Self::bind_virtual_tables`] runs, after the JIT module is finalized);
+    /// the descriptors point at these allocations.
+    vtables: HashMap<mir::SymbolId, RawOwned<[*const u8]>>,
     by_class: HashMap<mir::SymbolId, *const aster_runtime::descriptor::ClassDescriptor>,
     #[cfg(feature = "mem-exp-rc-core")]
     #[allow(
@@ -103,6 +107,7 @@ pub(super) struct ObjectDescriptors {
 }
 
 impl ObjectDescriptors {
+    #[allow(clippy::too_many_lines)]
     pub(super) fn build(layouts: &Layouts, module: &mir::Module) -> Result<Self, BackendError> {
         let mut store = Self::default();
         // `StringBuilder` objects have a native header without a count word,
@@ -156,6 +161,8 @@ impl ObjectDescriptors {
                     .into_boxed_slice(),
             );
             let entry_count = entries.as_ptr().len();
+            let vtable =
+                RawOwned::new(vec![std::ptr::null::<u8>(); class.vtable.len()].into_boxed_slice());
             let flags = (if class.is_abstract {
                 aster_runtime::descriptor::CLASS_FLAG_ABSTRACT
             } else {
@@ -186,6 +193,13 @@ impl ObjectDescriptors {
                 depth: 0,
                 ancestor_count: 0,
                 ancestors: std::ptr::null(),
+                vtable: if class.vtable.is_empty() {
+                    std::ptr::null()
+                } else {
+                    vtable.as_ptr().cast_const().cast()
+                },
+                vtable_count: u32::try_from(class.vtable.len())
+                    .map_err(|_| BackendError::new("class has too many virtual slots"))?,
             }));
             // Every later write and read goes through this raw pointer.
             store
@@ -194,6 +208,7 @@ impl ObjectDescriptors {
             #[cfg(feature = "mem-exp-rc-core")]
             store.offsets.push(offsets);
             store.interface_entries.insert(class.symbol, entries);
+            store.vtables.insert(class.symbol, vtable);
             store.classes.push(descriptor);
         }
         store.link_hierarchy(module)?;
@@ -334,6 +349,94 @@ impl ObjectDescriptors {
                 .table = address;
             }
             *slot += 1;
+        }
+        Ok(())
+    }
+
+    /// Write the finalized address of every virtual slot's function into the
+    /// class descriptors' virtual tables, then validate the result against the
+    /// MIR (object model B1, section 4.5): every table has exactly the
+    /// class's slot count, no entry is null, and an inherited slot whose
+    /// implementation the class did not replace holds exactly its base
+    /// class's entry. Must run after `finalize_definitions` and before any
+    /// generated code executes; descriptors are never written again.
+    ///
+    /// `address` maps a slot to the address of its implementation, or of the
+    /// stub of an abstract slot.
+    #[allow(unsafe_code)]
+    pub(super) fn bind_virtual_tables(
+        &mut self,
+        module: &mir::Module,
+        mut address: impl FnMut(&mir::VirtualSlot) -> Result<*const u8, BackendError>,
+    ) -> Result<(), BackendError> {
+        for class in &module.classes {
+            let Some(table) = self.vtables.get(&class.symbol).map(RawOwned::as_ptr) else {
+                return Err(BackendError::new("class descriptor has no virtual table"));
+            };
+            if table.len() != class.vtable.len() {
+                return Err(BackendError::new(
+                    "class descriptor virtual table has the wrong slot count",
+                ));
+            }
+            for (index, slot) in class.vtable.iter().enumerate() {
+                let function = address(slot)?;
+                // SAFETY: `table` is the published raw pointer of an array
+                // owned by `self` with `class.vtable.len()` entries, `index` is
+                // below that, and no generated code runs yet.
+                unsafe {
+                    table.cast::<*const u8>().add(index).write(function);
+                }
+            }
+        }
+        self.validate_virtual_tables(module)
+    }
+
+    /// Validate the filled virtual tables against the MIR.
+    #[allow(unsafe_code)]
+    fn validate_virtual_tables(&self, module: &mir::Module) -> Result<(), BackendError> {
+        let definitions = module
+            .classes
+            .iter()
+            .map(|class| (class.symbol, class))
+            .collect::<HashMap<_, _>>();
+        for class in &module.classes {
+            let own = self.by_class[&class.symbol];
+            // SAFETY: `own` is a descriptor owned by `self`; its table was
+            // written by `bind_virtual_tables` and points into allocations
+            // owned by `self`.
+            let entries = unsafe { (*own).vtable_entries() };
+            if entries.len() != class.vtable.len()
+                || unsafe { (*own).vtable_count } as usize != entries.len()
+            {
+                return Err(BackendError::new(
+                    "class descriptor virtual table has the wrong slot count",
+                ));
+            }
+            if entries.iter().any(|entry| entry.is_null()) {
+                return Err(BackendError::new(
+                    "class descriptor virtual table has an unbound slot",
+                ));
+            }
+            let Some(base) = class.base.and_then(|base| definitions.get(&base)) else {
+                continue;
+            };
+            let base_descriptor = self.by_class[&base.symbol];
+            // SAFETY: as above, for the base class's descriptor.
+            let base_entries = unsafe { (*base_descriptor).vtable_entries() };
+            if entries.len() < base_entries.len() {
+                return Err(BackendError::new(
+                    "class virtual table is shorter than its base class's",
+                ));
+            }
+            for (index, base_slot) in base.vtable.iter().enumerate() {
+                if class.vtable[index].implementation == base_slot.implementation
+                    && entries[index] != base_entries[index]
+                {
+                    return Err(BackendError::new(
+                        "class virtual table does not inherit its base class's slot",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -1059,6 +1162,7 @@ mod layout_tests {
                 base: None,
                 is_abstract: false,
                 is_sealed: false,
+                vtable: Vec::new(),
                 symbol: class,
                 name: "Node".to_owned(),
                 fields: vec![
@@ -1126,6 +1230,7 @@ mod layout_tests {
                 base: None,
                 is_abstract: false,
                 is_sealed: false,
+                vtable: Vec::new(),
                 symbol: mir::SymbolId(20),
                 name: "Empty".to_owned(),
                 fields: Vec::new(),
@@ -1134,6 +1239,7 @@ mod layout_tests {
                 base: None,
                 is_abstract: false,
                 is_sealed: false,
+                vtable: Vec::new(),
                 symbol: mir::SymbolId(21),
                 name: "Counter".to_owned(),
                 fields: vec![field(22, mir::Type::Int)],
@@ -1142,6 +1248,7 @@ mod layout_tests {
                 base: None,
                 is_abstract: false,
                 is_sealed: false,
+                vtable: Vec::new(),
                 symbol: mir::SymbolId(23),
                 name: "Mixed".to_owned(),
                 fields: vec![field(24, mir::Type::Byte), field(25, mir::Type::Long)],
@@ -1168,6 +1275,7 @@ mod layout_tests {
             base: None,
             is_abstract: false,
             is_sealed: false,
+            vtable: Vec::new(),
             symbol: mir::SymbolId(30),
             name: "Wide".to_owned(),
             fields: vec![
@@ -1267,6 +1375,7 @@ mod hierarchy_tests {
             base: base.map(mir::SymbolId),
             is_abstract: false,
             is_sealed: false,
+            vtable: Vec::new(),
             fields: fields
                 .into_iter()
                 .map(|(symbol, type_)| mir::FieldDefinition {

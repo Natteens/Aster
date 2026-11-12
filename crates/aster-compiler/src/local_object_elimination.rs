@@ -377,6 +377,12 @@ fn instruction_is_legal(instruction: &mir::Instruction, candidate: &Candidate) -
             receiver,
             arguments,
             ..
+        }
+        | mir::Instruction::CallVirtual {
+            destination,
+            receiver,
+            arguments,
+            ..
         } => {
             destination
                 .as_ref()
@@ -708,6 +714,12 @@ fn rewrite_instruction(
             }
         }
         mir::Instruction::CallInterface {
+            destination,
+            receiver,
+            arguments,
+            ..
+        }
+        | mir::Instruction::CallVirtual {
             destination,
             receiver,
             arguments,

@@ -119,6 +119,28 @@ pub struct ClassDefinition {
     /// The fields this class declares itself; inherited fields belong to the
     /// base chain's definitions.
     pub fields: Vec<FieldDefinition>,
+    /// The complete virtual table (object model B1, section 4.2): the base
+    /// class's slots in order, with overridden implementations replaced,
+    /// followed by the slots this class introduces. Empty for a class with no
+    /// virtual member anywhere in its chain.
+    pub vtable: Vec<VirtualSlot>,
+}
+
+/// One virtual dispatch slot. The slot index is the same in every class that
+/// inherits it, and the signature is fixed by the class that introduced it:
+/// overrides match it exactly (B1 U8).
+#[derive(Clone, Debug, PartialEq)]
+pub struct VirtualSlot {
+    /// Symbol of the method that introduced the slot: the identity of the slot
+    /// across the hierarchy. For an abstract slot it names no function body.
+    pub method: SymbolId,
+    pub name: String,
+    /// Parameter types without the receiver.
+    pub parameters: Vec<Type>,
+    pub return_type: Type,
+    /// The function a call through this class runs; `None` for an abstract
+    /// slot, which only an abstract class may leave unimplemented.
+    pub implementation: Option<SymbolId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -263,6 +285,21 @@ pub enum Instruction {
         destination: Option<Place>,
         receiver: Operand,
         method: SymbolId,
+        arguments: Vec<Operand>,
+        return_type: Type,
+    },
+    /// Virtual call through the dynamic class descriptor of `receiver` (object
+    /// model B1): load the descriptor from the object header, the function at
+    /// `slot` of its virtual table, and call it with `receiver` first. The
+    /// receiver's static type is a class whose `vtable[slot]` was introduced by
+    /// `method`; validation rejects any other pairing, and the slot index is a
+    /// compile-time constant below that table's length.
+    CallVirtual {
+        destination: Option<Place>,
+        receiver: Operand,
+        /// The method that introduced the slot (see [`VirtualSlot::method`]).
+        method: SymbolId,
+        slot: u32,
         arguments: Vec<Operand>,
         return_type: Type,
     },

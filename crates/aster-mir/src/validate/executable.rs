@@ -28,6 +28,9 @@ use crate as mir;
 /// I/O, clock reads, and the entropy seed read.
 #[allow(clippy::too_many_lines)]
 pub fn validate_no_console_io_in_workers(module: &mir::Module) -> Result<(), ValidationError> {
+    // A virtual call can reach any implementation of its slot.
+    let mut virtual_targets: HashMap<mir::SymbolId, Vec<mir::SymbolId>> = HashMap::new();
+    crate::ownership::add_virtual_targets(module, &mut virtual_targets);
     let mut callees: HashMap<mir::SymbolId, Vec<mir::SymbolId>> = HashMap::new();
     let mut io_users: HashSet<mir::SymbolId> = HashSet::new();
     let mut foreign_users: HashSet<mir::SymbolId> = HashSet::new();
@@ -39,6 +42,9 @@ pub fn validate_no_console_io_in_workers(module: &mir::Module) -> Result<(), Val
                     mir::Instruction::Call {
                         function: callee, ..
                     } => direct.push(*callee),
+                    mir::Instruction::CallVirtual { method, .. } => {
+                        direct.extend(virtual_targets.get(method).into_iter().flatten().copied());
+                    }
                     mir::Instruction::CallIntrinsic {
                         intrinsic:
                             mir::Intrinsic::ConsoleWrite
@@ -452,6 +458,7 @@ pub fn owned_region_direct_barrier(instruction: &mir::Instruction) -> bool {
         || matches!(
             instruction,
             mir::Instruction::CallInterface { .. }
+                | mir::Instruction::CallVirtual { .. }
                 | mir::Instruction::ListAdd { .. }
                 | mir::Instruction::DictionaryAdd { .. }
                 | mir::Instruction::DictionarySet { .. }
@@ -602,6 +609,12 @@ pub fn owned_instruction_reads(instruction: &mir::Instruction, reads: &mut HashS
             }
         }
         mir::Instruction::CallInterface {
+            destination,
+            receiver,
+            arguments,
+            ..
+        }
+        | mir::Instruction::CallVirtual {
             destination,
             receiver,
             arguments,
@@ -826,6 +839,7 @@ pub fn owned_instruction_definitions(
         } => owned_place_definition(target, definitions),
         mir::Instruction::Call { destination, .. }
         | mir::Instruction::CallInterface { destination, .. }
+        | mir::Instruction::CallVirtual { destination, .. }
         | mir::Instruction::CallIntrinsic { destination, .. } => {
             if let Some(destination) = destination {
                 owned_place_definition(destination, definitions);
@@ -1530,6 +1544,7 @@ pub fn temporary_subregion_instruction_is_executable(instruction: &mir::Instruct
         | mir::Instruction::Call { .. }
         | mir::Instruction::ForeignCall { .. }
         | mir::Instruction::CallInterface { .. }
+        | mir::Instruction::CallVirtual { .. }
         | mir::Instruction::AllocateList {
             region: mir::AllocationRegion::Persistent,
             ..

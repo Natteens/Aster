@@ -11,8 +11,8 @@
 
 use super::{
     Analyzer, Argument, Binding, Callable, Context, Diagnostic, FunctionDeclaration, HashMap,
-    HashSet, Item, Member, Model, Module, ResolvedBaseConstructor, Span, Type, TypeDeclaration,
-    TypeKind, Visibility, resolve_type_readonly,
+    HashSet, Item, Member, MemberDispatch, Model, Module, ResolvedBaseConstructor, Span, Type,
+    TypeDeclaration, TypeInfo, TypeKind, Visibility, resolve_type_readonly,
 };
 
 pub(super) fn resolve(module: &Module, context: &mut Context, diagnostics: &mut Vec<Diagnostic>) {
@@ -34,6 +34,7 @@ pub(super) fn resolve(module: &Module, context: &mut Context, diagnostics: &mut 
     for class in &classes {
         merge(&class.name, &by_name, context, &mut done, diagnostics);
     }
+    validate_overrides(&classes, context, diagnostics);
 }
 
 /// Classify every name after `:` and report the invalid ones.
@@ -244,7 +245,7 @@ fn merge(
                 ),
                 member_span(declaration, member),
             )
-            .with_help("rename the member; hiding an inherited member is not supported, and `override`/`virtual` members are not supported yet"),
+            .with_help("rename the member; hiding an inherited member is not supported"),
         );
     };
 
@@ -296,22 +297,45 @@ fn merge(
             continue;
         }
         let overloads = info.methods.entry(method_name.clone()).or_default();
-        if overloads
-            .iter()
-            .any(|own| own.signature.parameters == callable.signature.parameters)
-        {
-            diagnostics.push(
-                Diagnostic::error(
-                    format!(
-                        "method `{name}.{method_name}` has the signature of the inherited method `{declared_in}.{method_name}`"
-                    ),
-                    member_span(declaration, &method_name),
-                )
-                .with_help("hiding an inherited method is not supported; rename or change the parameters (`override` and `virtual` are not supported yet)"),
-            );
+        let own = overloads.iter().find(|own| {
+            own.key.owner.as_deref() == Some(name)
+                && own.signature.parameters == callable.signature.parameters
+        });
+        let Some(own) = own else {
+            overloads.push(callable);
+            continue;
+        };
+        if own.dispatch == MemberDispatch::Override {
+            // The override replaces the inherited declaration: it is the only
+            // candidate left in this class (B1 section 5).
+            if check_override(
+                &format!("method `{name}.{method_name}`"),
+                &format!("`{declared_in}.{method_name}`"),
+                own,
+                &callable,
+                member_span(declaration, &method_name),
+                diagnostics,
+            ) {
+                context
+                    .overrides
+                    .insert(own.key.clone(), callable.key.clone());
+            }
+            context.matched_overrides.insert(own.key.clone());
             continue;
         }
-        overloads.push(callable);
+        diagnostics.push(
+            Diagnostic::error(
+                format!(
+                    "method `{name}.{method_name}` has the signature of the inherited method `{declared_in}.{method_name}`"
+                ),
+                member_span(declaration, &method_name),
+            )
+            .with_help(if callable.dispatch == MemberDispatch::None {
+                "hiding an inherited method is not supported; rename it or change the parameters (only a `virtual`, `abstract` or `override` member can be overridden)"
+            } else {
+                "add `override` to replace the inherited member, or rename it; hiding is not supported"
+            }),
+        );
     }
 
     let mut property_names = base_info.properties.keys().cloned().collect::<Vec<_>>();
@@ -334,16 +358,283 @@ fn merge(
                 .insert(property_name.clone(), declared_in);
             continue;
         }
-        if info.fields.contains_key(&property_name)
-            || info.methods.contains_key(&property_name)
-            || info.properties.contains_key(&property_name)
-        {
+        if info.fields.contains_key(&property_name) || info.methods.contains_key(&property_name) {
             conflict("property", &property_name, &declared_in, diagnostics);
             continue;
         }
-        info.properties
-            .insert(property_name.clone(), property.clone());
+        let Some(own) = info.properties.get(&property_name).cloned() else {
+            info.properties
+                .insert(property_name.clone(), property.clone());
+            continue;
+        };
+        let own_dispatch = own
+            .getter
+            .iter()
+            .chain(own.setter.iter())
+            .map(|accessor| accessor.dispatch)
+            .next()
+            .unwrap_or(MemberDispatch::None);
+        if own_dispatch != MemberDispatch::Override {
+            conflict("property", &property_name, &declared_in, diagnostics);
+            continue;
+        }
+        let span = member_span(declaration, &property_name);
+        let target = format!("`{declared_in}.{property_name}`");
+        let what = format!("property `{name}.{property_name}`");
+        for accessor in own.getter.iter().chain(own.setter.iter()) {
+            context.matched_overrides.insert(accessor.key.clone());
+        }
+        if own.type_ != property.type_ {
+            diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "{what} overrides {target} with a different type (`{}` instead of `{}`)",
+                        own.type_.display(),
+                        property.type_.display()
+                    ),
+                    span,
+                )
+                .with_help("an override must match the overridden property exactly"),
+            );
+            continue;
+        }
+        for (own_accessor, base_accessor, kind) in [
+            (&own.getter, &property.getter, "getter"),
+            (&own.setter, &property.setter, "setter"),
+        ] {
+            let Some(own_accessor) = own_accessor else {
+                continue;
+            };
+            let Some(base_accessor) = base_accessor else {
+                diagnostics.push(
+                    Diagnostic::error(
+                        format!("{what} adds a {kind} that {target} does not have"),
+                        span,
+                    )
+                    .with_help(
+                        "an override must keep the accessor set of the property it overrides",
+                    ),
+                );
+                continue;
+            };
+            if check_override(
+                &format!("{kind} of {what}"),
+                &format!("the {kind} of {target}"),
+                own_accessor,
+                base_accessor,
+                span,
+                diagnostics,
+            ) {
+                context
+                    .overrides
+                    .insert(own_accessor.key.clone(), base_accessor.key.clone());
+            }
+        }
+        // Overriding one accessor keeps the other inherited.
+        let merged = info
+            .properties
+            .get_mut(&property_name)
+            .expect("own property is still present");
+        if merged.getter.is_none() {
+            merged.getter.clone_from(&property.getter);
+        }
+        if merged.setter.is_none() {
+            merged.setter.clone_from(&property.setter);
+        }
     }
+}
+
+/// Validate one override against the member it replaces (B1 N2, N3): the
+/// overridden member must be virtual, abstract or itself an override, and the
+/// parameters (already equal), return type and visibility must match exactly.
+/// Returns whether the override is well formed.
+fn check_override(
+    what: &str,
+    target: &str,
+    own: &Callable,
+    base: &Callable,
+    span: Span,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> bool {
+    if base.dispatch == MemberDispatch::None {
+        diagnostics.push(
+            Diagnostic::error(
+                format!(
+                    "{what} cannot override {target}, which is not virtual, abstract or an override"
+                ),
+                span,
+            )
+            .with_help("mark the base member `virtual` or `abstract`"),
+        );
+        return false;
+    }
+    if own.signature.result != base.signature.result {
+        diagnostics.push(
+            Diagnostic::error(
+                format!(
+                    "{what} overrides {target} with a different return type (`{}` instead of `{}`)",
+                    own.signature.result.display(),
+                    base.signature.result.display()
+                ),
+                span,
+            )
+            .with_help(
+                "an override must match the signature exactly; covariant returns are not supported",
+            ),
+        );
+        return false;
+    }
+    if own.visibility != base.visibility {
+        diagnostics.push(
+            Diagnostic::error(
+                format!("{what} overrides {target} with a different visibility"),
+                span,
+            )
+            .with_help("an override must keep the visibility of the member it overrides"),
+        );
+        return false;
+    }
+    true
+}
+
+/// Checks that need every class merged: an `override` that matched no
+/// inherited member (B1 N2/N3), and a concrete class that leaves an inherited
+/// abstract member unimplemented (B1 N7).
+pub(super) fn validate_overrides(
+    classes: &[&TypeDeclaration],
+    context: &Context,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for class in classes {
+        let Some(info) = context.types.get(&class.name) else {
+            continue;
+        };
+        for member in &class.members {
+            match member {
+                Member::Method(method)
+                    if !method.constructor && method.dispatch == MemberDispatch::Override =>
+                {
+                    let matched = info
+                        .methods
+                        .get(&method.name)
+                        .into_iter()
+                        .flatten()
+                        .any(|callable| context.matched_overrides.contains(&callable.key));
+                    if !matched {
+                        unmatched_override(
+                            class,
+                            info,
+                            &method.name,
+                            "method",
+                            method.span,
+                            context,
+                            diagnostics,
+                        );
+                    }
+                }
+                Member::Property(property) if property.dispatch == MemberDispatch::Override => {
+                    let matched = info.properties.get(&property.name).is_some_and(|found| {
+                        found
+                            .getter
+                            .iter()
+                            .chain(found.setter.iter())
+                            .any(|accessor| context.matched_overrides.contains(&accessor.key))
+                    });
+                    if !matched {
+                        unmatched_override(
+                            class,
+                            info,
+                            &property.name,
+                            "property",
+                            property.span,
+                            context,
+                            diagnostics,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        if info.is_abstract || info.kind != Some(TypeKind::Class) {
+            continue;
+        }
+        let mut missing = Vec::new();
+        for (member, overloads) in &info.methods {
+            for callable in overloads {
+                if callable.dispatch == MemberDispatch::Abstract
+                    && callable.key.owner.as_deref() != Some(class.name.as_str())
+                {
+                    missing.push(format!(
+                        "{}.{member}",
+                        callable.key.owner.as_deref().unwrap_or("?")
+                    ));
+                }
+            }
+        }
+        for (member, property) in &info.properties {
+            for accessor in property.getter.iter().chain(property.setter.iter()) {
+                if accessor.dispatch == MemberDispatch::Abstract
+                    && accessor.key.owner.as_deref() != Some(class.name.as_str())
+                {
+                    missing.push(format!(
+                        "{}.{member}",
+                        accessor.key.owner.as_deref().unwrap_or("?")
+                    ));
+                }
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        for member in missing {
+            diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "class `{}` does not override the inherited abstract member `{member}`",
+                        class.name
+                    ),
+                    class.span,
+                )
+                .with_help("add an `override` of it, or declare the class `abstract`"),
+            );
+        }
+    }
+}
+
+fn unmatched_override(
+    class: &TypeDeclaration,
+    info: &TypeInfo,
+    name: &str,
+    what: &str,
+    span: Span,
+    context: &Context,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let base_info = info
+        .base
+        .as_deref()
+        .and_then(|base| context.types.get(base));
+    let inherited_virtual_with_name = base_info.is_some_and(|base_info| {
+        base_info
+            .methods
+            .get(name)
+            .into_iter()
+            .flatten()
+            .any(|callable| callable.dispatch != MemberDispatch::None)
+    });
+    let message = if inherited_virtual_with_name {
+        format!(
+            "{what} `{}.{name}` is marked `override` but no inherited virtual method has these parameters",
+            class.name
+        )
+    } else {
+        format!(
+            "{what} `{}.{name}` is marked `override` but there is no virtual or abstract member `{name}` to override",
+            class.name
+        )
+    };
+    diagnostics.push(Diagnostic::error(message, span).with_help(
+        "an override must match an inherited `virtual`, `abstract` or `override` member exactly",
+    ));
 }
 
 /// Resolve and validate the base constructor a constructor runs: the explicit
@@ -492,6 +783,37 @@ fn member_span(declaration: &TypeDeclaration, name: &str) -> Span {
 }
 
 impl Analyzer<'_> {
+    /// The base class of the class being analyzed, when `base` can be used.
+    pub(super) fn base_class_of_owner(&self) -> Option<String> {
+        if !self.instance_context || self.base_arguments {
+            return None;
+        }
+        self.owner
+            .as_ref()
+            .and_then(|owner| self.context.types.get(owner))
+            .and_then(|info| info.base.clone())
+    }
+
+    /// `base` as the receiver of a member access: the static class is the base
+    /// class, and the access is a static (non-virtual) use of `this`.
+    pub(super) fn base_receiver(&mut self, span: Span) -> Type {
+        if let Some(base) = self.base_class_of_owner() {
+            return Type::Class(base);
+        }
+        let message = if self.base_arguments {
+            "`base` cannot be used in the arguments of `base(...)`"
+        } else if !self.instance_context {
+            "`base` is valid only inside an instance member"
+        } else {
+            "`base` requires the class to have a base class"
+        };
+        self.diagnostics.push(
+            Diagnostic::error(message, span)
+                .with_help("name a base class after `:` in the class declaration"),
+        );
+        Type::Unknown
+    }
+
     /// Whether `class` is `ancestor` or derives from it.
     pub(super) fn derives_from(&self, class: &str, ancestor: &str) -> bool {
         class == ancestor

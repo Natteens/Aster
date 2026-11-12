@@ -418,7 +418,12 @@ impl Lowerer<'_> {
         };
         let previous_return = std::mem::replace(&mut self.current_return, body_return);
         self.scopes.push(scope);
-        let mut body = function.body.as_ref().map(|body| self.block(body));
+        let dispatch = self.method_dispatch(function, owner, accessor);
+        let mut body = if function.dispatch == aster_syntax::MemberDispatch::Abstract {
+            None
+        } else {
+            function.body.as_ref().map(|body| self.block(body))
+        };
         if function.constructor
             && let (Some(owner), Some(receiver), Some(body)) =
                 (owner, self.current_receiver, body.as_mut())
@@ -435,6 +440,7 @@ impl Lowerer<'_> {
             .copied()
             .map(|intrinsic| self.resolve_intrinsic_payload(intrinsic, &return_type));
         hir::Function {
+            dispatch,
             constructor: function.constructor,
             is_test: function.is_test,
             is_static: function.is_static,
@@ -578,6 +584,40 @@ impl Lowerer<'_> {
         let initializer = self.expression(initializer);
         self.model_context = previous_context;
         initializer
+    }
+
+    /// How `function` is bound. An override carries the symbol of the member
+    /// semantic analysis matched it with.
+    fn method_dispatch(
+        &self,
+        function: &ast::FunctionDeclaration,
+        owner: Option<&ast::TypeDeclaration>,
+        accessor: Option<crate::semantic::AccessorKind>,
+    ) -> hir::MethodDispatch {
+        match function.dispatch {
+            aster_syntax::MemberDispatch::None => hir::MethodDispatch::None,
+            aster_syntax::MemberDispatch::Virtual => hir::MethodDispatch::Virtual,
+            aster_syntax::MemberDispatch::Abstract => hir::MethodDispatch::Abstract,
+            aster_syntax::MemberDispatch::Override => {
+                let key = crate::semantic::callable_key(
+                    &function.name,
+                    function.span.start,
+                    if accessor.is_some() {
+                        &[]
+                    } else {
+                        &function.parameters
+                    },
+                    accessor,
+                    owner.map(|owner| owner.name.as_str()),
+                );
+                let overridden = self
+                    .model
+                    .overrides
+                    .get(&key)
+                    .expect("a validated override names the member it overrides");
+                hir::MethodDispatch::Override(self.callable_symbols[overridden])
+            }
+        }
     }
 
     /// `class` followed by its base classes, nearest first.
@@ -752,6 +792,7 @@ fn accessor_function(
 ) -> ast::FunctionDeclaration {
     ast::FunctionDeclaration {
         base_call: None,
+        dispatch: property.dispatch,
         constructor: false,
         is_test: false,
         is_static: false,

@@ -1,6 +1,6 @@
 use super::{
-    Analyzer, Argument, Callable, Diagnostic, Dispatch, Expression, ExpressionKind, HashSet, Model,
-    Primitive, ResolvedArguments, ResolvedCall, ResolvedDefaultArgument,
+    Analyzer, Argument, Callable, Diagnostic, Dispatch, Expression, ExpressionKind, HashSet,
+    MemberDispatch, Model, Primitive, ResolvedArguments, ResolvedCall, ResolvedDefaultArgument,
     ResolvedDictionaryOperation, ResolvedEnumCase, ResolvedParallelFor, ResolvedParallelForEach,
     ResolvedParallelReduce, ResolvedStringBuilderOperation, ResolvedTaskRun, Signature, Span, Type,
     TypeKind, TypeRef, Visibility, resolve_type_readonly,
@@ -269,6 +269,7 @@ impl Analyzer<'_> {
             return Type::Enum(enum_name.clone());
         }
         let receiver_is_this = matches!(object.kind, ExpressionKind::This);
+        let receiver_is_base = matches!(object.kind, ExpressionKind::Base);
         let object_type = self.expression_receiver(object);
         if matches!(object_type, Type::Array(_)) {
             if name == "Length" {
@@ -333,6 +334,11 @@ impl Analyzer<'_> {
                 span,
             ));
         }
+        let access_receiver = if receiver_is_base {
+            self.owner.clone().unwrap_or_else(|| type_name.clone())
+        } else {
+            type_name.clone()
+        };
         self.context.types.get(&type_name).map_or_else(
             || Type::Unknown,
             |info| {
@@ -352,15 +358,28 @@ impl Analyzer<'_> {
                     self.check_member_access(
                         getter.visibility,
                         &declared_in,
-                        &type_name,
+                        &access_receiver,
                         &format!("getter for property `{type_name}.{name}`"),
                         span,
                     );
                     self.model
                         .property_reads
                         .insert(self.model_key(span), getter.key.clone());
-                    if receiver_is_this {
+                    if receiver_is_base && getter.dispatch == MemberDispatch::Abstract {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                format!(
+                                    "`base.{name}` is abstract and has no implementation to call"
+                                ),
+                                span,
+                            )
+                            .with_help("call a concrete member, or implement it in the base class"),
+                        );
+                    }
+                    if receiver_is_this || receiver_is_base {
+                        self.base_access = receiver_is_base;
                         self.note_this_call(&getter.key, span);
+                        self.base_access = false;
                     }
                     return property.type_.clone();
                 }
@@ -385,11 +404,11 @@ impl Analyzer<'_> {
                         .copied()
                         .unwrap_or(Visibility::Public),
                     &declared_in,
-                    &type_name,
+                    &access_receiver,
                     &format!("field `{type_name}.{name}`"),
                     span,
                 );
-                if receiver_is_this {
+                if receiver_is_this || receiver_is_base {
                     self.note_this_field_read(name);
                 }
                 type_
@@ -515,8 +534,10 @@ impl Analyzer<'_> {
         }
         // A call on `this` is checked by the this-confinement analysis
         // (`this_confinement`), which needs the callee's whole body.
+        let receiver_is_base = matches!(&callee.kind, ExpressionKind::Member { object, .. } if matches!(object.kind, ExpressionKind::Base));
         let call_on_this = matches!(&callee.kind, ExpressionKind::Name(name) if self.methods.contains_key(name))
             || matches!(&callee.kind, ExpressionKind::Member { object, .. } if matches!(object.kind, ExpressionKind::This));
+        let call_on_this = call_on_this || receiver_is_base;
         let argument_types = arguments
             .iter()
             .map(|argument| {
@@ -1035,8 +1056,22 @@ impl Analyzer<'_> {
                         span,
                     );
                     if let Some((callable, _)) = &result {
+                        if receiver_is_base && callable.dispatch == MemberDispatch::Abstract {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    format!("`base.{name}` is abstract and has no implementation to call"),
+                                    span,
+                                )
+                                .with_help("call a concrete member, or implement it in the base class"),
+                            );
+                        }
+                        let access_receiver = if receiver_is_base {
+                            self.owner.clone().unwrap_or_else(|| type_name.clone())
+                        } else {
+                            type_name.clone()
+                        };
                         self.check_member_visibility(
-                            &type_name,
+                            &access_receiver,
                             callable.key.owner.as_deref().unwrap_or(&type_name),
                             name,
                             callable.visibility,
@@ -1136,7 +1171,9 @@ impl Analyzer<'_> {
             }
         }
         if call_on_this && dispatch == Dispatch::Instance && !callable.is_static {
+            self.base_access = receiver_is_base;
             self.note_this_call(&callable_key, span);
+            self.base_access = false;
         }
         self.model.calls.insert(
             model_key.clone(),
@@ -1557,6 +1594,7 @@ impl Analyzer<'_> {
             async_state: self.async_state,
             unsafe_depth: self.unsafe_depth,
             this_usage: None,
+            base_access: false,
             base_arguments: self.base_arguments,
         };
         let actual = analyzer.expression_expected(argument, Some(expected));

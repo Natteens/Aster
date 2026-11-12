@@ -209,6 +209,9 @@ pub(crate) struct ResolvedBaseConstructor {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ThisSummary {
     pub escape: Option<Span>,
+    /// The first virtual or abstract member called on `this` (dynamic
+    /// dispatch): a body that does so is not this-confined.
+    pub virtual_call: Option<Span>,
     pub reads: std::collections::BTreeSet<String>,
     pub calls: Vec<CallableKey>,
 }
@@ -221,10 +224,15 @@ pub(crate) struct ConstructorThisCall {
     pub callable: CallableKey,
     pub span: Span,
     pub unassigned: Vec<String>,
+    /// The call is dispatched dynamically (a virtual, abstract or overriding
+    /// member reached without `base`).
+    pub virtual_dispatch: bool,
 }
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Model {
+    /// Each `override` callable mapped to the member it directly overrides.
+    pub overrides: HashMap<CallableKey, CallableKey>,
     /// Base constructor resolved for each constructor of a derived class,
     /// keyed by the constructor's model context.
     pub base_constructors: HashMap<String, ResolvedBaseConstructor>,

@@ -244,6 +244,12 @@ fn count_instruction_uses(instruction: &mir::Instruction, uses: &mut HashMap<mir
             receiver,
             arguments,
             ..
+        }
+        | mir::Instruction::CallVirtual {
+            destination,
+            receiver,
+            arguments,
+            ..
         } => {
             if let Some(destination) = destination {
                 place(destination, uses);
@@ -652,6 +658,12 @@ fn rewrite_instruction_operands(
             // shapes, so their arguments stay opaque.
         }
         mir::Instruction::CallInterface {
+            destination,
+            receiver,
+            arguments,
+            ..
+        }
+        | mir::Instruction::CallVirtual {
             destination,
             receiver,
             arguments,

@@ -108,6 +108,8 @@ pub struct MirTypeIndex {
     /// Direct base of every derived class.
     class_bases: HashMap<mir::SymbolId, mir::SymbolId>,
     abstract_classes: HashSet<mir::SymbolId>,
+    /// Virtual table of every class.
+    vtables: HashMap<mir::SymbolId, Vec<mir::VirtualSlot>>,
     enum_cases: HashMap<mir::SymbolId, mir::SymbolId>,
     enum_fields: HashMap<(mir::SymbolId, mir::SymbolId), mir::Type>,
 }
@@ -168,6 +170,7 @@ impl MirTypeIndex {
             }
         }
         index.index_class_hierarchy(module)?;
+        index.index_virtual_tables(module)?;
         for definition in &module.interfaces {
             index.insert_type(definition.symbol, NominalKind::Interface)?;
         }
@@ -250,6 +253,117 @@ impl MirTypeIndex {
             }
         }
         Ok(())
+    }
+
+    /// Validate every class's virtual table against its base chain (object
+    /// model B1, section 4.5): the table begins with the base's slots, each
+    /// inherited slot keeps its introducing method and exact signature and is
+    /// either inherited as is or replaced by an implementation declared by the
+    /// class itself with that exact signature, new slots follow, an abstract
+    /// slot (no implementation) may not be implemented away again, and a
+    /// non-abstract class has no abstract slot.
+    #[allow(clippy::too_many_lines)]
+    fn index_virtual_tables(&mut self, module: &mir::Module) -> Result<(), ValidationError> {
+        let definitions = module
+            .classes
+            .iter()
+            .map(|definition| (definition.symbol, definition))
+            .collect::<HashMap<_, _>>();
+        let functions = module
+            .functions
+            .iter()
+            .map(|function| (function.symbol, function))
+            .collect::<HashMap<_, _>>();
+        for definition in &module.classes {
+            let own = &definition.vtable;
+            let inherited = definition
+                .base
+                .and_then(|base| definitions.get(&base))
+                .map_or(&[][..], |base| base.vtable.as_slice());
+            if own.len() < inherited.len() {
+                return Err(ValidationError::invalid(format!(
+                    "virtual table of class `{}` is shorter than its base class's",
+                    definition.name
+                )));
+            }
+            let mut introduced = HashSet::new();
+            for (index, slot) in own.iter().enumerate() {
+                if !introduced.insert(slot.method) {
+                    return Err(ValidationError::invalid(format!(
+                        "virtual table of class `{}` lists method {:?} twice",
+                        definition.name, slot.method
+                    )));
+                }
+                let base_slot = inherited.get(index);
+                if let Some(base_slot) = base_slot
+                    && (slot.method != base_slot.method
+                        || slot.name != base_slot.name
+                        || slot.parameters != base_slot.parameters
+                        || slot.return_type != base_slot.return_type)
+                {
+                    return Err(ValidationError::invalid(format!(
+                        "virtual slot {index} of class `{}` does not match the slot it inherits from its base class",
+                        definition.name
+                    )));
+                }
+                match (
+                    base_slot.and_then(|base| base.implementation),
+                    slot.implementation,
+                ) {
+                    (Some(_), None) => {
+                        return Err(ValidationError::invalid(format!(
+                            "virtual slot {index} of class `{}` re-abstracts an implemented slot",
+                            definition.name
+                        )));
+                    }
+                    (inherited_implementation, Some(implementation))
+                        if inherited_implementation != Some(implementation) =>
+                    {
+                        // A new implementation is declared by this class and
+                        // matches the slot signature exactly.
+                        let function = functions.get(&implementation).ok_or_else(|| {
+                            ValidationError::invalid(format!(
+                                "virtual slot {index} of class `{}` names an unknown implementation",
+                                definition.name
+                            ))
+                        })?;
+                        let receiver = function
+                            .parameters
+                            .first()
+                            .map(|parameter| &parameter.type_);
+                        if receiver != Some(&mir::Type::Class(definition.symbol))
+                            || function
+                                .parameters
+                                .iter()
+                                .skip(1)
+                                .map(|parameter| &parameter.type_)
+                                .ne(slot.parameters.iter())
+                            || function.return_type != slot.return_type
+                        {
+                            return Err(ValidationError::invalid(format!(
+                                "implementation of virtual slot {index} of class `{}` does not match the slot signature exactly",
+                                definition.name
+                            )));
+                        }
+                    }
+                    _ => {}
+                }
+                if slot.implementation.is_none() && !definition.is_abstract {
+                    return Err(ValidationError::invalid(format!(
+                        "non-abstract class `{}` has the abstract virtual slot {index}",
+                        definition.name
+                    )));
+                }
+            }
+            self.vtables.insert(definition.symbol, own.clone());
+        }
+        Ok(())
+    }
+
+    /// The virtual table of `class`, or `None` for an unknown class.
+    #[must_use]
+    pub fn virtual_table(&self, class: mir::SymbolId) -> Option<&[mir::VirtualSlot]> {
+        self.vtables.get(&class).map(Vec::as_slice)
     }
 
     /// Whether `derived` strictly derives from `base` through the declared
@@ -436,6 +550,52 @@ fn validate_typed_instruction(
             operand(receiver)?;
             for argument in arguments {
                 operand(argument)?;
+            }
+            if let Some(result) = result {
+                destination(result, return_type)?;
+            }
+            Ok(())
+        }
+        mir::Instruction::CallVirtual {
+            destination: result,
+            receiver,
+            method,
+            slot,
+            arguments,
+            return_type,
+        } => {
+            operand(receiver)?;
+            for argument in arguments {
+                operand(argument)?;
+            }
+            let invalid = |what: &str| {
+                ValidationError::invalid(format!(
+                    "function `{function_name}` has a virtual call that {what}"
+                ))
+            };
+            let mir::Type::Class(class) = &receiver.type_ else {
+                return Err(invalid("has a receiver that is not a class"));
+            };
+            let table = types
+                .virtual_table(*class)
+                .ok_or_else(|| invalid("names an unknown class"))?;
+            let entry = usize::try_from(*slot)
+                .ok()
+                .and_then(|index| table.get(index))
+                .ok_or_else(|| invalid("uses a slot index outside the virtual table"))?;
+            if entry.method != *method {
+                return Err(invalid("names a method that does not own the slot"));
+            }
+            if entry.return_type != *return_type {
+                return Err(invalid("has a return type that differs from the slot"));
+            }
+            if arguments.len() != entry.parameters.len()
+                || arguments
+                    .iter()
+                    .zip(&entry.parameters)
+                    .any(|(argument, parameter)| &argument.type_ != parameter)
+            {
+                return Err(invalid("has arguments that differ from the slot signature"));
             }
             if let Some(result) = result {
                 destination(result, return_type)?;

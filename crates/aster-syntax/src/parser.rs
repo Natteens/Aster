@@ -5,9 +5,9 @@ use aster_diagnostics::{Diagnostic, Span};
 use crate::{
     Accessor, Argument, AssignmentOperator, BaseCall, BinaryOperator, Block, EnumCase,
     EnumDeclaration, Expression, ExpressionKind, Field, FieldInitializer, FunctionDeclaration,
-    IncrementOperator, InterpolatedPart, Item, Literal, Member, Module, Parameter, Property,
-    Statement, SwitchCase, SwitchExpressionCase, Token, TokenKind, TypeDeclaration, TypeParameter,
-    TypeRef, UnaryOperator, VariableDeclaration, VariableKind, Visibility,
+    IncrementOperator, InterpolatedPart, Item, Literal, Member, MemberDispatch, Module, Parameter,
+    Property, Statement, SwitchCase, SwitchExpressionCase, Token, TokenKind, TypeDeclaration,
+    TypeParameter, TypeRef, UnaryOperator, VariableDeclaration, VariableKind, Visibility,
 };
 
 /// Maximum recursive source/AST nesting accepted by the frontend. This is a
@@ -187,7 +187,10 @@ impl Parser {
                         InterpolatedPart::Text(_) => None,
                     }));
                 }
-                ExpressionKind::Literal(_) | ExpressionKind::Name(_) | ExpressionKind::This => {}
+                ExpressionKind::Literal(_)
+                | ExpressionKind::Name(_)
+                | ExpressionKind::This
+                | ExpressionKind::Base => {}
             }
         }
         true
@@ -562,6 +565,7 @@ impl Parser {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn member(&mut self, owner: TypeKind, owner_name: &str) -> Option<Member> {
         let start = self.current().span.start;
         let default = if owner == TypeKind::Interface {
@@ -570,9 +574,21 @@ impl Parser {
             Visibility::Private
         };
         let visibility = self.visibility(default);
-        self.unsupported_member_modifiers();
+        let mut dispatch = MemberDispatch::None;
+        let modifier_start = self.current().span;
+        self.dispatch_modifiers(&mut dispatch);
         let is_static = self.take(&TokenKind::Static).is_some();
-        self.unsupported_member_modifiers();
+        self.dispatch_modifiers(&mut dispatch);
+        if owner == TypeKind::Interface && dispatch != MemberDispatch::None {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "interface members cannot have dispatch modifiers",
+                    modifier_start,
+                )
+                .with_help("interface methods are implicitly abstract; remove the modifier"),
+            );
+            dispatch = MemberDispatch::None;
+        }
         let async_token = self.take(&TokenKind::Async);
         let is_async = async_token.is_some();
         if owner == TypeKind::Class
@@ -589,6 +605,15 @@ impl Parser {
                 self.diagnostics.push(
                     Diagnostic::error("constructors cannot be `async`", token.span)
                         .with_help("remove `async` from the constructor"),
+                );
+            }
+            if dispatch != MemberDispatch::None {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "constructors cannot be `virtual`, `override` or `abstract`",
+                        modifier_start,
+                    )
+                    .with_help("a constructor is always statically bound; remove the modifier"),
                 );
             }
             let token = self.advance().clone();
@@ -627,11 +652,14 @@ impl Parser {
                 type_ref,
                 name,
                 start,
-                owner == TypeKind::Interface,
+                owner == TypeKind::Interface || dispatch == MemberDispatch::Abstract,
                 true,
                 false,
             )
-            .map(Member::Method)
+            .map(|mut method| {
+                method.dispatch = dispatch;
+                Member::Method(method)
+            })
         } else if self.at(&TokenKind::LeftBrace) {
             if let Some(token) = &async_token {
                 self.diagnostics.push(
@@ -645,9 +673,18 @@ impl Parser {
                         .with_help("remove `static` from the property"),
                 );
             }
-            self.property_after_name(visibility, type_ref, name, start)
+            self.property_after_name(visibility, dispatch, type_ref, name, start)
                 .map(Member::Property)
         } else {
+            if dispatch != MemberDispatch::None {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "fields cannot be `virtual`, `override` or `abstract`",
+                        modifier_start,
+                    )
+                    .with_help("only methods and properties can be dispatched dynamically"),
+                );
+            }
             if let Some(token) = &async_token {
                 self.diagnostics.push(
                     Diagnostic::error("only methods can be `async`", token.span)
@@ -765,6 +802,7 @@ impl Parser {
         if signature_only || is_foreign {
             let end = self.expect(&TokenKind::Semicolon)?.span.end;
             Some(FunctionDeclaration {
+                dispatch: MemberDispatch::None,
                 constructor: false,
                 is_test,
                 is_static,
@@ -801,6 +839,7 @@ impl Parser {
             };
             let end = body.span.end.max(right_paren.span.end);
             Some(FunctionDeclaration {
+                dispatch: MemberDispatch::None,
                 constructor: false,
                 is_test,
                 is_static,
@@ -846,6 +885,7 @@ impl Parser {
     fn property_after_name(
         &mut self,
         visibility: Visibility,
+        dispatch: MemberDispatch,
         type_ref: TypeRef,
         name: String,
         start: usize,
@@ -858,7 +898,18 @@ impl Parser {
             let explicit_visibility = self.current_visibility().is_some();
             let accessor_visibility = self.visibility(visibility);
             let kind = self.advance().clone();
-            let body = self.block()?;
+            let body = if dispatch == MemberDispatch::Abstract {
+                // An abstract accessor has no body: `get;` / `set;`. The
+                // empty block only keeps the accessor shape uniform; semantic
+                // analysis never analyzes it.
+                let semicolon = self.expect(&TokenKind::Semicolon)?;
+                Block {
+                    statements: Vec::new(),
+                    span: Span::new(semicolon.span.start, semicolon.span.end),
+                }
+            } else {
+                self.block()?
+            };
             let accessor = Accessor {
                 visibility: accessor_visibility,
                 explicit_visibility,
@@ -888,6 +939,7 @@ impl Parser {
         }
         let end = self.expect(&TokenKind::RightBrace)?.span.end;
         Some(Property {
+            dispatch,
             visibility,
             type_ref,
             name,
@@ -2045,6 +2097,16 @@ impl Parser {
             TokenKind::LeftBracket => return self.array_literal(token.span.start),
             TokenKind::New => return self.new_expression(token.span.start),
             TokenKind::This => ExpressionKind::This,
+            TokenKind::Base => {
+                if !self.at(&TokenKind::Dot) {
+                    self.diagnostics.push(
+                        Diagnostic::error("`base` must be followed by a member access", token.span)
+                            .with_help("write `base.Method(...)` or `base.Property`"),
+                    );
+                    return None;
+                }
+                ExpressionKind::Base
+            }
             TokenKind::Identifier(name) if self.at(&TokenKind::LeftBrace) => {
                 return self.struct_literal(name, token.span.start);
             }
@@ -2505,10 +2567,13 @@ impl Parser {
         }
     }
 
-    /// Reject `virtual`, `override`, `abstract` and `sealed` before a member:
-    /// virtual dispatch is a later object-model step. The modifier is consumed
-    /// so the member still parses and no cascade of errors follows.
-    fn unsupported_member_modifiers(&mut self) {
+    /// Consume the contextual `virtual`, `override`, `abstract` and `sealed`
+    /// modifiers that precede a member. An identifier of that spelling is a
+    /// modifier only when a type, `static`, `async` or a member name follows
+    /// it, so an ordinary identifier with that spelling keeps working.
+    /// `sealed` applies to classes only: on a member (in particular
+    /// `sealed override`, B1 U8) it is reported and ignored.
+    fn dispatch_modifiers(&mut self, dispatch: &mut MemberDispatch) {
         loop {
             let TokenKind::Identifier(name) = &self.current().kind else {
                 return;
@@ -2546,15 +2611,46 @@ impl Parser {
                 return;
             }
             let token = self.advance().clone();
-            self.diagnostics.push(
-                Diagnostic::error(
-                    format!("`{name}` members are not supported yet"),
-                    token.span,
-                )
-                .with_help(
-                    "virtual dispatch (`virtual`, `override`, abstract methods) arrives in a later object-model step; declare a plain method",
-                ),
-            );
+            let requested = match name.as_str() {
+                "virtual" => MemberDispatch::Virtual,
+                "override" => MemberDispatch::Override,
+                "abstract" => MemberDispatch::Abstract,
+                _ => {
+                    let overriding = matches!(
+                        &self.current().kind,
+                        TokenKind::Identifier(next) if next == "override"
+                    ) || *dispatch == MemberDispatch::Override;
+                    let diagnostic = if overriding {
+                        Diagnostic::error(
+                            "`sealed override` is not supported: an override stays overridable",
+                            token.span,
+                        )
+                        .with_help(
+                            "remove `sealed`; B1 uses exact signatures and no `sealed override`",
+                        )
+                    } else {
+                        Diagnostic::error("`sealed` applies to classes, not to members", token.span)
+                            .with_help("remove `sealed` from the member, or seal the whole class")
+                    };
+                    self.diagnostics.push(diagnostic);
+                    continue;
+                }
+            };
+            if *dispatch == MemberDispatch::None {
+                *dispatch = requested;
+            } else {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        if *dispatch == requested {
+                            format!("duplicate `{name}` modifier")
+                        } else {
+                            format!("`{name}` cannot be combined with another dispatch modifier")
+                        },
+                        token.span,
+                    )
+                    .with_help("a member is at most one of `virtual`, `override` and `abstract`"),
+                );
+            }
         }
     }
 

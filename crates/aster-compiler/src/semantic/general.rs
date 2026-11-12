@@ -9,9 +9,9 @@ use crate::primitives::{
 };
 use aster_syntax::{
     Argument, AssignmentOperator, BinaryOperator, Block, Expression, ExpressionKind, Field,
-    FunctionDeclaration, IncrementOperator, InterpolatedPart, Item, Literal, Member, Module,
-    Property, Statement, TypeDeclaration, TypeRef, UnaryOperator, VariableDeclaration,
-    VariableKind, Visibility,
+    FunctionDeclaration, IncrementOperator, InterpolatedPart, Item, Literal, Member,
+    MemberDispatch, Module, Property, Statement, TypeDeclaration, TypeRef, UnaryOperator,
+    VariableDeclaration, VariableKind, Visibility,
 };
 
 use super::{
@@ -47,6 +47,7 @@ pub(super) fn validate(module: &Module, diagnostics: &mut Vec<Diagnostic>, model
     declarations::collect_declarations(module, &mut context, diagnostics);
     declarations::discover_official_types(&mut context);
     inheritance::resolve(module, &mut context, diagnostics);
+    model.overrides.clone_from(&context.overrides);
     declarations::validate_interface_implementations(module, &context, diagnostics);
     declarations::validate_struct_cycles(module, &context, diagnostics);
     declarations::validate_module_variables(module, &mut context, diagnostics, model);
@@ -72,6 +73,8 @@ struct Callable {
     visibility: Visibility,
     is_static: bool,
     is_foreign: bool,
+    /// `virtual`, `override` or `abstract` (methods and property accessors).
+    dispatch: MemberDispatch,
     key: CallableKey,
 }
 
@@ -144,6 +147,15 @@ struct Context {
     /// the core standard library is absent, in which case no type is official.
     official_result: Option<String>,
     official_option: Option<String>,
+    /// Every callable declared `virtual`, `override` or `abstract` (object
+    /// model B1, virtual dispatch). A call to one of these on `this` is
+    /// dispatched dynamically unless it goes through `base`.
+    virtual_callables: HashSet<CallableKey>,
+    /// Each override mapped to the member it directly overrides.
+    overrides: HashMap<CallableKey, CallableKey>,
+    /// Overrides (own declaration keys) that found an inherited member to
+    /// replace; an `override` missing from this set is an error.
+    matched_overrides: HashSet<CallableKey>,
 }
 
 #[derive(Clone, Debug)]
@@ -167,6 +179,7 @@ enum AsyncAnalysisState {
     AfterAwait,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 struct Analyzer<'a> {
     context: &'a Context,
     scopes: Vec<HashMap<String, Binding>>,
@@ -187,6 +200,9 @@ struct Analyzer<'a> {
     /// Analyzing the `base(...)` arguments of a constructor, where the object
     /// is not usable yet.
     base_arguments: bool,
+    /// Analyzing a member reached through `base`: a static call to the base
+    /// implementation, never dispatched dynamically.
+    base_access: bool,
 }
 
 impl<'a> Analyzer<'a> {
@@ -245,6 +261,7 @@ impl<'a> Analyzer<'a> {
             this_usage: (instance_context && owner_is_class)
                 .then(this_confinement::ThisUsage::default),
             base_arguments: false,
+            base_access: false,
         }
     }
 

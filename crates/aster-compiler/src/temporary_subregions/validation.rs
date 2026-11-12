@@ -911,7 +911,9 @@ fn span_barrier(instructions: &[mir::Instruction]) -> Option<TemporarySubregionR
             | mir::Instruction::TemporarySubregionExit { .. } => {
                 Some(TemporarySubregionRejectionReason::UnsupportedControlFlow)
             }
-            mir::Instruction::Call { .. } | mir::Instruction::CallInterface { .. } => {
+            mir::Instruction::Call { .. }
+            | mir::Instruction::CallInterface { .. }
+            | mir::Instruction::CallVirtual { .. } => {
                 Some(TemporarySubregionRejectionReason::CallBarrier)
             }
             mir::Instruction::ForeignCall { .. } => {

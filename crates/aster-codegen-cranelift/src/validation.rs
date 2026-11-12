@@ -608,6 +608,19 @@ fn validate_instruction(
             function_name,
             interface_methods,
         ),
+        mir::Instruction::CallVirtual {
+            destination,
+            receiver,
+            arguments,
+            return_type,
+            ..
+        } => validate_virtual_call(
+            destination.as_ref(),
+            receiver,
+            arguments,
+            return_type,
+            function_name,
+        ),
         mir::Instruction::CallIntrinsic {
             destination,
             intrinsic,
@@ -2303,6 +2316,32 @@ fn type_name_owned(type_: &mir::Type) -> String {
         mir::Type::Task(result) => format!("Task<{}>", type_name_owned(result)),
         other => type_name(other).to_owned(),
     }
+}
+
+/// Operand and destination shapes of a virtual call. The slot, the method that
+/// owns it and the exact argument types were checked against the receiver
+/// class's virtual table by the backend-neutral MIR validation.
+fn validate_virtual_call(
+    destination: Option<&mir::Place>,
+    receiver: &mir::Operand,
+    arguments: &[mir::Operand],
+    return_type: &mir::Type,
+    function_name: &str,
+) -> Result<(), BackendError> {
+    if let Some(destination) = destination {
+        validate_place(destination, function_name)?;
+    }
+    if !matches!(receiver.type_, mir::Type::Class(_)) {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a virtual call with a non-class receiver"
+        )));
+    }
+    validate_operand(receiver, function_name)?;
+    validate_call_destination_shape(destination, return_type, function_name, "virtual method")?;
+    for argument in arguments {
+        validate_operand(argument, function_name)?;
+    }
+    validate_return_type(return_type, function_name)
 }
 
 fn validate_interface_call(
@@ -5480,6 +5519,7 @@ mod tests {
             base: None,
             is_abstract: false,
             is_sealed: false,
+            vtable: Vec::new(),
             symbol: class_symbol,
             name: "Widget".to_owned(),
             fields: Vec::new(),
@@ -5727,6 +5767,7 @@ mod tests {
             base: None,
             is_abstract: false,
             is_sealed: false,
+            vtable: Vec::new(),
             symbol: class_symbol,
             name: "Widget".to_owned(),
             fields: Vec::new(),
@@ -5913,6 +5954,7 @@ mod tests {
             base: None,
             is_abstract: false,
             is_sealed: false,
+            vtable: Vec::new(),
             symbol: class_symbol,
             name: "Widget".to_owned(),
             fields: Vec::new(),
@@ -6047,6 +6089,7 @@ mod tests {
             base: None,
             is_abstract: false,
             is_sealed: false,
+            vtable: Vec::new(),
             symbol: class_symbol,
             name: "Widget".to_owned(),
             fields: Vec::new(),

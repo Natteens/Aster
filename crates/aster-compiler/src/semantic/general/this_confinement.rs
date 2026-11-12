@@ -31,6 +31,9 @@ pub(super) struct ThisUsage {
     /// The first use that lets `this` escape (methods only: in a constructor
     /// it is an immediate error).
     pub escape: Option<Span>,
+    /// The first virtual or abstract member called on `this` (dynamic
+    /// dispatch), in methods only; in a constructor it is an immediate error.
+    pub virtual_call: Option<Span>,
     /// Fields of `this` the body may read, as `Declaring.field`.
     pub reads: BTreeSet<String>,
     /// Methods and accessors called on `this`, with the fields that were
@@ -45,6 +48,9 @@ pub(super) struct ThisCall {
     /// Fields without a zero default that were not definitely assigned at the
     /// call, as `Declaring.field`.
     pub unassigned: Vec<String>,
+    /// Dispatched dynamically: a virtual, abstract or overriding member
+    /// reached without `base`.
+    pub virtual_dispatch: bool,
 }
 
 impl Analyzer<'_> {
@@ -87,6 +93,18 @@ impl Analyzer<'_> {
         if self.this_usage.is_none() {
             return;
         }
+        // A virtual, abstract or overriding member is bound at run time to the
+        // most derived override, whose body this analysis cannot see. A call
+        // through `base` is a static call to the base implementation.
+        let virtual_dispatch =
+            !self.base_access && self.context.virtual_callables.contains(callable);
+        if virtual_dispatch
+            && !self.constructor
+            && let Some(usage) = &mut self.this_usage
+        {
+            usage.virtual_call.get_or_insert(span);
+            return;
+        }
         let unassigned = if self.constructor {
             let mut names = self
                 .field_names
@@ -107,6 +125,7 @@ impl Analyzer<'_> {
                 callable: callable.clone(),
                 span,
                 unassigned,
+                virtual_dispatch,
             });
         }
     }
@@ -127,6 +146,8 @@ impl Analyzer<'_> {
     pub(super) fn expression_receiver(&mut self, expression: &super::Expression) -> super::Type {
         if matches!(expression.kind, super::ExpressionKind::This) {
             self.this_receiver(expression.span)
+        } else if matches!(expression.kind, super::ExpressionKind::Base) {
+            self.base_receiver(expression.span)
         } else {
             self.expression(expression)
         }
@@ -166,6 +187,7 @@ impl Analyzer<'_> {
 }
 
 /// Run the fixpoint over every recorded body and check each constructor call.
+#[allow(clippy::too_many_lines)]
 pub(super) fn validate(context: &Context, model: &Model, diagnostics: &mut Vec<Diagnostic>) {
     if model.constructor_this_calls.is_empty() {
         return;
@@ -175,7 +197,7 @@ pub(super) fn validate(context: &Context, model: &Model, diagnostics: &mut Vec<D
     // escape or it calls something that is not confined (or unknown).
     let mut confined = summaries
         .iter()
-        .filter(|(_, summary)| summary.escape.is_none())
+        .filter(|(_, summary)| summary.escape.is_none() && summary.virtual_call.is_none())
         .map(|(key, _)| key.clone())
         .collect::<HashSet<_>>();
     loop {
@@ -219,6 +241,21 @@ pub(super) fn validate(context: &Context, model: &Model, diagnostics: &mut Vec<D
     let _ = context;
     for call in &model.constructor_this_calls {
         let name = display_callable(&call.callable);
+        if call.virtual_dispatch {
+            diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "constructor of `{}` calls the virtual member `{name}` on `this`",
+                        call.class
+                    ),
+                    call.span,
+                )
+                .with_help(
+                    "a derived override would run before the derived constructor has completed; call a non-virtual method, or call `base.Member` to run the base implementation",
+                ),
+            );
+            continue;
+        }
         if !confined.contains(&call.callable) {
             diagnostics.push(
                 Diagnostic::error(
@@ -277,6 +314,9 @@ fn why_not_confined(
     let Some(summary) = summaries.get(key) else {
         return "its body is not available to the compiler, so it cannot be proven safe".to_owned();
     };
+    if summary.virtual_call.is_some() {
+        return "its body calls a virtual or abstract member on `this`, which a derived class may override".to_owned();
+    }
     if summary.escape.is_some() {
         return "its body lets `this` escape (it is passed, stored, returned or converted)"
             .to_owned();

@@ -207,6 +207,25 @@ impl Lowerer<'_> {
                     kind: hir::ExpressionKind::Symbol(symbol),
                 }
             }
+            ast::ExpressionKind::Base => {
+                let receiver = self
+                    .current_receiver
+                    .expect("validated base has a receiver");
+                let this = hir::Expression {
+                    type_: self.symbol_types[&receiver].clone(),
+                    kind: hir::ExpressionKind::Symbol(receiver),
+                };
+                let hir::Type::Class(class) = this.type_ else {
+                    unreachable!("validated base is used inside a class")
+                };
+                let base = self.class_bases[&class];
+                hir::Expression {
+                    type_: hir::Type::Class(base),
+                    kind: hir::ExpressionKind::BaseReceiver {
+                        object: Box::new(this),
+                    },
+                }
+            }
             ast::ExpressionKind::This => {
                 let receiver = self
                     .current_receiver

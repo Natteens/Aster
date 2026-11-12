@@ -2,9 +2,9 @@ use aster_diagnostics::Span;
 use aster_syntax::{
     Accessor, Argument, AssignmentOperator, BinaryOperator, Block, EnumCase, EnumDeclaration,
     Expression, ExpressionKind, Field, FieldInitializer, FunctionDeclaration, IncrementOperator,
-    Item, Literal, Member, Module, NamespaceDeclaration, Parameter, Property, Statement,
-    SwitchCase, TypeDeclaration, TypeParameter, TypeRef, UnaryOperator, UsingDeclaration,
-    VariableDeclaration, VariableKind, Visibility,
+    Item, Literal, Member, MemberDispatch, Module, NamespaceDeclaration, Parameter, Property,
+    Statement, SwitchCase, TypeDeclaration, TypeParameter, TypeRef, UnaryOperator,
+    UsingDeclaration, VariableDeclaration, VariableKind, Visibility,
     visit::{
         AstVisitorMut, walk_enum_declaration_mut, walk_expression_mut,
         walk_function_declaration_mut, walk_item_mut, walk_switch_case_mut,
@@ -222,6 +222,7 @@ fn fixture() -> Module {
     };
     let function = FunctionDeclaration {
         base_call: None,
+        dispatch: MemberDispatch::None,
         constructor: false,
         is_test: false,
         is_static: false,
@@ -245,6 +246,7 @@ fn fixture() -> Module {
         span: span(61),
     };
     let property = Property {
+        dispatch: MemberDispatch::None,
         visibility: Visibility::Public,
         type_ref: type_ref("Property<T>", 62),
         name: "Current".to_owned(),
@@ -287,6 +289,7 @@ fn fixture() -> Module {
             }),
             Member::Method(FunctionDeclaration {
                 base_call: None,
+                dispatch: MemberDispatch::None,
                 constructor: true,
                 is_test: false,
                 is_static: false,
@@ -348,6 +351,7 @@ fn fixture() -> Module {
                 interfaces: Vec::new(),
                 members: vec![Member::Method(FunctionDeclaration {
                     base_call: None,
+                    dispatch: MemberDispatch::None,
                     body: None,
                     ..function.clone()
                 })],
@@ -545,6 +549,7 @@ fn traversal_reaches_defaults_named_values_target_new_and_inferred_foreach() {
         usings: Vec::new(),
         items: vec![Item::Function(FunctionDeclaration {
             base_call: None,
+            dispatch: MemberDispatch::None,
             constructor: false,
             is_test: false,
             is_static: false,

@@ -424,11 +424,40 @@ backend layout validation (V1, V5), `Upcast` in HIR and MIR (validated: only alo
 chain), `base(...)` and the C# construction order of 6.1, `protected`, the rule B this-confinement of
 6.3 with `Reads(M)` (N10, N12, N13, N20 to N22), `abstract`/`sealed` classes, reserved `base` (U5), and
 the descriptor base pointer, depth and ancestors array of 4.2 (V3, V4). Cases covered: P2, P3, P6, P8,
-P9, P10 to P15 and N1, N4 to N6, N8 to N10, N12 to N18, N20 to N22; N2, N3 and N7 are rejected with a
+P9, P10 to P15 and N1, N4 to N6, N8 to N10, N12 to N18, N20 to N22; N2, N3 and N7 were rejected with a
 "not supported yet" diagnostic because they need `virtual`/`override`/`abstract` members (pull request
-2). An interface conversion from a derived class reuses the static table of the converted class,
-which is exact while no member is virtual; the dynamic lookup is pull request 3. Local object
-elimination skips every class that has a base. Not implemented: virtual dispatch, downcast, open bases.
+2 lifts that; see its delivery note). An interface conversion from a derived class reuses the static table of the converted class,
+which was exact while no member was virtual (pull request 2 replaces it for virtual implementations; the
+dynamic lookup is pull request 3). Local object elimination skips every class that has a base. Not
+implemented in that step: virtual dispatch (pull request 2), downcast, open bases.
+
+**Delivery note, pull request 2 (T-OBJ-3).** Implemented: `virtual`, `override` and `abstract` on
+methods and on property accessors (U9 as answered by Q-OBJ-2: an override may declare one accessor
+but cannot add one), `base.Method(...)`, `base.Property` and `base.Property = value` as static calls
+to the base implementation, exact override signatures (U8) with `sealed override` rejected, abstract
+members only in abstract classes and an error for a concrete class that leaves one unimplemented, and
+the 4.2 virtual table: one slot per introduced virtual member, overrides reusing the slot, the table
+of a class beginning with its base class's table. A virtual call loads the descriptor from the object
+header, the function from its table (`CallVirtual` in MIR, a compile-time slot index checked against
+the receiver class's table, V8) and calls it indirectly. The descriptor gained `vtable` and
+`vtable_count`, filled after the JIT module is finalized and owned through `RawOwned` like the other
+descriptor arrays. An abstract slot holds a generated stub that records a controlled runtime error
+(unreachable from valid source: no abstract class is instantiated and a concrete class has no abstract
+slot). MIR validation rejects a table shorter than its base's, an inherited slot with another
+introducing method or signature, an override not declared by the class or with another signature, a
+re-abstracted slot and an abstract slot in a concrete class; the backend rechecks the filled tables
+against the MIR. A virtual, abstract or overriding member called on `this`, or a virtual property read
+or written on `this`, inside a constructor is rejected (N11, Q-OBJ-2), and a helper that does so is
+not this-confined (N12). A virtual call is an escape of its receiver for escape analysis, the
+lifetime and ownership analyses treat every implementation of the slot as a possible callee, and
+local object elimination never removes an object that receives one. An interface implemented through
+a virtual method is exact for a base-typed static class: the interface entry of every non-sealed class
+whose implementing method is virtual is a generated function that performs the virtual call, so
+`IScore s = baseRef` runs the dynamic override (a sealed class points at its own implementation). The
+interface lookup from the dynamic type of a base-typed value is still pull request 3. Cases covered
+in addition to those of pull request 1: P1, P4, P5, P7 and N2, N3, N7, N11, with the virtual parts of
+N12 and N17 and V8 and the V-style table invariants. Not implemented: downcast, interface lookup from
+the dynamic type, open bases, devirtualization.
 
 ## 12. Statements to supersede on acceptance
 

@@ -305,6 +305,7 @@ pub extern "C" fn aster_rt_math_domain_error(context: *mut ExecutionContext, cod
         6 => "Math.Sign does not accept NaN",
         7 => "collection range is outside the valid bounds",
         8 => "random range requires minInclusive to be less than maxExclusive",
+        9 => "an abstract method was called: the object's class does not implement it",
         _ => "unknown runtime error",
     };
     context.fail(message);

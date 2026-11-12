@@ -35,6 +35,10 @@ pub enum ExpressionKind {
     Literal(Literal),
     Name(String),
     This,
+    /// `base`, valid only as the receiver of a member access or call
+    /// (`base.Name`, `base.Name(...)`): a non-virtual use of the base class's
+    /// member on `this`.
+    Base,
     StructLiteral {
         type_name: String,
         fields: Vec<FieldInitializer>,

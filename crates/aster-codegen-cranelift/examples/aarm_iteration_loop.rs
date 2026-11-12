@@ -263,6 +263,7 @@ fn module(iterations: usize, shape: AllocationShape, helper_scoped: bool) -> mir
             base: None,
             is_abstract: false,
             is_sealed: false,
+            vtable: Vec::new(),
             symbol: BOX,
             name: "Box".to_owned(),
             fields: vec![mir::FieldDefinition {
@@ -346,6 +347,7 @@ fn nested_module(
             base: None,
             is_abstract: false,
             is_sealed: false,
+            vtable: Vec::new(),
             symbol: BOX,
             name: "Box".to_owned(),
             fields: vec![mir::FieldDefinition {
@@ -410,6 +412,7 @@ fn compute_mixed_module(iterations: usize, scalar_operations: usize) -> mir::Mod
             base: None,
             is_abstract: false,
             is_sealed: false,
+            vtable: Vec::new(),
             symbol: BOX,
             name: "Box".to_owned(),
             fields: vec![mir::FieldDefinition {

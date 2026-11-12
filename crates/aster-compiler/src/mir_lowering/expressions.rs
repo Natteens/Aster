@@ -786,7 +786,8 @@ impl FunctionLowerer {
                     .expect("validated conversion operand produces a value");
                 Some(self.temporary(expression.type_.clone(), mir::RvalueKind::Cast(value)))
             }
-            hir::ExpressionKind::UpcastClass { object } => {
+            hir::ExpressionKind::UpcastClass { object }
+            | hir::ExpressionKind::BaseReceiver { object } => {
                 let object = self
                     .lower_expression(object)
                     .expect("validated class upcast has an object");

@@ -266,10 +266,28 @@ pub struct Field {
     pub initializer: Option<Expression>,
 }
 
+/// How a class method (or property accessor) is bound (object model B1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MethodDispatch {
+    /// Statically bound.
+    #[default]
+    None,
+    /// Introduces a virtual slot.
+    Virtual,
+    /// Replaces the virtual, abstract or overriding method `SymbolId` (the
+    /// member semantic analysis matched it with) and reuses its slot.
+    Override(SymbolId),
+    /// Introduces a virtual slot and has no body; only an abstract class
+    /// declares one.
+    Abstract,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Function {
     pub constructor: bool,
+    /// Virtual dispatch of a class method; `None` for every other function.
+    pub dispatch: MethodDispatch,
     /// Compiler-only declaration metadata used by project test discovery.
     /// Test callables lower to ordinary MIR functions.
     pub is_test: bool,
@@ -699,6 +717,13 @@ pub enum ExpressionKind {
     /// its base classes: the same object, no copy. This expression's type is
     /// the target base class; semantic analysis already proved the relation.
     UpcastClass {
+        object: Box<Expression>,
+    },
+    /// `this` viewed as its direct base class, as the receiver of a `base.Member`
+    /// access: the same object as an identity upcast, but a call or property
+    /// access whose receiver is this expression runs the base implementation
+    /// statically, with no virtual dispatch.
+    BaseReceiver {
         object: Box<Expression>,
     },
     /// Nominal, non-owning conversion from a class reference to an interface value.

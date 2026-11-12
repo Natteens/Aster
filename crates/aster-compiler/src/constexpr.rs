@@ -108,6 +108,7 @@ pub(crate) fn evaluate(
         }
         ExpressionKind::StructLiteral { .. }
         | ExpressionKind::This
+        | ExpressionKind::Base
         | ExpressionKind::NewObject { .. }
         | ExpressionKind::ArrayLiteral(_)
         | ExpressionKind::NewArray { .. }

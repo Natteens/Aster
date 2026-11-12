@@ -431,7 +431,10 @@ pub fn walk_expression_mut<V: AstVisitorMut + ?Sized>(
                 }
             }
         }
-        ExpressionKind::Literal(_) | ExpressionKind::Name(_) | ExpressionKind::This => {}
+        ExpressionKind::Literal(_)
+        | ExpressionKind::Name(_)
+        | ExpressionKind::This
+        | ExpressionKind::Base => {}
     }
 }
 

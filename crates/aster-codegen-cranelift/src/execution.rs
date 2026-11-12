@@ -145,6 +145,7 @@ impl PreparedProgram {
         let function_ids = codegen.declare_functions(module)?;
         let task_trampoline_ids = codegen.declare_task_trampolines(module)?;
         codegen.define_interface_tables(module, &function_ids)?;
+        let abstract_stubs = codegen.define_abstract_stubs(module)?;
         for function in &module.functions {
             codegen.define_function(function, &function_ids)?;
             if let Some(trampoline) = task_trampoline_ids.get(&function.symbol) {
@@ -163,6 +164,20 @@ impl PreparedProgram {
             &codegen.interface_tables,
             module,
         )?;
+        codegen.descriptors.bind_virtual_tables(module, |slot| {
+            let id = match slot.implementation {
+                Some(implementation) => {
+                    function_ids.get(&implementation).copied().ok_or_else(|| {
+                        BackendError::new("virtual slot references an unknown implementation")
+                    })?
+                }
+                None => abstract_stubs
+                    .get(&slot.method)
+                    .copied()
+                    .ok_or_else(|| BackendError::new("abstract virtual slot has no stub"))?,
+            };
+            Ok(codegen.jit.get_finalized_function(id))
+        })?;
         let entries = module
             .functions
             .iter()
@@ -1418,6 +1433,7 @@ mod tests {
                 base: None,
                 is_abstract: false,
                 is_sealed: false,
+                vtable: Vec::new(),
                 symbol: FINE_CLASS,
                 name: "FineBox".to_owned(),
                 fields: Vec::new(),
@@ -1959,6 +1975,7 @@ mod tests {
             base: None,
             is_abstract: false,
             is_sealed: false,
+            vtable: Vec::new(),
             symbol,
             name: name.to_owned(),
             fields,
@@ -2125,5 +2142,158 @@ mod tests {
             assert_eq!(slot0, method_address, "slot 0 is the implementing method");
         }
         assert_ne!(entries[0].table, entries[1].table);
+    }
+
+    const VT_ABSTRACT: mir::SymbolId = mir::SymbolId(92_001);
+    const VT_CONCRETE: mir::SymbolId = mir::SymbolId(92_002);
+    const VT_ROOT: mir::SymbolId = mir::SymbolId(92_003);
+    const VT_IMPL: mir::SymbolId = mir::SymbolId(92_004);
+    const VT_RUN: mir::SymbolId = mir::SymbolId(92_005);
+
+    /// An abstract class with one abstract slot (`int Go(int)`), a concrete
+    /// class that implements it by returning 7, and an entry that allocates the
+    /// concrete class and calls the slot through the descriptor.
+    fn virtual_module() -> mir::Module {
+        let slot = |implementation| mir::VirtualSlot {
+            method: VT_ROOT,
+            name: "Go".to_owned(),
+            parameters: vec![mir::Type::Int],
+            return_type: mir::Type::Int,
+            implementation,
+        };
+        let class = |symbol, name: &str, base, is_abstract, vtable| mir::ClassDefinition {
+            symbol,
+            name: name.to_owned(),
+            base,
+            is_abstract,
+            is_sealed: false,
+            vtable,
+            fields: Vec::new(),
+        };
+        let mut implementation = descriptor_function(
+            VT_IMPL,
+            mir::Type::Int,
+            Vec::new(),
+            Vec::new(),
+            Some(fine_integer(7)),
+        );
+        implementation.owner = Some(VT_CONCRETE);
+        implementation.parameters = vec![
+            fine_local(0, mir::Type::Class(VT_CONCRETE)),
+            fine_local(1, mir::Type::Int),
+        ];
+        let concrete_type = mir::Type::Class(VT_CONCRETE);
+        let run = descriptor_function(
+            VT_RUN,
+            mir::Type::Int,
+            vec![
+                fine_local(0, concrete_type.clone()),
+                fine_local(1, mir::Type::Int),
+            ],
+            vec![
+                mir::Instruction::AllocateObject {
+                    destination: mir::Place::Local(mir::LocalId(0)),
+                    class: VT_CONCRETE,
+                    region: mir::AllocationRegion::Persistent,
+                },
+                mir::Instruction::CallVirtual {
+                    destination: Some(mir::Place::Local(mir::LocalId(1))),
+                    receiver: mir::Operand {
+                        type_: concrete_type,
+                        kind: mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(0))),
+                    },
+                    method: VT_ROOT,
+                    slot: 0,
+                    arguments: vec![fine_integer(3)],
+                    return_type: mir::Type::Int,
+                },
+            ],
+            Some(mir::Operand {
+                type_: mir::Type::Int,
+                kind: mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(1))),
+            }),
+        );
+        mir::Module {
+            structs: Vec::new(),
+            classes: vec![
+                class(VT_ABSTRACT, "Abstract", None, true, vec![slot(None)]),
+                class(
+                    VT_CONCRETE,
+                    "Concrete",
+                    Some(VT_ABSTRACT),
+                    false,
+                    vec![slot(Some(VT_IMPL))],
+                ),
+            ],
+            interfaces: Vec::new(),
+            enums: Vec::new(),
+            interface_implementations: Vec::new(),
+            foreign_functions: Vec::new(),
+            functions: vec![implementation, run],
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn a_virtual_call_in_hand_built_mir_runs_the_override_through_the_descriptor() {
+        let module = virtual_module();
+        crate::validate(&module).expect("virtual module is valid");
+        let prepared = PreparedProgram::prepare(&module).expect("virtual module prepares");
+        let mut context = aster_runtime::ExecutionContext::new();
+        let (pointer, _) = prepared.entries.get(&VT_RUN).expect("entry was prepared");
+        // SAFETY: the entry was finalized as `(ExecutionContext*) -> i32`.
+        let run: extern "C" fn(*mut aster_runtime::ExecutionContext) -> i32 =
+            unsafe { std::mem::transmute(*pointer) };
+        assert_eq!(run(&raw mut context), 7);
+        assert_eq!(context.take_error(), None);
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn descriptors_hold_the_vtable_and_an_abstract_slot_holds_a_stub_that_records_an_error() {
+        let module = virtual_module();
+        crate::validate(&module).expect("virtual module is valid");
+        let prepared = PreparedProgram::prepare(&module).expect("virtual module prepares");
+        let address = |class| {
+            let pointer = prepared
+                .descriptors
+                .address(class)
+                .expect("class has a descriptor");
+            // SAFETY: the descriptor is owned by `prepared`, which is alive.
+            unsafe { &*(pointer as *const aster_runtime::ClassDescriptor) }
+        };
+        let (abstract_class, concrete) = (address(VT_ABSTRACT), address(VT_CONCRETE));
+        assert_eq!((abstract_class.vtable_count, concrete.vtable_count), (1, 1));
+        // SAFETY: the backend filled both tables before any code ran.
+        let (abstract_entries, concrete_entries) =
+            unsafe { (abstract_class.vtable_entries(), concrete.vtable_entries()) };
+        // The concrete slot is its implementation; the abstract slot is a stub.
+        assert_eq!(concrete_entries[0], prepared.entries[&VT_IMPL].0);
+        assert!(!abstract_entries[0].is_null());
+        assert_ne!(abstract_entries[0], concrete_entries[0]);
+
+        // SAFETY: the stub has the slot signature `(context, this, int) -> int`.
+        let stub: extern "C" fn(*mut aster_runtime::ExecutionContext, *const u8, i32) -> i32 =
+            unsafe { std::mem::transmute(abstract_entries[0]) };
+        let mut context = aster_runtime::ExecutionContext::new();
+        assert_eq!(stub(&raw mut context, std::ptr::null(), 3), 0);
+        let error = context.take_error().expect("the stub records an error");
+        assert!(error.contains("abstract method"), "{error}");
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn a_class_without_virtual_members_has_an_empty_vtable() {
+        let module = descriptor_module();
+        crate::validate(&module).expect("descriptor module is valid");
+        let prepared = PreparedProgram::prepare(&module).expect("descriptor module prepares");
+        let pointer = prepared
+            .descriptors
+            .address(DESC_PLAIN)
+            .expect("class has a descriptor");
+        // SAFETY: the descriptor is owned by `prepared`, which is alive.
+        let descriptor = unsafe { &*(pointer as *const aster_runtime::ClassDescriptor) };
+        assert_eq!(descriptor.vtable_count, 0);
+        assert!(descriptor.vtable.is_null());
     }
 }

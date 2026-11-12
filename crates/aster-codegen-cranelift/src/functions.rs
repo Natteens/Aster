@@ -304,7 +304,7 @@ impl Codegen {
         builder.switch_to_block(continuation);
     }
 
-    fn return_after_failed_call_guard(
+    pub(super) fn return_after_failed_call_guard(
         &self,
         builder: &mut FunctionBuilder<'_>,
         return_type: &mir::Type,
@@ -399,6 +399,9 @@ impl Codegen {
             ),
             call @ mir::Instruction::CallInterface { .. } => {
                 self.translate_interface_call(builder, call, state)
+            }
+            call @ mir::Instruction::CallVirtual { .. } => {
+                self.translate_virtual_call(builder, call, state)
             }
             mir::Instruction::CallIntrinsic {
                 destination,

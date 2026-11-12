@@ -73,6 +73,14 @@ pub struct ClassDescriptor {
     /// itself: `ancestors[i]` is the ancestor at depth `i`. This is what makes
     /// the subtype test bounded (see [`ClassDescriptor::derives_from`]).
     pub ancestors: *const *const ClassDescriptor,
+    /// Virtual table: one function address per slot (object model B1, section
+    /// 4.2). Slot `i` holds the implementation that a virtual call of slot `i`
+    /// runs for an object of exactly this class; an abstract slot holds a stub
+    /// that records a controlled runtime error. Null when `vtable_count` is
+    /// zero. Filled once, after the JIT module is finalized.
+    pub vtable: *const *const u8,
+    /// Number of entries behind `vtable`.
+    pub vtable_count: u32,
 }
 
 // SAFETY: a class descriptor is immutable once the program is prepared.
@@ -95,6 +103,23 @@ impl ClassDescriptor {
         }
         // SAFETY: guaranteed by the caller.
         unsafe { std::slice::from_raw_parts(self.interfaces, self.interface_count as usize) }
+    }
+
+    /// The virtual table of this class.
+    ///
+    /// # Safety
+    ///
+    /// `vtable` must point at `vtable_count` valid pointers that outlive the
+    /// returned slice (true for every descriptor produced by the compiler
+    /// backend while its program is alive).
+    #[allow(unsafe_code)]
+    #[must_use]
+    pub unsafe fn vtable_entries(&self) -> &[*const u8] {
+        if self.vtable.is_null() || self.vtable_count == 0 {
+            return &[];
+        }
+        // SAFETY: guaranteed by the caller.
+        unsafe { std::slice::from_raw_parts(self.vtable, self.vtable_count as usize) }
     }
 
     /// The ancestor descriptors, root first, ending with this class.

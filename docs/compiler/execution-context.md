@@ -42,8 +42,9 @@ A materialized class value is a non-null pointer to zeroed context-owned storage
 starts with an 8-byte header (pointer size on a 64-bit host) whose offset-0 word is the address of the
 class's immutable `ClassDescriptor`; the fields follow in declaration order with natural alignment,
 the first one at offset 8 or later, so a class with no fields is 8 bytes and `Counter { int score }`
-is 16 bytes with `score` at offset 8. User code never stores to the header word. There is no
-inheritance yet: a descriptor describes exactly one class. A materialized `new Class(arguments)` allocates
+is 16 bytes with `score` at offset 8. User code never stores to the header word. A descriptor describes exactly one class and
+carries its place in the single-inheritance hierarchy and its virtual table (see
+[classes](../reference/classes.md)). A materialized `new Class(arguments)` allocates
 that storage and immediately invokes the resolved constructor with the object as a hidden receiver.
 When identity and storage are compiler-proven unobservable, `new` does not guarantee a physical
 arena allocation. Methods receive the same receiver; assigning or passing a class value copies only

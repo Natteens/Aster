@@ -9,9 +9,8 @@
 //! bodies; initializer placement is a MIR-order test in the compiler crate),
 //! P10, P11 and P12 (observable through the field values; offsets are tested
 //! in `layouts.rs`), P13, P14, P15 and N1, N5, N6, N8, N9, N10, N12 to N18,
-//! N20 to N22. N2, N3, N4 and N7 belong to virtual dispatch (pull request 2)
-//! and are rejected with a "not supported yet" diagnostic, except N4, which
-//! is the silent-hiding error. P1, P4, P5 and P7 need `virtual`/`override`.
+//! N20 to N22 (and N4, the silent-hiding error). The virtual-dispatch cases (P1,
+//! P4, P5, P7, N2, N3, N7, N11) live in `virtual_dispatch_b1.rs`.
 
 use aster_codegen_cranelift::{ExecutionValue, execute};
 use aster_compiler::compile;
@@ -496,22 +495,6 @@ fn n1_inheritance_cycles_are_rejected() {
 }
 
 #[test]
-fn n2_n3_virtual_dispatch_modifiers_are_not_supported_yet() {
-    for modifier in ["virtual", "override", "abstract"] {
-        rejects(
-            &format!(
-                "public abstract class A {{ public A() {{}} public {modifier} int M() {{ return 1; }} }}"
-            ),
-            &format!("`{modifier}` members are not supported yet"),
-        );
-    }
-    rejects(
-        "public class A { public A() {} public virtual int P { get { return 1; } } }",
-        "`virtual` members are not supported yet",
-    );
-}
-
-#[test]
 fn n4_a_same_signature_method_in_the_derived_class_is_an_error() {
     rejects(
         r"public class A { public A() {} public int M() { return 1; } }
@@ -803,7 +786,7 @@ fn n17_modifier_combinations_are_rejected() {
     );
     rejects(
         "public class A { public A() {} public abstract int M(); }",
-        "`abstract` members are not supported yet",
+        "abstract method in class `A`, which is not abstract",
     );
 }
 

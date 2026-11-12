@@ -72,7 +72,7 @@ example, reference page. Gate: workspace tests; class A invariants unchanged or 
 | T-MEM-6 | Governor and page return by default | MEM-006 | MEM-EXP-2 | reinforced | medium | todo |
 | T-MEM-ARENA | Explicit `Arena` scope type for long-running memory (Q-MEM-0 fallback): record the new decision (syntax, escape rule checked by escape analysis, teardown), then implement | new decision (to record) | T-MEM-EXP-1 | reinforced | medium | todo (decision record first) |
 | T-OBJ-2 | Single inheritance (B1 PR 1) | OBJ-002 | T-MEM-2 or B1 H8 | B1 cases | medium | **done 2026-11-11** (see log) |
-| T-OBJ-3 | Virtual methods and properties | OBJ-003 | T-OBJ-2 | B1 cases | medium | blocked |
+| T-OBJ-3 | Virtual methods and properties | OBJ-003 | T-OBJ-2 | B1 cases | medium | **done 2026-11-12** (see log) |
 | T-OBJ-4 | Interfaces through hierarchies; `is`/`as` | OBJ-004 | T-OBJ-3, T-LANG-4b | B1 cases | low | blocked |
 | T-LANG-1a | Non-capturing lambdas and method groups | LANG-001 | — | workspace | medium | todo |
 | T-LANG-1b | Capturing closures (region environments; counted when escaping) | LANG-001 | T-LANG-1a; T-MEM-3c for escaping | reinforced | high | blocked: its escaping-environment rule assumed counting (T-MEM-3c, superseded); needs a revised rule under the fallback (Persistent or `Arena` environments) |
@@ -986,3 +986,36 @@ H8 (T-MEM-2 unblocked), explicit `Arena` scope as a new decision (T-MEM-ARENA). 
   (0 failed); `cargo test --workspace` 2,983 passed, 0 failed; clippy and rustfmt clean.
 - Docs: `docs/reference/classes.md` (single inheritance), `interfaces.md`, `grammar.md`,
   `specification/15-visibility.md`, B1 delivery note. Unblocked: T-OBJ-3 (virtual dispatch).
+
+### T-OBJ-3 — done 2026-11-12 (B1 pull request 2: virtual dispatch)
+
+- Delivered: `virtual`, `override`, `abstract` on methods and property accessors (Q-OBJ-2; an override
+  may declare one accessor, cannot add one), `base.Method(...)`, `base.Property` and
+  `base.Property = value` as static calls, exact signatures and no `sealed override` (U8), abstract
+  members only in abstract classes and N7 for a concrete class that leaves one open, one vtable slot
+  per introduced virtual member with overrides reusing the slot, `CallVirtual` in MIR through the
+  class descriptor (`vtable` pointer and `vtable_count`, bound after `finalize_definitions`, owned
+  through `layouts::RawOwned`), an abstract-slot stub that records a controlled runtime error, MIR
+  validation of the vtable invariants and of virtual calls (V8), and the N11 / Q-OBJ-2 rule: a
+  virtual, abstract or overriding member (method or property accessor) called on `this` inside a
+  constructor is rejected, and a helper that does so is not this-confined. A virtual call is an escape
+  of its receiver (`PassedToVirtualCall`); lifetime, ownership and worker-reachability analyses treat
+  every implementation of the slot as a possible callee; local object elimination never removes a
+  receiver of a virtual call. Interface tables are per (class, interface): a non-sealed class whose
+  implementing method is virtual gets a generated dispatching function as its entry, so
+  `IScore s = baseRef` runs the dynamic override without the (pull request 3) descriptor lookup.
+- B1 cases: P1, P4, P5, P7; N2, N3, N7, N11, the virtual parts of N12 and N17; V8 and the vtable
+  invariants (shorter table, changed slot, wrong override owner or signature, re-abstracted slot,
+  abstract slot in a concrete class, duplicate method). Deferred: downcast, interface lookup from the
+  dynamic type (T-OBJ-4), generics in hierarchies, devirtualization.
+- Gates (`CARGO_BUILD_JOBS=2`, `RUST_TEST_THREADS=2`, `cargo +stable-gnu`): `aster-syntax`,
+  `aster-compiler`, `aster-mir` 1,022 passed; `aster-codegen-cranelift --all-targets` default 1,568
+  and `mem-exp-c6` 1,574 passed (0 failed); `cargo test --workspace` 3,067 passed, 0 failed, 4
+  ignored; clippy workspace clean; rustfmt clean. The three focused runs preceded one last small change
+  (the private-accessor diagnostic and its test), which the workspace run covers.
+- Review notes for the leader: `aster-runtime/src/descriptor.rs` gained `vtable`, `vtable_count` and
+  `vtable_entries` and `math.rs` code 9 (abstract call message); the only `unsafe` added is the
+  virtual table write and read in `layouts.rs` and the slice view in `descriptor.rs`, each with a
+  SAFETY comment.
+- Docs: `docs/reference/classes.md` (virtual dispatch), `grammar.md`, `runtime-abi.md`,
+  `execution-context.md`, B1 delivery note. Unblocked: T-OBJ-4 once T-LANG-4b lands.

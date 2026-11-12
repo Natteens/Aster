@@ -105,6 +105,7 @@ fn is_call(instruction: &Instruction) -> bool {
         instruction,
         Instruction::Call { .. }
             | Instruction::CallInterface { .. }
+            | Instruction::CallVirtual { .. }
             | Instruction::ForeignCall { .. }
             | Instruction::CallIntrinsic { .. }
     )
@@ -180,6 +181,7 @@ fn destination_places(instruction: &Instruction) -> impl Iterator<Item = &Place>
         } => [Some(target), None, None],
         Instruction::Call { destination, .. }
         | Instruction::CallInterface { destination, .. }
+        | Instruction::CallVirtual { destination, .. }
         | Instruction::ForeignCall { destination, .. }
         | Instruction::CallIntrinsic { destination, .. } => [destination.as_ref(), None, None],
         Instruction::StringDecodeNext {
@@ -586,7 +588,8 @@ impl Context<'_> {
                 }
             }
             Instruction::Call { destination: d, .. }
-            | Instruction::CallInterface { destination: d, .. } => destination = d.as_ref(),
+            | Instruction::CallInterface { destination: d, .. }
+            | Instruction::CallVirtual { destination: d, .. } => destination = d.as_ref(),
             Instruction::ForeignCall {
                 destination: d,
                 arguments,
@@ -1317,7 +1320,24 @@ fn interface_targets(module: &Module) -> HashMap<SymbolId, Vec<SymbolId>> {
             targets.insert(method.symbol, methods);
         }
     }
+    add_virtual_targets(module, &mut targets);
     targets
+}
+
+/// Every function a virtual call can reach, keyed by the method that introduced
+/// the slot: the implementations of that slot in every class. A slot that is
+/// abstract everywhere has no target, which callers treat as unknown.
+pub(crate) fn add_virtual_targets(module: &Module, targets: &mut HashMap<SymbolId, Vec<SymbolId>>) {
+    for class in &module.classes {
+        for slot in &class.vtable {
+            let found = targets.entry(slot.method).or_default();
+            if let Some(implementation) = slot.implementation
+                && !found.contains(&implementation)
+            {
+                found.push(implementation);
+            }
+        }
+    }
 }
 
 fn is_retain_of(instruction: &Instruction, local: LocalId) -> bool {
@@ -1338,9 +1358,11 @@ fn calls_only_non_releasing(
 ) -> bool {
     match instruction {
         Instruction::Call { function, .. } => non_releasing.contains(function),
-        Instruction::CallInterface { method, .. } => targets.get(method).is_some_and(|found| {
-            !found.is_empty() && found.iter().all(|target| non_releasing.contains(target))
-        }),
+        Instruction::CallInterface { method, .. } | Instruction::CallVirtual { method, .. } => {
+            targets.get(method).is_some_and(|found| {
+                !found.is_empty() && found.iter().all(|target| non_releasing.contains(target))
+            })
+        }
         _ => true,
     }
 }
@@ -1548,6 +1570,11 @@ fn usage_of(instruction: &Instruction, local: LocalId) -> Usage {
             usage.call_argument = arguments.iter().any(direct);
         }
         Instruction::CallInterface {
+            receiver,
+            arguments,
+            ..
+        }
+        | Instruction::CallVirtual {
             receiver,
             arguments,
             ..
@@ -2363,6 +2390,7 @@ mod tests {
                 base: None,
                 is_abstract: false,
                 is_sealed: false,
+                vtable: Vec::new(),
                 symbol: SymbolId(10),
                 name: "C".into(),
                 fields: vec![
@@ -2465,6 +2493,7 @@ mod tests {
                 base: None,
                 is_abstract: false,
                 is_sealed: false,
+                vtable: Vec::new(),
                 symbol: SymbolId(10),
                 name: "C".into(),
                 fields: vec![
@@ -3903,6 +3932,7 @@ mod tests {
                 base: None,
                 is_abstract: false,
                 is_sealed: false,
+                vtable: Vec::new(),
                 symbol: SymbolId(NODE),
                 name: "Node".into(),
                 fields: vec![

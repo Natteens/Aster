@@ -22,6 +22,7 @@ mod task_abi;
 mod task_runtime;
 mod validation;
 mod values;
+mod virtuals;
 mod worker_pool;
 
 use std::{

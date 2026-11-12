@@ -184,6 +184,7 @@ impl Summary {
                 targets.insert(method.symbol, found);
             }
         }
+        crate::ownership::add_virtual_targets(module, &mut targets);
         let empty = Self::default();
         let non_releasing = module
             .functions
@@ -232,7 +233,8 @@ impl Summary {
     fn call_is_safe(&self, instruction: &mir::Instruction) -> bool {
         match instruction {
             mir::Instruction::Call { function, .. } => self.non_releasing.contains(function),
-            mir::Instruction::CallInterface { method, .. } => self.interface_is_safe(*method),
+            mir::Instruction::CallInterface { method, .. }
+            | mir::Instruction::CallVirtual { method, .. } => self.interface_is_safe(*method),
             _ => true,
         }
     }
@@ -1001,6 +1003,13 @@ impl<'a> Block<'a> {
                 method,
                 arguments,
                 ..
+            }
+            | I::CallVirtual {
+                destination,
+                receiver,
+                method,
+                arguments,
+                ..
             } => {
                 let safe = self.frame.summary.interface_is_safe(*method);
                 let plain: Vec<&Operand> = std::iter::once(receiver).chain(arguments).collect();
@@ -1400,6 +1409,7 @@ fn written_places(instruction: &mir::Instruction) -> Vec<&Place> {
         | I::ListToArray { destination, .. } => vec![destination],
         I::Call { destination, .. }
         | I::CallInterface { destination, .. }
+        | I::CallVirtual { destination, .. }
         | I::ForeignCall { destination, .. }
         | I::CallIntrinsic { destination, .. } => destination.iter().collect(),
         I::StringDecodeNext {
@@ -1733,6 +1743,7 @@ mod tests {
                 base: None,
                 is_abstract: false,
                 is_sealed: false,
+                vtable: Vec::new(),
                 symbol: SymbolId(10),
                 name: "C".into(),
                 fields: vec![mir::FieldDefinition {
@@ -2029,6 +2040,7 @@ mod tests {
                 base: None,
                 is_abstract: false,
                 is_sealed: false,
+                vtable: Vec::new(),
                 symbol: SymbolId(10),
                 name: "C".into(),
                 fields: vec![mir::FieldDefinition {
@@ -2246,6 +2258,7 @@ mod tests {
                 base: None,
                 is_abstract: false,
                 is_sealed: false,
+                vtable: Vec::new(),
                 symbol: SymbolId(10),
                 name: "C".into(),
                 fields: vec![mir::FieldDefinition {
@@ -2461,6 +2474,7 @@ mod tests {
                 base: None,
                 is_abstract: false,
                 is_sealed: false,
+                vtable: Vec::new(),
                 symbol: SymbolId(10),
                 name: "C".into(),
                 fields: vec![
@@ -2970,6 +2984,7 @@ mod tests {
                 base: None,
                 is_abstract: false,
                 is_sealed: false,
+                vtable: Vec::new(),
                 symbol: SymbolId(10),
                 name: "C".into(),
                 fields: vec![mir::FieldDefinition {

@@ -68,8 +68,26 @@ pub enum Member {
     Property(Property),
 }
 
+/// Dispatch modifier of a class method or property (object model B1, virtual
+/// dispatch). `sealed override` is deliberately not representable: exact
+/// signatures and no `sealed override` in B1 (U8).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum MemberDispatch {
+    /// Statically bound (the default).
+    #[default]
+    None,
+    /// Introduces a virtual slot.
+    Virtual,
+    /// Replaces an inherited virtual, abstract or overriding member.
+    Override,
+    /// Introduces a virtual slot without an implementation; the declaring
+    /// class must be abstract.
+    Abstract,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Property {
+    pub dispatch: MemberDispatch,
     pub visibility: Visibility,
     pub type_ref: TypeRef,
     pub name: String,
@@ -99,6 +117,9 @@ pub struct Field {
 #[allow(clippy::struct_excessive_bools)]
 pub struct FunctionDeclaration {
     pub constructor: bool,
+    /// `virtual`, `override` or `abstract` on a class method; `None` for every
+    /// other function.
+    pub dispatch: MemberDispatch,
     /// Marks a namespace-level test callable. This is compiler metadata only:
     /// its body still has ordinary ASTER function semantics.
     pub is_test: bool,

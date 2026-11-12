@@ -1,11 +1,11 @@
 use super::statements::ResolvedSwitch;
 use super::{
     Analyzer, AssignmentOperator, BinaryOperator, Binding, Diagnostic, Expression, ExpressionKind,
-    HashMap, HashSet, IncrementOperator, IntegerFit, InterpolatedPart, Literal, OptionCases,
-    Primitive, PropertyInfo, ResolvedPropagation, ResolvedPropertyAssignment, ResultCases, Span,
-    Type, TypeKind, TypeName, TypeRef, UnaryOperator, UnsignedFit, Visibility, classify_integer,
-    classify_unsigned, compatible, constant_integer, evaluate, fits_long, fits_ulong,
-    integer_value, promoted_numeric, resolve_type_readonly, zero_initializable,
+    HashMap, HashSet, IncrementOperator, IntegerFit, InterpolatedPart, Literal, MemberDispatch,
+    OptionCases, Primitive, PropertyInfo, ResolvedPropagation, ResolvedPropertyAssignment,
+    ResultCases, Span, Type, TypeKind, TypeName, TypeRef, UnaryOperator, UnsignedFit, Visibility,
+    classify_integer, classify_unsigned, compatible, constant_integer, evaluate, fits_long,
+    fits_ulong, integer_value, promoted_numeric, resolve_type_readonly, zero_initializable,
 };
 
 impl Analyzer<'_> {
@@ -396,6 +396,13 @@ impl Analyzer<'_> {
             ExpressionKind::Index { array, index } => self.index(array, index, expression.span),
             ExpressionKind::Name(name) => self.name(name, expression.span),
             ExpressionKind::This => self.this_expression(expression.span),
+            ExpressionKind::Base => {
+                self.diagnostics.push(
+                    Diagnostic::error("`base` can only be used as `base.Member`", expression.span)
+                        .with_help("write `base.Method(...)` or `base.Property`"),
+                );
+                Type::Unknown
+            }
             ExpressionKind::Member { object, name } => self.member(object, name, expression.span),
             ExpressionKind::Call {
                 callee, arguments, ..
@@ -1468,6 +1475,9 @@ impl Analyzer<'_> {
                                 _ => Type::Unknown,
                             }
                         })
+                    } else if matches!(object.kind, ExpressionKind::Base) {
+                        self.base_class_of_owner()
+                            .map_or(Type::Unknown, Type::Class)
                     } else {
                         self.expression(object)
                     };
@@ -1547,6 +1557,48 @@ impl Analyzer<'_> {
                 span,
                 target.span,
             );
+        }
+        if let ExpressionKind::Member { object, name } = &target.kind
+            && matches!(object.kind, ExpressionKind::Base)
+        {
+            let Some(base) = self.base_class_of_owner() else {
+                self.base_receiver(object.span);
+                return Type::Unknown;
+            };
+            if let Some(property) = self
+                .context
+                .types
+                .get(&base)
+                .and_then(|info| info.properties.get(name))
+                .cloned()
+            {
+                if property
+                    .setter
+                    .as_ref()
+                    .is_some_and(|setter| setter.dispatch == MemberDispatch::Abstract)
+                {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            format!("`base.{name}` is abstract and has no implementation to call"),
+                            target.span,
+                        )
+                        .with_help("write a concrete member, or implement it in the base class"),
+                    );
+                }
+                self.base_access = true;
+                let result = self.assign_property(
+                    &base,
+                    name,
+                    property,
+                    operator,
+                    &value_type,
+                    value,
+                    span,
+                    target.span,
+                );
+                self.base_access = false;
+                return result;
+            }
         }
         if let ExpressionKind::Member { object, name } = &target.kind {
             let object_type = self.expression_receiver(object);

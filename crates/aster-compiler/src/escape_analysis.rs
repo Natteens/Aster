@@ -73,6 +73,9 @@ pub(super) enum EscapeReason {
     InterfaceConversion,
     PassedToCall,
     PassedToInterfaceCall,
+    /// The object is the receiver or an argument of a virtual call: the callee
+    /// is any override, unknown until devirtualized (object model B1, section 9).
+    PassedToVirtualCall,
     PassedToIntrinsic,
     UnsupportedUse,
 }
@@ -440,6 +443,7 @@ fn is_scope_free_collection_mutation_helper(
                         | mir::Instruction::TemporarySubregionExit { .. }
                         | mir::Instruction::Call { .. }
                         | mir::Instruction::CallInterface { .. }
+                        | mir::Instruction::CallVirtual { .. }
                         | mir::Instruction::CallIntrinsic { .. }
                 )
             {
@@ -521,6 +525,7 @@ fn instruction_uses_alias(instruction: &mir::Instruction, aliases: &HashSet<mir:
         | mir::Instruction::Call { .. }
         | mir::Instruction::ForeignCall { .. }
         | mir::Instruction::CallInterface { .. }
+        | mir::Instruction::CallVirtual { .. }
         | mir::Instruction::CallIntrinsic { .. } => false,
     }
 }
@@ -833,6 +838,21 @@ fn instruction_escape(
                     .any(|argument| direct_alias(argument, aliases).is_some())
             {
                 Some(EscapeReason::PassedToInterfaceCall)
+            } else {
+                None
+            }
+        }
+        mir::Instruction::CallVirtual {
+            receiver,
+            arguments,
+            ..
+        } => {
+            if direct_alias(receiver, aliases).is_some()
+                || arguments
+                    .iter()
+                    .any(|argument| direct_alias(argument, aliases).is_some())
+            {
+                Some(EscapeReason::PassedToVirtualCall)
             } else {
                 None
             }

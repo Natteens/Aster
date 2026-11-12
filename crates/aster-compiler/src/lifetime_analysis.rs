@@ -520,6 +520,12 @@ fn instruction_access(
             receiver,
             arguments,
             ..
+        }
+        | mir::Instruction::CallVirtual {
+            destination,
+            receiver,
+            arguments,
+            ..
         } => {
             read_operand(receiver, locals, &mut access.uses)?;
             read_operands(arguments, locals, &mut access.uses)?;

@@ -1,6 +1,16 @@
 use super::expressions::{expression_symbol, lower_intrinsic};
 use super::{FunctionLowerer, hir, mir};
 
+/// Whether `object` is the receiver of a `base.Member` access: `this` viewed
+/// as its base class, possibly upcast further to the member's declaring class.
+pub(super) fn is_base_receiver(object: &hir::Expression) -> bool {
+    match &object.kind {
+        hir::ExpressionKind::BaseReceiver { .. } => true,
+        hir::ExpressionKind::UpcastClass { object } => is_base_receiver(object),
+        _ => false,
+    }
+}
+
 impl FunctionLowerer {
     pub(super) fn lower_call(
         &mut self,
@@ -44,6 +54,16 @@ impl FunctionLowerer {
                 kind: mir::OperandKind::Copy(destination),
             });
         }
+        if let hir::ExpressionKind::Member { object, .. } = &callee.kind
+            && !is_base_receiver(object)
+            && self.virtual_slots.contains_key(&function)
+        {
+            let receiver = self
+                .lower_expression(object)
+                .expect("method receiver produces a value");
+            let rest = self.lower_ordered_arguments(arguments, argument_order);
+            return self.emit_method_call(function, receiver, rest, return_type, false);
+        }
         let mut lowered_arguments = Vec::new();
         if let hir::ExpressionKind::Member { object, .. } = &callee.kind {
             lowered_arguments.push(
@@ -74,6 +94,47 @@ impl FunctionLowerer {
                 kind: mir::OperandKind::Copy(destination),
             })
         }
+    }
+
+    /// Call method `function` with `receiver` first. A virtual, abstract or
+    /// overriding method is called through the receiver's descriptor unless
+    /// `direct` (a `base.Member` access), which runs `function` itself.
+    pub(super) fn emit_method_call(
+        &mut self,
+        function: hir::SymbolId,
+        receiver: mir::Operand,
+        arguments: Vec<mir::Operand>,
+        return_type: &hir::Type,
+        direct: bool,
+    ) -> Option<mir::Operand> {
+        let destination = (return_type != &hir::Type::Void)
+            .then(|| mir::Place::Local(self.new_temporary(return_type.clone())));
+        match self.virtual_slots.get(&function).copied() {
+            Some((slot, method)) if !direct => {
+                self.instruction(mir::Instruction::CallVirtual {
+                    destination: destination.clone(),
+                    receiver,
+                    method,
+                    slot,
+                    arguments,
+                    return_type: return_type.clone(),
+                });
+            }
+            _ => {
+                let mut all = vec![receiver];
+                all.extend(arguments);
+                self.instruction(mir::Instruction::Call {
+                    destination: destination.clone(),
+                    function,
+                    arguments: all,
+                    return_type: return_type.clone(),
+                });
+            }
+        }
+        destination.map(|place| mir::Operand {
+            type_: return_type.clone(),
+            kind: mir::OperandKind::Copy(place),
+        })
     }
 
     pub(super) fn lower_ordered_arguments(
