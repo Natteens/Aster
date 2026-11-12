@@ -92,6 +92,15 @@ The callable signatures and element types are concrete before HIR and MIR. Worke
 complete in a different order, so programs cannot depend on worker scheduling order. Parameterized
 `Task.Run` does not weaken Parallel's existing worker-transfer or nested-concurrency barriers.
 
+`Parallel.Reduce` is reproducible: its result does not depend on the machine or worker count, even
+for a non-associative `combine` such as floating-point addition. For an array of `length` elements
+the chunk count is `chunks = min(length, 64)`, and chunk `i` covers the half-open index range
+`[i * length / chunks, (i + 1) * length / chunks)` (integer division, computed without overflow).
+Each chunk folds `accumulate` left to right starting from `identity`, and the per-chunk results are
+combined with `combine` left to right in chunk order. An empty array returns `identity` without
+calling `accumulate` or `combine`. The worker count only affects scheduling. Because every chunk
+starts from `identity`, `identity` should be neutral for `combine`.
+
 ## Isolation and deliberate limits
 
 Every worker has its own `ExecutionContext`, arenas, allocation limit, task-control view, and

@@ -190,7 +190,7 @@ guard. No concrete unsoundness was found; none was proven absent.
 | `Wait` | Blocks the calling OS thread on `mpsc::recv` | [A] |
 | Nested tasks | Rejected statically, including through helpers | `nested_concurrency.rs` |
 | Cancellation | Cooperative, atomic state machine | `worker_pool.rs:31-200` [A] |
-| `Parallel.For/ForEach/Reduce` | At most `worker_count` contiguous chunks, so `Reduce` grouping depends on the CPU count | [A] |
+| `Parallel.For/ForEach/Reduce` | `For/ForEach`: at most `worker_count` contiguous chunks. `Reduce` (CONC-009): `min(length, 64)` chunks independent of the CPU count | [A] |
 | Async | Static, parameterless, scalar result, linear body, **exactly one `await Task.Run`**; two states; frame is host `Vec<Option<ExecutionValue>>` (scalars); each `MoveNext` runs in a fresh context; driven by a blocking pump on the caller | `declarations.rs:1205-1330`, `async_machine.rs`, `task_runtime.rs:145-160`, `execution.rs:360-381` [A] |
 | Worker memory | Each worker context has its own 1 GiB cap; no aggregate budget by default | [A] |
 | Host operations in workers | Console, filesystem, clock, and foreign calls rejected | `concurrency.md` |

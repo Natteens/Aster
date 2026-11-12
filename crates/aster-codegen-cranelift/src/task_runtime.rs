@@ -1400,7 +1400,9 @@ impl TaskRuntime {
         if values.is_empty() {
             return Ok(identity);
         }
-        let boundaries = chunk_boundaries(values.len(), self.worker_count);
+        // Chunking depends only on the input length (Q-CONC-4); the worker
+        // count only affects scheduling.
+        let boundaries = reduce_chunk_boundaries(values.len());
         let budgets =
             self.parallel_memory_budgets("Parallel.Reduce accumulate", boundaries.len())?;
         self.pool.ensure_workers(boundaries.len())?;
@@ -1633,6 +1635,23 @@ fn chunk_boundaries(total: usize, worker_count: usize) -> Vec<usize> {
     (0..chunks)
         .map(|index| base + usize::from(index < remainder))
         .collect()
+}
+
+/// Maximum number of `Parallel.Reduce` chunks (Q-CONC-4).
+pub(super) const REDUCE_MAX_CHUNKS: usize = 64;
+
+/// `Parallel.Reduce` chunk lengths. They depend only on `length`, never on the
+/// worker count: `chunks = min(length, 64)` and chunk `i` covers
+/// `[i * length / chunks, (i + 1) * length / chunks)`. Every chunk is
+/// non-empty, and an empty input has no chunks.
+pub(super) fn reduce_chunk_boundaries(length: usize) -> Vec<usize> {
+    let chunks = length.min(REDUCE_MAX_CHUNKS);
+    // `u128` arithmetic cannot overflow for any `usize` length.
+    let edge = |index: usize| -> usize {
+        let value = (index as u128) * (length as u128) / (chunks as u128);
+        usize::try_from(value).expect("a chunk edge never exceeds the length")
+    };
+    (0..chunks).map(|i| edge(i + 1) - edge(i)).collect()
 }
 
 /// Wait for every accepted chunk and propagate the failure with the smallest
@@ -2107,6 +2126,48 @@ mod tests {
             "public int Work() { return 42; } public async Task<int> Run() { int value = await Task.Run(Work); return value; }",
         );
         assert!(module_uses_async(&async_module));
+    }
+
+    #[test]
+    fn reduce_chunk_boundaries_depend_only_on_length() {
+        assert_eq!(reduce_chunk_boundaries(0), Vec::<usize>::new());
+        assert_eq!(reduce_chunk_boundaries(1), vec![1]);
+        assert_eq!(reduce_chunk_boundaries(63), vec![1; 63]);
+        assert_eq!(reduce_chunk_boundaries(64), vec![1; 64]);
+        let sixty_five = reduce_chunk_boundaries(65);
+        assert_eq!(sixty_five.len(), 64);
+        assert_eq!(sixty_five.iter().sum::<usize>(), 65);
+        assert_eq!(sixty_five.iter().filter(|&&n| n == 2).count(), 1);
+        for length in [1usize, 2, 63, 64, 65, 100, 1000, 4097, 100_003] {
+            let chunks = length.min(64);
+            let lengths = reduce_chunk_boundaries(length);
+            assert_eq!(lengths.len(), chunks);
+            let mut start = 0usize;
+            for (index, &len) in lengths.iter().enumerate() {
+                assert!(len > 0);
+                assert_eq!(
+                    start,
+                    index * length / chunks,
+                    "length {length} chunk {index}"
+                );
+                start += len;
+                assert_eq!(start, (index + 1) * length / chunks);
+            }
+            assert_eq!(start, length);
+        }
+        // Near the top of the 32-bit element range, and the full usize range,
+        // `i * length` must not overflow.
+        for length in [i32::MAX as usize, usize::MAX] {
+            let lengths = reduce_chunk_boundaries(length);
+            assert_eq!(lengths.len(), 64);
+            let mut total = 0usize;
+            for len in &lengths {
+                total = total.checked_add(*len).expect("lengths sum to the input");
+            }
+            assert_eq!(total, length);
+            let (min, max) = (lengths.iter().min().unwrap(), lengths.iter().max().unwrap());
+            assert!(max - min <= 1);
+        }
     }
 
     #[test]

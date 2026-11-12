@@ -93,7 +93,7 @@ example, reference page. Gate: workspace tests; class A invariants unchanged or 
 | T-CONC-5 | Transfer by copy of strings, arrays, collections | CONC-005 | T-ARCH-5 | medium | todo |
 | T-CONC-7 | Domain failure contract §4.A for existing tasks; `TryWait`; `TaskScope`; channels | CONC-006, CONC-007 | T-CONC-4 | medium | todo |
 | T-CONC-8 | Reactor, timers, sockets, streaming files | CONC-008 | T-CONC-3 | high | blocked |
-| T-CONC-9 | Reproducible `Parallel.Reduce` | CONC-009 | — | low | todo |
+| T-CONC-9 | Reproducible `Parallel.Reduce` | CONC-009 | — | low | **done 2026-11-11**: `task_runtime::reduce_chunk_boundaries` (`min(length, 64)` chunks, left-to-right combine); tests `parallel_reduce_reproducible` (workers 1/2/3/4/8 identical), compiler `parallel` 83, codegen `parallel` 35 |
 | T-TOOL-3 | Source positions in runtime failures; debug information in AOT | TOOL-003 | — / T-PERF-1b | medium | todo |
 | T-PLAT-4 | macOS and arm64 | PLAT-004 | T-PERF-1b | medium | todo |
 | T-LANG-10 | Tuples | LANG-010 | — | low | todo |
