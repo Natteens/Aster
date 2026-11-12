@@ -59,7 +59,7 @@ example, reference page. Gate: workspace tests; class A invariants unchanged or 
 
 | ID | Objective | Decision | Depends on | Gate | Risk | Status |
 | --- | --- | --- | --- | --- | --- | --- |
-| T-OBJ-B1-1 | B1 stage 1: update B1 record with closure answers and the constant `H` | OBJ-002..004 | — | review | low | todo |
+| T-OBJ-B1-1 | B1 stage 1: update B1 record with closure answers and the constant `H` | OBJ-002..004 | — | review | low | **done 2026-11-11**: `docs/compiler/object-model-b1.md` §4.1 (`H = P`, H8 after MEM-EXP-1) and §10.1 (answers to U1 to U10 and closure amendments) |
 | T-MEM-EXP-1 | Branch with configurations C0 to C6, ownership pass and independent validator for class references; report | MEM-001..003, OBJ-001 | T-BENCH-1, T-ARCH-2b | closure §4.C thresholds | high | **done 2026-11-11, verdict FAIL** (execution time on `object_graph` and tier-1 preservation, for H12 and H16): [09-mem-exp-1-report.md](09-mem-exp-1-report.md); Q-MEM-0 fallback applies |
 | T-MEM-2 | Merge the chosen header: **B1 with H8** (Q-MEM-0 fallback after MEM-EXP-1 FAIL) | MEM-002 or B1 H8 | T-MEM-EXP-1 | reinforced | medium | todo |
 | T-MEM-3a | Counting for class references; store sequence §4.B; failure contract §4.A | MEM-003 | T-MEM-2 | reinforced + negative MIR cases of §4.B | high | superseded: Q-MEM-0 fallback after MEM-EXP-1 FAIL (no counting in the default build); experiment code stays behind `mem-exp-*` features |

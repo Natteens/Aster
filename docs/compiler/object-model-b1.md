@@ -71,11 +71,15 @@ Verified in the repository at the baseline:
 
 ### 4.1 Header and offsets
 
-`P` is the pointer size of the target (8 on a 64-bit host). Layout is computed with checked 32-bit
-arithmetic; an overflow is a controlled error. The rules, for a class `C` with optional base `B`:
+`P` is the pointer size of the target (8 on a 64-bit host). `H` is the header size, a named
+constant of the layout code. **`H = P`** (the H8 header on a 64-bit host): closure Q-OBJ-1 reserved
+a count word after the descriptor pointer (H12 or H16) only if reference counting were adopted, and
+MEM-EXP-1 rejected counting ([report](../proposals/architecture-2026/09-mem-exp-1-report.md)).
+Layout is computed with checked 32-bit arithmetic; an overflow is a controlled error. The rules, for
+a class `C` with optional base `B`:
 
-1. **Header.** Offset `0` holds the descriptor pointer: `P` bytes, aligned to `P`.
-2. **Start of the fields.** For a class with no base, the first field is placed at `align_up(P, field
+1. **Header.** Offset `0` holds the descriptor pointer: `H` bytes, aligned to `P`.
+2. **Start of the fields.** For a class with no base, the first field is placed at `align_up(H, field
    alignment)`. For a class with a base, the first own field is placed at `align_up(size(B), field
    alignment)`, where `size(B)` is the **complete** size of `B` including its tail padding. A derived
    field never occupies the tail padding of a base: the derived layout begins where the complete base
@@ -85,7 +89,7 @@ arithmetic; an overflow is a controlled error. The rules, for a class `C` with o
    today.
 4. **Alignment.** `align(C) = max(P, align(B), the alignment of every own field)`.
 5. **Size.** `size(C) = align_up(end of the last field, align(C))`.
-6. **Empty classes.** A class with no fields and no base has `size = P` and `align = P`; the header is
+6. **Empty classes.** A class with no fields and no base has `size = H` and `align = P`; the header is
    all of it. This replaces the current one-byte size of a field-less class. A derived class with no own
    fields has `size(D) = size(B)` and `align(D) = align(B)`.
 7. **Preservation.** Every field inherited from `B` keeps in `D` exactly the offset and size it has in
@@ -358,6 +362,32 @@ The `==` and `!=` operators keep comparing identity across all of these conversi
 | U8 | Covariant return types and `sealed override` | exact signatures and no `sealed override` in B1 | exact |
 | U9 | `virtual`/`override`/`abstract` on properties | methods only; properties as accessors | methods only in B1 |
 | U10 | Re-listing a base's interface in a derived class | error; C#-style re-implementation | error |
+
+### 10.1 Answers recorded by the architecture closure (2026-11)
+
+The 2026 architecture closure ([decision closure](../proposals/architecture-2026/06-decision-closure.md),
+[master plan §6](../proposals/architecture-2026/02-master-plan.md)) answered the open points. The
+contracts stay **PROPOSED** until the pull request that implements each part lands.
+
+| Point | Answer | Note |
+| --- | --- | --- |
+| U1 | Rule B (this-confinement of 6.3) | C may be added later |
+| U2 | C# order | 6.1 unchanged |
+| U3 | Search the descriptor's interface list | An indexed table only if measured at least 5% faster on `interface_dispatch` through a base type (OBJ-004) |
+| U4 | `value is Derived d` is the primary form; `value as Derived` yields `Option<Derived>` | The `T?` spelling depends on LANG-003 and is not assumed |
+| U5 | `base` is reserved | No identifier named `base` exists in the repository |
+| U6 | Uniform header | Required by the storage-class argument of the master plan |
+| U7 | Closed generic bases arrive with the generics-in-hierarchies step (OBJ-006) | Not in the first base-class PR |
+| U8 | Exact signatures; no `sealed override` | |
+| U9 | `virtual`/`override`/`abstract` on methods **and property accessors** (Q-OBJ-2) | Differs from this record's own recommendation. A virtual property on `this` inside a constructor is rejected like N11; P8 stays valid for non-virtual properties only |
+| U10 | Error | |
+| Header | `H = P` (H8) | Q-OBJ-1 after MEM-EXP-1 FAIL; T-MEM-2 merges this header |
+
+Amendments from the closure that do not change a contract here: the descriptor may gain fields
+(nothing is removed); descriptors are immortal module data in production and AOT, and live in
+session-stable storage in the development profile (HOT-002); class references stay
+non-transferable; a lambda that captures `this` inside a constructor is a new negative case; `sealed`
+does not make a hierarchy closed (exhaustive `switch` applies to enums only).
 
 ## 11. Stages, authorization and the sequence of pull requests
 
