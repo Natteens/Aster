@@ -343,6 +343,7 @@ impl Lexer<'_> {
             "default" => TokenKind::Default,
             "new" => TokenKind::New,
             "this" => TokenKind::This,
+            "base" => TokenKind::Base,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
             _ => TokenKind::Identifier(text.to_owned()),

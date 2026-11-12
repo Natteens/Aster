@@ -597,11 +597,16 @@ pub fn serialize_report(report: &Report) -> String {
         .collect();
     let benchmarks: Vec<String> = report.results.iter().map(json_result).collect();
     format!(
-        "{{\"schema_version\":{SCHEMA_VERSION},\"kind\":\"aster-performance-baseline\",\"metadata\":{{\"aster_version\":{},\"git_revision\":{},\"os\":{},\"arch\":{},\"profile\":{},\"rustc_version\":{},\"timing_unit\":\"ns\",\"warmup\":{},\"samples\":{},\"phases\":{{{}}}}},\"run\":{{\"started_unix_seconds\":{}}},\"benchmarks\":[{}]}}",
+        "{{\"schema_version\":{SCHEMA_VERSION},\"kind\":\"aster-performance-baseline\",\"metadata\":{{\"aster_version\":{},\"git_revision\":{},\"os\":{},\"arch\":{},\"target\":{},\"profile\":{},\"rustc_version\":{},\"timing_unit\":\"ns\",\"warmup\":{},\"samples\":{},\"phases\":{{{}}}}},\"run\":{{\"started_unix_seconds\":{}}},\"benchmarks\":[{}]}}",
         json_string(env!("CARGO_PKG_VERSION")),
         json_optional(git_revision.as_deref()),
         json_string(std::env::consts::OS),
         json_string(std::env::consts::ARCH),
+        json_string(&format!(
+            "{}-{}",
+            std::env::consts::ARCH,
+            std::env::consts::OS
+        )),
         json_string(profile),
         json_optional(rustc_version().as_deref()),
         report.config.warmup,

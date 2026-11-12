@@ -1,8 +1,8 @@
 use super::{
-    AccessorKind, Analyzer, Binding, Callable, Context, Diagnostic, EnumCaseInfo, Expression,
-    ExpressionKind, Field, FunctionDeclaration, HashMap, HashSet, InterpolatedPart, Item, Member,
-    Model, Module, Property, PropertyInfo, Signature, Span, Statement, Type, TypeDeclaration,
-    TypeInfo, TypeKind, TypeName, TypeRef, Visibility, callable_key, resolve_type,
+    AccessorKind, Analyzer, Binding, Callable, CallableKey, Context, Diagnostic, EnumCaseInfo,
+    Expression, ExpressionKind, Field, FunctionDeclaration, HashMap, HashSet, InterpolatedPart,
+    Item, Member, Model, Module, Property, PropertyInfo, Signature, Span, Statement, Type,
+    TypeDeclaration, TypeInfo, TypeKind, TypeName, TypeRef, Visibility, callable_key, resolve_type,
     resolve_type_readonly,
 };
 
@@ -13,6 +13,8 @@ pub(super) fn collect_type_names(module: &Module, context: &mut Context) {
                 let info = context.types.entry(item.name.clone()).or_default();
                 info.kind = Some(TypeKind::Class);
                 info.is_static = item.is_static;
+                info.is_abstract = item.is_abstract;
+                info.is_sealed = item.is_sealed;
             }
             Item::Struct(item) => {
                 context.types.entry(item.name.clone()).or_default().kind = Some(TypeKind::Struct);
@@ -508,6 +510,24 @@ fn collect_type_members(
                 })
                 .map(|interface| interface.name.clone())
                 .collect(),
+            // The first name after `:` is the base class when it names a
+            // class; `inheritance::resolve` validates the rest of the list.
+            base: declaration
+                .interfaces
+                .first()
+                .filter(|entry| {
+                    kind == TypeKind::Class
+                        && context
+                            .types
+                            .get(&entry.name)
+                            .is_some_and(|info| info.kind == Some(TypeKind::Class))
+                })
+                .map(|entry| entry.name.clone()),
+            is_abstract: declaration.is_abstract,
+            is_sealed: declaration.is_sealed,
+            field_owner: HashMap::new(),
+            ancestors: Vec::new(),
+            hidden_private: HashMap::new(),
             kind: Some(kind),
             enum_cases: Vec::new(),
         },
@@ -552,15 +572,8 @@ pub(super) fn validate_interface_implementations(
                 continue;
             };
             if interface_info.kind != Some(TypeKind::Interface) {
-                diagnostics.push(
-                    Diagnostic::error(
-                        format!("`{}` is not an interface", interface_ref.name),
-                        interface_ref.span,
-                    )
-                    .with_help(
-                        "only interfaces may appear after `:`; class inheritance is not supported",
-                    ),
-                );
+                // A class is the base class and any other kind was reported
+                // by the heritage validation (`inheritance::resolve`).
                 continue;
             }
             for (method_name, required_overloads) in &interface_info.methods {
@@ -871,6 +884,13 @@ pub(super) fn validate_bodies(
                             diagnostics,
                             model,
                             &initialized_fields,
+                            Some(callable_key(
+                                &method.name,
+                                method.span.start,
+                                &method.parameters,
+                                None,
+                                Some(&declaration.name),
+                            )),
                         ),
                         Member::Property(property) => {
                             validate_property(property, declaration, context, diagnostics, model);
@@ -958,9 +978,13 @@ fn validate_function(
         diagnostics,
         model,
         &HashSet::new(),
+        None,
     );
 }
 
+/// `summary_key` identifies a class method or property accessor whose use of
+/// `this` feeds the this-confinement analysis.
+#[allow(clippy::too_many_lines)]
 fn validate_function_with_initialized_fields(
     function: &FunctionDeclaration,
     context: &Context,
@@ -968,9 +992,26 @@ fn validate_function_with_initialized_fields(
     diagnostics: &mut Vec<Diagnostic>,
     model: &mut Model,
     initialized_fields: &HashSet<String>,
+    summary_key: Option<CallableKey>,
 ) {
     validate_test_function(function, owner, diagnostics);
     validate_parameter_defaults(function, context, owner, diagnostics, model);
+    let mut initialized_fields = initialized_fields.clone();
+    if function.constructor
+        && let Some(owner) = owner
+    {
+        // The base constructor completes before the body runs, so inherited
+        // fields are assigned. Its arguments are checked without an object.
+        model.register_function(
+            &crate::semantic::function_context(function, Some(owner)),
+            function,
+        );
+        super::inheritance::analyze_base_call(function, owner, context, diagnostics, model);
+        if let Some(info) = context.types.get(&owner.name) {
+            initialized_fields.extend(info.field_owner.keys().cloned());
+        }
+    }
+    let initialized_fields = &initialized_fields;
     if function.is_async && function.body.is_none() {
         diagnostics.push(
             Diagnostic::error("an `async` function must have a body", function.span).with_help(
@@ -1060,7 +1101,32 @@ fn validate_function_with_initialized_fields(
             .with_help("add a return statement with a compatible value"),
         );
     }
+    let usage = analyzer.this_usage.take();
     diagnostics.append(&mut analyzer.diagnostics);
+    if let Some(usage) = usage {
+        if function.constructor {
+            let class = owner.map(|owner| owner.name.clone()).unwrap_or_default();
+            for call in usage.calls {
+                model
+                    .constructor_this_calls
+                    .push(super::ConstructorThisCall {
+                        class: class.clone(),
+                        callable: call.callable,
+                        span: call.span,
+                        unassigned: call.unassigned,
+                    });
+            }
+        } else if let Some(key) = summary_key {
+            model.this_summaries.insert(
+                key,
+                super::ThisSummary {
+                    escape: usage.escape,
+                    reads: usage.reads,
+                    calls: usage.calls.into_iter().map(|call| call.callable).collect(),
+                },
+            );
+        }
+    }
 }
 
 fn validate_parameter_defaults(
@@ -1694,8 +1760,18 @@ fn validate_property(
     diagnostics: &mut Vec<Diagnostic>,
     model: &mut Model,
 ) {
+    let accessor_key = |kind: AccessorKind| {
+        callable_key(
+            &property.name,
+            property.span.start,
+            &[],
+            Some(kind),
+            Some(&owner.name),
+        )
+    };
     if let Some(getter) = &property.getter {
         let function = FunctionDeclaration {
+            base_call: None,
             constructor: false,
             is_test: false,
             is_static: false,
@@ -1709,10 +1785,19 @@ fn validate_property(
             body: Some(getter.body.clone()),
             span: getter.span,
         };
-        validate_function(&function, context, Some(owner), diagnostics, model);
+        validate_function_with_initialized_fields(
+            &function,
+            context,
+            Some(owner),
+            diagnostics,
+            model,
+            &HashSet::new(),
+            Some(accessor_key(AccessorKind::Get)),
+        );
     }
     if let Some(setter) = &property.setter {
         let function = FunctionDeclaration {
+            base_call: None,
             constructor: false,
             is_test: false,
             is_static: false,
@@ -1731,7 +1816,15 @@ fn validate_property(
             body: Some(setter.body.clone()),
             span: setter.span,
         };
-        validate_function(&function, context, Some(owner), diagnostics, model);
+        validate_function_with_initialized_fields(
+            &function,
+            context,
+            Some(owner),
+            diagnostics,
+            model,
+            &HashSet::new(),
+            Some(accessor_key(AccessorKind::Set)),
+        );
     }
 }
 
@@ -1755,9 +1848,7 @@ fn validate_module_visibility(
                 format!("`protected` is not valid on a namespace-level {declaration}"),
                 span,
             )
-            .with_help(
-                "use `internal` or `public`; protected access requires a future extension model",
-            ),
+            .with_help("use `internal` or `public`; `protected` applies only to class members"),
         ),
         Visibility::Public | Visibility::Internal => {}
     }
@@ -1769,16 +1860,11 @@ fn validate_member_visibility(
     owner: TypeKind,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    if visibility == Visibility::Protected {
+    if visibility == Visibility::Protected && owner != TypeKind::Class {
         let span = explicit_visibility_span(visibility, span);
-        let message = if owner == TypeKind::Class {
-            "`protected` members depend on a future inheritance or extension model"
-        } else {
-            "`protected` is only valid for class members"
-        };
         diagnostics.push(
-            Diagnostic::error(message, span)
-                .with_help("use `private`, `internal`, or `public` in this frontend phase"),
+            Diagnostic::error("`protected` is only valid for class members", span)
+                .with_help("use `private`, `internal`, or `public`"),
         );
     }
 }

@@ -55,9 +55,20 @@ struct FieldInitialization {
 /// scalar MIR locals. This runs after escape-region assignment, so it never
 /// independently decides whether an object escapes.
 pub(super) fn eliminate(module: &mut mir::Module) {
+    // Classes in a hierarchy are never eliminated: an upcast aliases the
+    // object, a derived object has inherited fields this pass does not model,
+    // and later steps add virtual calls that treat the receiver as escaping.
+    let bases = module
+        .classes
+        .iter()
+        .filter_map(|class| class.base)
+        .collect::<HashSet<_>>();
     let scalar_classes = module
         .classes
         .iter()
+        .filter(|class| {
+            class.base.is_none() && !class.is_abstract && !bases.contains(&class.symbol)
+        })
         .filter(|class| class.fields.iter().all(|field| is_scalar(&field.type_)))
         .map(|class| (class.symbol, class.fields.clone()))
         .collect::<HashMap<_, _>>();
@@ -513,6 +524,7 @@ fn rvalue_is_legal(value: &mir::Rvalue, candidate: &Candidate) -> bool {
         | mir::RvalueKind::ListVersion(operand)
         | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => operand_is_legal(operand, candidate),
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             fields
@@ -869,6 +881,7 @@ fn rewrite_rvalue(
         | mir::RvalueKind::ListVersion(operand)
         | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => rewrite_operand(operand, fields),
         mir::RvalueKind::Aggregate(values)
         | mir::RvalueKind::EnumConstruct { fields: values, .. } => {

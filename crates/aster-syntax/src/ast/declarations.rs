@@ -1,6 +1,6 @@
 use aster_diagnostics::Span;
 
-use super::{Block, Expression};
+use super::{Argument, Block, Expression};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Visibility {
@@ -32,7 +32,14 @@ pub struct TypeDeclaration {
     pub is_static: bool,
     pub name: String,
     pub type_parameters: Vec<TypeParameter>,
-    /// Interfaces implemented nominally by a class. Empty for structs and interfaces.
+    /// Class declared `abstract`: it cannot be instantiated. Always `false` for
+    /// structs and interfaces (the parser rejects the modifier there).
+    pub is_abstract: bool,
+    /// Class declared `sealed`: no class may derive from it.
+    pub is_sealed: bool,
+    /// The names after `:` in declaration order. Semantic analysis classifies
+    /// each name: a class base (at most one, and it must be first) or an
+    /// interface. Empty for structs and interfaces.
     pub interfaces: Vec<TypeRef>,
     pub members: Vec<Member>,
     pub span: Span,
@@ -105,7 +112,17 @@ pub struct FunctionDeclaration {
     pub return_type: TypeRef,
     pub name: String,
     pub parameters: Vec<Parameter>,
+    /// The `: base(arguments)` initializer of a constructor. `None` for every
+    /// other function and for a constructor that omits it.
+    pub base_call: Option<BaseCall>,
     pub body: Option<Block>,
+    pub span: Span,
+}
+
+/// `: base(arguments)` after a constructor's parameter list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BaseCall {
+    pub arguments: Vec<Argument>,
     pub span: Span,
 }
 

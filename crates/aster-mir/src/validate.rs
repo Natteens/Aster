@@ -105,6 +105,9 @@ pub struct MirTypeIndex {
     kinds: HashMap<mir::SymbolId, NominalKind>,
     struct_fields: HashMap<(mir::SymbolId, mir::SymbolId), mir::Type>,
     class_fields: HashMap<(mir::SymbolId, mir::SymbolId), mir::Type>,
+    /// Direct base of every derived class.
+    class_bases: HashMap<mir::SymbolId, mir::SymbolId>,
+    abstract_classes: HashSet<mir::SymbolId>,
     enum_cases: HashMap<mir::SymbolId, mir::SymbolId>,
     enum_fields: HashMap<(mir::SymbolId, mir::SymbolId), mir::Type>,
 }
@@ -164,6 +167,7 @@ impl MirTypeIndex {
                 }
             }
         }
+        index.index_class_hierarchy(module)?;
         for definition in &module.interfaces {
             index.insert_type(definition.symbol, NominalKind::Interface)?;
         }
@@ -196,6 +200,81 @@ impl MirTypeIndex {
             }
         }
         Ok(index)
+    }
+
+    /// Records every class's base and flags, and rejects a base that is not a
+    /// declared non-sealed class, a class that is its own ancestor, and a
+    /// sealed abstract class. Layout compatibility of derived classes is
+    /// recomputed by the backend's layout validation, which owns sizes.
+    fn index_class_hierarchy(&mut self, module: &mir::Module) -> Result<(), ValidationError> {
+        let definitions = module
+            .classes
+            .iter()
+            .map(|definition| (definition.symbol, definition))
+            .collect::<HashMap<_, _>>();
+        for definition in &module.classes {
+            if definition.is_abstract {
+                self.abstract_classes.insert(definition.symbol);
+            }
+            if definition.is_abstract && definition.is_sealed {
+                return Err(ValidationError::invalid(
+                    "MIR class is both abstract and sealed",
+                ));
+            }
+            let Some(base) = definition.base else {
+                continue;
+            };
+            let Some(base_definition) = definitions.get(&base) else {
+                return Err(ValidationError::invalid(
+                    "MIR class names a base that is not a declared class",
+                ));
+            };
+            if base_definition.is_sealed {
+                return Err(ValidationError::invalid(
+                    "MIR class derives from a sealed class",
+                ));
+            }
+            self.class_bases.insert(definition.symbol, base);
+        }
+        for definition in &module.classes {
+            let mut current = definition.symbol;
+            let mut steps = 0_usize;
+            while let Some(base) = self.class_bases.get(&current) {
+                steps += 1;
+                if *base == definition.symbol || steps > module.classes.len() {
+                    return Err(ValidationError::invalid(
+                        "MIR class inheritance contains a cycle",
+                    ));
+                }
+                current = *base;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `derived` strictly derives from `base` through the declared
+    /// base chain. A class does not derive from itself.
+    #[must_use]
+    pub fn class_derives_from(&self, derived: mir::SymbolId, base: mir::SymbolId) -> bool {
+        let mut current = derived;
+        let mut steps = 0_usize;
+        while let Some(next) = self.class_bases.get(&current) {
+            if *next == base {
+                return true;
+            }
+            steps += 1;
+            if steps > self.class_bases.len() {
+                return false;
+            }
+            current = *next;
+        }
+        false
+    }
+
+    /// Whether `class` is declared abstract.
+    #[must_use]
+    pub fn is_abstract_class(&self, class: mir::SymbolId) -> bool {
+        self.abstract_classes.contains(&class)
     }
 
     fn insert_type(
@@ -372,6 +451,13 @@ fn validate_typed_instruction(
             operand(length)?;
             destination(result, &mir::Type::Array(Box::new(element_type.clone())))
         }
+        mir::Instruction::AllocateObject {
+            destination: result,
+            class,
+            ..
+        } if types.is_abstract_class(*class) => Err(ValidationError::invalid(format!(
+            "function `{function_name}` allocates an abstract class"
+        ))),
         mir::Instruction::AllocateObject {
             destination: result,
             class,
@@ -621,6 +707,19 @@ fn validate_typed_rvalue(
         | mir::RvalueKind::Cast(input)
         | mir::RvalueKind::Unary { operand: input, .. } => operand(input),
         mir::RvalueKind::MakeInterface { object, .. } => operand(object),
+        mir::RvalueKind::Upcast(input) => {
+            operand(input)?;
+            match (&input.type_, &value.type_) {
+                (mir::Type::Class(derived), mir::Type::Class(base))
+                    if types.class_derives_from(*derived, *base) =>
+                {
+                    Ok(())
+                }
+                _ => Err(ValidationError::invalid(format!(
+                    "function `{function_name}` upcasts to a class that is not a base of its operand"
+                ))),
+            }
+        }
         mir::RvalueKind::Binary {
             left,
             operator,

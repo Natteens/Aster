@@ -658,3 +658,21 @@ fn string_keys_and_values_are_released_by_set_remove_and_clear() {
         stats.object_heap
     );
 }
+
+#[test]
+fn derived_objects_release_inherited_and_own_reference_fields() {
+    // The descriptor's reference offsets include the inherited field: a
+    // replaced derived object (held through its base type) must release both
+    // nodes and itself.
+    let stats = run(
+        &format!(
+            "{NODE} public class Base {{ public Node first; public Base(Node first) {{ this.first = first; }} }}              public class Derived : Base {{ public Node second;              public Derived(Node a, Node b) : base(a) {{ second = b; }} }}              internal Base MakeD(int i) {{ return new Derived(Make(i), Make(1)); }}              public int Run() {{ Base held = MakeD(0);              for (int i = 1; i < 50; i += 1) {{ held = MakeD(i); }}              return held.first.value - 42; }}"
+        ),
+        7,
+    );
+    assert!(
+        stats.object_heap.released_blocks >= 49 * 3,
+        "inherited or own fields leaked: {:?}",
+        stats.object_heap
+    );
+}

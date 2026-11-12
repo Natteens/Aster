@@ -305,6 +305,7 @@ fn synthesize_default_constructors(module: &mut Module) {
             continue;
         }
         class.members.push(Member::Method(FunctionDeclaration {
+            base_call: None,
             constructor: true,
             is_test: false,
             is_static: false,

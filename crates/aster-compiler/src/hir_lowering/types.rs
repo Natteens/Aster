@@ -158,6 +158,18 @@ pub(super) fn is_scalar_switch_type(type_: &hir::Type) -> bool {
 /// Wrap an expression in a `Convert` node when its type differs from the
 /// validated target type. Only value types are ever converted.
 pub(super) fn convert(expression: hir::Expression, target: &hir::Type) -> hir::Expression {
+    // Semantic analysis only admits a class-to-class conversion along the
+    // declared base chain, where it is an identity-preserving upcast.
+    if let (hir::Type::Class(from), hir::Type::Class(to)) = (&expression.type_, target)
+        && from != to
+    {
+        return hir::Expression {
+            type_: target.clone(),
+            kind: hir::ExpressionKind::UpcastClass {
+                object: Box::new(expression),
+            },
+        };
+    }
     if let (hir::Type::Class(class), hir::Type::Interface(interface)) =
         (expression.type_.clone(), target)
     {

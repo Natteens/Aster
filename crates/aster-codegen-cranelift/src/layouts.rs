@@ -39,20 +39,44 @@ pub(super) const OBJECT_HEADER_BYTES: u32 = if cfg!(feature = "mem-exp-h16") {
 /// stable when the store is moved, and is kept alive until the JIT module and
 /// every execution context are gone. Descriptors are immutable once
 /// [`Self::bind_interface_tables`] has run, before any generated code executes.
+/// Heap data whose address is published to generated code and to other
+/// descriptors. Owned through a raw pointer (never through a live `Box`), so
+/// later writes and reads through that published pointer stay valid under
+/// Rust's aliasing rules; freed on drop.
+pub(super) struct RawOwned<T: ?Sized>(std::ptr::NonNull<T>);
+
+impl<T: ?Sized> RawOwned<T> {
+    fn new(value: Box<T>) -> Self {
+        Self(std::ptr::NonNull::from(Box::leak(value)))
+    }
+
+    fn as_ptr(&self) -> *mut T {
+        self.0.as_ptr()
+    }
+}
+
+impl<T: ?Sized> Drop for RawOwned<T> {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from `Box::leak` in `new` and is freed once.
+        drop(unsafe { Box::from_raw(self.0.as_ptr()) });
+    }
+}
+
 #[derive(Default)]
 pub(super) struct ObjectDescriptors {
     #[cfg(feature = "mem-exp-rc-core")]
     #[allow(dead_code, reason = "owns the offset tables the descriptors point at")]
     offsets: Vec<Box<[u32]>>,
-    #[allow(
-        dead_code,
-        clippy::vec_box,
-        reason = "boxing keeps descriptor addresses stable"
-    )]
-    classes: Vec<Box<aster_runtime::descriptor::ClassDescriptor>>,
+    classes: Vec<RawOwned<aster_runtime::descriptor::ClassDescriptor>>,
     /// Interface entry arrays, in `module.interface_implementations` order per
     /// class; the descriptors point at these allocations.
-    interface_entries: HashMap<mir::SymbolId, Box<[aster_runtime::descriptor::InterfaceEntry]>>,
+    interface_entries:
+        HashMap<mir::SymbolId, RawOwned<[aster_runtime::descriptor::InterfaceEntry]>>,
+    /// Ancestor arrays (root first, ending with the class itself); the
+    /// descriptors point at these allocations.
+    #[allow(dead_code, reason = "owns the arrays the descriptors point at")]
+    ancestor_arrays: Vec<RawOwned<[*const aster_runtime::descriptor::ClassDescriptor]>>,
     by_class: HashMap<mir::SymbolId, *const aster_runtime::descriptor::ClassDescriptor>,
     #[cfg(feature = "mem-exp-rc-core")]
     #[allow(
@@ -125,37 +149,154 @@ impl ObjectDescriptors {
             );
             #[cfg(not(feature = "mem-exp-rc-core"))]
             let (reference_count, reference_offsets) = (0_u32, std::ptr::null());
-            let entries = interface_lists
-                .remove(&class.symbol)
-                .unwrap_or_default()
-                .into_boxed_slice();
-            let descriptor = Box::new(aster_runtime::descriptor::ClassDescriptor {
+            let entries = RawOwned::new(
+                interface_lists
+                    .remove(&class.symbol)
+                    .unwrap_or_default()
+                    .into_boxed_slice(),
+            );
+            let entry_count = entries.as_ptr().len();
+            let flags = (if class.is_abstract {
+                aster_runtime::descriptor::CLASS_FLAG_ABSTRACT
+            } else {
+                0
+            }) | (if class.is_sealed {
+                aster_runtime::descriptor::CLASS_FLAG_SEALED
+            } else {
+                0
+            });
+            // The hierarchy fields are filled below, once every descriptor
+            // has its final address and before any generated code runs.
+            let descriptor = RawOwned::new(Box::new(aster_runtime::descriptor::ClassDescriptor {
                 object: aster_runtime::descriptor::ObjectDescriptor {
                     size,
                     reference_count,
                     reference_offsets,
                 },
                 class_id: mir::type_key(&mir::Type::Class(class.symbol)),
-                interface_count: u32::try_from(entries.len())
+                interface_count: u32::try_from(entry_count)
                     .map_err(|_| BackendError::new("class implements too many interfaces"))?,
-                reserved: 0,
-                interfaces: if entries.is_empty() {
+                flags,
+                interfaces: if entry_count == 0 {
                     std::ptr::null()
                 } else {
-                    entries.as_ptr()
+                    entries.as_ptr().cast_const().cast()
                 },
-            });
+                base: std::ptr::null(),
+                depth: 0,
+                ancestor_count: 0,
+                ancestors: std::ptr::null(),
+            }));
+            // Every later write and read goes through this raw pointer.
             store
                 .by_class
-                .insert(class.symbol, std::ptr::from_ref(&*descriptor));
+                .insert(class.symbol, descriptor.as_ptr().cast_const());
             #[cfg(feature = "mem-exp-rc-core")]
             store.offsets.push(offsets);
             store.interface_entries.insert(class.symbol, entries);
             store.classes.push(descriptor);
         }
+        store.link_hierarchy(module)?;
         #[cfg(feature = "mem-exp-rc-core")]
         store.build_collection_descriptors(layouts, module, &native)?;
         Ok(store)
+    }
+
+    /// Fill the base pointer, depth and ancestor array of every descriptor
+    /// (object model B1, section 4.2) and validate the result (section 4.5).
+    #[allow(unsafe_code)]
+    fn link_hierarchy(&mut self, module: &mir::Module) -> Result<(), BackendError> {
+        let bases = module
+            .classes
+            .iter()
+            .filter_map(|class| Some((class.symbol, class.base?)))
+            .collect::<HashMap<_, _>>();
+        for class in &module.classes {
+            // The chain from the root down to the class itself.
+            let mut chain = vec![class.symbol];
+            while let Some(base) = bases.get(chain.last().expect("chain starts with the class")) {
+                if chain.contains(base) {
+                    return Err(BackendError::new("class inheritance contains a cycle"));
+                }
+                chain.push(*base);
+            }
+            chain.reverse();
+            let ancestors = chain
+                .iter()
+                .map(|symbol| {
+                    self.by_class
+                        .get(symbol)
+                        .copied()
+                        .ok_or_else(|| BackendError::new("class base has no descriptor"))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_boxed_slice();
+            let ancestors = RawOwned::new(ancestors);
+            let own = self.by_class[&class.symbol].cast_mut();
+            let base = if chain.len() >= 2 {
+                self.by_class[&chain[chain.len() - 2]]
+            } else {
+                std::ptr::null()
+            };
+            let depth = u32::try_from(chain.len() - 1)
+                .map_err(|_| BackendError::new("class hierarchy is too deep"))?;
+            // SAFETY: `own` is the published raw pointer of a descriptor owned
+            // by `self.classes` (`RawOwned`), no reference to it is live, and
+            // no generated code runs before the program is prepared.
+            unsafe {
+                (*own).base = base;
+                (*own).depth = depth;
+                (*own).ancestor_count = depth + 1;
+                (*own).ancestors = ancestors.as_ptr().cast_const().cast();
+            }
+            self.ancestor_arrays.push(ancestors);
+        }
+        self.validate_hierarchy()
+    }
+
+    /// Validate the descriptor invariants of section 4.5: the base chain is
+    /// acyclic, `depth` is the base's plus one, and `ancestors` has exactly
+    /// `depth + 1` entries, begins with the base's entries and ends with the
+    /// class itself.
+    #[allow(unsafe_code)]
+    pub(super) fn validate_hierarchy(&self) -> Result<(), BackendError> {
+        for owned in &self.classes {
+            let own = owned.as_ptr().cast_const();
+            // SAFETY: every pointer inspected below was written by
+            // `link_hierarchy` and points into allocations owned by `self`.
+            unsafe {
+                let descriptor = &*own;
+                let ancestors = descriptor.ancestor_entries();
+                if descriptor.ancestor_count != descriptor.depth + 1
+                    || ancestors.len() != descriptor.depth as usize + 1
+                    || !std::ptr::eq(ancestors[ancestors.len() - 1], own)
+                {
+                    return Err(BackendError::new(
+                        "class descriptor has a malformed ancestor array",
+                    ));
+                }
+                if descriptor.base.is_null() {
+                    if descriptor.depth != 0 {
+                        return Err(BackendError::new(
+                            "class descriptor without a base has a non-zero depth",
+                        ));
+                    }
+                } else {
+                    let base = &*descriptor.base;
+                    if descriptor.depth != base.depth + 1 {
+                        return Err(BackendError::new(
+                            "class descriptor depth is not its base depth plus one",
+                        ));
+                    }
+                    if base.ancestor_entries() != &ancestors[..ancestors.len() - 1] {
+                        return Err(BackendError::new(
+                            "class descriptor ancestors do not begin with its base ancestors",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Write the finalized JIT data address of every interface method table
@@ -175,12 +316,23 @@ impl ObjectDescriptors {
                 .get(&(implementation.class, implementation.interface))
                 .ok_or_else(|| BackendError::new("interface table was not defined"))?;
             let (address, _) = jit.get_finalized_data(*id);
-            let entry = self
+            let entries = self
                 .interface_entries
-                .get_mut(&implementation.class)
-                .and_then(|entries| entries.get_mut(*slot))
+                .get(&implementation.class)
+                .map(RawOwned::as_ptr)
                 .ok_or_else(|| BackendError::new("class descriptor has no interface entry"))?;
-            entry.table = address;
+            if *slot >= entries.len() {
+                return Err(BackendError::new("class descriptor has no interface entry"));
+            }
+            // SAFETY: `entries` is the published raw pointer of an array owned
+            // by `self`, `slot` is in bounds, and no generated code runs yet.
+            #[allow(unsafe_code)]
+            unsafe {
+                (*entries
+                    .cast::<aster_runtime::descriptor::InterfaceEntry>()
+                    .add(*slot))
+                .table = address;
+            }
             *slot += 1;
         }
         Ok(())
@@ -303,6 +455,9 @@ impl ObjectDescriptors {
 
 pub(super) struct Layouts {
     classes: std::collections::HashSet<mir::SymbolId>,
+    /// Direct base of every derived class. A derived object starts with the
+    /// complete base object (object model B1, section 4.1).
+    bases: HashMap<mir::SymbolId, mir::SymbolId>,
     pub(super) pointer_bytes: u32,
     pub(super) structs: HashMap<mir::SymbolId, mir::StructDefinition>,
     pub(super) enums: HashMap<mir::SymbolId, mir::EnumDefinition>,
@@ -314,6 +469,11 @@ impl Layouts {
     pub(super) fn new(module: &mir::Module, pointer_bytes: u32) -> Result<Self, BackendError> {
         let mut layouts = Self {
             classes: module.classes.iter().map(|class| class.symbol).collect(),
+            bases: module
+                .classes
+                .iter()
+                .filter_map(|class| Some((class.symbol, class.base?)))
+                .collect(),
             pointer_bytes,
             structs: module
                 .structs
@@ -346,7 +506,114 @@ impl Layouts {
         for symbol in enum_symbols {
             layouts.compute_enum(symbol, &mut Vec::new())?;
         }
+        layouts.validate_class_hierarchy(module)?;
         Ok(layouts)
+    }
+
+    /// Independently recompute the hierarchy invariants of object model B1,
+    /// section 4.1, from the class definitions and the finished layouts, and
+    /// reject a violation before any code is generated:
+    ///
+    /// * the base chain is acyclic and every base is a class;
+    /// * a derived class is at least as large and as aligned as its base, and
+    ///   no field is declared twice in one chain;
+    /// * a class's own fields start at or after the complete size of its base
+    ///   (the tail padding of the base is never reused), are naturally
+    ///   aligned, do not overlap each other or any inherited field, and end
+    ///   inside the object;
+    /// * every inherited field keeps exactly the offset it has in the base.
+    fn validate_class_hierarchy(&self, module: &mir::Module) -> Result<(), BackendError> {
+        let definitions = module
+            .classes
+            .iter()
+            .map(|class| (class.symbol, class))
+            .collect::<HashMap<_, _>>();
+        for class in &module.classes {
+            // The chain from the class up to its root, cycle-checked.
+            let mut chain = vec![class.symbol];
+            while let Some(base) = definitions
+                .get(chain.last().expect("chain starts with the class"))
+                .and_then(|definition| definition.base)
+            {
+                if !definitions.contains_key(&base) {
+                    return Err(BackendError::new("class base is not a declared class"));
+                }
+                if chain.contains(&base) {
+                    return Err(BackendError::new("class inheritance contains a cycle"));
+                }
+                chain.push(base);
+            }
+            let layout = self
+                .types
+                .get(&class.symbol)
+                .ok_or_else(|| BackendError::new("class has no computed object layout"))?;
+            let alignment = 1_u32 << layout.align_shift;
+            let mut taken: Vec<(u32, u32, mir::SymbolId)> = Vec::new();
+            // Root first: each class's own fields must lie at or after the
+            // complete size of its base.
+            for member in chain.iter().rev() {
+                let definition = definitions[member];
+                let member_layout = self
+                    .types
+                    .get(member)
+                    .ok_or_else(|| BackendError::new("class has no computed object layout"))?;
+                let floor = match definition.base {
+                    Some(base) => {
+                        let base_layout = self.types.get(&base).ok_or_else(|| {
+                            BackendError::new("class has no computed object layout")
+                        })?;
+                        if member_layout.size < base_layout.size
+                            || member_layout.align_shift < base_layout.align_shift
+                        {
+                            return Err(BackendError::new(
+                                "derived class layout is smaller or less aligned than its base",
+                            ));
+                        }
+                        base_layout.size
+                    }
+                    None => OBJECT_HEADER_BYTES,
+                };
+                for field in &definition.fields {
+                    let field_layout = self
+                        .fields
+                        .get(&field.symbol)
+                        .ok_or_else(|| BackendError::new("field has no computed layout"))?;
+                    let size = self.type_layout(&field.type_)?.size;
+                    let field_alignment = 1_u32 << self.type_layout(&field.type_)?.align_shift;
+                    let end = field_layout.offset.checked_add(size).ok_or_else(|| {
+                        BackendError::new("field layout exceeds addressable size")
+                    })?;
+                    if field_layout.offset < floor {
+                        return Err(BackendError::new(
+                            "field starts inside the header or the complete layout of its base",
+                        ));
+                    }
+                    if field_layout.offset % field_alignment != 0 {
+                        return Err(BackendError::new("field offset is not naturally aligned"));
+                    }
+                    if end > member_layout.size || end > layout.size {
+                        return Err(BackendError::new(
+                            "field extends past the end of its object",
+                        ));
+                    }
+                    if taken.iter().any(|(start, other_end, symbol)| {
+                        *symbol == field.symbol
+                            || (field_layout.offset < *other_end && *start < end)
+                    }) {
+                        return Err(BackendError::new(
+                            "class fields overlap or repeat within one inheritance chain",
+                        ));
+                    }
+                    taken.push((field_layout.offset, end, field.symbol));
+                }
+            }
+            if layout.size % alignment != 0 {
+                return Err(BackendError::new(
+                    "class size is not a multiple of its alignment",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Whether a value of `type_` holds at least one counted reference leaf.
@@ -394,6 +661,12 @@ impl Layouts {
             .structs
             .get(&aggregate)
             .ok_or_else(|| BackendError::new("unknown executable struct type"))?;
+        // A derived object starts with its complete base object, so the
+        // inherited reference leaves come first, at the offsets they have in
+        // the base.
+        if let Some(base_class) = self.bases.get(&aggregate) {
+            self.collect_reference_offsets(*base_class, base, native, offsets)?;
+        }
         for field in &definition.fields {
             let offset = base
                 + self
@@ -517,6 +790,13 @@ impl Layouts {
         };
         let mut offset = header;
         let mut alignment = if header == 0 { 1_u32 } else { 8 };
+        if let Some(base) = self.bases.get(&symbol).copied() {
+            // The derived object starts where the complete base object ends
+            // (its tail padding is never reused), and is at least as aligned.
+            let base_layout = self.compute_struct(base, visiting)?;
+            offset = base_layout.size;
+            alignment = alignment.max(1_u32 << base_layout.align_shift);
+        }
         for field in definition.fields {
             let field_layout = self.layout_of(&field.type_, visiting)?;
             let field_alignment = 1_u32 << field_layout.align_shift;
@@ -776,6 +1056,9 @@ mod layout_tests {
             enums: Vec::new(),
             structs: Vec::new(),
             classes: vec![mir::ClassDefinition {
+                base: None,
+                is_abstract: false,
+                is_sealed: false,
                 symbol: class,
                 name: "Node".to_owned(),
                 fields: vec![
@@ -840,16 +1123,25 @@ mod layout_tests {
         assert_eq!(super::OBJECT_HEADER_BYTES, 8);
         let module = class_module(vec![
             mir::ClassDefinition {
+                base: None,
+                is_abstract: false,
+                is_sealed: false,
                 symbol: mir::SymbolId(20),
                 name: "Empty".to_owned(),
                 fields: Vec::new(),
             },
             mir::ClassDefinition {
+                base: None,
+                is_abstract: false,
+                is_sealed: false,
                 symbol: mir::SymbolId(21),
                 name: "Counter".to_owned(),
                 fields: vec![field(22, mir::Type::Int)],
             },
             mir::ClassDefinition {
+                base: None,
+                is_abstract: false,
+                is_sealed: false,
                 symbol: mir::SymbolId(23),
                 name: "Mixed".to_owned(),
                 fields: vec![field(24, mir::Type::Byte), field(25, mir::Type::Long)],
@@ -873,6 +1165,9 @@ mod layout_tests {
     #[test]
     fn class_fields_never_overlap_the_header_word() {
         let module = class_module(vec![mir::ClassDefinition {
+            base: None,
+            is_abstract: false,
+            is_sealed: false,
             symbol: mir::SymbolId(30),
             name: "Wide".to_owned(),
             fields: vec![
@@ -952,5 +1247,152 @@ mod layout_tests {
         assert_eq!(layout.offsets, vec![0, 8, 16, 24]);
         assert_eq!(layout.size, 32);
         assert!(super::align_up(u32::MAX, 8).is_err());
+    }
+}
+
+#[cfg(test)]
+#[allow(unsafe_code)]
+mod hierarchy_tests {
+    use super::{Layouts, OBJECT_HEADER_BYTES, ObjectDescriptors};
+    use aster_mir as mir;
+
+    fn class(
+        symbol: u32,
+        base: Option<u32>,
+        fields: Vec<(u32, mir::Type)>,
+    ) -> mir::ClassDefinition {
+        mir::ClassDefinition {
+            symbol: mir::SymbolId(symbol),
+            name: format!("C{symbol}"),
+            base: base.map(mir::SymbolId),
+            is_abstract: false,
+            is_sealed: false,
+            fields: fields
+                .into_iter()
+                .map(|(symbol, type_)| mir::FieldDefinition {
+                    symbol: mir::SymbolId(symbol),
+                    name: format!("f{symbol}"),
+                    type_,
+                })
+                .collect(),
+        }
+    }
+
+    fn module(classes: Vec<mir::ClassDefinition>) -> mir::Module {
+        mir::Module {
+            structs: Vec::new(),
+            classes,
+            interfaces: Vec::new(),
+            enums: Vec::new(),
+            interface_implementations: Vec::new(),
+            foreign_functions: Vec::new(),
+            functions: Vec::new(),
+        }
+    }
+
+    /// B1 4.1: `Base { long x; byte b }`, `Derived : Base { byte d }`,
+    /// `Leaf : Derived`; the tail padding of `Base` is not reused.
+    #[test]
+    fn offsets_are_preserved_across_three_levels_and_tail_padding_is_not_reused() {
+        let h = OBJECT_HEADER_BYTES;
+        let m = module(vec![
+            class(1, None, vec![(10, mir::Type::Long), (11, mir::Type::Byte)]),
+            class(2, Some(1), vec![(12, mir::Type::Byte)]),
+            class(3, Some(2), vec![]),
+        ]);
+        let layouts = Layouts::new(&m, 8).expect("layouts");
+        let base_size = layouts.types[&mir::SymbolId(1)].size;
+        let x = h.next_multiple_of(8);
+        assert_eq!(base_size, (x + 8 + 1).next_multiple_of(8));
+        assert_eq!(layouts.fields[&mir::SymbolId(10)].offset, x);
+        assert_eq!(layouts.fields[&mir::SymbolId(11)].offset, x + 8);
+        // The derived field starts at the complete base size, not at the
+        // end of `b`.
+        assert_eq!(layouts.fields[&mir::SymbolId(12)].offset, base_size);
+        assert!(layouts.fields[&mir::SymbolId(12)].offset > x + 8);
+        assert_eq!(
+            layouts.types[&mir::SymbolId(2)].size,
+            (base_size + 1).next_multiple_of(8)
+        );
+        // A derived class without fields is exactly as large as its base.
+        assert_eq!(
+            layouts.types[&mir::SymbolId(3)].size,
+            layouts.types[&mir::SymbolId(2)].size
+        );
+        #[cfg(not(any(feature = "mem-exp-h12", feature = "mem-exp-h16")))]
+        assert_eq!(layouts.types[&mir::SymbolId(2)].size, 32);
+    }
+
+    #[test]
+    fn v1_a_field_inside_the_base_or_overlapping_is_rejected() {
+        let m = module(vec![
+            class(1, None, vec![(10, mir::Type::Long)]),
+            class(2, Some(1), vec![(12, mir::Type::Int)]),
+        ]);
+        let mut layouts = Layouts::new(&m, 8).expect("layouts");
+        // Move the derived field into the complete base object.
+        layouts.fields.get_mut(&mir::SymbolId(12)).unwrap().offset = OBJECT_HEADER_BYTES;
+        assert!(layouts.validate_class_hierarchy(&m).is_err());
+        // A derived layout smaller than its base.
+        let mut layouts = Layouts::new(&m, 8).expect("layouts");
+        layouts.types.get_mut(&mir::SymbolId(2)).unwrap().size = 8;
+        assert!(layouts.validate_class_hierarchy(&m).is_err());
+    }
+
+    #[test]
+    fn v5_cycles_and_unknown_bases_are_rejected() {
+        let cyclic = module(vec![class(1, Some(2), vec![]), class(2, Some(1), vec![])]);
+        assert!(Layouts::new(&cyclic, 8).is_err());
+        let unknown = module(vec![class(1, Some(9), vec![])]);
+        assert!(Layouts::new(&unknown, 8).is_err());
+    }
+
+    #[test]
+    fn descriptors_record_base_depth_and_ancestors() {
+        let m = module(vec![
+            class(3, Some(2), vec![]),
+            class(1, None, vec![(10, mir::Type::Int)]),
+            class(2, Some(1), vec![(11, mir::Type::Int)]),
+            class(4, None, vec![]),
+        ]);
+        let layouts = Layouts::new(&m, 8).expect("layouts");
+        let store = ObjectDescriptors::build(&layouts, &m).expect("descriptors");
+        let at = |symbol: u32| {
+            // SAFETY: the store owns the descriptor for its whole lifetime.
+            unsafe { &*store.by_class[&mir::SymbolId(symbol)] }
+        };
+        assert!(at(1).base.is_null() && at(1).depth == 0);
+        assert!(std::ptr::eq(at(2).base, at(1)) && at(2).depth == 1);
+        assert!(std::ptr::eq(at(3).base, at(2)) && at(3).depth == 2);
+        // SAFETY: descriptors built by `ObjectDescriptors` are valid.
+        unsafe {
+            let ancestors = at(3).ancestor_entries();
+            assert_eq!(ancestors.len(), 3);
+            assert!(std::ptr::eq(ancestors[0], at(1)));
+            assert!(std::ptr::eq(ancestors[1], at(2)));
+            assert!(std::ptr::eq(ancestors[2], at(3)));
+            assert!(at(3).derives_from(at(1)));
+            assert!(at(3).derives_from(at(3)));
+            assert!(!at(1).derives_from(at(3)));
+            // V4: a deep target against a shallow unrelated class is `false`
+            // without indexing past its ancestor array.
+            assert!(!at(4).derives_from(at(3)));
+            assert!(!at(3).derives_from(at(4)));
+        }
+        assert_eq!(at(2).object.size, layouts.types[&mir::SymbolId(2)].size);
+        assert!(store.validate_hierarchy().is_ok());
+    }
+
+    #[test]
+    fn v3_malformed_descriptors_are_rejected() {
+        let m = module(vec![class(1, None, vec![]), class(2, Some(1), vec![])]);
+        let layouts = Layouts::new(&m, 8).expect("layouts");
+        let store = ObjectDescriptors::build(&layouts, &m).expect("descriptors");
+        let derived = store.by_class[&mir::SymbolId(2)].cast_mut();
+        // SAFETY: test-only mutation of a descriptor owned by `store`.
+        unsafe {
+            (*derived).depth = 5;
+        }
+        assert!(store.validate_hierarchy().is_err());
     }
 }

@@ -13,7 +13,10 @@ impl Codegen {
         state: &FunctionState,
     ) -> Result<Value, BackendError> {
         match &value.kind {
-            mir::RvalueKind::Use(operand) => self.translate_operand(builder, operand, state),
+            // An upcast is the same object pointer: no code runs.
+            mir::RvalueKind::Use(operand) | mir::RvalueKind::Upcast(operand) => {
+                self.translate_operand(builder, operand, state)
+            }
             mir::RvalueKind::Aggregate(_) => Err(BackendError::new(
                 "aggregate rvalue reached scalar translation",
             )),

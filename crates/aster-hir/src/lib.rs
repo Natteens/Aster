@@ -245,6 +245,13 @@ pub struct TypeDeclaration {
     pub symbol: SymbolId,
     pub name: String,
     pub visibility: Visibility,
+    /// The base class of a class declaration (single inheritance); `None` for
+    /// a class without a base, and for structs and interfaces.
+    pub base: Option<SymbolId>,
+    pub is_abstract: bool,
+    pub is_sealed: bool,
+    /// Interfaces this class lists itself (a base's interfaces are inherited,
+    /// not repeated here).
     pub interfaces: Vec<SymbolId>,
     pub fields: Vec<Field>,
     pub methods: Vec<Function>,
@@ -687,6 +694,12 @@ pub enum ExpressionKind {
     /// Covers both implicit widening and explicit `(type)value` casts.
     Convert {
         operand: Box<Expression>,
+    },
+    /// Identity-preserving implicit conversion from a class reference to one of
+    /// its base classes: the same object, no copy. This expression's type is
+    /// the target base class; semantic analysis already proved the relation.
+    UpcastClass {
+        object: Box<Expression>,
     },
     /// Nominal, non-owning conversion from a class reference to an interface value.
     UpcastInterface {

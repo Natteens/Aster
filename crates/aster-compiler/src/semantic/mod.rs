@@ -194,8 +194,42 @@ pub(crate) enum ResolvedPropagation {
     },
 }
 
+/// The constructor of the base class a derived constructor runs: an explicit
+/// `: base(arguments)` or the implicit call of a base constructor whose
+/// parameters all have defaults. `arguments` binds the source-ordered
+/// arguments (none when implicit) and the evaluated defaults.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ResolvedBaseConstructor {
+    pub callable: CallableKey,
+    pub arguments: ResolvedArguments,
+}
+
+/// How one instance method or property accessor uses `this`; input to the
+/// this-confinement fixpoint (`general::this_confinement`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ThisSummary {
+    pub escape: Option<Span>,
+    pub reads: std::collections::BTreeSet<String>,
+    pub calls: Vec<CallableKey>,
+}
+
+/// One call on `this` inside a constructor, checked once every method's
+/// summary is known.
+#[derive(Clone, Debug)]
+pub(crate) struct ConstructorThisCall {
+    pub class: String,
+    pub callable: CallableKey,
+    pub span: Span,
+    pub unassigned: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Model {
+    /// Base constructor resolved for each constructor of a derived class,
+    /// keyed by the constructor's model context.
+    pub base_constructors: HashMap<String, ResolvedBaseConstructor>,
+    pub this_summaries: HashMap<CallableKey, ThisSummary>,
+    pub constructor_this_calls: Vec<ConstructorThisCall>,
     pub calls: HashMap<ModelNodeKey, ResolvedCall>,
     pub call_arguments: HashMap<ModelNodeKey, ResolvedArguments>,
     /// Call sites resolved to a concrete host-provided foreign declaration.

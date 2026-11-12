@@ -40,8 +40,15 @@ pub struct InterfaceEntry {
 #[allow(unsafe_code)]
 unsafe impl Sync for InterfaceEntry {}
 
+/// [`ClassDescriptor::flags`] bit: the class is abstract. No object header
+/// ever points at the descriptor of an abstract class.
+pub const CLASS_FLAG_ABSTRACT: u32 = 1;
+/// [`ClassDescriptor::flags`] bit: no class derives from this class.
+pub const CLASS_FLAG_SEALED: u32 = 1 << 1;
+
 /// Immutable class descriptor: the target of the header word of every
-/// instance of one class (no inheritance yet).
+/// instance of one class, and the carrier of its place in the (single
+/// inheritance) hierarchy.
 #[repr(C)]
 pub struct ClassDescriptor {
     /// Size and reference layout; must stay the first field.
@@ -51,10 +58,21 @@ pub struct ClassDescriptor {
     pub class_id: u64,
     /// Number of entries behind `interfaces`.
     pub interface_count: u32,
-    /// Explicit padding so the layout is identical on every target.
-    pub reserved: u32,
+    /// `CLASS_FLAG_*` bits.
+    pub flags: u32,
     /// Immutable array of `interface_count` entries (null when zero).
     pub interfaces: *const InterfaceEntry,
+    /// Descriptor of the direct base class; null for a class without a base.
+    pub base: *const ClassDescriptor,
+    /// Number of ancestors: `0` for a class without a base, otherwise the
+    /// base's depth plus one.
+    pub depth: u32,
+    /// Number of entries behind `ancestors`; always `depth + 1`.
+    pub ancestor_count: u32,
+    /// `depth + 1` descriptors, root class first, ending with this class
+    /// itself: `ancestors[i]` is the ancestor at depth `i`. This is what makes
+    /// the subtype test bounded (see [`ClassDescriptor::derives_from`]).
+    pub ancestors: *const *const ClassDescriptor,
 }
 
 // SAFETY: a class descriptor is immutable once the program is prepared.
@@ -77,5 +95,56 @@ impl ClassDescriptor {
         }
         // SAFETY: guaranteed by the caller.
         unsafe { std::slice::from_raw_parts(self.interfaces, self.interface_count as usize) }
+    }
+
+    /// The ancestor descriptors, root first, ending with this class.
+    ///
+    /// # Safety
+    ///
+    /// `ancestors` must point at `ancestor_count` valid pointers that outlive
+    /// the returned slice (true for every descriptor produced by the compiler
+    /// backend while its program is alive).
+    #[allow(unsafe_code)]
+    #[must_use]
+    pub unsafe fn ancestor_entries(&self) -> &[*const ClassDescriptor] {
+        if self.ancestors.is_null() || self.ancestor_count == 0 {
+            return &[];
+        }
+        // SAFETY: guaranteed by the caller.
+        unsafe { std::slice::from_raw_parts(self.ancestors, self.ancestor_count as usize) }
+    }
+
+    /// The bounded subtype test of the object model (B1, section 4.5):
+    /// whether `self` is `target` or derives from it. `target.depth <=
+    /// self.depth` is checked first, so an unrelated shallow class tested
+    /// against a deeper target never indexes past the `ancestors` array.
+    ///
+    /// # Safety
+    ///
+    /// Both descriptors must be valid compiler-produced descriptors (see
+    /// [`Self::ancestor_entries`]).
+    #[allow(unsafe_code)]
+    #[must_use]
+    pub unsafe fn derives_from(&self, target: &ClassDescriptor) -> bool {
+        if target.depth > self.depth {
+            return false;
+        }
+        // SAFETY: guaranteed by the caller.
+        let ancestors = unsafe { self.ancestor_entries() };
+        ancestors
+            .get(target.depth as usize)
+            .is_some_and(|ancestor| std::ptr::eq(*ancestor, target))
+    }
+
+    /// Whether the class is declared abstract.
+    #[must_use]
+    pub const fn is_abstract(&self) -> bool {
+        self.flags & CLASS_FLAG_ABSTRACT != 0
+    }
+
+    /// Whether the class is declared sealed.
+    #[must_use]
+    pub const fn is_sealed(&self) -> bool {
+        self.flags & CLASS_FLAG_SEALED != 0
     }
 }

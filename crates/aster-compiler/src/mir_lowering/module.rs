@@ -50,6 +50,9 @@ pub(super) fn lower(module: &hir::Module) -> mir::Module {
                 return None;
             };
             Some(mir::ClassDefinition {
+                base: declaration.base,
+                is_abstract: declaration.is_abstract,
+                is_sealed: declaration.is_sealed,
                 symbol: declaration.symbol,
                 name: declaration.name.clone(),
                 fields: declaration
@@ -194,27 +197,48 @@ fn lower_interfaces(
         .iter()
         .map(|interface| (interface.symbol, interface.methods.clone()))
         .collect::<HashMap<_, _>>();
+    let classes = module
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            hir::Item::Class(declaration) => Some((declaration.symbol, declaration)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
     let mut interface_implementations = Vec::new();
     for item in &module.items {
         let hir::Item::Class(declaration) = item else {
             continue;
         };
-        for interface in &declaration.interfaces {
+        // The class itself, then its base classes. No member is virtual in
+        // this step, so an inherited interface method is the base's own
+        // method, and the table of the static class is correct for every
+        // dynamic type derived from it.
+        let mut chain = vec![declaration];
+        while let Some(base) = chain.last().and_then(|class| class.base) {
+            chain.push(classes[&base]);
+        }
+        let mut seen = std::collections::HashSet::new();
+        for interface in chain.iter().flat_map(|class| &class.interfaces) {
+            if !seen.insert(*interface) {
+                continue;
+            }
             let methods = interface_methods[interface]
                 .iter()
                 .map(|required| {
-                    declaration
-                        .methods
+                    chain
                         .iter()
-                        .find(|method| {
-                            method.name == required.name
-                                && method.return_type == required.return_type
-                                && method
-                                    .parameters
-                                    .iter()
-                                    .skip(1)
-                                    .map(|parameter| &parameter.type_)
-                                    .eq(required.parameters.iter())
+                        .find_map(|class| {
+                            class.methods.iter().find(|method| {
+                                method.name == required.name
+                                    && method.return_type == required.return_type
+                                    && method
+                                        .parameters
+                                        .iter()
+                                        .skip(1)
+                                        .map(|parameter| &parameter.type_)
+                                        .eq(required.parameters.iter())
+                            })
                         })
                         .expect("validated class implements every interface method")
                         .symbol

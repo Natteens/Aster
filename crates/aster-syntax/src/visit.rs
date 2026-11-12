@@ -191,6 +191,11 @@ pub fn walk_function_declaration_mut<V: AstVisitorMut + ?Sized>(
     for parameter in &mut declaration.parameters {
         visitor.visit_parameter_mut(parameter);
     }
+    if let Some(base_call) = &mut declaration.base_call {
+        for argument in &mut base_call.arguments {
+            visitor.visit_expression_mut(&mut argument.value);
+        }
+    }
     if let Some(body) = &mut declaration.body {
         visitor.visit_block_mut(body);
     }

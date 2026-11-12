@@ -1,4 +1,4 @@
-use super::types::convert;
+use super::types::{constant_expression, convert};
 use super::{HashMap, Lowerer, ast, hir};
 use crate::constexpr::evaluate;
 
@@ -40,6 +40,15 @@ impl Lowerer<'_> {
                     self.symbol_types.insert(symbol, hir::Type::Enum(symbol));
                 }
                 _ => {}
+            }
+        }
+        for item in &module.items {
+            if let ast::Item::Class(declaration) = item
+                && let Some(first) = declaration.interfaces.first()
+                && let Some(base) = self.types.get(&first.name).copied()
+                && self.class_types.contains(&base)
+            {
+                self.class_bases.insert(self.types[&declaration.name], base);
             }
         }
         for item in &module.items {
@@ -311,16 +320,21 @@ impl Lowerer<'_> {
             symbol: owner_symbol,
             name: declaration.name.clone(),
             visibility: visibility(declaration.visibility),
+            base: self.class_bases.get(&owner_symbol).copied(),
+            is_abstract: declaration.is_abstract,
+            is_sealed: declaration.is_sealed,
             interfaces: declaration
                 .interfaces
                 .iter()
                 .filter_map(|interface| self.types.get(&interface.name).copied())
+                .filter(|symbol| self.interface_types.contains(symbol))
                 .collect(),
             fields,
             methods,
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) fn function(
         &mut self,
         function: &ast::FunctionDeclaration,
@@ -357,7 +371,10 @@ impl Lowerer<'_> {
         let mut receiver = None;
         if let Some(owner) = owner {
             let owner_symbol = self.types[&owner.name];
-            scope.extend(self.members.get(&owner_symbol).cloned().unwrap_or_default());
+            // Inherited members first, so a member of the class itself wins.
+            for class in self.class_chain(owner_symbol).into_iter().rev() {
+                scope.extend(self.members.get(&class).cloned().unwrap_or_default());
+            }
             if !self.interface_types.contains(&owner_symbol) && !function.is_static {
                 let receiver_type = self.symbol_types[&owner_symbol].clone();
                 let receiver_symbol = self.allocate();
@@ -406,7 +423,7 @@ impl Lowerer<'_> {
             && let (Some(owner), Some(receiver), Some(body)) =
                 (owner, self.current_receiver, body.as_mut())
         {
-            self.prepend_field_initializers(owner, receiver, body);
+            self.prepend_constructor_prologue(owner, function, receiver, body);
         }
         self.scopes.pop();
         self.current_return = previous_return;
@@ -563,6 +580,128 @@ impl Lowerer<'_> {
         initializer
     }
 
+    /// `class` followed by its base classes, nearest first.
+    pub(super) fn class_chain(&self, class: hir::SymbolId) -> Vec<hir::SymbolId> {
+        let mut chain = vec![class];
+        while let Some(base) = self
+            .class_bases
+            .get(chain.last().expect("chain is not empty"))
+        {
+            chain.push(*base);
+        }
+        chain
+    }
+
+    /// Whether `base` is a strict ancestor of `class`.
+    pub(super) fn derives_from(&self, class: hir::SymbolId, base: hir::SymbolId) -> bool {
+        class != base && self.class_chain(class).contains(&base)
+    }
+
+    /// Member `name` of `owner` or of its nearest base declaring it.
+    pub(super) fn lookup_member(&self, owner: hir::SymbolId, name: &str) -> Option<hir::SymbolId> {
+        self.class_chain(owner)
+            .into_iter()
+            .find_map(|class| self.members.get(&class)?.get(name).copied())
+    }
+
+    /// The receiver typed as the class that declares `member`: a member
+    /// inherited from a base is reached through an identity upcast.
+    pub(super) fn upcast_receiver(
+        &self,
+        object: hir::Expression,
+        member: hir::SymbolId,
+    ) -> hir::Expression {
+        let (hir::Type::Class(from), Some(owner)) =
+            (&object.type_, self.member_owners.get(&member))
+        else {
+            return object;
+        };
+        if from == owner || !self.class_types.contains(owner) {
+            return object;
+        }
+        hir::Expression {
+            type_: hir::Type::Class(*owner),
+            kind: hir::ExpressionKind::UpcastClass {
+                object: Box::new(object),
+            },
+        }
+    }
+
+    /// Statements that open a constructor body, in the C# construction order:
+    /// the class's field initializers, then the base constructor call
+    /// (arguments evaluated left to right, then the base constructor, which
+    /// runs the same sequence for its own class), then the declared body.
+    fn prepend_constructor_prologue(
+        &mut self,
+        owner: &ast::TypeDeclaration,
+        function: &ast::FunctionDeclaration,
+        receiver: hir::SymbolId,
+        body: &mut hir::Block,
+    ) {
+        self.prepend_field_initializers(owner, receiver, body);
+        let Some(resolved) = self
+            .model
+            .base_constructors
+            .get(&self.model_context)
+            .cloned()
+        else {
+            return;
+        };
+        let constructor = self.callable_symbols[&resolved.callable];
+        let parameter_types = self.callable_parameters[&constructor].clone();
+        let arguments = function
+            .base_call
+            .as_ref()
+            .map_or(&[][..], |call| call.arguments.as_slice());
+        let mut lowered = arguments
+            .iter()
+            .zip(&resolved.arguments.source_to_parameter)
+            .map(|(argument, parameter)| {
+                convert(
+                    self.expression(&argument.value),
+                    &parameter_types[*parameter],
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut argument_order = resolved.arguments.source_to_parameter.clone();
+        for default in &resolved.arguments.defaults {
+            lowered.push(convert(
+                constant_expression(&default.value),
+                &parameter_types[default.parameter],
+            ));
+            argument_order.push(default.parameter);
+        }
+        let this = hir::Expression {
+            type_: self.symbol_types[&receiver].clone(),
+            kind: hir::ExpressionKind::Symbol(receiver),
+        };
+        let object = self.upcast_receiver(this, constructor);
+        let call = hir::Statement::Expression(hir::Expression {
+            type_: hir::Type::Void,
+            kind: hir::ExpressionKind::Call {
+                callee: Box::new(hir::Expression {
+                    type_: hir::Type::Unknown,
+                    kind: hir::ExpressionKind::Member {
+                        object: Box::new(object),
+                        symbol: constructor,
+                    },
+                }),
+                arguments: lowered,
+                argument_order,
+            },
+        });
+        // `prepend_field_initializers` already placed the initializers first:
+        // the base call goes right after them, before the declared body.
+        let initializer_count = owner
+            .members
+            .iter()
+            .filter(
+                |member| matches!(member, ast::Member::Field(field) if field.initializer.is_some()),
+            )
+            .count();
+        body.statements.insert(initializer_count, call);
+    }
+
     fn prepend_field_initializers(
         &mut self,
         owner: &ast::TypeDeclaration,
@@ -612,6 +751,7 @@ fn accessor_function(
     getter: bool,
 ) -> ast::FunctionDeclaration {
     ast::FunctionDeclaration {
+        base_call: None,
         constructor: false,
         is_test: false,
         is_static: false,

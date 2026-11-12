@@ -88,6 +88,7 @@ fn object_fields(function: &mir::Function) -> usize {
             | mir::RvalueKind::ListVersion(operand)
             | mir::RvalueKind::StringByteLength(operand)
             | mir::RvalueKind::Cast(operand)
+            | mir::RvalueKind::Upcast(operand)
             | mir::RvalueKind::Unary { operand, .. } => operand_has_object_field(operand),
             mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
                 fields

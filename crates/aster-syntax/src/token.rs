@@ -57,6 +57,8 @@ pub enum TokenKind {
     Default,
     New,
     This,
+    /// Reserved: only valid as the `: base(...)` constructor initializer.
+    Base,
     True,
     False,
     Identifier(String),
@@ -178,6 +180,7 @@ impl TokenKind {
             Self::Default => "`default`",
             Self::New => "`new`",
             Self::This => "`this`",
+            Self::Base => "`base`",
             Self::True => "`true`",
             Self::False => "`false`",
             Self::Identifier(_) => "identifier",

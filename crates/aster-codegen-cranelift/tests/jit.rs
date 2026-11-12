@@ -1271,7 +1271,7 @@ fn dynamic_strings_are_owned_by_each_execution_context() {
 
 #[test]
 fn executes_long_arithmetic_and_returns() {
-    let source = "public long Big() { long base = 4000000000L; return base + 1; }";
+    let source = "public long Big() { long origin = 4000000000L; return origin + 1; }";
     assert_eq!(run(source, "Big"), Ok(ExecutionValue::Long(4_000_000_001)));
 }
 

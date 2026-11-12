@@ -1257,6 +1257,7 @@ fn rvalue_mentions_fine_owned(value: &mir::Rvalue, owned: &BTreeMap<u32, FineOwn
         | mir::RvalueKind::ListVersion(operand)
         | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => operand_mentions_owned_builder(operand, owned),
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             fields
@@ -1347,6 +1348,7 @@ fn is_execution_safe_rvalue(value: &mir::Rvalue) -> bool {
     match &value.kind {
         mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => is_execution_safe_operand(operand),
         mir::RvalueKind::Binary {
             left,
@@ -1472,6 +1474,7 @@ fn rvalue_contains_type(value: &mir::Rvalue, predicate: fn(&mir::Type) -> bool) 
             | mir::RvalueKind::ListVersion(operand)
             | mir::RvalueKind::StringByteLength(operand)
             | mir::RvalueKind::Cast(operand)
+            | mir::RvalueKind::Upcast(operand)
             | mir::RvalueKind::Unary { operand, .. } => predicate(&operand.type_),
             mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
                 fields.iter().any(|field| predicate(&field.value.type_))

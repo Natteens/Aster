@@ -108,6 +108,16 @@ pub struct StructDefinition {
 pub struct ClassDefinition {
     pub symbol: SymbolId,
     pub name: String,
+    /// The direct base class, if any (single inheritance). Derived objects
+    /// start with the complete base object: inherited fields keep the offsets
+    /// they have in the base.
+    pub base: Option<SymbolId>,
+    /// An abstract class has a layout and a descriptor but is never allocated.
+    pub is_abstract: bool,
+    /// No class may name a sealed class as its base.
+    pub is_sealed: bool,
+    /// The fields this class declares itself; inherited fields belong to the
+    /// base chain's definitions.
     pub fields: Vec<FieldDefinition>,
 }
 
@@ -1103,6 +1113,10 @@ pub enum RvalueKind {
     StringByteLength(Operand),
     /// Convert the operand to this rvalue's type.
     Cast(Operand),
+    /// Identity-preserving class upcast: the operand's class derives from this
+    /// rvalue's class and the result is the same object pointer. Validation
+    /// rejects any pair that is not a declared base chain.
+    Upcast(Operand),
     MakeInterface {
         object: Operand,
         class: SymbolId,

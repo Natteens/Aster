@@ -26,6 +26,10 @@ struct Lowerer<'a> {
     scopes: Vec<HashMap<String, hir::SymbolId>>,
     types: HashMap<String, hir::SymbolId>,
     class_types: HashSet<hir::SymbolId>,
+    /// Direct base class of every derived class, resolved from the first name
+    /// after `:` when it names a class. Semantic analysis already proved the
+    /// hierarchy acyclic.
+    class_bases: HashMap<hir::SymbolId, hir::SymbolId>,
     interface_types: HashSet<hir::SymbolId>,
     enum_types: HashSet<hir::SymbolId>,
     enum_cases: HashMap<(String, usize), (hir::SymbolId, Vec<hir::SymbolId>)>,
@@ -71,6 +75,7 @@ impl<'a> Lowerer<'a> {
             scopes: Vec::new(),
             types: HashMap::new(),
             class_types: HashSet::new(),
+            class_bases: HashMap::new(),
             interface_types: HashSet::new(),
             enum_types: HashSet::new(),
             enum_cases: HashMap::new(),

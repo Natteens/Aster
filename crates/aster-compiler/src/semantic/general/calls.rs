@@ -88,6 +88,19 @@ impl Analyzer<'_> {
             }
             return Type::Unknown;
         }
+        if info.is_abstract {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!("abstract class `{type_name}` cannot be instantiated"),
+                    span,
+                )
+                .with_help("create an instance of a concrete class derived from it"),
+            );
+            for argument in arguments {
+                self.expression(argument);
+            }
+            return Type::Class(type_name.to_owned());
+        }
         let Some(signature) = info.constructor.clone() else {
             self.diagnostics.push(
                 Diagnostic::error(format!("class `{type_name}` has no constructor"), span)
@@ -105,6 +118,14 @@ impl Analyzer<'_> {
                 format!("constructor `{type_name}` is private"),
                 span,
             ));
+        }
+        if info.constructor_visibility == Some(Visibility::Protected)
+            && self.owner.as_deref() != Some(type_name)
+        {
+            self.diagnostics.push(
+                Diagnostic::error(format!("constructor `{type_name}` is protected"), span)
+                    .with_help("a protected constructor is reached only through `base(...)` from a derived class"),
+            );
         }
         let argument_types = arguments
             .iter()
@@ -146,6 +167,7 @@ impl Analyzer<'_> {
                     .with_help("assign a value before reading the variable"),
                 );
             }
+            self.note_this_field_read(name);
             binding.type_
         } else if self.instance_context
             && let Some(owner) = &self.owner
@@ -165,7 +187,10 @@ impl Analyzer<'_> {
             self.model
                 .property_reads
                 .insert(self.model_key(span), getter.key.clone());
-            property.type_.clone()
+            let key = getter.key.clone();
+            let type_ = property.type_.clone();
+            self.note_this_call(&key, span);
+            type_
         } else if !self.instance_context
             && let Some(owner) = self.owner.clone()
             && let Some(info) = self.context.types.get(&owner)
@@ -176,11 +201,14 @@ impl Analyzer<'_> {
             } else {
                 "property"
             };
+            let context = if self.base_arguments {
+                "the arguments of `base(...)`"
+            } else {
+                "a static context"
+            };
             self.diagnostics.push(
                 Diagnostic::error(
-                    format!(
-                        "instance {member_kind} `{name}` cannot be used in a static context"
-                    ),
+                    format!("instance {member_kind} `{name}` cannot be used in {context}"),
                     span,
                 )
                 .with_help(format!(
@@ -189,6 +217,11 @@ impl Analyzer<'_> {
             );
             Type::Unknown
         } else {
+            if let Some(owner) = self.owner.clone()
+                && self.report_hidden_private(&owner, name, "member", span)
+            {
+                return Type::Unknown;
+            }
             self.diagnostics.push(
                 Diagnostic::error(format!("unknown name `{name}`"), span)
                     .with_help("declare the name before using it"),
@@ -235,7 +268,8 @@ impl Analyzer<'_> {
             );
             return Type::Enum(enum_name.clone());
         }
-        let object_type = self.expression(object);
+        let receiver_is_this = matches!(object.kind, ExpressionKind::This);
+        let object_type = self.expression_receiver(object);
         if matches!(object_type, Type::Array(_)) {
             if name == "Length" {
                 return Type::Int;
@@ -310,33 +344,53 @@ impl Analyzer<'_> {
                         ));
                         return Type::Unknown;
                     };
-                    if getter.visibility == Visibility::Private
-                        && self.owner.as_deref() != Some(type_name.as_str())
-                    {
-                        self.diagnostics.push(Diagnostic::error(
-                            format!("getter for property `{type_name}.{name}` is private"),
-                            span,
-                        ));
-                    }
+                    let declared_in = getter
+                        .key
+                        .owner
+                        .clone()
+                        .unwrap_or_else(|| type_name.clone());
+                    self.check_member_access(
+                        getter.visibility,
+                        &declared_in,
+                        &type_name,
+                        &format!("getter for property `{type_name}.{name}`"),
+                        span,
+                    );
                     self.model
                         .property_reads
                         .insert(self.model_key(span), getter.key.clone());
+                    if receiver_is_this {
+                        self.note_this_call(&getter.key, span);
+                    }
                     return property.type_.clone();
                 }
                 let Some(type_) = info.fields.get(name).cloned() else {
+                    if self.report_hidden_private(&type_name, name, "field", span) {
+                        return Type::Unknown;
+                    }
                     self.diagnostics.push(Diagnostic::error(
                         format!("type `{type_name}` has no field `{name}`"),
                         span,
                     ));
                     return Type::Unknown;
                 };
-                if info.field_visibility.get(name) == Some(&Visibility::Private)
-                    && self.owner.as_deref() != Some(type_name.as_str())
-                {
-                    self.diagnostics.push(
-                        Diagnostic::error(format!("field `{type_name}.{name}` is private"), span)
-                            .with_help("access the value through a public field or method"),
-                    );
+                let declared_in = info
+                    .field_owner
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| type_name.clone());
+                self.check_member_access(
+                    info.field_visibility
+                        .get(name)
+                        .copied()
+                        .unwrap_or(Visibility::Public),
+                    &declared_in,
+                    &type_name,
+                    &format!("field `{type_name}.{name}`"),
+                    span,
+                );
+                if receiver_is_this {
+                    self.note_this_field_read(name);
                 }
                 type_
             },
@@ -459,23 +513,10 @@ impl Analyzer<'_> {
                 };
             }
         }
-        let calls_current_instance = matches!(&callee.kind, ExpressionKind::Name(name) if self.methods.contains_key(name))
+        // A call on `this` is checked by the this-confinement analysis
+        // (`this_confinement`), which needs the callee's whole body.
+        let call_on_this = matches!(&callee.kind, ExpressionKind::Name(name) if self.methods.contains_key(name))
             || matches!(&callee.kind, ExpressionKind::Member { object, .. } if matches!(object.kind, ExpressionKind::This));
-        if self.constructor
-            && calls_current_instance
-            && self.field_names.iter().any(|field| {
-                self.binding(field)
-                    .is_some_and(|binding| !binding.initialized)
-            })
-        {
-            self.diagnostics.push(
-                Diagnostic::error(
-                    "cannot call an instance method before all fields are initialized",
-                    span,
-                )
-                .with_help("initialize every reference field first"),
-            );
-        }
         let argument_types = arguments
             .iter()
             .map(|argument| {
@@ -558,7 +599,7 @@ impl Analyzer<'_> {
                         Some((candidate, Dispatch::Direct, plan))
                     }
                 } else {
-                    let receiver = self.expression(object);
+                    let receiver = self.expression_receiver(object);
                     if receiver == Type::String {
                         return self.string_operation(name, &argument_types, arguments, span);
                     }
@@ -977,6 +1018,9 @@ impl Analyzer<'_> {
                         .cloned()
                         .collect::<Vec<_>>();
                     if candidates.is_empty() {
+                        if self.report_hidden_private(&type_name, name, "method", callee.span) {
+                            return Type::Unknown;
+                        }
                         self.diagnostics.push(Diagnostic::error(
                             format!("type `{type_name}` has no method `{name}`"),
                             callee.span,
@@ -991,7 +1035,13 @@ impl Analyzer<'_> {
                         span,
                     );
                     if let Some((callable, _)) = &result {
-                        self.check_member_visibility(&type_name, name, callable.visibility, span);
+                        self.check_member_visibility(
+                            &type_name,
+                            callable.key.owner.as_deref().unwrap_or(&type_name),
+                            name,
+                            callable.visibility,
+                            span,
+                        );
                     }
                     if result.is_none() {
                         return Type::Unknown;
@@ -1084,6 +1134,9 @@ impl Analyzer<'_> {
                     .string_builder_operations
                     .insert(model_key.clone(), operation);
             }
+        }
+        if call_on_this && dispatch == Dispatch::Instance && !callable.is_static {
+            self.note_this_call(&callable_key, span);
         }
         self.model.calls.insert(
             model_key.clone(),
@@ -1354,7 +1407,7 @@ impl Analyzer<'_> {
     }
 
     #[allow(clippy::too_many_lines)] // ranking, contextual validation, and default planning stay atomic
-    fn resolve_call_overload(
+    pub(super) fn resolve_call_overload(
         &mut self,
         name: &str,
         candidates: &[Callable],
@@ -1503,6 +1556,8 @@ impl Analyzer<'_> {
             model_context: self.model_context.clone(),
             async_state: self.async_state,
             unsafe_depth: self.unsafe_depth,
+            this_usage: None,
+            base_arguments: self.base_arguments,
         };
         let actual = analyzer.expression_expected(argument, Some(expected));
         analyzer.require_assignable_value(expected, &actual, argument);
@@ -1577,19 +1632,23 @@ impl Analyzer<'_> {
         }
     }
 
+    /// `receiver` is the static type the method is called on and
+    /// `declared_in` the class that declares it.
     fn check_member_visibility(
         &mut self,
-        owner: &str,
+        receiver: &str,
+        declared_in: &str,
         name: &str,
         visibility: Visibility,
         span: Span,
     ) {
-        if visibility == Visibility::Private && self.owner.as_deref() != Some(owner) {
-            self.diagnostics.push(Diagnostic::error(
-                format!("method `{owner}.{name}` is private"),
-                span,
-            ));
-        }
+        self.check_member_access(
+            visibility,
+            declared_in,
+            receiver,
+            &format!("method `{receiver}.{name}`"),
+            span,
+        );
     }
 
     fn logging_call(&mut self, level: LogLevel<'_>, arguments: &[Argument], span: Span) -> Type {

@@ -250,7 +250,7 @@ visitors; it is not a general pattern-matching or expression-shape restriction.
 
 ## Unsupported language features
 
-There is no class inheritance, interface inheritance, constructor/operator overloads, static
+Class inheritance is single and closed (see [classes](../reference/classes.md)); there is no virtual dispatch, interface inheritance, constructor/operator overloads, static
 fields, auto-properties, general pattern matching, switch guards,
 exceptions, `goto`,
 or engine lifecycle syntax. Application entry selection is a tooling rule rather than grammar:

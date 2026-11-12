@@ -30,7 +30,7 @@ public int Read(IScore item)
 }
 ```
 
-The name after `:` is an interface, not a base class. A class may list more than one interface,
+The names after `:` are an optional base class (first, see [classes](classes.md)) followed by interfaces. A class may list more than one interface,
 separated by commas. Every required method must be public and match the parameter and return types
 exactly. Interfaces cannot contain fields or method bodies.
 

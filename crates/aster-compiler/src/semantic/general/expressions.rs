@@ -474,8 +474,18 @@ impl Analyzer<'_> {
                 operator,
                 right,
             } => {
-                let left_type = self.expression(left);
-                let right_type = self.expression(right);
+                // `this == x` is an identity comparison, not an escape.
+                let identity = matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual);
+                let left_type = if identity {
+                    self.expression_receiver(left)
+                } else {
+                    self.expression(left)
+                };
+                let right_type = if identity {
+                    self.expression_receiver(right)
+                } else {
+                    self.expression(right)
+                };
                 let result = self.binary(*operator, &left_type, &right_type, expression.span);
                 if result != Type::Unknown
                     && let Some(operand) = binary_operand_type(*operator, &left_type, &right_type)
@@ -618,31 +628,16 @@ impl Analyzer<'_> {
         Type::User(type_name.to_owned())
     }
 
+    /// `this` in a position that is not a field access, a method receiver or
+    /// an identity comparison: it escapes (see `this_confinement`).
     fn this_expression(&mut self, span: Span) -> Type {
         if self.instance_context
             && let Some(owner) = self.owner.clone()
         {
-            if self.constructor
-                && self.field_names.iter().any(|field| {
-                    self.binding(field)
-                        .is_some_and(|binding| !binding.initialized)
-                })
-            {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        "`this` cannot be used before all fields are initialized",
-                        span,
-                    )
-                    .with_help("initialize every reference field before passing or using `this`"),
-                );
-            }
-            Type::Class(owner.clone())
+            self.this_escapes(span);
+            Type::Class(owner)
         } else {
-            self.diagnostics.push(
-                Diagnostic::error("`this` is valid only inside an instance method", span)
-                    .with_help("access the object through an explicit variable"),
-            );
-            Type::Unknown
+            self.this_outside_instance(span)
         }
     }
 
@@ -1351,7 +1346,10 @@ impl Analyzer<'_> {
                 comparable
             }
             (Type::Array(left), Type::Array(right)) => left == right,
-            (Type::Class(left), Type::Class(right)) => left == right,
+            // Identity comparison across a declared inheritance chain.
+            (Type::Class(left), Type::Class(right)) => {
+                left == right || self.derives_from(left, right) || self.derives_from(right, left)
+            }
             (Type::Interface(_), Type::Interface(_)) => true,
             (Type::Enum(left_name), Type::Enum(right_name)) if left_name == right_name => {
                 if !visiting.insert(left_name.clone()) {
@@ -1407,8 +1405,10 @@ impl Analyzer<'_> {
                 .is_none_or(|binding| !binding.iteration_readonly),
             ExpressionKind::This | ExpressionKind::Index { .. } => true,
             ExpressionKind::Member { object, .. } => {
-                matches!(self.expression(object), Type::Class(_) | Type::Interface(_))
-                    || self.is_assignable_place(object)
+                matches!(
+                    self.expression_receiver(object),
+                    Type::Class(_) | Type::Interface(_)
+                ) || self.is_assignable_place(object)
             }
             _ => false,
         }
@@ -1549,7 +1549,7 @@ impl Analyzer<'_> {
             );
         }
         if let ExpressionKind::Member { object, name } = &target.kind {
-            let object_type = self.expression(object);
+            let object_type = self.expression_receiver(object);
             if let Type::Class(type_name) = object_type
                 && let Some(property) = self
                     .context
@@ -1568,14 +1568,18 @@ impl Analyzer<'_> {
                     );
                     return Type::Unknown;
                 };
-                if setter.visibility == Visibility::Private
-                    && self.owner.as_deref() != Some(type_name.as_str())
-                {
-                    self.diagnostics.push(Diagnostic::error(
-                        format!("setter for property `{type_name}.{name}` is private"),
-                        target.span,
-                    ));
-                }
+                let declared_in = setter
+                    .key
+                    .owner
+                    .clone()
+                    .unwrap_or_else(|| type_name.clone());
+                self.check_member_access(
+                    setter.visibility,
+                    &declared_in,
+                    &type_name,
+                    &format!("setter for property `{type_name}.{name}`"),
+                    target.span,
+                );
                 if operator != AssignmentOperator::Assign && property.getter.is_none() {
                     self.diagnostics.push(Diagnostic::error(
                         format!("compound assignment requires getter for `{type_name}.{name}`"),
@@ -1693,6 +1697,9 @@ impl Analyzer<'_> {
                     .with_help("assign to a mutable variable instead"),
             );
         }
+        if operator != AssignmentOperator::Assign {
+            self.note_this_field_read(name);
+        }
         let result =
             self.assignment_types(operator, binding.type_.clone(), &value_type, value, span);
         if let Some(binding) = self.binding_mut(name) {
@@ -1729,6 +1736,12 @@ impl Analyzer<'_> {
         }
         let result =
             self.assignment_types(operator, property.type_.clone(), value_type, value, span);
+        self.note_this_call(&setter.key, target_span);
+        if operator != AssignmentOperator::Assign
+            && let Some(getter) = &property.getter
+        {
+            self.note_this_call(&getter.key, target_span);
+        }
         self.model.property_assignments.insert(
             self.model_key(span),
             ResolvedPropertyAssignment {
@@ -1941,14 +1954,21 @@ impl Analyzer<'_> {
         if compatible(expected, actual) {
             return true;
         }
-        let (Type::Interface(interface), Type::Class(class)) = (expected, actual) else {
-            return false;
-        };
-        self.context.types.get(class).is_some_and(|info| {
-            info.implemented_interfaces
-                .iter()
-                .any(|implemented| implemented == interface)
-        })
+        match (expected, actual) {
+            // Identity-preserving upcast along the declared base chain.
+            (Type::Class(base), Type::Class(derived)) => self.derives_from(derived, base),
+            // `implemented_interfaces` includes the interfaces of the base
+            // chain. In this step no member is virtual, so the table of the
+            // static class is correct for every dynamic type.
+            (Type::Interface(interface), Type::Class(class)) => {
+                self.context.types.get(class).is_some_and(|info| {
+                    info.implemented_interfaces
+                        .iter()
+                        .any(|implemented| implemented == interface)
+                })
+            }
+            _ => false,
+        }
     }
 
     pub(super) fn binding(&self, name: &str) -> Option<&Binding> {

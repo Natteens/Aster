@@ -1415,6 +1415,9 @@ mod tests {
         mir::Module {
             structs: Vec::new(),
             classes: vec![mir::ClassDefinition {
+                base: None,
+                is_abstract: false,
+                is_sealed: false,
                 symbol: FINE_CLASS,
                 name: "FineBox".to_owned(),
                 fields: Vec::new(),
@@ -1953,6 +1956,9 @@ mod tests {
 
     fn descriptor_module() -> mir::Module {
         let class = |symbol, name: &str, fields| mir::ClassDefinition {
+            base: None,
+            is_abstract: false,
+            is_sealed: false,
             symbol,
             name: name.to_owned(),
             fields,

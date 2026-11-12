@@ -389,6 +389,7 @@ fn count_rvalue_uses(value: &mir::Rvalue, uses: &mut HashMap<mir::LocalId, usize
         | mir::RvalueKind::ListVersion(value)
         | mir::RvalueKind::StringByteLength(value)
         | mir::RvalueKind::Cast(value)
+        | mir::RvalueKind::Upcast(value)
         | mir::RvalueKind::Unary { operand: value, .. } => count_operand_uses(value, uses),
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             for field in fields {
@@ -589,6 +590,7 @@ fn pure_non_failing_rvalue(value: &mir::Rvalue) -> bool {
         | mir::RvalueKind::DictionaryLength(_)
         | mir::RvalueKind::ListVersion(_)
         | mir::RvalueKind::StringByteLength(_)
+        | mir::RvalueKind::Upcast(_)
         | mir::RvalueKind::MakeInterface { .. }
         | mir::RvalueKind::Equality { .. } => false,
     }
@@ -797,6 +799,7 @@ fn rewrite_rvalue_operands(
         | mir::RvalueKind::ListVersion(value)
         | mir::RvalueKind::StringByteLength(value)
         | mir::RvalueKind::Cast(value)
+        | mir::RvalueKind::Upcast(value)
         | mir::RvalueKind::Unary { operand: value, .. } => operand(value),
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             for field in fields {

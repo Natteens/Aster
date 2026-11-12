@@ -867,6 +867,7 @@ pub fn owned_rvalue_reads(value: &mir::Rvalue, reads: &mut HashSet<mir::LocalId>
         | mir::RvalueKind::ListVersion(operand)
         | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => owned_operand_reads(operand, reads),
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             for field in fields {
@@ -1655,6 +1656,7 @@ pub fn temporary_subregion_rvalue_is_executable(value: &mir::Rvalue) -> bool {
         | mir::RvalueKind::DictionaryLength(_)
         | mir::RvalueKind::ListVersion(_)
         | mir::RvalueKind::StringByteLength(_)
+        | mir::RvalueKind::Upcast(_)
         | mir::RvalueKind::MakeInterface { .. } => false,
     }
 }
@@ -1799,6 +1801,26 @@ pub fn validate_interface_metadata<'a>(
             (interface.symbol, interface)
         })
         .collect::<HashMap<_, _>>();
+    let bases = module
+        .classes
+        .iter()
+        .filter_map(|class| Some((class.symbol, class.base?)))
+        .collect::<HashMap<_, _>>();
+    // The class itself, then its base chain (bounded: hierarchy validation
+    // already rejected cycles, the bound keeps this walk total regardless).
+    let in_chain = |class: mir::SymbolId, owner: mir::SymbolId| {
+        let mut current = class;
+        for _ in 0..=module.classes.len() {
+            if current == owner {
+                return true;
+            }
+            match bases.get(&current) {
+                Some(base) => current = *base,
+                None => return false,
+            }
+        }
+        false
+    };
     let mut implementations = HashSet::new();
     for implementation in &module.interface_implementations {
         if !classes.contains(&implementation.class) {
@@ -1823,11 +1845,15 @@ pub fn validate_interface_metadata<'a>(
             let concrete = signatures.get(concrete_symbol).ok_or_else(|| {
                 ValidationError::invalid("interface implementation references an unknown method")
             })?;
-            if concrete.owner != Some(implementation.class)
+            // The concrete method belongs to the implementing class or to a
+            // base class it inherits it from (no member is virtual yet, so the
+            // inherited method is exactly what a derived object runs).
+            let owner = concrete.owner;
+            if owner.is_none_or(|owner| !in_chain(implementation.class, owner))
                 || concrete.visibility != mir::Visibility::Public
                 || concrete.return_type != required.return_type
                 || concrete.parameters.first().map(|receiver| &receiver.type_)
-                    != Some(&mir::Type::Class(implementation.class))
+                    != owner.map(mir::Type::Class).as_ref()
                 || concrete
                     .parameters
                     .iter()

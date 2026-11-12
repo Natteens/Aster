@@ -51,7 +51,8 @@ Verified in the repository at the baseline:
 
 - Objects before stage 2 were headerless. `aster_rt_object_new(context, size)` returns zeroed storage
   owned by the `ExecutionContext`. Stage 2 (implemented) gives every class instance an 8-byte header
-  whose offset-0 word points at an immutable class descriptor; inheritance is not implemented yet.
+  whose offset-0 word points at an immutable class descriptor. Pull request 1 (T-OBJ-2, single
+  inheritance) is implemented: see the delivery note below section 11.
 - `mir::Type::Class(SymbolId)` is an exact type. MIR has no subtype relation.
 - Class layout is computed as a struct: fields in declaration order with natural alignment
   (`layouts.rs`), after the 8-byte header; a class with no fields occupies exactly the header (8 bytes).
@@ -415,6 +416,19 @@ authorization. No public page describes inheritance before the pull request that
 5. **Generics in hierarchies**, in the order of section 8 (including U7 if it was left out).
 
 Constructor overloads and `this(...)` (B2) are independent and not part of this sequence.
+
+**Delivery note, pull request 1 (T-OBJ-2).** Implemented: class bases (abstract or not; closed and
+fully specialized only, so `class D : Box<int>` works and an open base is rejected, which settles U7
+for this step), the 4.1 layout with inherited offsets preserved and independently recomputed by the
+backend layout validation (V1, V5), `Upcast` in HIR and MIR (validated: only along the declared
+chain), `base(...)` and the C# construction order of 6.1, `protected`, the rule B this-confinement of
+6.3 with `Reads(M)` (N10, N12, N13, N20 to N22), `abstract`/`sealed` classes, reserved `base` (U5), and
+the descriptor base pointer, depth and ancestors array of 4.2 (V3, V4). Cases covered: P2, P3, P6, P8,
+P9, P10 to P15 and N1, N4 to N6, N8 to N10, N12 to N18, N20 to N22; N2, N3 and N7 are rejected with a
+"not supported yet" diagnostic because they need `virtual`/`override`/`abstract` members (pull request
+2). An interface conversion from a derived class reuses the static table of the converted class,
+which is exact while no member is virtual; the dynamic lookup is pull request 3. Local object
+elimination skips every class that has a base. Not implemented: virtual dispatch, downcast, open bases.
 
 ## 12. Statements to supersede on acceptance
 

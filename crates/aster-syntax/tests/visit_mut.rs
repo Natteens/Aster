@@ -221,6 +221,7 @@ fn fixture() -> Module {
         span: span(56),
     };
     let function = FunctionDeclaration {
+        base_call: None,
         constructor: false,
         is_test: false,
         is_static: false,
@@ -262,6 +263,8 @@ fn fixture() -> Module {
         span: span(69),
     };
     let class = TypeDeclaration {
+        is_abstract: false,
+        is_sealed: false,
         visibility: Visibility::Public,
         is_static: false,
         name: "Container".to_owned(),
@@ -283,6 +286,7 @@ fn fixture() -> Module {
                 span: span(74),
             }),
             Member::Method(FunctionDeclaration {
+                base_call: None,
                 constructor: true,
                 is_test: false,
                 is_static: false,
@@ -318,6 +322,8 @@ fn fixture() -> Module {
         items: vec![
             Item::Class(class),
             Item::Struct(TypeDeclaration {
+                is_abstract: false,
+                is_sealed: false,
                 visibility: Visibility::Internal,
                 is_static: false,
                 name: "Record".to_owned(),
@@ -333,12 +339,15 @@ fn fixture() -> Module {
                 span: span(84),
             }),
             Item::Interface(TypeDeclaration {
+                is_abstract: false,
+                is_sealed: false,
                 visibility: Visibility::Public,
                 is_static: false,
                 name: "Contract".to_owned(),
                 type_parameters: Vec::new(),
                 interfaces: Vec::new(),
                 members: vec![Member::Method(FunctionDeclaration {
+                    base_call: None,
                     body: None,
                     ..function.clone()
                 })],
@@ -535,6 +544,7 @@ fn traversal_reaches_defaults_named_values_target_new_and_inferred_foreach() {
         namespace: None,
         usings: Vec::new(),
         items: vec![Item::Function(FunctionDeclaration {
+            base_call: None,
             constructor: false,
             is_test: false,
             is_static: false,

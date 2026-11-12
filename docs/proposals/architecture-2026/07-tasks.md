@@ -18,7 +18,7 @@ Status: `todo`, `in progress`, `done` (with date), `blocked (reason)`.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | T-BENCH-1 | Workloads expressible today: long-running object update, simulated requests, dictionary churn, object graph, property access, interface calls, collection growth, string pipeline, large-program compilation | None (benchmarks only) | `benchmarks/performance/*.aster`; `aster-codegen-cranelift/examples/perf_baseline.rs`; `aster-codegen-cranelift/tests/perf_baseline.rs`; new test `bench_workload_memory.rs` | — | Add `.aster` workloads with independent checksums; register them; generate `frontend_large` deterministically; record memory invariants in a test | + checksum per workload; + generated source is deterministic and compiles; + memory facts recorded; − unknown workload rejected (existing) | the workloads themselves | `benchmarks/performance/README.md` | perf_baseline tests and the new memory test pass; clippy clean | low | **done 2026-11-10** (see report) |
 | T-BENCH-2 | Harness support for task and parallel programs, and a worker-count option | None | `perf_baseline.rs` or a new `concurrency_baseline.rs` example; uses the existing worker-count entry points | T-BENCH-1 | Execution through `execute_resolved_with_aarm_parallel_workers` style entry points, which already accept a worker count | + `task_swarm`, `parallel_scaling` checksums at 1, 2, 4 workers; − invalid worker count rejected | `task_swarm`, `parallel_scaling` | README | tests pass | low | **done 2026-11-10** (see log) |
-| T-BENCH-3 | Baseline procedure: class A values per target, class B protocol | PERF-005 | `benchmarks/performance/README.md`, `compare.mjs`-style comparator if needed | T-BENCH-1 | Document and, if needed, extend the existing JSON comparator to perf_baseline | + comparator rejects mismatched target | — | README | review | low | todo |
+| T-BENCH-3 | Baseline procedure: class A values per target, class B protocol | PERF-005 | `benchmarks/performance/README.md`, `compare.mjs`-style comparator if needed | T-BENCH-1 | Document and, if needed, extend the existing JSON comparator to perf_baseline | + comparator rejects mismatched target | — | README | review | low | **done 2026-11-11**: README "Baseline procedure (PERF-005)", `benchmarks/performance/compare.mjs` (+9 node tests); `perf_baseline` reports `metadata.target` |
 | T-DOC-1 | Correct the factual contradictions listed in map §4 | DOC-001 | `docs/compiler/grammar.md`, `watch.md`, `memory-management.md`, `reference/concurrency.md`, `research/aarm.md` | — | Edit only the wrong statement in each pair; no new behavior described | Each correction checked against code (see log) | — | those files | review | low | **done 2026-11-10** (see log) |
 | T-ARCH-3 | HIR reads every expression type from the semantic model | ARCH-003 | `aster-compiler/src/hir_lowering/types.rs`, `expressions.rs` | — | Replace `binary_type` recomputation by a model lookup; agreement test over all fixtures and examples | + agreement test; − a seeded disagreement fails the test | `frontend_large` class A | `architecture.md` | compiler tests | low | **done 2026-11-10** (see log) |
 | T-ARCH-2a | Move backend-neutral MIR checks into `aster-mir` without behavior change | ARCH-002 | `aster-mir/src/validate.rs` (new); `aster-codegen-cranelift/src/validation.rs` | — | Mechanical move of structural, typing, CFG checks; backend calls them | Existing validation tests unchanged and passing | — | `architecture.md` | workspace tests | medium | **done 2026-11-10, partial coverage** (types only; see log) |
@@ -71,7 +71,7 @@ example, reference page. Gate: workspace tests; class A invariants unchanged or 
 | T-MEM-5 | `IDisposable`, `using`, handle table, safety-net close, lint | MEM-005 | — (`using`); T-MEM-3a for the safety net | reinforced | medium | todo |
 | T-MEM-6 | Governor and page return by default | MEM-006 | MEM-EXP-2 | reinforced | medium | todo |
 | T-MEM-ARENA | Explicit `Arena` scope type for long-running memory (Q-MEM-0 fallback): record the new decision (syntax, escape rule checked by escape analysis, teardown), then implement | new decision (to record) | T-MEM-EXP-1 | reinforced | medium | todo (decision record first) |
-| T-OBJ-2 | Single inheritance (B1 PR 1) | OBJ-002 | T-MEM-2 or B1 H8 | B1 cases | medium | blocked |
+| T-OBJ-2 | Single inheritance (B1 PR 1) | OBJ-002 | T-MEM-2 or B1 H8 | B1 cases | medium | **done 2026-11-11** (see log) |
 | T-OBJ-3 | Virtual methods and properties | OBJ-003 | T-OBJ-2 | B1 cases | medium | blocked |
 | T-OBJ-4 | Interfaces through hierarchies; `is`/`as` | OBJ-004 | T-OBJ-3, T-LANG-4b | B1 cases | low | blocked |
 | T-LANG-1a | Non-capturing lambdas and method groups | LANG-001 | — | workspace | medium | todo |
@@ -965,3 +965,24 @@ H8 (T-MEM-2 unblocked), explicit `Arena` scope as a new decision (T-MEM-ARENA). 
   workspace clean; rustfmt clean.
 - Docs: `docs/compiler/object-model-b1.md` §3, `runtime-abi.md`, `execution-context.md`.
 - Unblocked: T-OBJ-2 (single inheritance, B1 PR 1).
+
+### T-OBJ-2 — done 2026-11-11 (B1 pull request 1: single inheritance)
+
+- Delivered: `class D : B` (closed bases only; open generic bases rejected), §4.1 layout with
+  preserved inherited offsets (backend recomputes and rejects violations), identity-preserving
+  upcast (`RvalueKind::Upcast`), `base(...)` with the C# construction order, `protected`, rule B
+  this-confinement (`semantic/general/this_confinement.rs`), `abstract class` and `sealed class`,
+  reserved `base`; descriptors gain base, depth, ancestors, flags with validation (B1 V3, V4);
+  inherited interfaces use the base's methods (exact while nothing is virtual). `virtual`,
+  `override`, `abstract` members and `this(...)` are rejected as not supported yet.
+- B1 cases: P2, P3, P6, P8 to P15; N1, N4 to N6, N8 to N10, N12 to N18, N20 to N22; V1, V3, V4,
+  V5. Remaining (need virtual members): P1, P4, P5, P7, N2, N3, N7.
+- Review fix by the leader: descriptors, interface-entry arrays and ancestor arrays are now owned
+  through raw pointers (`layouts::RawOwned`, freed on drop) so the addresses published to generated
+  code are never invalidated by a `Box` move or a later `&mut` borrow.
+- Breaking: `base` is reserved; `this` may no longer escape a constructor (rule B). No repository
+  source depended on either.
+- Gates: `aster-codegen-cranelift --all-targets` default 1,521 and `mem-exp-c6` 1,527 passed
+  (0 failed); `cargo test --workspace` 2,983 passed, 0 failed; clippy and rustfmt clean.
+- Docs: `docs/reference/classes.md` (single inheritance), `interfaces.md`, `grammar.md`,
+  `specification/15-visibility.md`, B1 delivery note. Unblocked: T-OBJ-3 (virtual dispatch).

@@ -730,7 +730,9 @@ fn collect_aliases(
 
 fn alias_source(value: &mir::Rvalue, aliases: &HashSet<mir::LocalId>) -> Option<mir::LocalId> {
     match &value.kind {
-        mir::RvalueKind::Use(operand) | mir::RvalueKind::Cast(operand)
+        mir::RvalueKind::Use(operand)
+        | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
             if is_tracked_reference_type(&value.type_) =>
         {
             direct_alias(operand, aliases)
@@ -991,7 +993,12 @@ fn assignment_escape(
                 Some(EscapeReason::Stored)
             }
         }
-        mir::RvalueKind::Cast(operand) if direct_alias(operand, aliases).is_some() => {
+        // An upcast is an alias of the same object: it neither copies nor
+        // stores, so it escapes exactly when its result does (the alias
+        // closure of `alias_source` follows the result).
+        mir::RvalueKind::Cast(operand) | mir::RvalueKind::Upcast(operand)
+            if direct_alias(operand, aliases).is_some() =>
+        {
             if matches!(target, mir::Place::Local(_)) && is_tracked_reference_type(&value.type_) {
                 None
             } else {
@@ -1040,6 +1047,7 @@ fn rvalue_uses_alias(value: &mir::Rvalue, aliases: &HashSet<mir::LocalId>) -> bo
         | mir::RvalueKind::ListVersion(operand)
         | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => direct_alias(operand, aliases).is_some(),
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             fields

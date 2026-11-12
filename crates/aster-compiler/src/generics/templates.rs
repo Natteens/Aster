@@ -50,6 +50,46 @@ fn builtin_constraint_description(base: &str) -> Option<&'static str> {
         .then_some("a reserved built-in type")
 }
 
+/// A base class that mentions the derived class's own type parameters
+/// (`class Box<T> : Container<T>`) is an open base: it is deferred until the
+/// generics-in-hierarchies step (object model B1, section 8). Closed bases
+/// such as `Container<int>` are ordinary specializations.
+fn reject_open_bases(
+    class: &TypeDeclaration,
+    declarations: &HashMap<String, DeclarationFacts>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    fn mentions(name: &TypeName, parameters: &[TypeParameter]) -> bool {
+        parameters
+            .iter()
+            .any(|parameter| parameter.name == name.base)
+            || name
+                .arguments
+                .iter()
+                .any(|argument| mentions(argument, parameters))
+    }
+    for entry in &class.interfaces {
+        let Some(name) = TypeName::parse(&entry.name) else {
+            continue;
+        };
+        let is_class = declarations
+            .get(&name.base)
+            .is_some_and(|facts| matches!(facts.kind, DeclarationKind::Class));
+        if is_class && mentions(&name, &class.type_parameters) {
+            diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "generic class `{}` cannot derive from `{}`: an open base that mentions its own type parameters is not supported yet",
+                        class.name, entry.name
+                    ),
+                    entry.span,
+                )
+                .with_help("derive from a closed specialization such as `Container<int>`"),
+            );
+        }
+    }
+}
+
 impl Monomorphizer {
     #[allow(clippy::too_many_lines)]
     pub(super) fn new(module: &Module) -> Self {
@@ -140,6 +180,9 @@ impl Monomorphizer {
                 | Item::Struct(declaration)
                 | Item::Interface(declaration) => {
                     if !declaration.type_parameters.is_empty() {
+                        if let Item::Class(class) = item {
+                            reject_open_bases(class, &declarations, &mut diagnostics);
+                        }
                         let template = match item {
                             Item::Class(value) => GenericTypeTemplate::Class(value.clone()),
                             Item::Struct(value) => GenericTypeTemplate::Struct(value.clone()),

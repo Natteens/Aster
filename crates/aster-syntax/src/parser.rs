@@ -3,11 +3,11 @@ use std::mem::discriminant;
 use aster_diagnostics::{Diagnostic, Span};
 
 use crate::{
-    Accessor, Argument, AssignmentOperator, BinaryOperator, Block, EnumCase, EnumDeclaration,
-    Expression, ExpressionKind, Field, FieldInitializer, FunctionDeclaration, IncrementOperator,
-    InterpolatedPart, Item, Literal, Member, Module, Parameter, Property, Statement, SwitchCase,
-    SwitchExpressionCase, Token, TokenKind, TypeDeclaration, TypeParameter, TypeRef, UnaryOperator,
-    VariableDeclaration, VariableKind, Visibility,
+    Accessor, Argument, AssignmentOperator, BaseCall, BinaryOperator, Block, EnumCase,
+    EnumDeclaration, Expression, ExpressionKind, Field, FieldInitializer, FunctionDeclaration,
+    IncrementOperator, InterpolatedPart, Item, Literal, Member, Module, Parameter, Property,
+    Statement, SwitchCase, SwitchExpressionCase, Token, TokenKind, TypeDeclaration, TypeParameter,
+    TypeRef, UnaryOperator, VariableDeclaration, VariableKind, Visibility,
 };
 
 /// Maximum recursive source/AST nesting accepted by the frontend. This is a
@@ -63,6 +63,13 @@ struct FunctionModifiers {
     is_static: bool,
     is_async: bool,
     is_foreign: bool,
+}
+
+/// `abstract` and `sealed` before a class declaration.
+#[derive(Clone, Copy, Default)]
+struct ClassModifiers {
+    is_abstract: bool,
+    is_sealed: bool,
 }
 
 /// A run of directly adjacent `>` characters, as seen by the expression parser.
@@ -295,6 +302,7 @@ impl Parser {
         Some(name)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn item(&mut self) -> Option<Item> {
         let start = self.current().span.start;
         let visibility = self.visibility(Visibility::Internal);
@@ -332,7 +340,10 @@ impl Parser {
         if is_test {
             self.advance();
         }
+        let mut class_modifiers = ClassModifiers::default();
+        self.class_modifiers(&mut class_modifiers);
         let is_static = self.take(&TokenKind::Static).is_some();
+        self.class_modifiers(&mut class_modifiers);
         let async_token = self.take(&TokenKind::Async);
         let is_async = async_token.is_some();
         if let Some(token) = &async_token
@@ -378,13 +389,31 @@ impl Parser {
         }
         match &self.current().kind {
             TokenKind::Class => self
-                .type_declaration(visibility, start, TypeKind::Class, is_static)
+                .type_declaration(
+                    visibility,
+                    start,
+                    TypeKind::Class,
+                    is_static,
+                    class_modifiers,
+                )
                 .map(Item::Class),
             TokenKind::Struct => self
-                .type_declaration(visibility, start, TypeKind::Struct, is_static)
+                .type_declaration(
+                    visibility,
+                    start,
+                    TypeKind::Struct,
+                    is_static,
+                    class_modifiers,
+                )
                 .map(Item::Struct),
             TokenKind::Interface => self
-                .type_declaration(visibility, start, TypeKind::Interface, is_static)
+                .type_declaration(
+                    visibility,
+                    start,
+                    TypeKind::Interface,
+                    is_static,
+                    class_modifiers,
+                )
                 .map(Item::Interface),
             TokenKind::Enum => self.enum_declaration(visibility, start).map(Item::Enum),
             TokenKind::Const | TokenKind::Var => {
@@ -403,8 +432,36 @@ impl Parser {
         start: usize,
         kind: TypeKind,
         is_static: bool,
+        modifiers: ClassModifiers,
     ) -> Option<TypeDeclaration> {
         self.advance();
+        if (modifiers.is_abstract || modifiers.is_sealed) && kind != TypeKind::Class {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "`abstract` and `sealed` are valid only on a class",
+                    self.current().span,
+                )
+                .with_help("remove the modifier from this type declaration"),
+            );
+        }
+        if modifiers.is_abstract && modifiers.is_sealed {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "a class cannot be both `abstract` and `sealed`",
+                    self.current().span,
+                )
+                .with_help("an abstract class exists to be derived from; remove one modifier"),
+            );
+        }
+        if is_static && (modifiers.is_abstract || modifiers.is_sealed) && kind == TypeKind::Class {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "a `static` class cannot be `abstract` or `sealed`",
+                    self.current().span,
+                )
+                .with_help("a static class is already neither instantiable nor derivable"),
+            );
+        }
         if is_static && kind != TypeKind::Class {
             self.diagnostics.push(
                 Diagnostic::error("only classes can be static", self.current().span)
@@ -420,7 +477,7 @@ impl Parser {
                         "only classes can declare implemented interfaces",
                         colon.span,
                     )
-                    .with_help("remove the interface list; interface implementation by structs is not supported yet"),
+                    .with_help("remove the list after `:`; structs and interfaces cannot inherit or implement"),
                 );
             }
             let mut interfaces = Vec::new();
@@ -452,6 +509,8 @@ impl Parser {
             is_static,
             name,
             type_parameters,
+            is_abstract: modifiers.is_abstract,
+            is_sealed: modifiers.is_sealed,
             interfaces,
             members,
             span: Span::new(start, end),
@@ -511,7 +570,9 @@ impl Parser {
             Visibility::Private
         };
         let visibility = self.visibility(default);
+        self.unsupported_member_modifiers();
         let is_static = self.take(&TokenKind::Static).is_some();
+        self.unsupported_member_modifiers();
         let async_token = self.take(&TokenKind::Async);
         let is_async = async_token.is_some();
         if owner == TypeKind::Class
@@ -545,6 +606,7 @@ impl Parser {
                     start,
                     false,
                     false,
+                    true,
                 )
                 .map(|mut constructor| {
                     constructor.constructor = true;
@@ -567,6 +629,7 @@ impl Parser {
                 start,
                 owner == TypeKind::Interface,
                 true,
+                false,
             )
             .map(Member::Method)
         } else if self.at(&TokenKind::LeftBrace) {
@@ -626,6 +689,7 @@ impl Parser {
                 start,
                 false,
                 true,
+                false,
             )
             .map(Item::Function)
         } else {
@@ -663,6 +727,7 @@ impl Parser {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn function_after_name(
         &mut self,
         modifiers: FunctionModifiers,
@@ -671,6 +736,7 @@ impl Parser {
         start: usize,
         signature_only: bool,
         allow_expression_body: bool,
+        constructor: bool,
     ) -> Option<FunctionDeclaration> {
         let FunctionModifiers {
             visibility,
@@ -685,6 +751,11 @@ impl Parser {
         let right_paren = self.expect(&TokenKind::RightParen)?;
         // Covers both bodied functions and signature-only interface members.
         self.where_clauses(&mut type_parameters)?;
+        let base_call = if constructor && self.at(&TokenKind::Colon) {
+            Some(self.base_call()?)
+        } else {
+            None
+        };
         if is_foreign && !type_parameters.is_empty() {
             self.diagnostics.push(
                 Diagnostic::error("foreign functions cannot be generic", self.current().span)
@@ -704,6 +775,7 @@ impl Parser {
                 return_type,
                 name,
                 parameters,
+                base_call: None,
                 body: None,
                 span: Span::new(start, end),
             })
@@ -739,10 +811,36 @@ impl Parser {
                 return_type,
                 name,
                 parameters,
+                base_call,
                 body: Some(body),
                 span: Span::new(start, end),
             })
         }
+    }
+
+    /// `: base(arguments)` after a constructor's parameter list.
+    fn base_call(&mut self) -> Option<BaseCall> {
+        let colon = self.expect(&TokenKind::Colon)?;
+        if self.at(&TokenKind::This) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "`this(...)` constructor chaining is not supported yet",
+                    self.current().span,
+                )
+                .with_help(
+                    "a class has one constructor; use `: base(...)` to reach the base class",
+                ),
+            );
+            return None;
+        }
+        self.expect(&TokenKind::Base)?;
+        self.expect(&TokenKind::LeftParen)?;
+        let arguments = self.arguments()?;
+        let right_paren = self.expect(&TokenKind::RightParen)?;
+        Some(BaseCall {
+            arguments,
+            span: Span::new(colon.span.start, right_paren.span.end),
+        })
     }
 
     fn property_after_name(
@@ -2369,6 +2467,97 @@ impl Parser {
         }
     }
 
+    /// Consume `abstract`/`sealed` modifiers that precede a type declaration.
+    /// Both are contextual: an identifier of that spelling is a modifier only
+    /// when another modifier or a declaration keyword follows it.
+    fn class_modifiers(&mut self, modifiers: &mut ClassModifiers) {
+        loop {
+            let TokenKind::Identifier(name) = &self.current().kind else {
+                return;
+            };
+            let name = name.clone();
+            if name != "abstract" && name != "sealed" {
+                return;
+            }
+            let followed = matches!(
+                &self.peek(1).kind,
+                TokenKind::Class
+                    | TokenKind::Struct
+                    | TokenKind::Interface
+                    | TokenKind::Enum
+                    | TokenKind::Static
+            ) || matches!(&self.peek(1).kind, TokenKind::Identifier(next) if next == "abstract" || next == "sealed");
+            if !followed {
+                return;
+            }
+            let token = self.advance().clone();
+            let flag = if name == "abstract" {
+                &mut modifiers.is_abstract
+            } else {
+                &mut modifiers.is_sealed
+            };
+            if std::mem::replace(flag, true) {
+                self.diagnostics.push(Diagnostic::error(
+                    format!("duplicate `{name}` modifier"),
+                    token.span,
+                ));
+            }
+        }
+    }
+
+    /// Reject `virtual`, `override`, `abstract` and `sealed` before a member:
+    /// virtual dispatch is a later object-model step. The modifier is consumed
+    /// so the member still parses and no cascade of errors follows.
+    fn unsupported_member_modifiers(&mut self) {
+        loop {
+            let TokenKind::Identifier(name) = &self.current().kind else {
+                return;
+            };
+            let name = name.clone();
+            if !matches!(
+                name.as_str(),
+                "virtual" | "override" | "abstract" | "sealed"
+            ) {
+                return;
+            }
+            let next = &self.peek(1).kind;
+            let followed = matches!(
+                next,
+                TokenKind::Identifier(_)
+                    | TokenKind::Void
+                    | TokenKind::Static
+                    | TokenKind::Async
+                    | TokenKind::Bool
+                    | TokenKind::SByte
+                    | TokenKind::Byte
+                    | TokenKind::Short
+                    | TokenKind::UShort
+                    | TokenKind::Int
+                    | TokenKind::UInt
+                    | TokenKind::Long
+                    | TokenKind::ULong
+                    | TokenKind::Float
+                    | TokenKind::Double
+                    | TokenKind::Decimal
+                    | TokenKind::Char
+                    | TokenKind::String
+            );
+            if !followed {
+                return;
+            }
+            let token = self.advance().clone();
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!("`{name}` members are not supported yet"),
+                    token.span,
+                )
+                .with_help(
+                    "virtual dispatch (`virtual`, `override`, abstract methods) arrives in a later object-model step; declare a plain method",
+                ),
+            );
+        }
+    }
+
     fn is_value_type_keyword(&self) -> bool {
         matches!(
             self.current().kind,
@@ -2393,6 +2582,12 @@ impl Parser {
         let token = self.advance().clone();
         if let TokenKind::Identifier(name) = token.kind {
             Some((name, token.span))
+        } else if token.kind == TokenKind::Base {
+            self.diagnostics.push(
+                Diagnostic::error("`base` is a reserved word", token.span)
+                    .with_help("`base` is valid only as the `: base(...)` constructor initializer; choose another name"),
+            );
+            None
         } else {
             self.diagnostics.push(
                 Diagnostic::error(

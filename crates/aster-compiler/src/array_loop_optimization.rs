@@ -366,6 +366,7 @@ fn rvalue_has_matching_index(
         | mir::RvalueKind::ListVersion(operand)
         | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => {
             operand_has_matching_index(operand, array, index)
         }
@@ -443,6 +444,7 @@ fn mark_rvalue(
         | mir::RvalueKind::ListVersion(operand)
         | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => mark_operand(operand, array, index, header),
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             for field in fields {

@@ -75,8 +75,10 @@ fn invalid_interface_programs_have_specific_diagnostics() {
             "must be public",
         ),
         (
-            "public class A { public A() {} } public class B : A { public B() {} }",
-            "not an interface",
+            // T-OBJ-2: a class after `:` is the base class now; only a type that
+            // is neither a class nor an interface is still rejected.
+            "public struct A { public int x; } public class B : A { public B() {} }",
+            "cannot be a base class",
         ),
         (
             "public interface I { int Value(); } public class C : I, I { public C() {} public int Value() { return 1; } }",

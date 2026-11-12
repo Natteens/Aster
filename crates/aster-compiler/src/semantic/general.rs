@@ -15,18 +15,21 @@ use aster_syntax::{
 };
 
 use super::{
-    AccessorKind, CallableKey, Dispatch, Model, ResolvedArguments, ResolvedCall,
-    ResolvedDefaultArgument, ResolvedDictionaryOperation, ResolvedEnumCase, ResolvedParallelFor,
-    ResolvedParallelForEach, ResolvedParallelReduce, ResolvedPropagation,
-    ResolvedPropertyAssignment, ResolvedStringBuilderOperation, ResolvedTaskRun, callable_key,
+    AccessorKind, CallableKey, ConstructorThisCall, Dispatch, Model, ResolvedArguments,
+    ResolvedBaseConstructor, ResolvedCall, ResolvedDefaultArgument, ResolvedDictionaryOperation,
+    ResolvedEnumCase, ResolvedParallelFor, ResolvedParallelForEach, ResolvedParallelReduce,
+    ResolvedPropagation, ResolvedPropertyAssignment, ResolvedStringBuilderOperation,
+    ResolvedTaskRun, ThisSummary, callable_key,
 };
 use crate::type_names::TypeName;
 
 mod calls;
 mod declarations;
 mod expressions;
+mod inheritance;
 mod nested_concurrency;
 mod statements;
+mod this_confinement;
 mod types;
 
 // These modules extend one analyzer and share this private semantic domain. Keeping the state here
@@ -43,10 +46,13 @@ pub(super) fn validate(module: &Module, diagnostics: &mut Vec<Diagnostic>, model
     declarations::collect_type_names(module, &mut context);
     declarations::collect_declarations(module, &mut context, diagnostics);
     declarations::discover_official_types(&mut context);
+    inheritance::resolve(module, &mut context, diagnostics);
     declarations::validate_interface_implementations(module, &context, diagnostics);
     declarations::validate_struct_cycles(module, &context, diagnostics);
     declarations::validate_module_variables(module, &mut context, diagnostics, model);
     declarations::validate_bodies(module, &context, diagnostics, model);
+    // Needs the summary of every method body, so it runs after all of them.
+    this_confinement::validate(&context, model, diagnostics);
     // Runs after every call/Task.Run/Parallel resolution has been recorded in
     // `model`, so the call graph it walks is complete.
     nested_concurrency::validate(module, &context, model, diagnostics);
@@ -86,7 +92,22 @@ struct TypeInfo {
     properties: HashMap<String, PropertyInfo>,
     constructor: Option<Callable>,
     constructor_visibility: Option<Visibility>,
+    /// Interfaces the class lists itself followed by every interface its base
+    /// chain implements (a derived class may not list one again).
     implemented_interfaces: Vec<String>,
+    /// The base class, when the first name after `:` is a class.
+    base: Option<String>,
+    is_abstract: bool,
+    is_sealed: bool,
+    /// Accessible inherited fields mapped to their declaring class. Own fields
+    /// are absent; the inherited members are merged into `fields`, `methods`
+    /// and `properties` so lookups need no chain walk.
+    field_owner: HashMap<String, String>,
+    /// Base classes, nearest first. Empty for a class without a base.
+    ancestors: Vec<String>,
+    /// Private members of the base chain (name -> declaring class). They are
+    /// not members of this class; the table only sharpens diagnostics.
+    hidden_private: HashMap<String, String>,
     kind: Option<TypeKind>,
     enum_cases: Vec<EnumCaseInfo>,
 }
@@ -161,6 +182,11 @@ struct Analyzer<'a> {
     model_context: String,
     async_state: AsyncAnalysisState,
     unsafe_depth: usize,
+    /// How the body under analysis uses `this`; `None` outside instance bodies.
+    this_usage: Option<this_confinement::ThisUsage>,
+    /// Analyzing the `base(...)` arguments of a constructor, where the object
+    /// is not usable yet.
+    base_arguments: bool,
 }
 
 impl<'a> Analyzer<'a> {
@@ -177,6 +203,12 @@ impl<'a> Analyzer<'a> {
         model_context: String,
         model: &'a mut Model,
     ) -> Self {
+        let owner_is_class = owner.as_ref().is_some_and(|owner| {
+            context
+                .types
+                .get(owner)
+                .is_some_and(|info| info.kind == Some(TypeKind::Class))
+        });
         let mut outer = context.globals.clone();
         let field_names = fields.keys().cloned().collect();
         outer.extend(fields.into_iter().map(|(name, type_)| {
@@ -210,6 +242,9 @@ impl<'a> Analyzer<'a> {
             model_context,
             async_state: AsyncAnalysisState::OutsideAsync,
             unsafe_depth: 0,
+            this_usage: (instance_context && owner_is_class)
+                .then(this_confinement::ThisUsage::default),
+            base_arguments: false,
         }
     }
 

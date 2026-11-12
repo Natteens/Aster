@@ -923,7 +923,7 @@ impl<'a> Block<'a> {
         use mir::RvalueKind as K;
         let mut sources: Vec<(Path, ValueId)> = Vec::new();
         match &value.kind {
-            K::Use(o) | K::Cast(o) | K::MakeInterface { object: o, .. } => {
+            K::Use(o) | K::Cast(o) | K::Upcast(o) | K::MakeInterface { object: o, .. } => {
                 sources = self.operand_values(o);
             }
             K::Aggregate(fields) => {
@@ -1730,6 +1730,9 @@ mod tests {
         let module = Module {
             structs: Vec::new(),
             classes: vec![mir::ClassDefinition {
+                base: None,
+                is_abstract: false,
+                is_sealed: false,
                 symbol: SymbolId(10),
                 name: "C".into(),
                 fields: vec![mir::FieldDefinition {
@@ -2023,6 +2026,9 @@ mod tests {
         let module = Module {
             structs: Vec::new(),
             classes: vec![mir::ClassDefinition {
+                base: None,
+                is_abstract: false,
+                is_sealed: false,
                 symbol: SymbolId(10),
                 name: "C".into(),
                 fields: vec![mir::FieldDefinition {
@@ -2237,6 +2243,9 @@ mod tests {
         let module = Module {
             structs: Vec::new(),
             classes: vec![mir::ClassDefinition {
+                base: None,
+                is_abstract: false,
+                is_sealed: false,
                 symbol: SymbolId(10),
                 name: "C".into(),
                 fields: vec![mir::FieldDefinition {
@@ -2449,6 +2458,9 @@ mod tests {
         let module = Module {
             structs: Vec::new(),
             classes: vec![mir::ClassDefinition {
+                base: None,
+                is_abstract: false,
+                is_sealed: false,
                 symbol: SymbolId(10),
                 name: "C".into(),
                 fields: vec![
@@ -2955,6 +2967,9 @@ mod tests {
         let module = Module {
             structs: Vec::new(),
             classes: vec![mir::ClassDefinition {
+                base: None,
+                is_abstract: false,
+                is_sealed: false,
                 symbol: SymbolId(10),
                 name: "C".into(),
                 fields: vec![mir::FieldDefinition {

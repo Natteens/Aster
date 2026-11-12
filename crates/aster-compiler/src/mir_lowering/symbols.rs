@@ -423,6 +423,7 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
             collect_expression(value, max);
         }
         hir::ExpressionKind::LogCall { argument, .. } => collect_expression(argument, max),
+        hir::ExpressionKind::UpcastClass { object } => collect_expression(object, max),
         hir::ExpressionKind::UpcastInterface {
             object,
             class,

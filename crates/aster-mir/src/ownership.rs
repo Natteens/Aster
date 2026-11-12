@@ -575,6 +575,7 @@ impl Context<'_> {
                 match &value.kind {
                     RvalueKind::Use(operand)
                     | RvalueKind::Cast(operand)
+                    | RvalueKind::Upcast(operand)
                     | RvalueKind::MakeInterface {
                         object: operand, ..
                     } => sources.push(operand),
@@ -1534,6 +1535,7 @@ fn usage_of(instruction: &Instruction, local: LocalId) -> Usage {
         Instruction::Assign { value, .. } => match &value.kind {
             RvalueKind::Use(operand)
             | RvalueKind::Cast(operand)
+            | RvalueKind::Upcast(operand)
             | RvalueKind::MakeInterface {
                 object: operand, ..
             } => usage.kept = direct(operand),
@@ -2358,6 +2360,9 @@ mod tests {
                 },
             ],
             classes: vec![mir::ClassDefinition {
+                base: None,
+                is_abstract: false,
+                is_sealed: false,
                 symbol: SymbolId(10),
                 name: "C".into(),
                 fields: vec![
@@ -2457,6 +2462,9 @@ mod tests {
                 },
             ],
             classes: vec![mir::ClassDefinition {
+                base: None,
+                is_abstract: false,
+                is_sealed: false,
                 symbol: SymbolId(10),
                 name: "C".into(),
                 fields: vec![
@@ -3892,6 +3900,9 @@ mod tests {
         Module {
             structs: Vec::new(),
             classes: vec![mir::ClassDefinition {
+                base: None,
+                is_abstract: false,
+                is_sealed: false,
                 symbol: SymbolId(NODE),
                 name: "Node".into(),
                 fields: vec![

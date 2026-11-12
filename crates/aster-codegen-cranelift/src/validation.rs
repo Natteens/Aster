@@ -3026,6 +3026,7 @@ fn validate_rvalue(
         mir::RvalueKind::Discriminant(operand)
         | mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => {
             validate_operand_with_proven_bounds(operand, function_name, true)
         }
@@ -5476,6 +5477,9 @@ mod tests {
             mir::Type::Class(class_symbol),
         );
         module.classes.push(mir::ClassDefinition {
+            base: None,
+            is_abstract: false,
+            is_sealed: false,
             symbol: class_symbol,
             name: "Widget".to_owned(),
             fields: Vec::new(),
@@ -5720,6 +5724,9 @@ mod tests {
             mir::Type::Class(class_symbol),
         );
         module.classes.push(mir::ClassDefinition {
+            base: None,
+            is_abstract: false,
+            is_sealed: false,
             symbol: class_symbol,
             name: "Widget".to_owned(),
             fields: Vec::new(),
@@ -5903,6 +5910,9 @@ mod tests {
             mir::Type::Class(class_symbol),
         );
         module.classes.push(mir::ClassDefinition {
+            base: None,
+            is_abstract: false,
+            is_sealed: false,
             symbol: class_symbol,
             name: "Widget".to_owned(),
             fields: Vec::new(),
@@ -6034,6 +6044,9 @@ mod tests {
             mir::Type::Int,
         );
         module.classes.push(mir::ClassDefinition {
+            base: None,
+            is_abstract: false,
+            is_sealed: false,
             symbol: class_symbol,
             name: "Widget".to_owned(),
             fields: Vec::new(),

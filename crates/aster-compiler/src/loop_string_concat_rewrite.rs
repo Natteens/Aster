@@ -26,6 +26,9 @@ pub(super) fn rewrite(module: &mut mir::Module) {
     }
     if rewritten && existing_class.is_none() {
         module.classes.push(mir::ClassDefinition {
+            base: None,
+            is_abstract: false,
+            is_sealed: false,
             symbol: class,
             name: STRING_BUILDER_NAME.to_owned(),
             fields: Vec::new(),
@@ -350,6 +353,7 @@ fn rvalue_uses_local(value: &mir::Rvalue, local: mir::LocalId) -> bool {
         | mir::RvalueKind::ListVersion(operand)
         | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => operand_uses_local(operand, local),
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             fields

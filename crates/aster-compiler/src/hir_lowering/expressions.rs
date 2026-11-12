@@ -54,6 +54,23 @@ impl Lowerer<'_> {
                         left = convert(left, operand);
                         right = convert(right, operand);
                     }
+                    // An identity comparison across a base chain compares the
+                    // same object through the base class: upcast the derived
+                    // operand (no code runs, the pointer is unchanged).
+                    if matches!(
+                        operator,
+                        ast::BinaryOperator::Equal | ast::BinaryOperator::NotEqual
+                    ) && let (hir::Type::Class(l), hir::Type::Class(r)) =
+                        (&left.type_, &right.type_)
+                    {
+                        if self.derives_from(*l, *r) {
+                            let target = right.type_.clone();
+                            left = convert(left, &target);
+                        } else if self.derives_from(*r, *l) {
+                            let target = left.type_.clone();
+                            right = convert(right, &target);
+                        }
+                    }
                     let type_ = binary_type(operator, operand.as_ref(), &left.type_);
                     values.push(hir::Expression {
                         type_,
@@ -159,10 +176,13 @@ impl Lowerer<'_> {
                 if self.member_owners.contains_key(&symbol)
                     && let Some(receiver) = self.current_receiver
                 {
-                    let object = hir::Expression {
-                        type_: self.symbol_types[&receiver].clone(),
-                        kind: hir::ExpressionKind::Symbol(receiver),
-                    };
+                    let object = self.upcast_receiver(
+                        hir::Expression {
+                            type_: self.symbol_types[&receiver].clone(),
+                            kind: hir::ExpressionKind::Symbol(receiver),
+                        },
+                        symbol,
+                    );
                     let type_ = self
                         .symbol_types
                         .get(&symbol)
@@ -429,9 +449,12 @@ impl Lowerer<'_> {
                 let symbol = match object.type_ {
                     hir::Type::User(owner)
                     | hir::Type::Class(owner)
-                    | hir::Type::Interface(owner) => self.members[&owner][name],
+                    | hir::Type::Interface(owner) => self
+                        .lookup_member(owner, name)
+                        .expect("validated member access names a declared member"),
                     _ => unreachable!("validated member access has a user type"),
                 };
+                let object = self.upcast_receiver(object, symbol);
                 let type_ = self
                     .symbol_types
                     .get(&symbol)
@@ -1086,6 +1109,7 @@ impl Lowerer<'_> {
                             }
                             _ => unreachable!("validated method call has a member callee"),
                         };
+                        let receiver = self.upcast_receiver(receiver, symbol);
                         hir::Expression {
                             type_: hir::Type::Unknown,
                             kind: hir::ExpressionKind::Member {
@@ -1264,7 +1288,25 @@ impl Lowerer<'_> {
                 let condition = self.expression(condition);
                 let when_true = self.expression(when_true);
                 let when_false = self.expression(when_false);
-                let type_ = conditional_type(&when_true.type_, &when_false.type_);
+                let type_ = match (&when_true.type_, &when_false.type_) {
+                    (hir::Type::Class(a), hir::Type::Class(b)) if self.derives_from(*a, *b) => {
+                        when_false.type_.clone()
+                    }
+                    (hir::Type::Class(a), hir::Type::Class(b)) if self.derives_from(*b, *a) => {
+                        when_true.type_.clone()
+                    }
+                    // Sibling classes: the branches meet at their nearest
+                    // common base (semantic analysis accepted the conditional
+                    // against a base-typed target).
+                    (hir::Type::Class(a), hir::Type::Class(b)) if a != b => {
+                        let right_chain = self.class_chain(*b);
+                        self.class_chain(*a)
+                            .into_iter()
+                            .find(|class| right_chain.contains(class))
+                            .map_or_else(|| when_true.type_.clone(), hir::Type::Class)
+                    }
+                    _ => conditional_type(&when_true.type_, &when_false.type_),
+                };
                 let when_true = convert(when_true, &type_);
                 let when_false = convert(when_false, &type_);
                 hir::Expression {
@@ -1362,6 +1404,7 @@ impl Lowerer<'_> {
                         _ => unreachable!("property target is a name or member"),
                     };
                     let setter = self.callable_symbols[&resolved.setter];
+                    let object = self.upcast_receiver(object, setter);
                     let target_type = self.callable_parameters[&setter][0].clone();
                     let value = convert(self.expression(value), &target_type);
                     return hir::Expression {
@@ -1425,6 +1468,7 @@ impl Lowerer<'_> {
     }
 
     fn property_get(&self, object: hir::Expression, getter: hir::SymbolId) -> hir::Expression {
+        let object = self.upcast_receiver(object, getter);
         let type_ = self.callable_results[&getter].clone();
         hir::Expression {
             type_,
