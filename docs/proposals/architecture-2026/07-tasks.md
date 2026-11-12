@@ -39,12 +39,12 @@ example, reference page. Gate: workspace tests; class A invariants unchanged or 
 | ID | Objective | Decision | Depends on | Risk | Status |
 | --- | --- | --- | --- | --- | --- |
 | T-LANG-18 | `Main(string[] args)`, exit status, standard error, environment | LANG-018 | — | low | todo |
-| T-LANG-17 | `do`-`while`, `%=`, block comments, exponents, digit separators | LANG-017 | — | low | implemented 2026-11-11 (focused gates pass; full-suite gate pending with T-MEM-2) |
+| T-LANG-17 | `do`-`while`, `%=`, block comments, exponents, digit separators | LANG-017 | — | low | **done 2026-11-11** (`e2ab68e`; workspace 2,923 passed) |
 | T-FIX-FREM | Floating-point `%` and `%=` execute in the JIT (today a controlled "not yet supported" error; found by T-LANG-17) | LANG-017, numeric conformance | — | low | todo |
 | T-LANG-16 | Real literal defaults to `double` (breaking; migrate examples and stdlib) | LANG-016 | T-LANG-17 | low | todo |
 | T-OBJ-5 | Constructor overloads and `this(…)` (B2 record first) | OBJ-005 | — | low | todo |
 | T-LANG-5 | Auto-properties and `init` | LANG-005 | — | low | todo |
-| T-LANG-4a | `switch` on integers, chars, strings | LANG-004 | — | low | implemented 2026-11-11 (focused gates pass; full-suite gate pending with T-MEM-2) |
+| T-LANG-4a | `switch` on integers, chars, strings | LANG-004 | — | low | **done 2026-11-11** (`61ab237`; workspace 2,923 passed) |
 | T-LANG-4b | `is T x` patterns and `when` guards | LANG-004 | T-LANG-4a | low | todo |
 | T-LANG-3 | `T?`, `null`, `??`, `?.` | LANG-003 | T-LANG-4b | medium | todo |
 | T-LANG-6 | Static fields per domain | LANG-006 | — | medium | todo |
@@ -62,7 +62,7 @@ example, reference page. Gate: workspace tests; class A invariants unchanged or 
 | --- | --- | --- | --- | --- | --- | --- |
 | T-OBJ-B1-1 | B1 stage 1: update B1 record with closure answers and the constant `H` | OBJ-002..004 | — | review | low | **done 2026-11-11**: `docs/compiler/object-model-b1.md` §4.1 (`H = P`, H8 after MEM-EXP-1) and §10.1 (answers to U1 to U10 and closure amendments) |
 | T-MEM-EXP-1 | Branch with configurations C0 to C6, ownership pass and independent validator for class references; report | MEM-001..003, OBJ-001 | T-BENCH-1, T-ARCH-2b | closure §4.C thresholds | high | **done 2026-11-11, verdict FAIL** (execution time on `object_graph` and tier-1 preservation, for H12 and H16): [09-mem-exp-1-report.md](09-mem-exp-1-report.md); Q-MEM-0 fallback applies |
-| T-MEM-2 | Merge the chosen header: **B1 with H8** (Q-MEM-0 fallback after MEM-EXP-1 FAIL) | MEM-002 or B1 H8 | T-MEM-EXP-1 | reinforced | medium | todo |
+| T-MEM-2 | Merge the chosen header: **B1 with H8** (Q-MEM-0 fallback after MEM-EXP-1 FAIL) | MEM-002 or B1 H8 | T-MEM-EXP-1 | reinforced | medium | **done 2026-11-11** (see log) |
 | T-MEM-3a | Counting for class references; store sequence §4.B; failure contract §4.A | MEM-003 | T-MEM-2 | reinforced + negative MIR cases of §4.B | high | superseded: Q-MEM-0 fallback after MEM-EXP-1 FAIL (no counting in the default build); experiment code stays behind `mem-exp-*` features |
 | T-MEM-3b | Strings and arrays | MEM-003 | T-MEM-3a | reinforced | high | superseded: Q-MEM-0 fallback after MEM-EXP-1 FAIL (no counting in the default build); experiment code stays behind `mem-exp-*` features |
 | T-MEM-7 | Collections own and free buffers; element glue | MEM-007 | T-MEM-3b | reinforced | medium | superseded: Q-MEM-0 fallback after MEM-EXP-1 FAIL (no counting in the default build); experiment code stays behind `mem-exp-*` features |
@@ -947,3 +947,21 @@ H8 (T-MEM-2 unblocked), explicit `Arena` scope as a new decision (T-MEM-ARENA). 
 4. Class B timing protocol (release builds, interleaved rounds) and the §4.C thresholds.
 
 
+
+### T-MEM-2 — done 2026-11-11 (B1 stage 2 with H8, default build)
+
+- Every class instance has an 8-byte header; offset 0 points to an immutable `ClassDescriptor`
+  (`crates/aster-runtime/src/descriptor.rs`): an `ObjectDescriptor` prefix (size, and reference
+  offsets used only by the counting experiment), class identity (`type_key`), and the interface
+  table list. Descriptors are owned by the prepared program; interface table addresses are bound
+  after `finalize_definitions` and before any code runs. No hierarchy and no new syntax yet.
+- `OBJECT_HEADER_BYTES` defaults to 8; `mem-exp-h8` removed (now the default); `mem-exp-h12` and
+  `mem-exp-h16` remain experiment overrides. The pre-B1 headerless layout (old "C0") no longer
+  exists; `mem-exp-*` experiment configurations are measured against this default from now on.
+- Tests: descriptor identity and size, interface tables, B1 §4.1 layout examples, no field overlaps
+  the header word; one expectation changed (`long_lived_ownership` stride 8 → 16 by default).
+- Gates: `aster-codegen-cranelift --all-targets` default 1,471, `mem-exp-c4` 1,470, `mem-exp-c6`
+  1,476 passed (0 failed); `cargo test --workspace` 2,923 passed, 0 failed, 4 ignored; clippy
+  workspace clean; rustfmt clean.
+- Docs: `docs/compiler/object-model-b1.md` §3, `runtime-abi.md`, `execution-context.md`.
+- Unblocked: T-OBJ-2 (single inheritance, B1 PR 1).

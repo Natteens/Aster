@@ -18,31 +18,30 @@ pub(super) struct TaskArgumentLayout {
     pub(super) size: u32,
 }
 
-#[cfg(any(
-    all(feature = "mem-exp-h8", feature = "mem-exp-h12"),
-    all(feature = "mem-exp-h8", feature = "mem-exp-h16"),
-    all(feature = "mem-exp-h12", feature = "mem-exp-h16"),
-))]
-compile_error!("enable at most one MEM-EXP-1 header feature");
+#[cfg(all(feature = "mem-exp-h12", feature = "mem-exp-h16"))]
+compile_error!("enable at most one object header size feature");
 
-/// MEM-EXP-1 header configuration: bytes before a class object's first field.
-/// Zero (C0) is the production layout.
+/// Bytes before a class object's first field: the object header whose offset-0
+/// word points at the class descriptor (object model B1, `H = P`). The default
+/// is 8 (H8); `mem-exp-h12` and `mem-exp-h16` are MEM-EXP-1 experiment
+/// overrides.
 pub(super) const OBJECT_HEADER_BYTES: u32 = if cfg!(feature = "mem-exp-h16") {
     16
 } else if cfg!(feature = "mem-exp-h12") {
     12
-} else if cfg!(feature = "mem-exp-h8") {
-    8
 } else {
-    0
+    8
 };
 
-/// Per-class `ObjectDescriptor`s owned by the prepared program. Boxed so the
-/// addresses written into objects stay stable when the store is moved, and
-/// kept alive until the JIT module and every execution context are gone.
-#[cfg(feature = "mem-exp-rc-core")]
+/// Per-class `ClassDescriptor`s owned by the prepared program (every build),
+/// plus, under the counting experiment, the element and dictionary
+/// descriptors. Everything is boxed so the addresses written into objects stay
+/// stable when the store is moved, and is kept alive until the JIT module and
+/// every execution context are gone. Descriptors are immutable once
+/// [`Self::bind_interface_tables`] has run, before any generated code executes.
 #[derive(Default)]
 pub(super) struct ObjectDescriptors {
+    #[cfg(feature = "mem-exp-rc-core")]
     #[allow(dead_code, reason = "owns the offset tables the descriptors point at")]
     offsets: Vec<Box<[u32]>>,
     #[allow(
@@ -50,11 +49,23 @@ pub(super) struct ObjectDescriptors {
         clippy::vec_box,
         reason = "boxing keeps descriptor addresses stable"
     )]
-    descriptors: Vec<Box<aster_runtime::object_heap::ObjectDescriptor>>,
-    by_class: HashMap<mir::SymbolId, *const aster_runtime::object_heap::ObjectDescriptor>,
+    classes: Vec<Box<aster_runtime::descriptor::ClassDescriptor>>,
+    /// Interface entry arrays, in `module.interface_implementations` order per
+    /// class; the descriptors point at these allocations.
+    interface_entries: HashMap<mir::SymbolId, Box<[aster_runtime::descriptor::InterfaceEntry]>>,
+    by_class: HashMap<mir::SymbolId, *const aster_runtime::descriptor::ClassDescriptor>,
+    #[cfg(feature = "mem-exp-rc-core")]
+    #[allow(
+        dead_code,
+        clippy::vec_box,
+        reason = "boxing keeps descriptor addresses stable"
+    )]
+    elements: Vec<Box<aster_runtime::object_heap::ObjectDescriptor>>,
     /// Element descriptors of `List<T>` and `T[]` types with reference leaves,
     /// keyed by `mir::type_key(T)` (design sections 7 and 8).
+    #[cfg(feature = "mem-exp-rc-core")]
     by_element: HashMap<u64, *const aster_runtime::object_heap::ObjectDescriptor>,
+    #[cfg(feature = "mem-exp-rc-core")]
     #[allow(
         dead_code,
         clippy::vec_box,
@@ -63,16 +74,16 @@ pub(super) struct ObjectDescriptors {
     pairs: Vec<Box<aster_runtime::object_heap::DictionaryDescriptors>>,
     /// `{ key, value }` descriptor pairs of `Dictionary<K, V>` types with
     /// reference leaves, keyed by the two `mir::type_key`s (design section 11).
+    #[cfg(feature = "mem-exp-rc-core")]
     by_dictionary: HashMap<(u64, u64), *const aster_runtime::object_heap::DictionaryDescriptors>,
 }
 
-#[cfg(feature = "mem-exp-rc-core")]
 impl ObjectDescriptors {
-    #[allow(clippy::too_many_lines)]
     pub(super) fn build(layouts: &Layouts, module: &mir::Module) -> Result<Self, BackendError> {
         let mut store = Self::default();
         // `StringBuilder` objects have a native header without a count word,
         // so a field holding one is never released through a descriptor.
+        #[cfg(feature = "mem-exp-rc-core")]
         let native = module
             .functions
             .iter()
@@ -85,27 +96,113 @@ impl ObjectDescriptors {
                 _ => None,
             })
             .collect::<std::collections::HashSet<_>>();
+        let mut interface_lists =
+            HashMap::<mir::SymbolId, Vec<aster_runtime::descriptor::InterfaceEntry>>::new();
+        for implementation in &module.interface_implementations {
+            interface_lists
+                .entry(implementation.class)
+                .or_default()
+                .push(aster_runtime::descriptor::InterfaceEntry {
+                    interface_id: mir::type_key(&mir::Type::Interface(implementation.interface)),
+                    table: std::ptr::null(),
+                });
+        }
         for class in &module.classes {
             let size = layouts
                 .types
                 .get(&class.symbol)
                 .ok_or_else(|| BackendError::new("class has no computed object layout"))?
                 .size;
+            #[cfg(feature = "mem-exp-rc-core")]
             let offsets = layouts
                 .reference_offsets(class.symbol, &native)?
                 .into_boxed_slice();
-            let descriptor = Box::new(aster_runtime::object_heap::ObjectDescriptor {
-                size,
-                reference_count: u32::try_from(offsets.len())
+            #[cfg(feature = "mem-exp-rc-core")]
+            let (reference_count, reference_offsets) = (
+                u32::try_from(offsets.len())
                     .map_err(|_| BackendError::new("class has too many reference fields"))?,
-                reference_offsets: offsets.as_ptr(),
+                offsets.as_ptr(),
+            );
+            #[cfg(not(feature = "mem-exp-rc-core"))]
+            let (reference_count, reference_offsets) = (0_u32, std::ptr::null());
+            let entries = interface_lists
+                .remove(&class.symbol)
+                .unwrap_or_default()
+                .into_boxed_slice();
+            let descriptor = Box::new(aster_runtime::descriptor::ClassDescriptor {
+                object: aster_runtime::descriptor::ObjectDescriptor {
+                    size,
+                    reference_count,
+                    reference_offsets,
+                },
+                class_id: mir::type_key(&mir::Type::Class(class.symbol)),
+                interface_count: u32::try_from(entries.len())
+                    .map_err(|_| BackendError::new("class implements too many interfaces"))?,
+                reserved: 0,
+                interfaces: if entries.is_empty() {
+                    std::ptr::null()
+                } else {
+                    entries.as_ptr()
+                },
             });
             store
                 .by_class
                 .insert(class.symbol, std::ptr::from_ref(&*descriptor));
+            #[cfg(feature = "mem-exp-rc-core")]
             store.offsets.push(offsets);
-            store.descriptors.push(descriptor);
+            store.interface_entries.insert(class.symbol, entries);
+            store.classes.push(descriptor);
         }
+        #[cfg(feature = "mem-exp-rc-core")]
+        store.build_collection_descriptors(layouts, module, &native)?;
+        Ok(store)
+    }
+
+    /// Write the finalized JIT data address of every interface method table
+    /// into the descriptors' interface entries. Must run after
+    /// `finalize_definitions` and before any generated code executes;
+    /// descriptors are never written again.
+    pub(super) fn bind_interface_tables(
+        &mut self,
+        jit: &cranelift_jit::JITModule,
+        tables: &HashMap<(mir::SymbolId, mir::SymbolId), cranelift_module::DataId>,
+        module: &mir::Module,
+    ) -> Result<(), BackendError> {
+        let mut next = HashMap::<mir::SymbolId, usize>::new();
+        for implementation in &module.interface_implementations {
+            let slot = next.entry(implementation.class).or_default();
+            let id = tables
+                .get(&(implementation.class, implementation.interface))
+                .ok_or_else(|| BackendError::new("interface table was not defined"))?;
+            let (address, _) = jit.get_finalized_data(*id);
+            let entry = self
+                .interface_entries
+                .get_mut(&implementation.class)
+                .and_then(|entries| entries.get_mut(*slot))
+                .ok_or_else(|| BackendError::new("class descriptor has no interface entry"))?;
+            entry.table = address;
+            *slot += 1;
+        }
+        Ok(())
+    }
+
+    /// Address of the class descriptor written at offset 0 of every instance
+    /// of `class`.
+    pub(super) fn address(&self, class: mir::SymbolId) -> Option<u64> {
+        self.by_class.get(&class).map(|pointer| *pointer as u64)
+    }
+}
+
+#[cfg(feature = "mem-exp-rc-core")]
+impl ObjectDescriptors {
+    #[allow(clippy::too_many_lines)]
+    fn build_collection_descriptors(
+        &mut self,
+        layouts: &Layouts,
+        module: &mir::Module,
+        native: &std::collections::HashSet<mir::SymbolId>,
+    ) -> Result<(), BackendError> {
+        let store = self;
         let mut element_types = Vec::new();
         let mut dictionaries = Vec::new();
         for instruction in module
@@ -144,7 +241,7 @@ impl ObjectDescriptors {
                 continue;
             }
             let mut offsets = Vec::new();
-            layouts.collect_type_offsets(element_type, 0, &native, &mut offsets)?;
+            layouts.collect_type_offsets(element_type, 0, native, &mut offsets)?;
             if offsets.is_empty() {
                 continue;
             }
@@ -159,7 +256,7 @@ impl ObjectDescriptors {
                 .by_element
                 .insert(key, std::ptr::from_ref(&*descriptor));
             store.offsets.push(offsets);
-            store.descriptors.push(descriptor);
+            store.elements.push(descriptor);
         }
         for (key_type, value_type) in dictionaries {
             let key = (mir::type_key(key_type), mir::type_key(value_type));
@@ -178,7 +275,7 @@ impl ObjectDescriptors {
             store.by_dictionary.insert(key, std::ptr::from_ref(&*pair));
             store.pairs.push(pair);
         }
-        Ok(store)
+        Ok(())
     }
 
     /// Address of the `{ key, value }` descriptor pair of
@@ -201,10 +298,6 @@ impl ObjectDescriptors {
         self.by_element
             .get(&mir::type_key(element_type))
             .map(|pointer| *pointer as u64)
-    }
-
-    pub(super) fn address(&self, class: mir::SymbolId) -> Option<u64> {
-        self.by_class.get(&class).map(|pointer| *pointer as u64)
     }
 }
 
@@ -704,8 +797,8 @@ mod layout_tests {
             functions: Vec::new(),
         };
         let layouts = Layouts::new(&module, 8).expect("class layout");
-        // Exact per MEM-EXP-1 configuration: C0 (no header) 0/8/16, H8 8/16/24,
-        // H12 12/16/24, H16 16/24/32.
+        // Exact per header size: H8 (default) 8/16/24,
+        // experiment H12 12/16/24, H16 16/24/32.
         let header = super::OBJECT_HEADER_BYTES;
         let next_offset = (header + 4).next_multiple_of(8);
         assert_eq!(layouts.fields[&value].offset, header);
@@ -723,6 +816,80 @@ mod layout_tests {
             foreign_functions: Vec::new(),
             functions: Vec::new(),
         }
+    }
+
+    fn class_module(classes: Vec<mir::ClassDefinition>) -> mir::Module {
+        mir::Module {
+            classes,
+            ..empty_module()
+        }
+    }
+
+    fn field(symbol: u32, type_: mir::Type) -> mir::FieldDefinition {
+        mir::FieldDefinition {
+            symbol: mir::SymbolId(symbol),
+            name: format!("f{symbol}"),
+            type_,
+        }
+    }
+
+    /// Object model B1 section 4.1 examples (`H = P = 8`, the default).
+    #[test]
+    #[cfg(not(any(feature = "mem-exp-h12", feature = "mem-exp-h16")))]
+    fn b1_layout_examples_use_the_eight_byte_header() {
+        assert_eq!(super::OBJECT_HEADER_BYTES, 8);
+        let module = class_module(vec![
+            mir::ClassDefinition {
+                symbol: mir::SymbolId(20),
+                name: "Empty".to_owned(),
+                fields: Vec::new(),
+            },
+            mir::ClassDefinition {
+                symbol: mir::SymbolId(21),
+                name: "Counter".to_owned(),
+                fields: vec![field(22, mir::Type::Int)],
+            },
+            mir::ClassDefinition {
+                symbol: mir::SymbolId(23),
+                name: "Mixed".to_owned(),
+                fields: vec![field(24, mir::Type::Byte), field(25, mir::Type::Long)],
+            },
+        ]);
+        let layouts = Layouts::new(&module, 8).expect("class layouts");
+        let empty = &layouts.types[&mir::SymbolId(20)];
+        assert_eq!((empty.size, empty.align_shift), (8, 3));
+        let counter = &layouts.types[&mir::SymbolId(21)];
+        assert_eq!(layouts.fields[&mir::SymbolId(22)].offset, 8);
+        assert_eq!((counter.size, counter.align_shift), (16, 3));
+        let mixed = &layouts.types[&mir::SymbolId(23)];
+        assert_eq!(layouts.fields[&mir::SymbolId(24)].offset, 8);
+        assert_eq!(layouts.fields[&mir::SymbolId(25)].offset, 16);
+        assert_eq!(mixed.size, 24);
+    }
+
+    /// B1 section 4.1: user code can never store to the header word because
+    /// stores target field symbols and every class field offset starts at the
+    /// header size, so offset 0 is not addressable through MIR.
+    #[test]
+    fn class_fields_never_overlap_the_header_word() {
+        let module = class_module(vec![mir::ClassDefinition {
+            symbol: mir::SymbolId(30),
+            name: "Wide".to_owned(),
+            fields: vec![
+                field(31, mir::Type::Byte),
+                field(32, mir::Type::Bool),
+                field(33, mir::Type::Long),
+                field(34, mir::Type::Class(mir::SymbolId(30))),
+            ],
+        }]);
+        let layouts = Layouts::new(&module, 8).expect("class layout");
+        for symbol in 31..=34 {
+            assert!(
+                layouts.fields[&mir::SymbolId(symbol)].offset >= super::OBJECT_HEADER_BYTES,
+                "field {symbol} must start at or after the header"
+            );
+        }
+        assert!(layouts.types[&mir::SymbolId(30)].size > super::OBJECT_HEADER_BYTES);
     }
 
     #[test]

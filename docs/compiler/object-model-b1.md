@@ -49,11 +49,12 @@ These were approved by the maintainer and are inputs to this proposal.
 
 Verified in the repository at the baseline:
 
-- Objects are headerless. `aster_rt_object_new(context, size)` returns zeroed storage owned by the
-  `ExecutionContext`; no type identity exists at run time.
+- Objects before stage 2 were headerless. `aster_rt_object_new(context, size)` returns zeroed storage
+  owned by the `ExecutionContext`. Stage 2 (implemented) gives every class instance an 8-byte header
+  whose offset-0 word points at an immutable class descriptor; inheritance is not implemented yet.
 - `mir::Type::Class(SymbolId)` is an exact type. MIR has no subtype relation.
 - Class layout is computed as a struct: fields in declaration order with natural alignment
-  (`layouts.rs`). A class with no fields occupies one byte.
+  (`layouts.rs`), after the 8-byte header; a class with no fields occupies exactly the header (8 bytes).
 - An interface value is two pointers: the object and a table. `MakeInterface { object, class,
   interface }` selects the table at compile time from the pair `(class, interface)`, and
   `CallInterface` calls through it.

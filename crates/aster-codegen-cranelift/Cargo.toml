@@ -9,10 +9,10 @@ description = "Cranelift JIT backend for Aster MIR"
 
 [features]
 aarm-telemetry = ["aster-runtime/aarm-telemetry", "dep:windows-sys"]
-# MEM-EXP-1 configurations C1 to C3 (experiment only, mutually exclusive):
-# class objects get an 8-, 12-, or 16-byte header with a descriptor word at
-# offset 0. No feature means C0, the current headerless layout.
-mem-exp-h8 = []
+# Class objects carry an 8-byte header (H8) whose offset-0 word points at the
+# class descriptor; this is the default layout. The features below are
+# MEM-EXP-1 experiment overrides (mutually exclusive) that widen the header to
+# 12 or 16 bytes.
 mem-exp-h12 = []
 mem-exp-h16 = []
 # MEM-EXP-1 configuration C4: H12 header plus the size-class heap.

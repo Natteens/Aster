@@ -12,6 +12,7 @@
 
 mod arena;
 pub mod context;
+pub mod descriptor;
 pub mod filesystem;
 pub mod foreign;
 pub mod io;
@@ -57,6 +58,7 @@ pub use context::{
 };
 #[cfg(feature = "mem-exp-rc")]
 pub use context::{EXECUTION_CONTEXT_RELEASES_OFFSET, EXECUTION_CONTEXT_RETAINS_OFFSET};
+pub use descriptor::{ClassDescriptor, InterfaceEntry};
 pub use filesystem::{
     FailingFileSystemBackend, FileSystemBackend, FileSystemError, MAX_FILE_BYTES, MAX_LIST_FILES,
     MAX_LIST_PATH_BYTES, MemoryFileSystemBackend, PartialWriteFailureFileSystemBackend,

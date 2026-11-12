@@ -70,8 +70,11 @@ pub(super) struct PreparedProgram {
     task_entries: HashMap<mir::SymbolId, (*const u8, mir::Type)>,
     /// Declared last: class descriptors must outlive the JIT code and every
     /// object that points at them.
-    #[cfg(feature = "mem-exp-rc-core")]
-    _descriptors: super::layouts::ObjectDescriptors,
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "owned only to keep descriptor addresses valid")
+    )]
+    descriptors: super::layouts::ObjectDescriptors,
 }
 
 /// MEM-EXP-1 C5/C6: insert the ownership instructions (elided in C6) and
@@ -155,6 +158,11 @@ impl PreparedProgram {
         let codegen_elapsed = codegen_started.elapsed();
         let finalize_started = Instant::now();
         codegen.jit.finalize_definitions().map_err(module_error)?;
+        codegen.descriptors.bind_interface_tables(
+            &codegen.jit,
+            &codegen.interface_tables,
+            module,
+        )?;
         let entries = module
             .functions
             .iter()
@@ -182,8 +190,7 @@ impl PreparedProgram {
                 jit: Some(codegen.jit),
                 entries,
                 task_entries,
-                #[cfg(feature = "mem-exp-rc-core")]
-                _descriptors: codegen.descriptors,
+                descriptors: codegen.descriptors,
             },
             PrepareTimings {
                 codegen: codegen_elapsed,
@@ -1873,5 +1880,244 @@ mod tests {
         assert_sync::<mir::Module>();
         assert_send::<ExecutionValue>();
         assert_send::<crate::MemoryStats>();
+    }
+
+    const DESC_PLAIN: mir::SymbolId = mir::SymbolId(91_001);
+    const DESC_EMPTY: mir::SymbolId = mir::SymbolId(91_002);
+    const DESC_PAIR: mir::SymbolId = mir::SymbolId(91_003);
+    const DESC_FIELD: mir::SymbolId = mir::SymbolId(91_004);
+    const DESC_IFACE_A: mir::SymbolId = mir::SymbolId(91_010);
+    const DESC_IFACE_B: mir::SymbolId = mir::SymbolId(91_011);
+    const DESC_METHOD_A: mir::SymbolId = mir::SymbolId(91_012);
+    const DESC_METHOD_B: mir::SymbolId = mir::SymbolId(91_013);
+    const DESC_IMPL_A: mir::SymbolId = mir::SymbolId(91_014);
+    const DESC_IMPL_B: mir::SymbolId = mir::SymbolId(91_015);
+
+    fn descriptor_function(
+        symbol: mir::SymbolId,
+        return_type: mir::Type,
+        locals: Vec<mir::Local>,
+        instructions: Vec<mir::Instruction>,
+        result: Option<mir::Operand>,
+    ) -> mir::Function {
+        mir::Function {
+            constructor: false,
+            symbol,
+            owner: None,
+            name: format!("descriptor_{}", symbol.0),
+            visibility: mir::Visibility::Public,
+            parameters: Vec::new(),
+            locals,
+            return_type,
+            entry: FINE_BLOCK,
+            blocks: vec![mir::BasicBlock {
+                id: FINE_BLOCK,
+                instructions,
+                terminator: mir::Terminator::Return(result),
+            }],
+            temporary_subregion_candidates: Vec::new(),
+        }
+    }
+
+    /// Entry returning a freshly allocated persistent instance of `class`.
+    fn descriptor_maker(symbol: mir::SymbolId, class: mir::SymbolId) -> mir::Function {
+        let class_type = mir::Type::Class(class);
+        descriptor_function(
+            symbol,
+            class_type.clone(),
+            vec![fine_local(0, class_type.clone())],
+            vec![mir::Instruction::AllocateObject {
+                destination: mir::Place::Local(mir::LocalId(0)),
+                class,
+                region: mir::AllocationRegion::Persistent,
+            }],
+            Some(mir::Operand {
+                type_: class_type,
+                kind: mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(0))),
+            }),
+        )
+    }
+
+    fn descriptor_method(symbol: mir::SymbolId, owner: mir::SymbolId) -> mir::Function {
+        let mut function = descriptor_function(
+            symbol,
+            mir::Type::Int,
+            Vec::new(),
+            Vec::new(),
+            Some(fine_integer(7)),
+        );
+        function.owner = Some(owner);
+        function.parameters = vec![fine_local(0, mir::Type::Class(owner))];
+        function
+    }
+
+    fn descriptor_module() -> mir::Module {
+        let class = |symbol, name: &str, fields| mir::ClassDefinition {
+            symbol,
+            name: name.to_owned(),
+            fields,
+        };
+        let interface = |symbol, name: &str, method| mir::InterfaceDefinition {
+            symbol,
+            name: name.to_owned(),
+            methods: vec![mir::InterfaceMethodDefinition {
+                symbol: method,
+                name: name.to_owned(),
+                parameters: Vec::new(),
+                return_type: mir::Type::Int,
+            }],
+        };
+        mir::Module {
+            structs: Vec::new(),
+            classes: vec![
+                class(
+                    DESC_PLAIN,
+                    "Counter",
+                    vec![mir::FieldDefinition {
+                        symbol: DESC_FIELD,
+                        name: "score".to_owned(),
+                        type_: mir::Type::Int,
+                    }],
+                ),
+                class(DESC_EMPTY, "Empty", Vec::new()),
+                class(DESC_PAIR, "Both", Vec::new()),
+            ],
+            interfaces: vec![
+                interface(DESC_IFACE_A, "IA", DESC_METHOD_A),
+                interface(DESC_IFACE_B, "IB", DESC_METHOD_B),
+            ],
+            enums: Vec::new(),
+            interface_implementations: vec![
+                mir::InterfaceImplementation {
+                    class: DESC_PAIR,
+                    interface: DESC_IFACE_A,
+                    methods: vec![DESC_IMPL_A],
+                },
+                mir::InterfaceImplementation {
+                    class: DESC_PAIR,
+                    interface: DESC_IFACE_B,
+                    methods: vec![DESC_IMPL_B],
+                },
+            ],
+            foreign_functions: Vec::new(),
+            functions: vec![
+                descriptor_maker(mir::SymbolId(91_100), DESC_PLAIN),
+                descriptor_maker(mir::SymbolId(91_101), DESC_EMPTY),
+                descriptor_maker(mir::SymbolId(91_102), DESC_PAIR),
+                descriptor_method(DESC_IMPL_A, DESC_PAIR),
+                descriptor_method(DESC_IMPL_B, DESC_PAIR),
+            ],
+        }
+    }
+
+    /// Allocates one instance through generated code and returns its header
+    /// word reinterpreted as a class descriptor.
+    #[allow(unsafe_code, clippy::cast_ptr_alignment)]
+    fn allocate_and_read_header(
+        prepared: &PreparedProgram,
+        maker: mir::SymbolId,
+        context: &mut aster_runtime::ExecutionContext,
+    ) -> *const aster_runtime::ClassDescriptor {
+        let (pointer, _) = prepared.entries.get(&maker).expect("maker was prepared");
+        // SAFETY: the maker was finalized as `(ExecutionContext*) -> object*`
+        // and the object lives in the persistent region of `context`.
+        let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> *const u8 =
+            unsafe { std::mem::transmute(*pointer) };
+        let object = function(context);
+        assert!(!object.is_null(), "allocation produced an object");
+        // SAFETY: offset 0 of every class instance holds the descriptor word.
+        unsafe {
+            object
+                .cast::<*const aster_runtime::ClassDescriptor>()
+                .read()
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn fresh_objects_point_at_their_class_descriptor_with_size_and_identity() {
+        let module = descriptor_module();
+        crate::validate(&module).expect("descriptor module is valid");
+        let prepared = PreparedProgram::prepare(&module).expect("descriptor module prepares");
+        let mut context = aster_runtime::ExecutionContext::new();
+
+        let plain = allocate_and_read_header(&prepared, mir::SymbolId(91_100), &mut context);
+        let empty = allocate_and_read_header(&prepared, mir::SymbolId(91_101), &mut context);
+        let plain_again = allocate_and_read_header(&prepared, mir::SymbolId(91_100), &mut context);
+
+        assert_eq!(
+            plain as u64,
+            prepared
+                .descriptors
+                .address(DESC_PLAIN)
+                .expect("descriptor")
+        );
+        assert_eq!(
+            empty as u64,
+            prepared
+                .descriptors
+                .address(DESC_EMPTY)
+                .expect("descriptor")
+        );
+        assert_eq!(
+            plain, plain_again,
+            "instances of one class share a descriptor"
+        );
+        assert_ne!(plain, empty, "distinct classes have distinct descriptors");
+        // SAFETY: both descriptors are owned by `prepared`, which is alive.
+        let (plain, empty) = unsafe { (&*plain, &*empty) };
+        let header = crate::layouts::OBJECT_HEADER_BYTES;
+        assert_eq!(plain.object.size, (header + 4).next_multiple_of(8));
+        assert_eq!(empty.object.size, header.next_multiple_of(8));
+        #[cfg(not(any(feature = "mem-exp-h12", feature = "mem-exp-h16")))]
+        {
+            assert_eq!(plain.object.size, 16, "Counter with one int field");
+            assert_eq!(empty.object.size, 8, "empty class is exactly the header");
+        }
+        assert_eq!(plain.class_id, mir::type_key(&mir::Type::Class(DESC_PLAIN)));
+        assert_eq!(empty.class_id, mir::type_key(&mir::Type::Class(DESC_EMPTY)));
+        assert_ne!(plain.class_id, empty.class_id);
+        assert_eq!(plain.interface_count, 0);
+        assert!(plain.interfaces.is_null());
+        #[cfg(not(feature = "mem-exp-rc-core"))]
+        {
+            assert_eq!(plain.object.reference_count, 0);
+            assert!(plain.object.reference_offsets.is_null());
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code, clippy::cast_ptr_alignment)]
+    fn class_descriptor_lists_every_implemented_interface_with_its_table() {
+        let module = descriptor_module();
+        crate::validate(&module).expect("descriptor module is valid");
+        let prepared = PreparedProgram::prepare(&module).expect("descriptor module prepares");
+        let mut context = aster_runtime::ExecutionContext::new();
+
+        let both = allocate_and_read_header(&prepared, mir::SymbolId(91_102), &mut context);
+        // SAFETY: the descriptor is owned by `prepared`, which is alive.
+        let both = unsafe { &*both };
+        // SAFETY: the backend filled `interface_count` entries before running.
+        let entries = unsafe { both.interface_entries() };
+
+        assert_eq!(both.interface_count, 2);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].interface_id,
+            mir::type_key(&mir::Type::Interface(DESC_IFACE_A))
+        );
+        assert_eq!(
+            entries[1].interface_id,
+            mir::type_key(&mir::Type::Interface(DESC_IFACE_B))
+        );
+        assert_ne!(entries[0].interface_id, entries[1].interface_id);
+        for (entry, method) in entries.iter().zip([DESC_IMPL_A, DESC_IMPL_B]) {
+            assert!(!entry.table.is_null(), "table address was bound");
+            let method_address = prepared.entries[&method].0;
+            // SAFETY: a table is an array of method addresses in finalized data.
+            let slot0 = unsafe { entry.table.cast::<*const u8>().read() };
+            assert_eq!(slot0, method_address, "slot 0 is the implementing method");
+        }
+        assert_ne!(entries[0].table, entries[1].table);
     }
 }

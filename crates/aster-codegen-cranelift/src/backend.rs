@@ -50,7 +50,6 @@ impl Codegen {
             call_depth_guarded,
             runtime_fallible_functions,
             runtime_fallible_interface_methods,
-            #[cfg(feature = "mem-exp-rc-core")]
             descriptors: super::layouts::ObjectDescriptors::build(&layouts, module)?,
             layouts,
         };

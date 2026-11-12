@@ -87,22 +87,7 @@ pub static STRING_ELEMENT_DESCRIPTOR: ObjectDescriptor = ObjectDescriptor {
 #[cfg(debug_assertions)]
 const POISON: u8 = 0xDB;
 
-/// Immutable per-class metadata the descriptor word points to.
-#[repr(C)]
-pub struct ObjectDescriptor {
-    /// Allocation size of the object, header included.
-    pub size: u32,
-    /// Number of entries in `reference_offsets`.
-    pub reference_count: u32,
-    /// Byte offsets of the fields that hold strong class references.
-    pub reference_offsets: *const u32,
-}
-
-// SAFETY: a descriptor and its offset table are immutable after creation
-// (module data, or `static` in tests) and are only ever read, so sharing a
-// reference across threads cannot race.
-#[allow(unsafe_code)]
-unsafe impl Sync for ObjectDescriptor {}
+pub use crate::descriptor::ObjectDescriptor;
 
 /// Immutable `{ key, value }` pair of element descriptors a dictionary header
 /// points at (design section 11). Each side is null when its type has no

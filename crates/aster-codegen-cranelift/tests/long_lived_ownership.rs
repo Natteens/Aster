@@ -140,15 +140,14 @@ fn a_live_alias_prevents_the_overlapping_family_from_reclaiming() {
         ");
 
     assert_eq!(value, ExecutionValue::Int(1_000_000));
-    // One `int` field: an 8-byte allocation stride without a header, 16 with
-    // the 8- or 12-byte MEM-EXP-1 header, 24 with the 16-byte header. The
-    // bounds scale with the stride so each configuration keeps the same check.
+    // One `int` field behind the object header: a 16-byte allocation stride
+    // with the default 8-byte header (and the 12-byte experiment header), 24
+    // with the 16-byte experiment header. The bounds scale with the stride so
+    // each configuration keeps the same check.
     let stride: u64 = if cfg!(feature = "mem-exp-h16") {
         24
-    } else if cfg!(any(feature = "mem-exp-h8", feature = "mem-exp-h12")) {
-        16
     } else {
-        8
+        16
     };
     assert!(stats.used_bytes >= 4_000 * stride / 8);
     assert!(stats.used_bytes < 16_000 * stride / 8);
