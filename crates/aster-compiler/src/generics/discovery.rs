@@ -265,6 +265,7 @@ impl Monomorphizer {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // one exhaustive traversal of every expression form
     fn expression(
         &mut self,
         expression: &mut Expression,
@@ -301,6 +302,13 @@ impl Monomorphizer {
                     self.expression(&mut argument.value, environment);
                 }
                 type_name.clone().unwrap_or_default()
+            }
+            ExpressionKind::ObjectInitializer { creation, members } => {
+                let type_ = self.expression(creation, environment);
+                for member in members {
+                    self.expression(&mut member.value, environment);
+                }
+                type_
             }
             ExpressionKind::Index { array, index } => {
                 let array = self.expression(array, environment);
@@ -351,6 +359,10 @@ impl Monomorphizer {
                 self.expression(value, environment);
                 "bool".to_owned()
             }
+            ExpressionKind::TypeAs { value, target } => {
+                self.expression(value, environment);
+                self.type_as_result(&target.name, expression.span)
+            }
             ExpressionKind::Binary {
                 left,
                 operator,
@@ -370,6 +382,19 @@ impl Monomorphizer {
                 "string".to_owned()
             }
         }
+    }
+
+    /// `value as T` yields `Option<T>`: request that specialization exactly
+    /// like the `TryParse*` and `Dictionary.TryGet` results, and return its name.
+    fn type_as_result(&mut self, target: &str, span: aster_diagnostics::Span) -> String {
+        let option_base = format!("{}::Option", crate::standard_library::CORE_NAMESPACE);
+        let option_type = crate::standard_library::option_specialization_name(target);
+        if self.enum_templates.contains_key(&option_base)
+            && let Some(concrete) = TypeName::parse(&option_type)
+        {
+            self.instantiate_type(&concrete.base, &concrete.arguments, span);
+        }
+        option_type
     }
 
     fn conditional_expression(
@@ -742,6 +767,9 @@ impl Monomorphizer {
             }),
             ExpressionKind::This => environment.get("this").cloned().unwrap_or_default(),
             ExpressionKind::NewObject { type_name, .. } => type_name.clone().unwrap_or_default(),
+            ExpressionKind::ObjectInitializer { creation, .. } => {
+                self.infer_readonly(creation, environment)
+            }
             ExpressionKind::StructLiteral { type_name, .. } => type_name.clone(),
             _ => String::new(),
         }

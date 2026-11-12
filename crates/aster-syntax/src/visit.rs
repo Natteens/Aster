@@ -374,6 +374,12 @@ pub fn walk_expression_mut<V: AstVisitorMut + ?Sized>(
                 visitor.visit_expression_mut(&mut argument.value);
             }
         }
+        ExpressionKind::ObjectInitializer { creation, members } => {
+            visitor.visit_expression_mut(creation);
+            for member in members {
+                visitor.visit_expression_mut(&mut member.value);
+            }
+        }
         ExpressionKind::Index { array, index } => {
             visitor.visit_expression_mut(array);
             visitor.visit_expression_mut(index);
@@ -422,7 +428,8 @@ pub fn walk_expression_mut<V: AstVisitorMut + ?Sized>(
             visitor.visit_type_ref_mut(target);
             visitor.visit_expression_mut(operand);
         }
-        ExpressionKind::TypePattern { value, target, .. } => {
+        ExpressionKind::TypePattern { value, target, .. }
+        | ExpressionKind::TypeAs { value, target } => {
             visitor.visit_expression_mut(value);
             visitor.visit_type_ref_mut(target);
         }

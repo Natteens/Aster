@@ -527,6 +527,12 @@ fn rvalue_is_legal(value: &mir::Rvalue, candidate: &Candidate) -> bool {
         | mir::RvalueKind::ClassTest {
             object: operand, ..
         }
+        | mir::RvalueKind::InterfaceTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceLookup {
+            object: operand, ..
+        }
         | mir::RvalueKind::ArrayLength(operand)
         | mir::RvalueKind::ListLength(operand)
         | mir::RvalueKind::DictionaryLength(operand)
@@ -892,6 +898,12 @@ fn rewrite_rvalue(
         mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Discriminant(operand)
         | mir::RvalueKind::ClassTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceLookup {
             object: operand, ..
         }
         | mir::RvalueKind::ArrayLength(operand)

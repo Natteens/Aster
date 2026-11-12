@@ -66,12 +66,30 @@ mod inheritance_syntax {
     }
 
     #[test]
+    fn parses_this_delegation_with_arguments() {
+        let parsed =
+            module("class A { A(int x) : this(x, 2) {} A(int x, int y) {} }").expect("parses");
+        let Item::Class(a) = &parsed.items[0] else {
+            panic!()
+        };
+        let Member::Method(ctor) = &a.members[0] else {
+            panic!()
+        };
+        let call = ctor.base_call.as_ref().expect("this call");
+        assert!(call.delegates_to_this);
+        assert_eq!(call.arguments.len(), 2);
+    }
+
+    #[test]
     fn rejects_base_identifier_and_modifier_misuse() {
         for (source, expected) in [
             ("class A { int base; }", "`base` is a reserved word"),
             ("abstract sealed class A {}", "cannot be both"),
             ("abstract struct S {}", "valid only on a class"),
-            ("class A { A() : this() {} }", "constructor chaining"),
+            (
+                "class A { A() : this() : base() {} }",
+                "only one initializer",
+            ),
             (
                 "class A { sealed override int M() { return 1; } }",
                 "`sealed override` is not supported",

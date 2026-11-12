@@ -16,6 +16,15 @@ All fields must be named exactly once. Their order inside the literal does not m
 write fields with dot notation. Assignment and calls copy the whole value, so changing a copy
 does not change the original.
 
+A struct may declare auto-properties (`public int X { get; set; }`, `{ get; }`, `{ get; private set; }`).
+Each is a private backing field plus trivial accessors, lowered directly to the field, so it copies
+by value like any field. A struct literal names the property, not the backing field:
+`Position { X: 1, Y: 2 }`; every property must be named exactly once (a get-only property is
+initialized there, because a struct has no constructor; object initializers will widen this later).
+Struct auto-properties cannot have `= value` initializers yet, and a struct cannot declare explicit
+properties. `p.X = 5` writes the variable's field; a `get`-only or `init` property cannot be assigned
+after construction.
+
 Structs may contain other finite structs and executable scalar types. A recursive value such as
 `struct Node { public Node next; }` has no finite size and is rejected. `==` and `!=` compare fields
 recursively when every field is comparable. This is value equality; it does not compare padding.

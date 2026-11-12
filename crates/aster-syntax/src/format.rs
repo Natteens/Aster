@@ -741,7 +741,7 @@ impl<'a> Printer<'a> {
         let first = self.line_first[brace];
         let accessor = matches!(
             &self.atoms[previous].kind,
-            TokenKind::Identifier(name) if name == "get" || name == "set"
+            TokenKind::Identifier(name) if name == "get" || name == "set" || name == "init"
         );
         let declaration_start = matches!(
             self.kind(first),

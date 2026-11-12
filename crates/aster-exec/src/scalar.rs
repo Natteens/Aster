@@ -9,23 +9,23 @@
 //! `calls::scalar_to_bits`/`scalar_from_bits`), so the kind tag and the bit
 //! pattern together always name a fully concrete value.
 
-use super::{BackendError, ExecutionValue};
+use crate::{BackendError, ExecutionValue};
 
 // Kind tags shared by codegen (`calls::scalar_kind`) and the runtime ABI.
-pub(super) const BOOL: i32 = 0;
-pub(super) const SBYTE: i32 = 1;
-pub(super) const BYTE: i32 = 2;
-pub(super) const SHORT: i32 = 3;
-pub(super) const USHORT: i32 = 4;
-pub(super) const INT: i32 = 5;
-pub(super) const UINT: i32 = 6;
-pub(super) const LONG: i32 = 7;
-pub(super) const ULONG: i32 = 8;
-pub(super) const FLOAT: i32 = 9;
-pub(super) const DOUBLE: i32 = 10;
-pub(super) const CHAR: i32 = 11;
+pub const BOOL: i32 = 0;
+pub const SBYTE: i32 = 1;
+pub const BYTE: i32 = 2;
+pub const SHORT: i32 = 3;
+pub const USHORT: i32 = 4;
+pub const INT: i32 = 5;
+pub const UINT: i32 = 6;
+pub const LONG: i32 = 7;
+pub const ULONG: i32 = 8;
+pub const FLOAT: i32 = 9;
+pub const DOUBLE: i32 = 10;
+pub const CHAR: i32 = 11;
 
-pub(super) fn byte_width(kind: i32) -> Result<usize, BackendError> {
+pub fn byte_width(kind: i32) -> Result<usize, BackendError> {
     match kind {
         BOOL | SBYTE | BYTE => Ok(1),
         SHORT | USHORT => Ok(2),
@@ -37,7 +37,7 @@ pub(super) fn byte_width(kind: i32) -> Result<usize, BackendError> {
 
 /// The 64-bit carrier for `value`'s raw bits (zero-extended for narrow
 /// integers, IEEE bit pattern for floats).
-pub(super) fn to_bits(value: &ExecutionValue) -> i64 {
+pub fn to_bits(value: &ExecutionValue) -> i64 {
     let bits: u64 = match value {
         ExecutionValue::Bool(value) => u64::from(*value),
         ExecutionValue::SByte(value) => u64::from(u8::from_ne_bytes(value.to_ne_bytes())),
@@ -60,7 +60,7 @@ pub(super) fn to_bits(value: &ExecutionValue) -> i64 {
 /// invalid Unicode scalar values are controlled ABI errors, never silently
 /// reinterpreted as another type.
 #[allow(clippy::cast_possible_truncation)]
-pub(super) fn from_bits(kind: i32, bits: i64) -> Result<ExecutionValue, BackendError> {
+pub fn from_bits(kind: i32, bits: i64) -> Result<ExecutionValue, BackendError> {
     let bits = u64::from_ne_bytes(bits.to_ne_bytes());
     Ok(match kind {
         BOOL => ExecutionValue::Bool(bits != 0),

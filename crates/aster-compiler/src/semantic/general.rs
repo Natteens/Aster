@@ -10,8 +10,8 @@ use crate::primitives::{
 use aster_syntax::{
     Argument, AssignmentOperator, BinaryOperator, Block, Expression, ExpressionKind, Field,
     FunctionDeclaration, IncrementOperator, InterpolatedPart, Item, Literal, Member,
-    MemberDispatch, Module, Property, Statement, TypeDeclaration, TypeRef, UnaryOperator,
-    VariableDeclaration, VariableKind, Visibility,
+    MemberDispatch, MemberInitializer, Module, Property, Statement, TypeDeclaration, TypeRef,
+    UnaryOperator, VariableDeclaration, VariableKind, Visibility,
 };
 
 use super::{
@@ -19,7 +19,7 @@ use super::{
     ResolvedBaseConstructor, ResolvedCall, ResolvedDefaultArgument, ResolvedDictionaryOperation,
     ResolvedEnumCase, ResolvedParallelFor, ResolvedParallelForEach, ResolvedParallelReduce,
     ResolvedPropagation, ResolvedPropertyAssignment, ResolvedStringBuilderOperation,
-    ResolvedTaskRun, ThisSummary, callable_key,
+    ResolvedTaskRun, ResolvedTypeAs, ThisSummary, callable_key,
 };
 use crate::type_names::TypeName;
 
@@ -83,6 +83,43 @@ struct PropertyInfo {
     type_: Type,
     getter: Option<Callable>,
     setter: Option<Callable>,
+    /// The class or struct that declares the property.
+    declared_in: String,
+    /// The synthesized private backing field when this is an auto-property
+    /// (LANG-005); its accessors are trivial reads and writes of that field.
+    auto_backing: Option<String>,
+    /// The setter is an `init` accessor: callable only while the object is
+    /// under construction.
+    init_only: bool,
+}
+
+impl PropertyInfo {
+    /// Whether any accessor dispatches dynamically (`virtual`, `override`,
+    /// `abstract`); such an access must keep calling the accessor.
+    fn is_virtual(&self) -> bool {
+        self.getter
+            .iter()
+            .chain(self.setter.iter())
+            .any(|accessor| accessor.dispatch != MemberDispatch::None)
+    }
+
+    /// The backing field a use of this property may be lowered to directly:
+    /// an auto-property whose accessors are statically bound.
+    fn direct_backing(&self) -> Option<&str> {
+        self.auto_backing.as_deref().filter(|_| !self.is_virtual())
+    }
+}
+
+/// How a diagnostic names a field: a synthesized auto-property backing field
+/// is reported as its property, since the field name is not writable source.
+fn field_display(field: &str) -> String {
+    field
+        .strip_prefix('<')
+        .and_then(|name| name.strip_suffix(">k__BackingField"))
+        .map_or_else(
+            || format!("field `{field}`"),
+            |property| format!("auto-property `{property}`"),
+        )
 }
 
 #[derive(Clone, Debug, Default)]
@@ -93,8 +130,9 @@ struct TypeInfo {
     field_visibility: HashMap<String, Visibility>,
     methods: HashMap<String, Vec<Callable>>,
     properties: HashMap<String, PropertyInfo>,
-    constructor: Option<Callable>,
-    constructor_visibility: Option<Visibility>,
+    /// Every declared constructor (B2 overloads), in source order. Empty for
+    /// a class without one.
+    constructors: Vec<Callable>,
     /// Interfaces the class lists itself followed by every interface its base
     /// chain implements (a derived class may not list one again).
     implemented_interfaces: Vec<String>,
@@ -200,6 +238,8 @@ struct Analyzer<'a> {
     /// Analyzing the `base(...)` arguments of a constructor, where the object
     /// is not usable yet.
     base_arguments: bool,
+    /// `"base"` or `"this"`: which initializer `base_arguments` belongs to.
+    chain_label: &'static str,
     /// Analyzing a member reached through `base`: a static call to the base
     /// implementation, never dispatched dynamically.
     base_access: bool,
@@ -261,6 +301,7 @@ impl<'a> Analyzer<'a> {
             this_usage: (instance_context && owner_is_class)
                 .then(this_confinement::ThisUsage::default),
             base_arguments: false,
+            chain_label: "base",
             base_access: false,
         }
     }

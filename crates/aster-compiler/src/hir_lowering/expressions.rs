@@ -146,6 +146,28 @@ impl Lowerer<'_> {
             return self.expression(&explicit);
         }
         match &expression.kind {
+            ast::ExpressionKind::ObjectInitializer { creation, members } => {
+                let object = self.expression(creation);
+                let receiver = self.allocate();
+                self.symbol_types.insert(receiver, object.type_.clone());
+                self.scopes.push(std::collections::HashMap::from([(
+                    crate::semantic::INITIALIZER_RECEIVER.to_owned(),
+                    receiver,
+                )]));
+                let assignments = members
+                    .iter()
+                    .map(|member| self.expression(&crate::semantic::initializer_assignment(member)))
+                    .collect();
+                self.scopes.pop();
+                hir::Expression {
+                    type_: object.type_.clone(),
+                    kind: hir::ExpressionKind::ObjectInitializer {
+                        object: Box::new(object),
+                        receiver,
+                        assignments,
+                    },
+                }
+            }
             ast::ExpressionKind::Literal(literal) => {
                 let (literal, type_) = literal_value(literal);
                 hir::Expression {
@@ -154,6 +176,18 @@ impl Lowerer<'_> {
                 }
             }
             ast::ExpressionKind::Name(name) => {
+                if let Some(backing) = self.model.auto_property_fields.get(&model_key) {
+                    let receiver = self
+                        .current_receiver
+                        .expect("validated auto-property access has a receiver");
+                    return self.auto_property_field(
+                        hir::Expression {
+                            type_: self.symbol_types[&receiver].clone(),
+                            kind: hir::ExpressionKind::Symbol(receiver),
+                        },
+                        backing,
+                    );
+                }
                 if let Some(key) = self.model.property_reads.get(&model_key) {
                     let getter = self.callable_symbols[key];
                     let receiver = self
@@ -240,7 +274,12 @@ impl Lowerer<'_> {
                 let fields = fields
                     .iter()
                     .map(|field| {
-                        let field_symbol = self.members[&struct_symbol][&field.name];
+                        // A literal may name an auto-property; it initializes
+                        // the property's backing field.
+                        let members = &self.members[&struct_symbol];
+                        let field_symbol = members.get(&field.name).copied().unwrap_or_else(|| {
+                            members[&ast::auto_property_backing_field(&field.name)]
+                        });
                         let target = self.symbol_types[&field_symbol].clone();
                         let value = convert(self.expression(&field.value), &target);
                         hir::FieldValue {
@@ -461,6 +500,9 @@ impl Lowerer<'_> {
                             class_symbol,
                         },
                     };
+                }
+                if let Some(backing) = self.model.auto_property_fields.get(&model_key) {
+                    return self.auto_property_field(object, backing);
                 }
                 if let Some(key) = self.model.property_reads.get(&model_key) {
                     return self.property_get(object, self.callable_symbols[key]);
@@ -1461,9 +1503,6 @@ impl Lowerer<'_> {
             } => {
                 let value = self.expression(value);
                 let target_type = self.resolve_type(target);
-                let hir::Type::Class(class) = target_type else {
-                    unreachable!("semantic analysis accepts only class pattern targets")
-                };
                 let binding = binding.as_ref().map(|binding| {
                     let symbol = self.allocate();
                     self.symbol_types.insert(symbol, target_type.clone());
@@ -1480,12 +1519,62 @@ impl Lowerer<'_> {
                         initializer: None,
                     })
                 });
+                Self::runtime_type_test(value, &target_type, binding)
+            }
+            ast::ExpressionKind::TypeAs { value, target } => {
+                let resolved = self.model.type_as[&model_key].clone();
+                let value = self.expression(value);
+                let target_type = self.resolve_type(target);
+                let option_symbol = self.types[&resolved.option_type];
+                let (some_case, some_fields) =
+                    self.enum_cases[&(resolved.option_type.clone(), resolved.some_index)].clone();
+                let (none_case, _) =
+                    self.enum_cases[&(resolved.option_type.clone(), resolved.none_index)].clone();
+                // `value as T` is `value is T t ? Some(t) : None` over a
+                // compiler-introduced binding.
+                let symbol = self.allocate();
+                self.symbol_types.insert(symbol, target_type.clone());
+                let binding = Box::new(hir::Variable {
+                    symbol,
+                    name: format!("<as#{}>", symbol.0),
+                    visibility: None,
+                    type_: target_type.clone(),
+                    mutable: true,
+                    initializer: None,
+                });
+                let option_type = hir::Type::Enum(option_symbol);
                 hir::Expression {
-                    type_: hir::Type::Bool,
-                    kind: hir::ExpressionKind::ClassTest {
-                        value: Box::new(value),
-                        class,
-                        binding,
+                    type_: option_type.clone(),
+                    kind: hir::ExpressionKind::Conditional {
+                        condition: Box::new(Self::runtime_type_test(
+                            value,
+                            &target_type,
+                            Some(binding),
+                        )),
+                        when_true: Box::new(hir::Expression {
+                            type_: option_type.clone(),
+                            kind: hir::ExpressionKind::EnumValue {
+                                enum_symbol: option_symbol,
+                                case: some_case,
+                                tag: tag(resolved.some_index),
+                                fields: vec![hir::FieldValue {
+                                    field: some_fields[0],
+                                    value: hir::Expression {
+                                        type_: target_type.clone(),
+                                        kind: hir::ExpressionKind::Symbol(symbol),
+                                    },
+                                }],
+                            },
+                        }),
+                        when_false: Box::new(hir::Expression {
+                            type_: option_type,
+                            kind: hir::ExpressionKind::EnumValue {
+                                enum_symbol: option_symbol,
+                                case: none_case,
+                                tag: tag(resolved.none_index),
+                                fields: Vec::new(),
+                            },
+                        }),
                     },
                 }
             }
@@ -1520,6 +1609,53 @@ impl Lowerer<'_> {
                     kind: hir::ExpressionKind::InterpolatedString { parts },
                 }
             }
+        }
+    }
+
+    /// A read or write of an auto-property's synthesized backing field: the
+    /// accessor call is skipped, so MIR sees an ordinary field access. The
+    /// field is found through the base chain (a derived class reaches the
+    /// base's private backing field through an identity upcast).
+    fn auto_property_field(&self, object: hir::Expression, backing: &str) -> hir::Expression {
+        let (hir::Type::User(owner) | hir::Type::Class(owner)) = object.type_ else {
+            unreachable!("validated auto-property access has a class or struct receiver")
+        };
+        let symbol = self
+            .lookup_member(owner, backing)
+            .expect("an auto-property declares its backing field");
+        let object = self.upcast_receiver(object, symbol);
+        hir::Expression {
+            type_: self.symbol_types[&symbol].clone(),
+            kind: hir::ExpressionKind::Member {
+                object: Box::new(object),
+                symbol,
+            },
+        }
+    }
+
+    /// The `bool` run-time test of `value` against a class or an interface
+    /// target, with the optional binding of the narrowed value.
+    fn runtime_type_test(
+        value: hir::Expression,
+        target_type: &hir::Type,
+        binding: Option<Box<hir::Variable>>,
+    ) -> hir::Expression {
+        let kind = match target_type {
+            hir::Type::Class(class) => hir::ExpressionKind::ClassTest {
+                value: Box::new(value),
+                class: *class,
+                binding,
+            },
+            hir::Type::Interface(interface) => hir::ExpressionKind::InterfaceTest {
+                value: Box::new(value),
+                interface: *interface,
+                binding,
+            },
+            _ => unreachable!("semantic analysis accepts only class and interface targets"),
+        };
+        hir::Expression {
+            type_: hir::Type::Bool,
+            kind,
         }
     }
 

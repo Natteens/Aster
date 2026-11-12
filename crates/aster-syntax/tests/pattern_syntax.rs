@@ -144,3 +144,38 @@ fn the_formatter_keeps_patterns_and_guards_stable() {
     assert!(formatted.contains("case 1 when n > 0:"), "{formatted}");
     assert_eq!(format_source(&formatted).expect("formats again"), formatted);
 }
+
+#[test]
+fn parses_a_checked_downcast_with_as() {
+    let cast = returned("public bool F(Shape s) { return s as Circle; }");
+    let ExpressionKind::TypeAs { value, target } = cast.kind else {
+        panic!("expected a type `as` expression")
+    };
+    assert!(matches!(value.kind, ExpressionKind::Name(ref name) if name == "s"));
+    assert_eq!(target.name, "Circle");
+}
+
+#[test]
+fn as_binds_like_is_and_is_not_a_keyword() {
+    let tokens = lex("as").expect("lexes");
+    assert!(matches!(&tokens[0].kind, TokenKind::Identifier(name) if name == "as"));
+    // Looser than arithmetic, tighter than `&&`: the left operand of `&&` is the `as`.
+    let expression =
+        returned("public bool F(Shape s, bool b) { return s as Circle != null && b; }");
+    assert!(matches!(
+        expression.kind,
+        ExpressionKind::Binary {
+            operator: BinaryOperator::LogicalAnd,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn the_formatter_keeps_as_expressions_stable() {
+    use aster_syntax::format::format_source;
+    let source = "public int F(Shape s)\n{\n    var o = s  as   Circle;\n    return 0;\n}\n";
+    let formatted = format_source(source).expect("formats");
+    assert!(formatted.contains("s as Circle"), "{formatted}");
+    assert_eq!(format_source(&formatted).expect("formats again"), formatted);
+}

@@ -1256,6 +1256,12 @@ fn rvalue_mentions_fine_owned(value: &mir::Rvalue, owned: &BTreeMap<u32, FineOwn
         | mir::RvalueKind::ClassTest {
             object: operand, ..
         }
+        | mir::RvalueKind::InterfaceTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceLookup {
+            object: operand, ..
+        }
         | mir::RvalueKind::ArrayLength(operand)
         | mir::RvalueKind::ListLength(operand)
         | mir::RvalueKind::DictionaryLength(operand)
@@ -1380,6 +1386,8 @@ fn is_execution_safe_rvalue(value: &mir::Rvalue) -> bool {
         | mir::RvalueKind::EnumConstruct { .. }
         | mir::RvalueKind::Discriminant(_)
         | mir::RvalueKind::ClassTest { .. }
+        | mir::RvalueKind::InterfaceTest { .. }
+        | mir::RvalueKind::InterfaceLookup { .. }
         | mir::RvalueKind::ListLength(_)
         | mir::RvalueKind::DictionaryLength(_)
         | mir::RvalueKind::ListVersion(_)
@@ -1477,6 +1485,12 @@ fn rvalue_contains_type(value: &mir::Rvalue, predicate: fn(&mir::Type) -> bool) 
             mir::RvalueKind::Use(operand)
             | mir::RvalueKind::Discriminant(operand)
             | mir::RvalueKind::ClassTest {
+                object: operand, ..
+            }
+            | mir::RvalueKind::InterfaceTest {
+                object: operand, ..
+            }
+            | mir::RvalueKind::InterfaceLookup {
                 object: operand, ..
             }
             | mir::RvalueKind::ArrayLength(operand)

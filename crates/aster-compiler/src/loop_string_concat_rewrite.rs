@@ -351,6 +351,12 @@ fn rvalue_uses_local(value: &mir::Rvalue, local: mir::LocalId) -> bool {
         | mir::RvalueKind::ClassTest {
             object: operand, ..
         }
+        | mir::RvalueKind::InterfaceTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceLookup {
+            object: operand, ..
+        }
         | mir::RvalueKind::ArrayLength(operand)
         | mir::RvalueKind::ListLength(operand)
         | mir::RvalueKind::DictionaryLength(operand)

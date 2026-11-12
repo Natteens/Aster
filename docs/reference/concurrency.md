@@ -101,6 +101,20 @@ combined with `combine` left to right in chunk order. An empty array returns `id
 calling `accumulate` or `combine`. The worker count only affects scheduling. Because every chunk
 starts from `identity`, `identity` should be neutral for `combine`.
 
+## Scheduling behavior
+
+These are implementation notes; scheduling order is not part of the language contract.
+
+- A task without a suspension point runs to completion on one thread and is never preempted.
+- Each worker serves its own queue first and yields its thread to the shared injection queue after
+  64 consecutive tasks when work is waiting there, so new work cannot be starved.
+- `task.Wait()` and `Task.WaitAll` on the main thread block it and run nothing else. A worker
+  thread blocked in a wait may run other queued tasks instead of idling, nesting at most 4 deep;
+  beyond that it blocks (no program can wait inside a task yet: nested tasks remain rejected). Results and failure selection are unchanged
+  (`WaitAll` order, lowest-index failure).
+- There is no work stealing and there are no compensation threads in this version; whether they
+  are needed is decided by measurement (CONC-EXP-2). Nested `Task.Run` inside tasks remains rejected.
+
 ## Isolation and deliberate limits
 
 Every worker has its own `ExecutionContext`, arenas, allocation limit, task-control view, and

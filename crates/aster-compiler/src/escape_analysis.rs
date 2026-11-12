@@ -1033,6 +1033,7 @@ fn assignment_escape(
             }
         }
         mir::RvalueKind::MakeInterface { object, .. }
+        | mir::RvalueKind::InterfaceLookup { object, .. }
             if direct_alias(object, aliases).is_some() =>
         {
             Some(EscapeReason::InterfaceConversion)
@@ -1059,7 +1060,10 @@ fn assignment_escape(
         // an enum type was tracked at all (see `is_tracked_reference_type`).
         mir::RvalueKind::Discriminant(operand) if direct_alias(operand, aliases).is_some() => None,
         // A class test only reads the object's header descriptor.
-        mir::RvalueKind::ClassTest { object, .. } if direct_alias(object, aliases).is_some() => {
+        mir::RvalueKind::ClassTest { object, .. }
+        | mir::RvalueKind::InterfaceTest { object, .. }
+            if direct_alias(object, aliases).is_some() =>
+        {
             None
         }
         mir::RvalueKind::Equality { .. } => None,
@@ -1073,6 +1077,12 @@ fn rvalue_uses_alias(value: &mir::Rvalue, aliases: &HashSet<mir::LocalId>) -> bo
         mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Discriminant(operand)
         | mir::RvalueKind::ClassTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceLookup {
             object: operand, ..
         }
         | mir::RvalueKind::ArrayLength(operand)

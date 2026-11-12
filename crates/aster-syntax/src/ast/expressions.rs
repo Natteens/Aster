@@ -54,6 +54,13 @@ pub enum ExpressionKind {
         type_name: Option<String>,
         arguments: Vec<Argument>,
     },
+    /// `new T(args) { A = e1, B = e2 }`: the construction `creation` (always a
+    /// `NewObject`) followed by member assignments in source order. The
+    /// object is not observable until every assignment has completed.
+    ObjectInitializer {
+        creation: Box<Expression>,
+        members: Vec<MemberInitializer>,
+    },
     Index {
         array: Box<Expression>,
         index: Box<Expression>,
@@ -108,6 +115,14 @@ pub enum ExpressionKind {
         target: Box<super::TypeRef>,
         binding: Option<Box<PatternBinding>>,
     },
+    /// Checked narrowing: `value as Type`. Yields an `Option<Type>` that is
+    /// `Some` where the run-time type of `value` matches `Type` and `None`
+    /// otherwise.
+    TypeAs {
+        value: Box<Expression>,
+        // Boxed like `TypePattern::target` to keep `Expression` small.
+        target: Box<super::TypeRef>,
+    },
     /// Explicit conversion: `(type)expression`.
     Cast {
         target: super::TypeRef,
@@ -156,6 +171,15 @@ pub enum InterpolatedPart {
     Text(String),
     /// An embedded expression, parsed with the ordinary expression grammar.
     Expression(Expression),
+}
+
+/// One `Name = value` entry of an object initializer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemberInitializer {
+    pub name: String,
+    pub name_span: Span,
+    pub value: Expression,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq)]

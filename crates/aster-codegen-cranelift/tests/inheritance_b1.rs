@@ -737,10 +737,11 @@ fn n15_base_calls_are_only_valid_in_a_constructor_of_a_derived_class() {
           public class B : A { public B() : base() {} }",
         "constructor of base class `A` is private",
     );
-    // `this(...)` chaining is a separate record.
+    // `this(...)` chaining is B2 (`constructor_overloads.rs`); a constructor
+    // that delegates to itself is a cycle.
     rejects(
-        "public class A { public A() {} public A(int x) : this() {} }",
-        "constructor chaining is not supported yet",
+        "public class A { public A() : this() {} }",
+        "in a cycle through `this(...)`",
     );
     // `this` in the base arguments: the object is not usable yet.
     rejects(

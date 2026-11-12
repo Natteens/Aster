@@ -3,7 +3,7 @@
 //! ```text
 //! TaskRuntime
 //! ├── ExecutionPool     (crate::worker_pool; runs Task.Run and Parallel chunks)
-//! ├── driver            (a host-only PreparedProgram that runs MoveNext steps)
+//! ├── driver            (the pool's ExecutableProgram, which runs MoveNext steps)
 //! ├── completion queue  (Arc<CompletionQueue>; workers signal awaited inners)
 //! ├── plain task entries (keyed by a stable, opaque TaskHandleId)
 //! └── async task entries (the two-state machines behind async functions)
@@ -15,7 +15,7 @@
 //! ## Populations and borrow discipline
 //!
 //! One finalized program serves the whole execution: the program that runs
-//! `Main` (in `execution`) is shared as a `SharedProgram`, adopted by the pool,
+//! `Main` (in the code provider's crate) is shared as an `ExecutableProgram`, adopted by the pool,
 //! run by every worker thread, and is also the `driver` here that runs every
 //! `MoveNext`. `MoveNext` runs only on the host, only through `driver`; workers
 //! only run `Task.Run` and `Parallel` chunks and never touch this runtime.
@@ -29,14 +29,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use super::completion_queue::{CompletionQueue, CompletionToken};
-use super::execution::{PreparedProgram, SharedProgram};
-use super::worker_pool::{
+use crate::completion_queue::{CompletionQueue, CompletionToken};
+use crate::worker_pool::{
     AsyncInnerPhaseGate, AsyncMemoryDomain, ChunkOutcome, ExecutionPool, JobKind,
     ParallelMemoryBudget, ReduceChunkOutcome, TaskControl, TaskHandle, TaskMemoryDomain,
     TaskOutcome, TaskPayload,
 };
-use super::{BackendError, ExecutionValue, MemoryStats, mir, scalar};
+use crate::{BackendError, CodeProvider, ExecutableProgram, ExecutionValue, mir, scalar};
+use aster_runtime::MemoryStats;
 
 /// Host-side record of one deterministic governed Parallel budget plan.
 #[cfg(feature = "aarm-telemetry")]
@@ -118,14 +118,14 @@ struct AsyncMemoryDomainPlan {
 /// Never an arena pointer, never reused; generated code only ever holds the
 /// bare integer, never dereferences it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) struct TaskHandleId(u64);
+pub struct TaskHandleId(u64);
 
 impl TaskHandleId {
-    pub(super) fn to_bits(self) -> i64 {
+    pub fn to_bits(self) -> i64 {
         i64::from_ne_bytes(self.0.to_ne_bytes())
     }
 
-    pub(super) fn from_bits(bits: i64) -> Self {
+    pub fn from_bits(bits: i64) -> Self {
         Self(u64::from_ne_bytes(bits.to_ne_bytes()))
     }
 }
@@ -167,12 +167,12 @@ struct AsyncTask {
 /// Owns one [`ExecutionPool`], the async driver, the completion queue, and
 /// every task entry for the lifetime of one top-level execution. Dropping it
 /// shuts the pool and completion queue down and releases every entry.
-pub(super) struct TaskRuntime {
+pub struct TaskRuntime {
     pool: ExecutionPool,
     /// The pool's shared program, used on the host for `MoveNext` steps.
     /// `Option` so the pump can take exclusive ownership across a step without
     /// holding a runtime borrow; taking it also rejects nested pumping.
-    driver: Option<Arc<SharedProgram>>,
+    driver: Option<Arc<dyn ExecutableProgram>>,
     completion: Arc<CompletionQueue>,
     entries: HashMap<TaskHandleId, TaskEntry>,
     async_tasks: HashMap<TaskHandleId, AsyncTask>,
@@ -203,7 +203,7 @@ pub(super) struct TaskRuntime {
 /// stack-bounded runtime contract.
 struct DriverRestore {
     runtime: *mut TaskRuntime,
-    driver: Option<Arc<SharedProgram>>,
+    driver: Option<Arc<dyn ExecutableProgram>>,
 }
 
 impl Drop for DriverRestore {
@@ -225,11 +225,13 @@ impl TaskRuntime {
     // Production paths share their program through `with_program`; these
     // prepare their own and remain for tests and research entry points.
     #[cfg_attr(not(any(test, feature = "aarm-telemetry")), allow(dead_code))]
-    pub(super) fn new(
+    pub fn new(
+        provider: &Arc<dyn CodeProvider>,
         module: &Arc<mir::Module>,
         worker_count: usize,
     ) -> Result<Self, BackendError> {
         Self::new_with_foreign_registry(
+            provider,
             module,
             worker_count,
             &Arc::new(aster_runtime::ForeignRegistry::new()),
@@ -239,12 +241,14 @@ impl TaskRuntime {
     // Production paths share their program through `with_program`; these
     // prepare their own and remain for tests and research entry points.
     #[cfg_attr(not(any(test, feature = "aarm-telemetry")), allow(dead_code))]
-    pub(super) fn new_with_foreign_registry(
+    pub fn new_with_foreign_registry(
+        provider: &Arc<dyn CodeProvider>,
         module: &Arc<mir::Module>,
         worker_count: usize,
         foreign_registry: &Arc<aster_runtime::ForeignRegistry>,
     ) -> Result<Self, BackendError> {
         Self::with_governors(
+            provider,
             module,
             worker_count,
             None,
@@ -258,13 +262,15 @@ impl TaskRuntime {
     /// Runtime whose pool and async driver reuse `program`, the caller's
     /// already finalized program for the same module and foreign registry, so
     /// one execution compiles the module once.
-    pub(super) fn with_program(
+    pub fn with_program(
+        provider: &Arc<dyn CodeProvider>,
         module: &Arc<mir::Module>,
         worker_count: usize,
         foreign_registry: &Arc<aster_runtime::ForeignRegistry>,
-        program: Arc<SharedProgram>,
+        program: Arc<dyn ExecutableProgram>,
     ) -> Result<Self, BackendError> {
         Self::with_governors(
+            provider,
             module,
             worker_count,
             None,
@@ -275,16 +281,19 @@ impl TaskRuntime {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn with_governors(
+        provider: &Arc<dyn CodeProvider>,
         module: &Arc<mir::Module>,
         worker_count: usize,
         parallel_governor: Option<Arc<aster_runtime::MemoryGovernor>>,
         task_governor: Option<Arc<aster_runtime::MemoryGovernor>>,
         async_governor: Option<Arc<aster_runtime::MemoryGovernor>>,
         foreign_registry: &Arc<aster_runtime::ForeignRegistry>,
-        program: Option<Arc<SharedProgram>>,
+        program: Option<Arc<dyn ExecutableProgram>>,
     ) -> Result<Self, BackendError> {
         let pool = ExecutionPool::new_with_foreign_registry(
+            Arc::clone(provider),
             Arc::clone(module),
             worker_count,
             Arc::clone(foreign_registry),
@@ -326,12 +335,14 @@ impl TaskRuntime {
     }
 
     #[cfg(feature = "aarm-telemetry")]
-    pub(super) fn with_memory_governor(
+    pub fn with_memory_governor(
+        provider: &Arc<dyn CodeProvider>,
         module: &Arc<mir::Module>,
         worker_count: usize,
         governor: Arc<aster_runtime::MemoryGovernor>,
     ) -> Result<Self, BackendError> {
         Self::with_governors(
+            provider,
             module,
             worker_count,
             Some(governor),
@@ -343,12 +354,14 @@ impl TaskRuntime {
     }
 
     #[cfg(feature = "aarm-telemetry")]
-    pub(super) fn with_task_memory_governor(
+    pub fn with_task_memory_governor(
+        provider: &Arc<dyn CodeProvider>,
         module: &Arc<mir::Module>,
         worker_count: usize,
         governor: Arc<aster_runtime::MemoryGovernor>,
     ) -> Result<Self, BackendError> {
         Self::with_governors(
+            provider,
             module,
             worker_count,
             None,
@@ -360,12 +373,14 @@ impl TaskRuntime {
     }
 
     #[cfg(feature = "aarm-telemetry")]
-    pub(super) fn with_async_memory_governor(
+    pub fn with_async_memory_governor(
+        provider: &Arc<dyn CodeProvider>,
         module: &Arc<mir::Module>,
         worker_count: usize,
         governor: Arc<aster_runtime::MemoryGovernor>,
     ) -> Result<Self, BackendError> {
         Self::with_governors(
+            provider,
             module,
             worker_count,
             None,
@@ -377,17 +392,17 @@ impl TaskRuntime {
     }
 
     #[cfg(feature = "aarm-telemetry")]
-    pub(super) fn parallel_plans(&self) -> &[AarmParallelPlanningTelemetry] {
+    pub fn parallel_plans(&self) -> &[AarmParallelPlanningTelemetry] {
         &self.parallel_plans
     }
 
     #[cfg(feature = "aarm-telemetry")]
-    pub(super) fn parallel_snapshots(&self) -> &[aster_runtime::AarmMemoryTelemetry] {
+    pub fn parallel_snapshots(&self) -> &[aster_runtime::AarmMemoryTelemetry] {
         &self.parallel_snapshots
     }
 
     #[cfg(feature = "aarm-telemetry")]
-    pub(super) fn task_domain_telemetry(&self) -> Option<AarmTaskMemoryDomainTelemetry> {
+    pub fn task_domain_telemetry(&self) -> Option<AarmTaskMemoryDomainTelemetry> {
         let mut telemetry = self.task_domain_telemetry?;
         let counters = self.task_memory_domain.as_ref()?.counters();
         telemetry.task_submissions = counters.submissions;
@@ -400,7 +415,7 @@ impl TaskRuntime {
     }
 
     #[cfg(feature = "aarm-telemetry")]
-    pub(super) fn async_domain_telemetry(&self) -> Option<AarmAsyncMemoryDomainTelemetry> {
+    pub fn async_domain_telemetry(&self) -> Option<AarmAsyncMemoryDomainTelemetry> {
         let mut telemetry = self.async_domain_telemetry?;
         let counters = self.async_memory_domain.as_ref()?.counters();
         telemetry.async_handles_created = self.async_handles_created;
@@ -421,7 +436,7 @@ impl TaskRuntime {
     }
 
     #[cfg(feature = "aarm-telemetry")]
-    pub(super) fn quiesce_workers(&self) {
+    pub fn quiesce_workers(&self) {
         self.pool.shutdown();
     }
 
@@ -447,11 +462,11 @@ impl TaskRuntime {
 
     /// `Task.Run(function, arguments...)`: submit one plain task and return its handle.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) fn run(&mut self, symbol: mir::SymbolId) -> Result<TaskHandleId, BackendError> {
+    pub fn run(&mut self, symbol: mir::SymbolId) -> Result<TaskHandleId, BackendError> {
         self.submit_plain_task(symbol, TaskPayload::default(), None)
     }
 
-    pub(super) fn run_from_context(
+    pub fn run_from_context(
         &mut self,
         symbol: mir::SymbolId,
         main_context: &mut aster_runtime::ExecutionContext,
@@ -464,7 +479,7 @@ impl TaskRuntime {
         self.submit_plain_task(symbol, TaskPayload::default(), memory_domain)
     }
 
-    pub(super) fn run_with_payload_from_context(
+    pub fn run_with_payload_from_context(
         &mut self,
         symbol: mir::SymbolId,
         payload: TaskPayload,
@@ -496,7 +511,7 @@ impl TaskRuntime {
         Ok(id)
     }
 
-    pub(super) fn cancel(&self, id: TaskHandleId) -> Result<bool, BackendError> {
+    pub fn cancel(&self, id: TaskHandleId) -> Result<bool, BackendError> {
         if let Some(entry) = self.entries.get(&id) {
             return Ok(match entry {
                 TaskEntry::Pending(handle) => handle.cancel(),
@@ -655,18 +670,23 @@ impl TaskRuntime {
         Ok(domain)
     }
 
-    pub(super) fn is_async_handle(&self, id: TaskHandleId) -> bool {
+    pub fn is_async_handle(&self, id: TaskHandleId) -> bool {
         self.async_tasks.contains_key(&id)
     }
 
     /// `task.Wait()` for a plain task: join once, cache, replay on every call.
-    pub(super) fn wait(&mut self, id: TaskHandleId) -> Result<TaskOutcome, BackendError> {
+    pub fn wait(&mut self, id: TaskHandleId) -> Result<TaskOutcome, BackendError> {
         let entry = self
             .entries
             .remove(&id)
             .ok_or_else(|| BackendError::new("Task<T>.Wait received an unknown task handle"))?;
         let result = match entry {
             TaskEntry::Resolved(result) => result,
+            // Master plan §8.4: only a worker thread may run other domains' work
+            // while it waits; the main thread blocks and runs nothing else.
+            TaskEntry::Pending(handle) if self.pool.on_worker_thread() => {
+                self.pool.join_helping(handle)
+            }
             TaskEntry::Pending(handle) => handle.join(),
         };
         self.entries.insert(id, TaskEntry::Resolved(result.clone()));
@@ -677,7 +697,7 @@ impl TaskRuntime {
 
     /// The async wrapper's `AsyncSpawn`: register a lazy state machine and
     /// return its handle. The body does not run until the task is pumped.
-    pub(super) fn async_spawn(
+    pub fn async_spawn(
         &mut self,
         move_next: mir::SymbolId,
         slot_count: usize,
@@ -705,7 +725,20 @@ impl TaskRuntime {
         Ok(id)
     }
 
-    pub(super) fn async_state(&self, id: TaskHandleId) -> Result<i32, BackendError> {
+    /// Test hook: `(state, resolved, inner_submitted)` of an async task, or `None`
+    /// for an unknown handle.
+    #[doc(hidden)]
+    pub fn async_task_probe(&self, id: TaskHandleId) -> Option<(i32, bool, bool)> {
+        self.async_tasks.get(&id).map(|task| {
+            (
+                task.state,
+                task.resolved.is_some(),
+                task.inner.is_some() || task.inner_token.is_some(),
+            )
+        })
+    }
+
+    pub fn async_state(&self, id: TaskHandleId) -> Result<i32, BackendError> {
         let task = self
             .async_tasks
             .get(&id)
@@ -719,11 +752,7 @@ impl TaskRuntime {
         Ok(task.state)
     }
 
-    pub(super) fn async_set_state(
-        &mut self,
-        id: TaskHandleId,
-        state: i32,
-    ) -> Result<(), BackendError> {
+    pub fn async_set_state(&mut self, id: TaskHandleId, state: i32) -> Result<(), BackendError> {
         let task = self.async_tasks.get_mut(&id).ok_or_else(|| {
             BackendError::new("async state update received an unknown task handle")
         })?;
@@ -737,7 +766,7 @@ impl TaskRuntime {
         Ok(())
     }
 
-    pub(super) fn async_store_slot(
+    pub fn async_store_slot(
         &mut self,
         id: TaskHandleId,
         index: usize,
@@ -764,11 +793,7 @@ impl TaskRuntime {
         Ok(())
     }
 
-    pub(super) fn async_load_slot(
-        &self,
-        id: TaskHandleId,
-        index: usize,
-    ) -> Result<i64, BackendError> {
+    pub fn async_load_slot(&self, id: TaskHandleId, index: usize) -> Result<i64, BackendError> {
         let task = self
             .async_tasks
             .get(&id)
@@ -793,7 +818,7 @@ impl TaskRuntime {
     /// completion token bound to this async task. Only awaited inners carry a
     /// token; plain tasks and Parallel chunks never do.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) fn async_spawn_inner(
+    pub fn async_spawn_inner(
         &mut self,
         id: TaskHandleId,
         inner: mir::SymbolId,
@@ -801,7 +826,7 @@ impl TaskRuntime {
         self.async_spawn_inner_with_payload(id, inner, TaskPayload::default())
     }
 
-    pub(super) fn async_spawn_inner_with_payload(
+    pub fn async_spawn_inner_with_payload(
         &mut self,
         id: TaskHandleId,
         inner: mir::SymbolId,
@@ -873,7 +898,7 @@ impl TaskRuntime {
             .map_or(demand, |domain| demand.min(domain.concurrency_limit()))
     }
 
-    pub(super) fn async_await_result(&self, id: TaskHandleId) -> Result<i64, BackendError> {
+    pub fn async_await_result(&self, id: TaskHandleId) -> Result<i64, BackendError> {
         let task = self.async_tasks.get(&id).ok_or_else(|| {
             BackendError::new("async await result received an unknown task handle")
         })?;
@@ -888,7 +913,7 @@ impl TaskRuntime {
             .ok_or_else(|| BackendError::new("async awaited result is not ready"))
     }
 
-    pub(super) fn async_set_result(
+    pub fn async_set_result(
         &mut self,
         id: TaskHandleId,
         value: ExecutionValue,
@@ -925,7 +950,7 @@ impl TaskRuntime {
     /// call, with no other Rust reference to it held across this call (see the
     /// caller in `task_abi`).
     #[allow(unsafe_code)]
-    pub(super) unsafe fn pump(
+    pub unsafe fn pump(
         runtime: *mut Self,
         target: TaskHandleId,
     ) -> Result<TaskOutcome, BackendError> {
@@ -943,7 +968,7 @@ impl TaskRuntime {
         let outcome = match guard.driver.as_ref() {
             // SAFETY: same contract; each reborrow inside is short-lived and
             // never spans a driver step.
-            Some(driver) => unsafe { Self::pump_loop(runtime, driver, target) },
+            Some(driver) => unsafe { Self::pump_loop(runtime, driver.as_ref(), target) },
             None => Err(BackendError::new("the async pump lost its driver")),
         };
         drop(guard);
@@ -954,7 +979,7 @@ impl TaskRuntime {
     /// unresolved async step executes. The Main borrow ends before `pump`
     /// invokes JIT code.
     #[allow(unsafe_code)]
-    pub(super) unsafe fn pump_from_context(
+    pub(crate) unsafe fn pump_from_context(
         runtime: *mut Self,
         target: TaskHandleId,
         main_context: &mut aster_runtime::ExecutionContext,
@@ -981,7 +1006,7 @@ impl TaskRuntime {
     #[allow(unsafe_code)]
     unsafe fn pump_loop(
         runtime: *mut Self,
-        driver: &PreparedProgram,
+        driver: &dyn ExecutableProgram,
         target: TaskHandleId,
     ) -> Result<TaskOutcome, BackendError> {
         // SAFETY: short reborrow, immediately dropped.
@@ -1296,7 +1321,7 @@ impl TaskRuntime {
     /// `Parallel.For(start, end, Body)`: run `Body` over `[start, end)` in
     /// contiguous, worker-balanced chunks, block until all finish, and
     /// propagate the failure with the smallest logical index, if any.
-    pub(super) fn parallel_for(
+    pub fn parallel_for(
         &mut self,
         start: i32,
         end: i32,
@@ -1349,7 +1374,7 @@ impl TaskRuntime {
 
     /// `Parallel.ForEach(values, Body)`: `values` are already the host-owned
     /// scalar copies (see `async_abi`); no array pointer ever reaches a worker.
-    pub(super) fn parallel_for_each(
+    pub fn parallel_for_each(
         &mut self,
         values: Vec<ExecutionValue>,
         body: mir::SymbolId,
@@ -1390,7 +1415,7 @@ impl TaskRuntime {
     /// without running `Accumulate` or `Combine` at all. Chunk partials are
     /// collected in chunk-index order (never completion order) and folded
     /// left to right with `Combine`.
-    pub(super) fn parallel_reduce(
+    pub fn parallel_reduce(
         &mut self,
         values: Vec<ExecutionValue>,
         identity: ExecutionValue,
@@ -1638,13 +1663,13 @@ fn chunk_boundaries(total: usize, worker_count: usize) -> Vec<usize> {
 }
 
 /// Maximum number of `Parallel.Reduce` chunks (Q-CONC-4).
-pub(super) const REDUCE_MAX_CHUNKS: usize = 64;
+pub const REDUCE_MAX_CHUNKS: usize = 64;
 
 /// `Parallel.Reduce` chunk lengths. They depend only on `length`, never on the
 /// worker count: `chunks = min(length, 64)` and chunk `i` covers
 /// `[i * length / chunks, (i + 1) * length / chunks)`. Every chunk is
 /// non-empty, and an empty input has no chunks.
-pub(super) fn reduce_chunk_boundaries(length: usize) -> Vec<usize> {
+pub fn reduce_chunk_boundaries(length: usize) -> Vec<usize> {
     let chunks = length.min(REDUCE_MAX_CHUNKS);
     // `u128` arithmetic cannot overflow for any `usize` length.
     let edge = |index: usize| -> usize {
@@ -1771,7 +1796,7 @@ fn collect_reduce_chunks_observed(
 /// [`TaskRuntime`] for the duration of a top-level execution. The only place
 /// this crate inspects MIR to decide that; a fully sequential module never
 /// creates a pool, driver, or completion queue.
-pub(super) fn module_uses_tasks(module: &mir::Module) -> bool {
+pub fn module_uses_tasks(module: &mir::Module) -> bool {
     module.functions.iter().any(|function| {
         function.blocks.iter().any(|block| {
             block.instructions.iter().any(|instruction| {
@@ -1795,7 +1820,7 @@ pub(super) fn module_uses_tasks(module: &mir::Module) -> bool {
     })
 }
 
-pub(super) fn module_uses_async(module: &mir::Module) -> bool {
+pub fn module_uses_async(module: &mir::Module) -> bool {
     module.functions.iter().any(|function| {
         function.blocks.iter().any(|block| {
             block.instructions.iter().any(|instruction| {
@@ -1812,7 +1837,7 @@ pub(super) fn module_uses_async(module: &mir::Module) -> bool {
 }
 
 #[cfg(feature = "aarm-telemetry")]
-pub(super) fn module_uses_plain_task_run(module: &mir::Module) -> bool {
+pub fn module_uses_plain_task_run(module: &mir::Module) -> bool {
     module.functions.iter().any(|function| {
         function.blocks.iter().any(|block| {
             block.instructions.iter().any(|instruction| {
@@ -1829,7 +1854,7 @@ pub(super) fn module_uses_plain_task_run(module: &mir::Module) -> bool {
 }
 
 #[cfg(feature = "aarm-telemetry")]
-pub(super) fn module_uses_parallel(module: &mir::Module) -> bool {
+pub fn module_uses_parallel(module: &mir::Module) -> bool {
     module.functions.iter().any(|function| {
         function.blocks.iter().any(|block| {
             block.instructions.iter().any(|instruction| {
@@ -1868,23 +1893,102 @@ fn module_task_call_sites(module: &mir::Module) -> usize {
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
-    use std::thread;
-    use std::time::Duration;
 
     use super::*;
-
-    /// A bare `*mut TaskRuntime` is not `Send`; this wraps one so it can
-    /// cross to a helper thread in the pump timeout tests below. Only sound
-    /// because those tests block (with a bounded timeout) until that thread
-    /// finishes using it, and the runtime itself outlives the whole call.
-    struct SendPtr(*mut TaskRuntime);
-    #[allow(unsafe_code)]
-    unsafe impl Send for SendPtr {}
+    use crate::test_support::test_provider;
 
     fn compile(source: &str) -> mir::Module {
         aster_compiler::compile(source)
             .expect("source compiles")
             .mir
+    }
+
+    #[test]
+    fn task_worker_demand_tracks_live_submissions_not_static_call_sites() {
+        let module = Arc::new(compile(
+            "public int Work() { return 1; } public Task<int> Start() { return Task.Run(Work); } public int Main() { Task<int> a = Start(); Task<int> b = Start(); return a.Wait() + b.Wait(); }",
+        ));
+        let work = module
+            .functions
+            .iter()
+            .find(|function| function.name == "Work")
+            .expect("Work exists")
+            .symbol;
+        let mut runtime = TaskRuntime::new(&test_provider(), &module, 4).expect("runtime starts");
+
+        assert_eq!(runtime.pending_worker_demand(), 1);
+        let first = runtime.run(work).expect("first task starts");
+        assert_eq!(runtime.pending_worker_demand(), 2);
+        let second = runtime.run(work).expect("second task starts");
+        assert_eq!(runtime.pending_worker_demand(), 3);
+
+        runtime.wait(first).expect("first task completes");
+        assert_eq!(runtime.pending_worker_demand(), 2);
+        runtime.wait(second).expect("second task completes");
+        assert_eq!(runtime.pending_worker_demand(), 1);
+    }
+
+    #[test]
+    fn waiting_on_an_unknown_id_is_a_controlled_error() {
+        let module = compile("public int Compute() { return 1; }");
+        let mut runtime = TaskRuntime::new(&test_provider(), &Arc::new(module), 1)
+            .expect("runtime starts with no tasks yet");
+        let bogus = TaskHandleId(u64::MAX);
+        assert!(runtime.wait(bogus).is_err());
+    }
+
+    #[test]
+    fn many_plain_task_run_waits_never_produce_a_completion_token() {
+        let module = compile("public int Compute() { return 1; }");
+        let symbol = module
+            .functions
+            .iter()
+            .find(|function| function.name == "Compute")
+            .expect("Compute is declared")
+            .symbol;
+        let mut runtime =
+            TaskRuntime::new(&test_provider(), &Arc::new(module), 2).expect("runtime starts");
+        for _ in 0..50 {
+            let id = runtime.run(symbol).expect("task is accepted");
+            runtime.wait(id).expect("plain wait succeeds");
+        }
+        assert_eq!(
+            runtime.next_token, 0,
+            "no plain task ever mints a completion token"
+        );
+        assert!(runtime.token_to_async.is_empty());
+    }
+
+    #[test]
+    fn task_handle_exhaustion_is_controlled_instead_of_wrapping() {
+        let module = compile("public int Compute() { return 1; }");
+        let symbol = module.functions[0].symbol;
+        let mut runtime =
+            TaskRuntime::new(&test_provider(), &Arc::new(module), 1).expect("runtime starts");
+        runtime.next_id = u64::MAX;
+
+        let error = runtime.run(symbol).expect_err("id exhaustion must fail");
+        assert!(error.message().contains("id space is exhausted"));
+        assert!(runtime.entries.is_empty());
+    }
+
+    #[test]
+    fn async_driver_reuses_the_callers_program() {
+        let module = Arc::new(compile(
+            "public int Compute() { return 1; } public async Task<int> Run() { return await Task.Run(Compute); }",
+        ));
+        let program: Arc<dyn ExecutableProgram> =
+            Arc::new(crate::test_support::FakeProgram::default());
+        let runtime = TaskRuntime::with_program(
+            &test_provider(),
+            &module,
+            2,
+            &Arc::new(aster_runtime::ForeignRegistry::new()),
+            Arc::clone(&program),
+        )
+        .expect("runtime starts");
+        let driver = runtime.driver.as_ref().expect("async module has a driver");
+        assert!(Arc::ptr_eq(driver, &program));
     }
 
     #[test]
@@ -1902,215 +2006,11 @@ mod tests {
     }
 
     #[test]
-    fn task_worker_demand_tracks_live_submissions_not_static_call_sites() {
-        let module = Arc::new(compile(
-            "public int Work() { return 1; } public Task<int> Start() { return Task.Run(Work); } public int Main() { Task<int> a = Start(); Task<int> b = Start(); return a.Wait() + b.Wait(); }",
-        ));
-        let work = module
-            .functions
-            .iter()
-            .find(|function| function.name == "Work")
-            .expect("Work exists")
-            .symbol;
-        let mut runtime = TaskRuntime::new(&module, 4).expect("runtime starts");
-
-        assert_eq!(runtime.pending_worker_demand(), 1);
-        let first = runtime.run(work).expect("first task starts");
-        assert_eq!(runtime.pending_worker_demand(), 2);
-        let second = runtime.run(work).expect("second task starts");
-        assert_eq!(runtime.pending_worker_demand(), 3);
-
-        runtime.wait(first).expect("first task completes");
-        assert_eq!(runtime.pending_worker_demand(), 2);
-        runtime.wait(second).expect("second task completes");
-        assert_eq!(runtime.pending_worker_demand(), 1);
-    }
-
-    #[test]
-    #[cfg(feature = "aarm-telemetry")]
-    fn governed_plain_task_outcomes_are_scheduler_and_wait_order_independent() {
-        const HARD_LIMIT: usize = 64 * 1024;
-        let module = Arc::new(compile(
-            "public int Small() { int[] scratch = new int[1]; return 1; } \
-             public int Large() { int[] scratch = new int[20000]; return 2; }",
-        ));
-        let small = symbol(&module, "Small");
-        let large = symbol(&module, "Large");
-
-        for worker_count in [1, 2, 4, 16] {
-            let governor = Arc::new(aster_runtime::MemoryGovernor::new(HARD_LIMIT));
-            let mut main =
-                aster_runtime::ExecutionContext::with_memory_governor(Arc::clone(&governor));
-            let mut runtime = TaskRuntime::with_task_memory_governor(
-                &module,
-                worker_count,
-                Arc::clone(&governor),
-            )
-            .expect("governed task runtime starts");
-            let mut expected_failure = None;
-
-            for repetition in 0..10 {
-                let a = runtime
-                    .run_from_context(small, &mut main)
-                    .expect("small A submits");
-                let b = runtime
-                    .run_from_context(large, &mut main)
-                    .expect("large B submits");
-                let c = runtime
-                    .run_from_context(small, &mut main)
-                    .expect("small C submits");
-                let d = runtime
-                    .run_from_context(large, &mut main)
-                    .expect("large D submits");
-                let perturbation = thread::spawn(|| {
-                    for _ in 0..64 {
-                        thread::yield_now();
-                    }
-                });
-                let order = if repetition % 2 == 0 {
-                    [d, a, c, b]
-                } else {
-                    [a, b, c, d]
-                };
-                let outcomes = order.map(|id| runtime.wait(id).expect("task handle is known"));
-                perturbation.join().expect("perturbation completes");
-
-                for (position, outcome) in outcomes.into_iter().enumerate() {
-                    let should_fail = if repetition % 2 == 0 {
-                        matches!(position, 0 | 3)
-                    } else {
-                        matches!(position, 1 | 3)
-                    };
-                    match (should_fail, outcome) {
-                        (false, TaskOutcome::Completed(ExecutionValue::Int(1), _)) => {}
-                        (true, TaskOutcome::Failed(error)) => {
-                            assert!(
-                                error
-                                    .message()
-                                    .contains("deterministic Task.Run memory entitlement"),
-                                "unexpected task error: {error}"
-                            );
-                            assert_eq!(
-                                expected_failure.get_or_insert_with(|| error.message().to_owned()),
-                                error.message()
-                            );
-                        }
-                        (_, outcome) => panic!("unexpected task outcome: {outcome:?}"),
-                    }
-                }
-                assert_eq!(governor.telemetry().current_capacity_bytes, 0);
-            }
-
-            runtime.quiesce_workers();
-            let domain = runtime
-                .task_domain_telemetry()
-                .expect("first submission freezes the domain");
-            assert_eq!(domain.task_submissions, 40);
-            assert_eq!(domain.task_contexts_started, 40);
-            assert_eq!(domain.task_contexts_completed, 40);
-            assert_eq!(domain.task_context_memory_failures, 20);
-            let telemetry = governor.telemetry();
-            assert_eq!(telemetry.current_capacity_bytes, 0);
-            assert!(telemetry.peak_capacity_bytes <= telemetry.hard_limit_bytes);
-            assert_eq!(telemetry.grant_events, telemetry.release_events);
-            assert_eq!(
-                telemetry.granted_bytes_cumulative,
-                telemetry.released_bytes_cumulative
-            );
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "aarm-telemetry")]
-    fn queued_plain_tasks_do_not_precharge_their_entitlements() {
-        let module = Arc::new(compile("public int One() { return 1; }"));
-        let one = symbol(&module, "One");
-        let governor = Arc::new(aster_runtime::MemoryGovernor::new(64 * 1024));
-        let mut main = aster_runtime::ExecutionContext::with_memory_governor(Arc::clone(&governor));
-        let mut runtime = TaskRuntime::with_task_memory_governor(&module, 2, Arc::clone(&governor))
-            .expect("governed task runtime starts");
-
-        let handles = (0..16)
-            .map(|_| {
-                runtime
-                    .run_from_context(one, &mut main)
-                    .expect("queued task submits")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(governor.telemetry().current_capacity_bytes, 0);
-        for handle in handles {
-            assert!(matches!(
-                runtime.wait(handle).expect("queued task completes"),
-                TaskOutcome::Completed(ExecutionValue::Int(1), _)
-            ));
-        }
-        runtime.quiesce_workers();
-        let domain = runtime.task_domain_telemetry().expect("domain exists");
-        assert_eq!(domain.task_memory_concurrency_limit, 2);
-        assert_eq!(domain.task_submissions, 16);
-        assert_eq!(domain.task_contexts_completed, 16);
-        assert_eq!(governor.telemetry().grant_events, 0);
-    }
-
-    #[test]
-    #[cfg(feature = "aarm-telemetry")]
-    fn main_and_tasks_do_not_race_for_unpartitioned_future_headroom() {
-        let module = Arc::new(compile(
-            "public int Small() { int[] scratch = new int[1]; return 1; }",
-        ));
-        let small = symbol(&module, "Small");
-
-        for worker_count in [1, 2, 4, 16] {
-            for _ in 0..10 {
-                let governor = Arc::new(aster_runtime::MemoryGovernor::new(64 * 1024));
-                let mut main =
-                    aster_runtime::ExecutionContext::with_memory_governor(Arc::clone(&governor));
-                assert!(!aster_runtime::context::aster_rt_array_new(&raw mut main, 1, 1).is_null());
-                let mut runtime = TaskRuntime::with_task_memory_governor(
-                    &module,
-                    worker_count,
-                    Arc::clone(&governor),
-                )
-                .expect("governed task runtime starts");
-
-                let first = runtime
-                    .run_from_context(small, &mut main)
-                    .expect("first task submits");
-                let second = runtime
-                    .run_from_context(small, &mut main)
-                    .expect("second task submits");
-                assert!(
-                    aster_runtime::context::aster_rt_array_new(&raw mut main, 10_000, 4).is_null()
-                );
-                assert!(main.take_error().is_some_and(|error| {
-                    error.contains("deterministic Task.Run main-context memory entitlement")
-                }));
-
-                for handle in [second, first] {
-                    assert!(matches!(
-                        runtime.wait(handle).expect("task outcome is cached"),
-                        TaskOutcome::Completed(ExecutionValue::Int(1), _)
-                    ));
-                }
-                runtime.quiesce_workers();
-                assert_eq!(
-                    governor.telemetry().current_capacity_bytes,
-                    u64::try_from(aster_runtime::ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES)
-                        .expect("minimum page fits u64")
-                );
-                drop(runtime);
-                drop(main);
-                assert_eq!(governor.telemetry().current_capacity_bytes, 0);
-            }
-        }
-    }
-
-    #[test]
     fn independent_static_task_submissions_prepare_together() {
         let module = Arc::new(compile(
             "public int Work() { return 1; } public int Main() { Task<int> a = Task.Run(Work); Task<int> b = Task.Run(Work); return a.Wait() + b.Wait(); }",
         ));
-        let runtime = TaskRuntime::new(&module, 4).expect("runtime starts");
+        let runtime = TaskRuntime::new(&test_provider(), &module, 4).expect("runtime starts");
         assert_eq!(runtime.task_worker_count, 2);
         assert_eq!(runtime.pending_worker_demand(), 2);
     }
@@ -2126,6 +2026,136 @@ mod tests {
             "public int Work() { return 42; } public async Task<int> Run() { int value = await Task.Run(Work); return value; }",
         );
         assert!(module_uses_async(&async_module));
+    }
+
+    #[test]
+    fn a_move_next_step_returning_an_invalid_status_is_a_controlled_error() {
+        // `MoveNext` only ever legitimately returns `0` (pending) or `1`
+        // (completed); anything else can only come from adulterated MIR or a
+        // corrupted handle, and must resolve the task with a controlled
+        // error rather than being silently accepted as one of the two valid
+        // states.
+        let module = compile("public int Compute() { return 1; }");
+        let move_next = module.functions[0].symbol;
+        let mut runtime =
+            TaskRuntime::new(&test_provider(), &Arc::new(module), 1).expect("runtime starts");
+        let handle = runtime
+            .async_spawn(move_next, 0)
+            .expect("async task registers");
+
+        runtime.apply_move_next(
+            handle,
+            Ok((ExecutionValue::Int(42), MemoryStats::default())),
+        );
+
+        let task = runtime
+            .async_tasks
+            .get(&handle)
+            .expect("the task is still registered");
+        let resolved = task
+            .resolved
+            .clone()
+            .expect("an invalid status must resolve the task, not leave it pending");
+        let error = resolved.expect_err("an invalid status must be a controlled error");
+        assert!(error.message().contains("invalid status"));
+    }
+
+    #[test]
+    fn a_suspended_async_task_keeps_its_own_cancellation_control_until_resume() {
+        let module = compile("public int Compute() { return 1; }");
+        let move_next = module.functions[0].symbol;
+        let mut runtime =
+            TaskRuntime::new(&test_provider(), &Arc::new(module), 1).expect("runtime starts");
+        let id = runtime
+            .async_spawn(move_next, 0)
+            .expect("async task registers");
+        let control = Arc::clone(&runtime.async_tasks[&id].control);
+        let cancellation = control.cancellation();
+
+        assert!(control.begin_or_resume(), "the first async phase starts");
+        runtime.async_tasks.get_mut(&id).expect("task exists").state = 1;
+        assert!(runtime.cancel(id).expect("known async handle cancels"));
+        assert!(cancellation.is_requested());
+
+        runtime.ready.push_back(id);
+        assert!(
+            runtime.pop_ready().is_none(),
+            "a cancelled suspended task must not resume"
+        );
+        let outcome = runtime
+            .resolved_outcome(id)
+            .expect("resume attempt resolves cancellation")
+            .expect("cancellation is a task outcome");
+        assert!(matches!(
+            outcome,
+            TaskOutcome::Failed(error) if error.is_cancellation()
+        ));
+        assert!(!runtime.cancel(id).expect("terminal handle remains known"));
+        assert_eq!(
+            Arc::strong_count(&control),
+            2,
+            "only the task and test own control"
+        );
+    }
+
+    #[test]
+    fn completion_token_exhaustion_is_controlled_instead_of_wrapping() {
+        let module = compile("public int Compute() { return 1; }");
+        let symbol = module.functions[0].symbol;
+        let mut runtime =
+            TaskRuntime::new(&test_provider(), &Arc::new(module), 1).expect("runtime starts");
+        let outer = runtime
+            .async_spawn(symbol, 0)
+            .expect("outer async handle is allocated");
+        runtime.next_token = u64::MAX;
+
+        let error = runtime
+            .async_spawn_inner(outer, symbol)
+            .expect_err("token exhaustion must fail");
+        assert!(error.message().contains("token space is exhausted"));
+        assert!(runtime.token_to_async.is_empty());
+    }
+
+    #[test]
+    fn invalid_async_slots_and_state_transitions_are_controlled() {
+        let module = compile("public int Compute() { return 1; }");
+        let symbol = module.functions[0].symbol;
+        let mut runtime =
+            TaskRuntime::new(&test_provider(), &Arc::new(module), 1).expect("runtime starts");
+        let outer = runtime
+            .async_spawn(symbol, 0)
+            .expect("outer async handle is allocated");
+
+        assert!(
+            runtime
+                .async_store_slot(outer, 0, ExecutionValue::Int(1))
+                .is_err()
+        );
+        assert!(runtime.async_load_slot(outer, 0).is_err());
+        assert!(runtime.async_set_state(outer, 7).is_err());
+        assert!(runtime.on_completion(99).is_err());
+    }
+
+    #[test]
+    fn driver_guard_restores_the_driver_during_unwind() {
+        let module = compile(
+            "public int Compute() { return 1; } public async Task<int> Run() { return await Task.Run(Compute); }",
+        );
+        let mut runtime =
+            TaskRuntime::new(&test_provider(), &Arc::new(module), 1).expect("runtime starts");
+        let runtime_pointer = std::ptr::from_mut(&mut runtime);
+        let driver = runtime.driver.take().expect("driver is present");
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = DriverRestore {
+                runtime: runtime_pointer,
+                driver: Some(driver),
+            };
+            panic!("simulated host panic while pumping");
+        }));
+
+        assert!(result.is_err());
+        assert!(runtime.driver.is_some());
     }
 
     #[test]
@@ -2324,338 +2354,6 @@ mod tests {
     }
 
     #[test]
-    fn waiting_on_an_unknown_id_is_a_controlled_error() {
-        let module = compile("public int Compute() { return 1; }");
-        let mut runtime =
-            TaskRuntime::new(&Arc::new(module), 1).expect("runtime starts with no tasks yet");
-        let bogus = TaskHandleId(u64::MAX);
-        assert!(runtime.wait(bogus).is_err());
-    }
-
-    #[test]
-    fn a_move_next_step_returning_an_invalid_status_is_a_controlled_error() {
-        // `MoveNext` only ever legitimately returns `0` (pending) or `1`
-        // (completed); anything else can only come from adulterated MIR or a
-        // corrupted handle, and must resolve the task with a controlled
-        // error rather than being silently accepted as one of the two valid
-        // states.
-        let module = compile("public int Compute() { return 1; }");
-        let move_next = module.functions[0].symbol;
-        let mut runtime = TaskRuntime::new(&Arc::new(module), 1).expect("runtime starts");
-        let handle = runtime
-            .async_spawn(move_next, 0)
-            .expect("async task registers");
-
-        runtime.apply_move_next(
-            handle,
-            Ok((ExecutionValue::Int(42), MemoryStats::default())),
-        );
-
-        let task = runtime
-            .async_tasks
-            .get(&handle)
-            .expect("the task is still registered");
-        let resolved = task
-            .resolved
-            .clone()
-            .expect("an invalid status must resolve the task, not leave it pending");
-        let error = resolved.expect_err("an invalid status must be a controlled error");
-        assert!(error.message().contains("invalid status"));
-    }
-
-    #[test]
-    fn waiting_twice_on_the_same_plain_id_returns_the_same_outcome() {
-        let module = compile("public int Compute() { return 42; }");
-        let symbol = module
-            .functions
-            .iter()
-            .find(|function| function.name == "Compute")
-            .expect("Compute is declared")
-            .symbol;
-        let mut runtime = TaskRuntime::new(&Arc::new(module), 1).expect("runtime starts");
-        let id = runtime.run(symbol).expect("task is accepted");
-        let first = runtime.wait(id).expect("first wait succeeds");
-        let second = runtime
-            .wait(id)
-            .expect("second wait replays the cached result");
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn a_suspended_async_task_keeps_its_own_cancellation_control_until_resume() {
-        let module = compile("public int Compute() { return 1; }");
-        let move_next = module.functions[0].symbol;
-        let mut runtime = TaskRuntime::new(&Arc::new(module), 1).expect("runtime starts");
-        let id = runtime
-            .async_spawn(move_next, 0)
-            .expect("async task registers");
-        let control = Arc::clone(&runtime.async_tasks[&id].control);
-        let cancellation = control.cancellation();
-
-        assert!(control.begin_or_resume(), "the first async phase starts");
-        runtime.async_tasks.get_mut(&id).expect("task exists").state = 1;
-        assert!(runtime.cancel(id).expect("known async handle cancels"));
-        assert!(cancellation.is_requested());
-
-        runtime.ready.push_back(id);
-        assert!(
-            runtime.pop_ready().is_none(),
-            "a cancelled suspended task must not resume"
-        );
-        let outcome = runtime
-            .resolved_outcome(id)
-            .expect("resume attempt resolves cancellation")
-            .expect("cancellation is a task outcome");
-        assert!(matches!(
-            outcome,
-            TaskOutcome::Failed(error) if error.is_cancellation()
-        ));
-        assert!(!runtime.cancel(id).expect("terminal handle remains known"));
-        assert_eq!(
-            Arc::strong_count(&control),
-            2,
-            "only the task and test own control"
-        );
-    }
-
-    #[test]
-    fn a_plain_task_never_waited_is_dropped_cleanly() {
-        let module = compile("public int Compute() { return 1; }");
-        let symbol = module
-            .functions
-            .iter()
-            .find(|function| function.name == "Compute")
-            .expect("Compute is declared")
-            .symbol;
-        let mut runtime = TaskRuntime::new(&Arc::new(module), 2).expect("runtime starts");
-        for _ in 0..5 {
-            runtime.run(symbol).expect("task is accepted");
-        }
-        drop(runtime);
-    }
-
-    /// Run the wrapper of the canonical `Calculate` async example through
-    /// `worker_count` workers and pump it to resolution on a helper thread,
-    /// bounding the wait so a stuck pump fails the test instead of hanging it.
-    fn pump_canonical_example(worker_count: usize) -> Result<ExecutionValue, BackendError> {
-        let module = Arc::new(compile(
-            "public int Compute() { return 42; } \
-             public async Task<int> Calculate() { \
-                 int offset = 1; \
-                 int value = await Task.Run(Compute); \
-                 return value + offset; }",
-        ));
-        let wrapper = module
-            .functions
-            .iter()
-            .find(|function| function.name == "Calculate")
-            .expect("Calculate is declared")
-            .symbol;
-        let mut runtime = TaskRuntime::new(&module, worker_count)
-            .expect("runtime starts with the requested worker count");
-        let driver = PreparedProgram::prepare(&module).expect("driver prepares");
-        let pointer = std::ptr::from_mut(&mut runtime).cast::<()>();
-        let (value, _) = driver
-            .invoke(wrapper, false, Some(pointer), None, None)
-            .expect("wrapper registers the async task");
-        let ExecutionValue::Long(bits) = value else {
-            panic!("wrapper must return a Task<T> handle");
-        };
-        let handle = TaskHandleId::from_bits(bits);
-        // A bare `*mut TaskRuntime` is not `Send`; wrap it (see `SendPtr`
-        // below) so it can cross to the helper thread. Sound here because the
-        // receiving side blocks (with a bounded timeout) until that thread
-        // finishes using it, and `runtime` itself outlives the whole call.
-        let runtime_pointer = SendPtr(std::ptr::from_mut(&mut runtime));
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let runtime_pointer = runtime_pointer;
-            // SAFETY: `runtime_pointer` stays live for the whole call: this
-            // thread is joined (via the timeout below) before `runtime`
-            // could otherwise drop, and nothing else touches it meanwhile.
-            #[allow(unsafe_code)]
-            let outcome = unsafe { TaskRuntime::pump(runtime_pointer.0, handle) };
-            let _ = sender.send(outcome);
-        });
-        let outcome = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the pump must resolve without deadlocking")
-            .expect("the pump call itself must not fail");
-        match outcome {
-            TaskOutcome::Completed(value, _) => Ok(value),
-            TaskOutcome::Failed(error) => Err(error),
-        }
-    }
-
-    #[test]
-    fn pumping_with_a_single_worker_does_not_deadlock() {
-        // With one worker, `Compute` runs there while the host thread blocks
-        // on the completion queue, exactly the scenario the algorithm in the
-        // module doc exists to make safe.
-        assert_eq!(
-            pump_canonical_example(1).expect("resolves"),
-            ExecutionValue::Int(43)
-        );
-    }
-
-    #[test]
-    fn pumping_with_multiple_workers_resolves_the_same_way() {
-        assert_eq!(
-            pump_canonical_example(4).expect("resolves"),
-            ExecutionValue::Int(43)
-        );
-    }
-
-    #[test]
-    fn an_async_task_created_and_never_awaited_does_not_execute_its_body() {
-        let module = Arc::new(compile(
-            "public int Compute() { return 1; } \
-             public async Task<int> Calculate() { int v = await Task.Run(Compute); return v; }",
-        ));
-        let wrapper = module
-            .functions
-            .iter()
-            .find(|function| function.name == "Calculate")
-            .expect("Calculate is declared")
-            .symbol;
-        let mut runtime = TaskRuntime::new(&module, 1).expect("runtime starts");
-        let driver = PreparedProgram::prepare(&module).expect("driver prepares");
-        let pointer = std::ptr::from_mut(&mut runtime).cast::<()>();
-        let (value, _) = driver
-            .invoke(wrapper, false, Some(pointer), None, None)
-            .expect("wrapper registers the async task without running its body");
-        let ExecutionValue::Long(bits) = value else {
-            panic!("wrapper must return a Task<T> handle");
-        };
-        let handle = TaskHandleId::from_bits(bits);
-
-        let task = runtime
-            .async_tasks
-            .get(&handle)
-            .expect("the async task is registered");
-        assert_eq!(task.state, 0, "MoveNext never ran: state is still 0");
-        assert!(
-            task.resolved.is_none(),
-            "an unawaited task is never resolved"
-        );
-        assert!(
-            task.inner.is_none() && task.inner_token.is_none(),
-            "no inner Task.Run was ever submitted"
-        );
-
-        // Dropping a runtime with a pending, never-awaited async task must
-        // not hang or panic.
-        drop(runtime);
-    }
-
-    #[test]
-    fn many_plain_task_run_waits_never_produce_a_completion_token() {
-        let module = compile("public int Compute() { return 1; }");
-        let symbol = module
-            .functions
-            .iter()
-            .find(|function| function.name == "Compute")
-            .expect("Compute is declared")
-            .symbol;
-        let mut runtime = TaskRuntime::new(&Arc::new(module), 2).expect("runtime starts");
-        for _ in 0..50 {
-            let id = runtime.run(symbol).expect("task is accepted");
-            runtime.wait(id).expect("plain wait succeeds");
-        }
-        assert_eq!(
-            runtime.next_token, 0,
-            "no plain task ever mints a completion token"
-        );
-        assert!(runtime.token_to_async.is_empty());
-    }
-
-    #[test]
-    fn task_handle_exhaustion_is_controlled_instead_of_wrapping() {
-        let module = compile("public int Compute() { return 1; }");
-        let symbol = module.functions[0].symbol;
-        let mut runtime = TaskRuntime::new(&Arc::new(module), 1).expect("runtime starts");
-        runtime.next_id = u64::MAX;
-
-        let error = runtime.run(symbol).expect_err("id exhaustion must fail");
-        assert!(error.message().contains("id space is exhausted"));
-        assert!(runtime.entries.is_empty());
-    }
-
-    #[test]
-    fn completion_token_exhaustion_is_controlled_instead_of_wrapping() {
-        let module = compile("public int Compute() { return 1; }");
-        let symbol = module.functions[0].symbol;
-        let mut runtime = TaskRuntime::new(&Arc::new(module), 1).expect("runtime starts");
-        let outer = runtime
-            .async_spawn(symbol, 0)
-            .expect("outer async handle is allocated");
-        runtime.next_token = u64::MAX;
-
-        let error = runtime
-            .async_spawn_inner(outer, symbol)
-            .expect_err("token exhaustion must fail");
-        assert!(error.message().contains("token space is exhausted"));
-        assert!(runtime.token_to_async.is_empty());
-    }
-
-    #[test]
-    fn invalid_async_slots_and_state_transitions_are_controlled() {
-        let module = compile("public int Compute() { return 1; }");
-        let symbol = module.functions[0].symbol;
-        let mut runtime = TaskRuntime::new(&Arc::new(module), 1).expect("runtime starts");
-        let outer = runtime
-            .async_spawn(symbol, 0)
-            .expect("outer async handle is allocated");
-
-        assert!(
-            runtime
-                .async_store_slot(outer, 0, ExecutionValue::Int(1))
-                .is_err()
-        );
-        assert!(runtime.async_load_slot(outer, 0).is_err());
-        assert!(runtime.async_set_state(outer, 7).is_err());
-        assert!(runtime.on_completion(99).is_err());
-    }
-
-    #[test]
-    fn async_driver_reuses_the_callers_program() {
-        let module = Arc::new(compile(
-            "public int Compute() { return 1; } public async Task<int> Run() { return await Task.Run(Compute); }",
-        ));
-        let program = SharedProgram::new(PreparedProgram::prepare(&module).expect("prepares"));
-        let runtime = TaskRuntime::with_program(
-            &module,
-            2,
-            &Arc::new(aster_runtime::ForeignRegistry::new()),
-            Arc::clone(&program),
-        )
-        .expect("runtime starts");
-        let driver = runtime.driver.as_ref().expect("async module has a driver");
-        assert!(Arc::ptr_eq(driver, &program));
-    }
-
-    #[test]
-    fn driver_guard_restores_the_driver_during_unwind() {
-        let module = compile(
-            "public int Compute() { return 1; } public async Task<int> Run() { return await Task.Run(Compute); }",
-        );
-        let mut runtime = TaskRuntime::new(&Arc::new(module), 1).expect("runtime starts");
-        let runtime_pointer = std::ptr::from_mut(&mut runtime);
-        let driver = runtime.driver.take().expect("driver is present");
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = DriverRestore {
-                runtime: runtime_pointer,
-                driver: Some(driver),
-            };
-            panic!("simulated host panic while pumping");
-        }));
-
-        assert!(result.is_err());
-        assert!(runtime.driver.is_some());
-    }
-
-    #[test]
     fn disconnected_chunk_does_not_prevent_draining_later_outcomes() {
         let (disconnected_tx, disconnected_rx) = mpsc::channel();
         drop(disconnected_tx);
@@ -2672,206 +2370,6 @@ mod tests {
             .expect_err("all receivers are drained before selection");
         assert!(error.message().contains("later logical failure"));
     }
-
-    // --- Parallel.For / Parallel.ForEach: explicit worker-count coverage ---
-    //
-    // `execute`/`execute_with_stats` (the public surface exercised by the
-    // integration test suites) always pick `available_parallelism()`, so a
-    // CI runner's own core count silently decides whether "1 worker" or "N
-    // workers" is what actually gets tested. Driving `TaskRuntime` directly
-    // here pins the worker count explicitly, closing that gap for `For` and
-    // `ForEach` the same way Lote 6C already did for `Reduce` below.
-
-    fn symbol(module: &mir::Module, name: &str) -> mir::SymbolId {
-        module
-            .functions
-            .iter()
-            .find(|function| function.name == name)
-            .unwrap_or_else(|| panic!("{name} is declared"))
-            .symbol
-    }
-
-    #[test]
-    fn parallel_for_same_error_contract_with_one_two_or_many_workers() {
-        // Every index but 7 is safe against a length-8 array; index 7 alone
-        // overflows the length-7 slot it is deliberately given, so the
-        // deterministic "smallest failing index" is unambiguous regardless
-        // of how many workers actually run the range.
-        let source = "public void Body(int index) { \
-             int size = index == 7 ? 7 : 8; \
-             int[] a = new int[size]; \
-             int x = a[index]; \
-         }";
-        for worker_count in [1, 2, 6] {
-            let module = compile(source);
-            let body = symbol(&module, "Body");
-            let mut runtime = TaskRuntime::new(&Arc::new(module), worker_count)
-                .expect("runtime starts with the requested worker count");
-            let error = runtime
-                .parallel_for(0, 16, body)
-                .expect_err("index 7 must fail regardless of worker count");
-            assert!(
-                error.message().contains("array index 7"),
-                "worker_count {worker_count}: unexpected error {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn parallel_for_succeeds_identically_with_one_two_or_many_workers() {
-        let source = "public void Body(int index) { }";
-        for worker_count in [1, 2, 6] {
-            let module = compile(source);
-            let body = symbol(&module, "Body");
-            let mut runtime = TaskRuntime::new(&Arc::new(module), worker_count)
-                .expect("runtime starts with the requested worker count");
-            runtime
-                .parallel_for(0, 500, body)
-                .unwrap_or_else(|error| panic!("worker_count {worker_count}: {error}"));
-        }
-    }
-
-    #[test]
-    fn parallel_for_each_same_error_contract_with_one_two_or_many_workers() {
-        let source = "public void Body(int value) { \
-             int size = value == 7 ? 7 : 8; \
-             int[] a = new int[size]; \
-             int x = a[value]; \
-         }";
-        let values: Vec<ExecutionValue> = (0..16).map(ExecutionValue::Int).collect();
-        for worker_count in [1, 2, 6] {
-            let module = compile(source);
-            let body = symbol(&module, "Body");
-            let mut runtime = TaskRuntime::new(&Arc::new(module), worker_count)
-                .expect("runtime starts with the requested worker count");
-            let error = runtime
-                .parallel_for_each(values.clone(), body)
-                .expect_err("array position 7 must fail regardless of worker count");
-            assert!(
-                error.message().contains("array index 7"),
-                "worker_count {worker_count}: unexpected error {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn parallel_for_and_for_each_are_stable_across_repeated_runs_at_a_fixed_worker_count() {
-        let for_source = "public void Body(int index) { }";
-        let module = Arc::new(compile(for_source));
-        let body = symbol(&module, "Body");
-        let mut runtime = TaskRuntime::new(&module, 4).expect("runtime starts");
-        for repetition in 0..10 {
-            runtime
-                .parallel_for(0, 300, body)
-                .unwrap_or_else(|error| panic!("repetition {repetition}: {error}"));
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "aarm-telemetry")]
-    fn governed_parallel_for_is_scheduler_independent_under_memory_pressure() {
-        const HARD_LIMIT: usize = 64 * 1024;
-        let source = "public void Body(int index) { \
-             int size = index == 2 || index == 5 || index == 9 ? 20000 : 1; \
-             int[] scratch = new int[size]; \
-         }";
-        for worker_count in [1, 2, 4, 16] {
-            let module = Arc::new(compile(source));
-            let body = symbol(&module, "Body");
-            let governor = Arc::new(aster_runtime::MemoryGovernor::new(HARD_LIMIT));
-            let mut runtime =
-                TaskRuntime::with_memory_governor(&module, worker_count, Arc::clone(&governor))
-                    .expect("governed runtime starts");
-            let mut expected_error = None;
-            for repetition in 0..20 {
-                let error = runtime
-                    .parallel_for(0, 16, body)
-                    .expect_err("logical index 2 exceeds every fixed chunk ceiling");
-                assert!(
-                    error.message().contains("Parallel logical index 2"),
-                    "worker_count {worker_count}, repetition {repetition}: {error}"
-                );
-                assert_eq!(
-                    expected_error.get_or_insert_with(|| error.message().to_owned()),
-                    error.message(),
-                    "worker_count {worker_count}: diagnostic changed between repetitions"
-                );
-                let telemetry = governor.telemetry();
-                assert_eq!(telemetry.current_capacity_bytes, 0);
-                assert!(telemetry.peak_capacity_bytes <= telemetry.hard_limit_bytes);
-                assert_eq!(telemetry.grant_events, telemetry.release_events);
-                assert_eq!(
-                    telemetry.granted_bytes_cumulative,
-                    telemetry.released_bytes_cumulative
-                );
-            }
-            for plan in runtime.parallel_plans() {
-                assert_eq!(
-                    plan.chunk_budgets_bytes.iter().sum::<u64>(),
-                    plan.available_headroom_bytes
-                );
-            }
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "aarm-telemetry")]
-    fn governed_for_each_and_reduce_keep_the_same_logical_failure() {
-        const HARD_LIMIT: usize = 16 * 1024;
-        let module = Arc::new(compile(
-            "public void Each(int value) { int size = value == 2 || value == 5 ? 20000 : 1; int[] scratch = new int[size]; } \
-             public int Accumulate(int total, int value) { int size = value == 2 || value == 5 ? 20000 : 1; int[] scratch = new int[size]; return total + value; } \
-             public int Combine(int left, int right) { return left + right; }",
-        ));
-        let each = symbol(&module, "Each");
-        let accumulate = symbol(&module, "Accumulate");
-        let combine = symbol(&module, "Combine");
-        let values = (0..8).map(ExecutionValue::Int).collect::<Vec<_>>();
-
-        for reduce in [false, true] {
-            let governor = Arc::new(aster_runtime::MemoryGovernor::new(HARD_LIMIT));
-            let mut runtime = TaskRuntime::with_memory_governor(&module, 4, Arc::clone(&governor))
-                .expect("governed runtime starts");
-            let mut expected_error = None;
-            for repetition in 0..20 {
-                let error = if reduce {
-                    runtime
-                        .parallel_reduce(
-                            values.clone(),
-                            ExecutionValue::Int(0),
-                            accumulate,
-                            combine,
-                        )
-                        .expect_err("Reduce position 2 exceeds its fixed ceiling")
-                } else {
-                    runtime
-                        .parallel_for_each(values.clone(), each)
-                        .expect_err("ForEach position 2 exceeds its fixed ceiling")
-                };
-                assert!(
-                    error.message().contains("Parallel logical index 2"),
-                    "repetition {repetition}: {error}"
-                );
-                assert_eq!(
-                    expected_error.get_or_insert_with(|| error.message().to_owned()),
-                    error.message()
-                );
-                assert_eq!(governor.telemetry().current_capacity_bytes, 0);
-            }
-            let telemetry = governor.telemetry();
-            assert!(telemetry.peak_capacity_bytes <= telemetry.hard_limit_bytes);
-            assert_eq!(telemetry.grant_events, telemetry.release_events);
-            assert_eq!(
-                telemetry.granted_bytes_cumulative,
-                telemetry.released_bytes_cumulative
-            );
-        }
-    }
-
-    // --- Parallel.Reduce ---------------------------------------------------
-
-    const REDUCE_SOURCE: &str = "public int AddValue(int accumulator, int value) { return accumulator + value; } \
-         public int AddPartial(int left, int right) { return left + right; }";
 
     /// Deterministic proof that chunk partials are ordered by chunk index,
     /// never by arrival order: messages are sent in reverse of receiver
@@ -2958,185 +2456,5 @@ mod tests {
         let error = collect_reduce_chunks(vec![disconnected_rx, logical_rx])
             .expect_err("all receivers are drained before selection");
         assert!(error.message().contains("later logical failure"));
-    }
-
-    #[test]
-    fn parallel_reduce_gives_the_same_result_with_one_two_or_many_workers() {
-        let values: Vec<ExecutionValue> = (1..=50).map(ExecutionValue::Int).collect();
-        let expected = ExecutionValue::Int((1..=50).sum());
-        for worker_count in [1, 2, 8] {
-            let module = compile(REDUCE_SOURCE);
-            let accumulate = symbol(&module, "AddValue");
-            let combine = symbol(&module, "AddPartial");
-            let mut runtime = TaskRuntime::new(&Arc::new(module), worker_count)
-                .expect("runtime starts with the requested worker count");
-            let result = runtime
-                .parallel_reduce(values.clone(), ExecutionValue::Int(0), accumulate, combine)
-                .expect("reduction succeeds");
-            assert_eq!(
-                result, expected,
-                "worker_count {worker_count} produced a different result"
-            );
-        }
-    }
-
-    #[test]
-    fn parallel_reduce_empty_array_returns_identity_directly() {
-        let module = compile(REDUCE_SOURCE);
-        let accumulate = symbol(&module, "AddValue");
-        let combine = symbol(&module, "AddPartial");
-        let mut runtime = TaskRuntime::new(&Arc::new(module), 4).expect("runtime starts");
-        let result = runtime
-            .parallel_reduce(Vec::new(), ExecutionValue::Int(99), accumulate, combine)
-            .expect("an empty array never fails");
-        assert_eq!(result, ExecutionValue::Int(99));
-    }
-
-    #[test]
-    fn parallel_reduce_combines_partials_left_to_right_in_chunk_order() {
-        // `Combine(left, right) = left * 100 + right` is sensitive to
-        // combination order: getting chunk order wrong changes the result.
-        // With 4 workers over 4 single-element chunks (`[1, 2, 3, 4]`),
-        // `Accumulate` returns each element itself (identity `0`), so the
-        // only way to reach `1020304` is folding strictly left to right in
-        // chunk (array-position) order.
-        let module = compile(
-            "public int AddValue(int accumulator, int value) { return accumulator + value; } \
-             public int Weighted(int left, int right) { return left * 100 + right; }",
-        );
-        let accumulate = symbol(&module, "AddValue");
-        let combine = symbol(&module, "Weighted");
-        let mut runtime = TaskRuntime::new(&Arc::new(module), 4).expect("runtime starts");
-        let values = vec![
-            ExecutionValue::Int(1),
-            ExecutionValue::Int(2),
-            ExecutionValue::Int(3),
-            ExecutionValue::Int(4),
-        ];
-        let result = runtime
-            .parallel_reduce(values, ExecutionValue::Int(0), accumulate, combine)
-            .expect("reduction succeeds");
-        assert_eq!(result, ExecutionValue::Int(1_020_304));
-    }
-
-    #[test]
-    #[cfg(feature = "aarm-telemetry")]
-    fn governed_reduce_combine_reuses_released_headroom_sequentially() {
-        const HARD_LIMIT: usize = 64 * 1024;
-        let module = Arc::new(compile(
-            "public int AddValue(int total, int value) { return total + value; } \
-             public int AddPartial(int left, int right) { int[] scratch = new int[1]; return left + right; }",
-        ));
-        let accumulate = symbol(&module, "AddValue");
-        let combine = symbol(&module, "AddPartial");
-        let governor = Arc::new(aster_runtime::MemoryGovernor::new(HARD_LIMIT));
-        let mut runtime = TaskRuntime::with_memory_governor(&module, 4, Arc::clone(&governor))
-            .expect("governed runtime starts");
-
-        let result = runtime
-            .parallel_reduce(
-                (1..=4).map(ExecutionValue::Int).collect(),
-                ExecutionValue::Int(0),
-                accumulate,
-                combine,
-            )
-            .expect("governed reduction succeeds");
-        assert_eq!(result, ExecutionValue::Int(10));
-        let plans = runtime.parallel_plans();
-        assert_eq!(plans[0].operation, "Parallel.Reduce accumulate");
-        assert_eq!(plans[0].chunk_budgets_bytes, [16 * 1024; 4]);
-        assert_eq!(plans.len(), 4);
-        for plan in &plans[1..] {
-            assert_eq!(plan.operation, "Parallel.Reduce combine");
-            assert_eq!(plan.initial_governor_capacity_bytes, 0);
-            assert_eq!(plan.available_headroom_bytes, HARD_LIMIT as u64);
-            assert_eq!(plan.chunk_budgets_bytes, [HARD_LIMIT as u64]);
-        }
-        let telemetry = governor.telemetry();
-        assert_eq!(telemetry.current_capacity_bytes, 0);
-        assert_eq!(telemetry.grant_events, 3);
-        assert_eq!(telemetry.release_events, 3);
-    }
-
-    #[test]
-    fn parallel_reduce_repeated_executions_with_the_same_worker_count_return_the_same_result() {
-        let module = Arc::new(compile(REDUCE_SOURCE));
-        let accumulate = symbol(&module, "AddValue");
-        let combine = symbol(&module, "AddPartial");
-        let mut runtime = TaskRuntime::new(&module, 4).expect("runtime starts");
-        let values: Vec<ExecutionValue> = (1..=30).map(ExecutionValue::Int).collect();
-        for _ in 0..10 {
-            let result = runtime
-                .parallel_reduce(values.clone(), ExecutionValue::Int(0), accumulate, combine)
-                .expect("reduction succeeds");
-            assert_eq!(result, ExecutionValue::Int((1..=30).sum()));
-        }
-    }
-
-    #[test]
-    fn a_parallel_reduce_accumulate_error_does_not_contaminate_a_later_reduction() {
-        let module = Arc::new(compile(
-            "public int Boom(int accumulator, int value) { int[] a = new int[1]; return a[value]; } \
-             public int AddPartial(int left, int right) { return left + right; }",
-        ));
-        let boom = symbol(&module, "Boom");
-        let combine = symbol(&module, "AddPartial");
-        let mut runtime = TaskRuntime::new(&module, 2).expect("runtime starts");
-
-        let failing = runtime.parallel_reduce(
-            vec![ExecutionValue::Int(5)],
-            ExecutionValue::Int(0),
-            boom,
-            combine,
-        );
-        assert!(failing.is_err(), "the out-of-bounds access must fail");
-
-        let succeeding = runtime.parallel_reduce(
-            vec![ExecutionValue::Int(0)],
-            ExecutionValue::Int(0),
-            boom,
-            combine,
-        );
-        assert_eq!(
-            succeeding,
-            Ok(ExecutionValue::Int(0)),
-            "a later, valid reduction must not be affected by the earlier failure"
-        );
-    }
-
-    #[test]
-    fn a_parallel_reduce_combine_error_does_not_contaminate_a_later_reduction() {
-        let module = Arc::new(compile(
-            "public int AddValue(int accumulator, int value) { return accumulator + value; } \
-             public int BoomCombine(int left, int right) { int[] a = new int[1]; return a[left + right]; }",
-        ));
-        let accumulate = symbol(&module, "AddValue");
-        let boom_combine = symbol(&module, "BoomCombine");
-        let mut runtime = TaskRuntime::new(&module, 4).expect("runtime starts");
-
-        // Two single-element chunks (4 workers, 2 elements) force exactly one
-        // combine step; `left + right` (1) is out of bounds against `a`.
-        let failing = runtime.parallel_reduce(
-            vec![ExecutionValue::Int(0), ExecutionValue::Int(1)],
-            ExecutionValue::Int(0),
-            accumulate,
-            boom_combine,
-        );
-        assert!(
-            failing.is_err(),
-            "the combine step's failure must propagate"
-        );
-
-        let succeeding = runtime.parallel_reduce(
-            vec![ExecutionValue::Int(1)],
-            ExecutionValue::Int(0),
-            accumulate,
-            boom_combine,
-        );
-        assert_eq!(
-            succeeding,
-            Ok(ExecutionValue::Int(1)),
-            "a later reduction needing no combine step must not be affected"
-        );
     }
 }

@@ -3103,9 +3103,33 @@ fn validate_rvalue(
             }
             validate_operand_with_proven_bounds(object, function_name, true)
         }
+        mir::RvalueKind::InterfaceTest { object, .. } => {
+            validate_operand_with_proven_bounds(object, function_name, true)?;
+            if !matches!(object.type_, mir::Type::Class(_) | mir::Type::Interface(_))
+                || value.type_ != mir::Type::Bool
+            {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` has a malformed interface test"
+                )));
+            }
+            Ok(())
+        }
+        mir::RvalueKind::InterfaceLookup { object, interface } => {
+            validate_operand_with_proven_bounds(object, function_name, true)?;
+            if !matches!(object.type_, mir::Type::Class(_) | mir::Type::Interface(_))
+                || value.type_ != mir::Type::Interface(*interface)
+            {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` has a malformed interface lookup"
+                )));
+            }
+            Ok(())
+        }
         mir::RvalueKind::ClassTest { object, .. } => {
             validate_operand_with_proven_bounds(object, function_name, true)?;
-            if !matches!(object.type_, mir::Type::Class(_)) || value.type_ != mir::Type::Bool {
+            if !matches!(object.type_, mir::Type::Class(_) | mir::Type::Interface(_))
+                || value.type_ != mir::Type::Bool
+            {
                 return Err(BackendError::new(format!(
                     "function `{function_name}` has a malformed class test"
                 )));

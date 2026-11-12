@@ -882,6 +882,12 @@ pub fn owned_rvalue_reads(value: &mir::Rvalue, reads: &mut HashSet<mir::LocalId>
         | mir::RvalueKind::ClassTest {
             object: operand, ..
         }
+        | mir::RvalueKind::InterfaceTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceLookup {
+            object: operand, ..
+        }
         | mir::RvalueKind::ArrayLength(operand)
         | mir::RvalueKind::ListLength(operand)
         | mir::RvalueKind::DictionaryLength(operand)
@@ -1676,6 +1682,8 @@ pub fn temporary_subregion_rvalue_is_executable(value: &mir::Rvalue) -> bool {
         | mir::RvalueKind::EnumConstruct { .. }
         | mir::RvalueKind::Discriminant(_)
         | mir::RvalueKind::ClassTest { .. }
+        | mir::RvalueKind::InterfaceTest { .. }
+        | mir::RvalueKind::InterfaceLookup { .. }
         | mir::RvalueKind::ListLength(_)
         | mir::RvalueKind::DictionaryLength(_)
         | mir::RvalueKind::ListVersion(_)

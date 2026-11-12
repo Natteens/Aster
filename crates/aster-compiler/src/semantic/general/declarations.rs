@@ -1,3 +1,5 @@
+use aster_syntax::auto_property_backing_field;
+
 use super::{
     AccessorKind, Analyzer, Binding, Callable, CallableKey, Context, Diagnostic, EnumCaseInfo,
     Expression, ExpressionKind, Field, FunctionDeclaration, HashMap, HashSet, InterpolatedPart,
@@ -234,8 +236,7 @@ fn collect_type_members(
     let mut field_visibility = HashMap::new();
     let mut methods: HashMap<String, Vec<Callable>> = HashMap::new();
     let mut properties = HashMap::new();
-    let mut constructor = None;
-    let mut constructor_visibility = None;
+    let mut constructors: Vec<Callable> = Vec::new();
     let mut names = HashSet::new();
     for member in &declaration.members {
         match member {
@@ -313,13 +314,7 @@ fn collect_type_members(
                             ),
                         );
                     }
-                    if constructor.is_some() {
-                        diagnostics.push(Diagnostic::error(
-                            "constructor overloads are not implemented",
-                            method.span,
-                        ));
-                    }
-                    constructor = Some(Callable {
+                    let callable = Callable {
                         signature: signature(method, context, diagnostics),
                         parameter_names: method
                             .parameters
@@ -342,8 +337,22 @@ fn collect_type_members(
                             None,
                             Some(&declaration.name),
                         ),
-                    });
-                    constructor_visibility = Some(method.visibility);
+                    };
+                    if constructors.iter().any(|existing| {
+                        existing.signature.parameters == callable.signature.parameters
+                    }) {
+                        diagnostics.push(
+                            Diagnostic::error(
+                                format!(
+                                    "duplicate constructor `{}` with the same parameter types",
+                                    declaration.name
+                                ),
+                                method.span,
+                            )
+                            .with_help("change the parameter types; constructors are distinguished by their parameters"),
+                        );
+                    }
+                    constructors.push(callable);
                     continue;
                 }
                 if declaration.is_static && !method.is_static {
@@ -412,11 +421,31 @@ fn collect_type_members(
             }
             Member::Property(property) => {
                 validate_member_visibility(property.visibility, property.span, kind, diagnostics);
-                if kind != TypeKind::Class {
+                let auto_backing = declaration.members.iter().find_map(|member| match member {
+                    Member::Field(field)
+                        if field.name == auto_property_backing_field(&property.name) =>
+                    {
+                        Some(field)
+                    }
+                    _ => None,
+                });
+                if kind != TypeKind::Class && !(kind == TypeKind::Struct && auto_backing.is_some())
+                {
                     diagnostics.push(Diagnostic::error(
                         "properties are currently supported only in classes",
                         property.span,
                     ));
+                }
+                if kind == TypeKind::Struct
+                    && auto_backing.is_some_and(|field| field.initializer.is_some())
+                {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            "struct auto-property initializers are not supported yet",
+                            property.span,
+                        )
+                        .with_help("name the property in the struct literal instead"),
+                    );
                 }
                 if declaration.is_static {
                     diagnostics.push(
@@ -527,6 +556,12 @@ fn collect_type_members(
                         type_,
                         getter,
                         setter,
+                        declared_in: declaration.name.clone(),
+                        auto_backing: auto_backing.map(|field| field.name.clone()),
+                        init_only: property
+                            .setter
+                            .as_ref()
+                            .is_some_and(|setter| setter.is_init),
                     },
                 );
             }
@@ -541,8 +576,7 @@ fn collect_type_members(
             field_visibility,
             methods,
             properties,
-            constructor,
-            constructor_visibility,
+            constructors,
             implemented_interfaces: declaration
                 .interfaces
                 .iter()
@@ -941,6 +975,7 @@ pub(super) fn validate_bodies(
                         }
                     }
                 }
+                super::inheritance::check_delegation_cycles(declaration, diagnostics, model);
             }
             Item::Struct(declaration) => {
                 for member in &declaration.members {
@@ -957,10 +992,19 @@ pub(super) fn validate_bodies(
                         validate_function(method, context, Some(declaration), diagnostics, model);
                     }
                     if let Member::Property(property) = member {
-                        diagnostics.push(Diagnostic::error(
-                            "properties are currently supported only in classes",
-                            property.span,
-                        ));
+                        // Only an auto-property is accepted on a struct (its
+                        // accessors are synthesized over a backing field).
+                        if declaration.members.iter().any(|candidate| {
+                            matches!(candidate, Member::Field(field)
+                                if field.name == auto_property_backing_field(&property.name))
+                        }) {
+                            validate_property(property, declaration, context, diagnostics, model);
+                        } else {
+                            diagnostics.push(Diagnostic::error(
+                                "properties are currently supported only in classes",
+                                property.span,
+                            ));
+                        }
                     }
                 }
             }
@@ -1052,7 +1096,17 @@ fn validate_function_with_initialized_fields(
         );
         super::inheritance::analyze_base_call(function, owner, context, diagnostics, model);
         if let Some(info) = context.types.get(&owner.name) {
-            initialized_fields.extend(info.field_owner.keys().cloned());
+            if function
+                .base_call
+                .as_ref()
+                .is_some_and(|call| call.delegates_to_this)
+            {
+                // The delegation target ran the initializers, its chain and
+                // its body: every field of the object is assigned.
+                initialized_fields.extend(info.fields.keys().cloned());
+            } else {
+                initialized_fields.extend(info.field_owner.keys().cloned());
+            }
         }
     }
     let initialized_fields = &initialized_fields;
@@ -1124,7 +1178,10 @@ fn validate_function_with_initialized_fields(
             {
                 analyzer.diagnostics.push(
                     Diagnostic::error(
-                        format!("constructor does not initialize field `{field}`"),
+                        format!(
+                            "constructor does not initialize {}",
+                            super::field_display(&field)
+                        ),
                         function.span,
                     )
                     .with_help("assign the field on every constructor path"),
@@ -1631,6 +1688,12 @@ fn collect_expression_calls<'a>(expression: &'a Expression, out: &mut Vec<&'a Ex
                 collect_expression_calls(&argument.value, out);
             }
         }
+        ExpressionKind::ObjectInitializer { creation, members } => {
+            collect_expression_calls(creation, out);
+            for member in members {
+                collect_expression_calls(&member.value, out);
+            }
+        }
         ExpressionKind::Index { array, index } => {
             collect_expression_calls(array, out);
             collect_expression_calls(index, out);
@@ -1649,7 +1712,9 @@ fn collect_expression_calls<'a>(expression: &'a Expression, out: &mut Vec<&'a Ex
         | ExpressionKind::Try { operand }
         | ExpressionKind::Await { operand }
         | ExpressionKind::Cast { operand, .. } => collect_expression_calls(operand, out),
-        ExpressionKind::TypePattern { value, .. } => collect_expression_calls(value, out),
+        ExpressionKind::TypePattern { value, .. } | ExpressionKind::TypeAs { value, .. } => {
+            collect_expression_calls(value, out);
+        }
         ExpressionKind::Conditional {
             condition,
             when_true,
@@ -1739,7 +1804,9 @@ fn collect_expression_awaits<'a>(expression: &'a Expression, out: &mut Vec<&'a E
         | ExpressionKind::IncrementDecrement { operand, .. }
         | ExpressionKind::Try { operand }
         | ExpressionKind::Cast { operand, .. } => collect_expression_awaits(operand, out),
-        ExpressionKind::TypePattern { value, .. } => collect_expression_awaits(value, out),
+        ExpressionKind::TypePattern { value, .. } | ExpressionKind::TypeAs { value, .. } => {
+            collect_expression_awaits(value, out);
+        }
         ExpressionKind::Binary { left, right, .. } => {
             collect_expression_awaits(left, out);
             collect_expression_awaits(right, out);
@@ -1790,6 +1857,12 @@ fn collect_expression_awaits<'a>(expression: &'a Expression, out: &mut Vec<&'a E
         ExpressionKind::NewObject { arguments, .. } => {
             for argument in arguments {
                 collect_expression_awaits(&argument.value, out);
+            }
+        }
+        ExpressionKind::ObjectInitializer { creation, members } => {
+            collect_expression_awaits(creation, out);
+            for member in members {
+                collect_expression_awaits(&member.value, out);
             }
         }
         ExpressionKind::ArrayLiteral(elements) => {

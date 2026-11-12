@@ -27,7 +27,7 @@ impl Codegen {
             .descriptors
             .depth(class)
             .ok_or_else(|| BackendError::new("class test target has no object descriptor"))?;
-        let object = self.translate_operand(builder, object, state)?;
+        let object = self.object_pointer(builder, object, state)?;
         let depth_offset = i32::try_from(std::mem::offset_of!(
             aster_runtime::descriptor::ClassDescriptor,
             depth
@@ -83,6 +83,134 @@ impl Codegen {
         Ok(builder.block_params(done)[0])
     }
 
+    /// The object pointer an object-model operation inspects: a class
+    /// reference is the pointer itself, an interface value holds it in its
+    /// first word.
+    pub(super) fn object_pointer(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        operand: &mir::Operand,
+        state: &FunctionState,
+    ) -> Result<Value, BackendError> {
+        let value = self.translate_operand(builder, operand, state)?;
+        if matches!(operand.type_, mir::Type::Interface(_)) {
+            Ok(builder
+                .ins()
+                .load(self.pointer_type, MemFlags::new(), value, 0))
+        } else {
+            Ok(value)
+        }
+    }
+
+    /// The bounded interface search of object model B1 (sections 4.5 and 7,
+    /// U3): read the object's descriptor and compare `interface_id` of its
+    /// entries, in order, with the interface's identity. The loop runs at most
+    /// `interface_count` times and never reads an entry at or beyond it; a
+    /// null object, an empty list and a missing entry all end the search.
+    /// Returns `(found, table)` where `found` is an `i8` flag and `table` is
+    /// the entry's method table (null when not found, and a found null table
+    /// counts as not found, so a caller never calls through it).
+    pub(super) fn interface_search(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        object: Value,
+        interface: mir::SymbolId,
+    ) -> Result<(Value, Value), BackendError> {
+        use aster_runtime::descriptor::{ClassDescriptor, InterfaceEntry};
+        let offset = |value: usize, what: &str| {
+            i32::try_from(value)
+                .map_err(|_| BackendError::new(format!("descriptor {what} offset is too large")))
+        };
+        let count_offset = offset(
+            std::mem::offset_of!(ClassDescriptor, interface_count),
+            "interface count",
+        )?;
+        let entries_offset = offset(
+            std::mem::offset_of!(ClassDescriptor, interfaces),
+            "interface list",
+        )?;
+        let id_offset = offset(
+            std::mem::offset_of!(InterfaceEntry, interface_id),
+            "interface identity",
+        )?;
+        let table_offset = offset(
+            std::mem::offset_of!(InterfaceEntry, table),
+            "interface table",
+        )?;
+        let entry_size = i64::try_from(std::mem::size_of::<InterfaceEntry>())
+            .map_err(|_| BackendError::new("interface entry size is too large"))?;
+        let key = mir::type_key(&mir::Type::Interface(interface)).cast_signed();
+
+        let inspect = builder.create_block();
+        let check = builder.create_block();
+        let body = builder.create_block();
+        let hit = builder.create_block();
+        let next = builder.create_block();
+        let done = builder.create_block();
+        builder.append_block_param(check, types::I32);
+        builder.append_block_param(done, types::I8);
+        builder.append_block_param(done, self.pointer_type);
+
+        let none = builder.ins().iconst(types::I8, 0);
+        let no_table = builder.ins().iconst(self.pointer_type, 0);
+        builder
+            .ins()
+            .brif(object, inspect, &[], done, &[none.into(), no_table.into()]);
+
+        builder.switch_to_block(inspect);
+        let descriptor = builder
+            .ins()
+            .load(self.pointer_type, MemFlags::new(), object, 0);
+        let count = builder
+            .ins()
+            .load(types::I32, MemFlags::new(), descriptor, count_offset);
+        let entries = builder.ins().load(
+            self.pointer_type,
+            MemFlags::new(),
+            descriptor,
+            entries_offset,
+        );
+        let first = builder.ins().iconst(types::I32, 0);
+        builder.ins().jump(check, &[first.into()]);
+
+        builder.switch_to_block(check);
+        let index = builder.block_params(check)[0];
+        let in_range = builder.ins().icmp(IntCC::UnsignedLessThan, index, count);
+        let none = builder.ins().iconst(types::I8, 0);
+        let no_table = builder.ins().iconst(self.pointer_type, 0);
+        builder
+            .ins()
+            .brif(in_range, body, &[], done, &[none.into(), no_table.into()]);
+
+        builder.switch_to_block(body);
+        let wide = builder.ins().uextend(self.pointer_type, index);
+        let byte_offset = builder.ins().imul_imm(wide, entry_size);
+        let entry = builder.ins().iadd(entries, byte_offset);
+        let identity = builder
+            .ins()
+            .load(types::I64, MemFlags::new(), entry, id_offset);
+        let matches = builder.ins().icmp_imm(IntCC::Equal, identity, key);
+        builder.ins().brif(matches, hit, &[], next, &[]);
+
+        builder.switch_to_block(hit);
+        let table = builder
+            .ins()
+            .load(self.pointer_type, MemFlags::new(), entry, table_offset);
+        let found = builder.ins().iconst(types::I8, 1);
+        let none = builder.ins().iconst(types::I8, 0);
+        let present = builder.ins().icmp_imm(IntCC::NotEqual, table, 0);
+        let flag = builder.ins().select(present, found, none);
+        builder.ins().jump(done, &[flag.into(), table.into()]);
+
+        builder.switch_to_block(next);
+        let advanced = builder.ins().iadd_imm(index, 1);
+        builder.ins().jump(check, &[advanced.into()]);
+
+        builder.switch_to_block(done);
+        let params = builder.block_params(done);
+        Ok((params[0], params[1]))
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(super) fn translate_rvalue(
         &mut self,
@@ -92,12 +220,22 @@ impl Codegen {
     ) -> Result<Value, BackendError> {
         match &value.kind {
             // An upcast is the same object pointer: no code runs.
-            mir::RvalueKind::Use(operand)
-            | mir::RvalueKind::Upcast(operand)
-            | mir::RvalueKind::Downcast(operand) => self.translate_operand(builder, operand, state),
+            mir::RvalueKind::Use(operand) | mir::RvalueKind::Upcast(operand) => {
+                self.translate_operand(builder, operand, state)
+            }
+            // The same object pointer; the operand of a narrowing of an
+            // interface value holds it in its first word.
+            mir::RvalueKind::Downcast(operand) => self.object_pointer(builder, operand, state),
             mir::RvalueKind::ClassTest { object, class } => {
                 self.translate_class_test(builder, object, *class, state)
             }
+            mir::RvalueKind::InterfaceTest { object, interface } => {
+                let object = self.object_pointer(builder, object, state)?;
+                Ok(self.interface_search(builder, object, *interface)?.0)
+            }
+            mir::RvalueKind::InterfaceLookup { .. } => Err(BackendError::new(
+                "interface lookup reached scalar translation",
+            )),
             mir::RvalueKind::Aggregate(_) => Err(BackendError::new(
                 "aggregate rvalue reached scalar translation",
             )),

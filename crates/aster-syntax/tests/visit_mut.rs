@@ -254,12 +254,14 @@ fn fixture() -> Module {
         getter: Some(Accessor {
             visibility: Visibility::Public,
             explicit_visibility: false,
+            is_init: false,
             body: nested_block(63),
             span: span(65),
         }),
         setter: Some(Accessor {
             visibility: Visibility::Private,
             explicit_visibility: true,
+            is_init: false,
             body: nested_block(66),
             span: span(68),
         }),

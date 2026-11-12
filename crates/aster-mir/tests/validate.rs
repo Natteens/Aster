@@ -560,3 +560,125 @@ mod virtual_tables {
         assert!(message(validate_types(&not_a_class)).contains("not a class"));
     }
 }
+
+/// Object model B1, pull requests 3 and 4: dynamic interface tests and
+/// lookups, and the narrowing of an interface value back to a class.
+mod interface_search {
+    use super::*;
+    use aster_mir::{ClassDefinition, InterfaceDefinition};
+
+    fn class(symbol: u32) -> ClassDefinition {
+        ClassDefinition {
+            symbol: SymbolId(symbol),
+            name: format!("C{symbol}"),
+            base: None,
+            is_abstract: false,
+            is_sealed: false,
+            vtable: Vec::new(),
+            fields: Vec::new(),
+        }
+    }
+
+    /// Local 0 is `object_type`, local 1 is `result_type`; the module has class
+    /// 10 and interface 20.
+    fn with(object_type: Type, result_type: Type, kind: RvalueKind) -> Module {
+        let mut m = module(vec![function(
+            1,
+            vec![local(0, object_type), local(1, result_type.clone())],
+            vec![Instruction::Assign {
+                target: Place::Local(LocalId(1)),
+                value: Rvalue {
+                    type_: result_type,
+                    kind,
+                },
+            }],
+        )]);
+        m.classes = vec![class(10)];
+        m.interfaces = vec![InterfaceDefinition {
+            symbol: SymbolId(20),
+            name: "I".to_owned(),
+            methods: Vec::new(),
+        }];
+        m
+    }
+
+    fn object(type_: Type) -> Operand {
+        Operand {
+            type_,
+            kind: OperandKind::Copy(Place::Local(LocalId(0))),
+        }
+    }
+
+    #[test]
+    fn interface_test_and_lookup_accept_a_class_or_an_interface_object() {
+        for object_type in [Type::Class(SymbolId(10)), Type::Interface(SymbolId(20))] {
+            let test = RvalueKind::InterfaceTest {
+                object: object(object_type.clone()),
+                interface: SymbolId(20),
+            };
+            assert!(validate_types(&with(object_type.clone(), Type::Bool, test)).is_ok());
+            let lookup = RvalueKind::InterfaceLookup {
+                object: object(object_type.clone()),
+                interface: SymbolId(20),
+            };
+            assert!(
+                validate_types(&with(object_type, Type::Interface(SymbolId(20)), lookup)).is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn interface_test_and_lookup_reject_malformed_shapes() {
+        let class_type = Type::Class(SymbolId(10));
+        let test = |object_type: Type, interface: u32, result: Type| {
+            let kind = RvalueKind::InterfaceTest {
+                object: object(object_type.clone()),
+                interface: SymbolId(interface),
+            };
+            validate_types(&with(object_type, result, kind))
+        };
+        // The result must be `bool`.
+        assert!(test(class_type.clone(), 20, Type::Int).is_err());
+        // The tested name must be an interface, not a class or an unknown symbol.
+        assert!(test(class_type.clone(), 10, Type::Bool).is_err());
+        assert!(test(class_type, 99, Type::Bool).is_err());
+        // Only a class reference or an interface value has an object to inspect.
+        assert!(test(Type::Int, 20, Type::Bool).is_err());
+
+        let lookup = |object_type: Type, interface: u32, result: Type| {
+            let kind = RvalueKind::InterfaceLookup {
+                object: object(object_type.clone()),
+                interface: SymbolId(interface),
+            };
+            validate_types(&with(object_type, result, kind))
+        };
+        // The result must be the looked-up interface.
+        assert!(lookup(Type::Class(SymbolId(10)), 20, Type::Bool).is_err());
+        assert!(lookup(Type::Class(SymbolId(10)), 99, Type::Interface(SymbolId(99))).is_err());
+        assert!(lookup(Type::Int, 20, Type::Interface(SymbolId(20))).is_err());
+    }
+
+    #[test]
+    fn an_interface_value_narrows_to_a_class_and_a_class_test_accepts_an_interface_subject() {
+        let narrow = RvalueKind::Downcast(object(Type::Interface(SymbolId(20))));
+        assert!(
+            validate_types(&with(
+                Type::Interface(SymbolId(20)),
+                Type::Class(SymbolId(10)),
+                narrow
+            ))
+            .is_ok()
+        );
+        let test = RvalueKind::ClassTest {
+            object: object(Type::Interface(SymbolId(20))),
+            class: SymbolId(10),
+        };
+        assert!(validate_types(&with(Type::Interface(SymbolId(20)), Type::Bool, test)).is_ok());
+        // A class test names a class, never an interface.
+        let wrong = RvalueKind::ClassTest {
+            object: object(Type::Interface(SymbolId(20))),
+            class: SymbolId(20),
+        };
+        assert!(validate_types(&with(Type::Interface(SymbolId(20)), Type::Bool, wrong)).is_err());
+    }
+}

@@ -250,11 +250,12 @@ fn rejects_patterns_that_can_never_match() {
 }
 
 #[test]
-fn rejects_interface_targets_with_a_clear_not_supported_yet() {
-    rejected_with(
-        &program(r"public bool Run(Shape s) { return s is IShape i; }"),
-        "not supported yet",
-    );
+fn interface_targets_are_supported_by_a_dynamic_interface_search() {
+    // T-OBJ-4: a non-sealed class may be tested against an interface that a
+    // derived class implements; the binding is an interface value.
+    accepted(&program(
+        r"public int Run(Shape s) { if (s is IShape i) { return i.Area(); } return 0; }",
+    ));
 }
 
 #[test]

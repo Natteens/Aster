@@ -101,7 +101,7 @@ impl Analyzer<'_> {
             }
             return Type::Class(type_name.to_owned());
         }
-        let Some(signature) = info.constructor.clone() else {
+        if info.constructors.is_empty() {
             self.diagnostics.push(
                 Diagnostic::error(format!("class `{type_name}` has no constructor"), span)
                     .with_help(format!("declare `{type_name}(...)` inside the class")),
@@ -110,22 +110,36 @@ impl Analyzer<'_> {
                 self.expression(argument);
             }
             return Type::Class(type_name.to_owned());
-        };
-        if info.constructor_visibility == Some(Visibility::Private)
-            && self.owner.as_deref() != Some(type_name)
-        {
-            self.diagnostics.push(Diagnostic::error(
-                format!("constructor `{type_name}` is private"),
-                span,
-            ));
         }
-        if info.constructor_visibility == Some(Visibility::Protected)
-            && self.owner.as_deref() != Some(type_name)
-        {
-            self.diagnostics.push(
-                Diagnostic::error(format!("constructor `{type_name}` is protected"), span)
-                    .with_help("a protected constructor is reached only through `base(...)` from a derived class"),
-            );
+        // Only constructors the call site may use are candidates. When none is
+        // accessible the error names the strictest visibility.
+        let inside = self.owner.as_deref() == Some(type_name);
+        let accessible = info
+            .constructors
+            .iter()
+            .filter(|constructor| inside || constructor.visibility == Visibility::Public)
+            .cloned()
+            .collect::<Vec<_>>();
+        if accessible.is_empty() {
+            let all_protected = info
+                .constructors
+                .iter()
+                .all(|constructor| constructor.visibility == Visibility::Protected);
+            if all_protected {
+                self.diagnostics.push(
+                    Diagnostic::error(format!("constructor `{type_name}` is protected"), span)
+                        .with_help("a protected constructor is reached only through `base(...)` from a derived class"),
+                );
+            } else {
+                self.diagnostics.push(Diagnostic::error(
+                    format!("constructor `{type_name}` is private"),
+                    span,
+                ));
+            }
+            for argument in arguments {
+                self.expression(argument);
+            }
+            return Type::Class(type_name.to_owned());
         }
         let argument_types = arguments
             .iter()
@@ -137,13 +151,9 @@ impl Analyzer<'_> {
                 }
             })
             .collect::<Vec<_>>();
-        if let Some((signature, plan)) = self.resolve_call_overload(
-            type_name,
-            std::slice::from_ref(&signature),
-            &argument_types,
-            arguments,
-            span,
-        ) {
+        if let Some((signature, plan)) =
+            self.resolve_call_overload(type_name, &accessible, &argument_types, arguments, span)
+        {
             let key = self.model_key(span);
             self.model.constructors.insert(key.clone(), signature.key);
             self.model.call_arguments.insert(key, plan);
@@ -184,12 +194,22 @@ impl Analyzer<'_> {
                 ));
                 return Type::Unknown;
             };
-            self.model
-                .property_reads
-                .insert(self.model_key(span), getter.key.clone());
             let key = getter.key.clone();
             let type_ = property.type_.clone();
-            self.note_this_call(&key, span);
+            let direct = property.direct_backing().map(str::to_owned);
+            let declared_here = property.declared_in == *owner;
+            let property_name = name.to_owned();
+            if let Some(backing) = direct {
+                self.model
+                    .auto_property_fields
+                    .insert(self.model_key(span), backing.clone());
+                self.note_auto_property_read(&backing, declared_here, &key, &property_name, span);
+            } else {
+                self.model
+                    .property_reads
+                    .insert(self.model_key(span), key.clone());
+                self.note_this_call(&key, span);
+            }
             type_
         } else if !self.instance_context
             && let Some(owner) = self.owner.clone()
@@ -201,7 +221,9 @@ impl Analyzer<'_> {
             } else {
                 "property"
             };
-            let context = if self.base_arguments {
+            let context = if self.base_arguments && self.chain_label == "this" {
+                "the arguments of `this(...)`"
+            } else if self.base_arguments {
                 "the arguments of `base(...)`"
             } else {
                 "a static context"
@@ -362,9 +384,16 @@ impl Analyzer<'_> {
                         &format!("getter for property `{type_name}.{name}`"),
                         span,
                     );
-                    self.model
-                        .property_reads
-                        .insert(self.model_key(span), getter.key.clone());
+                    let direct = property.direct_backing().map(str::to_owned);
+                    if let Some(backing) = &direct {
+                        self.model
+                            .auto_property_fields
+                            .insert(self.model_key(span), backing.clone());
+                    } else {
+                        self.model
+                            .property_reads
+                            .insert(self.model_key(span), getter.key.clone());
+                    }
                     if receiver_is_base && getter.dispatch == MemberDispatch::Abstract {
                         self.diagnostics.push(
                             Diagnostic::error(
@@ -376,7 +405,18 @@ impl Analyzer<'_> {
                             .with_help("call a concrete member, or implement it in the base class"),
                         );
                     }
-                    if receiver_is_this || receiver_is_base {
+                    if let Some(backing) = direct.as_deref()
+                        && receiver_is_this
+                    {
+                        let declared_here = self.owner.as_deref() == Some(&property.declared_in);
+                        self.note_auto_property_read(
+                            backing,
+                            declared_here,
+                            &getter.key,
+                            name,
+                            span,
+                        );
+                    } else if receiver_is_this || receiver_is_base {
                         self.base_access = receiver_is_base;
                         self.note_this_call(&getter.key, span);
                         self.base_access = false;
@@ -1596,6 +1636,7 @@ impl Analyzer<'_> {
             this_usage: None,
             base_access: false,
             base_arguments: self.base_arguments,
+            chain_label: self.chain_label,
         };
         let actual = analyzer.expression_expected(argument, Some(expected));
         analyzer.require_assignable_value(expected, &actual, argument);

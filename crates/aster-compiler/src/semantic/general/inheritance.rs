@@ -637,11 +637,14 @@ fn unmatched_override(
     ));
 }
 
-/// Resolve and validate the base constructor a constructor runs: the explicit
-/// `: base(arguments)` or, without it, the base constructor whose parameters
-/// are all defaulted. The arguments are analyzed in a context with no object
-/// (no `this`, fields or instance methods), because the object is not usable
-/// before the base constructor completes.
+/// Resolve and validate the constructor a constructor runs first: the target
+/// of `: this(arguments)` (a constructor of the same class, B2), the explicit
+/// `: base(arguments)` or, without either, the base constructor whose
+/// parameters are all defaulted. The arguments are analyzed in a context with
+/// no object (no `this`, fields or instance methods), because the object is not
+/// usable before that constructor completes. The resolved target is stored in
+/// `Model::base_constructors`; for a delegation it is a constructor of the
+/// owner itself.
 #[allow(clippy::too_many_lines)]
 pub(super) fn analyze_base_call(
     function: &FunctionDeclaration,
@@ -653,60 +656,83 @@ pub(super) fn analyze_base_call(
     let Some(info) = context.types.get(&owner.name) else {
         return;
     };
-    let Some(base) = info.base.clone() else {
-        if let Some(call) = &function.base_call {
+    let delegates = function
+        .base_call
+        .as_ref()
+        .is_some_and(|call| call.delegates_to_this);
+    let (target, candidates, label) = if delegates {
+        (owner.name.clone(), info.constructors.clone(), "this")
+    } else {
+        let Some(base) = info.base.clone() else {
+            if let Some(call) = &function.base_call {
+                diagnostics.push(
+                    Diagnostic::error(
+                        format!("`base(...)` requires `{}` to have a base class", owner.name),
+                        call.span,
+                    )
+                    .with_help("name a base class after `:` in the class declaration, or remove the initializer"),
+                );
+            }
+            return;
+        };
+        let Some(base_info) = context.types.get(&base) else {
+            return;
+        };
+        let call_span = function
+            .base_call
+            .as_ref()
+            .map_or(function.span, |call| call.span);
+        if base_info.constructors.is_empty() {
             diagnostics.push(
                 Diagnostic::error(
-                    format!("`base(...)` requires `{}` to have a base class", owner.name),
-                    call.span,
+                    format!("base class `{base}` has no constructor to call"),
+                    call_span,
                 )
-                .with_help("name a base class after `:` in the class declaration, or remove the initializer"),
+                .with_help(format!(
+                    "declare a constructor in `{base}`; an implicit one exists only when every field has an initializer or a zero default"
+                )),
             );
+            return;
         }
-        return;
-    };
-    let Some(base_info) = context.types.get(&base) else {
-        return;
+        let accessible = base_info
+            .constructors
+            .iter()
+            .filter(|constructor| constructor.visibility != Visibility::Private)
+            .cloned()
+            .collect::<Vec<_>>();
+        if accessible.is_empty() {
+            diagnostics.push(
+                Diagnostic::error(
+                    format!("constructor of base class `{base}` is private"),
+                    call_span,
+                )
+                .with_help("make the base constructor `protected` or `public`"),
+            );
+            return;
+        }
+        if function.base_call.is_none()
+            && !accessible
+                .iter()
+                .any(|constructor| constructor.defaults.iter().all(Option::is_some))
+        {
+            diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "constructor of `{}` must call `base(...)`: base class `{base}` has no constructor without required arguments",
+                        owner.name
+                    ),
+                    function.span,
+                )
+                .with_help(format!("write `: base(...)` after the parameter list, passing the arguments `{base}` needs")),
+            );
+            return;
+        }
+        (base, accessible, "base")
     };
     let call_span = function
         .base_call
         .as_ref()
         .map_or(function.span, |call| call.span);
-    let Some(constructor) = base_info.constructor.clone() else {
-        diagnostics.push(
-            Diagnostic::error(
-                format!("base class `{base}` has no constructor to call"),
-                call_span,
-            )
-            .with_help(format!(
-                "declare a constructor in `{base}`; an implicit one exists only when every field has an initializer or a zero default"
-            )),
-        );
-        return;
-    };
-    if base_info.constructor_visibility == Some(Visibility::Private) {
-        diagnostics.push(
-            Diagnostic::error(
-                format!("constructor of base class `{base}` is private"),
-                call_span,
-            )
-            .with_help("make the base constructor `protected` or `public`"),
-        );
-        return;
-    }
-    if function.base_call.is_none() && constructor.defaults.iter().any(Option::is_none) {
-        diagnostics.push(
-            Diagnostic::error(
-                format!(
-                    "constructor of `{}` must call `base(...)`: base class `{base}` has no constructor without required arguments",
-                    owner.name
-                ),
-                function.span,
-            )
-            .with_help(format!("write `: base(...)` after the parameter list, passing the arguments `{base}` needs")),
-        );
-        return;
-    }
     let model_context = crate::semantic::function_context(function, Some(owner));
     let mut analyzer = Analyzer::new(
         context,
@@ -721,6 +747,7 @@ pub(super) fn analyze_base_call(
         model,
     );
     analyzer.base_arguments = true;
+    analyzer.chain_label = label;
     for parameter in &function.parameters {
         analyzer.declare(
             &parameter.name,
@@ -748,13 +775,9 @@ pub(super) fn analyze_base_call(
             }
         })
         .collect::<Vec<_>>();
-    if let Some((callable, plan)) = analyzer.resolve_call_overload(
-        &base,
-        std::slice::from_ref(&constructor),
-        &argument_types,
-        arguments,
-        call_span,
-    ) {
+    if let Some((callable, plan)) =
+        analyzer.resolve_call_overload(&target, &candidates, &argument_types, arguments, call_span)
+    {
         analyzer.model.base_constructors.insert(
             model_context,
             ResolvedBaseConstructor {
@@ -764,6 +787,86 @@ pub(super) fn analyze_base_call(
         );
     }
     diagnostics.append(&mut analyzer.diagnostics);
+}
+
+/// A constructor that delegates with `this(...)`, directly or through other
+/// constructors, back to itself can never complete: report each cycle once.
+pub(super) fn check_delegation_cycles(
+    declaration: &TypeDeclaration,
+    diagnostics: &mut Vec<Diagnostic>,
+    model: &Model,
+) {
+    let constructors = declaration
+        .members
+        .iter()
+        .filter_map(|member| match member {
+            Member::Method(method) if method.constructor => Some(method),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let key_of = |method: &FunctionDeclaration| {
+        crate::semantic::callable_key(
+            &method.name,
+            method.span.start,
+            &method.parameters,
+            None,
+            Some(&declaration.name),
+        )
+    };
+    // Constructor index -> index of the constructor its `this(...)` selects.
+    let edges = constructors
+        .iter()
+        .map(|method| {
+            if !method
+                .base_call
+                .as_ref()
+                .is_some_and(|call| call.delegates_to_this)
+            {
+                return None;
+            }
+            let resolved = model
+                .base_constructors
+                .get(&crate::semantic::function_context(
+                    method,
+                    Some(declaration),
+                ))?;
+            constructors
+                .iter()
+                .position(|candidate| key_of(candidate) == resolved.callable)
+        })
+        .collect::<Vec<_>>();
+    let mut reported = vec![false; constructors.len()];
+    for start in 0..constructors.len() {
+        let mut path: Vec<usize> = Vec::new();
+        let mut current = Some(start);
+        while let Some(index) = current {
+            if let Some(at) = path.iter().position(|visited| *visited == index) {
+                let cycle = &path[at..];
+                if cycle.iter().all(|member| !reported[*member]) {
+                    for member in cycle {
+                        reported[*member] = true;
+                    }
+                    let first = *cycle.iter().min().expect("a cycle has a constructor");
+                    diagnostics.push(
+                        Diagnostic::error(
+                            format!(
+                                "constructors of `{}` delegate to each other in a cycle through `this(...)`",
+                                declaration.name
+                            ),
+                            constructors[first].span,
+                        )
+                        .with_help("break the cycle: one constructor must not delegate with `this(...)` and run the initializers and the body"),
+                    );
+                }
+                break;
+            }
+            if reported[index] {
+                break;
+            }
+            path.push(index);
+            current = edges[index];
+        }
+    }
 }
 
 /// Span of the declaration of member `name`, for diagnostics.

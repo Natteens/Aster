@@ -581,6 +581,9 @@ impl Context<'_> {
                     | RvalueKind::Downcast(operand)
                     | RvalueKind::MakeInterface {
                         object: operand, ..
+                    }
+                    | RvalueKind::InterfaceLookup {
+                        object: operand, ..
                     } => sources.push(operand),
                     RvalueKind::Aggregate(fields) | RvalueKind::EnumConstruct { fields, .. } => {
                         sources.extend(fields.iter().map(|field| &field.value));
@@ -1565,6 +1568,9 @@ fn usage_of(instruction: &Instruction, local: LocalId) -> Usage {
             | RvalueKind::Upcast(operand)
             | RvalueKind::Downcast(operand)
             | RvalueKind::MakeInterface {
+                object: operand, ..
+            }
+            | RvalueKind::InterfaceLookup {
                 object: operand, ..
             } => usage.kept = direct(operand),
             RvalueKind::Aggregate(fields) | RvalueKind::EnumConstruct { fields, .. } => {

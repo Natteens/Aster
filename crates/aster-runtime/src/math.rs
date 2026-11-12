@@ -306,6 +306,7 @@ pub extern "C" fn aster_rt_math_domain_error(context: *mut ExecutionContext, cod
         7 => "collection range is outside the valid bounds",
         8 => "random range requires minInclusive to be less than maxExclusive",
         9 => "an abstract method was called: the object's class does not implement it",
+        10 => "an interface conversion found no method table in the object's class",
         _ => "unknown runtime error",
     };
     context.fail(message);

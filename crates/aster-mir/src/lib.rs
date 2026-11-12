@@ -1180,9 +1180,10 @@ pub enum RvalueKind {
     Upcast(Operand),
     /// Identity-preserving class narrowing that backs the binding of a class
     /// type pattern: the result is the same object pointer, statically typed
-    /// as a class related to the operand's class (derived, equal or base).
-    /// It performs no check and is only produced for a binding that is read
-    /// where a dominating `ClassTest` proved the test succeeded.
+    /// as a class related to the operand's class (derived, equal or base), or
+    /// the object half of an interface-typed operand. It performs no check
+    /// and is only produced for a binding that is read where a dominating
+    /// `ClassTest` proved the test succeeded.
     Downcast(Operand),
     /// Run-time class test of a class reference: `true` when the object's
     /// class is `class` or derives from it. The result type is `bool`.
@@ -1193,6 +1194,23 @@ pub enum RvalueKind {
     MakeInterface {
         object: Operand,
         class: SymbolId,
+        interface: SymbolId,
+    },
+    /// Run-time interface test (object model B1, sections 4.5 and 7): `true`
+    /// when the class descriptor of `object` lists `interface`. `object` is a
+    /// class reference or an interface value (its object half is tested). The
+    /// search is bounded by the descriptor's interface count. The result type
+    /// is `bool`.
+    InterfaceTest {
+        object: Operand,
+        interface: SymbolId,
+    },
+    /// Dynamic class-to-interface conversion: an interface value made of the
+    /// object and the table found by searching the descriptor's interface
+    /// list for `interface`. A search that finds nothing records a controlled
+    /// run-time error. The result type is `Interface(interface)`.
+    InterfaceLookup {
+        object: Operand,
         interface: SymbolId,
     },
     Unary {

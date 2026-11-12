@@ -5,6 +5,7 @@ members = [
     "crates/aster-codegen-cranelift",
     "crates/aster-compiler",
     "crates/aster-diagnostics",
+    "crates/aster-exec",
     "crates/aster-hir",
     "crates/aster-mir",
     "crates/aster-runtime",

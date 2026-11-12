@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Cranelift JIT backend for Aster MIR"
 
 [features]
-aarm-telemetry = ["aster-runtime/aarm-telemetry", "dep:windows-sys"]
+aarm-telemetry = ["aster-runtime/aarm-telemetry", "aster-exec/aarm-telemetry", "dep:windows-sys"]
 # Class objects carry an 8-byte header (H8) whose offset-0 word points at the
 # class descriptor; this is the default layout. The features below are
 # MEM-EXP-1 experiment overrides (mutually exclusive) that widen the header to
@@ -85,6 +85,7 @@ path = "examples/array_loop_matrix.rs"
 required-features = ["aarm-telemetry"]
 
 [dependencies]
+aster-exec = { path = "../aster-exec", version = "0.71.0" }
 aster-mir = { path = "../aster-mir", version = "0.71.0" }
 aster-runtime = { path = "../aster-runtime", version = "0.71.0" }
 aster-types = { path = "../aster-types", version = "0.71.0" }

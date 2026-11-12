@@ -5,10 +5,10 @@ use aster_diagnostics::{Diagnostic, Span};
 use crate::{
     Accessor, Argument, AssignmentOperator, BaseCall, BinaryOperator, Block, EnumCase,
     EnumDeclaration, Expression, ExpressionKind, Field, FieldInitializer, FunctionDeclaration,
-    IncrementOperator, InterpolatedPart, Item, Literal, Member, MemberDispatch, Module, Parameter,
-    PatternBinding, Property, Statement, SwitchCase, SwitchExpressionCase, Token, TokenKind,
-    TypeDeclaration, TypeParameter, TypeRef, UnaryOperator, VariableDeclaration, VariableKind,
-    Visibility,
+    IncrementOperator, InterpolatedPart, Item, Literal, Member, MemberDispatch, MemberInitializer,
+    Module, Parameter, PatternBinding, Property, Statement, SwitchCase, SwitchExpressionCase,
+    Token, TokenKind, TypeDeclaration, TypeParameter, TypeRef, UnaryOperator, VariableDeclaration,
+    VariableKind, Visibility, auto_property_backing_field,
 };
 
 /// Maximum recursive source/AST nesting accepted by the frontend. This is a
@@ -28,6 +28,7 @@ pub fn parse(tokens: Vec<Token>) -> Result<Module, Vec<Diagnostic>> {
         diagnostics: Vec::new(),
         nesting_depth: 0,
         nesting_reported: false,
+        pending_members: Vec::new(),
     };
     let module = parser.module();
     if parser.diagnostics.is_empty() {
@@ -43,6 +44,9 @@ struct Parser {
     diagnostics: Vec<Diagnostic>,
     nesting_depth: usize,
     nesting_reported: bool,
+    /// Members synthesized next to the one `member` returns (the backing
+    /// field of an auto-property); the type body pushes them first.
+    pending_members: Vec<Member>,
 }
 
 /// One parsed switch label; see `Parser::switch_pattern`.
@@ -138,11 +142,16 @@ impl Parser {
                     operand: length, ..
                 }
                 | ExpressionKind::TypePattern { value: length, .. }
+                | ExpressionKind::TypeAs { value: length, .. }
                 | ExpressionKind::Member { object: length, .. } => {
                     pending.push((length, nested));
                 }
                 ExpressionKind::NewObject { arguments, .. } => {
                     pending.extend(arguments.iter().map(|argument| (&argument.value, nested)));
+                }
+                ExpressionKind::ObjectInitializer { creation, members } => {
+                    pending.push((creation, nested));
+                    pending.extend(members.iter().map(|member| (&member.value, nested)));
                 }
                 ExpressionKind::Index { array, index }
                 | ExpressionKind::Binary {
@@ -509,8 +518,10 @@ impl Parser {
         let mut members = Vec::new();
         while !self.at(&TokenKind::RightBrace) && !self.at(&TokenKind::Eof) {
             if let Some(member) = self.member(kind, &name) {
+                members.append(&mut self.pending_members);
                 members.push(member);
             } else {
+                self.pending_members.clear();
                 self.synchronize_member();
             }
         }
@@ -675,14 +686,23 @@ impl Parser {
                         .with_help("remove `async` from the property"),
                 );
             }
+            let property = self.property_after_name(visibility, dispatch, type_ref, name, start)?;
             if is_static {
-                self.diagnostics.push(
-                    Diagnostic::error("static properties are not implemented", self.current().span)
-                        .with_help("remove `static` from the property"),
-                );
+                let (message, help) = if self.pending_members.is_empty() {
+                    (
+                        "static properties are not implemented",
+                        "remove `static` from the property",
+                    )
+                } else {
+                    (
+                        "static auto-properties are not supported yet",
+                        "they need static fields; write an explicit property or a static method",
+                    )
+                };
+                self.diagnostics
+                    .push(Diagnostic::error(message, property.span).with_help(help));
             }
-            self.property_after_name(visibility, dispatch, type_ref, name, start)
-                .map(Member::Property)
+            Some(Member::Property(property))
         } else {
             if dispatch != MemberDispatch::None {
                 self.diagnostics.push(
@@ -865,31 +885,37 @@ impl Parser {
         }
     }
 
-    /// `: base(arguments)` after a constructor's parameter list.
+    /// `: base(arguments)` or `: this(arguments)` after a constructor's
+    /// parameter list.
     fn base_call(&mut self) -> Option<BaseCall> {
         let colon = self.expect(&TokenKind::Colon)?;
-        if self.at(&TokenKind::This) {
-            self.diagnostics.push(
-                Diagnostic::error(
-                    "`this(...)` constructor chaining is not supported yet",
-                    self.current().span,
-                )
-                .with_help(
-                    "a class has one constructor; use `: base(...)` to reach the base class",
-                ),
-            );
-            return None;
+        let delegates_to_this = self.at(&TokenKind::This);
+        if delegates_to_this {
+            self.advance();
+        } else {
+            self.expect(&TokenKind::Base)?;
         }
-        self.expect(&TokenKind::Base)?;
         self.expect(&TokenKind::LeftParen)?;
         let arguments = self.arguments()?;
         let right_paren = self.expect(&TokenKind::RightParen)?;
+        if self.at(&TokenKind::Colon) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "a constructor can have only one initializer, `: this(...)` or `: base(...)`",
+                    self.current().span,
+                )
+                .with_help("`this(...)` runs another constructor of the class, which reaches `base(...)` itself"),
+            );
+            return None;
+        }
         Some(BaseCall {
+            delegates_to_this,
             arguments,
             span: Span::new(colon.span.start, right_paren.span.end),
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn property_after_name(
         &mut self,
         visibility: Visibility,
@@ -901,16 +927,26 @@ impl Parser {
         self.expect(&TokenKind::LeftBrace)?;
         let mut getter = None;
         let mut setter = None;
+        let mut accessor_count = 0_usize;
+        let mut bodyless_count = 0_usize;
         while !self.at(&TokenKind::RightBrace) && !self.at(&TokenKind::Eof) {
             let accessor_start = self.current().span.start;
             let explicit_visibility = self.current_visibility().is_some();
             let accessor_visibility = self.visibility(visibility);
             let kind = self.advance().clone();
-            let body = if dispatch == MemberDispatch::Abstract {
+            accessor_count += 1;
+            let bodyless = self.at(&TokenKind::Semicolon);
+            let body = if dispatch == MemberDispatch::Abstract || bodyless {
                 // An abstract accessor has no body: `get;` / `set;`. The
                 // empty block only keeps the accessor shape uniform; semantic
-                // analysis never analyzes it.
+                // analysis never analyzes it. On a non-abstract property the
+                // bodyless accessor is an auto-property accessor, and the
+                // block is replaced below once the property is known to be
+                // wholly automatic.
                 let semicolon = self.expect(&TokenKind::Semicolon)?;
+                if dispatch != MemberDispatch::Abstract {
+                    bodyless_count += 1;
+                }
                 Block {
                     statements: Vec::new(),
                     span: Span::new(semicolon.span.start, semicolon.span.end),
@@ -918,9 +954,11 @@ impl Parser {
             } else {
                 self.block()?
             };
+            let is_init = matches!(&kind.kind, TokenKind::Identifier(value) if value == "init");
             let accessor = Accessor {
                 visibility: accessor_visibility,
                 explicit_visibility,
+                is_init,
                 span: Span::new(accessor_start, body.span.end),
                 body,
             };
@@ -928,24 +966,118 @@ impl Parser {
                 TokenKind::Identifier(ref value) if value == "get" && getter.is_none() => {
                     getter = Some(accessor);
                 }
-                TokenKind::Identifier(ref value) if value == "set" && setter.is_none() => {
+                TokenKind::Identifier(ref value)
+                    if (value == "set" || value == "init") && setter.is_none() =>
+                {
                     setter = Some(accessor);
                 }
                 TokenKind::Identifier(ref value) if value == "get" => self.diagnostics.push(
                     Diagnostic::error("a property can declare only one getter", kind.span),
                 ),
-                TokenKind::Identifier(ref value) if value == "set" => self.diagnostics.push(
-                    Diagnostic::error("a property can declare only one setter", kind.span),
-                ),
+                TokenKind::Identifier(ref value) if value == "set" || value == "init" => {
+                    self.diagnostics.push(Diagnostic::error(
+                        "a property can declare only one setter",
+                        kind.span,
+                    ));
+                }
                 _ => {
                     self.diagnostics.push(
-                        Diagnostic::error("expected `get` or `set` accessor", kind.span)
+                        Diagnostic::error("expected `get`, `set` or `init` accessor", kind.span)
                             .with_help("declare an explicit accessor body"),
                     );
                 }
             }
         }
-        let end = self.expect(&TokenKind::RightBrace)?.span.end;
+        let mut end = self.expect(&TokenKind::RightBrace)?.span.end;
+        let auto = bodyless_count > 0;
+        if auto && bodyless_count != accessor_count {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "an auto-property cannot mix accessors with and without bodies",
+                    Span::new(start, end),
+                )
+                .with_help("give every accessor a body, or none of them"),
+            );
+        }
+        if setter.as_ref().is_some_and(|accessor| accessor.is_init)
+            && dispatch != MemberDispatch::None
+        {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "`init` accessors are not supported yet on `virtual`, `override` or `abstract` properties",
+                    Span::new(start, end),
+                )
+                .with_help("use `set`, or make the property non-virtual"),
+            );
+        }
+        let mut initializer = None;
+        if self.at(&TokenKind::Equal) {
+            let equal = self.advance().span;
+            if auto {
+                initializer = Some(self.expression()?);
+                end = self.expect(&TokenKind::Semicolon)?.span.end;
+            } else {
+                self.diagnostics.push(
+                    Diagnostic::error("only an auto-property can have an initializer", equal)
+                        .with_help(
+                            "remove the initializer, or declare the accessors as `get;`/`set;`",
+                        ),
+                );
+                self.expression()?;
+                self.expect(&TokenKind::Semicolon)?;
+            }
+        }
+        let span = Span::new(start, end);
+        if auto {
+            // LANG-005: an auto-property is a private backing field plus
+            // trivial accessors over it. The field name contains `<`, so no
+            // source identifier can name it.
+            let backing = auto_property_backing_field(&name);
+            let this_field = |at: Span| Expression {
+                kind: ExpressionKind::Member {
+                    object: Box::new(Expression {
+                        kind: ExpressionKind::This,
+                        span: at,
+                    }),
+                    name: backing.clone(),
+                },
+                span: at,
+            };
+            if let Some(accessor) = &mut getter {
+                let at = accessor.span;
+                accessor.body = Block {
+                    statements: vec![Statement::Return {
+                        value: Some(this_field(at)),
+                        span: at,
+                    }],
+                    span: at,
+                };
+            }
+            if let Some(accessor) = &mut setter {
+                let at = accessor.span;
+                accessor.body = Block {
+                    statements: vec![Statement::Expression(Expression {
+                        kind: ExpressionKind::Assignment {
+                            target: Box::new(this_field(at)),
+                            operator: AssignmentOperator::Assign,
+                            value: Box::new(Expression {
+                                kind: ExpressionKind::Name("value".to_owned()),
+                                span: at,
+                            }),
+                        },
+                        span: at,
+                    })],
+                    span: at,
+                };
+            }
+            self.pending_members.push(Member::Field(Field {
+                visibility: Visibility::Private,
+                type_ref: type_ref.clone(),
+                name: backing,
+                initializer,
+                span,
+            }));
+        }
         Some(Property {
             dispatch,
             visibility,
@@ -953,7 +1085,7 @@ impl Parser {
             name,
             getter,
             setter,
-            span: Span::new(start, end),
+            span,
         })
     }
 
@@ -1770,6 +1902,18 @@ impl Parser {
     /// `value is Type` and `value is Type name`, at the relational level.
     /// `is` is a contextual keyword recognized only in operator position.
     fn type_pattern_suffix(&mut self, mut expression: Expression) -> Option<Expression> {
+        while self.at_identifier("as") {
+            self.advance();
+            let target = self.type_ref()?;
+            let span = Span::new(expression.span.start, target.span.end);
+            expression = Expression {
+                kind: ExpressionKind::TypeAs {
+                    value: Box::new(expression),
+                    target: Box::new(target),
+                },
+                span,
+            };
+        }
         while self.at_identifier("is") {
             self.advance();
             let target = self.type_ref()?;
@@ -2398,13 +2542,14 @@ impl Parser {
             self.advance();
             let arguments = self.arguments()?;
             let end = self.expect(&TokenKind::RightParen)?.span.end;
-            return Some(Expression {
+            let creation = Expression {
                 kind: ExpressionKind::NewObject {
                     type_name: None,
                     arguments,
                 },
                 span: Span::new(start, end),
-            });
+            };
+            return self.object_initializer(creation);
         }
         let element_type = self.type_ref_base()?;
         if self.take(&TokenKind::LeftBracket).is_some() {
@@ -2418,13 +2563,84 @@ impl Parser {
                 span: Span::new(start, end),
             });
         }
+        if self.at(&TokenKind::LeftBrace) {
+            // `new T { ... }`: the parameterless form of an object initializer.
+            let creation = Expression {
+                kind: ExpressionKind::NewObject {
+                    type_name: Some(element_type.name),
+                    arguments: Vec::new(),
+                },
+                span: Span::new(start, element_type.span.end),
+            };
+            return self.object_initializer(creation);
+        }
         self.expect(&TokenKind::LeftParen)?;
         let arguments = self.arguments()?;
         let end = self.expect(&TokenKind::RightParen)?.span.end;
-        Some(Expression {
+        let creation = Expression {
             kind: ExpressionKind::NewObject {
                 type_name: Some(element_type.name),
                 arguments,
+            },
+            span: Span::new(start, end),
+        };
+        self.object_initializer(creation)
+    }
+
+    /// Optional `{ Name = value, ... }` after `new T(...)`. Nested object
+    /// initializers and collection initializers are rejected explicitly.
+    fn object_initializer(&mut self, creation: Expression) -> Option<Expression> {
+        if !self.at(&TokenKind::LeftBrace) {
+            return Some(creation);
+        }
+        self.advance();
+        let start = creation.span.start;
+        let mut members = Vec::new();
+        while !self.at(&TokenKind::RightBrace) && !self.at(&TokenKind::Eof) {
+            let (name, name_span) = self.identifier()?;
+            if !self.at(&TokenKind::Equal) {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "expected `=` after `{name}` in an object initializer, found {}",
+                            self.current().kind.description()
+                        ),
+                        self.current().span,
+                    )
+                    .with_help(
+                        "write `Member = value`; collection initializers are not supported yet",
+                    ),
+                );
+                return None;
+            }
+            self.advance();
+            if self.at(&TokenKind::LeftBrace) {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "nested object and collection initializers are not supported yet",
+                        self.current().span,
+                    )
+                    .with_help("assign a fully constructed value: `Member = new Type(...)`"),
+                );
+                return None;
+            }
+            let value = self.expression()?;
+            let end = value.span.end;
+            members.push(MemberInitializer {
+                name,
+                name_span,
+                value,
+                span: Span::new(name_span.start, end),
+            });
+            if self.take(&TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+        let end = self.expect(&TokenKind::RightBrace)?.span.end;
+        Some(Expression {
+            kind: ExpressionKind::ObjectInitializer {
+                creation: Box::new(creation),
+                members,
             },
             span: Span::new(start, end),
         })

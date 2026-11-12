@@ -1,0 +1,26 @@
+[package]
+name = "aster-exec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Backend-neutral scheduler, task runtime and concurrency ABI for Aster programs"
+
+[features]
+# Forwarded by aster-codegen-cranelift's own `aarm-telemetry` feature.
+aarm-telemetry = ["aster-runtime/aarm-telemetry"]
+
+[dependencies]
+aster-mir = { path = "../aster-mir", version = "0.71.0" }
+aster-runtime = { path = "../aster-runtime", version = "0.71.0" }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[dev-dependencies]
+aster-compiler = { path = "../aster-compiler", version = "0.71.0" }

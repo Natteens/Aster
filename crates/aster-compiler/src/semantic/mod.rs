@@ -5,7 +5,8 @@ use std::collections::{HashMap, HashSet};
 use aster_diagnostics::{Diagnostic, Span};
 use aster_hir::StringOperation;
 use aster_syntax::{
-    Expression, ExpressionKind, Item, Literal, Module, SwitchCase, SwitchExpressionCase, TypeRef,
+    AssignmentOperator, Expression, ExpressionKind, Item, Literal, MemberInitializer, Module,
+    SwitchCase, SwitchExpressionCase, TypeRef,
     visit::{
         AstVisitorMut, walk_expression_mut, walk_switch_case_mut, walk_switch_expression_case_mut,
     },
@@ -194,6 +195,15 @@ pub(crate) enum ResolvedPropagation {
     },
 }
 
+/// The `Option<T>` an `value as T` expression produces: the concrete
+/// specialization and the positions of its `Some` and `None` cases.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedTypeAs {
+    pub option_type: String,
+    pub some_index: usize,
+    pub none_index: usize,
+}
+
 /// The constructor of the base class a derived constructor runs: an explicit
 /// `: base(arguments)` or the implicit call of a base constructor whose
 /// parameters all have defaults. `arguments` binds the source-ordered
@@ -245,6 +255,12 @@ pub(crate) struct Model {
     pub foreign_calls: HashSet<ModelNodeKey>,
     pub constructors: HashMap<ModelNodeKey, CallableKey>,
     pub property_reads: HashMap<ModelNodeKey, CallableKey>,
+    /// Reads and writes of a statically bound auto-property that HIR lowers
+    /// directly to its synthesized backing field (LANG-005), keyed by the
+    /// `Name` or `Member` expression, mapped to the backing field name. There
+    /// is no inliner: the accessor call is skipped at lowering time, so the
+    /// backend sees a plain field access.
+    pub auto_property_fields: HashMap<ModelNodeKey, String>,
     pub property_assignments: HashMap<ModelNodeKey, ResolvedPropertyAssignment>,
     pub enum_values: HashMap<ModelNodeKey, ResolvedEnumCase>,
     pub task_runs: HashMap<ModelNodeKey, ResolvedTaskRun>,
@@ -281,6 +297,8 @@ pub(crate) struct Model {
     /// element slots exist; later layers never repeat source-level reasoning.
     pub zero_length_new_arrays: HashSet<ModelNodeKey>,
     pub propagations: HashMap<ModelNodeKey, ResolvedPropagation>,
+    /// `value as T` sites and the `Option<T>` specialization each produces.
+    pub type_as: HashMap<ModelNodeKey, ResolvedTypeAs>,
     pub string_operations: HashMap<ModelNodeKey, StringOperation>,
     pub dictionary_operations: HashMap<ModelNodeKey, ResolvedDictionaryOperation>,
     /// Intrinsic operations on the official `aster.core.StringBuilder`,
@@ -475,6 +493,34 @@ pub(crate) fn validate_deferred_language_surfaces(module: &mut Module) -> Vec<Di
     validator.diagnostics
 }
 
+/// The hidden binding naming the object under construction in an object
+/// initializer. Not a valid identifier, so source can never name it.
+pub(crate) const INITIALIZER_RECEIVER: &str = "$init";
+
+/// The synthesized `$init.Member = value` assignment for one member of an
+/// object initializer. Semantic analysis and HIR lowering both build it from
+/// the same spans so their model entries agree.
+pub(crate) fn initializer_assignment(member: &MemberInitializer) -> Expression {
+    let receiver_span = Span::new(member.name_span.start, member.name_span.start);
+    Expression {
+        kind: ExpressionKind::Assignment {
+            target: Box::new(Expression {
+                kind: ExpressionKind::Member {
+                    object: Box::new(Expression {
+                        kind: ExpressionKind::Name(INITIALIZER_RECEIVER.to_owned()),
+                        span: receiver_span,
+                    }),
+                    name: member.name.clone(),
+                },
+                span: member.name_span,
+            }),
+            operator: AssignmentOperator::Assign,
+            value: Box::new(member.value.clone()),
+        },
+        span: member.span,
+    }
+}
+
 struct DeferredLanguageSurfaceValidator {
     diagnostics: Vec<Diagnostic>,
 }
@@ -638,6 +684,7 @@ impl Model {
             calls,
             call_arguments,
             property_assignments,
+            auto_property_fields,
             enum_values,
             task_runs,
             parallel_for,
@@ -645,6 +692,7 @@ impl Model {
             parallel_reduce,
             switch_cases,
             propagations,
+            type_as,
             string_operations,
             dictionary_operations,
             string_builder_operations

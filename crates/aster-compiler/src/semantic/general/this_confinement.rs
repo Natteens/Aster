@@ -87,6 +87,35 @@ impl Analyzer<'_> {
         }
     }
 
+    /// Record a read of an auto-property of `this` that is lowered directly
+    /// to its backing field (LANG-005). Within the declaring class this is a
+    /// field read, subject to the same definite-assignment rule; a property
+    /// inherited from a base class keeps being summarized as its getter call.
+    pub(super) fn note_auto_property_read(
+        &mut self,
+        backing: &str,
+        declared_here: bool,
+        getter: &CallableKey,
+        property: &str,
+        span: Span,
+    ) {
+        if !declared_here {
+            self.note_this_call(getter, span);
+            return;
+        }
+        if self.constructor
+            && self
+                .binding(backing)
+                .is_some_and(|binding| !binding.initialized)
+        {
+            self.diagnostics.push(Diagnostic::error(
+                format!("property `{property}` is used before initialization"),
+                span,
+            ));
+        }
+        self.note_this_field_read(backing);
+    }
+
     /// Record a call of `callable` on `this` (a method, or a property
     /// accessor), with the constructor's current assignment state.
     pub(super) fn note_this_call(&mut self, callable: &CallableKey, span: Span) {
@@ -174,7 +203,11 @@ impl Analyzer<'_> {
 
     pub(super) fn this_outside_instance(&mut self, span: Span) -> super::Type {
         let message = if self.base_arguments {
-            "`this` cannot be used in the arguments of `base(...)`"
+            if self.chain_label == "this" {
+                "`this` cannot be used in the arguments of `this(...)`"
+            } else {
+                "`this` cannot be used in the arguments of `base(...)`"
+            }
         } else {
             "`this` is valid only inside an instance method"
         };

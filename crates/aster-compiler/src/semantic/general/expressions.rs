@@ -2,11 +2,13 @@ use super::statements::ResolvedSwitch;
 use super::{
     Analyzer, AssignmentOperator, BinaryOperator, Binding, Diagnostic, Expression, ExpressionKind,
     HashMap, HashSet, IncrementOperator, IntegerFit, InterpolatedPart, Literal, MemberDispatch,
-    OptionCases, Primitive, PropertyInfo, ResolvedPropagation, ResolvedPropertyAssignment,
-    ResultCases, Span, Type, TypeKind, TypeName, TypeRef, UnaryOperator, UnsignedFit, Visibility,
-    classify_integer, classify_unsigned, compatible, constant_integer, evaluate, fits_long,
-    fits_ulong, integer_value, promoted_numeric, resolve_type_readonly, zero_initializable,
+    MemberInitializer, OptionCases, Primitive, PropertyInfo, ResolvedPropagation,
+    ResolvedPropertyAssignment, ResolvedTypeAs, ResultCases, Span, Type, TypeKind, TypeName,
+    TypeRef, UnaryOperator, UnsignedFit, Visibility, classify_integer, classify_unsigned,
+    compatible, constant_integer, evaluate, fits_long, fits_ulong, integer_value, promoted_numeric,
+    resolve_type_readonly, zero_initializable,
 };
+use crate::semantic::{INITIALIZER_RECEIVER, initializer_assignment};
 
 impl Analyzer<'_> {
     /// Whether `name`'s enum shares the nominal identity of the discovered
@@ -335,6 +337,9 @@ impl Analyzer<'_> {
                     .insert(self.model_key(expression.span), type_name.clone());
                 self.new_object(&type_name, arguments, expression.span)
             }
+            (ExpressionKind::ObjectInitializer { creation, members }, Some(expected)) => {
+                self.object_initializer(creation, members, Some(expected))
+            }
             (
                 ExpressionKind::Conditional {
                     condition,
@@ -359,6 +364,69 @@ impl Analyzer<'_> {
             ),
             _ => self.expression_synthesized(expression),
         }
+    }
+
+    /// `new T(args) { A = e1, B = e2 }` (LANG-008). The constructor runs
+    /// first, then each member assignment in source order, against a hidden
+    /// receiver bound to the new object; the object is not observable before
+    /// every assignment completes. Each member is checked exactly like
+    /// `receiver.Member = value`, except that an `init` accessor is allowed.
+    fn object_initializer(
+        &mut self,
+        creation: &Expression,
+        members: &[MemberInitializer],
+        expected: Option<&Type>,
+    ) -> Type {
+        let type_ = self.expression_expected(creation, expected);
+        let Type::Class(_) = &type_ else {
+            if type_ != Type::Unknown {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "object initializers require a class, but this is `{}`",
+                            type_.display()
+                        ),
+                        creation.span,
+                    )
+                    .with_help("assign the members in separate statements"),
+                );
+            }
+            for member in members {
+                self.expression(&member.value);
+            }
+            return Type::Unknown;
+        };
+        let mut seen = HashSet::new();
+        self.scopes.push(HashMap::from([(
+            INITIALIZER_RECEIVER.to_owned(),
+            Binding {
+                type_: type_.clone(),
+                mutable: true,
+                iteration_readonly: false,
+                initialized: true,
+                span: creation.span,
+                value: None,
+            },
+        )]));
+        for member in members {
+            if !seen.insert(member.name.as_str()) {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "member `{}` is initialized more than once in this object initializer",
+                            member.name
+                        ),
+                        member.name_span,
+                    )
+                    .with_help("assign each member at most once"),
+                );
+                self.expression(&member.value);
+                continue;
+            }
+            self.expression(&initializer_assignment(member));
+        }
+        self.scopes.pop();
+        type_
     }
 
     #[allow(clippy::too_many_lines)] // central exhaustive expression-kind dispatch
@@ -392,6 +460,9 @@ impl Analyzer<'_> {
                     }
                     Type::Unknown
                 }
+            }
+            ExpressionKind::ObjectInitializer { creation, members } => {
+                self.object_initializer(creation, members, None)
             }
             ExpressionKind::Index { array, index } => self.index(array, index, expression.span),
             ExpressionKind::Name(name) => self.name(name, expression.span),
@@ -481,6 +552,9 @@ impl Analyzer<'_> {
                 target,
                 binding,
             } => self.type_pattern(value, target, binding.as_deref(), expression.span),
+            ExpressionKind::TypeAs { value, target } => {
+                self.type_as(value, target, expression.span)
+            }
             ExpressionKind::Binary {
                 left,
                 operator,
@@ -616,6 +690,40 @@ impl Analyzer<'_> {
                 self.expression(&field.value);
                 continue;
             }
+            if let Some(property) = info.properties.get(&field.name)
+                && let Some(backing) = &property.auto_backing
+            {
+                // An auto-property is initialized by name: the literal is the
+                // only construction path of a struct, so a get-only or `init`
+                // property is assignable here (T-LANG-8 widens this to object
+                // initializers). The backing field is never named in source.
+                let expected = property.type_.clone();
+                let actual = self.expression_expected(&field.value, Some(&expected));
+                let accessor_visibility = property
+                    .setter
+                    .as_ref()
+                    .or(property.getter.as_ref())
+                    .map_or(Visibility::Public, |accessor| accessor.visibility);
+                if accessor_visibility != Visibility::Public
+                    && self.owner.as_deref() != Some(type_name)
+                {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            format!("property `{type_name}.{}` is not public", field.name),
+                            field.span,
+                        )
+                        .with_help("construct aggregate values using public properties"),
+                    );
+                }
+                if !initialized.insert(backing.as_str()) {
+                    self.diagnostics.push(Diagnostic::error(
+                        format!("field `{}` is initialized more than once", field.name),
+                        field.span,
+                    ));
+                }
+                self.require_assignable_value(&expected, &actual, &field.value);
+                continue;
+            }
             let Some(expected) = info.fields.get(&field.name) else {
                 self.diagnostics.push(Diagnostic::error(
                     format!("struct `{type_name}` has no field `{}`", field.name),
@@ -640,7 +748,10 @@ impl Analyzer<'_> {
             if !initialized.contains(name.as_str()) {
                 self.diagnostics.push(
                     Diagnostic::error(
-                        format!("missing field `{name}` in `{type_name}` literal"),
+                        format!(
+                            "missing {} in `{type_name}` literal",
+                            super::field_display(name)
+                        ),
                         span,
                     )
                     .with_help("initialize every struct field explicitly"),
@@ -1059,12 +1170,146 @@ impl Analyzer<'_> {
         }
     }
 
-    /// `value is Type [name]`: a run-time class test. The target must be a class
-    /// related to the static class of the value (a derived class, or the same
-    /// or a base class, for which the test is always true); anything else can
-    /// never match and is an error. The binding is declared unassigned; the
-    /// definite-assignment rules mark it assigned where the test succeeded.
+    /// Whether the class named `class` declares or inherits `interface`.
+    fn class_implements(&self, class: &str, interface: &str) -> bool {
+        self.context.types.get(class).is_some_and(|info| {
+            info.implemented_interfaces
+                .iter()
+                .any(|implemented| implemented == interface)
+        })
+    }
+
+    /// Whether no class can derive from `class`.
+    fn class_is_sealed(&self, class: &str) -> bool {
+        self.context
+            .types
+            .get(class)
+            .is_some_and(|info| info.is_sealed)
+    }
+
+    /// Relate the static type of a value to the target of `is` / `as` (object
+    /// model B1, sections 7 and 10.1). A class subject may be tested against a
+    /// related class (derived: a real test; equal or base: always true) or an
+    /// interface (statically implemented: always true; otherwise a run-time
+    /// search of the object descriptor, unless the class is sealed and the
+    /// test can never succeed). An interface subject may be tested against a
+    /// class that implements it or may have a subclass that does, or against
+    /// another interface. Returns the static type of the narrowed value, or
+    /// `Unknown` after reporting an error.
     #[allow(clippy::too_many_lines)]
+    fn runtime_type_relation(
+        &mut self,
+        subject: &Type,
+        target_type: &Type,
+        target: &aster_syntax::TypeRef,
+        value: &Expression,
+        span: Span,
+        operator: &str,
+    ) -> Type {
+        let never = if operator == "is" {
+            "pattern can never match".to_owned()
+        } else {
+            "`as` can never succeed".to_owned()
+        };
+        match (subject, target_type) {
+            (Type::Unknown, _) | (_, Type::Unknown) => Type::Unknown,
+            (Type::Enum(name), _) if self.is_official_option(name) => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!("unwrapping an `Option<T>` with `{operator}` is not supported yet"),
+                        value.span,
+                    )
+                    .with_help("use a `switch` with `Some(value)` and `None` cases"),
+                );
+                Type::Unknown
+            }
+            (Type::Class(subject_class), Type::Class(target_class)) => {
+                if self.derives_from(target_class, subject_class)
+                    || self.derives_from(subject_class, target_class)
+                {
+                    target_type.clone()
+                } else {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            format!(
+                                "{never}: `{subject_class}` and `{target_class}` are unrelated classes"
+                            ),
+                            span,
+                        )
+                        .with_help("the target class must derive from, or be a base of, the class of the value"),
+                    );
+                    Type::Unknown
+                }
+            }
+            (Type::Class(subject_class), Type::Interface(interface)) => {
+                if self.class_implements(subject_class, interface)
+                    || !self.class_is_sealed(subject_class)
+                {
+                    target_type.clone()
+                } else {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            format!(
+                                "{never}: sealed class `{subject_class}` does not implement interface `{interface}`"
+                            ),
+                            span,
+                        )
+                        .with_help("a sealed class has no subclass that could implement the interface"),
+                    );
+                    Type::Unknown
+                }
+            }
+            (Type::Interface(interface), Type::Class(target_class)) => {
+                if self.class_implements(target_class, interface)
+                    || !self.class_is_sealed(target_class)
+                {
+                    target_type.clone()
+                } else {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            format!(
+                                "{never}: sealed class `{target_class}` does not implement interface `{interface}`"
+                            ),
+                            span,
+                        )
+                        .with_help("a sealed class has no subclass that could implement the interface"),
+                    );
+                    Type::Unknown
+                }
+            }
+            (Type::Interface(_), Type::Interface(_)) => target_type.clone(),
+            (Type::Class(_) | Type::Interface(_), other) => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "a type pattern target must be a class, found `{}`",
+                            other.display()
+                        ),
+                        target.span,
+                    )
+                    .with_help("name a class or an interface related to the type of the value"),
+                );
+                Type::Unknown
+            }
+            (other, _) => {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        format!(
+                            "a type pattern requires a class-typed value, found `{}`",
+                            other.display()
+                        ),
+                        value.span,
+                    )
+                    .with_help("`is` and `as` test the run-time type of a class reference or an interface value"),
+                );
+                Type::Unknown
+            }
+        }
+    }
+
+    /// `value is Type [name]`: a run-time class or interface test (see
+    /// [`Self::runtime_type_relation`]). The binding is declared unassigned;
+    /// the definite-assignment rules mark it assigned where the test succeeded.
     fn type_pattern(
         &mut self,
         value: &Expression,
@@ -1078,78 +1323,7 @@ impl Analyzer<'_> {
             self.expression_receiver(value)
         };
         let target_type = self.resolve_local_type(target);
-        let mut bound = Type::Unknown;
-        match (&subject, &target_type) {
-            (Type::Unknown, _) | (_, Type::Unknown) => {}
-            (_, Type::Interface(name)) => {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        format!("a type pattern on interface `{name}` is not supported yet"),
-                        target.span,
-                    )
-                    .with_help("only class targets are supported; interface patterns need dynamic interface lookup"),
-                );
-            }
-            (Type::Interface(name), _) => {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        format!("a type pattern on interface value `{name}` is not supported yet"),
-                        value.span,
-                    )
-                    .with_help("type patterns need a class-typed value"),
-                );
-            }
-            (Type::Enum(name), _) if self.is_official_option(name) => {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        "unwrapping an `Option<T>` with `is` is not supported yet",
-                        value.span,
-                    )
-                    .with_help("use a `switch` with `Some(value)` and `None` cases"),
-                );
-            }
-            (Type::Class(subject_class), Type::Class(target_class)) => {
-                if self.derives_from(target_class, subject_class)
-                    || self.derives_from(subject_class, target_class)
-                {
-                    bound = target_type.clone();
-                } else {
-                    self.diagnostics.push(
-                        Diagnostic::error(
-                            format!(
-                                "pattern can never match: `{subject_class}` and `{target_class}` are unrelated classes"
-                            ),
-                            span,
-                        )
-                        .with_help("the target class must derive from, or be a base of, the value's class"),
-                    );
-                }
-            }
-            (Type::Class(_), other) => {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        format!(
-                            "a type pattern target must be a class, found `{}`",
-                            other.display()
-                        ),
-                        target.span,
-                    )
-                    .with_help("name a class derived from the value's class"),
-                );
-            }
-            (other, _) => {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        format!(
-                            "a type pattern requires a class-typed value, found `{}`",
-                            other.display()
-                        ),
-                        value.span,
-                    )
-                    .with_help("`is` tests the run-time class of a class reference"),
-                );
-            }
-        }
+        let bound = self.runtime_type_relation(&subject, &target_type, target, value, span, "is");
         if let Some(binding) = binding {
             // Same conservative rule as for an ordinary local: a class
             // reference cannot cross the single `await` in this version.
@@ -1176,6 +1350,59 @@ impl Analyzer<'_> {
             );
         }
         Type::Bool
+    }
+
+    /// `value as Type`: a checked narrowing that yields the official
+    /// `Option<Type>` (`Some` where the run-time type matches, `None`
+    /// otherwise). The relation rules are those of `is`; an impossible `as` is
+    /// an error and a statically trivial one is allowed.
+    fn type_as(&mut self, value: &Expression, target: &aster_syntax::TypeRef, span: Span) -> Type {
+        let subject = self.expression(value);
+        let target_type = self.resolve_local_type(target);
+        if self.runtime_type_relation(&subject, &target_type, target, value, span, "as")
+            == Type::Unknown
+        {
+            return Type::Unknown;
+        }
+        if self.context.official_option.is_none() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "`as {}` requires `aster.core.Option<{}>`",
+                        target.name, target.name
+                    ),
+                    span,
+                )
+                .with_help("add `using aster.core;` to this file"),
+            );
+            return Type::Unknown;
+        }
+        let option_name = crate::standard_library::option_specialization_name(&target.name);
+        let Some(cases) = self
+            .option_cases(&option_name)
+            .filter(|_| self.context.types.contains_key(&option_name))
+        else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "`as {}` requires the `Option<{}>` specialization, which was not generated",
+                        target.name, target.name
+                    ),
+                    span,
+                )
+                .with_help("this indicates an internal compiler error, not a source mistake"),
+            );
+            return Type::Unknown;
+        };
+        self.model.type_as.insert(
+            self.model_key(span),
+            ResolvedTypeAs {
+                option_type: option_name.clone(),
+                some_index: cases.some_index,
+                none_index: cases.none_index,
+            },
+        );
+        Type::Enum(option_name)
     }
 
     /// Mark pattern variables definitely assigned; returns the ones that were
@@ -1780,7 +2007,8 @@ impl Analyzer<'_> {
         }
         if let ExpressionKind::Member { object, name } = &target.kind {
             let object_type = self.expression_receiver(object);
-            if let Type::Class(type_name) = object_type
+            let struct_receiver = matches!(object_type, Type::User(_));
+            if let Type::Class(type_name) | Type::User(type_name) = object_type
                 && let Some(property) = self
                     .context
                     .types
@@ -1788,16 +2016,41 @@ impl Analyzer<'_> {
                     .and_then(|info| info.properties.get(name))
                     .cloned()
             {
-                let Some(setter) = property.setter else {
-                    self.diagnostics.push(
-                        Diagnostic::error(
-                            format!("property `{type_name}.{name}` is read-only"),
-                            target.span,
-                        )
-                        .with_help("add a setter or assign to a mutable field inside the class"),
-                    );
+                if struct_receiver {
+                    if let Some(readonly) = self.foreach_readonly_binding(target) {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                format!("foreach variable `{readonly}` is read-only"),
+                                target.span,
+                            )
+                            .with_help("use an indexed loop to modify array elements"),
+                        );
+                        return Type::Unknown;
+                    }
+                    if !self.is_assignable_place(target) {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "cannot assign to a field of a temporary value",
+                                target.span,
+                            )
+                            .with_help(
+                                "store the value in a variable first, then assign to its field",
+                            ),
+                        );
+                        return Type::Unknown;
+                    }
+                }
+                let Some(setter) = property.setter.clone() else {
+                    self.report_read_only_property(&type_name, name, &property, target.span);
                     return Type::Unknown;
                 };
+                if property.init_only
+                    && !matches!(&object.kind, ExpressionKind::Name(receiver)
+                        if receiver == INITIALIZER_RECEIVER)
+                {
+                    self.report_init_assignment(&type_name, name, target.span);
+                    return Type::Unknown;
+                }
                 let declared_in = setter
                     .key
                     .owner
@@ -1824,6 +2077,12 @@ impl Analyzer<'_> {
                     value,
                     span,
                 );
+                if let Some(backing) = property.direct_backing() {
+                    self.model
+                        .auto_property_fields
+                        .insert(self.model_key(target.span), backing.to_owned());
+                    return result;
+                }
                 self.model.property_assignments.insert(
                     self.model_key(span),
                     ResolvedPropertyAssignment {
@@ -1950,19 +2209,48 @@ impl Analyzer<'_> {
         span: Span,
         target_span: Span,
     ) -> Type {
-        let Some(setter) = property.setter else {
-            self.diagnostics.push(Diagnostic::error(
-                format!("property `{owner}.{name}` is read-only"),
+        // A `this`/bare-name write inside a constructor of the declaring class
+        // reaches the backing field of an auto-property directly, even when
+        // the property has no setter (get-only) or an `init` setter.
+        let in_declaring_constructor = self.constructor
+            && !self.base_access
+            && self.owner.as_deref() == Some(property.declared_in.as_str());
+        let Some(setter) = property.setter.clone() else {
+            if !in_declaring_constructor || property.auto_backing.is_none() {
+                self.report_read_only_property(owner, name, &property, target_span);
+                return Type::Unknown;
+            }
+            return self.assign_backing_field(
+                name,
+                &property,
+                operator,
+                value_type,
+                value,
+                span,
                 target_span,
-            ));
-            return Type::Unknown;
+            );
         };
+        if property.init_only && !self.constructor {
+            self.report_init_assignment(owner, name, target_span);
+            return Type::Unknown;
+        }
         if operator != AssignmentOperator::Assign && property.getter.is_none() {
             self.diagnostics.push(Diagnostic::error(
                 format!("compound assignment requires getter for `{owner}.{name}`"),
                 target_span,
             ));
             return Type::Unknown;
+        }
+        if property.direct_backing().is_some() && !self.base_access {
+            return self.assign_backing_field(
+                name,
+                &property,
+                operator,
+                value_type,
+                value,
+                span,
+                target_span,
+            );
         }
         let result =
             self.assignment_types(operator, property.type_.clone(), value_type, value, span);
@@ -1980,6 +2268,90 @@ impl Analyzer<'_> {
             },
         );
         result
+    }
+
+    /// A write of `this.<name>` / `<name>` to an auto-property that HIR lowers
+    /// to its backing field: a field assignment for definite assignment and
+    /// this-confinement, with no accessor call.
+    #[allow(clippy::too_many_arguments)]
+    fn assign_backing_field(
+        &mut self,
+        name: &str,
+        property: &PropertyInfo,
+        operator: AssignmentOperator,
+        value_type: &Type,
+        value: &Expression,
+        span: Span,
+        target_span: Span,
+    ) -> Type {
+        let backing = property
+            .auto_backing
+            .clone()
+            .expect("direct writes target auto-properties");
+        if operator != AssignmentOperator::Assign {
+            let Some(getter) = &property.getter else {
+                self.diagnostics.push(Diagnostic::error(
+                    format!("compound assignment requires getter for `{name}`"),
+                    target_span,
+                ));
+                return Type::Unknown;
+            };
+            let declared_here = self.owner.as_deref() == Some(property.declared_in.as_str());
+            self.note_auto_property_read(&backing, declared_here, &getter.key, name, target_span);
+        }
+        let result =
+            self.assignment_types(operator, property.type_.clone(), value_type, value, span);
+        if let Some(binding) = self.binding_mut(&backing) {
+            binding.initialized = true;
+        }
+        self.model
+            .auto_property_fields
+            .insert(self.model_key(target_span), backing);
+        result
+    }
+
+    /// A write to a property without a setter. A get-only auto-property is
+    /// assignable only in a constructor of its declaring class.
+    fn report_read_only_property(
+        &mut self,
+        owner: &str,
+        name: &str,
+        property: &PropertyInfo,
+        span: Span,
+    ) {
+        if property.auto_backing.is_some() {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!("get-only auto-property `{owner}.{name}` cannot be assigned here"),
+                    span,
+                )
+                .with_help(format!(
+                    "assign it in a constructor of `{}`, or declare `set` or `init`",
+                    property.declared_in
+                )),
+            );
+        } else {
+            self.diagnostics.push(
+                Diagnostic::error(format!("property `{owner}.{name}` is read-only"), span)
+                    .with_help("add a setter or assign to a mutable field inside the class"),
+            );
+        }
+    }
+
+    /// A write to an `init` property outside a constructor or an object
+    /// initializer (the two permitted contexts, checked by the callers).
+    fn report_init_assignment(&mut self, owner: &str, name: &str, span: Span) {
+        self.diagnostics.push(
+            Diagnostic::error(
+                format!(
+                    "init-only property `{owner}.{name}` can be assigned only in a constructor or an object initializer"
+                ),
+                span,
+            )
+            .with_help(
+                "assign it from a constructor, or in `new Type(...) { Name = value }`",
+            ),
+        );
     }
 
     fn assignment_types(
@@ -2221,6 +2593,7 @@ pub(super) fn needs_contextual_type(expression: &Expression) -> bool {
         ExpressionKind::NewObject {
             type_name: None, ..
         } => true,
+        ExpressionKind::ObjectInitializer { creation, .. } => needs_contextual_type(creation),
         ExpressionKind::Conditional {
             when_true,
             when_false,

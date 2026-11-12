@@ -103,20 +103,29 @@ if (!(shape is Square square))
 Use(square);   // definitely assigned: the other path returned
 ```
 
-- The value must be a class reference and `Type` a class related to the value's class: a derived class
-  (a real test), the same class or a base class (always true). Unrelated classes can never match and
-  are a compile error, as in C#. A struct, primitive or enum target is an error.
-- The test follows the single-inheritance descriptor check: it compares the object's ancestor
-  at `Type`'s depth, never reading past the descriptor's ancestor array.
+- The value must be a class reference or an interface value. For a class reference, `Type` is a class
+  related to the value's class (a derived class is a real test; the same class or a base class is always
+  true; unrelated classes can never match and are a compile error, as in C#) or an interface (always
+  true when the class implements it; otherwise a run-time search of the object's descriptor, and an
+  error for a `sealed` class that does not implement it). For an interface value, `Type` is a class that
+  implements the interface or may have a subclass that does (a `sealed` class that does not is an
+  error), or another interface. A struct, primitive or enum target is an error.
+- A class test follows the single-inheritance descriptor check: it compares the object's ancestor
+  at `Type`'s depth, never reading past the descriptor's ancestor array. An interface test compares
+  the interface identity with the entries of the descriptor's interface list, never reading past
+  its count; the binding of a successful interface test is an interface value made of the object and
+  the table found.
+- `value as Type` is the checked form that yields a value: an `Option<Type>` (`Some` with the same
+  object, or `None`), with the same targets and the same compile-time errors; a statically trivial
+  `as` is allowed. It needs `using aster.core;` and has no `T?` spelling yet.
 - `name` is definitely assigned only where the test is known to have succeeded: the true branch of
   `if`/`while` and the body of a `for`, the right operand of `&&` (and of `||` after a negated test),
   through `!`, `&&` and `||` with the C# rules. Reading it elsewhere is the error
   "variable `name` is used before initialization". A variable declared in an `if` condition belongs to
   the enclosing block (so a guard clause leaves it in scope); one declared in a loop condition is
   scoped to the loop. Declaring the same name twice in one scope is an error.
-- Not supported yet: interface targets (`value is IShape s`, which needs the dynamic interface
-  lookup of object model B1 part 3), interface-typed subjects, unwrapping `Option<T>` with `is`
-  (use a `switch`), nested patterns, `as`, and generic-type inference from a pattern binding.
+- Not supported yet: unwrapping `Option<T>` with `is` or `as` (use a `switch`), nested patterns,
+  generic-type inference from a pattern binding, and the `T?` spelling of `as`.
 
 A `when` guard follows the label of a `switch` case or arm: `case 5 when limit > 3:`,
 `Circle(r) when r > 10 => ...`. The guard is a `bool` evaluated only after the label matched, in the
@@ -130,4 +139,4 @@ body of that case.
 ## Not implemented
 
 `if` is not an expression. There is no unconditional `loop`, iterator protocol, loop label,
-general `match`, nested pattern, interface or `Option` type pattern, or exception control flow.
+general `match`, nested pattern, `Option` type pattern, or exception control flow.

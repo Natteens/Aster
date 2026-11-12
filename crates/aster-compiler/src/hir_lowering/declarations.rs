@@ -671,6 +671,9 @@ impl Lowerer<'_> {
     /// the class's field initializers, then the base constructor call
     /// (arguments evaluated left to right, then the base constructor, which
     /// runs the same sequence for its own class), then the declared body.
+    /// A constructor that delegates with `this(...)` (B2) runs no initializers
+    /// itself: the delegation target runs them exactly once, so its call (the
+    /// arguments, then the target) is the first statement.
     fn prepend_constructor_prologue(
         &mut self,
         owner: &ast::TypeDeclaration,
@@ -678,7 +681,13 @@ impl Lowerer<'_> {
         receiver: hir::SymbolId,
         body: &mut hir::Block,
     ) {
-        self.prepend_field_initializers(owner, receiver, body);
+        let delegates = function
+            .base_call
+            .as_ref()
+            .is_some_and(|call| call.delegates_to_this);
+        if !delegates {
+            self.prepend_field_initializers(owner, receiver, body);
+        }
         let Some(resolved) = self
             .model
             .base_constructors
@@ -732,13 +741,17 @@ impl Lowerer<'_> {
         });
         // `prepend_field_initializers` already placed the initializers first:
         // the base call goes right after them, before the declared body.
-        let initializer_count = owner
-            .members
-            .iter()
-            .filter(
-                |member| matches!(member, ast::Member::Field(field) if field.initializer.is_some()),
-            )
-            .count();
+        let initializer_count = if delegates {
+            0
+        } else {
+            owner
+                .members
+                .iter()
+                .filter(
+                    |member| matches!(member, ast::Member::Field(field) if field.initializer.is_some()),
+                )
+                .count()
+        };
         body.statements.insert(initializer_count, call);
     }
 

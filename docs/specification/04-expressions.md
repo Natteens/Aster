@@ -23,8 +23,9 @@ int result = calculate(10, 20);
   the operator is right-associative. Its precedence sits between assignment (lower) and `||`
   (higher).
 - `&&` and `||` short-circuit.
-- `value is Type [name]` is a `bool` class type test at relational precedence (see
-  [control flow](06-control-flow.md#type-patterns-and-when-guards)); `is` is contextual.
+- `value is Type [name]` is a `bool` class or interface type test, and `value as Type` yields an
+  `Option<Type>`, both at relational precedence (see
+  [control flow](06-control-flow.md#type-patterns-and-when-guards)); `is` and `as` are contextual.
 - The bitwise operators `&`, `|`, `^`, unary `~`, and the shifts `<<`, `>>`, `>>>` are implemented
   with C# precedence and semantics (see [types](02-types.md#bitwise-and-shift-operators)). `&`, `|`,
   and `^` on `bool` operands are eager: both operands are evaluated, left to right. `a & b == 0`
@@ -41,6 +42,11 @@ int result = calculate(10, 20);
 - Empty `[]` and target-typed `new()` use one exact expected type from an explicit initializer,
   assignment, return, selected call candidate, or contextual conditional/switch arm. They remain
   errors without that context.
+- An object initializer `new T(args) { A = e1, B = e2 }` evaluates the constructor arguments, runs
+  the constructor, then assigns the members left to right; each member at most once, `init`
+  properties included, get-only properties rejected. The object is not observable until all
+  assignments complete. Nested and collection initializers are not supported yet. See
+  [classes](../reference/classes.md#object-initializers).
 - `List<T>` indexing uses the existing checked `Get`/`Set` semantics for reads, writes, compound
   assignments, and prefix/postfix `++`/`--`. Receiver and index expressions are evaluated once.
 

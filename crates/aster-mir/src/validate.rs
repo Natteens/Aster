@@ -392,6 +392,18 @@ impl MirTypeIndex {
         a == b || self.class_derives_from(a, b) || self.class_derives_from(b, a)
     }
 
+    /// Whether `symbol` names a declared class.
+    #[must_use]
+    pub fn is_class(&self, symbol: mir::SymbolId) -> bool {
+        self.kinds.get(&symbol) == Some(&NominalKind::Class)
+    }
+
+    /// Whether `symbol` names a declared interface.
+    #[must_use]
+    pub fn is_interface(&self, symbol: mir::SymbolId) -> bool {
+        self.kinds.get(&symbol) == Some(&NominalKind::Interface)
+    }
+
     /// Whether `class` is declared abstract.
     #[must_use]
     pub fn is_abstract_class(&self, class: mir::SymbolId) -> bool {
@@ -895,9 +907,37 @@ fn validate_typed_rvalue(
                 {
                     Ok(())
                 }
+                // The object half of an interface value, viewed as a class.
+                (mir::Type::Interface(_), mir::Type::Class(_)) => Ok(()),
                 _ => Err(ValidationError::invalid(format!(
                     "function `{function_name}` narrows a class reference to an unrelated class"
                 ))),
+            }
+        }
+        mir::RvalueKind::InterfaceTest { object, interface } => {
+            operand(object)?;
+            if matches!(object.type_, mir::Type::Class(_) | mir::Type::Interface(_))
+                && value.type_ == mir::Type::Bool
+                && types.is_interface(*interface)
+            {
+                Ok(())
+            } else {
+                Err(ValidationError::invalid(format!(
+                    "function `{function_name}` has a malformed interface test"
+                )))
+            }
+        }
+        mir::RvalueKind::InterfaceLookup { object, interface } => {
+            operand(object)?;
+            if matches!(object.type_, mir::Type::Class(_) | mir::Type::Interface(_))
+                && value.type_ == mir::Type::Interface(*interface)
+                && types.is_interface(*interface)
+            {
+                Ok(())
+            } else {
+                Err(ValidationError::invalid(format!(
+                    "function `{function_name}` has a malformed interface lookup"
+                )))
             }
         }
         mir::RvalueKind::ClassTest { object, class } => {
@@ -905,6 +945,12 @@ fn validate_typed_rvalue(
             match &object.type_ {
                 mir::Type::Class(from)
                     if value.type_ == mir::Type::Bool && types.class_related(*from, *class) =>
+                {
+                    Ok(())
+                }
+                // The object behind an interface value may be of any class.
+                mir::Type::Interface(_)
+                    if value.type_ == mir::Type::Bool && types.is_class(*class) =>
                 {
                     Ok(())
                 }

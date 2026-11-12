@@ -133,7 +133,8 @@ impl Analyzer<'_> {
                         {
                             self.diagnostics.push(Diagnostic::error(
                                 format!(
-                                    "constructor returns before field `{field}` is initialized"
+                                    "constructor returns before {} is initialized",
+                                    super::field_display(field)
                                 ),
                                 *span,
                             ));

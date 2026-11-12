@@ -53,7 +53,10 @@ base-call           = ":" , "base" , "(" , [ argument , { "," , argument } ] , "
 interface-member    = [ visibility ] , type , identifier , parameters , ";" ;
 field-tail          = [ "=" , expression ] , ";" ;
 property-tail       = "{" , accessor , { accessor } , "}" ;
-accessor            = [ visibility ] , ( "get" | "set" ) , block ;
+accessor            = [ visibility ] , ( "get" | "set" | "init" ) , block ;
+auto-property-tail  = "{" , auto-accessor , { auto-accessor } , "}" , [ "=" , expression , ";" ] ;
+auto-accessor       = [ visibility ] , ( "get" | "set" | "init" ) , ";" ;  (* LANG-005; `init` is contextual;
+                      not static, and `init` not on virtual members yet *)
 
 function            = type , identifier , [ type-parameters ] , function-tail ;
 foreign-function    = "unsafe" , "foreign" , type , identifier ,
@@ -147,7 +150,10 @@ struct-literal      = named-type , "{" , field-value , { "," , field-value } , "
 field-value         = identifier , ":" , expression ;
 array-literal       = "[" , [ expression , { "," , expression } ] , "]" ;
 new-array           = "new" , element-type , "[" , expression , "]" ;
-new-object          = "new" , [ named-type ] , arguments ;
+new-object          = "new" , [ named-type ] , ( arguments | object-initializer
+                    | arguments , object-initializer ) ;           (* LANG-008 *)
+object-initializer  = "{" , [ member-init , { "," , member-init } , [ "," ] ] , "}" ;
+member-init         = identifier , "=" , expression ;  (* nested/collection forms rejected *)
 enum-value          = named-type , "." , identifier , [ arguments ] ;
 assignment-op       = "=" | "+=" | "-=" | "*=" | "/=" | "&=" | "|=" | "^="
                     | "<<=" | ">>=" | ">>>=" ;
@@ -234,7 +240,7 @@ visitors; it is not a general pattern-matching or expression-shape restriction.
   `Dictionary<K, V>` supports its official key types, lookup/update/removal, and entry snapshots.
 - Classes support one constructor, arena allocation, reference identity, declaration-order field
   initializers, instance and static methods, explicit properties, implicit instance receivers, and
-  explicit `this`. Static fields and auto-properties are not accepted.
+  explicit `this`, and auto-properties. Static fields and static auto-properties are not accepted.
 - Executable namespace functions and class, struct, static, and generic methods may use block or
   expression bodies. Functions and methods may overload parameter signatures, accept positional
   arguments followed by named arguments, and declare trailing compile-time defaults. Exact
@@ -263,7 +269,7 @@ visitors; it is not a general pattern-matching or expression-shape restriction.
 ## Unsupported language features
 
 Class inheritance is single and closed, with virtual dispatch (see [classes](../reference/classes.md)); there is no downcast, interface inheritance, constructor/operator overloads, static
-fields, auto-properties, general pattern matching, switch guards,
+fields, general pattern matching, switch guards,
 exceptions, `goto`,
 or engine lifecycle syntax. Application entry selection is a tooling rule rather than grammar:
 `aster run [FILE]` resolves one public static parameterless `Main` returning `void` or `int`, while

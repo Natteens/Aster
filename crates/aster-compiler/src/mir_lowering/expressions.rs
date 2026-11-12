@@ -76,6 +76,11 @@ impl FunctionLowerer {
                 arguments,
                 argument_order,
             )),
+            hir::ExpressionKind::ObjectInitializer {
+                object,
+                receiver,
+                assignments,
+            } => Some(self.lower_object_initializer(object, *receiver, assignments)),
             hir::ExpressionKind::ArrayLiteral(elements) => {
                 Some(self.lower_array_literal(&expression.type_, elements))
             }
@@ -830,6 +835,55 @@ impl FunctionLowerer {
                 }
                 Some(test)
             }
+            hir::ExpressionKind::InterfaceTest {
+                value,
+                interface,
+                binding,
+            } => {
+                let object = self
+                    .lower_expression(value)
+                    .expect("validated interface test operand produces a value");
+                let test = self.temporary(
+                    mir::Type::Bool,
+                    mir::RvalueKind::InterfaceTest {
+                        object: object.clone(),
+                        interface: *interface,
+                    },
+                );
+                if let Some(binding) = binding {
+                    // The lookup is a controlled run-time error when the
+                    // descriptor has no table, so unlike a class binding it is
+                    // assigned only on the path where the test succeeded.
+                    let local = self.source_local(
+                        binding.symbol,
+                        binding.name.clone(),
+                        binding.type_.clone(),
+                        binding.mutable,
+                    );
+                    self.locals.push(local.clone());
+                    let lookup_id = self.new_block();
+                    let join_id = self.new_block();
+                    self.terminate_current(mir::Terminator::Branch {
+                        condition: test.clone(),
+                        then_block: lookup_id,
+                        else_block: join_id,
+                    });
+                    self.current = Some(lookup_id);
+                    self.assign(
+                        mir::Place::Local(local.id),
+                        mir::Rvalue {
+                            type_: binding.type_.clone(),
+                            kind: mir::RvalueKind::InterfaceLookup {
+                                object,
+                                interface: *interface,
+                            },
+                        },
+                    );
+                    self.terminate_current(mir::Terminator::Goto(join_id));
+                    self.current = Some(join_id);
+                }
+                Some(test)
+            }
             hir::ExpressionKind::UpcastInterface {
                 object,
                 class,
@@ -1402,6 +1456,41 @@ impl FunctionLowerer {
             return_type: mir::Type::Void,
         });
         receiver
+    }
+
+    /// Construct first (arguments, then constructor), then run the member
+    /// assignments in source order against the new object, which is bound to
+    /// the hidden `receiver` symbol; the finished object is the result.
+    fn lower_object_initializer(
+        &mut self,
+        object: &hir::Expression,
+        receiver: hir::SymbolId,
+        assignments: &[hir::Expression],
+    ) -> mir::Operand {
+        let created = self
+            .lower_expression(object)
+            .expect("validated object creation produces a value");
+        let local = if let mir::OperandKind::Copy(mir::Place::Local(local)) = &created.kind {
+            *local
+        } else {
+            let local = self.new_temporary(object.type_.clone());
+            self.assign(
+                mir::Place::Local(local),
+                mir::Rvalue {
+                    type_: object.type_.clone(),
+                    kind: mir::RvalueKind::Use(created),
+                },
+            );
+            local
+        };
+        self.symbol_locals.insert(receiver, local);
+        for assignment in assignments {
+            self.lower_expression(assignment);
+        }
+        mir::Operand {
+            type_: object.type_.clone(),
+            kind: mir::OperandKind::Copy(mir::Place::Local(local)),
+        }
     }
 
     fn lower_array_literal(

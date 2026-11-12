@@ -487,6 +487,16 @@ pub enum ExpressionKind {
         /// operands for the callee ABI.
         argument_order: Vec<usize>,
     },
+    /// `new T(args) { A = e1, B = e2 }`: evaluates `object` (a `NewObject`),
+    /// binds the result to the hidden local `receiver`, evaluates each of
+    /// `assignments` in order (each a `receiver.member = value` expression,
+    /// result discarded) and yields the receiver. The object is not
+    /// observable before every assignment completes.
+    ObjectInitializer {
+        object: Box<Expression>,
+        receiver: SymbolId,
+        assignments: Vec<Expression>,
+    },
     ArrayLiteral(Vec<Expression>),
     NewArray {
         element_type: Type,
@@ -734,6 +744,17 @@ pub enum ExpressionKind {
     ClassTest {
         value: Box<Expression>,
         class: SymbolId,
+        binding: Option<Box<Variable>>,
+    },
+    /// `value is Interface` / `value is Interface name`: a `bool` run-time
+    /// test that the object behind the class reference or interface value
+    /// `value` has a class whose descriptor lists `interface` (a bounded
+    /// search, object model B1 section 4.5). The optional `binding` is an
+    /// interface-typed local assigned `{object, table}` from that search only
+    /// when the test succeeded.
+    InterfaceTest {
+        value: Box<Expression>,
+        interface: SymbolId,
         binding: Option<Box<Variable>>,
     },
     /// Identity-preserving implicit conversion from a class reference to one of

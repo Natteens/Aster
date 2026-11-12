@@ -26,11 +26,48 @@ read and write execute explicit accessor bodies. A getter is required for reads,
 and `value` exists only in a setter. Compound assignment such as `Health -= 10` calls the getter once
 and then the setter. Accessor visibility is enforced independently.
 
+### Auto-properties
+
+An accessor written without a body, `get;`, `set;` or `init;`, declares an auto-property. The
+compiler synthesizes a private backing field, which no source can name, and trivial accessors over it:
+
+```aster
+public class Account
+{
+    public int Id { get; }                       // assignable only in a constructor
+    public string Owner { get; init; }           // assignable only while constructing
+    public int Balance { get; private set; } = 100;
+    public int Limit { get; set; } = 500;
+    public Account(int id, string owner) { Id = id; Owner = owner; }
+}
+```
+
+- Every accessor must be bodiless; an auto-property cannot mix them with explicit bodies. Accessor
+  visibility follows the explicit-property rules (`private set`, `protected set`, ...).
+- `= expression;` after the closing brace initializes the backing field. It runs with the field
+  initializers, in declaration order, before the base constructor and the constructor body. Only an
+  auto-property can have one (an `abstract` property cannot).
+- A `get`-only auto-property is assignable only in a constructor of its declaring class, through
+  `Name = value` or `this.Name = value`. An `init` accessor is assignable only while the object is
+  under construction: in a constructor of the declaring class or of a derived class, or in an
+  [object initializer](#object-initializers). Anywhere else the assignment is a diagnostic.
+- A non-virtual auto-property is lowered directly to its backing field: there is no accessor call
+  and no inliner is involved. For this-confinement a read or write of such a property on `this` is a
+  field access (a read before the constructor assigned a reference-typed backing field is an error).
+  A `virtual`, `override` or `abstract` auto-property keeps dispatching through its accessors, so a
+  use on `this` inside a constructor stays rejected like any virtual member. An `override`
+  auto-property gets its own backing field. `init` accessors are not accepted on virtual members yet.
+- A `string` or class-typed auto-property has no zero default, so a constructor must assign it
+  (or the property needs an initializer), exactly like a field.
+- `static` auto-properties are not supported yet (they need static fields). Interfaces cannot
+  declare properties. `++`/`--` on a property is not supported; write `P += 1`.
+
 Methods and namespace-level functions may be overloaded by parameter count and types. Exact matches win,
 then documented safe implicit conversions. Equally good candidates are an error; return type never
-selects an overload. Constructor overloads remain unsupported.
+selects an overload. A class may declare several constructors, selected by the same rules
+([constructor overloads and `this(...)`](../compiler/object-model-b2.md)).
 
-Executable methods may use `=> expression;`. Calls and the single supported constructor accept
+Executable methods may use `=> expression;`. Calls and constructors accept
 positional arguments followed by named arguments, and trailing parameters may have compile-time
 constant defaults:
 
@@ -42,6 +79,24 @@ Player player = new(health: 100);
 Named argument expressions evaluate left to right in source order. Target-typed `new()` is accepted
 when an initializer, assignment, return, or selected call candidate supplies one exact class or
 collection type.
+
+### Object initializers
+
+`new T(args) { A = e1, B = e2 }` (or `new T { A = e1 }` when a parameterless constructor is
+accessible, and target-typed `new() { ... }`) constructs the object and then assigns members:
+
+- Evaluation order: the constructor arguments, then the constructor (and its base chain), then each
+  `Member = value` from left to right in source order. The object is not observable (it cannot be
+  named) until every assignment has completed; the whole expression then yields it.
+- A member is a field or a settable property (including `init` properties, which are assignable in
+  an object initializer and in constructors only). It is checked exactly like `obj.Member = value`:
+  it must exist, be accessible from the creation site and accept the value's type. A get-only
+  property is an error. Each member may appear at most once.
+- A `virtual` property assignment dispatches to the most-derived setter: the object is fully
+  constructed when the assignments run. A non-virtual auto-property is written directly to its
+  backing field.
+- Not supported yet: nested initializers (`P = { X = 1 }`), collection initializers
+  (`new List<int> { 1, 2 }`) and struct creation (structs keep the named struct literal).
 
 A `static class` is only a container for static methods. It has no instances, fields,
 constructors, properties, interfaces, or instance methods:
@@ -57,7 +112,8 @@ The standard library uses this form for `aster.math.Math`.
 
 Assigning a class variable copies its reference. `==` and `!=` therefore compare object identity,
 not fields. Objects are non-null in the current language and live in the per-run ExecutionContext.
-There is no downcast expression (`(Derived)value` or `as`), static fields, auto-properties, finalizers, independent freeing, or `null`.
+There is no `(Derived)value` cast, static fields, finalizers, independent freeing, or `null`. A checked downcast
+is the pattern `value is Derived d` or `value as Derived` (see [downcast](#downcast-and-interface-tests)).
 Single inheritance and virtual dispatch are described in the next sections.
 
 ## Single inheritance
@@ -100,7 +156,10 @@ public class Circle : Shape
   field initializers, then the arguments of `base(...)` (which cannot use `this` or fields), then the
   base constructor (running the same sequence up the chain), then the derived constructor's body. A
   constructor without `: base(...)` calls a base constructor whose parameters are all defaulted;
-  otherwise it must call `base(...)`.
+  otherwise it must call `base(...)`. A constructor may instead delegate with `: this(...)` to another
+  constructor of its own class: the target runs the initializers and its own `base(...)` call, then
+  the delegating body runs. `this(...)` and `base(...)` cannot appear on the same constructor, a
+  delegation cycle is an error, and a class with any explicit constructor has no implicit one.
 - While a constructor runs, `this` may only read or write fields, be the receiver of a *this-confined*
   method, and be compared with `==`/`!=`. It cannot be passed, stored, returned or converted. A
   method is this-confined when its body only uses `this` the same way and calls only this-confined
@@ -164,11 +223,42 @@ int total = shape.Describe();   // 25 + 20
   constructors.
 - An interface implemented through a virtual method dispatches dynamically: a `Base` reference whose
   object is a `Derived` converts to the interface and a call through it runs `Derived`'s override.
-  The conversion from a base-typed value to an interface still needs the static class to implement
-  it; looking up an interface table from the dynamic type of a base-typed value is not available yet,
-  so `value is IShape s` is rejected as not supported yet.
+  The implicit conversion from a base-typed value to an interface still needs the static class to
+  implement it (`Base` to `IFoo` is an error when only `Derived` implements `IFoo`); the checked forms
+  below look the interface up from the dynamic type.
 - A virtual call is an escape of its receiver for the memory analyses (the callee is unknown until
   devirtualized), so an object that receives one is never eliminated or kept in a temporary region.
+
+### Downcast and interface tests
+
+A base-typed value is narrowed with a checked operation, never an implicit conversion:
+
+```aster
+Shape shape = new Square(7, 5);
+
+if (shape is Square square)          // primary form: test and bind the same object
+{
+    Use(square.Side);
+}
+
+Option<Square> maybe = shape as Square;   // Some(square) or None (needs `using aster.core;`)
+```
+
+- `value is Derived d` and `value is Derived` test the run-time class of a class reference; `d` is an
+  identity alias of the same object, as in [type patterns](../specification/06-control-flow.md).
+- `value as T` yields the official `Option<T>`: `Some` holding the same object when the run-time type
+  matches, `None` otherwise. It requires `aster.core`; the `T?` spelling is not available.
+- The target may be a class or an interface. For an interface, `shape is IShape s` and `shape as IShape`
+  search the interface list in the object's class descriptor, bounded by the descriptor's interface
+  count, and the binding is an interface value (the object and the table found). The search is linear;
+  an indexed table is only worth adding if it measures at least 5 percent faster on `interface_dispatch`
+  through a base type (decision OBJ-004), and that experiment has not been run.
+- The subject may itself be an interface value: `area is Square sq` and `area as Polygon` test the
+  descriptor of the object behind it, and `area is IOther other` searches for another interface.
+- A test that can never succeed is a compile error: unrelated classes, and a `sealed` class that does
+  not implement the interface (or an interface subject tested against such a sealed class). A test that
+  always succeeds (an upcast, or an interface the static class implements) is allowed, as in C#.
+- Unwrapping an `Option<T>` with `is` or `as` is not supported; use a `switch`.
 
 Classes may declare type parameters, such as `Box<T>`. Every construction names a closed type,
 `new Box<int>(42)` (or `Box<int> box = new(42);`), and each closed class has its own fields and methods while retaining the same

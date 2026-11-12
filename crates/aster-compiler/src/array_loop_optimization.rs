@@ -363,6 +363,12 @@ fn rvalue_has_matching_index(
         | mir::RvalueKind::ClassTest {
             object: operand, ..
         }
+        | mir::RvalueKind::InterfaceTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceLookup {
+            object: operand, ..
+        }
         | mir::RvalueKind::ArrayLength(operand)
         | mir::RvalueKind::ListLength(operand)
         | mir::RvalueKind::DictionaryLength(operand)
@@ -443,6 +449,12 @@ fn mark_rvalue(
         mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Discriminant(operand)
         | mir::RvalueKind::ClassTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceLookup {
             object: operand, ..
         }
         | mir::RvalueKind::ArrayLength(operand)

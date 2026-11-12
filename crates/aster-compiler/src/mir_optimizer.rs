@@ -390,6 +390,8 @@ fn count_rvalue_uses(value: &mir::Rvalue, uses: &mut HashMap<mir::LocalId, usize
         mir::RvalueKind::Use(value)
         | mir::RvalueKind::Discriminant(value)
         | mir::RvalueKind::ClassTest { object: value, .. }
+        | mir::RvalueKind::InterfaceTest { object: value, .. }
+        | mir::RvalueKind::InterfaceLookup { object: value, .. }
         | mir::RvalueKind::ArrayLength(value)
         | mir::RvalueKind::ListLength(value)
         | mir::RvalueKind::DictionaryLength(value)
@@ -594,6 +596,8 @@ fn pure_non_failing_rvalue(value: &mir::Rvalue) -> bool {
         | mir::RvalueKind::EnumConstruct { .. }
         | mir::RvalueKind::Discriminant(_)
         | mir::RvalueKind::ClassTest { .. }
+        | mir::RvalueKind::InterfaceTest { .. }
+        | mir::RvalueKind::InterfaceLookup { .. }
         | mir::RvalueKind::ArrayLength(_)
         | mir::RvalueKind::ListLength(_)
         | mir::RvalueKind::DictionaryLength(_)
@@ -810,6 +814,8 @@ fn rewrite_rvalue_operands(
         mir::RvalueKind::Use(value)
         | mir::RvalueKind::Discriminant(value)
         | mir::RvalueKind::ClassTest { object: value, .. }
+        | mir::RvalueKind::InterfaceTest { object: value, .. }
+        | mir::RvalueKind::InterfaceLookup { object: value, .. }
         | mir::RvalueKind::ArrayLength(value)
         | mir::RvalueKind::ListLength(value)
         | mir::RvalueKind::DictionaryLength(value)

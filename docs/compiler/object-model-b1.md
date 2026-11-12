@@ -459,6 +459,31 @@ in addition to those of pull request 1: P1, P4, P5, P7 and N2, N3, N7, N11, with
 N12 and N17 and V8 and the V-style table invariants. Not implemented: downcast, interface lookup from
 the dynamic type, open bases, devirtualization.
 
+**Delivery note, pull requests 3 and 4 (T-OBJ-4).** Implemented: the dynamic interface lookup and the
+checked downcast. `value is IShape s` and `value is IShape` search the object descriptor's interface
+list (U3, a linear search bounded by `interface_count`, comparing `interface_id`; the binding is an
+interface value, the table being assigned only on the path where the test succeeded). `value is Derived`
+also accepts an interface-typed subject (the object half is tested, bound as the class) and an interface
+target on an interface subject. `value as T` (U4; the `T?` spelling is not assumed) yields the official
+`Option<T>` for class and interface targets and is lowered in HIR as `value is T t ? Some(t) : None`
+over a compiler-introduced binding; an impossible `as` (unrelated classes, or a `sealed` class that
+cannot implement the interface) is an error and a statically trivial one is allowed. MIR gained the
+backend-neutral `InterfaceTest { object, interface }` (a `bool`) and `InterfaceLookup { object,
+interface }` (an interface value), both over a class reference or an interface value and validated in
+`aster-mir` and again by the backend; `Downcast` and `ClassTest` accept an interface-typed operand.
+Code generation emits a bounded loop over `interface_count` (nothing is read at or beyond it, a null
+object or a null list ends the search, a found null table counts as missing); a lookup that finds no
+table records a controlled run-time error and takes the failure path, without calling through anything
+(V7). The implicit conversion keeps the compile-time table: the static rule of section 7 plus the
+per-class virtual thunks of pull request 2 already make that table run the most-derived override, so
+no implicit conversion needs the lookup, and `Base` to `IFoo` when only `Derived` implements it remains
+N9. Experiment OBJ-U3 (an indexed table, adopted only if at least 5 percent faster on
+`interface_dispatch` through a base type, OBJ-004) was not run; the search is the shipped mechanism and
+no index exists. Cases covered in addition to the earlier pull requests: P5 through a dynamic lookup,
+N8 for `as`, N9 retained, V4 (the class test of pull request 1) and V7; V6 is not extended by this
+step. Not implemented: `T?`, unwrapping an `Option` with `is`, generics in hierarchies (pull request 5),
+and the C6 experiment decision (C0 stays the default).
+
 ## 12. Statements to supersede on acceptance
 
 `docs/reference/classes.md`, `docs/reference/interfaces.md` ("The name after `:` is an interface"),

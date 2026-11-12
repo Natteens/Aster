@@ -85,6 +85,13 @@ pub enum MemberDispatch {
     Abstract,
 }
 
+/// The name of the synthesized private backing field of auto-property
+/// `property` (LANG-005). It contains `<`, so no source identifier can name it.
+#[must_use]
+pub fn auto_property_backing_field(property: &str) -> String {
+    format!("<{property}>k__BackingField")
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Property {
     pub dispatch: MemberDispatch,
@@ -100,6 +107,9 @@ pub struct Property {
 pub struct Accessor {
     pub visibility: Visibility,
     pub explicit_visibility: bool,
+    /// An `init` accessor (LANG-005): a setter assignable only while the
+    /// object is being constructed. Never set on a getter.
+    pub is_init: bool,
     pub body: Block,
     pub span: Span,
 }
@@ -140,9 +150,13 @@ pub struct FunctionDeclaration {
     pub span: Span,
 }
 
-/// `: base(arguments)` after a constructor's parameter list.
+/// `: base(arguments)` or `: this(arguments)` after a constructor's parameter
+/// list.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BaseCall {
+    /// `true` for `this(...)`, which delegates to another constructor of the
+    /// same class; `false` for `base(...)`.
+    pub delegates_to_this: bool,
     pub arguments: Vec<Argument>,
     pub span: Span,
 }

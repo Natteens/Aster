@@ -212,6 +212,17 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
                 collect_expression(argument, max);
             }
         }
+        hir::ExpressionKind::ObjectInitializer {
+            object,
+            receiver,
+            assignments,
+        } => {
+            collect_expression(object, max);
+            note(max, *receiver);
+            for assignment in assignments {
+                collect_expression(assignment, max);
+            }
+        }
         hir::ExpressionKind::ArrayLiteral(elements) => {
             for element in elements {
                 collect_expression(element, max);
@@ -436,6 +447,17 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
             binding,
         } => {
             note(max, *class);
+            if let Some(binding) = binding {
+                collect_variable(binding, max);
+            }
+            collect_expression(value, max);
+        }
+        hir::ExpressionKind::InterfaceTest {
+            value,
+            interface,
+            binding,
+        } => {
+            note(max, *interface);
             if let Some(binding) = binding {
                 collect_variable(binding, max);
             }

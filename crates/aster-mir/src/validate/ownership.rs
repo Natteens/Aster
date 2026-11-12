@@ -933,7 +933,8 @@ impl<'a> Block<'a> {
             | K::Cast(o)
             | K::Upcast(o)
             | K::Downcast(o)
-            | K::MakeInterface { object: o, .. } => {
+            | K::MakeInterface { object: o, .. }
+            | K::InterfaceLookup { object: o, .. } => {
                 sources = self.operand_values(o);
             }
             K::Aggregate(fields) => {
@@ -953,6 +954,7 @@ impl<'a> Block<'a> {
             }
             K::Discriminant(o)
             | K::ClassTest { object: o, .. }
+            | K::InterfaceTest { object: o, .. }
             | K::ArrayLength(o)
             | K::ListLength(o)
             | K::DictionaryLength(o)
