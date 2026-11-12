@@ -131,6 +131,84 @@ not comparable across machines or runners, and there is no cross-machine
 normalization, statistical regression test, or CI gate. A difference between
 two runs is a lead to investigate, not proof of a speedup or regression.
 
+## Baseline procedure (PERF-005)
+
+Measurements are split in two classes with different authority.
+
+### Class A: deterministic invariants (may gate)
+
+Per target (target triple and profile), record values that do not depend on the
+machine's speed or load and compare them for **equality**: checksums, allocation
+counts and bytes, final and peak live bytes (`benchmarks/memory`, the `memory_matrix`
+example and its `benchmarks/memory/compare.mjs`), count operations, MIR instruction
+and function counts, and code size. In `perf_baseline --json` the class A data is
+each benchmark's `status` and `invariants` object (`entry`, `expected_checksum`,
+`checksum`, `mir_function_count`). Class A differences are real changes and may fail
+a gate. A baseline is only valid for the target it was produced on.
+
+`compare.mjs` applies this to two `perf_baseline --json` reports:
+
+```console
+node benchmarks/performance/compare.mjs baseline.json candidate.json
+```
+
+- Rejected (exit 3, not compared): different `schema_version`, `kind`, or
+  `metadata.target`, `os`, `arch`, `profile`, `timing_unit`.
+- Class A failure (exit 1, differences listed): any benchmark `status` or
+  `invariants` field that differs, and any benchmark missing from or extra in the
+  candidate (the workload sets must be identical, so compare runs with the same
+  `--workload`/`--category` selection).
+- Class B is printed (exit unaffected): per benchmark and phase, baseline and
+  candidate median, ratio candidate/baseline, and spread (max - min). `run`,
+  `warmup`, `samples`, `git_revision` and `rustc_version` are not compared.
+- Exit 0 means class A is equal; exit 2 is a usage or read error.
+
+`metadata.target` is `<arch>-<os>` from the running binary, matching
+`memory_matrix`.
+
+### Class B: wall-clock timings (advisory, never a gate)
+
+Timings depend on the machine, so they are reported with their noise and never fail a
+check. Protocol, as used for MEM-EXP-1 (`docs/proposals/architecture-2026/09-mem-exp-1-report.md`,
+"Raw values"):
+
+1. One reference machine, fixed power state, quiet background, same toolchain.
+2. Build one release binary **per configuration** (baseline and candidate), keep them
+   as separate files, and never rebuild between rounds.
+3. Run 4 rounds, **alternating** which configuration goes first each round (A/B,
+   B/A, A/B, B/A), with `--samples 7 --warmup 2`, so drift and thermal state hit both
+   sides equally. This yields 28 samples per workload and configuration.
+4. Pool the samples per workload and configuration; report the **median**, the
+   **spread** (max - min) and the ratio of medians. Control workloads whose generated
+   code is identical bound the protocol's noise (about 3.5% in MEM-EXP-1); ratios
+   inside that band are not findings.
+5. Report class B in a table beside class A, labelled advisory.
+
+```console
+# build one release binary per configuration (checkout/build each side, then copy)
+cargo +stable-gnu build --release -p aster-codegen-cranelift --example perf_baseline
+cp target/release/examples/perf_baseline perf_baseline_base    # baseline revision
+# ...switch to the candidate configuration, rebuild, then:
+cp target/release/examples/perf_baseline perf_baseline_cand    # candidate
+
+# 4 alternating rounds
+for round in 1 2 3 4; do
+  if [ $((round % 2)) -eq 1 ]; then order="base cand"; else order="cand base"; fi
+  for side in $order; do
+    ./perf_baseline_$side --json --samples 7 --warmup 2 > "round${round}_${side}.json"
+  done
+done
+
+# class A gate on any pair (identical for every round), class B printed alongside
+node benchmarks/performance/compare.mjs round1_base.json round1_cand.json
+```
+
+`compare.mjs` compares one report pair; the pooled median of the 28 samples per
+side comes from concatenating each workload's `timings.<phase>.samples` across the
+four rounds. Use `execution_warm` for steady-state code quality and the cold
+phases for compile cost. Use `CARGO_BUILD_JOBS=2` and `RUST_TEST_THREADS=2` on the
+project notebook.
+
 ## Limitations
 
 - Execution timings use the prepared execution path with memory statistics
