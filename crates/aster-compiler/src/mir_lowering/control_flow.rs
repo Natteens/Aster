@@ -796,18 +796,12 @@ impl FunctionLowerer {
         for case in cases {
             let arm = self.new_block();
             let next = self.new_block();
-            let condition = self.temporary(
-                mir::Type::Bool,
-                mir::RvalueKind::Binary {
-                    left: discriminant.clone(),
-                    operator: mir::BinaryOperator::Equal,
-                    right: mir::Operand {
-                        type_: mir::Type::UInt,
-                        kind: mir::OperandKind::Constant(mir::Constant::Integer(
-                            case.tag.to_string(),
-                        )),
-                    },
-                },
+            let condition = self.switch_condition(
+                value_local,
+                &value.type_,
+                &discriminant,
+                case.label.as_ref(),
+                case.tag,
             );
             self.terminate_current(mir::Terminator::Branch {
                 condition,
@@ -815,7 +809,9 @@ impl FunctionLowerer {
                 else_block: next,
             });
             self.current = Some(arm);
-            self.bind_switch_case(value_local, case.case, &case.bindings);
+            if case.label.is_none() {
+                self.bind_switch_case(value_local, case.case, &case.bindings);
+            }
             self.lower_block(&case.body);
             if let Some(block) = self.current.take() {
                 self.terminate(block, mir::Terminator::Goto(join));
@@ -842,6 +838,9 @@ impl FunctionLowerer {
         }
     }
 
+    /// Evaluate the switch subject once into a temporary. Enum subjects also
+    /// yield their discriminant; integer, `char` and `string` subjects are
+    /// compared directly, so their discriminant operand is never read.
     fn lower_switch_value(&mut self, value: &hir::Expression) -> (mir::LocalId, mir::Operand) {
         let value_operand = self
             .lower_expression(value)
@@ -854,13 +853,72 @@ impl FunctionLowerer {
                 kind: mir::RvalueKind::Use(value_operand),
             },
         );
-        let enum_operand = mir::Operand {
+        let subject_operand = mir::Operand {
             type_: value.type_.clone(),
             kind: mir::OperandKind::Copy(mir::Place::Local(value_local)),
         };
-        let discriminant =
-            self.temporary(mir::Type::UInt, mir::RvalueKind::Discriminant(enum_operand));
+        if is_scalar_switch_type(&value.type_) {
+            return (value_local, subject_operand);
+        }
+        let discriminant = self.temporary(
+            mir::Type::UInt,
+            mir::RvalueKind::Discriminant(subject_operand),
+        );
         (value_local, discriminant)
+    }
+
+    /// The branch condition of one switch case: an enum tag comparison, or
+    /// for a constant `label` an equality test against the subject (`string`
+    /// through the content-equality intrinsic, so comparison is ordinal).
+    fn switch_condition(
+        &mut self,
+        value_local: mir::LocalId,
+        subject_type: &hir::Type,
+        discriminant: &mir::Operand,
+        label: Option<&hir::Expression>,
+        tag: u32,
+    ) -> mir::Operand {
+        let Some(label) = label else {
+            return self.temporary(
+                mir::Type::Bool,
+                mir::RvalueKind::Binary {
+                    left: discriminant.clone(),
+                    operator: mir::BinaryOperator::Equal,
+                    right: mir::Operand {
+                        type_: mir::Type::UInt,
+                        kind: mir::OperandKind::Constant(mir::Constant::Integer(tag.to_string())),
+                    },
+                },
+            );
+        };
+        let subject = mir::Operand {
+            type_: subject_type.clone(),
+            kind: mir::OperandKind::Copy(mir::Place::Local(value_local)),
+        };
+        let label = self
+            .lower_expression(label)
+            .expect("validated switch label produces a value");
+        if *subject_type == hir::Type::String {
+            let equals = self.new_temporary(hir::Type::Bool);
+            self.instruction(mir::Instruction::CallIntrinsic {
+                destination: Some(mir::Place::Local(equals)),
+                intrinsic: mir::Intrinsic::StringEquals,
+                arguments: vec![subject, label],
+                return_type: mir::Type::Bool,
+            });
+            return mir::Operand {
+                type_: mir::Type::Bool,
+                kind: mir::OperandKind::Copy(mir::Place::Local(equals)),
+            };
+        }
+        self.temporary(
+            mir::Type::Bool,
+            mir::RvalueKind::Binary {
+                left: subject,
+                operator: mir::BinaryOperator::Equal,
+                right: label,
+            },
+        )
     }
 
     fn bind_switch_case(
@@ -912,18 +970,12 @@ impl FunctionLowerer {
         for case in cases {
             let arm = self.new_block();
             let next = self.new_block();
-            let condition = self.temporary(
-                mir::Type::Bool,
-                mir::RvalueKind::Binary {
-                    left: discriminant.clone(),
-                    operator: mir::BinaryOperator::Equal,
-                    right: mir::Operand {
-                        type_: mir::Type::UInt,
-                        kind: mir::OperandKind::Constant(mir::Constant::Integer(
-                            case.tag.to_string(),
-                        )),
-                    },
-                },
+            let condition = self.switch_condition(
+                value_local,
+                &value.type_,
+                &discriminant,
+                case.label.as_ref(),
+                case.tag,
             );
             self.terminate_current(mir::Terminator::Branch {
                 condition,
@@ -931,7 +983,9 @@ impl FunctionLowerer {
                 else_block: next,
             });
             self.current = Some(arm);
-            self.bind_switch_case(value_local, case.case, &case.bindings);
+            if case.label.is_none() {
+                self.bind_switch_case(value_local, case.case, &case.bindings);
+            }
             let arm_value = self
                 .lower_expression(&case.value)
                 .expect("validated switch arm produces a value");
@@ -1127,4 +1181,21 @@ impl FunctionLowerer {
             }),
         )
     }
+}
+
+/// Subject types compared by value instead of by enum discriminant.
+fn is_scalar_switch_type(type_: &hir::Type) -> bool {
+    matches!(
+        type_,
+        hir::Type::Char
+            | hir::Type::String
+            | hir::Type::SByte
+            | hir::Type::Byte
+            | hir::Type::Short
+            | hir::Type::UShort
+            | hir::Type::Int
+            | hir::Type::UInt
+            | hir::Type::Long
+            | hir::Type::ULong
+    )
 }

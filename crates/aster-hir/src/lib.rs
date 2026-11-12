@@ -348,6 +348,10 @@ pub struct SwitchCase {
     pub case: SymbolId,
     pub tag: u32,
     pub bindings: Vec<Parameter>,
+    /// Integer, `char` or `string` switch: the constant label, already
+    /// converted to the subject type. Then `case`/`tag` are placeholders and
+    /// `bindings` is empty; MIR compares the subject with this value.
+    pub label: Option<Expression>,
     pub body: Block,
 }
 
@@ -356,6 +360,10 @@ pub struct SwitchExpressionCase {
     pub case: SymbolId,
     pub tag: u32,
     pub bindings: Vec<Parameter>,
+    /// Integer, `char` or `string` switch: the constant label, already
+    /// converted to the subject type. Then `case`/`tag` are placeholders and
+    /// `bindings` is empty; MIR compares the subject with this value.
+    pub label: Option<Expression>,
     pub value: Expression,
 }
 

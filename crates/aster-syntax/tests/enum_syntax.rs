@@ -205,3 +205,49 @@ fn rejects_unreachable_switch_expression_arm_after_default() {
             && diagnostic.help.as_deref() == Some("move `default` to the final arm")
     }));
 }
+
+#[test]
+fn parses_constant_switch_labels_next_to_enum_patterns() {
+    let module = parse(
+        lex(r#"
+        public int F(int v, string s) {
+            switch (v) { case 1: return 1; case -2: return 2; case Max + 1: return 3; case Limit: return 4; default: return 0; }
+            return s switch { "a" => 1, 'b' => 2, Other.Name => 3, Pay(x) => 4, default => 0, };
+        }
+        "#)
+        .expect("lexes"),
+    )
+    .expect("parses");
+    let aster_syntax::Item::Function(function) = &module.items[0] else {
+        panic!("function");
+    };
+    let statements = &function.body.as_ref().expect("body").statements;
+    let aster_syntax::Statement::Switch { cases, default, .. } = &statements[0] else {
+        panic!("switch statement");
+    };
+    assert!(default.is_some());
+    assert_eq!(cases.len(), 4);
+    assert!(cases[..3].iter().all(|case| case.case_name.is_empty()));
+    assert!(cases[..3].iter().all(|case| case.label.is_some()));
+    // A bare name stays an enum pattern and also records its expression.
+    assert_eq!(cases[3].case_name, "Limit");
+    assert!(matches!(
+        cases[3].label.as_ref().map(|label| &label.kind),
+        Some(aster_syntax::ExpressionKind::Name(name)) if name == "Limit"
+    ));
+    let aster_syntax::Statement::Return {
+        value: Some(value), ..
+    } = &statements[1]
+    else {
+        panic!("return");
+    };
+    let aster_syntax::ExpressionKind::Switch { cases, .. } = &value.kind else {
+        panic!("switch expression");
+    };
+    assert_eq!(cases.len(), 4);
+    assert!(cases[0].label.is_some() && cases[1].label.is_some());
+    assert_eq!(cases[2].enum_name.as_deref(), Some("Other"));
+    assert!(cases[2].label.is_some());
+    assert_eq!(cases[3].case_name, "Pay");
+    assert!(cases[3].label.is_none());
+}

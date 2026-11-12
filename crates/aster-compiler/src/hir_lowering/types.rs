@@ -138,6 +138,23 @@ pub(super) fn constant_expression(value: &ConstValue) -> hir::Expression {
     }
 }
 
+/// Subject types of an integer, `char` or `string` switch.
+pub(super) fn is_scalar_switch_type(type_: &hir::Type) -> bool {
+    matches!(
+        type_,
+        hir::Type::Char
+            | hir::Type::String
+            | hir::Type::SByte
+            | hir::Type::Byte
+            | hir::Type::Short
+            | hir::Type::UShort
+            | hir::Type::Int
+            | hir::Type::UInt
+            | hir::Type::Long
+            | hir::Type::ULong
+    )
+}
+
 /// Wrap an expression in a `Convert` node when its type differs from the
 /// validated target type. Only value types are ever converted.
 pub(super) fn convert(expression: hir::Expression, target: &hir::Type) -> hir::Expression {

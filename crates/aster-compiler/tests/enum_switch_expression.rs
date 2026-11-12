@@ -116,8 +116,8 @@ fn resolves_switch_expression_to_typed_hir_and_cfg_mir() {
 fn validates_switch_expression_patterns_exhaustiveness_and_result_types() {
     for (source, expected) in [
         (
-            "public int Read(int value) { return value switch { Anything => 1, }; }",
-            "requires an enum value",
+            "public int Read(bool value) { return value switch { Anything => 1, }; }",
+            "requires an enum, integer, `char` or `string` value",
         ),
         (
             "public enum E { A, B } public int Read(E value) { return value switch { A => 1, }; }",

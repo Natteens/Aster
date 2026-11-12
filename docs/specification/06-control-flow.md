@@ -59,6 +59,31 @@ iteration yields Unicode scalars as `char`.
 bindings are scoped to their direct arm. A restricted expression form uses `=>` arms and produces
 one value. See [Enums](16-enums.md).
 
+## `switch` on integers, `char` and `string`
+
+`switch` also accepts a subject of any integer type, `char` or `string`, in both the statement and the
+`=>` expression form. Labels are compile-time constants (literals, named constants, constant
+expressions) that convert implicitly to the subject type; an integer constant must fit the subject
+range, so `case 300:` on a `byte` is an error, and a label of another type is an error. A duplicate
+constant label is a compile error. `string` labels compare ordinally (byte-wise UTF-8, no
+normalization or case folding). Only enums can be exhaustive, so these switches require `default`.
+The subject is evaluated once, cases do not fall through, and `default` must be the last case.
+`break` and `continue` inside a case apply to the enclosing loop.
+
+```aster
+switch (command)
+{
+    case "start":
+        Start();
+    case "stop":
+        Stop();
+    default:
+        Unknown();
+}
+```
+
+Patterns such as `is T x` and `when` guards are not part of this form.
+
 ## Not implemented
 
 `if` is not an expression. There is no unconditional `loop`, iterator protocol, loop label,

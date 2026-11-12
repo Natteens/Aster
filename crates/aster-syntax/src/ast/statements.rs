@@ -88,6 +88,10 @@ pub struct SwitchCase {
     pub enum_name: Option<String>,
     pub case_name: String,
     pub bindings: Vec<String>,
+    /// The label as an expression: always set for non-name labels (then
+    /// `case_name` is empty), and set for payload-free enum-style names so a
+    /// constant name can label an integer, `char` or `string` switch.
+    pub label: Option<Expression>,
     pub body: Block,
     pub span: Span,
 }

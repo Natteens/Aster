@@ -204,6 +204,7 @@ fn fixture() -> Module {
                     enum_name: Some("Choice<T>".to_owned()),
                     case_name: "Some".to_owned(),
                     bindings: vec!["binding".to_owned()],
+                    label: None,
                     body: nested_block(46),
                     span: span(48),
                 }],

@@ -44,7 +44,7 @@ example, reference page. Gate: workspace tests; class A invariants unchanged or 
 | T-LANG-16 | Real literal defaults to `double` (breaking; migrate examples and stdlib) | LANG-016 | T-LANG-17 | low | todo |
 | T-OBJ-5 | Constructor overloads and `this(…)` (B2 record first) | OBJ-005 | — | low | todo |
 | T-LANG-5 | Auto-properties and `init` | LANG-005 | — | low | todo |
-| T-LANG-4a | `switch` on integers, chars, strings | LANG-004 | — | low | todo |
+| T-LANG-4a | `switch` on integers, chars, strings | LANG-004 | — | low | implemented 2026-11-11 (focused gates pass; full-suite gate pending with T-MEM-2) |
 | T-LANG-4b | `is T x` patterns and `when` guards | LANG-004 | T-LANG-4a | low | todo |
 | T-LANG-3 | `T?`, `null`, `??`, `?.` | LANG-003 | T-LANG-4b | medium | todo |
 | T-LANG-6 | Static fields per domain | LANG-006 | — | medium | todo |

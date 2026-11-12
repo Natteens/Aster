@@ -1282,17 +1282,24 @@ impl Lowerer<'_> {
                 default,
             } => {
                 let value = self.expression(value);
+                let scalar = super::types::is_scalar_switch_type(&value.type_);
                 let mut lowered_cases = Vec::new();
                 for case in cases {
                     self.scopes.push(std::collections::HashMap::new());
-                    let (case_symbol, tag, bindings) =
-                        self.switch_pattern(case.span, &case.bindings);
+                    let (case_symbol, tag, bindings, label) = if scalar {
+                        self.scalar_switch_pattern(case.label.as_ref(), &value.type_)
+                    } else {
+                        let (case_symbol, tag, bindings) =
+                            self.switch_pattern(case.span, &case.bindings);
+                        (case_symbol, tag, bindings, None)
+                    };
                     let arm = self.expression(&case.value);
                     self.scopes.pop();
                     lowered_cases.push(hir::SwitchExpressionCase {
                         case: case_symbol,
                         tag,
                         bindings,
+                        label,
                         value: arm,
                     });
                 }

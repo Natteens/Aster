@@ -44,6 +44,15 @@ struct Parser {
     nesting_reported: bool,
 }
 
+/// One parsed switch label; see `Parser::switch_pattern`.
+struct SwitchPattern {
+    enum_name: Option<String>,
+    case_name: String,
+    bindings: Vec<String>,
+    label: Option<Expression>,
+    end: usize,
+}
+
 /// The declaration modifiers already parsed before a function's name, grouped
 /// so `function_after_name` keeps a small argument list.
 #[derive(Clone, Copy)]
@@ -1201,31 +1210,15 @@ impl Parser {
                         .with_help("move `default` after every explicit case"),
                     );
                 }
-                let (first, first_span) = self.identifier()?;
-                let (enum_name, case_name) = if self.take(&TokenKind::Dot).is_some() {
-                    (Some(first), self.identifier()?.0)
-                } else {
-                    (None, first)
-                };
-                let mut bindings = Vec::new();
-                if self.take(&TokenKind::LeftParen).is_some() {
-                    if !self.at(&TokenKind::RightParen) {
-                        loop {
-                            bindings.push(self.identifier()?.0);
-                            if self.take(&TokenKind::Comma).is_none() {
-                                break;
-                            }
-                        }
-                    }
-                    self.expect(&TokenKind::RightParen)?;
-                }
+                let pattern = self.switch_pattern(&TokenKind::Colon)?;
                 self.expect(&TokenKind::Colon)?;
                 let body = self.switch_case_body();
                 cases.push(SwitchCase {
-                    enum_name,
-                    case_name,
-                    bindings,
-                    span: Span::new(case_start, body.span.end.max(first_span.end)),
+                    enum_name: pattern.enum_name,
+                    case_name: pattern.case_name,
+                    bindings: pattern.bindings,
+                    label: pattern.label,
+                    span: Span::new(case_start, body.span.end.max(pattern.end)),
                     body,
                 });
             } else if self.at(&TokenKind::Default) {
@@ -1252,6 +1245,76 @@ impl Parser {
             cases,
             default,
             span: Span::new(start, end),
+        })
+    }
+
+    /// A switch label before `terminator`: either an enum case pattern
+    /// (`Case`, `Enum.Case`, optionally with payload bindings) or a constant
+    /// expression for integer, `char` and `string` subjects. A plain or
+    /// dotted name without bindings is both: it keeps the enum pattern and
+    /// also records the equivalent expression, and semantic analysis picks one
+    /// from the subject type.
+    fn switch_pattern(&mut self, terminator: &TokenKind) -> Option<SwitchPattern> {
+        let is_name = |kind: &TokenKind| matches!(kind, TokenKind::Identifier(_));
+        let ends = |kind: &TokenKind| {
+            discriminant(kind) == discriminant(terminator) || matches!(kind, TokenKind::LeftParen)
+        };
+        let enum_pattern = is_name(&self.peek(0).kind)
+            && (ends(&self.peek(1).kind)
+                || (matches!(self.peek(1).kind, TokenKind::Dot)
+                    && is_name(&self.peek(2).kind)
+                    && ends(&self.peek(3).kind)));
+        if !enum_pattern {
+            let label = self.with_nesting(Self::logical_or)?;
+            let end = label.span.end;
+            return Some(SwitchPattern {
+                enum_name: None,
+                case_name: String::new(),
+                bindings: Vec::new(),
+                label: Some(label),
+                end,
+            });
+        }
+        let (first, first_span) = self.identifier()?;
+        let mut end = first_span.end;
+        let mut label = Expression {
+            kind: ExpressionKind::Name(first.clone()),
+            span: first_span,
+        };
+        let (enum_name, case_name) = if self.take(&TokenKind::Dot).is_some() {
+            let (second, second_span) = self.identifier()?;
+            end = second_span.end;
+            label = Expression {
+                span: Span::new(first_span.start, second_span.end),
+                kind: ExpressionKind::Member {
+                    object: Box::new(label),
+                    name: second.clone(),
+                },
+            };
+            (Some(first), second)
+        } else {
+            (None, first)
+        };
+        let mut bindings = Vec::new();
+        let mut has_payload = false;
+        if self.take(&TokenKind::LeftParen).is_some() {
+            has_payload = true;
+            if !self.at(&TokenKind::RightParen) {
+                loop {
+                    bindings.push(self.identifier()?.0);
+                    if self.take(&TokenKind::Comma).is_none() {
+                        break;
+                    }
+                }
+            }
+            self.expect(&TokenKind::RightParen)?;
+        }
+        Some(SwitchPattern {
+            enum_name,
+            case_name,
+            bindings,
+            label: (!has_payload).then_some(label),
+            end,
         })
     }
 
@@ -1390,31 +1453,15 @@ impl Parser {
                     );
                 }
                 let case_start = self.current().span.start;
-                let (first, first_span) = self.identifier()?;
-                let (enum_name, case_name) = if self.take(&TokenKind::Dot).is_some() {
-                    (Some(first), self.identifier()?.0)
-                } else {
-                    (None, first)
-                };
-                let mut bindings = Vec::new();
-                if self.take(&TokenKind::LeftParen).is_some() {
-                    if !self.at(&TokenKind::RightParen) {
-                        loop {
-                            bindings.push(self.identifier()?.0);
-                            if self.take(&TokenKind::Comma).is_none() {
-                                break;
-                            }
-                        }
-                    }
-                    self.expect(&TokenKind::RightParen)?;
-                }
+                let pattern = self.switch_pattern(&TokenKind::FatArrow)?;
                 self.expect(&TokenKind::FatArrow)?;
                 let arm = self.with_nesting(Self::assignment_expression)?;
-                let end = arm.span.end.max(first_span.end);
+                let end = arm.span.end.max(pattern.end);
                 cases.push(SwitchExpressionCase {
-                    enum_name,
-                    case_name,
-                    bindings,
+                    enum_name: pattern.enum_name,
+                    case_name: pattern.case_name,
+                    bindings: pattern.bindings,
+                    label: pattern.label,
                     value: arm,
                     span: Span::new(case_start, end),
                 });

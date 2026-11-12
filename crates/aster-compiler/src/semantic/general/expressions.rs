@@ -1051,17 +1051,20 @@ impl Analyzer<'_> {
         expected: Option<&Type>,
     ) -> Type {
         let selected = self.expression(value);
+        if super::statements::is_scalar_switch_subject(&selected) {
+            return self.scalar_switch_expression(&selected, cases, default, span, expected);
+        }
         let Type::Enum(enum_name) = selected else {
             if selected != Type::Unknown {
                 self.diagnostics.push(
                     Diagnostic::error(
                         format!(
-                            "`switch` expression requires an enum value, found `{}`",
+                            "`switch` expression requires an enum, integer, `char` or `string` value, found `{}`",
                             selected.display()
                         ),
                         value.span,
                     )
-                    .with_help("select a declared enum value"),
+                    .with_help("select an enum, integer, `char` or `string` value"),
                 );
             }
             for case in cases {
@@ -1131,6 +1134,51 @@ impl Analyzer<'_> {
             result_type = Some(self.switch_result_type(result_type, arm_type, default.span));
         } else {
             self.validate_switch_coverage(&enum_cases, &covered, None, span);
+        }
+        let result_type = result_type.unwrap_or_else(|| {
+            self.diagnostics.push(Diagnostic::error(
+                "a switch expression must contain at least one result arm",
+                span,
+            ));
+            Type::Unknown
+        });
+        let result_type = expected.cloned().unwrap_or(result_type);
+        if result_type != Type::Unknown {
+            self.model
+                .switch_expression_types
+                .insert(self.model_key(span), result_type.display());
+        }
+        result_type
+    }
+
+    /// Integer, `char` and `string` switch expression: constant labels, no
+    /// exhaustiveness, so `default` is mandatory.
+    fn scalar_switch_expression(
+        &mut self,
+        selected: &Type,
+        cases: &[aster_syntax::SwitchExpressionCase],
+        default: Option<&Expression>,
+        span: Span,
+        expected: Option<&Type>,
+    ) -> Type {
+        let mut seen = HashSet::new();
+        let mut result_type = None;
+        for case in cases {
+            self.check_scalar_label(selected, case.label.as_ref(), case.span, &mut seen);
+            let arm_type = self.expression_expected(&case.value, expected);
+            if let Some(expected) = expected {
+                self.require_assignable_value(expected, &arm_type, &case.value);
+            }
+            result_type = Some(self.switch_result_type(result_type, arm_type, case.value.span));
+        }
+        if let Some(default) = default {
+            let arm_type = self.expression_expected(default, expected);
+            if let Some(expected) = expected {
+                self.require_assignable_value(expected, &arm_type, default);
+            }
+            result_type = Some(self.switch_result_type(result_type, arm_type, default.span));
+        } else {
+            self.require_scalar_default(selected, span);
         }
         let result_type = result_type.unwrap_or_else(|| {
             self.diagnostics.push(Diagnostic::error(

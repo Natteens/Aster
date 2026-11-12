@@ -120,6 +120,8 @@ pub struct SwitchExpressionCase {
     pub enum_name: Option<String>,
     pub case_name: String,
     pub bindings: Vec<String>,
+    /// See `SwitchCase::label`.
+    pub label: Option<Expression>,
     pub value: Expression,
     pub span: Span,
 }

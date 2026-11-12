@@ -10,6 +10,23 @@ pub(super) struct ResolvedSwitch<'a> {
     pub(super) indices: &'a HashMap<&'a str, usize>,
 }
 
+/// Compile-time identity of an integer, `char` or `string` switch label;
+/// `char` labels compare by scalar value like integers.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) enum ScalarSwitchKey {
+    Integer(i128),
+    String(String),
+}
+
+/// Integer, `char` and `string` values may be switched on with constant
+/// labels (and a mandatory `default`), in addition to enums.
+pub(super) fn is_scalar_switch_subject(type_: &Type) -> bool {
+    matches!(type_, Type::Char | Type::String)
+        || type_
+            .primitive()
+            .is_some_and(aster_types::Primitive::is_integer)
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct Flow {
     pub(super) can_continue: bool,
@@ -335,17 +352,34 @@ impl Analyzer<'_> {
         span: Span,
     ) -> Flow {
         let selected = self.expression(value);
+        if is_scalar_switch_subject(&selected) {
+            let mut seen = HashSet::new();
+            let mut any_continues = false;
+            for case in cases {
+                self.check_scalar_label(&selected, case.label.as_ref(), case.span, &mut seen);
+                any_continues |= self.block(&case.body, true).can_continue;
+            }
+            if let Some(default) = default {
+                any_continues |= self.block(default, true).can_continue;
+            } else {
+                self.require_scalar_default(&selected, span);
+                any_continues = true;
+            }
+            return Flow {
+                can_continue: any_continues,
+            };
+        }
         let Type::Enum(enum_name) = selected else {
             if selected != Type::Unknown {
                 self.diagnostics.push(
                     Diagnostic::error(
                         format!(
-                            "`switch` requires an enum value, found `{}`",
+                            "`switch` requires an enum, integer, `char` or `string` value, found `{}`",
                             selected.display()
                         ),
                         value.span,
                     )
-                    .with_help("select a declared enum value"),
+                    .with_help("select an enum, integer, `char` or `string` value"),
                 );
             }
             for case in cases {
@@ -414,6 +448,106 @@ impl Analyzer<'_> {
         Flow {
             can_continue: any_continues,
         }
+    }
+
+    /// Validate one constant label of an integer, `char` or `string` switch:
+    /// it must convert implicitly to the subject type (integer constants that
+    /// fit the subject range convert), be a compile-time constant, and not
+    /// repeat an earlier label.
+    pub(super) fn check_scalar_label(
+        &mut self,
+        subject: &Type,
+        label: Option<&Expression>,
+        span: Span,
+        seen: &mut HashSet<ScalarSwitchKey>,
+    ) {
+        let Some(label) = label else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "a `{}` switch case must be a constant label, not an enum pattern",
+                        subject.display()
+                    ),
+                    span,
+                )
+                .with_help("use a literal or constant of the switch value's type"),
+            );
+            return;
+        };
+        let label_type = self.expression(label);
+        if label_type == Type::Unknown {
+            return;
+        }
+        let errors_before = self.diagnostics.len();
+        self.require_assignable_value(subject, &label_type, label);
+        if self.diagnostics.len() != errors_before {
+            return;
+        }
+        let resolve = |name: &str| self.binding(name).and_then(|binding| binding.value.clone());
+        let value = match evaluate(label, &resolve) {
+            Ok(value) => value,
+            Err(error) => {
+                let diagnostic = match error {
+                    ConstError::NotConstant(span) => {
+                        Diagnostic::error("a switch case label must be a constant expression", span)
+                            .with_help(
+                                "use literals, constants, operators, `?:`, or casts; calls and variables are not constant",
+                            )
+                    }
+                    ConstError::Overflow(span, type_name) => Diagnostic::error(
+                        format!("constant expression overflows `{type_name}`"),
+                        span,
+                    ),
+                    ConstError::DivisionByZero(span) => {
+                        Diagnostic::error("constant expression divides by zero", span)
+                    }
+                };
+                self.diagnostics.push(diagnostic);
+                return;
+            }
+        };
+        let (key, shown) = match value {
+            ConstValue::Integer(value, _) => (ScalarSwitchKey::Integer(value), value.to_string()),
+            ConstValue::Char(value) => (
+                ScalarSwitchKey::Integer(i128::from(u32::from(value))),
+                format!("'{}'", value.escape_default()),
+            ),
+            ConstValue::Str(value) => (
+                ScalarSwitchKey::String(value.clone()),
+                format!("\"{}\"", value.escape_default()),
+            ),
+            _ => {
+                self.diagnostics.push(Diagnostic::error(
+                    format!(
+                        "a switch case label cannot have type `{}` here",
+                        label_type.display()
+                    ),
+                    label.span,
+                ));
+                return;
+            }
+        };
+        if !seen.insert(key) {
+            self.diagnostics.push(Diagnostic::error(
+                format!("duplicate switch case `{shown}`"),
+                span,
+            ));
+        }
+    }
+
+    /// Only enums can be exhaustive, so an integer, `char` or `string` switch
+    /// always needs `default`.
+    pub(super) fn require_scalar_default(&mut self, subject: &Type, span: Span) {
+        self.diagnostics.push(
+            Diagnostic::error(
+                format!(
+                    "a `switch` on `{}` requires a `default` case",
+                    subject.display()
+                ),
+                span,
+            )
+            .with_help("only enum switches can be exhaustive; add a `default` case"),
+        );
     }
 
     pub(super) fn resolve_switch_pattern(

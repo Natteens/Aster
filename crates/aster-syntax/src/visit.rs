@@ -319,6 +319,9 @@ pub fn walk_statement_mut<V: AstVisitorMut + ?Sized>(visitor: &mut V, statement:
 }
 
 pub fn walk_switch_case_mut<V: AstVisitorMut + ?Sized>(visitor: &mut V, case: &mut SwitchCase) {
+    if let Some(label) = &mut case.label {
+        visitor.visit_expression_mut(label);
+    }
     visitor.visit_block_mut(&mut case.body);
 }
 
@@ -326,6 +329,9 @@ pub fn walk_switch_expression_case_mut<V: AstVisitorMut + ?Sized>(
     visitor: &mut V,
     case: &mut SwitchExpressionCase,
 ) {
+    if let Some(label) = &mut case.label {
+        visitor.visit_expression_mut(label);
+    }
     visitor.visit_expression_mut(&mut case.value);
 }
 

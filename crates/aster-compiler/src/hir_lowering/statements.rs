@@ -1,5 +1,5 @@
 use super::declarations::visibility;
-use super::types::{constant_expression, convert};
+use super::types::{constant_expression, convert, is_scalar_switch_type};
 use super::{HashMap, Lowerer, ast, hir};
 use crate::constexpr::evaluate;
 
@@ -130,17 +130,24 @@ impl Lowerer<'_> {
                 ..
             } => {
                 let value = self.expression(value);
+                let scalar = is_scalar_switch_type(&value.type_);
                 let mut lowered_cases = Vec::new();
                 for case in cases {
                     self.scopes.push(HashMap::new());
-                    let (case_symbol, tag, bindings) =
-                        self.switch_pattern(case.span, &case.bindings);
+                    let (case_symbol, tag, bindings, label) = if scalar {
+                        self.scalar_switch_pattern(case.label.as_ref(), &value.type_)
+                    } else {
+                        let (case_symbol, tag, bindings) =
+                            self.switch_pattern(case.span, &case.bindings);
+                        (case_symbol, tag, bindings, None)
+                    };
                     let body = self.block(&case.body);
                     self.scopes.pop();
                     lowered_cases.push(hir::SwitchCase {
                         case: case_symbol,
                         tag,
                         bindings,
+                        label,
                         body,
                     });
                 }
@@ -154,6 +161,23 @@ impl Lowerer<'_> {
             ast::Statement::Continue(_) => hir::Statement::Continue,
             ast::Statement::Unsafe { body, .. } => hir::Statement::Block(self.block(body)),
         })
+    }
+
+    /// A constant label of an integer, `char` or `string` switch, converted
+    /// to the subject type, with placeholder case data.
+    pub(super) fn scalar_switch_pattern(
+        &mut self,
+        label: Option<&ast::Expression>,
+        subject: &hir::Type,
+    ) -> (
+        hir::SymbolId,
+        u32,
+        Vec<hir::Parameter>,
+        Option<hir::Expression>,
+    ) {
+        let label = label.expect("validated scalar switch case has a label");
+        let label = convert(self.expression(label), subject);
+        (self.allocate(), 0, Vec::new(), Some(label))
     }
 
     pub(super) fn switch_pattern(
