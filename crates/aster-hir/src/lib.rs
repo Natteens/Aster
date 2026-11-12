@@ -314,6 +314,10 @@ pub enum Statement {
         condition: Expression,
         body: Block,
     },
+    DoWhile {
+        body: Block,
+        condition: Expression,
+    },
     For {
         initializer: Option<Box<Statement>>,
         condition: Option<Expression>,
@@ -899,6 +903,7 @@ pub enum AssignmentOperator {
     SubtractAssign,
     MultiplyAssign,
     DivideAssign,
+    RemainderAssign,
     BitwiseAndAssign,
     BitwiseOrAssign,
     BitwiseXorAssign,

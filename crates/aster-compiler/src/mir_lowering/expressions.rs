@@ -1812,6 +1812,7 @@ pub(super) fn compound_operator(operator: hir::AssignmentOperator) -> mir::Binar
         hir::AssignmentOperator::SubtractAssign => mir::BinaryOperator::Subtract,
         hir::AssignmentOperator::MultiplyAssign => mir::BinaryOperator::Multiply,
         hir::AssignmentOperator::DivideAssign => mir::BinaryOperator::Divide,
+        hir::AssignmentOperator::RemainderAssign => mir::BinaryOperator::Remainder,
         hir::AssignmentOperator::BitwiseAndAssign => mir::BinaryOperator::BitwiseAnd,
         hir::AssignmentOperator::BitwiseOrAssign => mir::BinaryOperator::BitwiseOr,
         hir::AssignmentOperator::BitwiseXorAssign => mir::BinaryOperator::BitwiseXor,

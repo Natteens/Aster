@@ -53,6 +53,12 @@ impl Lowerer<'_> {
                 condition: self.expression(condition),
                 body: self.block(body),
             },
+            ast::Statement::DoWhile {
+                body, condition, ..
+            } => hir::Statement::DoWhile {
+                body: self.block(body),
+                condition: self.expression(condition),
+            },
             ast::Statement::For {
                 initializer,
                 condition,

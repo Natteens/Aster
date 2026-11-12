@@ -989,6 +989,9 @@ impl Parser {
         if self.at(&TokenKind::While) {
             return self.while_statement();
         }
+        if self.at(&TokenKind::Do) {
+            return self.do_while_statement();
+        }
         if self.at(&TokenKind::For) {
             return self.for_statement();
         }
@@ -1068,6 +1071,21 @@ impl Parser {
         Some(Statement::While {
             condition,
             body,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn do_while_statement(&mut self) -> Option<Statement> {
+        let start = self.expect(&TokenKind::Do)?.span.start;
+        let body = self.block()?;
+        self.expect(&TokenKind::While)?;
+        self.expect(&TokenKind::LeftParen)?;
+        let condition = self.expression()?;
+        self.expect(&TokenKind::RightParen)?;
+        let end = self.expect(&TokenKind::Semicolon)?.span.end;
+        Some(Statement::DoWhile {
+            body,
+            condition,
             span: Span::new(start, end),
         })
     }
@@ -1282,6 +1300,7 @@ impl Parser {
             TokenKind::MinusEqual => Some((AssignmentOperator::SubtractAssign, 1)),
             TokenKind::StarEqual => Some((AssignmentOperator::MultiplyAssign, 1)),
             TokenKind::SlashEqual => Some((AssignmentOperator::DivideAssign, 1)),
+            TokenKind::PercentEqual => Some((AssignmentOperator::RemainderAssign, 1)),
             TokenKind::AmpersandEqual => Some((AssignmentOperator::BitwiseAndAssign, 1)),
             TokenKind::PipeEqual => Some((AssignmentOperator::BitwiseOrAssign, 1)),
             TokenKind::CaretEqual => Some((AssignmentOperator::BitwiseXorAssign, 1)),
@@ -1824,6 +1843,7 @@ impl Parser {
                     | TokenKind::MinusEqual
                     | TokenKind::StarEqual
                     | TokenKind::SlashEqual
+                    | TokenKind::PercentEqual
             )
     }
 
@@ -2402,6 +2422,7 @@ impl Parser {
                 TokenKind::RightBrace
                 | TokenKind::Eof
                 | TokenKind::If
+                | TokenKind::Do
                 | TokenKind::While
                 | TokenKind::For
                 | TokenKind::Return

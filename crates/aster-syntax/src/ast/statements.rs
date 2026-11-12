@@ -26,6 +26,12 @@ pub enum Statement {
         body: Block,
         span: Span,
     },
+    /// `do { body } while (condition);` — the body runs before the first test.
+    DoWhile {
+        body: Block,
+        condition: Expression,
+        span: Span,
+    },
     For {
         initializer: Option<Box<Statement>>,
         condition: Option<Expression>,
@@ -65,6 +71,7 @@ impl Statement {
             Self::Return { span, .. }
             | Self::If { span, .. }
             | Self::While { span, .. }
+            | Self::DoWhile { span, .. }
             | Self::For { span, .. }
             | Self::ForEach { span, .. }
             | Self::Switch { span, .. }

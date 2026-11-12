@@ -262,6 +262,12 @@ pub fn walk_statement_mut<V: AstVisitorMut + ?Sized>(visitor: &mut V, statement:
             visitor.visit_expression_mut(condition);
             visitor.visit_block_mut(body);
         }
+        Statement::DoWhile {
+            body, condition, ..
+        } => {
+            visitor.visit_block_mut(body);
+            visitor.visit_expression_mut(condition);
+        }
         Statement::For {
             initializer,
             condition,

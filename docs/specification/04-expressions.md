@@ -51,8 +51,10 @@ int result = calculate(10, 20);
 - Assignment requires a writable place expression on the left.
 - Proposed arithmetic operators are `+`, `-`, `*`, `/`, and `%`.
 - Proposed comparison operators are `==`, `!=`, `<`, `<=`, `>`, and `>=`.
-- Implemented compound assignments are `+=`, `-=`, `*=`, `/=`, `&=`, `|=`, `^=`, `<<=`, `>>=`, and
-  `>>>=`. `%=` is only proposed and is not parsed.
+- Implemented compound assignments are `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`, and
+  `>>>=`. `%=` follows the typing rules of `%` and of the other arithmetic compound assignments
+  (the operation type must equal the target type, so it never narrows silently), and evaluates its
+  target place once.
 - No implicit truthiness is proposed; conditions require `bool`.
 
 ## Valid design examples

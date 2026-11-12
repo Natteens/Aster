@@ -1364,6 +1364,7 @@ fn validate_async_statement(statement: &Statement, diagnostics: &mut Vec<Diagnos
     match statement {
         Statement::If { span, .. }
         | Statement::While { span, .. }
+        | Statement::DoWhile { span, .. }
         | Statement::For { span, .. }
         | Statement::ForEach { span, .. }
         | Statement::Switch { span, .. }
@@ -1426,6 +1427,14 @@ pub(super) fn collect_statement_calls<'a>(statement: &'a Statement, out: &mut Ve
             for statement in &body.statements {
                 collect_statement_calls(statement, out);
             }
+        }
+        Statement::DoWhile {
+            body, condition, ..
+        } => {
+            for statement in &body.statements {
+                collect_statement_calls(statement, out);
+            }
+            collect_expression_calls(condition, out);
         }
         Statement::For {
             initializer,
@@ -1584,6 +1593,7 @@ fn collect_statement_awaits<'a>(statement: &'a Statement, out: &mut Vec<&'a Expr
         Statement::Expression(expression) => collect_expression_awaits(expression, out),
         Statement::If { .. }
         | Statement::While { .. }
+        | Statement::DoWhile { .. }
         | Statement::For { .. }
         | Statement::ForEach { .. }
         | Statement::Switch { .. }

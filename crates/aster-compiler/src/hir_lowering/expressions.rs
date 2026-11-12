@@ -1571,6 +1571,7 @@ convert_operator!(
         SubtractAssign,
         MultiplyAssign,
         DivideAssign,
+        RemainderAssign,
         BitwiseAndAssign,
         BitwiseOrAssign,
         BitwiseXorAssign,

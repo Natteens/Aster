@@ -39,7 +39,8 @@ example, reference page. Gate: workspace tests; class A invariants unchanged or 
 | ID | Objective | Decision | Depends on | Risk | Status |
 | --- | --- | --- | --- | --- | --- |
 | T-LANG-18 | `Main(string[] args)`, exit status, standard error, environment | LANG-018 | — | low | todo |
-| T-LANG-17 | `do`-`while`, `%=`, block comments, exponents, digit separators | LANG-017 | — | low | todo |
+| T-LANG-17 | `do`-`while`, `%=`, block comments, exponents, digit separators | LANG-017 | — | low | implemented 2026-11-11 (focused gates pass; full-suite gate pending with T-MEM-2) |
+| T-FIX-FREM | Floating-point `%` and `%=` execute in the JIT (today a controlled "not yet supported" error; found by T-LANG-17) | LANG-017, numeric conformance | — | low | todo |
 | T-LANG-16 | Real literal defaults to `double` (breaking; migrate examples and stdlib) | LANG-016 | T-LANG-17 | low | todo |
 | T-OBJ-5 | Constructor overloads and `this(…)` (B2 record first) | OBJ-005 | — | low | todo |
 | T-LANG-5 | Auto-properties and `init` | LANG-005 | — | low | todo |

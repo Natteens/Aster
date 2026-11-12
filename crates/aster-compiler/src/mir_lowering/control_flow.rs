@@ -37,6 +37,7 @@ impl FunctionLowerer {
                 else_block,
             } => self.lower_if(condition, then_block, else_block.as_ref()),
             hir::Statement::While { condition, body } => self.lower_while(condition, body),
+            hir::Statement::DoWhile { body, condition } => self.lower_do_while(body, condition),
             hir::Statement::For {
                 initializer,
                 condition,
@@ -208,6 +209,37 @@ impl FunctionLowerer {
             self.terminate(block, mir::Terminator::Goto(condition_id));
         }
         self.loops.pop();
+        self.current = Some(exit_id);
+    }
+
+    /// `do { body } while (condition);`: the body block runs first, and
+    /// `continue` jumps to the condition check.
+    fn lower_do_while(&mut self, body: &hir::Block, condition: &hir::Expression) {
+        let body_id = self.new_block();
+        let condition_id = self.new_block();
+        let exit_id = self.new_block();
+        self.terminate_current(mir::Terminator::Goto(body_id));
+
+        self.loops.push(LoopTargets {
+            break_block: exit_id,
+            continue_block: condition_id,
+        });
+        self.current = Some(body_id);
+        self.lower_block(body);
+        if let Some(block) = self.current.take() {
+            self.terminate(block, mir::Terminator::Goto(condition_id));
+        }
+        self.loops.pop();
+
+        self.current = Some(condition_id);
+        let condition = self
+            .lower_expression(condition)
+            .expect("validated condition produces a value");
+        self.terminate_current(mir::Terminator::Branch {
+            condition,
+            then_block: body_id,
+            else_block: exit_id,
+        });
         self.current = Some(exit_id);
     }
 

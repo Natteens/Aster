@@ -180,6 +180,12 @@ impl Monomorphizer {
                 self.expression(condition, environment);
                 self.block(body, &mut environment.clone());
             }
+            Statement::DoWhile {
+                body, condition, ..
+            } => {
+                self.block(body, &mut environment.clone());
+                self.expression(condition, environment);
+            }
             Statement::For {
                 initializer,
                 condition,

@@ -205,6 +205,7 @@ pub enum AssignmentOperator {
     SubtractAssign,
     MultiplyAssign,
     DivideAssign,
+    RemainderAssign,
     BitwiseAndAssign,
     BitwiseOrAssign,
     BitwiseXorAssign,

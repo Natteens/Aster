@@ -174,6 +174,18 @@ impl Analyzer<'_> {
                 self.loop_depth -= 1;
                 Flow::CONTINUE
             }
+            Statement::DoWhile {
+                body, condition, ..
+            } => {
+                self.loop_depth += 1;
+                let before = self.scopes.clone();
+                self.block(body, true);
+                self.scopes = before;
+                self.loop_depth -= 1;
+                let condition_type = self.expression(condition);
+                self.require_bool_condition("do-while", &condition_type, condition.span);
+                Flow::CONTINUE
+            }
             Statement::For {
                 initializer,
                 condition,

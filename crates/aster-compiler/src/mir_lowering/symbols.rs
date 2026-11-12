@@ -106,6 +106,10 @@ fn collect_statement(statement: &hir::Statement, max: &mut u32) {
             collect_expression(condition, max);
             collect_block(body, max);
         }
+        hir::Statement::DoWhile { body, condition } => {
+            collect_block(body, max);
+            collect_expression(condition, max);
+        }
         hir::Statement::For {
             initializer,
             condition,

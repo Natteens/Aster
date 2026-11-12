@@ -2,7 +2,7 @@
 
 ## Accepted syntax
 
-ASTER supports `if`/`else`, `while`, C-style `for`, compiler-known `foreach`, enum `switch`,
+ASTER supports `if`/`else`, `while`, `do`-`while`, C-style `for`, compiler-known `foreach`, enum `switch`,
 `break`, `continue`, and `return`.
 
 ```aster
@@ -10,6 +10,12 @@ if (temperature > limit)
 {
     Warn();
 }
+
+do
+{
+    attempts++;
+}
+while (attempts < limit);
 
 for (int index = 0; index < values.Length; index++)
 {
@@ -31,6 +37,9 @@ foreach (var value in values)
 
 - Conditions have type `bool`.
 - Control-flow bodies use blocks.
+- `do { body } while (condition);` runs the body before the first test of the `bool` condition, and
+  the terminating `;` is required. `continue` inside it jumps to the condition check. Locals declared in
+  the body are not visible in the condition (as in C#).
 - C-style `for` has initializer, condition, and update clauses.
 - `foreach (T name in expression)` checks an explicit element type; `foreach (var name in
   expression)` infers the exact element type.
