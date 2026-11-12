@@ -182,6 +182,19 @@ pub(super) fn convert(expression: hir::Expression, target: &hir::Type) -> hir::E
             },
         };
     }
+    // Semantic analysis only admits an interface-to-interface conversion
+    // toward a base interface.
+    if let (hir::Type::Interface(from), hir::Type::Interface(to)) = (&expression.type_, target)
+        && from != to
+    {
+        return hir::Expression {
+            type_: target.clone(),
+            kind: hir::ExpressionKind::UpcastInterfaceValue {
+                object: Box::new(expression),
+                interface: *to,
+            },
+        };
+    }
     if &expression.type_ == target
         || matches!(
             expression.type_,

@@ -2767,8 +2767,8 @@ fn validate_intrinsic_shape(
                     (mir::Type::Task(result), [function, values @ ..])
                         if matches!(function.kind, mir::OperandKind::Function(_))
                             && function.type_ == **result
-                            && is_worker_transferable(result)
-                            && values.iter().all(|value| task_argument_shape(&value.type_))
+                            && copy_result_shape(result)
+                            && values.iter().all(|value| copy_argument_shape(&value.type_))
                             && function_operand_matches(
                                 function,
                                 &values.iter().map(|value| value.type_.clone()).collect::<Vec<_>>(),
@@ -2779,7 +2779,7 @@ fn validate_intrinsic_shape(
         }
         mir::Intrinsic::TaskWait => {
             destination.is_some()
-                && is_worker_transferable(return_type)
+                && copy_result_shape(return_type)
                 && matches!(
                     arguments,
                     [argument] if matches!(
@@ -2793,7 +2793,7 @@ fn validate_intrinsic_shape(
                 && matches!(
                     (return_type, arguments),
                     (mir::Type::Array(result), [tasks])
-                        if is_worker_transferable(result)
+                        if copy_result_shape(result)
                             && tasks.type_ == mir::Type::Array(Box::new(mir::Type::Task(result.clone())))
                 )
         }
@@ -3335,10 +3335,30 @@ fn is_worker_transferable(type_: &mir::Type) -> bool {
     primitive(type_).is_some_and(aster_types::Primitive::is_worker_transferable)
 }
 
+/// Shallow shape of a value that may cross `Task.Run` by deep copy: scalars,
+/// strings, collections, structs and enums. Contents are checked nominally by
+/// `validate_task_argument_transfer`.
+fn copy_argument_shape(type_: &mir::Type) -> bool {
+    task_argument_shape(type_)
+        || matches!(
+            type_,
+            mir::Type::String
+                | mir::Type::Array(_)
+                | mir::Type::List(_)
+                | mir::Type::Dictionary(_, _)
+        )
+}
+
+/// Shallow shape of a task result: any copy-transferable value.
+fn copy_result_shape(type_: &mir::Type) -> bool {
+    copy_argument_shape(type_)
+}
+
 fn task_argument_shape(type_: &mir::Type) -> bool {
     is_worker_transferable(type_) || matches!(type_, mir::Type::User(_) | mir::Type::Enum(_))
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_task_argument_transfer(
     module: &mir::Module,
     structs: &HashMap<mir::SymbolId, &mir::StructDefinition>,
@@ -3349,9 +3369,23 @@ fn validate_task_argument_transfer(
         structs: &HashMap<mir::SymbolId, &mir::StructDefinition>,
         enums: &HashMap<mir::SymbolId, &mir::EnumDefinition>,
         visiting: &mut HashSet<mir::SymbolId>,
+        deep: bool,
     ) -> bool {
         if is_worker_transferable(type_) {
             return true;
+        }
+        if deep {
+            match type_ {
+                mir::Type::String => return true,
+                mir::Type::Array(element) | mir::Type::List(element) => {
+                    return transferable(element, structs, enums, visiting, deep);
+                }
+                mir::Type::Dictionary(key, value) => {
+                    return transferable(key, structs, enums, visiting, deep)
+                        && transferable(value, structs, enums, visiting, deep);
+                }
+                _ => {}
+            }
         }
         let symbol = match type_ {
             mir::Type::User(symbol) | mir::Type::Enum(symbol) => *symbol,
@@ -3365,13 +3399,13 @@ fn validate_task_argument_transfer(
                 definition
                     .fields
                     .iter()
-                    .all(|field| transferable(&field.type_, structs, enums, visiting))
+                    .all(|field| transferable(&field.type_, structs, enums, visiting, deep))
             }),
             mir::Type::Enum(_) => enums.get(&symbol).is_some_and(|definition| {
                 definition.cases.iter().all(|case| {
                     case.fields
                         .iter()
-                        .all(|field| transferable(&field.type_, structs, enums, visiting))
+                        .all(|field| transferable(&field.type_, structs, enums, visiting, deep))
                 })
             }),
             _ => false,
@@ -3385,18 +3419,45 @@ fn validate_task_argument_transfer(
             let mir::Instruction::CallIntrinsic {
                 intrinsic,
                 arguments,
+                return_type,
                 ..
             } = instruction
             else {
                 continue;
             };
-            let skip = match intrinsic {
-                mir::Intrinsic::TaskRun => 1,
-                mir::Intrinsic::AsyncSpawnInner => 2,
+            let (skip, deep) = match intrinsic {
+                mir::Intrinsic::TaskRun => (1, true),
+                mir::Intrinsic::AsyncSpawnInner => (2, false),
+                mir::Intrinsic::TaskWait | mir::Intrinsic::TaskWaitAll => {
+                    let result = match return_type {
+                        mir::Type::Array(element) if *intrinsic == mir::Intrinsic::TaskWaitAll => {
+                            element
+                        }
+                        other => other,
+                    };
+                    if !transferable(result, structs, enums, &mut HashSet::new(), true) {
+                        return Err(BackendError::new(format!(
+                            "function `{}` contains a malformed {intrinsic:?} with non-transferable result type `{}`",
+                            function.name,
+                            type_name(result)
+                        )));
+                    }
+                    continue;
+                }
                 _ => continue,
             };
+            if *intrinsic == mir::Intrinsic::TaskRun
+                && let mir::Type::Task(result) = return_type
+                && !transferable(result, structs, enums, &mut HashSet::new(), true)
+            {
+                return Err(BackendError::new(format!(
+                    "function `{}` contains a malformed TaskRun with non-transferable result type `{}`",
+                    function.name,
+                    type_name(result)
+                )));
+            }
             for argument in arguments.iter().skip(skip) {
-                if !transferable(&argument.type_, structs, enums, &mut HashSet::new()) {
+                if !transferable(&argument.type_, structs, enums, &mut HashSet::new(), deep) {
                     return Err(BackendError::new(format!(
                         "function `{}` contains a malformed TaskRun with non-transferable argument type `{}`",
                         function.name,

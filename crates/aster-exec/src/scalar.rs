@@ -51,7 +51,7 @@ pub fn to_bits(value: &ExecutionValue) -> i64 {
         ExecutionValue::Float(value) => u64::from(value.to_bits()),
         ExecutionValue::Double(value) => value.to_bits(),
         ExecutionValue::Char(value) => u64::from(*value as u32),
-        ExecutionValue::String(_) | ExecutionValue::Void => 0,
+        ExecutionValue::String(_) | ExecutionValue::Transfer(_) | ExecutionValue::Void => 0,
     };
     i64::from_ne_bytes(bits.to_ne_bytes())
 }

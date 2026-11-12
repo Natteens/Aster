@@ -46,7 +46,11 @@ impl Codegen {
         signature
             .params
             .push(super::AbiParam::new(self.pointer_type));
-        if function.return_type != mir::Type::Void && !is_aggregate(&function.return_type) {
+        signature
+            .params
+            .push(super::AbiParam::new(self.pointer_type));
+        let deep_result = super::transfer::is_deep_result_type(&function.return_type);
+        if function.return_type != mir::Type::Void && !deep_result {
             signature.returns.push(super::AbiParam::new(
                 self.clif_value_type(&function.return_type)?,
             ));
@@ -61,6 +65,7 @@ impl Codegen {
             builder.seal_block(entry);
             let context_value = builder.block_params(entry)[0];
             let payload = builder.block_params(entry)[1];
+            let result_out = builder.block_params(entry)[2];
             let layout = self.layouts.task_argument_layout(
                 &function
                     .parameters
@@ -69,6 +74,10 @@ impl Codegen {
                     .collect::<Vec<_>>(),
             )?;
             let mut values = vec![context_value];
+            if is_aggregate(&function.return_type) {
+                // Hidden return pointer: the host-provided result image.
+                values.push(result_out);
+            }
             for (parameter, offset) in function.parameters.iter().zip(layout.offsets) {
                 if is_aggregate(&parameter.type_) {
                     values.push(builder.ins().iadd_imm(payload, i64::from(offset)));
@@ -87,6 +96,11 @@ impl Codegen {
             let target = self.jit.declare_func_in_func(function_id, builder.func);
             let call = builder.ins().call(target, &values);
             if function.return_type == mir::Type::Void || is_aggregate(&function.return_type) {
+                builder.ins().return_(&[]);
+            } else if deep_result {
+                // String/array/list/dictionary: the pointer goes to the image.
+                let result = builder.inst_results(call)[0];
+                builder.ins().store(MemFlags::new(), result, result_out, 0);
                 builder.ins().return_(&[]);
             } else {
                 let result = builder.inst_results(call)[0];

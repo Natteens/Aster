@@ -988,7 +988,7 @@ fn a_diverged_version_is_rejected_with_the_stable_message() {
 }
 
 #[test]
-fn workers_still_reject_a_list_crossing_a_worker_boundary() {
+fn a_list_crosses_a_worker_boundary_by_copy() {
     let errors = compile_errors(
         r"
         public List<int> Make() { return new List<int>(); }
@@ -998,12 +998,8 @@ fn workers_still_reject_a_list_crossing_a_worker_boundary() {
         }
         ",
     );
-    assert!(
-        errors
-            .iter()
-            .any(|message| message.contains("cross a worker boundary")),
-        "foreach must not have changed List<T> worker-transferability, got {errors:?}"
-    );
+    // CONC-005: a `List<T>` of transferables crosses by copy.
+    assert!(errors.is_empty(), "unexpected errors: {errors:?}");
 }
 
 #[test]

@@ -224,15 +224,12 @@ fn substring_escape_analysis_classifies_the_result_independently() {
 }
 
 #[test]
-fn concurrency_still_rejects_string_results() {
-    assert!(
-        messages(
-            r#"
+fn string_results_cross_a_worker_boundary_by_copy() {
+    compile(
+        r#"
         public string Slice() { return "aster".Substring(1); }
         public int Run() { Task<string> task = Task.Run(Slice); return 0; }
-        "#
-        )
-        .iter()
-        .any(|message| message.contains("cannot cross a worker boundary"))
-    );
+        "#,
+    )
+    .expect("string task results are copied across the worker boundary");
 }

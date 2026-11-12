@@ -195,6 +195,17 @@ the `extern "C"` task/async/parallel ABI functions that generated code calls (`t
 re-exports unchanged. It depends only on `aster-mir` and `aster-runtime`, so an ahead-of-time
 backend can reuse it without a JIT.
 
+Task transfer (CONC-005) copies strings, arrays, `List<T>`, `Dictionary<K, V>` and structs/enums of
+those across the worker boundary. The backend describes each transferable type as a
+`aster_runtime::TransferShape` (memory-image only: scalar widths, pointer kinds, field offsets,
+enum tags, plus the counting descriptors). `ExecutionContext::transfer_pack` serializes a value in
+the source domain into a `TransferWire` (little-endian, depth first, no pointers); on the receiving
+domain `transfer_unpack` materializes it through the ordinary allocation paths. `Task.Run`
+arguments are packed by `aster_task_pack_arg` into the `TaskPayload` and unpacked into a
+worker-local frame copy in the worker's context; results are packed in the worker (`invoke_deep_task`)
+as `ExecutionValue::Transfer` and unpacked by `aster_task_wait_deep` / `aster_task_wait_all_deep`.
+Task trampolines take `(context, payload, result_out)`.
+
 Machine code reaches the scheduler through an injected code provider, never through a concrete
 code generator:
 

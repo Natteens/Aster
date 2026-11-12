@@ -1771,17 +1771,17 @@ impl Analyzer<'_> {
         let Some(candidate) = self.resolve_task_run_target(target, &value_types) else {
             return Type::Unknown;
         };
-        if !transferable(&candidate.signature.result) {
+        if !self.worker_transferable_layout(&candidate.signature.result, &mut HashSet::new()) {
             self.diagnostics.push(
                 Diagnostic::error(
                     format!(
-                        "`Task<{}>` cannot cross a worker boundary in this version",
+                        "`Task<{}>` cannot cross a worker boundary",
                         candidate.signature.result.display()
                     ),
                     target.span,
                 )
                 .with_help(
-                    "Task.Run currently supports only scalar results (bool, char, integers, floats)",
+                    "task results are copied: use a scalar, string, array, List, Dictionary, or a struct/enum of those (class instances and interfaces cannot cross)",
                 ),
             );
             return Type::Unknown;
@@ -1797,16 +1797,23 @@ impl Analyzer<'_> {
                         value.span,
                     )
                     .with_help(
-                        "use a scalar or a finite struct/enum containing only transferable values",
+                        "arguments are copied: use a scalar, string, array, List, Dictionary, or a finite struct/enum of those (class instances and interfaces cannot cross)",
                     ),
                 );
             }
         }
         let result_type = candidate.signature.result.clone();
+        let copies_references = !transferable(&result_type)
+            || candidate
+                .signature
+                .parameters
+                .iter()
+                .any(|type_| self.copies_references_layout(type_, &mut HashSet::new()));
         self.model.task_runs.insert(
             self.model_key(span),
             ResolvedTaskRun {
                 function: candidate.key,
+                copies_references,
             },
         );
         Type::Task(Box::new(result_type))
@@ -1906,7 +1913,7 @@ impl Analyzer<'_> {
             ));
             return Type::Unknown;
         };
-        if !transferable(&result) {
+        if !self.worker_transferable_layout(&result, &mut HashSet::new()) {
             self.diagnostics.push(Diagnostic::error(
                 format!(
                     "`Task.WaitAll` cannot compose `Task<{}>` results",
@@ -1919,13 +1926,50 @@ impl Analyzer<'_> {
         Type::Array(result)
     }
 
+    /// Whether a value of `type_` holds a string or collection somewhere
+    /// inside it (and therefore crosses `Task.Run` by deep copy rather than a
+    /// raw frame copy).
+    fn copies_references_layout(&self, type_: &Type, visiting: &mut HashSet<String>) -> bool {
+        match type_ {
+            Type::String | Type::Array(_) | Type::List(_) | Type::Dictionary(_, _) => true,
+            Type::User(name) | Type::Enum(name) => {
+                if !visiting.insert(name.clone()) {
+                    return false;
+                }
+                let found = self.context.types.get(name).is_some_and(|info| {
+                    info.fields
+                        .values()
+                        .any(|field| self.copies_references_layout(field, visiting))
+                        || info.enum_cases.iter().any(|case| {
+                            case.fields
+                                .iter()
+                                .any(|(_, field)| self.copies_references_layout(field, visiting))
+                        })
+                });
+                visiting.remove(name);
+                found
+            }
+            _ => false,
+        }
+    }
+
     /// One semantic worker-transfer authority. Primitive scalars defer to
     /// `aster-types`; finite structs/enums recurse nominally through their
     /// already-specialized field layouts. Reference-bearing and recursive
     /// shapes fail closed.
     fn worker_transferable_layout(&self, type_: &Type, visiting: &mut HashSet<String>) -> bool {
-        if transferable(type_) {
+        if transferable(type_) || matches!(type_, Type::String) {
             return true;
+        }
+        match type_ {
+            Type::Array(element) | Type::List(element) => {
+                return self.worker_transferable_layout(element, visiting);
+            }
+            Type::Dictionary(key, value) => {
+                return self.worker_transferable_layout(key, visiting)
+                    && self.worker_transferable_layout(value, visiting);
+            }
+            _ => {}
         }
         let (name, is_enum) = match type_ {
             Type::User(name) => (name, false),

@@ -22,6 +22,7 @@ mod provider;
 #[cfg(test)]
 mod scheduler_tests;
 mod task_abi;
+mod transfer;
 mod validation;
 mod values;
 mod virtuals;
@@ -95,6 +96,8 @@ struct Codegen {
     jit: JITModule,
     pointer_type: ClifType,
     string_data: HashMap<String, DataId>,
+    /// Interned encodings of deep-copy transfer shapes (CONC-005).
+    transfer_data: HashMap<Vec<u8>, DataId>,
     runtime_ids: HashMap<&'static str, FuncId>,
     foreign_ids: HashMap<mir::SymbolId, FuncId>,
     interface_tables: HashMap<(mir::SymbolId, mir::SymbolId), DataId>,

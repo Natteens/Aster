@@ -40,6 +40,23 @@ impl Analyzer<'_> {
         }
         self.async_state = super::AsyncAnalysisState::AfterAwait;
         if let Type::Task(result_type) = operand_type {
+            let copies = !super::calls::transferable(&result_type)
+                || self
+                    .model
+                    .task_runs
+                    .get(&self.model_key(operand.span))
+                    .is_some_and(|run| run.copies_references);
+            if copies {
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        "`await` of a `Task.Run` whose arguments or result are copied (strings, collections, aggregates) is not supported in this version",
+                        span,
+                    )
+                    .with_help(
+                        "use scalar arguments and results with `await`, or call `Task.Wait()` outside an async function",
+                    ),
+                );
+            }
             return *result_type;
         }
         if operand_type != Type::Unknown {
@@ -2567,6 +2584,16 @@ impl Analyzer<'_> {
                     info.implemented_interfaces
                         .iter()
                         .any(|implemented| implemented == interface)
+                })
+            }
+            // `implemented_interfaces` of an interface is the transitive
+            // closure of its base interfaces (LANG-012): `IB -> IA` is an
+            // implicit conversion that finds the `IA` table at run time.
+            (Type::Interface(base), Type::Interface(derived)) => {
+                self.context.types.get(derived).is_some_and(|info| {
+                    info.implemented_interfaces
+                        .iter()
+                        .any(|implemented| implemented == base)
                 })
             }
             _ => false,

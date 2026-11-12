@@ -512,9 +512,35 @@ impl Codegen {
                     })?,
                 );
             }
+            let mut deep_index = 0_i64;
             for (argument, offset) in arguments.iter().zip(layout.offsets) {
                 let destination = builder.ins().iadd_imm(frame, i64::from(offset));
                 let value = self.translate_operand(builder, argument, state)?;
+                if self.type_needs_transfer(&argument.type_)? {
+                    // Deep copy (CONC-005): serialize in this context; the
+                    // frame slot stays zero and is filled on the worker.
+                    let shape = self.transfer_shape(&argument.type_)?;
+                    let (shape_pointer, shape_length) =
+                        self.transfer_shape_operands(builder, &shape)?;
+                    let image = self.value_image_address(builder, &argument.type_, value);
+                    let index = builder.ins().iconst(types::I32, deep_index);
+                    let frame_offset = builder.ins().iconst(types::I32, i64::from(offset));
+                    self.call_runtime(
+                        builder,
+                        "aster_task_pack_arg",
+                        &[
+                            context,
+                            index,
+                            frame_offset,
+                            shape_pointer,
+                            shape_length,
+                            image,
+                        ],
+                    );
+                    self.continue_if_runtime_ok(builder, state)?;
+                    deep_index += 1;
+                    continue;
+                }
                 if is_aggregate(&argument.type_) {
                     self.copy_value(builder, &argument.type_, value, destination)?;
                 } else {
@@ -554,12 +580,28 @@ impl Codegen {
         let mir::Type::Array(result_type) = return_type else {
             return Err(BackendError::new("Task.WaitAll requires an array result"));
         };
-        let symbol = super::task_abi::wait_all_symbol_for(result_type)
-            .ok_or_else(|| BackendError::new("Task.WaitAll result type has no transferable ABI"))?;
         let context = state
             .execution_context
             .ok_or_else(|| BackendError::new("Task.WaitAll requires an execution context"))?;
         let tasks = self.translate_operand(builder, tasks, state)?;
+        let Some(symbol) = super::task_abi::wait_all_symbol_for(result_type) else {
+            // Deep-copy results (CONC-005): each element is materialized.
+            let shape = self.transfer_shape(result_type)?;
+            let (shape_pointer, shape_length) = self.transfer_shape_operands(builder, &shape)?;
+            let descriptor = self.element_descriptor_bits(result_type);
+            #[allow(clippy::cast_possible_wrap)]
+            let descriptor = builder.ins().iconst(types::I64, descriptor as i64);
+            let call = self.call_runtime(
+                builder,
+                "aster_task_wait_all_deep",
+                &[context, tasks, shape_pointer, shape_length, descriptor],
+            );
+            self.continue_if_runtime_ok(builder, state)?;
+            if let Some(destination) = destination {
+                self.store_scalar(builder, destination, builder.inst_results(call)[0], state)?;
+            }
+            return Ok(());
+        };
         let function_ref = self
             .jit
             .declare_func_in_func(self.runtime_ids[symbol], builder.func);
@@ -628,16 +670,42 @@ impl Codegen {
                 "Task<T>.Wait requires exactly one task argument",
             ));
         };
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("Task<T>.Wait requires an execution context"))?;
+        let handle = self.translate_operand(builder, task, state)?;
+        if super::task_abi::wait_symbol_for(return_type).is_none() {
+            // Deep-copy result (CONC-005): materialize into this context.
+            let shape = self.transfer_shape(return_type)?;
+            let (shape_pointer, shape_length) = self.transfer_shape_operands(builder, &shape)?;
+            let image = if is_aggregate(return_type) {
+                let destination = destination.ok_or_else(|| {
+                    BackendError::new("aggregate Task<T>.Wait result requires a destination")
+                })?;
+                self.place_address(builder, destination, state)?
+            } else {
+                self.transfer_image_slot(builder, &shape)?
+            };
+            self.call_runtime(
+                builder,
+                "aster_task_wait_deep",
+                &[context, handle, shape_pointer, shape_length, image],
+            );
+            self.continue_if_runtime_ok(builder, state)?;
+            if !is_aggregate(return_type)
+                && let Some(destination) = destination
+            {
+                let pointer = self.load_image_pointer(builder, image);
+                self.store_scalar(builder, destination, pointer, state)?;
+            }
+            return Ok(());
+        }
         let symbol = super::task_abi::wait_symbol_for(return_type).ok_or_else(|| {
             BackendError::new(format!(
                 "`Task<{}>.Wait` cannot execute yet",
                 type_name(return_type)
             ))
         })?;
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("Task<T>.Wait requires an execution context"))?;
-        let handle = self.translate_operand(builder, task, state)?;
         let function_ref = self
             .jit
             .declare_func_in_func(self.runtime_ids[symbol], builder.func);

@@ -18,6 +18,10 @@ use crate::arena::{DEFAULT_PAGE_SIZE, MIN_PAGE_SIZE};
 use crate::memory_governor::{MemoryGovernor, MemoryGovernorTelemetry};
 use crate::string::AsterStrHeader;
 
+mod transfer;
+#[cfg(test)]
+mod transfer_tests;
+
 /// Maximum arena capacity reserved by one execution context, shared by its
 /// persistent and temporary regions. One GiB preserves the externally
 /// validated 50,000,000-element `long` array (400,000,000 payload bytes plus
@@ -908,6 +912,8 @@ pub struct ExecutionContext {
     dictionary_hash_k0: u64,
     dictionary_hash_k1: u64,
     dictionary_owner_id: u64,
+    /// Deep-copy transfers packed for the `Task.Run` call being assembled.
+    pending_transfers: Vec<crate::transfer::TransferItem>,
 }
 
 static NEXT_DICTIONARY_OWNER_ID: AtomicU64 = AtomicU64::new(1);
@@ -993,6 +999,7 @@ impl ExecutionContext {
             dictionary_hash_k0,
             dictionary_hash_k1,
             dictionary_owner_id,
+            pending_transfers: Vec::new(),
         }
     }
 

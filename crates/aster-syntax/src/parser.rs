@@ -491,13 +491,13 @@ impl Parser {
         let (name, _) = self.identifier()?;
         let mut type_parameters = self.type_parameters()?;
         let interfaces = if let Some(colon) = self.take(&TokenKind::Colon) {
-            if kind != TypeKind::Class {
+            if kind == TypeKind::Struct {
                 self.diagnostics.push(
                     Diagnostic::error(
                         "only classes can declare implemented interfaces",
                         colon.span,
                     )
-                    .with_help("remove the list after `:`; structs and interfaces cannot inherit or implement"),
+                    .with_help("remove the list after `:`; structs cannot inherit or implement"),
                 );
             }
             let mut interfaces = Vec::new();

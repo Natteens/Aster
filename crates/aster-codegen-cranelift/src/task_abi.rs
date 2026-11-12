@@ -20,7 +20,24 @@ impl Codegen {
         for (name, _) in task_functions() {
             let mut signature = self.jit.make_signature();
             signature.params.push(AbiParam::new(self.pointer_type));
-            if name == "aster_task_run" {
+            if name == "aster_task_pack_arg" {
+                signature.params.push(AbiParam::new(types::I32));
+                signature.params.push(AbiParam::new(types::I32));
+                signature.params.push(AbiParam::new(self.pointer_type));
+                signature.params.push(AbiParam::new(types::I32));
+                signature.params.push(AbiParam::new(self.pointer_type));
+            } else if name == "aster_task_wait_deep" {
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(self.pointer_type));
+                signature.params.push(AbiParam::new(types::I32));
+                signature.params.push(AbiParam::new(self.pointer_type));
+            } else if name == "aster_task_wait_all_deep" {
+                signature.params.push(AbiParam::new(self.pointer_type));
+                signature.params.push(AbiParam::new(self.pointer_type));
+                signature.params.push(AbiParam::new(types::I32));
+                signature.params.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(self.pointer_type));
+            } else if name == "aster_task_run" {
                 signature.params.push(AbiParam::new(types::I32));
                 signature.returns.push(AbiParam::new(types::I64));
             } else if name == "aster_task_run_args" {

@@ -19,6 +19,10 @@ pub enum ExecutionValue {
     Bool(bool),
     Char(char),
     String(String),
+    /// A value that crosses a task boundary by deep copy (strings, arrays,
+    /// lists, dictionaries, structs and enums of those): serialized bytes with
+    /// no pointer into the producing context.
+    Transfer(aster_runtime::TransferWire),
     Void,
 }
 
@@ -50,6 +54,7 @@ impl fmt::Display for ExecutionValue {
             Self::Bool(value) => write!(formatter, "{value}"),
             Self::Char(value) => write!(formatter, "{value}"),
             Self::String(value) => formatter.write_str(value),
+            Self::Transfer(_) => formatter.write_str("<transferred value>"),
             Self::Void => formatter.write_str("function completed successfully (void)"),
         }
     }

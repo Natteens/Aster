@@ -472,6 +472,10 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
             note(max, *interface);
             collect_expression(object, max);
         }
+        hir::ExpressionKind::UpcastInterfaceValue { object, interface } => {
+            note(max, *interface);
+            collect_expression(object, max);
+        }
         hir::ExpressionKind::IncrementDecrement { target, .. } => collect_expression(target, max),
         hir::ExpressionKind::Conditional {
             condition,

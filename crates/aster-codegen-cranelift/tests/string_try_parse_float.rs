@@ -683,12 +683,6 @@ fn a_constructed_option_double_still_cannot_cross_a_worker_boundary_via_task_run
     let source = "using aster.core;\n\
         public Option<double> Make() { return \"1.0\".TryParseDouble(); }\n\
         public int Main() { Task<Option<double>> task = Task.Run(Make); return 0; }";
-    let errors = match run(source, "Main") {
-        Err(message) => message,
-        Ok(value) => panic!("expected a compile error, got {value:?}"),
-    };
-    assert!(
-        errors.contains("cross a worker boundary"),
-        "expected the non-transferable-result diagnostic, got {errors}"
-    );
+    // An enum of scalars now crosses the worker boundary by copy (CONC-005).
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(0)));
 }

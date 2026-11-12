@@ -32,6 +32,7 @@ impl Codegen {
             jit,
             pointer_type,
             string_data: HashMap::new(),
+            transfer_data: HashMap::new(),
             runtime_ids,
             foreign_ids: HashMap::new(),
             interface_tables: HashMap::new(),

@@ -39,6 +39,9 @@ const TASK_CANCELLED: u8 = 5;
 #[derive(Clone, Debug, Default)]
 pub struct TaskPayload {
     words: Vec<u64>,
+    /// Arguments that cross by deep copy (CONC-005): serialized in the
+    /// caller's context, materialized into the frame on the worker.
+    transfers: Vec<aster_runtime::TransferItem>,
 }
 
 impl TaskPayload {
@@ -66,7 +69,26 @@ impl TaskPayload {
         unsafe {
             std::ptr::copy_nonoverlapping(pointer, owned.as_mut_ptr().cast::<u8>(), size);
         }
-        Ok(Self { words: owned })
+        Ok(Self {
+            words: owned,
+            transfers: Vec::new(),
+        })
+    }
+
+    /// Attach the deep-copy arguments packed for this call.
+    pub(crate) fn with_transfers(mut self, transfers: Vec<aster_runtime::TransferItem>) -> Self {
+        self.transfers = transfers;
+        self
+    }
+
+    /// Deep-copy arguments to materialize into a worker-local frame copy.
+    pub fn transfers(&self) -> &[aster_runtime::TransferItem] {
+        &self.transfers
+    }
+
+    /// The frame words, for building a mutable worker-local copy.
+    pub fn words(&self) -> &[u64] {
+        &self.words
     }
 
     pub fn as_ptr(&self) -> *const u64 {

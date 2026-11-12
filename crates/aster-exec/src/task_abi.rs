@@ -19,8 +19,14 @@ use crate::{BackendError, ExecutionValue, mir};
 
 /// Name and address of every function this module exports to generated
 /// code, alongside `aster_runtime::runtime_functions()`.
-pub fn task_functions() -> [(&'static str, *const u8); 16] {
+pub fn task_functions() -> [(&'static str, *const u8); 19] {
     [
+        ("aster_task_pack_arg", aster_task_pack_arg as *const u8),
+        ("aster_task_wait_deep", aster_task_wait_deep as *const u8),
+        (
+            "aster_task_wait_all_deep",
+            aster_task_wait_all_deep as *const u8,
+        ),
         ("aster_task_run", aster_task_run as *const u8),
         ("aster_task_run_args", aster_task_run_args as *const u8),
         ("aster_task_cancel", aster_task_cancel as *const u8),
@@ -108,8 +114,9 @@ pub extern "C" fn aster_task_run_args(
         context.fail("Task.Run received an invalid argument frame size");
         return 0;
     };
+    let transfers = context.take_pending_transfers();
     let payload = match crate::worker_pool::TaskPayload::copy_from(payload, payload_size) {
-        Ok(payload) => payload,
+        Ok(payload) => payload.with_transfers(transfers),
         Err(error) => {
             context.fail(error.message().to_owned());
             return 0;
@@ -296,6 +303,7 @@ fn execution_value_kind(value: &ExecutionValue) -> &'static str {
         ExecutionValue::Double(_) => "double",
         ExecutionValue::Char(_) => "char",
         ExecutionValue::String(_) => "string",
+        ExecutionValue::Transfer(_) => "a transferred value",
         ExecutionValue::Void => "void",
     }
 }
@@ -420,6 +428,7 @@ fn wait_all(
     context: *mut ExecutionContext,
     tasks: *mut aster_runtime::AsterArray,
     kind: WaitAllKind,
+    deep: Option<(&aster_runtime::TransferShape, u64)>,
 ) -> *mut aster_runtime::AsterArray {
     if context.is_null() {
         return std::ptr::null_mut();
@@ -485,18 +494,30 @@ fn wait_all(
         context.fail("task was cancelled");
         return std::ptr::null_mut();
     }
-    write_wait_all_results(context, length, kind, outcomes)
+    write_wait_all_results(context, length, kind, deep, outcomes)
 }
 
 fn write_wait_all_results(
     context: &mut ExecutionContext,
     length: i32,
     kind: WaitAllKind,
+    deep: Option<(&aster_runtime::TransferShape, u64)>,
     outcomes: Vec<Result<TaskOutcome, BackendError>>,
 ) -> *mut aster_runtime::AsterArray {
-    let result = aster_runtime::context::aster_rt_array_new(context, length, kind.size());
+    let element_size = match deep {
+        Some((shape, _)) => i32::try_from(shape.image_size()).unwrap_or(0),
+        None => kind.size(),
+    };
+    let result = aster_runtime::context::aster_rt_array_new(context, length, element_size);
     if result.is_null() {
         return std::ptr::null_mut();
+    }
+    if let Some((_, descriptor)) = deep {
+        // SAFETY: `result` is the array header just allocated by this context.
+        #[allow(unsafe_code)]
+        unsafe {
+            context.transfer_set_array_descriptor(result, descriptor);
+        }
     }
     for (index, outcome) in outcomes.into_iter().enumerate() {
         let Ok(index) = i32::try_from(index) else {
@@ -518,6 +539,24 @@ fn write_wait_all_results(
                 return std::ptr::null_mut();
             }
         };
+        if let Some((shape, _)) = deep {
+            let ExecutionValue::Transfer(wire) = value else {
+                context.fail(format!(
+                    "Task.WaitAll result type mismatch: produced {}",
+                    execution_value_kind(&value)
+                ));
+                return std::ptr::null_mut();
+            };
+            // SAFETY: the destination is the element slot of the new array,
+            // sized by the shape's image.
+            #[allow(unsafe_code)]
+            let unpacked = unsafe { context.transfer_unpack(shape, wire.as_bytes(), destination) };
+            if let Err(message) = unpacked {
+                context.fail(message);
+                return std::ptr::null_mut();
+            }
+            continue;
+        }
         // SAFETY: destination belongs to the new caller-owned array and the
         // typed ABI kind fixes its slot width.
         #[allow(unsafe_code)]
@@ -576,40 +615,175 @@ pub extern "C" fn aster_task_wait_all_i8(
     context: *mut ExecutionContext,
     tasks: *mut aster_runtime::AsterArray,
 ) -> *mut aster_runtime::AsterArray {
-    wait_all(context, tasks, WaitAllKind::I8)
+    wait_all(context, tasks, WaitAllKind::I8, None)
 }
 
 pub extern "C" fn aster_task_wait_all_i16(
     context: *mut ExecutionContext,
     tasks: *mut aster_runtime::AsterArray,
 ) -> *mut aster_runtime::AsterArray {
-    wait_all(context, tasks, WaitAllKind::I16)
+    wait_all(context, tasks, WaitAllKind::I16, None)
 }
 
 pub extern "C" fn aster_task_wait_all_i32(
     context: *mut ExecutionContext,
     tasks: *mut aster_runtime::AsterArray,
 ) -> *mut aster_runtime::AsterArray {
-    wait_all(context, tasks, WaitAllKind::I32)
+    wait_all(context, tasks, WaitAllKind::I32, None)
 }
 
 pub extern "C" fn aster_task_wait_all_i64(
     context: *mut ExecutionContext,
     tasks: *mut aster_runtime::AsterArray,
 ) -> *mut aster_runtime::AsterArray {
-    wait_all(context, tasks, WaitAllKind::I64)
+    wait_all(context, tasks, WaitAllKind::I64, None)
 }
 
 pub extern "C" fn aster_task_wait_all_f32(
     context: *mut ExecutionContext,
     tasks: *mut aster_runtime::AsterArray,
 ) -> *mut aster_runtime::AsterArray {
-    wait_all(context, tasks, WaitAllKind::F32)
+    wait_all(context, tasks, WaitAllKind::F32, None)
 }
 
 pub extern "C" fn aster_task_wait_all_f64(
     context: *mut ExecutionContext,
     tasks: *mut aster_runtime::AsterArray,
 ) -> *mut aster_runtime::AsterArray {
-    wait_all(context, tasks, WaitAllKind::F64)
+    wait_all(context, tasks, WaitAllKind::F64, None)
+}
+
+/// Decode a generated-code shape constant, reporting failures on `context`.
+fn decode_shape(
+    context: &mut ExecutionContext,
+    shape: *const u8,
+    shape_len: i32,
+) -> Option<aster_runtime::TransferShape> {
+    let Ok(length) = usize::try_from(shape_len) else {
+        context.fail("transfer shape has an invalid length");
+        return None;
+    };
+    if shape.is_null() {
+        context.fail("transfer shape is missing");
+        return None;
+    }
+    // SAFETY: generated code passes a constant shape blob of `shape_len`
+    // bytes that lives as long as the program.
+    #[allow(unsafe_code)]
+    let bytes = unsafe { std::slice::from_raw_parts(shape, length) };
+    match aster_runtime::TransferShape::decode(bytes) {
+        Ok(shape) => Some(shape),
+        Err(message) => {
+            context.fail(message);
+            None
+        }
+    }
+}
+
+/// Serialize one deep-copy `Task.Run` argument (CONC-005) into the pending
+/// transfer set of `context`. `index == 0` starts a fresh set; the following
+/// `aster_task_run_args` call takes it. `value` is the address of the
+/// argument's memory image (a pointer slot or an inline aggregate).
+pub extern "C" fn aster_task_pack_arg(
+    context: *mut ExecutionContext,
+    index: i32,
+    frame_offset: i32,
+    shape: *const u8,
+    shape_len: i32,
+    value: *const u8,
+) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: generated code passes its live context.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let Some(decoded) = decode_shape(context, shape, shape_len) else {
+        return;
+    };
+    let Ok(frame_offset) = u32::try_from(frame_offset) else {
+        context.fail("Task.Run argument frame offset is invalid");
+        return;
+    };
+    // SAFETY: `value` is the image of a value of this shape (generated code).
+    #[allow(unsafe_code)]
+    let wire = unsafe { context.transfer_pack(&decoded, value) };
+    match wire {
+        Ok(wire) => {
+            // SAFETY: the same blob decoded above.
+            #[allow(unsafe_code)]
+            let shape_bytes = unsafe {
+                std::slice::from_raw_parts(shape, usize::try_from(shape_len).unwrap_or(0))
+            }
+            .to_vec();
+            context.push_pending_transfer(
+                index,
+                aster_runtime::TransferItem {
+                    frame_offset,
+                    shape: shape_bytes,
+                    wire,
+                },
+            );
+        }
+        Err(message) => context.fail(format!(
+            "Task.Run argument cannot be transferred: {message}"
+        )),
+    }
+}
+
+/// `task.Wait()` for a deep-copy result: join and materialize the value into
+/// fresh allocations of the waiting context, writing its image at `dest`.
+pub extern "C" fn aster_task_wait_deep(
+    context: *mut ExecutionContext,
+    handle: i64,
+    shape: *const u8,
+    shape_len: i32,
+    dest: *mut u8,
+) {
+    let Some(value) = wait(context, handle) else {
+        return;
+    };
+    // SAFETY: `wait` returned `Some`, so the context pointer is non-null and live.
+    #[allow(unsafe_code)]
+    let context = unsafe { &mut *context };
+    let Some(decoded) = decode_shape(context, shape, shape_len) else {
+        return;
+    };
+    let ExecutionValue::Transfer(wire) = value else {
+        report_wait_type_mismatch(context, "a transferred value", &value);
+        return;
+    };
+    // SAFETY: `dest` is the image slot of the result type (generated code).
+    #[allow(unsafe_code)]
+    if let Err(message) = unsafe { context.transfer_unpack(&decoded, wire.as_bytes(), dest) } {
+        context.fail(message);
+    }
+}
+
+/// `Task.WaitAll` for deep-copy results: the result array's elements are
+/// materialized from each task's transferred value.
+pub extern "C" fn aster_task_wait_all_deep(
+    context: *mut ExecutionContext,
+    tasks: *mut aster_runtime::AsterArray,
+    shape: *const u8,
+    shape_len: i32,
+    element_descriptor: i64,
+) -> *mut aster_runtime::AsterArray {
+    if context.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: generated code passes its live context.
+    #[allow(unsafe_code)]
+    let decoded = decode_shape(unsafe { &mut *context }, shape, shape_len);
+    let Some(decoded) = decoded else {
+        return std::ptr::null_mut();
+    };
+    #[allow(clippy::cast_sign_loss)]
+    let descriptor = element_descriptor as u64;
+    wait_all(
+        context,
+        tasks,
+        WaitAllKind::I64,
+        Some((&decoded, descriptor)),
+    )
 }

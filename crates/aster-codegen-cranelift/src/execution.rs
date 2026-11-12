@@ -68,6 +68,9 @@ pub(super) struct PreparedProgram {
     jit: Option<JITModule>,
     entries: HashMap<mir::SymbolId, (*const u8, mir::Type)>,
     task_entries: HashMap<mir::SymbolId, (*const u8, mir::Type)>,
+    /// Transfer shape of every `Task.Run` target whose result crosses by deep
+    /// copy (CONC-005); such targets always run through a trampoline.
+    task_result_shapes: HashMap<mir::SymbolId, aster_runtime::TransferShape>,
     /// Declared last: class descriptors must outlive the JIT code and every
     /// object that points at them.
     #[cfg_attr(
@@ -116,6 +119,7 @@ impl PreparedProgram {
     /// where the time went: `codegen` covers JIT setup, declaration and
     /// per-function Cranelift compilation; `finalize` covers
     /// `finalize_definitions` and entry-address lookup.
+    #[allow(clippy::too_many_lines)]
     pub(super) fn prepare_timed_with_foreign_registry(
         module: &mir::Module,
         registry: &aster_runtime::ForeignRegistry,
@@ -154,6 +158,17 @@ impl PreparedProgram {
                     function_ids[&function.symbol],
                     *trampoline,
                 )?;
+            }
+        }
+        let mut task_result_shapes = HashMap::new();
+        for function in &module.functions {
+            if task_trampoline_ids.contains_key(&function.symbol)
+                && super::transfer::is_deep_result_type(&function.return_type)
+            {
+                task_result_shapes.insert(
+                    function.symbol,
+                    codegen.transfer_shape(&function.return_type)?,
+                );
             }
         }
         let codegen_elapsed = codegen_started.elapsed();
@@ -205,6 +220,7 @@ impl PreparedProgram {
                 jit: Some(codegen.jit),
                 entries,
                 task_entries,
+                task_result_shapes,
                 descriptors: codegen.descriptors,
             },
             PrepareTimings {
@@ -426,10 +442,48 @@ impl PreparedProgram {
             aster_exec::worker_pool::TaskMemoryPolicy::context,
         );
         context.set_task_cancellation(cancellation);
-        let value = if payload.is_empty() {
+        // Deep-copy arguments are materialized into a worker-local copy of the
+        // frame, in this worker's own context (CONC-005).
+        let mut frame_copy = Vec::new();
+        let mut frame = payload.as_ptr();
+        if !payload.transfers().is_empty() {
+            frame_copy.extend_from_slice(payload.words());
+            frame = frame_copy.as_mut_ptr().cast_const();
+            for item in payload.transfers() {
+                let unpacked =
+                    aster_runtime::TransferShape::decode(&item.shape).and_then(|shape| {
+                        let offset = item.frame_offset as usize;
+                        if offset
+                            .checked_add(shape.image_size())
+                            .is_none_or(|end| end > frame_copy.len() * 8)
+                        {
+                            return Err("transfer argument lies outside its frame".to_owned());
+                        }
+                        // SAFETY: the offset and image fit inside `frame_copy`.
+                        #[allow(unsafe_code)]
+                        unsafe {
+                            context.transfer_unpack(
+                                &shape,
+                                item.wire.as_bytes(),
+                                frame_copy.as_mut_ptr().cast::<u8>().add(offset),
+                            )
+                        }
+                    });
+                if let Err(message) = unpacked {
+                    context.fail(message);
+                    break;
+                }
+            }
+        }
+        let deep_result = self.task_result_shapes.get(&symbol);
+        let value = if context.has_failed() {
+            Err(BackendError::new("task arguments could not be transferred"))
+        } else if let Some(shape) = deep_result {
+            invoke_deep_task(*pointer, shape, frame, &mut context)
+        } else if payload.is_empty() {
             invoke_finalized(*pointer, return_type, &mut context)
         } else {
-            invoke_task_finalized(*pointer, return_type, payload.as_ptr(), &mut context)
+            invoke_task_finalized(*pointer, return_type, frame, &mut context)
         };
         let runtime_error = context.take_error();
         #[cfg(feature = "mem-exp-rc-core")]
@@ -794,7 +848,7 @@ fn invoke_body_scalar(
                     std::mem::transmute(pointer);
                 body(context, *value as u32);
             }
-            ExecutionValue::String(_) | ExecutionValue::Void => {}
+            ExecutionValue::String(_) | ExecutionValue::Transfer(_) | ExecutionValue::Void => {}
         }
     }
 }
@@ -918,7 +972,7 @@ fn invoke_binary_scalar(
                     ) -> $accumulator_native = unsafe { std::mem::transmute(pointer) };
                     function(context, $accumulator_value, *value as u32)
                 }
-                ExecutionValue::String(_) | ExecutionValue::Void => {
+                ExecutionValue::String(_) | ExecutionValue::Transfer(_) | ExecutionValue::Void => {
                     return Err(BackendError::new(
                         "Parallel.Reduce received a non-scalar element",
                     ));
@@ -950,7 +1004,7 @@ fn invoke_binary_scalar(
                 ))
             });
         }
-        ExecutionValue::String(_) | ExecutionValue::Void => {
+        ExecutionValue::String(_) | ExecutionValue::Transfer(_) | ExecutionValue::Void => {
             return Err(BackendError::new(
                 "Parallel.Reduce received a non-scalar accumulator",
             ));
@@ -1406,6 +1460,32 @@ fn invoke_finalized_with_arguments(
     Ok(value)
 }
 
+/// Run a task whose result crosses by deep copy: the trampoline writes the
+/// result image into a worker-local buffer, which is then serialized in the
+/// worker's context before that context is dropped (CONC-005).
+#[allow(unsafe_code)]
+fn invoke_deep_task(
+    pointer: *const u8,
+    shape: &aster_runtime::TransferShape,
+    payload: *const u64,
+    context: &mut aster_runtime::ExecutionContext,
+) -> Result<ExecutionValue, BackendError> {
+    let mut image = vec![0_u64; shape.image_size().div_ceil(8).max(1)];
+    // SAFETY: `pointer` names the generated `(context, payload, result_out)`
+    // trampoline of a deep-result target; `image` outlives the call.
+    let function: extern "C" fn(*mut aster_runtime::ExecutionContext, *const u64, *mut u64) =
+        unsafe { std::mem::transmute(pointer) };
+    function(context, payload, image.as_mut_ptr());
+    if context.has_failed() {
+        return Ok(ExecutionValue::Void);
+    }
+    // SAFETY: the trampoline left a value of exactly this shape in `image`.
+    let wire = unsafe { context.transfer_pack(shape, image.as_ptr().cast::<u8>()) }.map_err(
+        |message| BackendError::new(format!("task result cannot be transferred: {message}")),
+    )?;
+    Ok(ExecutionValue::Transfer(wire))
+}
+
 /// Invoke a generated parameterized-task trampoline. Validation guarantees a
 /// scalar transferable result and a copied host payload matching the target
 /// signature; this boundary dispatches only the concrete result ABI.
@@ -1423,8 +1503,9 @@ fn invoke_task_finalized(
             let function: extern "C" fn(
                 *mut aster_runtime::ExecutionContext,
                 *const u64,
+                *mut u64,
             ) -> $native = unsafe { std::mem::transmute(pointer) };
-            function(context, payload)
+            function(context, payload, std::ptr::null_mut())
         }};
     }
     Ok(match return_type {

@@ -86,23 +86,16 @@ fn every_scalar_width_uses_the_target_signature_abi() {
 }
 
 #[test]
-fn reference_bearing_task_arguments_fail_before_mir() {
-    let errors = compile_errors(
-        r#"
+fn reference_bearing_task_arguments_cross_by_copy() {
+    let source = r#"
         public struct Hidden { public string text; }
         public int Read(Hidden value) { return value.text.Length; }
         public int Main() {
             Hidden value = Hidden { text: "x" };
             return Task.Run(Read, value).Wait();
         }
-        "#,
-    );
-    assert!(
-        errors
-            .iter()
-            .any(|message| message.contains("cannot cross a worker boundary")),
-        "unexpected diagnostics: {errors:?}"
-    );
+    "#;
+    assert_eq!(run(source), Ok(ExecutionValue::Int(1)));
 }
 
 #[test]
@@ -386,23 +379,16 @@ fn static_and_inferred_generic_targets_have_concrete_worker_identities() {
 }
 
 #[test]
-fn generic_specialization_cannot_hide_a_reference_bearing_field() {
-    let errors = compile_errors(
-        r#"
+fn generic_specialization_copies_a_reference_bearing_field() {
+    let source = r#"
         public struct Payload<T> { public T value; }
         public int Read<T>(Payload<T> value) { return 1; }
         public int Main() {
             Payload<string> value = Payload<string> { value: "hidden" };
             return Task.Run(Read, value).Wait();
         }
-        "#,
-    );
-    assert!(
-        errors
-            .iter()
-            .any(|message| message.contains("cannot cross a worker boundary")),
-        "unexpected diagnostics: {errors:?}"
-    );
+    "#;
+    assert_eq!(run(source), Ok(ExecutionValue::Int(1)));
 }
 
 #[test]
@@ -465,10 +451,6 @@ fn an_async_resume_uses_the_outer_tasks_control_not_stale_worker_state() {
 #[test]
 fn nested_generic_reference_shapes_are_rejected_before_hir() {
     let hidden_types = [
-        ("string", ""),
-        ("int[]", ""),
-        ("List<int>", ""),
-        ("Dictionary<int, int>", ""),
         ("Box", "public class Box { public Box() {} }"),
         (
             "IBox",
@@ -501,10 +483,22 @@ fn nested_generic_reference_shapes_are_rejected_before_hir() {
         ",
     );
     assert!(
-        enum_errors
+        enum_errors.is_empty(),
+        "string-bearing enums now cross by copy: {enum_errors:?}"
+    );
+    let class_enum_errors = compile_errors(
+        r"
+        public class Box { public Box() {} }
+        public enum Hidden<T> { Value(T value), Empty }
+        public int Read<T>(Hidden<T> value) { return 1; }
+        public int Main(Hidden<Box> input) { return Task.Run(Read, input).Wait(); }
+        ",
+    );
+    assert!(
+        class_enum_errors
             .iter()
             .any(|message| message.contains("cannot cross a worker boundary")),
-        "reference-bearing enum unexpectedly crossed: {enum_errors:?}"
+        "class-bearing enum unexpectedly crossed: {class_enum_errors:?}"
     );
 }
 

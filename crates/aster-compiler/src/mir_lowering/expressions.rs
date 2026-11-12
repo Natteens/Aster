@@ -901,6 +901,18 @@ impl FunctionLowerer {
                     },
                 ))
             }
+            hir::ExpressionKind::UpcastInterfaceValue { object, interface } => {
+                let object = self
+                    .lower_expression(object)
+                    .expect("validated interface conversion has an object");
+                Some(self.temporary(
+                    expression.type_.clone(),
+                    mir::RvalueKind::InterfaceLookup {
+                        object,
+                        interface: *interface,
+                    },
+                ))
+            }
             hir::ExpressionKind::Unary { operator, operand } => {
                 let operand = self
                     .lower_expression(operand)

@@ -119,6 +119,9 @@ pub(crate) struct ResolvedPropertyAssignment {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedTaskRun {
     pub function: CallableKey,
+    /// A runtime argument or the result is copied across the worker boundary
+    /// (string, collection, or aggregate containing one): CONC-005 transfer.
+    pub copies_references: bool,
 }
 
 /// A resolved `Parallel.For(start, end, Body)`: `Body`'s concrete zero-capture

@@ -776,6 +776,13 @@ pub enum ExpressionKind {
         class: SymbolId,
         interface: SymbolId,
     },
+    /// Implicit conversion from an interface value to one of its base
+    /// interfaces (LANG-012): the same object with the base interface's table,
+    /// found by the bounded search of the object's descriptor.
+    UpcastInterfaceValue {
+        object: Box<Expression>,
+        interface: SymbolId,
+    },
     Unary {
         operator: UnaryOperator,
         operand: Box<Expression>,

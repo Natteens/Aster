@@ -29,7 +29,7 @@ Status: `todo`, `in progress`, `done` (with date), `blocked (reason)`.
 | T-CONC-2 | Adopt the shared module | CONC-002 | same | T-CONC-EXP-1 passes | — | — | — | `architecture.md` | reinforced gate | medium | **done 2026-11-10** (see log) |
 | T-ARCH-1 | Structural semantic identity | ARCH-001 | `aster-compiler/src/semantic/mod.rs`, `semantic/general/*`, `hir_lowering/*`, `declaration_key.rs` | — | Replace `ModelNodeKey`/`CallableKey` span fields with declaration key plus per-declaration expression index | + identical model after a whitespace edit; + all pipeline tests | `frontend_large` | `architecture.md` | workspace tests | medium | **done 2026-11-10** (see log) |
 | T-ARCH-7 | Diagnostic codes | ARCH-007 | `aster-diagnostics`, all diagnostic sites | — | Add `code` field; assign codes by layer | + golden output; − duplicate code test | — | `reference/cli.md` | workspace tests | low | todo |
-| T-ARCH-5 | Scheduler into `aster-exec` behind a code provider | ARCH-005 | new `crates/aster-exec`; `worker_pool.rs`, `task_runtime.rs`, `task_abi.rs`, `async_abi.rs`, `completion_queue.rs` | — (independent of CONC-002, see closure §4.D) | Move code; inject the provider | Concurrency suites unchanged | `task_swarm` | `architecture.md` | reinforced gate | medium | implemented 2026-11-12, focused gates pass; combined full gate pending |
+| T-ARCH-5 | Scheduler into `aster-exec` behind a code provider | ARCH-005 | new `crates/aster-exec`; `worker_pool.rs`, `task_runtime.rs`, `task_abi.rs`, `async_abi.rs`, `completion_queue.rs` | — (independent of CONC-002, see closure §4.D) | Move code; inject the provider | Concurrency suites unchanged | `task_swarm` | `architecture.md` | reinforced gate | medium | **done 2026-11-12** (workspace 3,341 passed, `mem-exp-c6` codegen 1,647 passed, 0 failed) |
 
 ## Phase 1 — Everyday surface
 
@@ -42,8 +42,8 @@ example, reference page. Gate: workspace tests; class A invariants unchanged or 
 | T-LANG-17 | `do`-`while`, `%=`, block comments, exponents, digit separators | LANG-017 | — | low | **done 2026-11-11** (`e2ab68e`; workspace 2,923 passed) |
 | T-FIX-FREM | Floating-point `%` and `%=` execute in the JIT (today a controlled "not yet supported" error; found by T-LANG-17) | LANG-017, numeric conformance | — | low | **done 2026-11-11**: runtime `aster_rt_fmod_f32/f64` (IEEE fmod, C# semantics); tests `float_remainder` 6, `jit` 154, `numeric_conformance` 12 pass |
 | T-LANG-16 | Real literal defaults to `double` (breaking; migrate examples and stdlib) | LANG-016 | T-LANG-17 | low | todo |
-| T-OBJ-5 | Constructor overloads and `this(…)` (B2 record first) | OBJ-005 | — | low | implemented 2026-11-12, focused gates pass; combined full gate pending |
-| T-LANG-5 | Auto-properties and `init` | LANG-005 | — | low | implemented 2026-11-12, focused gates pass; combined full gate pending |
+| T-OBJ-5 | Constructor overloads and `this(…)` (B2 record first) | OBJ-005 | — | low | **done 2026-11-12** (workspace 3,341 passed, `mem-exp-c6` codegen 1,647 passed, 0 failed) |
+| T-LANG-5 | Auto-properties and `init` | LANG-005 | — | low | **done 2026-11-12** (workspace 3,341 passed, `mem-exp-c6` codegen 1,647 passed, 0 failed) |
 | T-LANG-4a | `switch` on integers, chars, strings | LANG-004 | — | low | **done 2026-11-11** (`61ab237`; workspace 2,923 passed) |
 | T-LANG-4b | `is T x` patterns and `when` guards | LANG-004 | T-LANG-4a | low | **done 2026-11-12**: `is T` / `is T x` (class hierarchy, C# definite assignment, §4.5 bounds-safe `ClassTest`), `when` guards; interface targets and `Option` unwrap deferred to T-OBJ-4 / later ("not supported yet") |
 | T-LANG-3 | `T?`, `null`, `??`, `?.` | LANG-003 | T-LANG-4b | medium | todo |
@@ -51,9 +51,9 @@ example, reference page. Gate: workspace tests; class A invariants unchanged or 
 | T-LANG-9 | Struct receiver by reference; `ref` parameters (breaking) | LANG-009 | — | medium | todo |
 | T-LANG-7 | Structs and primitives satisfy interfaces statically | LANG-007 | — | medium | todo |
 | T-LANG-11 | Operators and indexers | LANG-011 | — | low | todo |
-| T-LANG-12 | Interface inheritance | LANG-012 | — | low | todo |
+| T-LANG-12 | Interface inheritance | LANG-012 | — | low | **done 2026-11-12** (transitive member expansion pass, IB→IA via descriptor lookup; known gap: `where T : IA` not satisfied through IB; workspace 3,341 passed, `mem-exp-c6` codegen 1,647 passed, 0 failed) |
 | T-LANG-13 | Extension methods | LANG-013 | — | low | todo |
-| T-LANG-8 | Object initializers | LANG-008 | T-LANG-5 | low | implemented 2026-11-12, focused gates pass; combined full gate pending |
+| T-LANG-8 | Object initializers | LANG-008 | T-LANG-5 | low | **done 2026-11-12** (workspace 3,341 passed, `mem-exp-c6` codegen 1,647 passed, 0 failed) |
 | T-STD-1 | List search and removal; set, queue, stack; string case and formatting, written in ASTER | — | T-LANG-7 | low | todo |
 
 ## Phase 2 — Memory and object model
@@ -73,7 +73,7 @@ example, reference page. Gate: workspace tests; class A invariants unchanged or 
 | T-MEM-ARENA | Explicit `Arena` scope type for long-running memory (Q-MEM-0 fallback): record the new decision (syntax, escape rule checked by escape analysis, teardown), then implement | new decision (to record) | T-MEM-EXP-1 | reinforced | medium | todo (decision record first) |
 | T-OBJ-2 | Single inheritance (B1 PR 1) | OBJ-002 | T-MEM-2 or B1 H8 | B1 cases | medium | **done 2026-11-11** (see log) |
 | T-OBJ-3 | Virtual methods and properties | OBJ-003 | T-OBJ-2 | B1 cases | medium | **done 2026-11-12** (see log) |
-| T-OBJ-4 | Interfaces through hierarchies; `is`/`as` | OBJ-004 | T-OBJ-3, T-LANG-4b | B1 cases | low | implemented 2026-11-12, focused gates pass; combined full gate pending |
+| T-OBJ-4 | Interfaces through hierarchies; `is`/`as` | OBJ-004 | T-OBJ-3, T-LANG-4b | B1 cases | low | **done 2026-11-12** (workspace 3,341 passed, `mem-exp-c6` codegen 1,647 passed, 0 failed) |
 | T-LANG-1a | Non-capturing lambdas and method groups | LANG-001 | — | workspace | medium | todo |
 | T-LANG-1b | Capturing closures (region environments; counted when escaping) | LANG-001 | T-LANG-1a; T-MEM-3c for escaping | reinforced | high | blocked: its escaping-environment rule assumed counting (T-MEM-3c, superseded); needs a revised rule under the fallback (Persistent or `Arena` environments) |
 | T-PERF-2 | MIR inliner then devirtualization (PERF-EXP-1 first) | PERF-002 | T-ARCH-2b | experiment threshold | medium | todo |
@@ -89,8 +89,8 @@ example, reference page. Gate: workspace tests; class A invariants unchanged or 
 | T-PLAT-1b | FFI: `ptr<T>`, `CString`, C-layout structs | PLAT-001 | T-PLAT-1a | high | todo |
 | T-PLAT-1c | FFI: callbacks (synchronous, posting), callback thread-local | PLAT-001, Q-CONC-2 | T-PLAT-1b, T-LANG-1a | high | todo |
 | T-CONC-3 | General async state machine | CONC-003 | T-MEM-3c, T-LANG-1b, T-ARCH-5 | high | blocked |
-| T-CONC-4 | Scheduler: turn budget, helping wait, nested tasks | CONC-004 | T-ARCH-5 | medium | implemented 2026-11-12 (per-worker queues + injection, 64-turn budget, helping `Wait()` on worker threads only, depth 4; stealing/compensation CONDITIONAL on CONC-EXP-2; nested tasks still rejected: needs CONC-002/003); combined full gate pending |
-| T-CONC-5 | Transfer by copy of strings, arrays, collections | CONC-005 | T-ARCH-5 | medium | todo |
+| T-CONC-4 | Scheduler: turn budget, helping wait, nested tasks | CONC-004 | T-ARCH-5 | medium | **done 2026-11-12** (queues + injection, 64-turn budget, helping `Wait()` on workers only; stealing/compensation CONDITIONAL on CONC-EXP-2; nested tasks need CONC-002/003; workspace 3,341 passed, `mem-exp-c6` codegen 1,647 passed, 0 failed) |
+| T-CONC-5 | Transfer by copy of strings, arrays, collections | CONC-005 | T-ARCH-5 | medium | **done 2026-11-12** (deep copy of strings, arrays, lists, dictionaries, structs/enums for `Task.Run` arguments and `Wait`/`WaitAll` results; `await Task.Run` and `Parallel.*` stay scalar-only; workspace 3,341 passed, `mem-exp-c6` codegen 1,647 passed, 0 failed) |
 | T-CONC-7 | Domain failure contract §4.A for existing tasks; `TryWait`; `TaskScope`; channels | CONC-006, CONC-007 | T-CONC-4 | medium | todo |
 | T-CONC-8 | Reactor, timers, sockets, streaming files | CONC-008 | T-CONC-3 | high | blocked |
 | T-CONC-9 | Reproducible `Parallel.Reduce` | CONC-009 | — | low | **done 2026-11-11**: `task_runtime::reduce_chunk_boundaries` (`min(length, 64)` chunks, left-to-right combine); tests `parallel_reduce_reproducible` (workers 1/2/3/4/8 identical), compiler `parallel` 83, codegen `parallel` 35 |

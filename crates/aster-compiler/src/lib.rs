@@ -8,6 +8,7 @@ mod escape_analysis;
 mod generics;
 mod git_source;
 mod hir_lowering;
+mod interface_inheritance;
 mod lifetime_analysis;
 mod local_object_elimination;
 mod lockfile;
@@ -227,6 +228,10 @@ fn compile_module(
     let generic_diagnostics = generics::monomorphize(&mut module);
     if !generic_diagnostics.is_empty() {
         return Err(generic_diagnostics);
+    }
+    let interface_diagnostics = interface_inheritance::expand(&mut module);
+    if !interface_diagnostics.is_empty() {
+        return Err(interface_diagnostics);
     }
     let (diagnostics, semantic_model) = semantic::validate(&module);
     if diagnostics
