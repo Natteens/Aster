@@ -1629,13 +1629,14 @@ fn public_execution_apis_return_controlled_integer_errors() {
 }
 
 #[test]
-fn rejects_float_remainder_with_clear_diagnostic() {
-    let error = run(
-        "public float Bad() { float a = 5f; float b = 2f; return a % b; }",
-        "Bad",
-    )
-    .unwrap_err();
-    assert!(error.contains("floating-point remainder"));
+fn executes_float_remainder() {
+    assert_eq!(
+        run(
+            "public float Ok() { float a = 5f; float b = 2f; return a % b; }",
+            "Ok",
+        ),
+        Ok(ExecutionValue::Float(1.0))
+    );
 }
 
 #[test]

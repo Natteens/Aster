@@ -115,21 +115,21 @@ fn remainder_assignment_on_numeric_types() {
         ),
         Ok(ExecutionValue::Long(10_000_000_000 % 7))
     );
-    // Floating-point `%` is not implemented by the JIT yet (a codegen gap that
-    // predates LANG-017): `%=` type-checks like `%` and fails identically there.
-    for (compound, binary) in [
+    // Floating-point `%` is IEEE fmod; `%=` behaves identically to `%`.
+    for (compound, binary, expected) in [
         (
             "public float Run() { float a = 7.5f; a %= 2.0f; return a; }",
             "public float Run() { float a = 7.5f; return a % 2.0f; }",
+            ExecutionValue::Float(1.5),
         ),
         (
             "public double Run() { double a = 7.5; a %= 2.0; return a; }",
             "public double Run() { double a = 7.5; return a % 2.0; }",
+            ExecutionValue::Double(1.5),
         ),
     ] {
-        assert!(compile(compound).is_ok());
-        let expected = run(binary, "Run").expect_err("float remainder is a JIT gap");
-        assert_eq!(run(compound, "Run"), Err(expected));
+        assert_eq!(run(compound, "Run"), Ok(expected.clone()));
+        assert_eq!(run(binary, "Run"), Ok(expected));
     }
     // Same typing as `+=`: an int target with a long operand would narrow.
     assert!(rejected(

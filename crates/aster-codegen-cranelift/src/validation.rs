@@ -2931,19 +2931,6 @@ fn validate_rvalue(
     locals: &HashMap<mir::LocalId, mir::Type>,
 ) -> Result<(), BackendError> {
     validate_value_type(&value.type_, function_name)?;
-    if matches!(value.type_, mir::Type::Float | mir::Type::Double)
-        && matches!(
-            value.kind,
-            mir::RvalueKind::Binary {
-                operator: mir::BinaryOperator::Remainder,
-                ..
-            }
-        )
-    {
-        return Err(BackendError::new(format!(
-            "floating-point remainder is not yet supported by the JIT in function `{function_name}`"
-        )));
-    }
     match &value.kind {
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             for field in fields {
@@ -3084,9 +3071,7 @@ fn validate_division_or_remainder_shape(
         )));
     }
     let integer = primitive(&left.type_).is_some_and(aster_types::Primitive::is_integer);
-    let supported = integer
-        || (operator == mir::BinaryOperator::Divide
-            && matches!(left.type_, mir::Type::Float | mir::Type::Double));
+    let supported = integer || matches!(left.type_, mir::Type::Float | mir::Type::Double);
     if supported {
         Ok(())
     } else {

@@ -121,6 +121,18 @@ impl Codegen {
                         (right, power_of_two_divisor),
                         state,
                     )
+                } else if *operator == mir::BinaryOperator::Remainder {
+                    // Cranelift has no `frem`; use the runtime's IEEE `fmod`.
+                    let symbol = if operand_type == mir::Type::Double {
+                        "aster_rt_fmod_f64"
+                    } else {
+                        "aster_rt_fmod_f32"
+                    };
+                    let function_ref = self
+                        .jit
+                        .declare_func_in_func(self.runtime_ids[symbol], builder.func);
+                    let call = builder.ins().call(function_ref, &[left, right]);
+                    Ok(builder.inst_results(call)[0])
                 } else {
                     translate_binary(builder, *operator, &operand_type, left, right)
                 }
@@ -704,7 +716,7 @@ fn translate_float_binary(
         mir::BinaryOperator::NotEqual => builder.ins().fcmp(FloatCC::NotEqual, left, right),
         mir::BinaryOperator::Remainder => {
             return Err(BackendError::new(
-                "floating-point remainder is not yet supported by the JIT",
+                "floating-point remainder must be lowered to a runtime call",
             ));
         }
         mir::BinaryOperator::LogicalAnd | mir::BinaryOperator::LogicalOr => {

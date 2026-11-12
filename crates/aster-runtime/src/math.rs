@@ -237,6 +237,19 @@ pub extern "C" fn aster_rt_math_pow_double(value: f64, exponent: f64) -> f64 {
     value.powf(exponent)
 }
 
+/// IEEE `fmod` for `float` `%`: sign of the dividend, NaN for a zero divisor or
+/// infinite dividend, the dividend for an infinite divisor.
+#[must_use]
+pub extern "C" fn aster_rt_fmod_f32(left: f32, right: f32) -> f32 {
+    left % right
+}
+
+/// `double` counterpart of [`aster_rt_fmod_f32`].
+#[must_use]
+pub extern "C" fn aster_rt_fmod_f64(left: f64, right: f64) -> f64 {
+    left % right
+}
+
 #[must_use]
 pub extern "C" fn aster_rt_math_binary_float(left: f32, right: f32, operation: i32) -> f32 {
     match operation {
@@ -537,5 +550,25 @@ mod tests {
         assert!(aster_rt_math_unary_double(f64::INFINITY, 5).is_nan());
         assert!(aster_rt_math_unary_double(f64::INFINITY, 6).is_nan());
         assert!((aster_rt_math_unary_double(std::f64::consts::FRAC_PI_2, 4) - 1.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn fmod_follows_ieee_remainder_rules() {
+        assert_eq!(
+            super::aster_rt_fmod_f64(-7.5, 2.0).to_bits(),
+            (-1.5_f64).to_bits()
+        );
+        assert!(super::aster_rt_fmod_f64(1.0, 0.0).is_nan());
+        assert!(super::aster_rt_fmod_f64(f64::INFINITY, 2.0).is_nan());
+        assert_eq!(
+            super::aster_rt_fmod_f64(3.0, f64::INFINITY).to_bits(),
+            3.0_f64.to_bits()
+        );
+        assert!(super::aster_rt_fmod_f64(-0.0, 5.0).is_sign_negative());
+        assert_eq!(
+            super::aster_rt_fmod_f32(7.5, -2.0).to_bits(),
+            1.5_f32.to_bits()
+        );
+        assert!(super::aster_rt_fmod_f32(1.0, 0.0).is_nan());
     }
 }

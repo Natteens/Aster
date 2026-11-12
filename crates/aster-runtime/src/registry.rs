@@ -1293,6 +1293,22 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             },
         },
         RuntimeFunction {
+            name: "aster_rt_fmod_f32",
+            address: crate::math::aster_rt_fmod_f32 as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::F32, RuntimeType::F32],
+                result: Some(RuntimeType::F32),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_fmod_f64",
+            address: crate::math::aster_rt_fmod_f64 as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::F64, RuntimeType::F64],
+                result: Some(RuntimeType::F64),
+            },
+        },
+        RuntimeFunction {
             name: "aster_rt_math_pow_float",
             address: aster_rt_math_pow_float as *const u8,
             signature: RuntimeSignature {
