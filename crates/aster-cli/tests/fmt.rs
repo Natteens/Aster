@@ -92,7 +92,7 @@ fn fmt_reports_lexical_errors_and_leaves_the_file_alone() {
     fs::write(&broken, "void F() { string s = \"open; }").expect("write");
     let output = aster(&directory, ["fmt", "broken.aster"]);
     assert_eq!(output.status.code(), Some(1));
-    assert!(!stderr(&output).is_empty());
+    assert_ne!(stderr(&output), "");
     assert_eq!(
         fs::read_to_string(&broken).expect("read"),
         "void F() { string s = \"open; }"
