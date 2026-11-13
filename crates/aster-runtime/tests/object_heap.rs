@@ -68,7 +68,24 @@ fn a_released_block_is_reused_zeroed_and_classes_do_not_mix() {
             fresh_blocks: 2,
             reused_blocks: 1,
             released_blocks: 1,
-            ..ObjectHeapStats::default()
+            #[cfg(feature = "mem-exp-rc")]
+            retains: 0,
+            #[cfg(feature = "mem-exp-rc")]
+            releases: 0,
+            #[cfg(feature = "mem-exp-rc")]
+            released_arrays: 0,
+            #[cfg(feature = "mem-exp-rc")]
+            unreturned_array_blocks: 0,
+            #[cfg(feature = "mem-exp-rc")]
+            released_strings: 0,
+            #[cfg(feature = "mem-exp-rc")]
+            released_lists: 0,
+            #[cfg(feature = "mem-exp-rc")]
+            unreturned_list_buffers: 0,
+            #[cfg(feature = "mem-exp-rc")]
+            released_dictionaries: 0,
+            #[cfg(feature = "mem-exp-rc")]
+            unreturned_dictionary_blocks: 0,
         }
     );
 }
