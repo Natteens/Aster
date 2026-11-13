@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const workflow = readFileSync(join(root, ".github", "workflows", "release.yml"), "utf8");
 const ci = readFileSync(join(root, ".github", "workflows", "ci.yml"), "utf8");
+const windowsCi = readFileSync(join(root, ".github", "workflows", "windows-ci.yml"), "utf8");
 const recovery = readFileSync(join(root, ".github", "workflows", "release-recovery.yml"), "utf8");
 const releaseConfig = readFileSync(join(root, "release.config.mjs"), "utf8");
 const releaseValidator = readFileSync(join(root, "scripts", "validate-release-ref.mjs"), "utf8");
@@ -91,7 +92,7 @@ test("automatic checkout and validation use release inputs even when the caller 
 
 test("main CI runs semantic-release after verification and directly calls M6F", () => {
     assert.match(ci, /^  semantic-release:\s*$/m);
-    assert.match(ci, /semantic-release:[\s\S]*needs: verify/);
+    assert.match(ci, /semantic-release:[\s\S]*needs: \[verify, experiments\]/);
     assert.match(ci, /github\.event_name == 'push'/);
     assert.match(ci, /github\.ref == 'refs\/heads\/main'/);
     assert.match(ci, /!contains\(github\.event\.head_commit\.message, '\[skip ci\]'\)/);
@@ -156,7 +157,7 @@ test("workflow contains bounded build, assembly, final verification, and publish
 test("quality gates run once before release builds and installer lifecycle runs only on final assets", () => {
     for (const command of [
         "cargo fmt --all --check",
-        "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+        "cargo clippy --workspace --all-targets --features aster-codegen-cranelift/aarm-telemetry -- -D warnings",
         "cargo test --workspace --all-targets",
         "cargo check --workspace --locked",
         "npm run test:release-core",
@@ -167,6 +168,18 @@ test("quality gates run once before release builds and installer lifecycle runs 
     assert.equal((workflow.match(/npm run test:installers/g) ?? []).length, 1);
     assert.doesNotMatch(workflow.slice(workflow.indexOf("  assemble:"), workflow.indexOf("  verify-assets:")), /install-linux\.test|test:installers/);
     assert.doesNotMatch(releaseConfig, /cargo check --workspace --locked/);
+});
+
+test("CI keeps mutually exclusive memory experiment layouts in separate builds", () => {
+    for (const source of [ci, windowsCi]) {
+        assert.doesNotMatch(source, /run: cargo .*--all-features/);
+        assert.ok(source.includes("cargo clippy --workspace --all-targets --features aster-codegen-cranelift/aarm-telemetry -- -D warnings"));
+        assert.ok(source.includes("cargo test --workspace --all-targets"));
+    }
+    assert.match(ci, /feature: \[mem-exp-c4, mem-exp-c5, mem-exp-c6, mem-exp-c6-h16\]/);
+    assert.match(ci, /fail-fast: false/);
+    assert.ok(ci.includes("cargo clippy -p aster-codegen-cranelift -p aster-runtime -p aster-exec --all-targets --features aster-codegen-cranelift/${{ matrix.feature }},aster-codegen-cranelift/aarm-telemetry -- -D warnings"));
+    assert.ok(ci.includes("cargo test -p aster-codegen-cranelift -p aster-runtime -p aster-exec --all-targets --features aster-codegen-cranelift/${{ matrix.feature }}"));
 });
 
 test("release core excludes installer lifecycle and the local aggregate remains explicit", () => {

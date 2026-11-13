@@ -110,7 +110,7 @@ fn initializers_are_emitted_once_in_the_constructor_that_does_not_delegate() {
 
     // `C()` runs the initializer `a = 1`; nothing else.
     assert_eq!(field_stores(plain).len(), 1);
-    assert!(calls_a_constructor(&compilation, plain).is_empty());
+    assert_eq!(calls_a_constructor(&compilation, plain), [] as [usize; 0]);
 
     // `C(int)` calls its target first and only then stores `b = x`: it has
     // no initializer store of its own.
@@ -153,7 +153,7 @@ fn a_derived_chain_reaches_the_base_constructor_once() {
     assert_eq!(calls_a_constructor(&compilation, with_base).len(), 1);
     assert_eq!(field_stores(with_base).len(), 1);
     assert_eq!(calls_a_constructor(&compilation, delegating).len(), 1);
-    assert!(field_stores(delegating).is_empty());
+    assert_eq!(field_stores(delegating), [] as [usize; 0]);
 }
 
 #[test]

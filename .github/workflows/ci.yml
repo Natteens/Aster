@@ -51,7 +51,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --features aster-codegen-cranelift/aarm-telemetry -- -D warnings
 
       - name: Run tests
         run: cargo test --workspace --all-targets
@@ -65,9 +65,32 @@ jobs:
       - name: Test release automation core
         run: npm run test:release-core
 
+  experiments:
+    name: Verify memory experiment (${{ matrix.feature }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [mem-exp-c4, mem-exp-c5, mem-exp-c6, mem-exp-c6-h16]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup component add clippy --toolchain stable
+
+      # Each experiment is a separate Cargo invocation: H12 and H16 cannot coexist.
+      - name: Run experimental Clippy
+        run: cargo clippy -p aster-codegen-cranelift -p aster-runtime -p aster-exec --all-targets --features aster-codegen-cranelift/${{ matrix.feature }},aster-codegen-cranelift/aarm-telemetry -- -D warnings
+
+      - name: Run experimental tests
+        run: cargo test -p aster-codegen-cranelift -p aster-runtime -p aster-exec --all-targets --features aster-codegen-cranelift/${{ matrix.feature }}
+
   semantic-release:
     name: Version and tag release
-    needs: verify
+    needs: [verify, experiments]
     if: >-
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main' &&
