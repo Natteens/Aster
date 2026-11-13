@@ -82,6 +82,10 @@ fn temporary_object_array_and_string_stress_stays_bounded() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "mem-exp-rc-core",
+    ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
+)]
 fn overlapping_returned_families_fall_back_while_the_final_family_reclaims() {
     let (value, stats) = execute(PERSISTENT_STRESS);
 
@@ -203,6 +207,10 @@ fn temporary_list_stress_stays_bounded() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "mem-exp-rc-core",
+    ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
+)]
 fn returned_overwritten_list_stress_stays_bounded() {
     let (value, stats) = execute(PERSISTENT_LIST_STRESS);
 

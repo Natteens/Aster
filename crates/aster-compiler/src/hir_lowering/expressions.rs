@@ -8,7 +8,7 @@ impl Lowerer<'_> {
     fn binary_expression(&mut self, expression: &ast::Expression) -> hir::Expression {
         enum Work<'a> {
             Visit(&'a ast::Expression),
-            Combine(ast::BinaryOperator),
+            Combine(ast::BinaryOperator, aster_diagnostics::Span),
         }
 
         let mut work = vec![Work::Visit(expression)];
@@ -22,35 +22,56 @@ impl Lowerer<'_> {
                         right,
                     } = &expression.kind
                     {
-                        work.push(Work::Combine(*operator));
+                        work.push(Work::Combine(*operator, expression.span));
                         work.push(Work::Visit(right));
                         work.push(Work::Visit(left));
                     } else {
                         values.push(self.expression(expression));
                     }
                 }
-                Work::Combine(operator) => {
+                Work::Combine(operator, span) => {
                     let mut right = values.pop().expect("binary right operand was lowered");
                     let mut left = values.pop().expect("binary left operand was lowered");
+                    let key = self.model.node_key(&self.model_context, span);
+                    // Semantic analysis chose the operand type. For a shift the count is
+                    // converted to the promoted left type too: widening or reinterpreting
+                    // an `int` preserves the low bits the shift masks, so negative counts
+                    // keep their specified meaning while both MIR operands share a type.
+                    let operand = self
+                        .model
+                        .binary_operand_types
+                        .get(&key)
+                        .cloned()
+                        .map(|name| self.resolve_type(&ast::TypeRef::new(name, span)));
+                    // Agreement check over every compiled program in debug builds: the
+                    // semantic decision must equal the central promotion table.
+                    debug_assert_eq!(
+                        operand,
+                        table_operand_type(operator, &left.type_, &right.type_),
+                        "semantic analysis and the promotion table disagree on a binary operand type"
+                    );
+                    if let Some(operand) = &operand {
+                        left = convert(left, operand);
+                        right = convert(right, operand);
+                    }
+                    // An identity comparison across a base chain compares the
+                    // same object through the base class: upcast the derived
+                    // operand (no code runs, the pointer is unchanged).
                     if matches!(
                         operator,
-                        ast::BinaryOperator::ShiftLeft
-                            | ast::BinaryOperator::ShiftRight
-                            | ast::BinaryOperator::UnsignedShiftRight
-                    ) {
-                        // Only the left operand is promoted. The count is converted to
-                        // the same type: widening or reinterpreting an `int` preserves
-                        // the low bits that the shift masks, so negative counts keep
-                        // their specified meaning while both MIR operands share a type.
-                        if let Some(promoted) = unary_promoted(&left.type_) {
-                            left = convert(left, &promoted);
-                            right = convert(right, &promoted);
+                        ast::BinaryOperator::Equal | ast::BinaryOperator::NotEqual
+                    ) && let (hir::Type::Class(l), hir::Type::Class(r)) =
+                        (&left.type_, &right.type_)
+                    {
+                        if self.derives_from(*l, *r) {
+                            let target = right.type_.clone();
+                            left = convert(left, &target);
+                        } else if self.derives_from(*r, *l) {
+                            let target = left.type_.clone();
+                            right = convert(right, &target);
                         }
-                    } else if let Some(promoted) = promoted(&left.type_, &right.type_) {
-                        left = convert(left, &promoted);
-                        right = convert(right, &promoted);
                     }
-                    let type_ = binary_type(operator, &left.type_, &right.type_);
+                    let type_ = binary_type(operator, operand.as_ref(), &left.type_);
                     values.push(hir::Expression {
                         type_,
                         kind: hir::ExpressionKind::Binary {
@@ -69,10 +90,7 @@ impl Lowerer<'_> {
 
     #[allow(clippy::too_many_lines)]
     pub(super) fn expression(&mut self, expression: &ast::Expression) -> hir::Expression {
-        let model_key = crate::semantic::ModelNodeKey {
-            context: self.model_context.clone(),
-            span: expression.span,
-        };
+        let model_key = self.model.node_key(&self.model_context, expression.span);
         if let Some(resolved) = self.model.enum_values.get(&model_key).cloned() {
             let enum_symbol = self.types[&resolved.enum_name];
             let (case_symbol, field_symbols) =
@@ -128,6 +146,28 @@ impl Lowerer<'_> {
             return self.expression(&explicit);
         }
         match &expression.kind {
+            ast::ExpressionKind::ObjectInitializer { creation, members } => {
+                let object = self.expression(creation);
+                let receiver = self.allocate();
+                self.symbol_types.insert(receiver, object.type_.clone());
+                self.scopes.push(std::collections::HashMap::from([(
+                    crate::semantic::INITIALIZER_RECEIVER.to_owned(),
+                    receiver,
+                )]));
+                let assignments = members
+                    .iter()
+                    .map(|member| self.expression(&crate::semantic::initializer_assignment(member)))
+                    .collect();
+                self.scopes.pop();
+                hir::Expression {
+                    type_: object.type_.clone(),
+                    kind: hir::ExpressionKind::ObjectInitializer {
+                        object: Box::new(object),
+                        receiver,
+                        assignments,
+                    },
+                }
+            }
             ast::ExpressionKind::Literal(literal) => {
                 let (literal, type_) = literal_value(literal);
                 hir::Expression {
@@ -136,6 +176,18 @@ impl Lowerer<'_> {
                 }
             }
             ast::ExpressionKind::Name(name) => {
+                if let Some(backing) = self.model.auto_property_fields.get(&model_key) {
+                    let receiver = self
+                        .current_receiver
+                        .expect("validated auto-property access has a receiver");
+                    return self.auto_property_field(
+                        hir::Expression {
+                            type_: self.symbol_types[&receiver].clone(),
+                            kind: hir::ExpressionKind::Symbol(receiver),
+                        },
+                        backing,
+                    );
+                }
                 if let Some(key) = self.model.property_reads.get(&model_key) {
                     let getter = self.callable_symbols[key];
                     let receiver = self
@@ -158,10 +210,13 @@ impl Lowerer<'_> {
                 if self.member_owners.contains_key(&symbol)
                     && let Some(receiver) = self.current_receiver
                 {
-                    let object = hir::Expression {
-                        type_: self.symbol_types[&receiver].clone(),
-                        kind: hir::ExpressionKind::Symbol(receiver),
-                    };
+                    let object = self.upcast_receiver(
+                        hir::Expression {
+                            type_: self.symbol_types[&receiver].clone(),
+                            kind: hir::ExpressionKind::Symbol(receiver),
+                        },
+                        symbol,
+                    );
                     let type_ = self
                         .symbol_types
                         .get(&symbol)
@@ -186,6 +241,25 @@ impl Lowerer<'_> {
                     kind: hir::ExpressionKind::Symbol(symbol),
                 }
             }
+            ast::ExpressionKind::Base => {
+                let receiver = self
+                    .current_receiver
+                    .expect("validated base has a receiver");
+                let this = hir::Expression {
+                    type_: self.symbol_types[&receiver].clone(),
+                    kind: hir::ExpressionKind::Symbol(receiver),
+                };
+                let hir::Type::Class(class) = this.type_ else {
+                    unreachable!("validated base is used inside a class")
+                };
+                let base = self.class_bases[&class];
+                hir::Expression {
+                    type_: hir::Type::Class(base),
+                    kind: hir::ExpressionKind::BaseReceiver {
+                        object: Box::new(this),
+                    },
+                }
+            }
             ast::ExpressionKind::This => {
                 let receiver = self
                     .current_receiver
@@ -200,7 +274,12 @@ impl Lowerer<'_> {
                 let fields = fields
                     .iter()
                     .map(|field| {
-                        let field_symbol = self.members[&struct_symbol][&field.name];
+                        // A literal may name an auto-property; it initializes
+                        // the property's backing field.
+                        let members = &self.members[&struct_symbol];
+                        let field_symbol = members.get(&field.name).copied().unwrap_or_else(|| {
+                            members[&ast::auto_property_backing_field(&field.name)]
+                        });
                         let target = self.symbol_types[&field_symbol].clone();
                         let value = convert(self.expression(&field.value), &target);
                         hir::FieldValue {
@@ -422,15 +501,21 @@ impl Lowerer<'_> {
                         },
                     };
                 }
+                if let Some(backing) = self.model.auto_property_fields.get(&model_key) {
+                    return self.auto_property_field(object, backing);
+                }
                 if let Some(key) = self.model.property_reads.get(&model_key) {
                     return self.property_get(object, self.callable_symbols[key]);
                 }
                 let symbol = match object.type_ {
                     hir::Type::User(owner)
                     | hir::Type::Class(owner)
-                    | hir::Type::Interface(owner) => self.members[&owner][name],
+                    | hir::Type::Interface(owner) => self
+                        .lookup_member(owner, name)
+                        .expect("validated member access names a declared member"),
                     _ => unreachable!("validated member access has a user type"),
                 };
+                let object = self.upcast_receiver(object, symbol);
                 let type_ = self
                     .symbol_types
                     .get(&symbol)
@@ -1085,6 +1170,7 @@ impl Lowerer<'_> {
                             }
                             _ => unreachable!("validated method call has a member callee"),
                         };
+                        let receiver = self.upcast_receiver(receiver, symbol);
                         hir::Expression {
                             type_: hir::Type::Unknown,
                             kind: hir::ExpressionKind::Member {
@@ -1138,10 +1224,7 @@ impl Lowerer<'_> {
                 prefix,
                 operand,
             } => {
-                let operand_key = crate::semantic::ModelNodeKey {
-                    context: self.model_context.clone(),
-                    span: operand.span,
-                };
+                let operand_key = self.model.node_key(&self.model_context, operand.span);
                 if self.model.list_indexes.contains(&operand_key) {
                     let ast::ExpressionKind::Index { array, index } = &operand.kind else {
                         unreachable!("a list index model entry belongs to an index expression")
@@ -1266,7 +1349,25 @@ impl Lowerer<'_> {
                 let condition = self.expression(condition);
                 let when_true = self.expression(when_true);
                 let when_false = self.expression(when_false);
-                let type_ = conditional_type(&when_true.type_, &when_false.type_);
+                let type_ = match (&when_true.type_, &when_false.type_) {
+                    (hir::Type::Class(a), hir::Type::Class(b)) if self.derives_from(*a, *b) => {
+                        when_false.type_.clone()
+                    }
+                    (hir::Type::Class(a), hir::Type::Class(b)) if self.derives_from(*b, *a) => {
+                        when_true.type_.clone()
+                    }
+                    // Sibling classes: the branches meet at their nearest
+                    // common base (semantic analysis accepted the conditional
+                    // against a base-typed target).
+                    (hir::Type::Class(a), hir::Type::Class(b)) if a != b => {
+                        let right_chain = self.class_chain(*b);
+                        self.class_chain(*a)
+                            .into_iter()
+                            .find(|class| right_chain.contains(class))
+                            .map_or_else(|| when_true.type_.clone(), hir::Type::Class)
+                    }
+                    _ => conditional_type(&when_true.type_, &when_false.type_),
+                };
                 let when_true = convert(when_true, &type_);
                 let when_false = convert(when_false, &type_);
                 hir::Expression {
@@ -1284,17 +1385,26 @@ impl Lowerer<'_> {
                 default,
             } => {
                 let value = self.expression(value);
+                let scalar = super::types::is_scalar_switch_type(&value.type_);
                 let mut lowered_cases = Vec::new();
                 for case in cases {
                     self.scopes.push(std::collections::HashMap::new());
-                    let (case_symbol, tag, bindings) =
-                        self.switch_pattern(case.span, &case.bindings);
+                    let (case_symbol, tag, bindings, label) = if scalar {
+                        self.scalar_switch_pattern(case.label.as_ref(), &value.type_)
+                    } else {
+                        let (case_symbol, tag, bindings) =
+                            self.switch_pattern(case.span, &case.bindings);
+                        (case_symbol, tag, bindings, None)
+                    };
+                    let guard = case.guard.as_ref().map(|guard| self.expression(guard));
                     let arm = self.expression(&case.value);
                     self.scopes.pop();
                     lowered_cases.push(hir::SwitchExpressionCase {
                         case: case_symbol,
                         tag,
                         bindings,
+                        label,
+                        guard,
                         value: arm,
                     });
                 }
@@ -1321,10 +1431,7 @@ impl Lowerer<'_> {
                 operator,
                 value,
             } => {
-                let target_key = crate::semantic::ModelNodeKey {
-                    context: self.model_context.clone(),
-                    span: target.span,
-                };
+                let target_key = self.model.node_key(&self.model_context, target.span);
                 if self.model.list_indexes.contains(&target_key) {
                     let ast::ExpressionKind::Index { array, index } = &target.kind else {
                         unreachable!("a list index model entry belongs to an index expression")
@@ -1360,6 +1467,7 @@ impl Lowerer<'_> {
                         _ => unreachable!("property target is a name or member"),
                     };
                     let setter = self.callable_symbols[&resolved.setter];
+                    let object = self.upcast_receiver(object, setter);
                     let target_type = self.callable_parameters[&setter][0].clone();
                     let value = convert(self.expression(value), &target_type);
                     return hir::Expression {
@@ -1385,6 +1493,88 @@ impl Lowerer<'_> {
                         target: Box::new(target),
                         operator: assignment(*operator),
                         value: Box::new(value),
+                    },
+                }
+            }
+            ast::ExpressionKind::TypePattern {
+                value,
+                target,
+                binding,
+            } => {
+                let value = self.expression(value);
+                let target_type = self.resolve_type(target);
+                let binding = binding.as_ref().map(|binding| {
+                    let symbol = self.allocate();
+                    self.symbol_types.insert(symbol, target_type.clone());
+                    self.scopes
+                        .last_mut()
+                        .expect("pattern scope")
+                        .insert(binding.name.clone(), symbol);
+                    Box::new(hir::Variable {
+                        symbol,
+                        name: binding.name.clone(),
+                        visibility: None,
+                        type_: target_type.clone(),
+                        mutable: true,
+                        initializer: None,
+                    })
+                });
+                Self::runtime_type_test(value, &target_type, binding)
+            }
+            ast::ExpressionKind::TypeAs { value, target } => {
+                let resolved = self.model.type_as[&model_key].clone();
+                let value = self.expression(value);
+                let target_type = self.resolve_type(target);
+                let option_symbol = self.types[&resolved.option_type];
+                let (some_case, some_fields) =
+                    self.enum_cases[&(resolved.option_type.clone(), resolved.some_index)].clone();
+                let (none_case, _) =
+                    self.enum_cases[&(resolved.option_type.clone(), resolved.none_index)].clone();
+                // `value as T` is `value is T t ? Some(t) : None` over a
+                // compiler-introduced binding.
+                let symbol = self.allocate();
+                self.symbol_types.insert(symbol, target_type.clone());
+                let binding = Box::new(hir::Variable {
+                    symbol,
+                    name: format!("<as#{}>", symbol.0),
+                    visibility: None,
+                    type_: target_type.clone(),
+                    mutable: true,
+                    initializer: None,
+                });
+                let option_type = hir::Type::Enum(option_symbol);
+                hir::Expression {
+                    type_: option_type.clone(),
+                    kind: hir::ExpressionKind::Conditional {
+                        condition: Box::new(Self::runtime_type_test(
+                            value,
+                            &target_type,
+                            Some(binding),
+                        )),
+                        when_true: Box::new(hir::Expression {
+                            type_: option_type.clone(),
+                            kind: hir::ExpressionKind::EnumValue {
+                                enum_symbol: option_symbol,
+                                case: some_case,
+                                tag: tag(resolved.some_index),
+                                fields: vec![hir::FieldValue {
+                                    field: some_fields[0],
+                                    value: hir::Expression {
+                                        type_: target_type.clone(),
+                                        kind: hir::ExpressionKind::Symbol(symbol),
+                                    },
+                                }],
+                            },
+                        }),
+                        when_false: Box::new(hir::Expression {
+                            type_: option_type,
+                            kind: hir::ExpressionKind::EnumValue {
+                                enum_symbol: option_symbol,
+                                case: none_case,
+                                tag: tag(resolved.none_index),
+                                fields: Vec::new(),
+                            },
+                        }),
                     },
                 }
             }
@@ -1422,7 +1612,55 @@ impl Lowerer<'_> {
         }
     }
 
+    /// A read or write of an auto-property's synthesized backing field: the
+    /// accessor call is skipped, so MIR sees an ordinary field access. The
+    /// field is found through the base chain (a derived class reaches the
+    /// base's private backing field through an identity upcast).
+    fn auto_property_field(&self, object: hir::Expression, backing: &str) -> hir::Expression {
+        let (hir::Type::User(owner) | hir::Type::Class(owner)) = object.type_ else {
+            unreachable!("validated auto-property access has a class or struct receiver")
+        };
+        let symbol = self
+            .lookup_member(owner, backing)
+            .expect("an auto-property declares its backing field");
+        let object = self.upcast_receiver(object, symbol);
+        hir::Expression {
+            type_: self.symbol_types[&symbol].clone(),
+            kind: hir::ExpressionKind::Member {
+                object: Box::new(object),
+                symbol,
+            },
+        }
+    }
+
+    /// The `bool` run-time test of `value` against a class or an interface
+    /// target, with the optional binding of the narrowed value.
+    fn runtime_type_test(
+        value: hir::Expression,
+        target_type: &hir::Type,
+        binding: Option<Box<hir::Variable>>,
+    ) -> hir::Expression {
+        let kind = match target_type {
+            hir::Type::Class(class) => hir::ExpressionKind::ClassTest {
+                value: Box::new(value),
+                class: *class,
+                binding,
+            },
+            hir::Type::Interface(interface) => hir::ExpressionKind::InterfaceTest {
+                value: Box::new(value),
+                interface: *interface,
+                binding,
+            },
+            _ => unreachable!("semantic analysis accepts only class and interface targets"),
+        };
+        hir::Expression {
+            type_: hir::Type::Bool,
+            kind,
+        }
+    }
+
     fn property_get(&self, object: hir::Expression, getter: hir::SymbolId) -> hir::Expression {
+        let object = self.upcast_receiver(object, getter);
         let type_ = self.callable_results[&getter].clone();
         hir::Expression {
             type_,
@@ -1576,6 +1814,7 @@ convert_operator!(
         SubtractAssign,
         MultiplyAssign,
         DivideAssign,
+        RemainderAssign,
         BitwiseAndAssign,
         BitwiseOrAssign,
         BitwiseXorAssign,
@@ -1584,3 +1823,19 @@ convert_operator!(
         UnsignedShiftRightAssign
     ]
 );
+
+/// The operand type the central promotion table yields, used only by the
+/// debug agreement check against the semantic decision.
+fn table_operand_type(
+    operator: ast::BinaryOperator,
+    left: &hir::Type,
+    right: &hir::Type,
+) -> Option<hir::Type> {
+    match operator {
+        ast::BinaryOperator::LogicalAnd | ast::BinaryOperator::LogicalOr => None,
+        ast::BinaryOperator::ShiftLeft
+        | ast::BinaryOperator::ShiftRight
+        | ast::BinaryOperator::UnsignedShiftRight => unary_promoted(left),
+        _ => promoted(left, right),
+    }
+}

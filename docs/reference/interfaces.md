@@ -30,7 +30,7 @@ public int Read(IScore item)
 }
 ```
 
-The name after `:` is an interface, not a base class. A class may list more than one interface,
+The names after `:` are an optional base class (first, see [classes](classes.md)) followed by interfaces. A class may list more than one interface,
 separated by commas. Every required method must be public and match the parameter and return types
 exactly. Interfaces cannot contain fields or method bodies.
 
@@ -38,9 +38,14 @@ Converting a class reference to one of its declared interfaces is implicit and s
 value still refers to the same object, so mutation through an interface is visible through the
 original class reference. Calls use the object's concrete implementation at runtime.
 
+An interface value can be recovered from a base-typed reference with `value is IShape s` or
+`value as IShape` when a derived class implements the interface, and an interface value can be tested
+against a class (`area is Square sq`) or another interface; see
+[downcast and interface tests](classes.md#downcast-and-interface-tests).
+
 Interface values can be used in locals, parameters, class fields, arrays and returns between ASTER
 functions. They are non-null in the current language because `null` does not exist. Equality uses
-the identity of the underlying object. Downcasts, interface inheritance, default methods and struct
+the identity of the underlying object. Interface inheritance, default methods and struct
 implementations are not implemented yet.
 
 Interfaces may declare type parameters. A closed contract such as `IValue<int>` receives its own

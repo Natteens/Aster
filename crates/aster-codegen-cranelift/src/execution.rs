@@ -68,6 +68,36 @@ pub(super) struct PreparedProgram {
     jit: Option<JITModule>,
     entries: HashMap<mir::SymbolId, (*const u8, mir::Type)>,
     task_entries: HashMap<mir::SymbolId, (*const u8, mir::Type)>,
+    /// Transfer shape of every `Task.Run` target whose result crosses by deep
+    /// copy (CONC-005); such targets always run through a trampoline.
+    task_result_shapes: HashMap<mir::SymbolId, aster_runtime::TransferShape>,
+    /// Declared last: class descriptors must outlive the JIT code and every
+    /// object that points at them.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "owned only to keep descriptor addresses valid")
+    )]
+    descriptors: super::layouts::ObjectDescriptors,
+}
+
+/// MEM-EXP-1 C5/C6: insert the ownership instructions (elided in C6) and
+/// validate them before any code is generated.
+#[cfg(feature = "mem-exp-rc-core")]
+fn prepare_ownership_module(module: &mir::Module) -> Result<mir::Module, BackendError> {
+    #[cfg(feature = "mem-exp-elide")]
+    let (transformed, _stats) = mir::ownership::insert_ownership_elided(module);
+    #[cfg(not(feature = "mem-exp-elide"))]
+    let (transformed, _stats) = mir::ownership::insert_ownership(module);
+    mir::validate::ownership::validate_ownership(&transformed).map_err(|findings| {
+        BackendError::new(
+            findings
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    })?;
+    Ok(transformed)
 }
 
 impl PreparedProgram {
@@ -89,11 +119,16 @@ impl PreparedProgram {
     /// where the time went: `codegen` covers JIT setup, declaration and
     /// per-function Cranelift compilation; `finalize` covers
     /// `finalize_definitions` and entry-address lookup.
+    #[allow(clippy::too_many_lines)]
     pub(super) fn prepare_timed_with_foreign_registry(
         module: &mir::Module,
         registry: &aster_runtime::ForeignRegistry,
     ) -> Result<(Self, PrepareTimings), BackendError> {
         let codegen_started = Instant::now();
+        #[cfg(feature = "mem-exp-rc-core")]
+        let transformed = prepare_ownership_module(module)?;
+        #[cfg(feature = "mem-exp-rc-core")]
+        let module = &transformed;
         let mut builder = jit_builder()?;
         for function in runtime_functions() {
             builder.symbol(function.name, function.address);
@@ -114,6 +149,7 @@ impl PreparedProgram {
         let function_ids = codegen.declare_functions(module)?;
         let task_trampoline_ids = codegen.declare_task_trampolines(module)?;
         codegen.define_interface_tables(module, &function_ids)?;
+        let abstract_stubs = codegen.define_abstract_stubs(module)?;
         for function in &module.functions {
             codegen.define_function(function, &function_ids)?;
             if let Some(trampoline) = task_trampoline_ids.get(&function.symbol) {
@@ -124,9 +160,39 @@ impl PreparedProgram {
                 )?;
             }
         }
+        let mut task_result_shapes = HashMap::new();
+        for function in &module.functions {
+            if task_trampoline_ids.contains_key(&function.symbol)
+                && super::transfer::is_deep_result_type(&function.return_type)
+            {
+                task_result_shapes.insert(
+                    function.symbol,
+                    codegen.transfer_shape(&function.return_type)?,
+                );
+            }
+        }
         let codegen_elapsed = codegen_started.elapsed();
         let finalize_started = Instant::now();
         codegen.jit.finalize_definitions().map_err(module_error)?;
+        codegen.descriptors.bind_interface_tables(
+            &codegen.jit,
+            &codegen.interface_tables,
+            module,
+        )?;
+        codegen.descriptors.bind_virtual_tables(module, |slot| {
+            let id = match slot.implementation {
+                Some(implementation) => {
+                    function_ids.get(&implementation).copied().ok_or_else(|| {
+                        BackendError::new("virtual slot references an unknown implementation")
+                    })?
+                }
+                None => abstract_stubs
+                    .get(&slot.method)
+                    .copied()
+                    .ok_or_else(|| BackendError::new("abstract virtual slot has no stub"))?,
+            };
+            Ok(codegen.jit.get_finalized_function(id))
+        })?;
         let entries = module
             .functions
             .iter()
@@ -154,6 +220,8 @@ impl PreparedProgram {
                 jit: Some(codegen.jit),
                 entries,
                 task_entries,
+                task_result_shapes,
+                descriptors: codegen.descriptors,
             },
             PrepareTimings {
                 codegen: codegen_elapsed,
@@ -194,6 +262,29 @@ impl PreparedProgram {
             console_backend,
             filesystem_backend,
             None,
+            None,
+        )
+        .map(|(value, stats, _)| (value, stats))
+    }
+
+    /// Run an entry declared `Main(string[] args)` once, passing `arguments`
+    /// as a fresh persistent `string[]` allocated in the invocation's context.
+    pub(super) fn invoke_with_arguments(
+        &self,
+        symbol: mir::SymbolId,
+        collect_stats: bool,
+        task_runtime: Option<*mut ()>,
+        arguments: &[String],
+        console_backend: Option<Box<dyn aster_runtime::ConsoleBackend>>,
+    ) -> Result<(ExecutionValue, super::MemoryStats), BackendError> {
+        self.invoke_observed(
+            symbol,
+            collect_stats,
+            task_runtime,
+            console_backend,
+            None,
+            None,
+            Some(arguments),
         )
         .map(|(value, stats, _)| (value, stats))
     }
@@ -204,7 +295,7 @@ impl PreparedProgram {
         symbol: mir::SymbolId,
         task_runtime: Option<*mut ()>,
     ) -> Result<(ExecutionValue, aster_runtime::AarmMemoryTelemetry), BackendError> {
-        self.invoke_observed(symbol, true, task_runtime, None, None, None)
+        self.invoke_observed(symbol, true, task_runtime, None, None, None, None)
             .map(|(value, _, telemetry)| {
                 (
                     value,
@@ -220,7 +311,7 @@ impl PreparedProgram {
         task_runtime: Option<*mut ()>,
         governor: Arc<aster_runtime::MemoryGovernor>,
     ) -> Result<(ExecutionValue, aster_runtime::AarmMemoryTelemetry), BackendError> {
-        self.invoke_observed(symbol, true, task_runtime, None, None, Some(governor))
+        self.invoke_observed(symbol, true, task_runtime, None, None, Some(governor), None)
             .map(|(value, _, telemetry)| {
                 (
                     value,
@@ -229,6 +320,7 @@ impl PreparedProgram {
             })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn invoke_observed(
         &self,
         symbol: mir::SymbolId,
@@ -237,6 +329,7 @@ impl PreparedProgram {
         console_backend: Option<Box<dyn aster_runtime::ConsoleBackend>>,
         filesystem_backend: Option<Box<dyn aster_runtime::FileSystemBackend>>,
         governor: Option<Arc<aster_runtime::MemoryGovernor>>,
+        arguments: Option<&[String]>,
     ) -> Result<
         (
             ExecutionValue,
@@ -268,8 +361,25 @@ impl PreparedProgram {
         if let Some(backend) = filesystem_backend {
             execution_context.set_filesystem_backend(backend);
         }
-        let value = invoke_finalized(*pointer, return_type, &mut execution_context);
+        let value = match arguments {
+            None => invoke_finalized(*pointer, return_type, &mut execution_context),
+            Some(arguments) => {
+                let array = execution_context.allocate_string_array(arguments);
+                if array.is_null() {
+                    Ok(ExecutionValue::Void)
+                } else {
+                    invoke_finalized_with_arguments(
+                        *pointer,
+                        return_type,
+                        Some(array),
+                        &mut execution_context,
+                    )
+                }
+            }
+        };
         let runtime_error = execution_context.take_error();
+        #[cfg(feature = "mem-exp-rc-core")]
+        execution_context.refresh_object_heap_stats();
         let stats = execution_context.memory_stats().clone();
         let telemetry = execution_context.aarm_memory_telemetry();
         if let Some(error) = runtime_error {
@@ -303,15 +413,15 @@ impl PreparedProgram {
     pub(super) fn run_task(
         &self,
         symbol: mir::SymbolId,
-        payload: &super::worker_pool::TaskPayload,
+        payload: &aster_exec::worker_pool::TaskPayload,
         cancellation: Arc<aster_runtime::TaskCancellation>,
         collect_stats: bool,
-        memory_policy: Option<&super::worker_pool::TaskMemoryPolicy>,
+        memory_policy: Option<&aster_exec::worker_pool::TaskMemoryPolicy>,
     ) -> (
-        super::worker_pool::TaskOutcome,
+        aster_exec::worker_pool::TaskOutcome,
         Option<aster_runtime::AarmMemoryTelemetry>,
     ) {
-        use super::worker_pool::TaskOutcome;
+        use aster_exec::worker_pool::TaskOutcome;
 
         let Some((pointer, return_type)) = self.task_entries.get(&symbol) else {
             return (
@@ -329,15 +439,55 @@ impl PreparedProgram {
                     aster_runtime::ExecutionContext::new()
                 }
             },
-            super::worker_pool::TaskMemoryPolicy::context,
+            aster_exec::worker_pool::TaskMemoryPolicy::context,
         );
         context.set_task_cancellation(cancellation);
-        let value = if payload.is_empty() {
+        // Deep-copy arguments are materialized into a worker-local copy of the
+        // frame, in this worker's own context (CONC-005).
+        let mut frame_copy = Vec::new();
+        let mut frame = payload.as_ptr();
+        if !payload.transfers().is_empty() {
+            frame_copy.extend_from_slice(payload.words());
+            frame = frame_copy.as_mut_ptr().cast_const();
+            for item in payload.transfers() {
+                let unpacked =
+                    aster_runtime::TransferShape::decode(&item.shape).and_then(|shape| {
+                        let offset = item.frame_offset as usize;
+                        if offset
+                            .checked_add(shape.image_size())
+                            .is_none_or(|end| end > frame_copy.len() * 8)
+                        {
+                            return Err("transfer argument lies outside its frame".to_owned());
+                        }
+                        // SAFETY: the offset and image fit inside `frame_copy`.
+                        #[allow(unsafe_code)]
+                        unsafe {
+                            context.transfer_unpack(
+                                &shape,
+                                item.wire.as_bytes(),
+                                frame_copy.as_mut_ptr().cast::<u8>().add(offset),
+                            )
+                        }
+                    });
+                if let Err(message) = unpacked {
+                    context.fail(message);
+                    break;
+                }
+            }
+        }
+        let deep_result = self.task_result_shapes.get(&symbol);
+        let value = if context.has_failed() {
+            Err(BackendError::new("task arguments could not be transferred"))
+        } else if let Some(shape) = deep_result {
+            invoke_deep_task(*pointer, shape, frame, &mut context)
+        } else if payload.is_empty() {
             invoke_finalized(*pointer, return_type, &mut context)
         } else {
-            invoke_task_finalized(*pointer, return_type, payload.as_ptr(), &mut context)
+            invoke_task_finalized(*pointer, return_type, frame, &mut context)
         };
         let runtime_error = context.take_error();
+        #[cfg(feature = "mem-exp-rc-core")]
+        context.refresh_object_heap_stats();
         let stats = context.memory_stats().clone();
         let telemetry = context.aarm_memory_telemetry();
         let outcome = match runtime_error {
@@ -363,7 +513,7 @@ impl PreparedProgram {
         handle: i64,
         task_runtime: *mut (),
         cancellation: Arc<aster_runtime::TaskCancellation>,
-        memory_domain: Option<&super::worker_pool::AsyncMemoryDomain>,
+        memory_domain: Option<&aster_exec::worker_pool::AsyncMemoryDomain>,
     ) -> (
         Result<(ExecutionValue, super::MemoryStats), BackendError>,
         Option<aster_runtime::AarmMemoryTelemetry>,
@@ -392,6 +542,8 @@ impl PreparedProgram {
         let function: extern "C" fn(*mut aster_runtime::ExecutionContext, i64) -> i32 =
             unsafe { std::mem::transmute(*pointer) };
         let move_next_status = function(&raw mut context, handle);
+        #[cfg(feature = "mem-exp-rc-core")]
+        context.refresh_object_heap_stats();
         let stats = context.memory_stats().clone();
         let result = match context.take_error() {
             Some(error) => Err(BackendError::new(format!("Aster runtime error: {error}"))),
@@ -409,8 +561,8 @@ impl PreparedProgram {
         symbol: mir::SymbolId,
         start: i32,
         end: i32,
-        memory_budget: Option<&super::worker_pool::ParallelMemoryBudget>,
-    ) -> super::worker_pool::ChunkOutcome {
+        memory_budget: Option<&aster_exec::worker_pool::ParallelMemoryBudget>,
+    ) -> aster_exec::worker_pool::ChunkOutcome {
         let Some((pointer, _)) = self.entries.get(&symbol) else {
             return chunk_error(i64::from(start), "Parallel body was not prepared");
         };
@@ -424,7 +576,7 @@ impl PreparedProgram {
             body(&raw mut context, index);
             if let Some(error) = context.take_error() {
                 let logical = i64::from(index);
-                return super::worker_pool::ChunkOutcome {
+                return aster_exec::worker_pool::ChunkOutcome {
                     first_error: Some((
                         logical,
                         BackendError::new(parallel_runtime_error(
@@ -438,7 +590,7 @@ impl PreparedProgram {
                 };
             }
         }
-        super::worker_pool::ChunkOutcome {
+        aster_exec::worker_pool::ChunkOutcome {
             first_error: None,
             #[cfg(feature = "aarm-telemetry")]
             telemetry: context.aarm_memory_telemetry(),
@@ -452,8 +604,8 @@ impl PreparedProgram {
         symbol: mir::SymbolId,
         base: usize,
         values: &[ExecutionValue],
-        memory_budget: Option<&super::worker_pool::ParallelMemoryBudget>,
-    ) -> super::worker_pool::ChunkOutcome {
+        memory_budget: Option<&aster_exec::worker_pool::ParallelMemoryBudget>,
+    ) -> aster_exec::worker_pool::ChunkOutcome {
         let logical = |offset: usize| i64::try_from(base + offset).unwrap_or(i64::MAX);
         let Some((pointer, _)) = self.entries.get(&symbol) else {
             return chunk_error(logical(0), "Parallel body was not prepared");
@@ -463,7 +615,7 @@ impl PreparedProgram {
             invoke_body_scalar(*pointer, &mut context, value);
             if let Some(error) = context.take_error() {
                 let logical = logical(offset);
-                return super::worker_pool::ChunkOutcome {
+                return aster_exec::worker_pool::ChunkOutcome {
                     first_error: Some((
                         logical,
                         BackendError::new(parallel_runtime_error(
@@ -477,7 +629,7 @@ impl PreparedProgram {
                 };
             }
         }
-        super::worker_pool::ChunkOutcome {
+        aster_exec::worker_pool::ChunkOutcome {
             first_error: None,
             #[cfg(feature = "aarm-telemetry")]
             telemetry: context.aarm_memory_telemetry(),
@@ -495,9 +647,9 @@ impl PreparedProgram {
         base: usize,
         identity: &ExecutionValue,
         values: &[ExecutionValue],
-        memory_budget: Option<&super::worker_pool::ParallelMemoryBudget>,
-    ) -> super::worker_pool::ReduceChunkOutcome {
-        use super::worker_pool::ReduceChunkOutcome;
+        memory_budget: Option<&aster_exec::worker_pool::ParallelMemoryBudget>,
+    ) -> aster_exec::worker_pool::ReduceChunkOutcome {
+        use aster_exec::worker_pool::ReduceChunkOutcome;
         let logical = |offset: usize| i64::try_from(base + offset).unwrap_or(i64::MAX);
         let Some((pointer, _)) = self.entries.get(&symbol) else {
             return ReduceChunkOutcome {
@@ -554,9 +706,9 @@ impl PreparedProgram {
         symbol: mir::SymbolId,
         left: &ExecutionValue,
         right: &ExecutionValue,
-        memory_budget: Option<&super::worker_pool::ParallelMemoryBudget>,
-    ) -> super::worker_pool::CombineOutcome {
-        use super::worker_pool::CombineOutcome;
+        memory_budget: Option<&aster_exec::worker_pool::ParallelMemoryBudget>,
+    ) -> aster_exec::worker_pool::CombineOutcome {
+        use aster_exec::worker_pool::CombineOutcome;
         let Some((pointer, _)) = self.entries.get(&symbol) else {
             return CombineOutcome {
                 result: Err(BackendError::new(
@@ -593,7 +745,7 @@ impl PreparedProgram {
 }
 
 fn parallel_context(
-    memory_budget: Option<&super::worker_pool::ParallelMemoryBudget>,
+    memory_budget: Option<&aster_exec::worker_pool::ParallelMemoryBudget>,
 ) -> aster_runtime::ExecutionContext {
     memory_budget.map_or_else(aster_runtime::ExecutionContext::new, |budget| {
         aster_runtime::ExecutionContext::with_memory_budget(
@@ -607,8 +759,8 @@ fn jit_builder() -> Result<JITBuilder, BackendError> {
     JITBuilder::with_flags(&[("opt_level", "speed")], default_libcall_names()).map_err(module_error)
 }
 
-fn chunk_error(index: i64, message: impl Into<String>) -> super::worker_pool::ChunkOutcome {
-    super::worker_pool::ChunkOutcome {
+fn chunk_error(index: i64, message: impl Into<String>) -> aster_exec::worker_pool::ChunkOutcome {
+    aster_exec::worker_pool::ChunkOutcome {
         first_error: Some((index, BackendError::new(message))),
         #[cfg(feature = "aarm-telemetry")]
         telemetry: None,
@@ -696,7 +848,7 @@ fn invoke_body_scalar(
                     std::mem::transmute(pointer);
                 body(context, *value as u32);
             }
-            ExecutionValue::String(_) | ExecutionValue::Void => {}
+            ExecutionValue::String(_) | ExecutionValue::Transfer(_) | ExecutionValue::Void => {}
         }
     }
 }
@@ -820,7 +972,7 @@ fn invoke_binary_scalar(
                     ) -> $accumulator_native = unsafe { std::mem::transmute(pointer) };
                     function(context, $accumulator_value, *value as u32)
                 }
-                ExecutionValue::String(_) | ExecutionValue::Void => {
+                ExecutionValue::String(_) | ExecutionValue::Transfer(_) | ExecutionValue::Void => {
                     return Err(BackendError::new(
                         "Parallel.Reduce received a non-scalar element",
                     ));
@@ -852,7 +1004,7 @@ fn invoke_binary_scalar(
                 ))
             });
         }
-        ExecutionValue::String(_) | ExecutionValue::Void => {
+        ExecutionValue::String(_) | ExecutionValue::Transfer(_) | ExecutionValue::Void => {
             return Err(BackendError::new(
                 "Parallel.Reduce received a non-scalar accumulator",
             ));
@@ -860,6 +1012,47 @@ fn invoke_binary_scalar(
     };
     Ok(result)
 }
+
+/// One finalized program shared by the main thread, the async driver, and
+/// every worker of an execution. The JIT memory is freed once, when the last
+/// holder drops its `Arc`.
+pub(super) struct SharedProgram(PreparedProgram);
+
+impl SharedProgram {
+    pub(super) fn new(program: PreparedProgram) -> Arc<Self> {
+        Arc::new(Self(program))
+    }
+}
+
+impl std::ops::Deref for SharedProgram {
+    type Target = PreparedProgram;
+
+    fn deref(&self) -> &PreparedProgram {
+        &self.0
+    }
+}
+
+// SAFETY (audited for T-CONC-2; see docs/proposals/architecture-2026/07-tasks.md):
+// - After `finalize_definitions`, nothing reads or writes the `JITModule`
+//   through `&PreparedProgram`: it is touched only in `prepare` and `Drop`
+//   (its `RefCell` symbol table is the reason it is not `Sync` itself).
+//   Every `&self` method reads only the immutable `entries`/`task_entries`
+//   maps, whose raw pointers are addresses of finalized code.
+// - cranelift-jit 0.123 makes code pages read+execute and read-only data
+//   pages read-only at finalization (with a multi-thread pipeline flush), and
+//   this backend declares data only through `declare_anonymous_data(false,
+//   false)`: no writable data and no thread-local storage exist.
+// - Every invocation creates its own `ExecutionContext`; runtime entry
+//   points share no mutable state except atomics.
+// - Cross-thread publication happens through `Arc` passed to `thread::spawn`,
+//   which orders the finalized writes before any use on the worker.
+// - Drop runs once, on whichever thread releases the last `Arc`, after every
+//   invocation through it has returned; pool shutdown joins every worker.
+#[allow(unsafe_code)]
+unsafe impl Send for SharedProgram {}
+// SAFETY: see `Send` above; shared access is read-only.
+#[allow(unsafe_code)]
+unsafe impl Sync for SharedProgram {}
 
 impl Drop for PreparedProgram {
     fn drop(&mut self) {
@@ -900,8 +1093,15 @@ pub(super) fn execute_resolved(
             filesystem_backend,
         );
     }
+    let prepared = SharedProgram::new(prepared);
     let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let mut runtime = TaskRuntime::new(&Arc::new(module.clone()), worker_count)?;
+    let mut runtime = TaskRuntime::with_program(
+        &super::provider::provider(),
+        &Arc::new(module.clone()),
+        worker_count,
+        &Arc::new(aster_runtime::ForeignRegistry::new()),
+        Arc::<SharedProgram>::clone(&prepared),
+    )?;
     // SAFETY-relevant only in spirit: this is a plain pointer value, not a
     // live borrow held across the call. `runtime` is not read or written by
     // name again until after `invoke` returns, so nothing aliases it while
@@ -918,6 +1118,67 @@ pub(super) fn execute_resolved(
     )
 }
 
+/// Counterpart of [`execute_resolved`] for an entry declared
+/// `Main(string[] args)`: `arguments` becomes that `string[]`.
+pub(super) fn execute_resolved_with_arguments(
+    module: &mir::Module,
+    entry: &mir::Function,
+    arguments: &[String],
+    collect_stats: bool,
+    console_backend: Option<Box<dyn aster_runtime::ConsoleBackend>>,
+) -> Result<(ExecutionValue, super::MemoryStats), BackendError> {
+    let prepared = PreparedProgram::prepare(module)?;
+    if !module_uses_tasks(module) {
+        return prepared.invoke_with_arguments(
+            entry.symbol,
+            collect_stats,
+            None,
+            arguments,
+            console_backend,
+        );
+    }
+    let prepared = SharedProgram::new(prepared);
+    let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let mut runtime = TaskRuntime::with_program(
+        &super::provider::provider(),
+        &Arc::new(module.clone()),
+        worker_count,
+        &Arc::new(aster_runtime::ForeignRegistry::new()),
+        Arc::<SharedProgram>::clone(&prepared),
+    )?;
+    // Same pointer discipline as `execute_resolved`: `runtime` outlives the call.
+    let pointer = std::ptr::from_mut(&mut runtime).cast::<()>();
+    prepared.invoke_with_arguments(
+        entry.symbol,
+        collect_stats,
+        Some(pointer),
+        arguments,
+        console_backend,
+    )
+}
+
+pub(super) fn execute_resolved_with_worker_count(
+    module: &mir::Module,
+    entry: &mir::Function,
+    worker_count: usize,
+) -> Result<(ExecutionValue, super::MemoryStats), BackendError> {
+    let prepared = PreparedProgram::prepare(module)?;
+    if !module_uses_tasks(module) {
+        return prepared.invoke(entry.symbol, true, None, None, None);
+    }
+    let prepared = SharedProgram::new(prepared);
+    let mut runtime = TaskRuntime::with_program(
+        &super::provider::provider(),
+        &Arc::new(module.clone()),
+        worker_count,
+        &Arc::new(aster_runtime::ForeignRegistry::new()),
+        Arc::<SharedProgram>::clone(&prepared),
+    )?;
+    // Same pointer discipline as `execute_resolved`: `runtime` outlives the call.
+    let pointer = std::ptr::from_mut(&mut runtime).cast::<()>();
+    prepared.invoke(entry.symbol, true, Some(pointer), None, None)
+}
+
 pub(super) fn execute_resolved_with_foreign_registry(
     module: &mir::Module,
     entry: &mir::Function,
@@ -931,8 +1192,14 @@ pub(super) fn execute_resolved_with_foreign_registry(
     let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let module = Arc::new(module.clone());
     let foreign_registry = Arc::new(registry.clone());
-    let mut runtime =
-        TaskRuntime::new_with_foreign_registry(&module, worker_count, &foreign_registry)?;
+    let prepared = SharedProgram::new(prepared);
+    let mut runtime = TaskRuntime::with_program(
+        &super::provider::provider(),
+        &module,
+        worker_count,
+        &foreign_registry,
+        Arc::<SharedProgram>::clone(&prepared),
+    )?;
     let pointer = std::ptr::from_mut(&mut runtime).cast::<()>();
     prepared.invoke(entry.symbol, collect_stats, Some(pointer), None, None)
 }
@@ -947,7 +1214,11 @@ pub(super) fn execute_resolved_with_aarm_telemetry(
         return prepared.invoke_with_aarm_telemetry(entry.symbol, None);
     }
     let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let mut runtime = TaskRuntime::new(&Arc::new(module.clone()), worker_count)?;
+    let mut runtime = TaskRuntime::new(
+        &super::provider::provider(),
+        &Arc::new(module.clone()),
+        worker_count,
+    )?;
     let pointer = std::ptr::from_mut(&mut runtime).cast::<()>();
     prepared.invoke_with_aarm_telemetry(entry.symbol, Some(pointer))
 }
@@ -974,6 +1245,7 @@ pub(super) fn execute_resolved_with_aarm_parallel_governor(
             .map(|(value, telemetry)| (value, telemetry, Vec::new(), Vec::new()));
     }
     let mut runtime = TaskRuntime::with_memory_governor(
+        &super::provider::provider(),
         &Arc::new(module.clone()),
         worker_count,
         Arc::clone(&governor),
@@ -995,7 +1267,11 @@ pub(super) fn execute_resolved_with_aarm_parallel_workers(
     if !module_uses_tasks(module) {
         return prepared.invoke_with_aarm_telemetry(entry.symbol, None);
     }
-    let mut runtime = TaskRuntime::new(&Arc::new(module.clone()), worker_count)?;
+    let mut runtime = TaskRuntime::new(
+        &super::provider::provider(),
+        &Arc::new(module.clone()),
+        worker_count,
+    )?;
     let pointer = std::ptr::from_mut(&mut runtime).cast::<()>();
     prepared.invoke_with_aarm_telemetry(entry.symbol, Some(pointer))
 }
@@ -1031,6 +1307,7 @@ pub(super) fn execute_resolved_with_aarm_task_governor(
             .map(|(value, telemetry)| (value, telemetry, None));
     }
     let mut runtime = TaskRuntime::with_task_memory_governor(
+        &super::provider::provider(),
         &Arc::new(module.clone()),
         worker_count,
         Arc::clone(&governor),
@@ -1073,6 +1350,7 @@ pub(super) fn execute_resolved_with_aarm_async_governor(
             .map(|(value, telemetry)| (value, telemetry, None));
     }
     let mut runtime = TaskRuntime::with_async_memory_governor(
+        &super::provider::provider(),
         &Arc::new(module.clone()),
         worker_count,
         Arc::clone(&governor),
@@ -1095,73 +1373,54 @@ fn invoke_finalized(
     return_type: &mir::Type,
     context: &mut aster_runtime::ExecutionContext,
 ) -> Result<ExecutionValue, BackendError> {
+    invoke_finalized_with_arguments(pointer, return_type, None, context)
+}
+
+/// Like [`invoke_finalized`], for an entry declared `Main(string[] args)`:
+/// `arguments` is the host-allocated `string[]` passed as the one visible
+/// parameter after the hidden context. `None` calls the zero-parameter ABI.
+#[allow(unsafe_code)]
+fn invoke_finalized_with_arguments(
+    pointer: *const u8,
+    return_type: &mir::Type,
+    arguments: Option<*mut aster_runtime::AsterArray>,
+    context: &mut aster_runtime::ExecutionContext,
+) -> Result<ExecutionValue, BackendError> {
+    // SAFETY (all arms): the function was declared and finalized with the
+    // ABI selected here: `(context) -> native` without arguments, or
+    // `(context, array) -> native` when the entry takes `string[] args`.
+    macro_rules! call {
+        ($native:ty) => {{
+            match arguments {
+                None => {
+                    let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> $native =
+                        unsafe { std::mem::transmute(pointer) };
+                    function(context)
+                }
+                Some(array) => {
+                    let function: extern "C" fn(
+                        *mut aster_runtime::ExecutionContext,
+                        *mut aster_runtime::AsterArray,
+                    ) -> $native = unsafe { std::mem::transmute(pointer) };
+                    function(context, array)
+                }
+            }
+        }};
+    }
     let value = match return_type {
-        mir::Type::SByte => {
-            // SAFETY: The function was declared and finalized as `() -> i8` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> i8 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::SByte(function(context))
-        }
-        mir::Type::Byte => {
-            // SAFETY: The function was declared and finalized as `() -> i8` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> u8 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::Byte(function(context))
-        }
-        mir::Type::Short => {
-            // SAFETY: The function was declared and finalized as `() -> i16` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> i16 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::Short(function(context))
-        }
-        mir::Type::UShort => {
-            // SAFETY: The function was declared and finalized as `() -> i16` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> u16 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::UShort(function(context))
-        }
-        mir::Type::UInt => {
-            // SAFETY: The function was declared and finalized as `() -> i32` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> u32 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::UInt(function(context))
-        }
-        mir::Type::ULong => {
-            // SAFETY: The function was declared and finalized as `() -> i64` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> u64 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::ULong(function(context))
-        }
-        mir::Type::Int => {
-            // SAFETY: The function was declared and finalized as `() -> i32` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> i32 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::Int(function(context))
-        }
-        mir::Type::Long => {
-            // SAFETY: The function was declared and finalized as `() -> i64` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> i64 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::Long(function(context))
-        }
-        mir::Type::Float => {
-            // SAFETY: The function was declared and finalized as `() -> f32` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> f32 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::float(function(context))
-        }
-        mir::Type::Double => {
-            // SAFETY: The function was declared and finalized as `() -> f64` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> f64 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::double(function(context))
-        }
+        mir::Type::SByte => ExecutionValue::SByte(call!(i8)),
+        mir::Type::Byte => ExecutionValue::Byte(call!(u8)),
+        mir::Type::Short => ExecutionValue::Short(call!(i16)),
+        mir::Type::UShort => ExecutionValue::UShort(call!(u16)),
+        mir::Type::UInt => ExecutionValue::UInt(call!(u32)),
+        mir::Type::ULong => ExecutionValue::ULong(call!(u64)),
+        mir::Type::Int => ExecutionValue::Int(call!(i32)),
+        mir::Type::Long => ExecutionValue::Long(call!(i64)),
+        mir::Type::Float => ExecutionValue::float(call!(f32)),
+        mir::Type::Double => ExecutionValue::double(call!(f64)),
         mir::Type::Char => {
-            // SAFETY: The function was declared and finalized as `() -> i32` above,
-            // holding a Unicode scalar value.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> u32 =
-                unsafe { std::mem::transmute(pointer) };
-            let value = function(context);
+            // The function returns a Unicode scalar value as `i32`.
+            let value = call!(u32);
             let value = char::from_u32(value).ok_or_else(|| {
                 BackendError::new(format!(
                     "Aster function returned invalid Unicode scalar value U+{value:08X} as `char`"
@@ -1169,20 +1428,11 @@ fn invoke_finalized(
             })?;
             ExecutionValue::Char(value)
         }
-        mir::Type::Bool => {
-            // SAFETY: The function was declared and finalized as `() -> i8` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> u8 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::Bool(function(context) != 0)
-        }
+        mir::Type::Bool => ExecutionValue::Bool(call!(u8) != 0),
         mir::Type::String => {
-            // SAFETY: The function was declared and finalized as `() -> ptr`,
-            // where the pointer follows the runtime string ABI and stays valid
+            // The pointer follows the runtime string ABI and stays valid
             // while the JIT module is alive.
-            let function: extern "C" fn(
-                *mut aster_runtime::ExecutionContext,
-            ) -> *const aster_runtime::AsterStrHeader = unsafe { std::mem::transmute(pointer) };
-            let result = function(context);
+            let result = call!(*const aster_runtime::AsterStrHeader);
             // SAFETY: the returned pointer originates from this module's data
             // section; the module is still alive here and `decode_str` copies
             // the payload before the module can be dropped.
@@ -1195,27 +1445,45 @@ fn invoke_finalized(
             }
         }
         mir::Type::Void => {
-            // SAFETY: The function was declared and finalized as `() -> ()` above.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) =
-                unsafe { std::mem::transmute(pointer) };
-            function(context);
+            call!(());
             ExecutionValue::Void
         }
-        mir::Type::Task(_) => {
-            // SAFETY: The function was declared and finalized as `() -> i64`
-            // above (`Task<T>` is always a plain handle, never a pointer).
-            // `execute`/`execute_symbol` themselves never reach this arm
-            // (`validate_invocable_entry` rejects a `Task<T>` entry with a
-            // controlled error first); this stays defensive for any other
-            // caller of `PreparedProgram::invoke`, such as internal tests
-            // that call an async wrapper directly.
-            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> i64 =
-                unsafe { std::mem::transmute(pointer) };
-            ExecutionValue::Long(function(context))
-        }
+        // `Task<T>` is always a plain handle, never a pointer. `execute`/
+        // `execute_symbol` themselves never reach this arm
+        // (`validate_invocable_entry` rejects a `Task<T>` entry with a
+        // controlled error first); this stays defensive for any other
+        // caller of `PreparedProgram::invoke`, such as internal tests
+        // that call an async wrapper directly.
+        mir::Type::Task(_) => ExecutionValue::Long(call!(i64)),
         _ => unreachable!("entry return type was validated before code generation"),
     };
     Ok(value)
+}
+
+/// Run a task whose result crosses by deep copy: the trampoline writes the
+/// result image into a worker-local buffer, which is then serialized in the
+/// worker's context before that context is dropped (CONC-005).
+#[allow(unsafe_code)]
+fn invoke_deep_task(
+    pointer: *const u8,
+    shape: &aster_runtime::TransferShape,
+    payload: *const u64,
+    context: &mut aster_runtime::ExecutionContext,
+) -> Result<ExecutionValue, BackendError> {
+    let mut image = vec![0_u64; shape.image_size().div_ceil(8).max(1)];
+    // SAFETY: `pointer` names the generated `(context, payload, result_out)`
+    // trampoline of a deep-result target; `image` outlives the call.
+    let function: extern "C" fn(*mut aster_runtime::ExecutionContext, *const u64, *mut u64) =
+        unsafe { std::mem::transmute(pointer) };
+    function(context, payload, image.as_mut_ptr());
+    if context.has_failed() {
+        return Ok(ExecutionValue::Void);
+    }
+    // SAFETY: the trampoline left a value of exactly this shape in `image`.
+    let wire = unsafe { context.transfer_pack(shape, image.as_ptr().cast::<u8>()) }.map_err(
+        |message| BackendError::new(format!("task result cannot be transferred: {message}")),
+    )?;
+    Ok(ExecutionValue::Transfer(wire))
 }
 
 /// Invoke a generated parameterized-task trampoline. Validation guarantees a
@@ -1235,8 +1503,9 @@ fn invoke_task_finalized(
             let function: extern "C" fn(
                 *mut aster_runtime::ExecutionContext,
                 *const u64,
+                *mut u64,
             ) -> $native = unsafe { std::mem::transmute(pointer) };
-            function(context, payload)
+            function(context, payload, std::ptr::null_mut())
         }};
     }
     Ok(match return_type {
@@ -1299,6 +1568,10 @@ mod tests {
         mir::Module {
             structs: Vec::new(),
             classes: vec![mir::ClassDefinition {
+                base: None,
+                is_abstract: false,
+                is_sealed: false,
+                vtable: Vec::new(),
                 symbol: FINE_CLASS,
                 name: "FineBox".to_owned(),
                 fields: Vec::new(),
@@ -1578,7 +1851,9 @@ mod tests {
         assert_eq!(governor.telemetry().current_capacity_bytes, 0);
     }
 
+    // C5 removes owned regions: a failure leaves objects for the bulk domain release.
     #[test]
+    #[cfg(not(feature = "mem-exp-rc-core"))]
     fn generated_owned_region_runtime_failures_unwind_once_and_allow_context_reuse() {
         let cases = [
             (
@@ -1762,5 +2037,582 @@ mod tests {
         assert_sync::<mir::Module>();
         assert_send::<ExecutionValue>();
         assert_send::<crate::MemoryStats>();
+    }
+
+    const DESC_PLAIN: mir::SymbolId = mir::SymbolId(91_001);
+    const DESC_EMPTY: mir::SymbolId = mir::SymbolId(91_002);
+    const DESC_PAIR: mir::SymbolId = mir::SymbolId(91_003);
+    const DESC_FIELD: mir::SymbolId = mir::SymbolId(91_004);
+    const DESC_IFACE_A: mir::SymbolId = mir::SymbolId(91_010);
+    const DESC_IFACE_B: mir::SymbolId = mir::SymbolId(91_011);
+    const DESC_METHOD_A: mir::SymbolId = mir::SymbolId(91_012);
+    const DESC_METHOD_B: mir::SymbolId = mir::SymbolId(91_013);
+    const DESC_IMPL_A: mir::SymbolId = mir::SymbolId(91_014);
+    const DESC_IMPL_B: mir::SymbolId = mir::SymbolId(91_015);
+
+    fn descriptor_function(
+        symbol: mir::SymbolId,
+        return_type: mir::Type,
+        locals: Vec<mir::Local>,
+        instructions: Vec<mir::Instruction>,
+        result: Option<mir::Operand>,
+    ) -> mir::Function {
+        mir::Function {
+            constructor: false,
+            symbol,
+            owner: None,
+            name: format!("descriptor_{}", symbol.0),
+            visibility: mir::Visibility::Public,
+            parameters: Vec::new(),
+            locals,
+            return_type,
+            entry: FINE_BLOCK,
+            blocks: vec![mir::BasicBlock {
+                id: FINE_BLOCK,
+                instructions,
+                terminator: mir::Terminator::Return(result),
+            }],
+            temporary_subregion_candidates: Vec::new(),
+        }
+    }
+
+    /// Entry returning a freshly allocated persistent instance of `class`.
+    fn descriptor_maker(symbol: mir::SymbolId, class: mir::SymbolId) -> mir::Function {
+        let class_type = mir::Type::Class(class);
+        descriptor_function(
+            symbol,
+            class_type.clone(),
+            vec![fine_local(0, class_type.clone())],
+            vec![mir::Instruction::AllocateObject {
+                destination: mir::Place::Local(mir::LocalId(0)),
+                class,
+                region: mir::AllocationRegion::Persistent,
+            }],
+            Some(mir::Operand {
+                type_: class_type,
+                kind: mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(0))),
+            }),
+        )
+    }
+
+    fn descriptor_method(symbol: mir::SymbolId, owner: mir::SymbolId) -> mir::Function {
+        let mut function = descriptor_function(
+            symbol,
+            mir::Type::Int,
+            Vec::new(),
+            Vec::new(),
+            Some(fine_integer(7)),
+        );
+        function.owner = Some(owner);
+        function.parameters = vec![fine_local(0, mir::Type::Class(owner))];
+        function
+    }
+
+    fn descriptor_module() -> mir::Module {
+        let class = |symbol, name: &str, fields| mir::ClassDefinition {
+            base: None,
+            is_abstract: false,
+            is_sealed: false,
+            vtable: Vec::new(),
+            symbol,
+            name: name.to_owned(),
+            fields,
+        };
+        let interface = |symbol, name: &str, method| mir::InterfaceDefinition {
+            symbol,
+            name: name.to_owned(),
+            methods: vec![mir::InterfaceMethodDefinition {
+                symbol: method,
+                name: name.to_owned(),
+                parameters: Vec::new(),
+                return_type: mir::Type::Int,
+            }],
+        };
+        mir::Module {
+            structs: Vec::new(),
+            classes: vec![
+                class(
+                    DESC_PLAIN,
+                    "Counter",
+                    vec![mir::FieldDefinition {
+                        symbol: DESC_FIELD,
+                        name: "score".to_owned(),
+                        type_: mir::Type::Int,
+                    }],
+                ),
+                class(DESC_EMPTY, "Empty", Vec::new()),
+                class(DESC_PAIR, "Both", Vec::new()),
+            ],
+            interfaces: vec![
+                interface(DESC_IFACE_A, "IA", DESC_METHOD_A),
+                interface(DESC_IFACE_B, "IB", DESC_METHOD_B),
+            ],
+            enums: Vec::new(),
+            interface_implementations: vec![
+                mir::InterfaceImplementation {
+                    class: DESC_PAIR,
+                    interface: DESC_IFACE_A,
+                    methods: vec![DESC_IMPL_A],
+                },
+                mir::InterfaceImplementation {
+                    class: DESC_PAIR,
+                    interface: DESC_IFACE_B,
+                    methods: vec![DESC_IMPL_B],
+                },
+            ],
+            foreign_functions: Vec::new(),
+            functions: vec![
+                descriptor_maker(mir::SymbolId(91_100), DESC_PLAIN),
+                descriptor_maker(mir::SymbolId(91_101), DESC_EMPTY),
+                descriptor_maker(mir::SymbolId(91_102), DESC_PAIR),
+                descriptor_method(DESC_IMPL_A, DESC_PAIR),
+                descriptor_method(DESC_IMPL_B, DESC_PAIR),
+            ],
+        }
+    }
+
+    /// Allocates one instance through generated code and returns its header
+    /// word reinterpreted as a class descriptor.
+    #[allow(unsafe_code, clippy::cast_ptr_alignment)]
+    fn allocate_and_read_header(
+        prepared: &PreparedProgram,
+        maker: mir::SymbolId,
+        context: &mut aster_runtime::ExecutionContext,
+    ) -> *const aster_runtime::ClassDescriptor {
+        let (pointer, _) = prepared.entries.get(&maker).expect("maker was prepared");
+        // SAFETY: the maker was finalized as `(ExecutionContext*) -> object*`
+        // and the object lives in the persistent region of `context`.
+        let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> *const u8 =
+            unsafe { std::mem::transmute(*pointer) };
+        let object = function(context);
+        assert!(!object.is_null(), "allocation produced an object");
+        // SAFETY: offset 0 of every class instance holds the descriptor word.
+        unsafe {
+            object
+                .cast::<*const aster_runtime::ClassDescriptor>()
+                .read()
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn fresh_objects_point_at_their_class_descriptor_with_size_and_identity() {
+        let module = descriptor_module();
+        crate::validate(&module).expect("descriptor module is valid");
+        let prepared = PreparedProgram::prepare(&module).expect("descriptor module prepares");
+        let mut context = aster_runtime::ExecutionContext::new();
+
+        let plain = allocate_and_read_header(&prepared, mir::SymbolId(91_100), &mut context);
+        let empty = allocate_and_read_header(&prepared, mir::SymbolId(91_101), &mut context);
+        let plain_again = allocate_and_read_header(&prepared, mir::SymbolId(91_100), &mut context);
+
+        assert_eq!(
+            plain as u64,
+            prepared
+                .descriptors
+                .address(DESC_PLAIN)
+                .expect("descriptor")
+        );
+        assert_eq!(
+            empty as u64,
+            prepared
+                .descriptors
+                .address(DESC_EMPTY)
+                .expect("descriptor")
+        );
+        assert_eq!(
+            plain, plain_again,
+            "instances of one class share a descriptor"
+        );
+        assert_ne!(plain, empty, "distinct classes have distinct descriptors");
+        // SAFETY: both descriptors are owned by `prepared`, which is alive.
+        let (plain, empty) = unsafe { (&*plain, &*empty) };
+        let header = crate::layouts::OBJECT_HEADER_BYTES;
+        assert_eq!(plain.object.size, (header + 4).next_multiple_of(8));
+        assert_eq!(empty.object.size, header.next_multiple_of(8));
+        #[cfg(not(any(feature = "mem-exp-h12", feature = "mem-exp-h16")))]
+        {
+            assert_eq!(plain.object.size, 16, "Counter with one int field");
+            assert_eq!(empty.object.size, 8, "empty class is exactly the header");
+        }
+        assert_eq!(plain.class_id, mir::type_key(&mir::Type::Class(DESC_PLAIN)));
+        assert_eq!(empty.class_id, mir::type_key(&mir::Type::Class(DESC_EMPTY)));
+        assert_ne!(plain.class_id, empty.class_id);
+        assert_eq!(plain.interface_count, 0);
+        assert!(plain.interfaces.is_null());
+        #[cfg(not(feature = "mem-exp-rc-core"))]
+        {
+            assert_eq!(plain.object.reference_count, 0);
+            assert!(plain.object.reference_offsets.is_null());
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code, clippy::cast_ptr_alignment)]
+    fn class_descriptor_lists_every_implemented_interface_with_its_table() {
+        let module = descriptor_module();
+        crate::validate(&module).expect("descriptor module is valid");
+        let prepared = PreparedProgram::prepare(&module).expect("descriptor module prepares");
+        let mut context = aster_runtime::ExecutionContext::new();
+
+        let both = allocate_and_read_header(&prepared, mir::SymbolId(91_102), &mut context);
+        // SAFETY: the descriptor is owned by `prepared`, which is alive.
+        let both = unsafe { &*both };
+        // SAFETY: the backend filled `interface_count` entries before running.
+        let entries = unsafe { both.interface_entries() };
+
+        assert_eq!(both.interface_count, 2);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].interface_id,
+            mir::type_key(&mir::Type::Interface(DESC_IFACE_A))
+        );
+        assert_eq!(
+            entries[1].interface_id,
+            mir::type_key(&mir::Type::Interface(DESC_IFACE_B))
+        );
+        assert_ne!(entries[0].interface_id, entries[1].interface_id);
+        for (entry, method) in entries.iter().zip([DESC_IMPL_A, DESC_IMPL_B]) {
+            assert!(!entry.table.is_null(), "table address was bound");
+            let method_address = prepared.entries[&method].0;
+            // SAFETY: a table is an array of method addresses in finalized data.
+            let slot0 = unsafe { entry.table.cast::<*const u8>().read() };
+            assert_eq!(slot0, method_address, "slot 0 is the implementing method");
+        }
+        assert_ne!(entries[0].table, entries[1].table);
+    }
+
+    const VT_ABSTRACT: mir::SymbolId = mir::SymbolId(92_001);
+    const VT_CONCRETE: mir::SymbolId = mir::SymbolId(92_002);
+    const VT_ROOT: mir::SymbolId = mir::SymbolId(92_003);
+    const VT_IMPL: mir::SymbolId = mir::SymbolId(92_004);
+    const VT_RUN: mir::SymbolId = mir::SymbolId(92_005);
+
+    /// An abstract class with one abstract slot (`int Go(int)`), a concrete
+    /// class that implements it by returning 7, and an entry that allocates the
+    /// concrete class and calls the slot through the descriptor.
+    fn virtual_module() -> mir::Module {
+        let slot = |implementation| mir::VirtualSlot {
+            method: VT_ROOT,
+            name: "Go".to_owned(),
+            parameters: vec![mir::Type::Int],
+            return_type: mir::Type::Int,
+            implementation,
+        };
+        let class = |symbol, name: &str, base, is_abstract, vtable| mir::ClassDefinition {
+            symbol,
+            name: name.to_owned(),
+            base,
+            is_abstract,
+            is_sealed: false,
+            vtable,
+            fields: Vec::new(),
+        };
+        let mut implementation = descriptor_function(
+            VT_IMPL,
+            mir::Type::Int,
+            Vec::new(),
+            Vec::new(),
+            Some(fine_integer(7)),
+        );
+        implementation.owner = Some(VT_CONCRETE);
+        implementation.parameters = vec![
+            fine_local(0, mir::Type::Class(VT_CONCRETE)),
+            fine_local(1, mir::Type::Int),
+        ];
+        let concrete_type = mir::Type::Class(VT_CONCRETE);
+        let run = descriptor_function(
+            VT_RUN,
+            mir::Type::Int,
+            vec![
+                fine_local(0, concrete_type.clone()),
+                fine_local(1, mir::Type::Int),
+            ],
+            vec![
+                mir::Instruction::AllocateObject {
+                    destination: mir::Place::Local(mir::LocalId(0)),
+                    class: VT_CONCRETE,
+                    region: mir::AllocationRegion::Persistent,
+                },
+                mir::Instruction::CallVirtual {
+                    destination: Some(mir::Place::Local(mir::LocalId(1))),
+                    receiver: mir::Operand {
+                        type_: concrete_type,
+                        kind: mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(0))),
+                    },
+                    method: VT_ROOT,
+                    slot: 0,
+                    arguments: vec![fine_integer(3)],
+                    return_type: mir::Type::Int,
+                },
+            ],
+            Some(mir::Operand {
+                type_: mir::Type::Int,
+                kind: mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(1))),
+            }),
+        );
+        mir::Module {
+            structs: Vec::new(),
+            classes: vec![
+                class(VT_ABSTRACT, "Abstract", None, true, vec![slot(None)]),
+                class(
+                    VT_CONCRETE,
+                    "Concrete",
+                    Some(VT_ABSTRACT),
+                    false,
+                    vec![slot(Some(VT_IMPL))],
+                ),
+            ],
+            interfaces: Vec::new(),
+            enums: Vec::new(),
+            interface_implementations: Vec::new(),
+            foreign_functions: Vec::new(),
+            functions: vec![implementation, run],
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn a_virtual_call_in_hand_built_mir_runs_the_override_through_the_descriptor() {
+        let module = virtual_module();
+        crate::validate(&module).expect("virtual module is valid");
+        let prepared = PreparedProgram::prepare(&module).expect("virtual module prepares");
+        let mut context = aster_runtime::ExecutionContext::new();
+        let (pointer, _) = prepared.entries.get(&VT_RUN).expect("entry was prepared");
+        // SAFETY: the entry was finalized as `(ExecutionContext*) -> i32`.
+        let run: extern "C" fn(*mut aster_runtime::ExecutionContext) -> i32 =
+            unsafe { std::mem::transmute(*pointer) };
+        assert_eq!(run(&raw mut context), 7);
+        assert_eq!(context.take_error(), None);
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn descriptors_hold_the_vtable_and_an_abstract_slot_holds_a_stub_that_records_an_error() {
+        let module = virtual_module();
+        crate::validate(&module).expect("virtual module is valid");
+        let prepared = PreparedProgram::prepare(&module).expect("virtual module prepares");
+        let address = |class| {
+            let pointer = prepared
+                .descriptors
+                .address(class)
+                .expect("class has a descriptor");
+            // SAFETY: the descriptor is owned by `prepared`, which is alive.
+            unsafe { &*(pointer as *const aster_runtime::ClassDescriptor) }
+        };
+        let (abstract_class, concrete) = (address(VT_ABSTRACT), address(VT_CONCRETE));
+        assert_eq!((abstract_class.vtable_count, concrete.vtable_count), (1, 1));
+        // SAFETY: the backend filled both tables before any code ran.
+        let (abstract_entries, concrete_entries) =
+            unsafe { (abstract_class.vtable_entries(), concrete.vtable_entries()) };
+        // The concrete slot is its implementation; the abstract slot is a stub.
+        assert_eq!(concrete_entries[0], prepared.entries[&VT_IMPL].0);
+        assert!(!abstract_entries[0].is_null());
+        assert_ne!(abstract_entries[0], concrete_entries[0]);
+
+        // SAFETY: the stub has the slot signature `(context, this, int) -> int`.
+        let stub: extern "C" fn(*mut aster_runtime::ExecutionContext, *const u8, i32) -> i32 =
+            unsafe { std::mem::transmute(abstract_entries[0]) };
+        let mut context = aster_runtime::ExecutionContext::new();
+        assert_eq!(stub(&raw mut context, std::ptr::null(), 3), 0);
+        let error = context.take_error().expect("the stub records an error");
+        assert!(error.contains("abstract method"), "{error}");
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn a_class_without_virtual_members_has_an_empty_vtable() {
+        let module = descriptor_module();
+        crate::validate(&module).expect("descriptor module is valid");
+        let prepared = PreparedProgram::prepare(&module).expect("descriptor module prepares");
+        let pointer = prepared
+            .descriptors
+            .address(DESC_PLAIN)
+            .expect("class has a descriptor");
+        // SAFETY: the descriptor is owned by `prepared`, which is alive.
+        let descriptor = unsafe { &*(pointer as *const aster_runtime::ClassDescriptor) };
+        assert_eq!(descriptor.vtable_count, 0);
+        assert!(descriptor.vtable.is_null());
+    }
+
+    const LOOKUP_IFACE_C: mir::SymbolId = mir::SymbolId(91_016);
+    const LOOKUP_METHOD_C: mir::SymbolId = mir::SymbolId(91_017);
+    const LOOKUP_TEST_PAIR_A: mir::SymbolId = mir::SymbolId(91_200);
+    const LOOKUP_TEST_PAIR_B: mir::SymbolId = mir::SymbolId(91_201);
+    const LOOKUP_TEST_PAIR_C: mir::SymbolId = mir::SymbolId(91_202);
+    const LOOKUP_TEST_PLAIN_A: mir::SymbolId = mir::SymbolId(91_203);
+    const LOOKUP_PAIR_B: mir::SymbolId = mir::SymbolId(91_204);
+    const LOOKUP_PLAIN_A: mir::SymbolId = mir::SymbolId(91_205);
+
+    /// `bool Test() { Class o = new Class(); return o is Interface; }` in
+    /// hand-built MIR: an `InterfaceTest` on a class reference.
+    fn interface_test_entry(
+        symbol: mir::SymbolId,
+        class: mir::SymbolId,
+        interface: mir::SymbolId,
+    ) -> mir::Function {
+        let class_type = mir::Type::Class(class);
+        descriptor_function(
+            symbol,
+            mir::Type::Bool,
+            vec![
+                fine_local(0, class_type.clone()),
+                fine_local(1, mir::Type::Bool),
+            ],
+            vec![
+                mir::Instruction::AllocateObject {
+                    destination: mir::Place::Local(mir::LocalId(0)),
+                    class,
+                    region: mir::AllocationRegion::Persistent,
+                },
+                mir::Instruction::Assign {
+                    target: mir::Place::Local(mir::LocalId(1)),
+                    value: mir::Rvalue {
+                        type_: mir::Type::Bool,
+                        kind: mir::RvalueKind::InterfaceTest {
+                            object: mir::Operand {
+                                type_: class_type,
+                                kind: mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(0))),
+                            },
+                            interface,
+                        },
+                    },
+                },
+            ],
+            Some(mir::Operand {
+                type_: mir::Type::Bool,
+                kind: mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(1))),
+            }),
+        )
+    }
+
+    /// `int Lookup() { Class o = new Class(); Interface i = <lookup o>; return
+    /// i.Method(); }` in hand-built MIR: an `InterfaceLookup`, then a call
+    /// through the table it found.
+    fn interface_lookup_entry(
+        symbol: mir::SymbolId,
+        class: mir::SymbolId,
+        interface: mir::SymbolId,
+        method: mir::SymbolId,
+    ) -> mir::Function {
+        let class_type = mir::Type::Class(class);
+        let interface_type = mir::Type::Interface(interface);
+        descriptor_function(
+            symbol,
+            mir::Type::Int,
+            vec![
+                fine_local(0, class_type.clone()),
+                fine_local(1, interface_type.clone()),
+                fine_local(2, mir::Type::Int),
+            ],
+            vec![
+                mir::Instruction::AllocateObject {
+                    destination: mir::Place::Local(mir::LocalId(0)),
+                    class,
+                    region: mir::AllocationRegion::Persistent,
+                },
+                mir::Instruction::Assign {
+                    target: mir::Place::Local(mir::LocalId(1)),
+                    value: mir::Rvalue {
+                        type_: interface_type.clone(),
+                        kind: mir::RvalueKind::InterfaceLookup {
+                            object: mir::Operand {
+                                type_: class_type,
+                                kind: mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(0))),
+                            },
+                            interface,
+                        },
+                    },
+                },
+                mir::Instruction::CallInterface {
+                    destination: Some(mir::Place::Local(mir::LocalId(2))),
+                    receiver: mir::Operand {
+                        type_: interface_type,
+                        kind: mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(1))),
+                    },
+                    method,
+                    arguments: Vec::new(),
+                    return_type: mir::Type::Int,
+                },
+            ],
+            Some(mir::Operand {
+                type_: mir::Type::Int,
+                kind: mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(2))),
+            }),
+        )
+    }
+
+    /// The descriptor module plus a third interface that no class implements
+    /// and entries that test and look up interfaces through the descriptor.
+    fn lookup_module() -> mir::Module {
+        let mut module = descriptor_module();
+        module.interfaces.push(mir::InterfaceDefinition {
+            symbol: LOOKUP_IFACE_C,
+            name: "IC".to_owned(),
+            methods: vec![mir::InterfaceMethodDefinition {
+                symbol: LOOKUP_METHOD_C,
+                name: "IC".to_owned(),
+                parameters: Vec::new(),
+                return_type: mir::Type::Int,
+            }],
+        });
+        module.functions.extend([
+            interface_test_entry(LOOKUP_TEST_PAIR_A, DESC_PAIR, DESC_IFACE_A),
+            interface_test_entry(LOOKUP_TEST_PAIR_B, DESC_PAIR, DESC_IFACE_B),
+            interface_test_entry(LOOKUP_TEST_PAIR_C, DESC_PAIR, LOOKUP_IFACE_C),
+            interface_test_entry(LOOKUP_TEST_PLAIN_A, DESC_PLAIN, DESC_IFACE_A),
+            interface_lookup_entry(LOOKUP_PAIR_B, DESC_PAIR, DESC_IFACE_B, DESC_METHOD_B),
+            interface_lookup_entry(LOOKUP_PLAIN_A, DESC_PLAIN, DESC_IFACE_A, DESC_METHOD_A),
+        ]);
+        module
+    }
+
+    #[allow(unsafe_code)]
+    fn call_bool(prepared: &PreparedProgram, entry: mir::SymbolId) -> bool {
+        let mut context = aster_runtime::ExecutionContext::new();
+        let (pointer, _) = prepared.entries.get(&entry).expect("entry was prepared");
+        // SAFETY: the entry was finalized as `(ExecutionContext*) -> bool`.
+        let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> u8 =
+            unsafe { std::mem::transmute(*pointer) };
+        function(&raw mut context) & 1 == 1
+    }
+
+    #[test]
+    fn an_interface_test_searches_the_descriptor_list_in_bounds() {
+        let module = lookup_module();
+        crate::validate(&module).expect("lookup module is valid");
+        let prepared = PreparedProgram::prepare(&module).expect("lookup module prepares");
+        // The first entry, the second entry (the loop advances), an interface
+        // the class does not list, and a class whose list is empty and null.
+        assert!(call_bool(&prepared, LOOKUP_TEST_PAIR_A));
+        assert!(call_bool(&prepared, LOOKUP_TEST_PAIR_B));
+        assert!(!call_bool(&prepared, LOOKUP_TEST_PAIR_C));
+        assert!(!call_bool(&prepared, LOOKUP_TEST_PLAIN_A));
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn an_interface_lookup_finds_the_table_and_a_missing_one_is_a_controlled_error() {
+        let module = lookup_module();
+        crate::validate(&module).expect("lookup module is valid");
+        let prepared = PreparedProgram::prepare(&module).expect("lookup module prepares");
+        let call_int = |entry, context: &mut aster_runtime::ExecutionContext| {
+            let (pointer, _) = prepared.entries.get(&entry).expect("entry was prepared");
+            // SAFETY: the entry was finalized as `(ExecutionContext*) -> i32`.
+            let function: extern "C" fn(*mut aster_runtime::ExecutionContext) -> i32 =
+                unsafe { std::mem::transmute(*pointer) };
+            function(context)
+        };
+
+        let mut context = aster_runtime::ExecutionContext::new();
+        assert_eq!(call_int(LOOKUP_PAIR_B, &mut context), 7);
+        assert_eq!(context.take_error(), None);
+
+        // V7: the class has no table for the interface (hand-built MIR); no
+        // call goes through a missing table and an error is recorded instead.
+        let mut context = aster_runtime::ExecutionContext::new();
+        assert_eq!(call_int(LOOKUP_PLAIN_A, &mut context), 0);
+        let error = context.take_error().expect("a missing table is an error");
+        assert!(error.contains("no method table"), "{error}");
     }
 }

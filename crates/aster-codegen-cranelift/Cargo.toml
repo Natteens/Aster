@@ -8,12 +8,42 @@ repository.workspace = true
 description = "Cranelift JIT backend for Aster MIR"
 
 [features]
-aarm-telemetry = ["aster-runtime/aarm-telemetry", "dep:windows-sys"]
+aarm-telemetry = ["aster-runtime/aarm-telemetry", "aster-exec/aarm-telemetry", "dep:windows-sys"]
+# Class objects carry an 8-byte header (H8) whose offset-0 word points at the
+# class descriptor; this is the default layout. The features below are
+# MEM-EXP-1 experiment overrides (mutually exclusive) that widen the header to
+# 12 or 16 bytes.
+mem-exp-h12 = []
+mem-exp-h16 = []
+# MEM-EXP-1 configuration C4: H12 header plus the size-class heap.
+mem-exp-c4 = ["mem-exp-h12", "mem-exp-heap"]
+# Size-class heap, independent of the header choice.
+mem-exp-heap = ["aster-runtime/mem-exp-heap"]
+# Counting machinery (ownership pass, validator, lowering), independent of the
+# header choice. Not a configuration by itself: select C5, C6, or C6-H16.
+mem-exp-rc-core = ["mem-exp-heap", "aster-runtime/mem-exp-rc"]
+# Retain/release elision on top of the counting machinery.
+mem-exp-elide = ["mem-exp-rc-core"]
+# MEM-EXP-1 configuration C5: C4 plus naive reference counting.
+mem-exp-c5 = ["mem-exp-c4", "mem-exp-rc-core"]
+# MEM-EXP-1 configuration C6: C5 plus retain/release elision.
+mem-exp-c6 = ["mem-exp-c5", "mem-exp-elide"]
+# MEM-EXP-1 configuration C6 with the H16 header, for the H16 side of the gates.
+mem-exp-c6-h16 = ["mem-exp-h16", "mem-exp-elide"]
 
 [[example]]
 name = "aarm_memory_matrix"
 path = "examples/aarm_memory_matrix.rs"
 required-features = ["aarm-telemetry"]
+
+[[example]]
+name = "mem_exp_pass_time"
+path = "examples/mem_exp_pass_time.rs"
+
+[[example]]
+name = "mem_exp_counts"
+path = "examples/mem_exp_counts.rs"
+required-features = ["mem-exp-rc-core"]
 
 [[example]]
 name = "aarm_iteration_loop"
@@ -55,6 +85,7 @@ path = "examples/array_loop_matrix.rs"
 required-features = ["aarm-telemetry"]
 
 [dependencies]
+aster-exec = { path = "../aster-exec", version = "0.71.0" }
 aster-mir = { path = "../aster-mir", version = "0.71.0" }
 aster-runtime = { path = "../aster-runtime", version = "0.71.0" }
 aster-types = { path = "../aster-types", version = "0.71.0" }

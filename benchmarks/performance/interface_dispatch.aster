@@ -1,0 +1,86 @@
+// Interface dispatch over a heterogeneous list of three implementations.
+
+public interface IShape
+{
+    int Area(int scale);
+}
+
+public class Square : IShape
+{
+    private int side;
+
+    public Square(int side)
+    {
+        this.side = side;
+    }
+
+    public int Area(int scale)
+    {
+        return side * side * scale;
+    }
+}
+
+public class Rectangle : IShape
+{
+    private int width;
+    private int height;
+
+    public Rectangle(int width, int height)
+    {
+        this.width = width;
+        this.height = height;
+    }
+
+    public int Area(int scale)
+    {
+        return width * height * scale;
+    }
+}
+
+public class Triangle : IShape
+{
+    private int width;
+    private int height;
+
+    public Triangle(int width, int height)
+    {
+        this.width = width;
+        this.height = height;
+    }
+
+    public int Area(int scale)
+    {
+        return width * height * scale / 2;
+    }
+}
+
+public long Run()
+{
+    List<IShape> shapes = new List<IShape>();
+    for (int index = 0; index < 30; index++)
+    {
+        int kind = index % 3;
+        if (kind == 0)
+        {
+            shapes.Add(new Square(index % 5 + 1));
+        }
+        else if (kind == 1)
+        {
+            shapes.Add(new Rectangle(index % 4 + 1, index % 6 + 1));
+        }
+        else
+        {
+            shapes.Add(new Triangle(index % 7 + 2, index % 3 + 2));
+        }
+    }
+    long total = 0L;
+    for (int round = 0; round < 10000; round++)
+    {
+        int scale = round % 4 + 1;
+        foreach (IShape shape in shapes)
+        {
+            total = total + (long)shape.Area(scale);
+        }
+    }
+    return total;
+}

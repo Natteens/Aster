@@ -49,11 +49,13 @@ These were approved by the maintainer and are inputs to this proposal.
 
 Verified in the repository at the baseline:
 
-- Objects are headerless. `aster_rt_object_new(context, size)` returns zeroed storage owned by the
-  `ExecutionContext`; no type identity exists at run time.
+- Objects before stage 2 were headerless. `aster_rt_object_new(context, size)` returns zeroed storage
+  owned by the `ExecutionContext`. Stage 2 (implemented) gives every class instance an 8-byte header
+  whose offset-0 word points at an immutable class descriptor. Pull request 1 (T-OBJ-2, single
+  inheritance) is implemented: see the delivery note below section 11.
 - `mir::Type::Class(SymbolId)` is an exact type. MIR has no subtype relation.
 - Class layout is computed as a struct: fields in declaration order with natural alignment
-  (`layouts.rs`). A class with no fields occupies one byte.
+  (`layouts.rs`), after the 8-byte header; a class with no fields occupies exactly the header (8 bytes).
 - An interface value is two pointers: the object and a table. `MakeInterface { object, class,
   interface }` selects the table at compile time from the pair `(class, interface)`, and
   `CallInterface` calls through it.
@@ -71,11 +73,15 @@ Verified in the repository at the baseline:
 
 ### 4.1 Header and offsets
 
-`P` is the pointer size of the target (8 on a 64-bit host). Layout is computed with checked 32-bit
-arithmetic; an overflow is a controlled error. The rules, for a class `C` with optional base `B`:
+`P` is the pointer size of the target (8 on a 64-bit host). `H` is the header size, a named
+constant of the layout code. **`H = P`** (the H8 header on a 64-bit host): closure Q-OBJ-1 reserved
+a count word after the descriptor pointer (H12 or H16) only if reference counting were adopted, and
+MEM-EXP-1 rejected counting ([report](../proposals/architecture-2026/09-mem-exp-1-report.md)).
+Layout is computed with checked 32-bit arithmetic; an overflow is a controlled error. The rules, for
+a class `C` with optional base `B`:
 
-1. **Header.** Offset `0` holds the descriptor pointer: `P` bytes, aligned to `P`.
-2. **Start of the fields.** For a class with no base, the first field is placed at `align_up(P, field
+1. **Header.** Offset `0` holds the descriptor pointer: `H` bytes, aligned to `P`.
+2. **Start of the fields.** For a class with no base, the first field is placed at `align_up(H, field
    alignment)`. For a class with a base, the first own field is placed at `align_up(size(B), field
    alignment)`, where `size(B)` is the **complete** size of `B` including its tail padding. A derived
    field never occupies the tail padding of a base: the derived layout begins where the complete base
@@ -85,7 +91,7 @@ arithmetic; an overflow is a controlled error. The rules, for a class `C` with o
    today.
 4. **Alignment.** `align(C) = max(P, align(B), the alignment of every own field)`.
 5. **Size.** `size(C) = align_up(end of the last field, align(C))`.
-6. **Empty classes.** A class with no fields and no base has `size = P` and `align = P`; the header is
+6. **Empty classes.** A class with no fields and no base has `size = H` and `align = P`; the header is
    all of it. This replaces the current one-byte size of a field-less class. A derived class with no own
    fields has `size(D) = size(B)` and `align(D) = align(B)`.
 7. **Preservation.** Every field inherited from `B` keeps in `D` exactly the offset and size it has in
@@ -359,6 +365,32 @@ The `==` and `!=` operators keep comparing identity across all of these conversi
 | U9 | `virtual`/`override`/`abstract` on properties | methods only; properties as accessors | methods only in B1 |
 | U10 | Re-listing a base's interface in a derived class | error; C#-style re-implementation | error |
 
+### 10.1 Answers recorded by the architecture closure (2026-11)
+
+The 2026 architecture closure ([decision closure](../proposals/architecture-2026/06-decision-closure.md),
+[master plan §6](../proposals/architecture-2026/02-master-plan.md)) answered the open points. The
+contracts stay **PROPOSED** until the pull request that implements each part lands.
+
+| Point | Answer | Note |
+| --- | --- | --- |
+| U1 | Rule B (this-confinement of 6.3) | C may be added later |
+| U2 | C# order | 6.1 unchanged |
+| U3 | Search the descriptor's interface list | An indexed table only if measured at least 5% faster on `interface_dispatch` through a base type (OBJ-004) |
+| U4 | `value is Derived d` is the primary form; `value as Derived` yields `Option<Derived>` | The `T?` spelling depends on LANG-003 and is not assumed |
+| U5 | `base` is reserved | No identifier named `base` exists in the repository |
+| U6 | Uniform header | Required by the storage-class argument of the master plan |
+| U7 | Closed generic bases arrive with the generics-in-hierarchies step (OBJ-006) | Not in the first base-class PR |
+| U8 | Exact signatures; no `sealed override` | |
+| U9 | `virtual`/`override`/`abstract` on methods **and property accessors** (Q-OBJ-2) | Differs from this record's own recommendation. A virtual property on `this` inside a constructor is rejected like N11; P8 stays valid for non-virtual properties only |
+| U10 | Error | |
+| Header | `H = P` (H8) | Q-OBJ-1 after MEM-EXP-1 FAIL; T-MEM-2 merges this header |
+
+Amendments from the closure that do not change a contract here: the descriptor may gain fields
+(nothing is removed); descriptors are immortal module data in production and AOT, and live in
+session-stable storage in the development profile (HOT-002); class references stay
+non-transferable; a lambda that captures `this` inside a constructor is a new negative case; `sealed`
+does not make a hierarchy closed (exhaustive `switch` applies to enums only).
+
 ## 11. Stages, authorization and the sequence of pull requests
 
 Design acceptance, experimental implementation, performance validation and authorization are separate
@@ -384,6 +416,73 @@ authorization. No public page describes inheritance before the pull request that
 5. **Generics in hierarchies**, in the order of section 8 (including U7 if it was left out).
 
 Constructor overloads and `this(...)` (B2) are independent and not part of this sequence.
+
+**Delivery note, pull request 1 (T-OBJ-2).** Implemented: class bases (abstract or not; closed and
+fully specialized only, so `class D : Box<int>` works and an open base is rejected, which settles U7
+for this step), the 4.1 layout with inherited offsets preserved and independently recomputed by the
+backend layout validation (V1, V5), `Upcast` in HIR and MIR (validated: only along the declared
+chain), `base(...)` and the C# construction order of 6.1, `protected`, the rule B this-confinement of
+6.3 with `Reads(M)` (N10, N12, N13, N20 to N22), `abstract`/`sealed` classes, reserved `base` (U5), and
+the descriptor base pointer, depth and ancestors array of 4.2 (V3, V4). Cases covered: P2, P3, P6, P8,
+P9, P10 to P15 and N1, N4 to N6, N8 to N10, N12 to N18, N20 to N22; N2, N3 and N7 were rejected with a
+"not supported yet" diagnostic because they need `virtual`/`override`/`abstract` members (pull request
+2 lifts that; see its delivery note). An interface conversion from a derived class reuses the static table of the converted class,
+which was exact while no member was virtual (pull request 2 replaces it for virtual implementations; the
+dynamic lookup is pull request 3). Local object elimination skips every class that has a base. Not
+implemented in that step: virtual dispatch (pull request 2), downcast, open bases.
+
+**Delivery note, pull request 2 (T-OBJ-3).** Implemented: `virtual`, `override` and `abstract` on
+methods and on property accessors (U9 as answered by Q-OBJ-2: an override may declare one accessor
+but cannot add one), `base.Method(...)`, `base.Property` and `base.Property = value` as static calls
+to the base implementation, exact override signatures (U8) with `sealed override` rejected, abstract
+members only in abstract classes and an error for a concrete class that leaves one unimplemented, and
+the 4.2 virtual table: one slot per introduced virtual member, overrides reusing the slot, the table
+of a class beginning with its base class's table. A virtual call loads the descriptor from the object
+header, the function from its table (`CallVirtual` in MIR, a compile-time slot index checked against
+the receiver class's table, V8) and calls it indirectly. The descriptor gained `vtable` and
+`vtable_count`, filled after the JIT module is finalized and owned through `RawOwned` like the other
+descriptor arrays. An abstract slot holds a generated stub that records a controlled runtime error
+(unreachable from valid source: no abstract class is instantiated and a concrete class has no abstract
+slot). MIR validation rejects a table shorter than its base's, an inherited slot with another
+introducing method or signature, an override not declared by the class or with another signature, a
+re-abstracted slot and an abstract slot in a concrete class; the backend rechecks the filled tables
+against the MIR. A virtual, abstract or overriding member called on `this`, or a virtual property read
+or written on `this`, inside a constructor is rejected (N11, Q-OBJ-2), and a helper that does so is
+not this-confined (N12). A virtual call is an escape of its receiver for escape analysis, the
+lifetime and ownership analyses treat every implementation of the slot as a possible callee, and
+local object elimination never removes an object that receives one. An interface implemented through
+a virtual method is exact for a base-typed static class: the interface entry of every non-sealed class
+whose implementing method is virtual is a generated function that performs the virtual call, so
+`IScore s = baseRef` runs the dynamic override (a sealed class points at its own implementation). The
+interface lookup from the dynamic type of a base-typed value is still pull request 3. Cases covered
+in addition to those of pull request 1: P1, P4, P5, P7 and N2, N3, N7, N11, with the virtual parts of
+N12 and N17 and V8 and the V-style table invariants. Not implemented: downcast, interface lookup from
+the dynamic type, open bases, devirtualization.
+
+**Delivery note, pull requests 3 and 4 (T-OBJ-4).** Implemented: the dynamic interface lookup and the
+checked downcast. `value is IShape s` and `value is IShape` search the object descriptor's interface
+list (U3, a linear search bounded by `interface_count`, comparing `interface_id`; the binding is an
+interface value, the table being assigned only on the path where the test succeeded). `value is Derived`
+also accepts an interface-typed subject (the object half is tested, bound as the class) and an interface
+target on an interface subject. `value as T` (U4; the `T?` spelling is not assumed) yields the official
+`Option<T>` for class and interface targets and is lowered in HIR as `value is T t ? Some(t) : None`
+over a compiler-introduced binding; an impossible `as` (unrelated classes, or a `sealed` class that
+cannot implement the interface) is an error and a statically trivial one is allowed. MIR gained the
+backend-neutral `InterfaceTest { object, interface }` (a `bool`) and `InterfaceLookup { object,
+interface }` (an interface value), both over a class reference or an interface value and validated in
+`aster-mir` and again by the backend; `Downcast` and `ClassTest` accept an interface-typed operand.
+Code generation emits a bounded loop over `interface_count` (nothing is read at or beyond it, a null
+object or a null list ends the search, a found null table counts as missing); a lookup that finds no
+table records a controlled run-time error and takes the failure path, without calling through anything
+(V7). The implicit conversion keeps the compile-time table: the static rule of section 7 plus the
+per-class virtual thunks of pull request 2 already make that table run the most-derived override, so
+no implicit conversion needs the lookup, and `Base` to `IFoo` when only `Derived` implements it remains
+N9. Experiment OBJ-U3 (an indexed table, adopted only if at least 5 percent faster on
+`interface_dispatch` through a base type, OBJ-004) was not run; the search is the shipped mechanism and
+no index exists. Cases covered in addition to the earlier pull requests: P5 through a dynamic lookup,
+N8 for `as`, N9 retained, V4 (the class test of pull request 1) and V7; V6 is not extended by this
+step. Not implemented: `T?`, unwrapping an `Option` with `is`, generics in hierarchies (pull request 5),
+and the C6 experiment decision (C0 stays the default).
 
 ## 12. Statements to supersede on acceptance
 

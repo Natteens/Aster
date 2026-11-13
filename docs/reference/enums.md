@@ -79,6 +79,7 @@ switch (message)
 }
 ```
 
-Both forms work only with enums. General pattern matching, guards, combined cases, numeric/string
-switches, explicit discriminants, enum methods,
-and recursive value layouts are not implemented.
+Enum cases are matched by name. Integer, `char` and `string` values can also be switched on with
+constant labels and a mandatory `default`; see
+[Control flow](../specification/06-control-flow.md), which also describes `when` guards. General
+pattern matching, combined cases, explicit discriminants, enum methods, and recursive value layouts are not implemented.

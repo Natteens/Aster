@@ -37,7 +37,7 @@ jobs:
           key: windows-verify
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --features aster-codegen-cranelift/aarm-telemetry -- -D warnings
 
       - name: Run tests
         run: cargo test --workspace --all-targets

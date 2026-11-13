@@ -59,7 +59,7 @@ aster check
 aster run
 ```
 
-The generated program prints `Hello from ASTER!` and returns `0`.
+The generated program prints `Hello from ASTER!` and exits with status `0`.
 
 ## A small ASTER program
 
@@ -95,7 +95,8 @@ The [language tour](docs/language-tour.md) introduces these features through cod
 ## Current limits
 
 ASTER currently distributes native toolchains for Windows x64 and Linux x64. macOS and ARM are not
-official targets. There is no package manager or standalone AOT compiler yet, and the worker model
+official targets. There is no package registry or standalone AOT compiler yet (dependencies are local paths or
+pinned Git repositories), and the worker model
 does not provide general shared-memory threads.
 
 See the [roadmap](docs/roadmap.md) for planned work and research boundaries.

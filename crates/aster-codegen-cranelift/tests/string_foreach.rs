@@ -992,7 +992,7 @@ fn list_version_mismatch_still_fails_deterministically() {
 }
 
 #[test]
-fn workers_still_reject_a_string_crossing_a_worker_boundary() {
+fn workers_copy_a_string_crossing_a_worker_boundary() {
     let errors = compile_errors(
         r#"
         public string Make() { return "hi"; }
@@ -1003,10 +1003,8 @@ fn workers_still_reject_a_string_crossing_a_worker_boundary() {
         "#,
     );
     assert!(
-        errors
-            .iter()
-            .any(|message| message.contains("cross a worker boundary")),
-        "foreach must not have changed string worker-transferability, got {errors:?}"
+        errors.is_empty(),
+        "strings cross a worker boundary by copy, got {errors:?}"
     );
 }
 

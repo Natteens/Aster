@@ -35,6 +35,10 @@ pub enum ExpressionKind {
     Literal(Literal),
     Name(String),
     This,
+    /// `base`, valid only as the receiver of a member access or call
+    /// (`base.Name`, `base.Name(...)`): a non-virtual use of the base class's
+    /// member on `this`.
+    Base,
     StructLiteral {
         type_name: String,
         fields: Vec<FieldInitializer>,
@@ -49,6 +53,13 @@ pub enum ExpressionKind {
         /// one exact constructible expected type before HIR lowering.
         type_name: Option<String>,
         arguments: Vec<Argument>,
+    },
+    /// `new T(args) { A = e1, B = e2 }`: the construction `creation` (always a
+    /// `NewObject`) followed by member assignments in source order. The
+    /// object is not observable until every assignment has completed.
+    ObjectInitializer {
+        creation: Box<Expression>,
+        members: Vec<MemberInitializer>,
     },
     Index {
         array: Box<Expression>,
@@ -94,6 +105,24 @@ pub enum ExpressionKind {
         cases: Vec<SwitchExpressionCase>,
         default: Option<Box<Expression>>,
     },
+    /// Type pattern: `value is Type` or `value is Type name`. A boolean
+    /// expression; the optional binding is definitely assigned where the test
+    /// is known to have succeeded.
+    TypePattern {
+        value: Box<Expression>,
+        // Boxed so this variant does not enlarge every `Expression` (the
+        // recursive-descent parser's stack frames scale with its size).
+        target: Box<super::TypeRef>,
+        binding: Option<Box<PatternBinding>>,
+    },
+    /// Checked narrowing: `value as Type`. Yields an `Option<Type>` that is
+    /// `Some` where the run-time type of `value` matches `Type` and `None`
+    /// otherwise.
+    TypeAs {
+        value: Box<Expression>,
+        // Boxed like `TypePattern::target` to keep `Expression` small.
+        target: Box<super::TypeRef>,
+    },
     /// Explicit conversion: `(type)expression`.
     Cast {
         target: super::TypeRef,
@@ -115,11 +144,23 @@ pub enum ExpressionKind {
     },
 }
 
+/// The variable declared by a type pattern: `name` in `value is Type name`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PatternBinding {
+    pub name: String,
+    pub span: Span,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SwitchExpressionCase {
     pub enum_name: Option<String>,
     pub case_name: String,
     pub bindings: Vec<String>,
+    /// See `SwitchCase::label`.
+    pub label: Option<Expression>,
+    /// `when` guard: the arm is selected only when the pattern matches and
+    /// the guard is true; otherwise matching continues with later arms.
+    pub guard: Option<Expression>,
     pub value: Expression,
     pub span: Span,
 }
@@ -130,6 +171,15 @@ pub enum InterpolatedPart {
     Text(String),
     /// An embedded expression, parsed with the ordinary expression grammar.
     Expression(Expression),
+}
+
+/// One `Name = value` entry of an object initializer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemberInitializer {
+    pub name: String,
+    pub name_span: Span,
+    pub value: Expression,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -205,6 +255,7 @@ pub enum AssignmentOperator {
     SubtractAssign,
     MultiplyAssign,
     DivideAssign,
+    RemainderAssign,
     BitwiseAndAssign,
     BitwiseOrAssign,
     BitwiseXorAssign,

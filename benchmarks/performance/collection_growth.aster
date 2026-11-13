@@ -1,0 +1,32 @@
+// Collection growth: a list and a dictionary grow from empty in every round.
+// `RunLong` performs 10x rounds.
+
+internal long Grow(int rounds)
+{
+    long total = 0L;
+    for (int round = 0; round < rounds; round++)
+    {
+        List<int> values = new List<int>();
+        for (int index = 0; index < 1024; index++)
+        {
+            values.Add(index ^ round);
+        }
+        Dictionary<int, int> lookup = new Dictionary<int, int>();
+        for (int key = 0; key < 256; key++)
+        {
+            lookup.Set(key, values[key * 4]);
+        }
+        total = total + (long)values.Length + (long)lookup.GetOr(round % 256, 0);
+    }
+    return total;
+}
+
+public long Run()
+{
+    return Grow(50);
+}
+
+public long RunLong()
+{
+    return Grow(500);
+}

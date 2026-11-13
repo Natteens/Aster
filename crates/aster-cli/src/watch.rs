@@ -152,7 +152,7 @@ fn build_and_run(
     let execution_started = Instant::now();
     let dependencies = Some(watched_paths(&project));
     if let Ok((value, entry_name, _stats)) =
-        crate::execute_project(&project, Path::new(file_name), function_name)
+        crate::execute_project(&project, Path::new(file_name), function_name, &[])
     {
         let execution_time = execution_started.elapsed();
         println!(

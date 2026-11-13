@@ -1,6 +1,6 @@
 use super::{
-    Analyzer, Argument, Callable, Diagnostic, Dispatch, Expression, ExpressionKind, HashSet, Model,
-    Primitive, ResolvedArguments, ResolvedCall, ResolvedDefaultArgument,
+    Analyzer, Argument, Callable, Diagnostic, Dispatch, Expression, ExpressionKind, HashSet,
+    MemberDispatch, Model, Primitive, ResolvedArguments, ResolvedCall, ResolvedDefaultArgument,
     ResolvedDictionaryOperation, ResolvedEnumCase, ResolvedParallelFor, ResolvedParallelForEach,
     ResolvedParallelReduce, ResolvedStringBuilderOperation, ResolvedTaskRun, Signature, Span, Type,
     TypeKind, TypeRef, Visibility, resolve_type_readonly,
@@ -88,7 +88,20 @@ impl Analyzer<'_> {
             }
             return Type::Unknown;
         }
-        let Some(signature) = info.constructor.clone() else {
+        if info.is_abstract {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!("abstract class `{type_name}` cannot be instantiated"),
+                    span,
+                )
+                .with_help("create an instance of a concrete class derived from it"),
+            );
+            for argument in arguments {
+                self.expression(argument);
+            }
+            return Type::Class(type_name.to_owned());
+        }
+        if info.constructors.is_empty() {
             self.diagnostics.push(
                 Diagnostic::error(format!("class `{type_name}` has no constructor"), span)
                     .with_help(format!("declare `{type_name}(...)` inside the class")),
@@ -97,14 +110,36 @@ impl Analyzer<'_> {
                 self.expression(argument);
             }
             return Type::Class(type_name.to_owned());
-        };
-        if info.constructor_visibility == Some(Visibility::Private)
-            && self.owner.as_deref() != Some(type_name)
-        {
-            self.diagnostics.push(Diagnostic::error(
-                format!("constructor `{type_name}` is private"),
-                span,
-            ));
+        }
+        // Only constructors the call site may use are candidates. When none is
+        // accessible the error names the strictest visibility.
+        let inside = self.owner.as_deref() == Some(type_name);
+        let accessible = info
+            .constructors
+            .iter()
+            .filter(|constructor| inside || constructor.visibility == Visibility::Public)
+            .cloned()
+            .collect::<Vec<_>>();
+        if accessible.is_empty() {
+            let all_protected = info
+                .constructors
+                .iter()
+                .all(|constructor| constructor.visibility == Visibility::Protected);
+            if all_protected {
+                self.diagnostics.push(
+                    Diagnostic::error(format!("constructor `{type_name}` is protected"), span)
+                        .with_help("a protected constructor is reached only through `base(...)` from a derived class"),
+                );
+            } else {
+                self.diagnostics.push(Diagnostic::error(
+                    format!("constructor `{type_name}` is private"),
+                    span,
+                ));
+            }
+            for argument in arguments {
+                self.expression(argument);
+            }
+            return Type::Class(type_name.to_owned());
         }
         let argument_types = arguments
             .iter()
@@ -116,13 +151,9 @@ impl Analyzer<'_> {
                 }
             })
             .collect::<Vec<_>>();
-        if let Some((signature, plan)) = self.resolve_call_overload(
-            type_name,
-            std::slice::from_ref(&signature),
-            &argument_types,
-            arguments,
-            span,
-        ) {
+        if let Some((signature, plan)) =
+            self.resolve_call_overload(type_name, &accessible, &argument_types, arguments, span)
+        {
             let key = self.model_key(span);
             self.model.constructors.insert(key.clone(), signature.key);
             self.model.call_arguments.insert(key, plan);
@@ -146,6 +177,7 @@ impl Analyzer<'_> {
                     .with_help("assign a value before reading the variable"),
                 );
             }
+            self.note_this_field_read(name);
             binding.type_
         } else if self.instance_context
             && let Some(owner) = &self.owner
@@ -162,10 +194,23 @@ impl Analyzer<'_> {
                 ));
                 return Type::Unknown;
             };
-            self.model
-                .property_reads
-                .insert(self.model_key(span), getter.key.clone());
-            property.type_.clone()
+            let key = getter.key.clone();
+            let type_ = property.type_.clone();
+            let direct = property.direct_backing().map(str::to_owned);
+            let declared_here = property.declared_in == *owner;
+            let property_name = name.to_owned();
+            if let Some(backing) = direct {
+                self.model
+                    .auto_property_fields
+                    .insert(self.model_key(span), backing.clone());
+                self.note_auto_property_read(&backing, declared_here, &key, &property_name, span);
+            } else {
+                self.model
+                    .property_reads
+                    .insert(self.model_key(span), key.clone());
+                self.note_this_call(&key, span);
+            }
+            type_
         } else if !self.instance_context
             && let Some(owner) = self.owner.clone()
             && let Some(info) = self.context.types.get(&owner)
@@ -176,11 +221,16 @@ impl Analyzer<'_> {
             } else {
                 "property"
             };
+            let context = if self.base_arguments && self.chain_label == "this" {
+                "the arguments of `this(...)`"
+            } else if self.base_arguments {
+                "the arguments of `base(...)`"
+            } else {
+                "a static context"
+            };
             self.diagnostics.push(
                 Diagnostic::error(
-                    format!(
-                        "instance {member_kind} `{name}` cannot be used in a static context"
-                    ),
+                    format!("instance {member_kind} `{name}` cannot be used in {context}"),
                     span,
                 )
                 .with_help(format!(
@@ -189,6 +239,11 @@ impl Analyzer<'_> {
             );
             Type::Unknown
         } else {
+            if let Some(owner) = self.owner.clone()
+                && self.report_hidden_private(&owner, name, "member", span)
+            {
+                return Type::Unknown;
+            }
             self.diagnostics.push(
                 Diagnostic::error(format!("unknown name `{name}`"), span)
                     .with_help("declare the name before using it"),
@@ -235,7 +290,9 @@ impl Analyzer<'_> {
             );
             return Type::Enum(enum_name.clone());
         }
-        let object_type = self.expression(object);
+        let receiver_is_this = matches!(object.kind, ExpressionKind::This);
+        let receiver_is_base = matches!(object.kind, ExpressionKind::Base);
+        let object_type = self.expression_receiver(object);
         if matches!(object_type, Type::Array(_)) {
             if name == "Length" {
                 return Type::Int;
@@ -299,6 +356,11 @@ impl Analyzer<'_> {
                 span,
             ));
         }
+        let access_receiver = if receiver_is_base {
+            self.owner.clone().unwrap_or_else(|| type_name.clone())
+        } else {
+            type_name.clone()
+        };
         self.context.types.get(&type_name).map_or_else(
             || Type::Unknown,
             |info| {
@@ -310,33 +372,84 @@ impl Analyzer<'_> {
                         ));
                         return Type::Unknown;
                     };
-                    if getter.visibility == Visibility::Private
-                        && self.owner.as_deref() != Some(type_name.as_str())
-                    {
-                        self.diagnostics.push(Diagnostic::error(
-                            format!("getter for property `{type_name}.{name}` is private"),
-                            span,
-                        ));
+                    let declared_in = getter
+                        .key
+                        .owner
+                        .clone()
+                        .unwrap_or_else(|| type_name.clone());
+                    self.check_member_access(
+                        getter.visibility,
+                        &declared_in,
+                        &access_receiver,
+                        &format!("getter for property `{type_name}.{name}`"),
+                        span,
+                    );
+                    let direct = property.direct_backing().map(str::to_owned);
+                    if let Some(backing) = &direct {
+                        self.model
+                            .auto_property_fields
+                            .insert(self.model_key(span), backing.clone());
+                    } else {
+                        self.model
+                            .property_reads
+                            .insert(self.model_key(span), getter.key.clone());
                     }
-                    self.model
-                        .property_reads
-                        .insert(self.model_key(span), getter.key.clone());
+                    if receiver_is_base && getter.dispatch == MemberDispatch::Abstract {
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                format!(
+                                    "`base.{name}` is abstract and has no implementation to call"
+                                ),
+                                span,
+                            )
+                            .with_help("call a concrete member, or implement it in the base class"),
+                        );
+                    }
+                    if let Some(backing) = direct.as_deref()
+                        && receiver_is_this
+                    {
+                        let declared_here = self.owner.as_deref() == Some(&property.declared_in);
+                        self.note_auto_property_read(
+                            backing,
+                            declared_here,
+                            &getter.key,
+                            name,
+                            span,
+                        );
+                    } else if receiver_is_this || receiver_is_base {
+                        self.base_access = receiver_is_base;
+                        self.note_this_call(&getter.key, span);
+                        self.base_access = false;
+                    }
                     return property.type_.clone();
                 }
                 let Some(type_) = info.fields.get(name).cloned() else {
+                    if self.report_hidden_private(&type_name, name, "field", span) {
+                        return Type::Unknown;
+                    }
                     self.diagnostics.push(Diagnostic::error(
                         format!("type `{type_name}` has no field `{name}`"),
                         span,
                     ));
                     return Type::Unknown;
                 };
-                if info.field_visibility.get(name) == Some(&Visibility::Private)
-                    && self.owner.as_deref() != Some(type_name.as_str())
-                {
-                    self.diagnostics.push(
-                        Diagnostic::error(format!("field `{type_name}.{name}` is private"), span)
-                            .with_help("access the value through a public field or method"),
-                    );
+                let declared_in = info
+                    .field_owner
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| type_name.clone());
+                self.check_member_access(
+                    info.field_visibility
+                        .get(name)
+                        .copied()
+                        .unwrap_or(Visibility::Public),
+                    &declared_in,
+                    &access_receiver,
+                    &format!("field `{type_name}.{name}`"),
+                    span,
+                );
+                if receiver_is_this || receiver_is_base {
+                    self.note_this_field_read(name);
                 }
                 type_
             },
@@ -459,23 +572,12 @@ impl Analyzer<'_> {
                 };
             }
         }
-        let calls_current_instance = matches!(&callee.kind, ExpressionKind::Name(name) if self.methods.contains_key(name))
+        // A call on `this` is checked by the this-confinement analysis
+        // (`this_confinement`), which needs the callee's whole body.
+        let receiver_is_base = matches!(&callee.kind, ExpressionKind::Member { object, .. } if matches!(object.kind, ExpressionKind::Base));
+        let call_on_this = matches!(&callee.kind, ExpressionKind::Name(name) if self.methods.contains_key(name))
             || matches!(&callee.kind, ExpressionKind::Member { object, .. } if matches!(object.kind, ExpressionKind::This));
-        if self.constructor
-            && calls_current_instance
-            && self.field_names.iter().any(|field| {
-                self.binding(field)
-                    .is_some_and(|binding| !binding.initialized)
-            })
-        {
-            self.diagnostics.push(
-                Diagnostic::error(
-                    "cannot call an instance method before all fields are initialized",
-                    span,
-                )
-                .with_help("initialize every reference field first"),
-            );
-        }
+        let call_on_this = call_on_this || receiver_is_base;
         let argument_types = arguments
             .iter()
             .map(|argument| {
@@ -558,7 +660,7 @@ impl Analyzer<'_> {
                         Some((candidate, Dispatch::Direct, plan))
                     }
                 } else {
-                    let receiver = self.expression(object);
+                    let receiver = self.expression_receiver(object);
                     if receiver == Type::String {
                         return self.string_operation(name, &argument_types, arguments, span);
                     }
@@ -977,6 +1079,9 @@ impl Analyzer<'_> {
                         .cloned()
                         .collect::<Vec<_>>();
                     if candidates.is_empty() {
+                        if self.report_hidden_private(&type_name, name, "method", callee.span) {
+                            return Type::Unknown;
+                        }
                         self.diagnostics.push(Diagnostic::error(
                             format!("type `{type_name}` has no method `{name}`"),
                             callee.span,
@@ -991,7 +1096,27 @@ impl Analyzer<'_> {
                         span,
                     );
                     if let Some((callable, _)) = &result {
-                        self.check_member_visibility(&type_name, name, callable.visibility, span);
+                        if receiver_is_base && callable.dispatch == MemberDispatch::Abstract {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    format!("`base.{name}` is abstract and has no implementation to call"),
+                                    span,
+                                )
+                                .with_help("call a concrete member, or implement it in the base class"),
+                            );
+                        }
+                        let access_receiver = if receiver_is_base {
+                            self.owner.clone().unwrap_or_else(|| type_name.clone())
+                        } else {
+                            type_name.clone()
+                        };
+                        self.check_member_visibility(
+                            &access_receiver,
+                            callable.key.owner.as_deref().unwrap_or(&type_name),
+                            name,
+                            callable.visibility,
+                            span,
+                        );
                     }
                     if result.is_none() {
                         return Type::Unknown;
@@ -1084,6 +1209,11 @@ impl Analyzer<'_> {
                     .string_builder_operations
                     .insert(model_key.clone(), operation);
             }
+        }
+        if call_on_this && dispatch == Dispatch::Instance && !callable.is_static {
+            self.base_access = receiver_is_base;
+            self.note_this_call(&callable_key, span);
+            self.base_access = false;
         }
         self.model.calls.insert(
             model_key.clone(),
@@ -1354,7 +1484,7 @@ impl Analyzer<'_> {
     }
 
     #[allow(clippy::too_many_lines)] // ranking, contextual validation, and default planning stay atomic
-    fn resolve_call_overload(
+    pub(super) fn resolve_call_overload(
         &mut self,
         name: &str,
         candidates: &[Callable],
@@ -1503,6 +1633,10 @@ impl Analyzer<'_> {
             model_context: self.model_context.clone(),
             async_state: self.async_state,
             unsafe_depth: self.unsafe_depth,
+            this_usage: None,
+            base_access: false,
+            base_arguments: self.base_arguments,
+            chain_label: self.chain_label,
         };
         let actual = analyzer.expression_expected(argument, Some(expected));
         analyzer.require_assignable_value(expected, &actual, argument);
@@ -1577,19 +1711,23 @@ impl Analyzer<'_> {
         }
     }
 
+    /// `receiver` is the static type the method is called on and
+    /// `declared_in` the class that declares it.
     fn check_member_visibility(
         &mut self,
-        owner: &str,
+        receiver: &str,
+        declared_in: &str,
         name: &str,
         visibility: Visibility,
         span: Span,
     ) {
-        if visibility == Visibility::Private && self.owner.as_deref() != Some(owner) {
-            self.diagnostics.push(Diagnostic::error(
-                format!("method `{owner}.{name}` is private"),
-                span,
-            ));
-        }
+        self.check_member_access(
+            visibility,
+            declared_in,
+            receiver,
+            &format!("method `{receiver}.{name}`"),
+            span,
+        );
     }
 
     fn logging_call(&mut self, level: LogLevel<'_>, arguments: &[Argument], span: Span) -> Type {
@@ -1633,17 +1771,17 @@ impl Analyzer<'_> {
         let Some(candidate) = self.resolve_task_run_target(target, &value_types) else {
             return Type::Unknown;
         };
-        if !transferable(&candidate.signature.result) {
+        if !self.worker_transferable_layout(&candidate.signature.result, &mut HashSet::new()) {
             self.diagnostics.push(
                 Diagnostic::error(
                     format!(
-                        "`Task<{}>` cannot cross a worker boundary in this version",
+                        "`Task<{}>` cannot cross a worker boundary",
                         candidate.signature.result.display()
                     ),
                     target.span,
                 )
                 .with_help(
-                    "Task.Run currently supports only scalar results (bool, char, integers, floats)",
+                    "task results are copied: use a scalar, string, array, List, Dictionary, or a struct/enum of those (class instances and interfaces cannot cross)",
                 ),
             );
             return Type::Unknown;
@@ -1659,16 +1797,23 @@ impl Analyzer<'_> {
                         value.span,
                     )
                     .with_help(
-                        "use a scalar or a finite struct/enum containing only transferable values",
+                        "arguments are copied: use a scalar, string, array, List, Dictionary, or a finite struct/enum of those (class instances and interfaces cannot cross)",
                     ),
                 );
             }
         }
         let result_type = candidate.signature.result.clone();
+        let copies_references = !transferable(&result_type)
+            || candidate
+                .signature
+                .parameters
+                .iter()
+                .any(|type_| self.copies_references_layout(type_, &mut HashSet::new()));
         self.model.task_runs.insert(
             self.model_key(span),
             ResolvedTaskRun {
                 function: candidate.key,
+                copies_references,
             },
         );
         Type::Task(Box::new(result_type))
@@ -1768,7 +1913,7 @@ impl Analyzer<'_> {
             ));
             return Type::Unknown;
         };
-        if !transferable(&result) {
+        if !self.worker_transferable_layout(&result, &mut HashSet::new()) {
             self.diagnostics.push(Diagnostic::error(
                 format!(
                     "`Task.WaitAll` cannot compose `Task<{}>` results",
@@ -1781,13 +1926,50 @@ impl Analyzer<'_> {
         Type::Array(result)
     }
 
+    /// Whether a value of `type_` holds a string or collection somewhere
+    /// inside it (and therefore crosses `Task.Run` by deep copy rather than a
+    /// raw frame copy).
+    fn copies_references_layout(&self, type_: &Type, visiting: &mut HashSet<String>) -> bool {
+        match type_ {
+            Type::String | Type::Array(_) | Type::List(_) | Type::Dictionary(_, _) => true,
+            Type::User(name) | Type::Enum(name) => {
+                if !visiting.insert(name.clone()) {
+                    return false;
+                }
+                let found = self.context.types.get(name).is_some_and(|info| {
+                    info.fields
+                        .values()
+                        .any(|field| self.copies_references_layout(field, visiting))
+                        || info.enum_cases.iter().any(|case| {
+                            case.fields
+                                .iter()
+                                .any(|(_, field)| self.copies_references_layout(field, visiting))
+                        })
+                });
+                visiting.remove(name);
+                found
+            }
+            _ => false,
+        }
+    }
+
     /// One semantic worker-transfer authority. Primitive scalars defer to
     /// `aster-types`; finite structs/enums recurse nominally through their
     /// already-specialized field layouts. Reference-bearing and recursive
     /// shapes fail closed.
     fn worker_transferable_layout(&self, type_: &Type, visiting: &mut HashSet<String>) -> bool {
-        if transferable(type_) {
+        if transferable(type_) || matches!(type_, Type::String) {
             return true;
+        }
+        match type_ {
+            Type::Array(element) | Type::List(element) => {
+                return self.worker_transferable_layout(element, visiting);
+            }
+            Type::Dictionary(key, value) => {
+                return self.worker_transferable_layout(key, visiting)
+                    && self.worker_transferable_layout(value, visiting);
+            }
+            _ => {}
         }
         let (name, is_enum) = match type_ {
             Type::User(name) => (name, false),

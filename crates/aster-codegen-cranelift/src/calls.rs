@@ -320,6 +320,12 @@ impl Codegen {
             }
             mir::Intrinsic::RandomMix => ("aster_rt_random_mix", None, false),
             mir::Intrinsic::RandomEntropySeed => ("aster_rt_random_entropy_seed", None, true),
+            mir::Intrinsic::ConsoleWriteError => ("aster_rt_io_write_error", None, true),
+            mir::Intrinsic::EnvironmentHasVariable => ("aster_rt_env_has", None, true),
+            mir::Intrinsic::EnvironmentGetVariable => ("aster_rt_env_get", None, true),
+            mir::Intrinsic::EnvironmentGetVariableTemporary => {
+                ("aster_rt_env_get_temporary", None, true)
+            }
             mir::Intrinsic::StringFromBool => ("aster_rt_string_from_bool", None, true),
             mir::Intrinsic::StringFromBoolTemporary => {
                 ("aster_rt_string_from_bool_temporary", None, true)
@@ -506,9 +512,35 @@ impl Codegen {
                     })?,
                 );
             }
+            let mut deep_index = 0_i64;
             for (argument, offset) in arguments.iter().zip(layout.offsets) {
                 let destination = builder.ins().iadd_imm(frame, i64::from(offset));
                 let value = self.translate_operand(builder, argument, state)?;
+                if self.type_needs_transfer(&argument.type_)? {
+                    // Deep copy (CONC-005): serialize in this context; the
+                    // frame slot stays zero and is filled on the worker.
+                    let shape = self.transfer_shape(&argument.type_)?;
+                    let (shape_pointer, shape_length) =
+                        self.transfer_shape_operands(builder, &shape)?;
+                    let image = self.value_image_address(builder, &argument.type_, value);
+                    let index = builder.ins().iconst(types::I32, deep_index);
+                    let frame_offset = builder.ins().iconst(types::I32, i64::from(offset));
+                    self.call_runtime(
+                        builder,
+                        "aster_task_pack_arg",
+                        &[
+                            context,
+                            index,
+                            frame_offset,
+                            shape_pointer,
+                            shape_length,
+                            image,
+                        ],
+                    );
+                    self.continue_if_runtime_ok(builder, state)?;
+                    deep_index += 1;
+                    continue;
+                }
                 if is_aggregate(&argument.type_) {
                     self.copy_value(builder, &argument.type_, value, destination)?;
                 } else {
@@ -548,12 +580,28 @@ impl Codegen {
         let mir::Type::Array(result_type) = return_type else {
             return Err(BackendError::new("Task.WaitAll requires an array result"));
         };
-        let symbol = super::task_abi::wait_all_symbol_for(result_type)
-            .ok_or_else(|| BackendError::new("Task.WaitAll result type has no transferable ABI"))?;
         let context = state
             .execution_context
             .ok_or_else(|| BackendError::new("Task.WaitAll requires an execution context"))?;
         let tasks = self.translate_operand(builder, tasks, state)?;
+        let Some(symbol) = super::task_abi::wait_all_symbol_for(result_type) else {
+            // Deep-copy results (CONC-005): each element is materialized.
+            let shape = self.transfer_shape(result_type)?;
+            let (shape_pointer, shape_length) = self.transfer_shape_operands(builder, &shape)?;
+            let descriptor = self.element_descriptor_bits(result_type);
+            #[allow(clippy::cast_possible_wrap)]
+            let descriptor = builder.ins().iconst(types::I64, descriptor as i64);
+            let call = self.call_runtime(
+                builder,
+                "aster_task_wait_all_deep",
+                &[context, tasks, shape_pointer, shape_length, descriptor],
+            );
+            self.continue_if_runtime_ok(builder, state)?;
+            if let Some(destination) = destination {
+                self.store_scalar(builder, destination, builder.inst_results(call)[0], state)?;
+            }
+            return Ok(());
+        };
         let function_ref = self
             .jit
             .declare_func_in_func(self.runtime_ids[symbol], builder.func);
@@ -622,16 +670,42 @@ impl Codegen {
                 "Task<T>.Wait requires exactly one task argument",
             ));
         };
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("Task<T>.Wait requires an execution context"))?;
+        let handle = self.translate_operand(builder, task, state)?;
+        if super::task_abi::wait_symbol_for(return_type).is_none() {
+            // Deep-copy result (CONC-005): materialize into this context.
+            let shape = self.transfer_shape(return_type)?;
+            let (shape_pointer, shape_length) = self.transfer_shape_operands(builder, &shape)?;
+            let image = if is_aggregate(return_type) {
+                let destination = destination.ok_or_else(|| {
+                    BackendError::new("aggregate Task<T>.Wait result requires a destination")
+                })?;
+                self.place_address(builder, destination, state)?
+            } else {
+                self.transfer_image_slot(builder, &shape)?
+            };
+            self.call_runtime(
+                builder,
+                "aster_task_wait_deep",
+                &[context, handle, shape_pointer, shape_length, image],
+            );
+            self.continue_if_runtime_ok(builder, state)?;
+            if !is_aggregate(return_type)
+                && let Some(destination) = destination
+            {
+                let pointer = self.load_image_pointer(builder, image);
+                self.store_scalar(builder, destination, pointer, state)?;
+            }
+            return Ok(());
+        }
         let symbol = super::task_abi::wait_symbol_for(return_type).ok_or_else(|| {
             BackendError::new(format!(
                 "`Task<{}>.Wait` cannot execute yet",
                 type_name(return_type)
             ))
         })?;
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("Task<T>.Wait requires an execution context"))?;
-        let handle = self.translate_operand(builder, task, state)?;
         let function_ref = self
             .jit
             .declare_func_in_func(self.runtime_ids[symbol], builder.func);
@@ -1720,7 +1794,44 @@ impl Codegen {
         let call = builder.ins().call(function_ref, &[context, length, size]);
         let array = builder.inst_results(call)[0];
         self.continue_if_runtime_ok(builder, state)?;
+        #[cfg(feature = "mem-exp-rc-core")]
+        self.set_array_element_descriptor(builder, array, element_type, false, state)?;
         self.store_scalar(builder, destination, array, state)
+    }
+
+    /// MEM-EXP-1 C5 (design section 8): the array owns one count per leaf of
+    /// each element, so the runtime needs the element descriptor. `adopt`
+    /// also retains the elements the producer already wrote.
+    #[cfg(feature = "mem-exp-rc-core")]
+    fn set_array_element_descriptor(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        array: cranelift_codegen::ir::Value,
+        element_type: &mir::Type,
+        adopt: bool,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        let Some(address) = self.descriptors.element_address(element_type) else {
+            return Ok(());
+        };
+        let symbol = if adopt {
+            "aster_rt_array_adopt_elements"
+        } else {
+            "aster_rt_array_set_element_descriptor"
+        };
+        let function_ref = self
+            .jit
+            .declare_func_in_func(self.runtime_ids[symbol], builder.func);
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("array ownership is missing its ExecutionContext"))?;
+        let descriptor = builder
+            .ins()
+            .iconst(self.pointer_type, address.cast_signed());
+        builder
+            .ins()
+            .call(function_ref, &[context, array, descriptor]);
+        Ok(())
     }
 
     pub(super) fn translate_object_allocation(
@@ -1750,7 +1861,138 @@ impl Codegen {
         let call = builder.ins().call(function_ref, &[context, size]);
         let object = builder.inst_results(call)[0];
         self.continue_if_runtime_ok(builder, state)?;
+        // B1: every instance starts with a header whose offset-0 word is the
+        // address of the class's immutable `ClassDescriptor`.
+        let descriptor_bits = self
+            .descriptors
+            .address(class)
+            .ok_or_else(|| BackendError::new("class has no object descriptor"))?
+            .cast_signed();
+        let descriptor = builder.ins().iconst(types::I64, descriptor_bits);
+        builder.ins().store(
+            cranelift_codegen::ir::MemFlags::trusted(),
+            descriptor,
+            object,
+            0,
+        );
         self.store_scalar(builder, destination, object, state)
+    }
+
+    /// Lower `Retain`/`Release` (MEM-EXP-1 C5): inline count fast paths with a
+    /// cold runtime slow path for the last release; no failure edge is emitted.
+    #[cfg_attr(not(feature = "mem-exp-rc-core"), allow(clippy::unused_self))]
+    pub(super) fn translate_reference_count(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        value: &mir::Operand,
+        retain: bool,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        #[cfg(feature = "mem-exp-rc-core")]
+        {
+            let operand = self.translate_operand(builder, value, state)?;
+            let object = if matches!(value.type_, mir::Type::Interface(_)) {
+                builder.ins().load(
+                    self.pointer_type,
+                    cranelift_codegen::ir::MemFlags::new(),
+                    operand,
+                    0,
+                )
+            } else {
+                operand
+            };
+            let context = state.execution_context.ok_or_else(|| {
+                BackendError::new("reference count is missing its ExecutionContext")
+            })?;
+            self.emit_inline_reference_count(builder, context, object, retain)?;
+            Ok(())
+        }
+        #[cfg(not(feature = "mem-exp-rc-core"))]
+        {
+            let _ = (builder, value, retain, state);
+            Err(BackendError::new(
+                "ownership instructions require MEM-EXP-1 C5",
+            ))
+        }
+    }
+
+    /// Inline fast paths of `Retain`/`Release` (MEM-EXP-1 design section 13).
+    /// Null and immortal operands are skipped; the executed-operation counters
+    /// in the context are updated in place; the last release of an object
+    /// takes a cold call to the runtime slow path, which does not count again.
+    #[cfg(feature = "mem-exp-rc-core")]
+    fn emit_inline_reference_count(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        context: cranelift_codegen::ir::Value,
+        object: cranelift_codegen::ir::Value,
+        retain: bool,
+    ) -> Result<(), BackendError> {
+        use aster_runtime::object_heap::{COUNT_MASK, COUNT_OFFSET, IMMORTAL};
+        use aster_runtime::{EXECUTION_CONTEXT_RELEASES_OFFSET, EXECUTION_CONTEXT_RETAINS_OFFSET};
+        use cranelift_codegen::ir::MemFlags;
+        let count_offset = i32::try_from(COUNT_OFFSET)
+            .map_err(|_| BackendError::new("count word offset is too large"))?;
+        let counter_offset = i32::try_from(if retain {
+            EXECUTION_CONTEXT_RETAINS_OFFSET
+        } else {
+            EXECUTION_CONTEXT_RELEASES_OFFSET
+        })
+        .map_err(|_| BackendError::new("counter offset is too large"))?;
+        let inspect = builder.create_block();
+        let update = builder.create_block();
+        let continuation = builder.create_block();
+        builder.ins().brif(object, inspect, &[], continuation, &[]);
+
+        builder.switch_to_block(inspect);
+        let word = builder
+            .ins()
+            .load(types::I32, MemFlags::new(), object, count_offset);
+        let count = builder.ins().band_imm(word, i64::from(COUNT_MASK));
+        let immortal = builder
+            .ins()
+            .icmp_imm(IntCC::Equal, count, i64::from(IMMORTAL));
+        builder.ins().brif(immortal, continuation, &[], update, &[]);
+
+        builder.switch_to_block(update);
+        let counter = builder
+            .ins()
+            .load(types::I64, MemFlags::new(), context, counter_offset);
+        let counter = builder.ins().iadd_imm(counter, 1);
+        builder
+            .ins()
+            .store(MemFlags::new(), counter, context, counter_offset);
+        if retain {
+            // The kind bits are untouched; IMMORTAL - 1 saturates to IMMORTAL.
+            let next = builder.ins().iadd_imm(word, 1);
+            builder
+                .ins()
+                .store(MemFlags::new(), next, object, count_offset);
+            builder.ins().jump(continuation, &[]);
+        } else {
+            let decrement = builder.create_block();
+            let last = builder.create_block();
+            builder.set_cold_block(last);
+            let shared = builder.ins().icmp_imm(IntCC::UnsignedGreaterThan, count, 1);
+            builder.ins().brif(shared, decrement, &[], last, &[]);
+
+            builder.switch_to_block(decrement);
+            let next = builder.ins().iadd_imm(word, -1);
+            builder
+                .ins()
+                .store(MemFlags::new(), next, object, count_offset);
+            builder.ins().jump(continuation, &[]);
+
+            builder.switch_to_block(last);
+            let function_ref = self.jit.declare_func_in_func(
+                self.runtime_ids["aster_rt_object_release_last"],
+                builder.func,
+            );
+            builder.ins().call(function_ref, &[context, object]);
+            builder.ins().jump(continuation, &[]);
+        }
+        builder.switch_to_block(continuation);
+        Ok(())
     }
 
     pub(super) fn translate_list_allocation(
@@ -1787,6 +2029,21 @@ impl Codegen {
             .call(function_ref, &[context, size, align, type_key]);
         let list = builder.inst_results(call)[0];
         self.continue_if_runtime_ok(builder, state)?;
+        #[cfg(feature = "mem-exp-rc-core")]
+        if let Some(address) = self.descriptors.element_address(element_type) {
+            // MEM-EXP-1 C5 (design section 7): the list owns one count per
+            // reference leaf of each element; the runtime needs the leaves.
+            let set_descriptor = self.jit.declare_func_in_func(
+                self.runtime_ids["aster_rt_list_set_element_descriptor"],
+                builder.func,
+            );
+            let descriptor = builder
+                .ins()
+                .iconst(self.pointer_type, address.cast_signed());
+            builder
+                .ins()
+                .call(set_descriptor, &[context, list, descriptor]);
+        }
         self.store_scalar(builder, destination, list, state)
     }
 
@@ -1948,6 +2205,22 @@ impl Codegen {
         );
         let dictionary = builder.inst_results(call)[0];
         self.continue_if_runtime_ok(builder, state)?;
+        #[cfg(feature = "mem-exp-rc-core")]
+        if let Some(address) = self.descriptors.dictionary_address(key_type, value_type) {
+            // MEM-EXP-1 C5 (design section 11): the dictionary owns one count
+            // per reference leaf of every live key and value; the runtime
+            // needs the immutable `{ key, value }` descriptor pair.
+            let set_descriptors = self.jit.declare_func_in_func(
+                self.runtime_ids["aster_rt_dictionary_set_descriptors"],
+                builder.func,
+            );
+            let pair = builder
+                .ins()
+                .iconst(self.pointer_type, address.cast_signed());
+            builder
+                .ins()
+                .call(set_descriptors, &[context, dictionary, pair]);
+        }
         self.store_scalar(builder, destination, dictionary, state)
     }
 
@@ -2266,6 +2539,8 @@ impl Codegen {
         let call = builder.ins().call(function_ref, &arguments);
         let entries = builder.inst_results(call)[0];
         self.continue_if_runtime_ok(builder, state)?;
+        #[cfg(feature = "mem-exp-rc-core")]
+        self.set_array_element_descriptor(builder, entries, entry_type, true, state)?;
         self.store_scalar(builder, destination, entries, state)
     }
 
@@ -2340,6 +2615,8 @@ impl Codegen {
         let call = builder.ins().call(function_ref, &arguments);
         let result = builder.inst_results(call)[0];
         self.continue_if_runtime_ok(builder, state)?;
+        #[cfg(feature = "mem-exp-rc-core")]
+        self.set_array_element_descriptor(builder, result, component_type, true, state)?;
         self.store_scalar(builder, destination, result, state)
     }
 

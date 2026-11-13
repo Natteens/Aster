@@ -191,6 +191,11 @@ pub fn walk_function_declaration_mut<V: AstVisitorMut + ?Sized>(
     for parameter in &mut declaration.parameters {
         visitor.visit_parameter_mut(parameter);
     }
+    if let Some(base_call) = &mut declaration.base_call {
+        for argument in &mut base_call.arguments {
+            visitor.visit_expression_mut(&mut argument.value);
+        }
+    }
     if let Some(body) = &mut declaration.body {
         visitor.visit_block_mut(body);
     }
@@ -262,6 +267,12 @@ pub fn walk_statement_mut<V: AstVisitorMut + ?Sized>(visitor: &mut V, statement:
             visitor.visit_expression_mut(condition);
             visitor.visit_block_mut(body);
         }
+        Statement::DoWhile {
+            body, condition, ..
+        } => {
+            visitor.visit_block_mut(body);
+            visitor.visit_expression_mut(condition);
+        }
         Statement::For {
             initializer,
             condition,
@@ -313,6 +324,12 @@ pub fn walk_statement_mut<V: AstVisitorMut + ?Sized>(visitor: &mut V, statement:
 }
 
 pub fn walk_switch_case_mut<V: AstVisitorMut + ?Sized>(visitor: &mut V, case: &mut SwitchCase) {
+    if let Some(label) = &mut case.label {
+        visitor.visit_expression_mut(label);
+    }
+    if let Some(guard) = &mut case.guard {
+        visitor.visit_expression_mut(guard);
+    }
     visitor.visit_block_mut(&mut case.body);
 }
 
@@ -320,6 +337,12 @@ pub fn walk_switch_expression_case_mut<V: AstVisitorMut + ?Sized>(
     visitor: &mut V,
     case: &mut SwitchExpressionCase,
 ) {
+    if let Some(label) = &mut case.label {
+        visitor.visit_expression_mut(label);
+    }
+    if let Some(guard) = &mut case.guard {
+        visitor.visit_expression_mut(guard);
+    }
     visitor.visit_expression_mut(&mut case.value);
 }
 
@@ -349,6 +372,12 @@ pub fn walk_expression_mut<V: AstVisitorMut + ?Sized>(
         ExpressionKind::NewObject { arguments, .. } => {
             for argument in arguments {
                 visitor.visit_expression_mut(&mut argument.value);
+            }
+        }
+        ExpressionKind::ObjectInitializer { creation, members } => {
+            visitor.visit_expression_mut(creation);
+            for member in members {
+                visitor.visit_expression_mut(&mut member.value);
             }
         }
         ExpressionKind::Index { array, index } => {
@@ -399,6 +428,11 @@ pub fn walk_expression_mut<V: AstVisitorMut + ?Sized>(
             visitor.visit_type_ref_mut(target);
             visitor.visit_expression_mut(operand);
         }
+        ExpressionKind::TypePattern { value, target, .. }
+        | ExpressionKind::TypeAs { value, target } => {
+            visitor.visit_expression_mut(value);
+            visitor.visit_type_ref_mut(target);
+        }
         ExpressionKind::Binary { left, right, .. } => {
             visitor.visit_expression_mut(left);
             visitor.visit_expression_mut(right);
@@ -414,7 +448,10 @@ pub fn walk_expression_mut<V: AstVisitorMut + ?Sized>(
                 }
             }
         }
-        ExpressionKind::Literal(_) | ExpressionKind::Name(_) | ExpressionKind::This => {}
+        ExpressionKind::Literal(_)
+        | ExpressionKind::Name(_)
+        | ExpressionKind::This
+        | ExpressionKind::Base => {}
     }
 }
 

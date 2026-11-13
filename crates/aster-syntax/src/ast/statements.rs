@@ -26,6 +26,12 @@ pub enum Statement {
         body: Block,
         span: Span,
     },
+    /// `do { body } while (condition);` — the body runs before the first test.
+    DoWhile {
+        body: Block,
+        condition: Expression,
+        span: Span,
+    },
     For {
         initializer: Option<Box<Statement>>,
         condition: Option<Expression>,
@@ -65,6 +71,7 @@ impl Statement {
             Self::Return { span, .. }
             | Self::If { span, .. }
             | Self::While { span, .. }
+            | Self::DoWhile { span, .. }
             | Self::For { span, .. }
             | Self::ForEach { span, .. }
             | Self::Switch { span, .. }
@@ -81,6 +88,13 @@ pub struct SwitchCase {
     pub enum_name: Option<String>,
     pub case_name: String,
     pub bindings: Vec<String>,
+    /// The label as an expression: always set for non-name labels (then
+    /// `case_name` is empty), and set for payload-free enum-style names so a
+    /// constant name can label an integer, `char` or `string` switch.
+    pub label: Option<Expression>,
+    /// `when` guard: the case is selected only when the pattern matches and
+    /// the guard is true; otherwise matching continues with later cases.
+    pub guard: Option<Expression>,
     pub body: Block,
     pub span: Span,
 }

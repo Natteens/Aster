@@ -73,6 +73,9 @@ pub(super) enum EscapeReason {
     InterfaceConversion,
     PassedToCall,
     PassedToInterfaceCall,
+    /// The object is the receiver or an argument of a virtual call: the callee
+    /// is any override, unknown until devirtualized (object model B1, section 9).
+    PassedToVirtualCall,
     PassedToIntrinsic,
     UnsupportedUse,
 }
@@ -440,6 +443,7 @@ fn is_scope_free_collection_mutation_helper(
                         | mir::Instruction::TemporarySubregionExit { .. }
                         | mir::Instruction::Call { .. }
                         | mir::Instruction::CallInterface { .. }
+                        | mir::Instruction::CallVirtual { .. }
                         | mir::Instruction::CallIntrinsic { .. }
                 )
             {
@@ -476,6 +480,9 @@ fn is_direct_local(operand: &mir::Operand, local: mir::LocalId) -> bool {
 
 fn instruction_uses_alias(instruction: &mir::Instruction, aliases: &HashSet<mir::LocalId>) -> bool {
     match instruction {
+        mir::Instruction::Retain { value } | mir::Instruction::Release { value } => {
+            direct_alias(value, aliases).is_some()
+        }
         mir::Instruction::Assign { target, value } => {
             matches!(target, mir::Place::Local(local) if aliases.contains(local))
                 || rvalue_uses_alias(value, aliases)
@@ -518,6 +525,7 @@ fn instruction_uses_alias(instruction: &mir::Instruction, aliases: &HashSet<mir:
         | mir::Instruction::Call { .. }
         | mir::Instruction::ForeignCall { .. }
         | mir::Instruction::CallInterface { .. }
+        | mir::Instruction::CallVirtual { .. }
         | mir::Instruction::CallIntrinsic { .. } => false,
     }
 }
@@ -727,7 +735,10 @@ fn collect_aliases(
 
 fn alias_source(value: &mir::Rvalue, aliases: &HashSet<mir::LocalId>) -> Option<mir::LocalId> {
     match &value.kind {
-        mir::RvalueKind::Use(operand) | mir::RvalueKind::Cast(operand)
+        mir::RvalueKind::Use(operand)
+        | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
+        | mir::RvalueKind::Downcast(operand)
             if is_tracked_reference_type(&value.type_) =>
         {
             direct_alias(operand, aliases)
@@ -832,6 +843,21 @@ fn instruction_escape(
                 None
             }
         }
+        mir::Instruction::CallVirtual {
+            receiver,
+            arguments,
+            ..
+        } => {
+            if direct_alias(receiver, aliases).is_some()
+                || arguments
+                    .iter()
+                    .any(|argument| direct_alias(argument, aliases).is_some())
+            {
+                Some(EscapeReason::PassedToVirtualCall)
+            } else {
+                None
+            }
+        }
         mir::Instruction::ForeignCall { arguments, .. } => arguments
             .iter()
             .any(|argument| direct_alias(argument, aliases).is_some())
@@ -892,6 +918,10 @@ fn instruction_escape(
                     | mir::Intrinsic::StringTryParseDouble
                     | mir::Intrinsic::ConsoleWrite
                     | mir::Intrinsic::ConsoleWriteLine
+                    | mir::Intrinsic::ConsoleWriteError
+                    | mir::Intrinsic::EnvironmentHasVariable
+                    | mir::Intrinsic::EnvironmentGetVariable
+                    | mir::Intrinsic::EnvironmentGetVariableTemporary
                     | mir::Intrinsic::FileReadAllText(_)
                     | mir::Intrinsic::FileReadAllTextTemporary(_)
                     | mir::Intrinsic::FileWriteAllText(_)
@@ -952,7 +982,9 @@ fn instruction_escape(
         | mir::Instruction::OwnedRegionEnter { .. }
         | mir::Instruction::OwnedRegionExit { .. }
         | mir::Instruction::TemporarySubregionEnter { .. }
-        | mir::Instruction::TemporarySubregionExit { .. } => None,
+        | mir::Instruction::TemporarySubregionExit { .. }
+        | mir::Instruction::Retain { .. }
+        | mir::Instruction::Release { .. } => None,
         // Storing a reference into a list's buffer is an aggregate store,
         // exactly like `Assign{target: Field/Index, value: Use(alias)}`
         // (`assignment_escape` above): conservatively persistent, regardless
@@ -986,7 +1018,14 @@ fn assignment_escape(
                 Some(EscapeReason::Stored)
             }
         }
-        mir::RvalueKind::Cast(operand) if direct_alias(operand, aliases).is_some() => {
+        // An upcast is an alias of the same object: it neither copies nor
+        // stores, so it escapes exactly when its result does (the alias
+        // closure of `alias_source` follows the result).
+        mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
+        | mir::RvalueKind::Downcast(operand)
+            if direct_alias(operand, aliases).is_some() =>
+        {
             if matches!(target, mir::Place::Local(_)) && is_tracked_reference_type(&value.type_) {
                 None
             } else {
@@ -994,6 +1033,7 @@ fn assignment_escape(
             }
         }
         mir::RvalueKind::MakeInterface { object, .. }
+        | mir::RvalueKind::InterfaceLookup { object, .. }
             if direct_alias(object, aliases).is_some() =>
         {
             Some(EscapeReason::InterfaceConversion)
@@ -1019,6 +1059,13 @@ fn assignment_escape(
         // own regardless of whether the enum escapes. Never observed before
         // an enum type was tracked at all (see `is_tracked_reference_type`).
         mir::RvalueKind::Discriminant(operand) if direct_alias(operand, aliases).is_some() => None,
+        // A class test only reads the object's header descriptor.
+        mir::RvalueKind::ClassTest { object, .. }
+        | mir::RvalueKind::InterfaceTest { object, .. }
+            if direct_alias(object, aliases).is_some() =>
+        {
+            None
+        }
         mir::RvalueKind::Equality { .. } => None,
         _ if rvalue_uses_alias(value, aliases) => Some(EscapeReason::UnsupportedUse),
         _ => None,
@@ -1029,12 +1076,23 @@ fn rvalue_uses_alias(value: &mir::Rvalue, aliases: &HashSet<mir::LocalId>) -> bo
     match &value.kind {
         mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Discriminant(operand)
+        | mir::RvalueKind::ClassTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceLookup {
+            object: operand, ..
+        }
         | mir::RvalueKind::ArrayLength(operand)
         | mir::RvalueKind::ListLength(operand)
         | mir::RvalueKind::DictionaryLength(operand)
         | mir::RvalueKind::ListVersion(operand)
         | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
+        | mir::RvalueKind::Downcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => direct_alias(operand, aliases).is_some(),
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             fields

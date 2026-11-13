@@ -3,7 +3,8 @@
 ## Objective
 
 Distinguish namespace-level functions, class methods, struct methods, and interface members while
-preserving ASTER’s type-before-name convention. This chapter does not select a program entry point.
+preserving ASTER’s type-before-name convention. The accepted program entry point is specified in
+[Application entry](#application-entry).
 
 ## Accepted syntax
 

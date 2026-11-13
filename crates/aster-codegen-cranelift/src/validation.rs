@@ -1,5 +1,11 @@
 use super::{BackendError, HashMap, HashSet, integer_constant_bits, mir, primitive, type_name};
-use std::collections::BTreeMap;
+use mir::validate::executable::{
+    InterfaceMethods, owned_instruction_definitions, owned_instruction_reads, owned_operand_reads,
+    owned_region_effects, owned_rvalue_reads, validate_block_target,
+    validate_enum_construct_shapes, validate_executable_owned_regions,
+    validate_executable_temporary_subregions, validate_interface_metadata,
+    validate_no_console_io_in_workers, validate_struct_literal_shapes,
+};
 
 mod array_bounds;
 
@@ -20,12 +26,36 @@ pub(super) fn validate_invocable_entry(
     function: &mir::Function,
     function_name: &str,
 ) -> Result<(), BackendError> {
+    validate_entry_shape(function, function_name, false)
+}
+
+/// Entry validation for `Main()` and `Main(string[] args)`: like
+/// [`validate_invocable_entry`], but one `string[]` parameter is allowed (the
+/// host passes it the program arguments).
+pub(super) fn validate_invocable_entry_with_arguments(
+    function: &mir::Function,
+    function_name: &str,
+) -> Result<(), BackendError> {
+    validate_entry_shape(function, function_name, true)
+}
+
+fn validate_entry_shape(
+    function: &mir::Function,
+    function_name: &str,
+    allow_arguments: bool,
+) -> Result<(), BackendError> {
     if function.visibility != mir::Visibility::Public {
         return Err(BackendError::new(format!(
             "function `{function_name}` is not public"
         )));
     }
-    if !function.parameters.is_empty() {
+    let takes_arguments = matches!(
+        function.parameters.as_slice(),
+        [parameter] if parameter.type_ == mir::Type::Array(Box::new(mir::Type::String))
+    );
+    let parameters_accepted =
+        function.parameters.is_empty() || (allow_arguments && takes_arguments);
+    if !parameters_accepted {
         return Err(BackendError::new(format!(
             "entry function `{function_name}` must have no parameters"
         )));
@@ -73,129 +103,8 @@ pub(super) fn validate_invocable_entry(
     Ok(())
 }
 
-#[derive(Default)]
-struct MirTypeIndex {
-    kinds: HashMap<mir::SymbolId, NominalKind>,
-    struct_fields: HashMap<(mir::SymbolId, mir::SymbolId), mir::Type>,
-    class_fields: HashMap<(mir::SymbolId, mir::SymbolId), mir::Type>,
-    enum_cases: HashMap<mir::SymbolId, mir::SymbolId>,
-    enum_fields: HashMap<(mir::SymbolId, mir::SymbolId), mir::Type>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum NominalKind {
-    Struct,
-    Class,
-    Interface,
-    Enum,
-}
-
-impl MirTypeIndex {
-    fn build(module: &mir::Module) -> Result<Self, BackendError> {
-        let mut index = Self::default();
-        // `Layouts` intentionally indexes executable fields by their module-
-        // wide symbol identity. Reject collisions here, before layout
-        // construction could silently replace one owner's field metadata.
-        let mut field_symbols = HashSet::new();
-        for definition in &module.structs {
-            index.insert_type(definition.symbol, NominalKind::Struct)?;
-            for field in &definition.fields {
-                if !field_symbols.insert(field.symbol) {
-                    return Err(BackendError::new("duplicate field symbol in MIR"));
-                }
-                if index
-                    .struct_fields
-                    .insert((definition.symbol, field.symbol), field.type_.clone())
-                    .is_some()
-                {
-                    return Err(BackendError::new("duplicate struct field symbol in MIR"));
-                }
-            }
-        }
-        for definition in &module.classes {
-            index.insert_type(definition.symbol, NominalKind::Class)?;
-            for field in &definition.fields {
-                if !field_symbols.insert(field.symbol) {
-                    return Err(BackendError::new("duplicate field symbol in MIR"));
-                }
-                if index
-                    .class_fields
-                    .insert((definition.symbol, field.symbol), field.type_.clone())
-                    .is_some()
-                {
-                    return Err(BackendError::new("duplicate class field symbol in MIR"));
-                }
-            }
-        }
-        for definition in &module.interfaces {
-            index.insert_type(definition.symbol, NominalKind::Interface)?;
-        }
-        for definition in &module.enums {
-            index.insert_type(definition.symbol, NominalKind::Enum)?;
-            for case in &definition.cases {
-                if index
-                    .enum_cases
-                    .insert(case.symbol, definition.symbol)
-                    .is_some()
-                {
-                    return Err(BackendError::new("duplicate enum case symbol in MIR"));
-                }
-                for field in &case.fields {
-                    if !field_symbols.insert(field.symbol) {
-                        return Err(BackendError::new("duplicate field symbol in MIR"));
-                    }
-                    if index
-                        .enum_fields
-                        .insert((case.symbol, field.symbol), field.type_.clone())
-                        .is_some()
-                    {
-                        return Err(BackendError::new("duplicate enum field symbol in MIR"));
-                    }
-                }
-            }
-        }
-        Ok(index)
-    }
-
-    fn insert_type(
-        &mut self,
-        symbol: mir::SymbolId,
-        kind: NominalKind,
-    ) -> Result<(), BackendError> {
-        if self.kinds.insert(symbol, kind).is_some() {
-            Err(BackendError::new("duplicate nominal type symbol in MIR"))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn validate_type(&self, type_: &mir::Type, function_name: &str) -> Result<(), BackendError> {
-        let valid = match type_ {
-            mir::Type::User(symbol) => self.kinds.get(symbol) == Some(&NominalKind::Struct),
-            mir::Type::Class(symbol) => self.kinds.get(symbol) == Some(&NominalKind::Class),
-            mir::Type::Interface(symbol) => self.kinds.get(symbol) == Some(&NominalKind::Interface),
-            mir::Type::Enum(symbol) => self.kinds.get(symbol) == Some(&NominalKind::Enum),
-            mir::Type::Array(element) | mir::Type::Task(element) | mir::Type::List(element) => {
-                return self.validate_type(element, function_name);
-            }
-            mir::Type::Dictionary(key, value) => {
-                self.validate_type(key, function_name)?;
-                return self.validate_type(value, function_name);
-            }
-            _ => true,
-        };
-        if valid {
-            Ok(())
-        } else {
-            Err(BackendError::new(format!(
-                "function `{function_name}` references an unknown or mismatched nominal type"
-            )))
-        }
-    }
-}
-
 pub(super) fn validate_module(module: &mir::Module) -> Result<(), BackendError> {
-    let type_index = MirTypeIndex::build(module)?;
+    let type_index = mir::validate::MirTypeIndex::build(module)?;
     let mut signatures = HashMap::new();
     for function in &module.functions {
         if signatures.insert(function.symbol, function).is_some() {
@@ -263,122 +172,6 @@ pub(super) fn validate_module(module: &mir::Module) -> Result<(), BackendError> 
         validate_struct_literal_shapes(function, &struct_definitions)?;
     }
     validate_no_console_io_in_workers(module)?;
-    Ok(())
-}
-
-/// Host operations and foreign calls are rejected anywhere reachable from a
-/// `Task.Run`/`Parallel.For`/`ForEach`/`Reduce` worker body: output order,
-/// input consumption, and file access would be non-deterministic across
-/// workers, and neither backend is shared or synchronized. Builds the whole
-/// module's direct call graph once (`Instruction::Call` edges), marks every
-/// function whose body directly calls a host I/O intrinsic or foreign binding,
-/// then, for every worker entry point found anywhere in the module, walks
-/// the graph from its `Function` operand(s) to see whether an I/O-using
-/// function is reachable. Host operations currently include terminal/filesystem
-/// I/O, clock reads, and the entropy seed read.
-#[allow(clippy::too_many_lines)]
-fn validate_no_console_io_in_workers(module: &mir::Module) -> Result<(), BackendError> {
-    let mut callees: HashMap<mir::SymbolId, Vec<mir::SymbolId>> = HashMap::new();
-    let mut io_users: HashSet<mir::SymbolId> = HashSet::new();
-    let mut foreign_users: HashSet<mir::SymbolId> = HashSet::new();
-    for function in &module.functions {
-        let mut direct = Vec::new();
-        for block in &function.blocks {
-            for instruction in &block.instructions {
-                match instruction {
-                    mir::Instruction::Call {
-                        function: callee, ..
-                    } => direct.push(*callee),
-                    mir::Instruction::CallIntrinsic {
-                        intrinsic:
-                            mir::Intrinsic::ConsoleWrite
-                            | mir::Intrinsic::ConsoleWriteLine
-                            | mir::Intrinsic::ConsoleReadLine
-                            | mir::Intrinsic::ConsoleReadLineTemporary
-                            | mir::Intrinsic::FileReadAllText(_)
-                            | mir::Intrinsic::FileReadAllTextTemporary(_)
-                            | mir::Intrinsic::FileWriteAllText(_)
-                            | mir::Intrinsic::FileAppendAllText(_)
-                            | mir::Intrinsic::FileListFiles(_)
-                            | mir::Intrinsic::FileListFilesTemporary(_)
-                            | mir::Intrinsic::FileListDirectories(_)
-                            | mir::Intrinsic::FileListDirectoriesTemporary(_)
-                            | mir::Intrinsic::FileExists(_)
-                            | mir::Intrinsic::DirectoryExists(_)
-                            | mir::Intrinsic::FileCreateDirectory(_)
-                            | mir::Intrinsic::FileDeleteFile(_)
-                            | mir::Intrinsic::FileDeleteDirectory(_)
-                            | mir::Intrinsic::TimeMonotonicMilliseconds
-                            | mir::Intrinsic::TimeUnixMilliseconds
-                            | mir::Intrinsic::RandomEntropySeed,
-                        ..
-                    } => {
-                        io_users.insert(function.symbol);
-                    }
-                    mir::Instruction::ForeignCall { .. } => {
-                        foreign_users.insert(function.symbol);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        callees.insert(function.symbol, direct);
-    }
-    let reaches = |root: mir::SymbolId, users: &HashSet<mir::SymbolId>| -> bool {
-        let mut visited: HashSet<mir::SymbolId> = HashSet::new();
-        let mut stack = vec![root];
-        while let Some(symbol) = stack.pop() {
-            if !visited.insert(symbol) {
-                continue;
-            }
-            if users.contains(&symbol) {
-                return true;
-            }
-            if let Some(direct) = callees.get(&symbol) {
-                stack.extend(direct.iter().copied());
-            }
-        }
-        false
-    };
-    for function in &module.functions {
-        for block in &function.blocks {
-            for instruction in &block.instructions {
-                let mir::Instruction::CallIntrinsic {
-                    intrinsic,
-                    arguments,
-                    ..
-                } = instruction
-                else {
-                    continue;
-                };
-                let worker_name = match intrinsic {
-                    mir::Intrinsic::TaskRun => "Task.Run",
-                    mir::Intrinsic::ParallelFor => "Parallel.For",
-                    mir::Intrinsic::ParallelForEach => "Parallel.ForEach",
-                    mir::Intrinsic::ParallelReduce => "Parallel.Reduce",
-                    _ => continue,
-                };
-                for argument in arguments {
-                    if let mir::OperandKind::Function(target) = argument.kind
-                        && reaches(target, &foreign_users)
-                    {
-                        return Err(BackendError::new(format!(
-                            "function `{}` uses `{worker_name}` with a worker body that (directly or transitively) performs a foreign call, which is rejected in this version",
-                            function.name
-                        )));
-                    }
-                    if let mir::OperandKind::Function(target) = argument.kind
-                        && reaches(target, &io_users)
-                    {
-                        return Err(BackendError::new(format!(
-                            "function `{}` uses `{worker_name}` with a worker body that (directly or transitively) calls `aster.io.Write`/`WriteLine`/`ReadLine`/`ReadAllText`/`WriteAllText`/`ListFiles`, another filesystem operation, a clock host operation through `aster.time.Clock`, or an entropy host operation through `Random.FromEntropy`, which is rejected in this version",
-                            function.name
-                        )));
-                    }
-                }
-            }
-        }
-    }
     Ok(())
 }
 
@@ -501,129 +294,6 @@ fn validate_foreign_abi(
                     return Err(BackendError::new(format!(
                         "function `{}` has a foreign result destination with the wrong type",
                         function.name
-                    )));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Every `EnumConstruct` (built by enum literals, `switch` desugaring, and
-/// postfix `?`'s `Result`/`Option` propagation alike) must name a `case`
-/// symbol that is actually one of `value.type_`'s declared cases, with a
-/// matching `tag` and exactly the fields that case declares (by symbol and
-/// type, in order). Runs once per function over the whole module's enum
-/// definitions, the same data `validate_string_try_parse_targets` uses,
-/// rather than a construct-site-specific check duplicated per caller.
-fn validate_enum_construct_shapes(
-    function: &mir::Function,
-    enum_definitions: &HashMap<mir::SymbolId, &mir::EnumDefinition>,
-) -> Result<(), BackendError> {
-    for block in &function.blocks {
-        for instruction in &block.instructions {
-            let mir::Instruction::Assign { value, .. } = instruction else {
-                continue;
-            };
-            let mir::RvalueKind::EnumConstruct { case, tag, fields } = &value.kind else {
-                continue;
-            };
-            let mir::Type::Enum(symbol) = &value.type_ else {
-                return Err(BackendError::new(format!(
-                    "function `{}` has an `EnumConstruct` whose declared type is not an enum",
-                    function.name
-                )));
-            };
-            let definition = enum_definitions.get(symbol).ok_or_else(|| {
-                BackendError::new(format!(
-                    "function `{}` has an `EnumConstruct` for an unknown enum type",
-                    function.name
-                ))
-            })?;
-            let matched = definition
-                .cases
-                .iter()
-                .find(|case_definition| case_definition.symbol == *case);
-            let Some(matched) = matched else {
-                return Err(BackendError::new(format!(
-                    "function `{}` has an `EnumConstruct` whose case symbol is not one of `{}`'s cases",
-                    function.name, definition.name
-                )));
-            };
-            if matched.tag != *tag {
-                return Err(BackendError::new(format!(
-                    "function `{}` has an `EnumConstruct` for case `{}` with tag {tag}, expected {}",
-                    function.name, matched.name, matched.tag
-                )));
-            }
-            if fields.len() != matched.fields.len() {
-                return Err(BackendError::new(format!(
-                    "function `{}` has an `EnumConstruct` for case `{}` with {} field(s), expected {}",
-                    function.name,
-                    matched.name,
-                    fields.len(),
-                    matched.fields.len()
-                )));
-            }
-            for (provided, expected) in fields.iter().zip(&matched.fields) {
-                if provided.field != expected.symbol || provided.value.type_ != expected.type_ {
-                    return Err(BackendError::new(format!(
-                        "function `{}` has an `EnumConstruct` for case `{}` with a field that does not match its declaration",
-                        function.name, matched.name
-                    )));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Every `Aggregate` (a struct literal, e.g. `IOError { Kind: ..., OsCode:
-/// ... }`) must name a `Type::User` struct that actually exists, with
-/// exactly the fields that struct declares, by symbol, order, and type.
-/// Mirrors [`validate_enum_construct_shapes`]: previously `Aggregate`'s only
-/// check was that each field operand was itself well-formed
-/// (`validate_rvalue`), never that the *set* of fields matched the struct's
-/// real declaration, so adulterated MIR reached Cranelift's own verifier
-/// instead of a controlled `BackendError`.
-fn validate_struct_literal_shapes(
-    function: &mir::Function,
-    struct_definitions: &HashMap<mir::SymbolId, &mir::StructDefinition>,
-) -> Result<(), BackendError> {
-    for block in &function.blocks {
-        for instruction in &block.instructions {
-            let mir::Instruction::Assign { value, .. } = instruction else {
-                continue;
-            };
-            let mir::RvalueKind::Aggregate(fields) = &value.kind else {
-                continue;
-            };
-            let mir::Type::User(symbol) = &value.type_ else {
-                return Err(BackendError::new(format!(
-                    "function `{}` has an `Aggregate` whose declared type is not a struct",
-                    function.name
-                )));
-            };
-            let definition = struct_definitions.get(symbol).ok_or_else(|| {
-                BackendError::new(format!(
-                    "function `{}` has an `Aggregate` for an unknown struct type",
-                    function.name
-                ))
-            })?;
-            if fields.len() != definition.fields.len() {
-                return Err(BackendError::new(format!(
-                    "function `{}` has an `Aggregate` for `{}` with {} field(s), expected {}",
-                    function.name,
-                    definition.name,
-                    fields.len(),
-                    definition.fields.len()
-                )));
-            }
-            for (provided, expected) in fields.iter().zip(&definition.fields) {
-                if provided.field != expected.symbol || provided.value.type_ != expected.type_ {
-                    return Err(BackendError::new(format!(
-                        "function `{}` has an `Aggregate` for `{}` with a field that does not match its declaration",
-                        function.name, definition.name
                     )));
                 }
             }
@@ -800,661 +470,6 @@ fn validate_file_io_result_shapes(
     Ok(())
 }
 
-type InterfaceMethods<'a> =
-    HashMap<mir::SymbolId, (mir::SymbolId, &'a mir::InterfaceMethodDefinition)>;
-
-fn validate_interface_metadata<'a>(
-    module: &'a mir::Module,
-    signatures: &HashMap<mir::SymbolId, &'a mir::Function>,
-    classes: &HashSet<mir::SymbolId>,
-) -> Result<
-    (
-        InterfaceMethods<'a>,
-        HashSet<(mir::SymbolId, mir::SymbolId)>,
-    ),
-    BackendError,
-> {
-    let mut methods = HashMap::new();
-    let interfaces = module
-        .interfaces
-        .iter()
-        .map(|interface| {
-            for method in &interface.methods {
-                methods.insert(method.symbol, (interface.symbol, method));
-            }
-            (interface.symbol, interface)
-        })
-        .collect::<HashMap<_, _>>();
-    let mut implementations = HashSet::new();
-    for implementation in &module.interface_implementations {
-        if !classes.contains(&implementation.class) {
-            return Err(BackendError::new(
-                "interface implementation references an unknown class",
-            ));
-        }
-        let interface = interfaces.get(&implementation.interface).ok_or_else(|| {
-            BackendError::new("interface implementation references an unknown interface")
-        })?;
-        if !implementations.insert((implementation.class, implementation.interface)) {
-            return Err(BackendError::new(
-                "duplicate interface implementation in MIR",
-            ));
-        }
-        if implementation.methods.len() != interface.methods.len() {
-            return Err(BackendError::new(
-                "interface implementation has the wrong method count",
-            ));
-        }
-        for (required, concrete_symbol) in interface.methods.iter().zip(&implementation.methods) {
-            let concrete = signatures.get(concrete_symbol).ok_or_else(|| {
-                BackendError::new("interface implementation references an unknown method")
-            })?;
-            if concrete.owner != Some(implementation.class)
-                || concrete.visibility != mir::Visibility::Public
-                || concrete.return_type != required.return_type
-                || concrete.parameters.first().map(|receiver| &receiver.type_)
-                    != Some(&mir::Type::Class(implementation.class))
-                || concrete
-                    .parameters
-                    .iter()
-                    .skip(1)
-                    .map(|parameter| &parameter.type_)
-                    .ne(required.parameters.iter())
-            {
-                return Err(BackendError::new(format!(
-                    "concrete method `{}` does not match interface method `{}`",
-                    concrete.name, required.name
-                )));
-            }
-        }
-    }
-    Ok((methods, implementations))
-}
-
-fn validate_typed_function(
-    function: &mir::Function,
-    locals: &HashMap<mir::LocalId, mir::Type>,
-    signatures: &HashMap<mir::SymbolId, &mir::Function>,
-    types: &MirTypeIndex,
-) -> Result<(), BackendError> {
-    for block in &function.blocks {
-        for instruction in &block.instructions {
-            validate_typed_instruction(instruction, &function.name, locals, signatures, types)?;
-        }
-        match &block.terminator {
-            mir::Terminator::Branch { condition, .. } => {
-                validate_typed_operand(condition, &function.name, locals, signatures, types)?;
-            }
-            mir::Terminator::Return(Some(value)) => {
-                validate_typed_operand(value, &function.name, locals, signatures, types)?;
-                if value.type_ != function.return_type {
-                    return Err(BackendError::new(format!(
-                        "function `{}` returns `{}` from a function declared `{}`",
-                        function.name,
-                        type_name(&value.type_),
-                        type_name(&function.return_type)
-                    )));
-                }
-            }
-            mir::Terminator::Return(None) if function.return_type != mir::Type::Void => {
-                return Err(BackendError::new(format!(
-                    "function `{}` returns no value from a non-void function",
-                    function.name
-                )));
-            }
-            mir::Terminator::Goto(_)
-            | mir::Terminator::Return(None)
-            | mir::Terminator::End
-            | mir::Terminator::Unreachable => {}
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_lines)]
-fn validate_typed_instruction(
-    instruction: &mir::Instruction,
-    function_name: &str,
-    locals: &HashMap<mir::LocalId, mir::Type>,
-    signatures: &HashMap<mir::SymbolId, &mir::Function>,
-    types: &MirTypeIndex,
-) -> Result<(), BackendError> {
-    let place =
-        |value: &mir::Place| validate_typed_place(value, function_name, locals, signatures, types);
-    let operand = |value: &mir::Operand| {
-        validate_typed_operand(value, function_name, locals, signatures, types)
-    };
-    let destination = |value: &mir::Place, expected: &mir::Type| -> Result<(), BackendError> {
-        let actual = place(value)?;
-        if &actual == expected {
-            Ok(())
-        } else {
-            Err(BackendError::new(format!(
-                "function `{function_name}` stores `{}` into a destination declared `{}`",
-                type_name(expected),
-                type_name(&actual)
-            )))
-        }
-    };
-
-    match instruction {
-        mir::Instruction::OwnedRegionEnter { .. }
-        | mir::Instruction::OwnedRegionExit { .. }
-        | mir::Instruction::TemporarySubregionEnter { .. }
-        | mir::Instruction::TemporarySubregionExit { .. } => Ok(()),
-        mir::Instruction::Assign { target, value } => {
-            let target_type = place(target)?;
-            validate_typed_rvalue(value, function_name, locals, signatures, types)?;
-            if target_type == value.type_ {
-                Ok(())
-            } else {
-                Err(BackendError::new(format!(
-                    "function `{function_name}` assigns `{}` into a place declared `{}`",
-                    type_name(&value.type_),
-                    type_name(&target_type)
-                )))
-            }
-        }
-        mir::Instruction::Call {
-            destination: result,
-            arguments,
-            return_type,
-            ..
-        }
-        | mir::Instruction::ForeignCall {
-            destination: result,
-            arguments,
-            return_type,
-            ..
-        }
-        | mir::Instruction::CallIntrinsic {
-            destination: result,
-            arguments,
-            return_type,
-            ..
-        } => {
-            for argument in arguments {
-                operand(argument)?;
-            }
-            if let Some(result) = result {
-                destination(result, return_type)?;
-            }
-            Ok(())
-        }
-        mir::Instruction::CallInterface {
-            destination: result,
-            receiver,
-            arguments,
-            return_type,
-            ..
-        } => {
-            operand(receiver)?;
-            for argument in arguments {
-                operand(argument)?;
-            }
-            if let Some(result) = result {
-                destination(result, return_type)?;
-            }
-            Ok(())
-        }
-        mir::Instruction::AllocateArray {
-            destination: result,
-            element_type,
-            length,
-            ..
-        } => {
-            operand(length)?;
-            destination(result, &mir::Type::Array(Box::new(element_type.clone())))
-        }
-        mir::Instruction::AllocateObject {
-            destination: result,
-            class,
-            ..
-        }
-        | mir::Instruction::AllocateStringBuilder {
-            destination: result,
-            class,
-            ..
-        } => destination(result, &mir::Type::Class(*class)),
-        mir::Instruction::AllocateList {
-            destination: result,
-            element_type,
-            ..
-        } => destination(result, &mir::Type::List(Box::new(element_type.clone()))),
-        mir::Instruction::AllocateDictionary {
-            destination: result,
-            key_type,
-            value_type,
-            ..
-        } => destination(
-            result,
-            &mir::Type::Dictionary(Box::new(key_type.clone()), Box::new(value_type.clone())),
-        ),
-        mir::Instruction::StringBuilderAppend { builder, value, .. } => {
-            operand(builder)?;
-            operand(value)
-        }
-        mir::Instruction::StringBuilderToString {
-            destination: result,
-            builder,
-            ..
-        } => {
-            operand(builder)?;
-            destination(result, &mir::Type::String)
-        }
-        mir::Instruction::DictionaryAdd {
-            destination: result,
-            dictionary,
-            key,
-            value,
-        }
-        | mir::Instruction::DictionarySet {
-            destination: result,
-            dictionary,
-            key,
-            value,
-        } => {
-            operand(dictionary)?;
-            operand(key)?;
-            operand(value)?;
-            destination(result, &mir::Type::Bool)
-        }
-        mir::Instruction::DictionaryTryGet {
-            destination: result,
-            dictionary,
-            key,
-            ..
-        }
-        | mir::Instruction::DictionaryContainsKey {
-            destination: result,
-            dictionary,
-            key,
-        }
-        | mir::Instruction::DictionaryRemove {
-            destination: result,
-            dictionary,
-            key,
-        } => {
-            operand(dictionary)?;
-            operand(key)?;
-            place(result).map(|_| ())
-        }
-        mir::Instruction::DictionaryEntries {
-            destination: result,
-            dictionary,
-            key_type,
-            value_type,
-            entry_type,
-            ..
-        } => {
-            operand(dictionary)?;
-            let expected_dictionary =
-                mir::Type::Dictionary(Box::new(key_type.clone()), Box::new(value_type.clone()));
-            if dictionary.type_ != expected_dictionary {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` has Dictionary entries metadata that does not match its receiver"
-                )));
-            }
-            destination(result, &mir::Type::Array(Box::new(entry_type.clone())))
-        }
-        mir::Instruction::DictionaryClear { dictionary } => operand(dictionary),
-        mir::Instruction::DictionaryKeys {
-            destination: result,
-            dictionary,
-            key_type,
-            ..
-        } => {
-            operand(dictionary)?;
-            destination(result, &mir::Type::Array(Box::new(key_type.clone())))
-        }
-        mir::Instruction::DictionaryValues {
-            destination: result,
-            dictionary,
-            value_type,
-            ..
-        } => {
-            operand(dictionary)?;
-            destination(result, &mir::Type::Array(Box::new(value_type.clone())))
-        }
-        mir::Instruction::ListAdd { list, value } => {
-            operand(list)?;
-            operand(value)
-        }
-        mir::Instruction::ListGet {
-            destination: result,
-            list,
-            index,
-            element_type,
-        } => {
-            operand(list)?;
-            operand(index)?;
-            destination(result, element_type)
-        }
-        mir::Instruction::ListRemoveAt { list, index } => {
-            operand(list)?;
-            operand(index)
-        }
-        mir::Instruction::ListSet { list, index, value } => {
-            operand(list)?;
-            operand(index)?;
-            operand(value)
-        }
-        mir::Instruction::ListClear { list } => operand(list),
-        mir::Instruction::ListToArray {
-            destination: result,
-            list,
-            element_type,
-            ..
-        } => {
-            operand(list)?;
-            destination(result, &mir::Type::Array(Box::new(element_type.clone())))
-        }
-        mir::Instruction::StringDecodeNext {
-            string,
-            cursor,
-            char_destination,
-            next_cursor_destination,
-            ok_destination,
-        } => {
-            operand(string)?;
-            operand(cursor)?;
-            destination(char_destination, &mir::Type::Char)?;
-            destination(next_cursor_destination, &mir::Type::Int)?;
-            destination(ok_destination, &mir::Type::Bool)
-        }
-    }
-}
-
-#[allow(clippy::too_many_lines)]
-fn validate_typed_rvalue(
-    value: &mir::Rvalue,
-    function_name: &str,
-    locals: &HashMap<mir::LocalId, mir::Type>,
-    signatures: &HashMap<mir::SymbolId, &mir::Function>,
-    types: &MirTypeIndex,
-) -> Result<(), BackendError> {
-    types.validate_type(&value.type_, function_name)?;
-    let operand = |value: &mir::Operand| {
-        validate_typed_operand(value, function_name, locals, signatures, types)
-    };
-    match &value.kind {
-        mir::RvalueKind::Use(input) => {
-            operand(input)?;
-            ensure_same_type(&value.type_, &input.type_, function_name, "copy")
-        }
-        mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
-            for field in fields {
-                operand(&field.value)?;
-            }
-            Ok(())
-        }
-        mir::RvalueKind::Discriminant(input) => {
-            operand(input)?;
-            if matches!(input.type_, mir::Type::Enum(_)) && value.type_ == mir::Type::UInt {
-                Ok(())
-            } else {
-                Err(BackendError::new(format!(
-                    "function `{function_name}` has a malformed enum discriminant"
-                )))
-            }
-        }
-        mir::RvalueKind::ArrayLength(input) => {
-            operand(input)?;
-            if matches!(input.type_, mir::Type::Array(_)) && value.type_ == mir::Type::Int {
-                Ok(())
-            } else {
-                Err(BackendError::new(format!(
-                    "function `{function_name}` has a malformed array length read"
-                )))
-            }
-        }
-        mir::RvalueKind::Unary {
-            operator: mir::UnaryOperator::BitwiseNot,
-            operand: input,
-        } => {
-            operand(input)?;
-            // Complement only reaches the backend on 32- and 64-bit integers:
-            // narrower operands are promoted first, and no 8- or 16-bit shape
-            // may be emitted.
-            if !is_wide_integer(&input.type_) {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` has a bitwise complement of unsupported type `{}`",
-                    type_name(&input.type_)
-                )));
-            }
-            ensure_same_type(
-                &value.type_,
-                &input.type_,
-                function_name,
-                "complement result",
-            )
-        }
-        mir::RvalueKind::ListLength(input)
-        | mir::RvalueKind::DictionaryLength(input)
-        | mir::RvalueKind::StringByteLength(input)
-        | mir::RvalueKind::ListVersion(input)
-        | mir::RvalueKind::Cast(input)
-        | mir::RvalueKind::Unary { operand: input, .. } => operand(input),
-        mir::RvalueKind::MakeInterface { object, .. } => operand(object),
-        mir::RvalueKind::Binary {
-            left,
-            operator,
-            right,
-        } => {
-            operand(left)?;
-            operand(right)?;
-            ensure_same_type(&left.type_, &right.type_, function_name, "binary operands")?;
-            validate_bitwise_operands(*operator, &left.type_, function_name)?;
-            let expected = if matches!(
-                operator,
-                mir::BinaryOperator::Less
-                    | mir::BinaryOperator::LessEqual
-                    | mir::BinaryOperator::Greater
-                    | mir::BinaryOperator::GreaterEqual
-                    | mir::BinaryOperator::Equal
-                    | mir::BinaryOperator::NotEqual
-                    | mir::BinaryOperator::LogicalAnd
-                    | mir::BinaryOperator::LogicalOr
-            ) {
-                &mir::Type::Bool
-            } else {
-                &left.type_
-            };
-            ensure_same_type(&value.type_, expected, function_name, "binary result")
-        }
-        mir::RvalueKind::Equality { left, right, .. } => {
-            operand(left)?;
-            operand(right)?;
-            ensure_same_type(
-                &left.type_,
-                &right.type_,
-                function_name,
-                "equality operands",
-            )?;
-            ensure_same_type(
-                &value.type_,
-                &mir::Type::Bool,
-                function_name,
-                "equality result",
-            )
-        }
-    }
-}
-
-fn is_wide_integer(type_: &mir::Type) -> bool {
-    matches!(
-        type_,
-        mir::Type::Int | mir::Type::UInt | mir::Type::Long | mir::Type::ULong
-    )
-}
-
-/// Fail-closed operand check for the bitwise and shift operators. Shifts are
-/// only ever generated for 32- and 64-bit integers, so no 8- or 16-bit shape can
-/// reach code generation; bitwise `&`, `|`, `^` also accept `bool`.
-fn validate_bitwise_operands(
-    operator: mir::BinaryOperator,
-    operand_type: &mir::Type,
-    function_name: &str,
-) -> Result<(), BackendError> {
-    let valid = match operator {
-        mir::BinaryOperator::BitwiseAnd
-        | mir::BinaryOperator::BitwiseOr
-        | mir::BinaryOperator::BitwiseXor => {
-            *operand_type == mir::Type::Bool || integer_width_of(operand_type).is_some()
-        }
-        mir::BinaryOperator::ShiftLeft
-        | mir::BinaryOperator::ShiftRight
-        | mir::BinaryOperator::UnsignedShiftRight => is_wide_integer(operand_type),
-        _ => return Ok(()),
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(BackendError::new(format!(
-            "function `{function_name}` has a bitwise or shift operation on unsupported type `{}`",
-            type_name(operand_type)
-        )))
-    }
-}
-
-fn integer_width_of(type_: &mir::Type) -> Option<u16> {
-    match type_ {
-        mir::Type::SByte | mir::Type::Byte => Some(8),
-        mir::Type::Short | mir::Type::UShort => Some(16),
-        mir::Type::Int | mir::Type::UInt => Some(32),
-        mir::Type::Long | mir::Type::ULong => Some(64),
-        _ => None,
-    }
-}
-
-fn validate_typed_operand(
-    operand: &mir::Operand,
-    function_name: &str,
-    locals: &HashMap<mir::LocalId, mir::Type>,
-    signatures: &HashMap<mir::SymbolId, &mir::Function>,
-    types: &MirTypeIndex,
-) -> Result<(), BackendError> {
-    types.validate_type(&operand.type_, function_name)?;
-    match &operand.kind {
-        mir::OperandKind::Constant(constant) => {
-            validate_constant_type(constant, &operand.type_, function_name)
-        }
-        mir::OperandKind::Copy(place) => {
-            let actual = validate_typed_place(place, function_name, locals, signatures, types)?;
-            ensure_same_type(&operand.type_, &actual, function_name, "copied place")
-        }
-        mir::OperandKind::Function(symbol) => {
-            if signatures.contains_key(symbol) {
-                Ok(())
-            } else {
-                Err(BackendError::new(format!(
-                    "function `{function_name}` references an unknown function value"
-                )))
-            }
-        }
-    }
-}
-
-fn validate_typed_place(
-    place: &mir::Place,
-    function_name: &str,
-    locals: &HashMap<mir::LocalId, mir::Type>,
-    signatures: &HashMap<mir::SymbolId, &mir::Function>,
-    types: &MirTypeIndex,
-) -> Result<mir::Type, BackendError> {
-    match place {
-        mir::Place::Local(local) => locals.get(local).cloned().ok_or_else(|| {
-            BackendError::new(format!(
-                "function `{function_name}` references undeclared local {local:?}"
-            ))
-        }),
-        mir::Place::Field { base, field } => {
-            let mir::Type::User(owner) =
-                validate_typed_place(base, function_name, locals, signatures, types)?
-            else {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` reads a struct field from a non-struct place"
-                )));
-            };
-            types
-                .struct_fields
-                .get(&(owner, *field))
-                .cloned()
-                .ok_or_else(|| BackendError::new("MIR struct field does not belong to its base"))
-        }
-        mir::Place::Index {
-            array,
-            index,
-            element_type,
-            ..
-        } => {
-            validate_typed_operand(array, function_name, locals, signatures, types)?;
-            validate_typed_operand(index, function_name, locals, signatures, types)?;
-            if array.type_ != mir::Type::Array(Box::new(element_type.clone()))
-                || index.type_ != mir::Type::Int
-            {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` contains malformed array index metadata"
-                )));
-            }
-            Ok(element_type.clone())
-        }
-        mir::Place::ObjectField { object, field } => {
-            validate_typed_operand(object, function_name, locals, signatures, types)?;
-            let mir::Type::Class(owner) = object.type_ else {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` reads an object field from a non-class value"
-                )));
-            };
-            types
-                .class_fields
-                .get(&(owner, *field))
-                .cloned()
-                .ok_or_else(|| BackendError::new("MIR class field does not belong to its object"))
-        }
-        mir::Place::EnumField { base, case, field } => {
-            let mir::Type::Enum(owner) =
-                validate_typed_place(base, function_name, locals, signatures, types)?
-            else {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` reads an enum field from a non-enum place"
-                )));
-            };
-            if types.enum_cases.get(case) != Some(&owner) {
-                return Err(BackendError::new(
-                    "MIR enum case does not belong to its base",
-                ));
-            }
-            types
-                .enum_fields
-                .get(&(*case, *field))
-                .cloned()
-                .ok_or_else(|| BackendError::new("MIR enum field does not belong to its case"))
-        }
-        mir::Place::Symbol(_) => Err(unsupported(
-            function_name,
-            "module globals, classes, and objects",
-        )),
-    }
-}
-
-fn ensure_same_type(
-    actual: &mir::Type,
-    expected: &mir::Type,
-    function_name: &str,
-    operation: &str,
-) -> Result<(), BackendError> {
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(BackendError::new(format!(
-            "function `{function_name}` has mismatched types for {operation}: `{}` and `{}`",
-            type_name(actual),
-            type_name(expected)
-        )))
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn validate_function(
     function: &mir::Function,
@@ -1466,7 +481,7 @@ fn validate_function(
     enums: &HashSet<mir::SymbolId>,
     interface_methods: &InterfaceMethods<'_>,
     implementations: &HashSet<(mir::SymbolId, mir::SymbolId)>,
-    type_index: &MirTypeIndex,
+    type_index: &mir::validate::MirTypeIndex,
 ) -> Result<(), BackendError> {
     if !function.temporary_subregion_candidates.is_empty() {
         return Err(unsupported(
@@ -1541,11 +556,7 @@ fn validate_function(
     }
     array_bounds::validate(function)?;
     validate_explicit_array_initialization(function)?;
-    type_index.validate_type(&function.return_type, &function.name)?;
-    for local in function.parameters.iter().chain(&function.locals) {
-        type_index.validate_type(&local.type_, &function.name)?;
-    }
-    validate_typed_function(function, &locals, signatures, type_index)?;
+    mir::validate::validate_function_types(function, signatures, type_index)?;
     Ok(())
 }
 
@@ -1569,6 +580,25 @@ fn validate_instruction(
         | mir::Instruction::OwnedRegionEnter { .. }
         | mir::Instruction::OwnedRegionExit { .. }
         | mir::Instruction::ForeignCall { .. } => Ok(()),
+        mir::Instruction::Retain { value } | mir::Instruction::Release { value } => {
+            if cfg!(feature = "mem-exp-rc-core")
+                && matches!(
+                    value.type_,
+                    mir::Type::Class(_)
+                        | mir::Type::Interface(_)
+                        | mir::Type::Array(_)
+                        | mir::Type::List(_)
+                        | mir::Type::Dictionary(_, _)
+                        | mir::Type::String
+                )
+            {
+                Ok(())
+            } else {
+                Err(BackendError::new(format!(
+                    "function `{function_name}` contains a reference-count instruction that is not a class, interface, array, list, dictionary or string operand under MEM-EXP-1 C5"
+                )))
+            }
+        }
         mir::Instruction::Assign { target, value } => {
             validate_assign(target, value, function_name, locals, implementations)
         }
@@ -1601,6 +631,19 @@ fn validate_instruction(
             *method,
             function_name,
             interface_methods,
+        ),
+        mir::Instruction::CallVirtual {
+            destination,
+            receiver,
+            arguments,
+            return_type,
+            ..
+        } => validate_virtual_call(
+            destination.as_ref(),
+            receiver,
+            arguments,
+            return_type,
+            function_name,
         ),
         mir::Instruction::CallIntrinsic {
             destination,
@@ -1867,1496 +910,6 @@ fn validate_instruction(
             locals,
         ),
     }
-}
-
-#[allow(clippy::too_many_lines)]
-fn validate_executable_owned_regions(
-    function: &mir::Function,
-    effects: &HashMap<mir::SymbolId, bool>,
-) -> Result<(), BackendError> {
-    let locals = function
-        .parameters
-        .iter()
-        .chain(&function.locals)
-        .map(|local| (local.id, &local.type_))
-        .collect::<HashMap<_, _>>();
-    let mut entered = HashSet::new();
-
-    for block in &function.blocks {
-        let mut active: Option<(mir::OwnedRegionId, HashSet<mir::LocalId>)> = None;
-        for instruction in &block.instructions {
-            match instruction {
-                mir::Instruction::OwnedRegionEnter { id } => {
-                    if active.is_some() || !entered.insert(*id) {
-                        return Err(unsupported(
-                            &function.name,
-                            "nested or duplicate executable owned-region enter",
-                        ));
-                    }
-                    active = Some((*id, HashSet::new()));
-                }
-                mir::Instruction::OwnedRegionExit { id, invalidated } => {
-                    let Some((active_id, produced)) = active.take() else {
-                        return Err(unsupported(
-                            &function.name,
-                            "owned-region exit without a matching enter",
-                        ));
-                    };
-                    let invalidated_set = invalidated.iter().copied().collect::<HashSet<_>>();
-                    if active_id != *id
-                        || invalidated.is_empty()
-                        || invalidated_set.len() != invalidated.len()
-                        || invalidated_set.iter().any(|local| {
-                            locals
-                                .get(local)
-                                .is_none_or(|type_| !owned_region_result_type(type_))
-                        })
-                        || produced.is_empty()
-                        || !produced.is_subset(&invalidated_set)
-                    {
-                        return Err(unsupported(
-                            &function.name,
-                            "mismatched executable owned-region exit",
-                        ));
-                    }
-                }
-                mir::Instruction::TemporarySubregionEnter { .. }
-                | mir::Instruction::TemporarySubregionExit { .. }
-                    if active.is_some() =>
-                {
-                    return Err(unsupported(
-                        &function.name,
-                        "Temporary reclaim inside an executable owned region",
-                    ));
-                }
-                instruction if active.is_some() => {
-                    let (_, aliases) = active.as_mut().expect("owned region is active");
-                    if aliases.is_empty() {
-                        let mir::Instruction::Call {
-                            destination: Some(mir::Place::Local(destination)),
-                            return_type,
-                            ..
-                        } = instruction
-                        else {
-                            return Err(unsupported(
-                                &function.name,
-                                "owned-region checkpoint not followed by its producer call",
-                            ));
-                        };
-                        if !owned_region_result_type(return_type) {
-                            return Err(unsupported(
-                                &function.name,
-                                "owned-region producer with a non-reference result",
-                            ));
-                        }
-                        aliases.insert(*destination);
-                        continue;
-                    }
-                    if owned_region_barrier(instruction, effects) {
-                        return Err(unsupported(
-                            &function.name,
-                            "unrelated Persistent effect inside an executable owned region",
-                        ));
-                    }
-                    if let mir::Instruction::Assign {
-                        target: mir::Place::Local(destination),
-                        value,
-                    } = instruction
-                        && owned_alias_source(value, aliases)
-                    {
-                        aliases.insert(*destination);
-                    }
-                }
-                _ => {}
-            }
-        }
-        if active.is_some() {
-            return Err(unsupported(
-                &function.name,
-                "executable owned region crosses a basic-block boundary",
-            ));
-        }
-    }
-
-    if entered.is_empty() {
-        return Ok(());
-    }
-    validate_owned_region_invalidated_uses(function)
-}
-
-fn owned_region_effects(
-    module: &mir::Module,
-    signatures: &HashMap<mir::SymbolId, &mir::Function>,
-) -> HashMap<mir::SymbolId, bool> {
-    // This is a fail-closed check over the explicit typed MIR contract, not a
-    // second ownership selector: source aliases and last-use stay compiler-owned.
-    let mut effects = module
-        .functions
-        .iter()
-        .map(|function| {
-            let direct = function
-                .blocks
-                .iter()
-                .flat_map(|block| &block.instructions)
-                .any(|instruction| match instruction {
-                    mir::Instruction::Call { function, .. } => !signatures.contains_key(function),
-                    _ => owned_region_direct_barrier(instruction),
-                });
-            (function.symbol, direct)
-        })
-        .collect::<HashMap<_, _>>();
-
-    loop {
-        let mut changed = false;
-        for function in &module.functions {
-            if effects[&function.symbol] {
-                continue;
-            }
-            let transitive = function
-                .blocks
-                .iter()
-                .flat_map(|block| &block.instructions)
-                .any(|instruction| {
-                    matches!(instruction,
-                        mir::Instruction::Call { function, .. }
-                            if effects.get(function).copied().unwrap_or(true))
-                });
-            if transitive {
-                effects.insert(function.symbol, true);
-                changed = true;
-            }
-        }
-        if !changed {
-            return effects;
-        }
-    }
-}
-
-fn owned_region_barrier(
-    instruction: &mir::Instruction,
-    effects: &HashMap<mir::SymbolId, bool>,
-) -> bool {
-    match instruction {
-        mir::Instruction::Call { function, .. } => effects.get(function).copied().unwrap_or(true),
-        _ => owned_region_direct_barrier(instruction),
-    }
-}
-
-fn owned_region_direct_barrier(instruction: &mir::Instruction) -> bool {
-    let persistent_allocation = match instruction {
-        mir::Instruction::AllocateObject { region, .. }
-        | mir::Instruction::AllocateArray { region, .. }
-        | mir::Instruction::AllocateList { region, .. }
-        | mir::Instruction::AllocateDictionary { region, .. }
-        | mir::Instruction::AllocateStringBuilder { region, .. }
-        | mir::Instruction::StringBuilderToString { region, .. }
-        | mir::Instruction::DictionaryEntries { region, .. }
-        | mir::Instruction::DictionaryKeys { region, .. }
-        | mir::Instruction::DictionaryValues { region, .. }
-        | mir::Instruction::ListToArray { region, .. } => {
-            *region == mir::AllocationRegion::Persistent
-        }
-        mir::Instruction::CallIntrinsic { intrinsic, .. } => {
-            intrinsic.allocation_region() == Some(mir::AllocationRegion::Persistent)
-                || is_concurrency_intrinsic(*intrinsic)
-        }
-        _ => false,
-    };
-    persistent_allocation
-        || matches!(
-            instruction,
-            mir::Instruction::CallInterface { .. }
-                | mir::Instruction::ListAdd { .. }
-                | mir::Instruction::DictionaryAdd { .. }
-                | mir::Instruction::DictionarySet { .. }
-                | mir::Instruction::StringBuilderAppend { .. }
-        )
-}
-
-fn owned_alias_source(value: &mir::Rvalue, aliases: &HashSet<mir::LocalId>) -> bool {
-    matches!(
-        &value.kind,
-        mir::RvalueKind::Use(mir::Operand {
-            kind: mir::OperandKind::Copy(mir::Place::Local(local)),
-            ..
-        }) | mir::RvalueKind::Cast(mir::Operand {
-            kind: mir::OperandKind::Copy(mir::Place::Local(local)),
-            ..
-        }) if owned_region_result_type(&value.type_) && aliases.contains(local)
-    )
-}
-
-fn owned_region_result_type(type_: &mir::Type) -> bool {
-    matches!(
-        type_,
-        mir::Type::String
-            | mir::Type::Array(_)
-            | mir::Type::Class(_)
-            | mir::Type::List(_)
-            | mir::Type::Dictionary(_, _)
-    )
-}
-
-fn validate_owned_region_invalidated_uses(function: &mir::Function) -> Result<(), BackendError> {
-    let blocks = function
-        .blocks
-        .iter()
-        .map(|block| (block.id, block))
-        .collect::<HashMap<_, _>>();
-    let mut incoming = HashMap::from([(function.entry, HashSet::<mir::LocalId>::new())]);
-    let mut pending = vec![function.entry];
-    while let Some(block_id) = pending.pop() {
-        let Some(block) = blocks.get(&block_id) else {
-            return Err(unsupported(&function.name, "malformed owned-region CFG"));
-        };
-        let mut invalid = incoming[&block_id].clone();
-        for instruction in &block.instructions {
-            let mut reads = HashSet::new();
-            owned_instruction_reads(instruction, &mut reads);
-            if reads.iter().any(|local| invalid.contains(local)) {
-                return Err(unsupported(
-                    &function.name,
-                    "use of a reclaimed owned-region local before redefinition",
-                ));
-            }
-            let mut definitions = HashSet::new();
-            owned_instruction_definitions(instruction, &mut definitions);
-            invalid.retain(|local| !definitions.contains(local));
-            if let mir::Instruction::OwnedRegionExit { invalidated, .. } = instruction {
-                invalid.extend(invalidated.iter().copied());
-            }
-        }
-        let mut terminator_reads = HashSet::new();
-        match &block.terminator {
-            mir::Terminator::Branch { condition, .. }
-            | mir::Terminator::Return(Some(condition)) => {
-                owned_operand_reads(condition, &mut terminator_reads);
-            }
-            _ => {}
-        }
-        if terminator_reads.iter().any(|local| invalid.contains(local)) {
-            return Err(unsupported(
-                &function.name,
-                "use of a reclaimed owned-region local in a terminator",
-            ));
-        }
-        let successors = match block.terminator {
-            mir::Terminator::Goto(target) => vec![target],
-            mir::Terminator::Branch {
-                then_block,
-                else_block,
-                ..
-            } => vec![then_block, else_block],
-            mir::Terminator::Return(_) | mir::Terminator::End | mir::Terminator::Unreachable => {
-                Vec::new()
-            }
-        };
-        for successor in successors {
-            if !blocks.contains_key(&successor) {
-                return Err(unsupported(&function.name, "malformed owned-region CFG"));
-            }
-            if let Some(state) = incoming.get_mut(&successor) {
-                let old_len = state.len();
-                state.extend(invalid.iter().copied());
-                if state.len() != old_len {
-                    pending.push(successor);
-                }
-            } else {
-                incoming.insert(successor, invalid.clone());
-                pending.push(successor);
-            }
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_lines)]
-fn owned_instruction_reads(instruction: &mir::Instruction, reads: &mut HashSet<mir::LocalId>) {
-    match instruction {
-        mir::Instruction::OwnedRegionEnter { .. }
-        | mir::Instruction::OwnedRegionExit { .. }
-        | mir::Instruction::TemporarySubregionEnter { .. }
-        | mir::Instruction::TemporarySubregionExit { .. } => {}
-        mir::Instruction::Assign { target, value } => {
-            if !matches!(target, mir::Place::Local(_)) {
-                owned_place_reads(target, reads);
-            }
-            owned_rvalue_reads(value, reads);
-        }
-        mir::Instruction::Call {
-            destination,
-            arguments,
-            ..
-        }
-        | mir::Instruction::ForeignCall {
-            destination,
-            arguments,
-            ..
-        }
-        | mir::Instruction::CallIntrinsic {
-            destination,
-            arguments,
-            ..
-        } => {
-            if let Some(destination) = destination
-                && !matches!(destination, mir::Place::Local(_))
-            {
-                owned_place_reads(destination, reads);
-            }
-            for argument in arguments {
-                owned_operand_reads(argument, reads);
-            }
-        }
-        mir::Instruction::CallInterface {
-            destination,
-            receiver,
-            arguments,
-            ..
-        } => {
-            if let Some(destination) = destination
-                && !matches!(destination, mir::Place::Local(_))
-            {
-                owned_place_reads(destination, reads);
-            }
-            owned_operand_reads(receiver, reads);
-            for argument in arguments {
-                owned_operand_reads(argument, reads);
-            }
-        }
-        mir::Instruction::AllocateArray {
-            destination,
-            length,
-            ..
-        } => {
-            if !matches!(destination, mir::Place::Local(_)) {
-                owned_place_reads(destination, reads);
-            }
-            owned_operand_reads(length, reads);
-        }
-        mir::Instruction::AllocateObject { destination, .. }
-        | mir::Instruction::AllocateList { destination, .. }
-        | mir::Instruction::AllocateDictionary { destination, .. }
-        | mir::Instruction::AllocateStringBuilder { destination, .. } => {
-            owned_destination_reads(destination, reads);
-        }
-        mir::Instruction::StringBuilderAppend { builder, value, .. } => {
-            owned_operand_reads(builder, reads);
-            owned_operand_reads(value, reads);
-        }
-        mir::Instruction::StringBuilderToString {
-            destination,
-            builder,
-            ..
-        } => {
-            if !matches!(destination, mir::Place::Local(_)) {
-                owned_place_reads(destination, reads);
-            }
-            owned_operand_reads(builder, reads);
-        }
-        mir::Instruction::DictionaryAdd {
-            destination,
-            dictionary,
-            key,
-            value,
-        }
-        | mir::Instruction::DictionarySet {
-            destination,
-            dictionary,
-            key,
-            value,
-        } => {
-            owned_destination_reads(destination, reads);
-            owned_operand_reads(dictionary, reads);
-            owned_operand_reads(key, reads);
-            owned_operand_reads(value, reads);
-        }
-        mir::Instruction::DictionaryTryGet {
-            destination,
-            dictionary,
-            key,
-            ..
-        }
-        | mir::Instruction::DictionaryContainsKey {
-            destination,
-            dictionary,
-            key,
-        }
-        | mir::Instruction::DictionaryRemove {
-            destination,
-            dictionary,
-            key,
-        } => {
-            owned_destination_reads(destination, reads);
-            owned_operand_reads(dictionary, reads);
-            owned_operand_reads(key, reads);
-        }
-        mir::Instruction::DictionaryEntries {
-            destination,
-            dictionary,
-            ..
-        }
-        | mir::Instruction::DictionaryKeys {
-            destination,
-            dictionary,
-            ..
-        }
-        | mir::Instruction::DictionaryValues {
-            destination,
-            dictionary,
-            ..
-        } => {
-            owned_destination_reads(destination, reads);
-            owned_operand_reads(dictionary, reads);
-        }
-        mir::Instruction::DictionaryClear { dictionary } => {
-            owned_operand_reads(dictionary, reads);
-        }
-        mir::Instruction::ListAdd { list, value } => {
-            owned_operand_reads(list, reads);
-            owned_operand_reads(value, reads);
-        }
-        mir::Instruction::ListGet {
-            destination,
-            list,
-            index,
-            ..
-        } => {
-            owned_destination_reads(destination, reads);
-            owned_operand_reads(list, reads);
-            owned_operand_reads(index, reads);
-        }
-        mir::Instruction::ListRemoveAt { list, index } => {
-            owned_operand_reads(list, reads);
-            owned_operand_reads(index, reads);
-        }
-        mir::Instruction::ListSet { list, index, value } => {
-            owned_operand_reads(list, reads);
-            owned_operand_reads(index, reads);
-            owned_operand_reads(value, reads);
-        }
-        mir::Instruction::ListClear { list } => owned_operand_reads(list, reads),
-        mir::Instruction::ListToArray {
-            destination, list, ..
-        } => {
-            owned_destination_reads(destination, reads);
-            owned_operand_reads(list, reads);
-        }
-        mir::Instruction::StringDecodeNext {
-            string,
-            cursor,
-            char_destination,
-            next_cursor_destination,
-            ok_destination,
-        } => {
-            owned_operand_reads(string, reads);
-            owned_operand_reads(cursor, reads);
-            owned_destination_reads(char_destination, reads);
-            owned_destination_reads(next_cursor_destination, reads);
-            owned_destination_reads(ok_destination, reads);
-        }
-    }
-}
-
-fn owned_instruction_definitions(
-    instruction: &mir::Instruction,
-    definitions: &mut HashSet<mir::LocalId>,
-) {
-    match instruction {
-        mir::Instruction::Assign { target, .. }
-        | mir::Instruction::AllocateArray {
-            destination: target,
-            ..
-        }
-        | mir::Instruction::AllocateObject {
-            destination: target,
-            ..
-        }
-        | mir::Instruction::AllocateList {
-            destination: target,
-            ..
-        }
-        | mir::Instruction::AllocateDictionary {
-            destination: target,
-            ..
-        }
-        | mir::Instruction::AllocateStringBuilder {
-            destination: target,
-            ..
-        }
-        | mir::Instruction::StringBuilderToString {
-            destination: target,
-            ..
-        }
-        | mir::Instruction::DictionaryAdd {
-            destination: target,
-            ..
-        }
-        | mir::Instruction::DictionarySet {
-            destination: target,
-            ..
-        }
-        | mir::Instruction::DictionaryTryGet {
-            destination: target,
-            ..
-        }
-        | mir::Instruction::DictionaryContainsKey {
-            destination: target,
-            ..
-        }
-        | mir::Instruction::DictionaryRemove {
-            destination: target,
-            ..
-        }
-        | mir::Instruction::DictionaryEntries {
-            destination: target,
-            ..
-        }
-        | mir::Instruction::DictionaryKeys {
-            destination: target,
-            ..
-        }
-        | mir::Instruction::DictionaryValues {
-            destination: target,
-            ..
-        }
-        | mir::Instruction::ListGet {
-            destination: target,
-            ..
-        }
-        | mir::Instruction::ListToArray {
-            destination: target,
-            ..
-        } => owned_place_definition(target, definitions),
-        mir::Instruction::Call { destination, .. }
-        | mir::Instruction::CallInterface { destination, .. }
-        | mir::Instruction::CallIntrinsic { destination, .. } => {
-            if let Some(destination) = destination {
-                owned_place_definition(destination, definitions);
-            }
-        }
-        mir::Instruction::StringDecodeNext {
-            char_destination,
-            next_cursor_destination,
-            ok_destination,
-            ..
-        } => {
-            owned_place_definition(char_destination, definitions);
-            owned_place_definition(next_cursor_destination, definitions);
-            owned_place_definition(ok_destination, definitions);
-        }
-        _ => {}
-    }
-}
-
-fn owned_place_definition(place: &mir::Place, definitions: &mut HashSet<mir::LocalId>) {
-    if let mir::Place::Local(local) = place {
-        definitions.insert(*local);
-    }
-}
-
-fn owned_destination_reads(place: &mir::Place, reads: &mut HashSet<mir::LocalId>) {
-    if !matches!(place, mir::Place::Local(_)) {
-        owned_place_reads(place, reads);
-    }
-}
-
-fn owned_rvalue_reads(value: &mir::Rvalue, reads: &mut HashSet<mir::LocalId>) {
-    match &value.kind {
-        mir::RvalueKind::Use(operand)
-        | mir::RvalueKind::Discriminant(operand)
-        | mir::RvalueKind::ArrayLength(operand)
-        | mir::RvalueKind::ListLength(operand)
-        | mir::RvalueKind::DictionaryLength(operand)
-        | mir::RvalueKind::ListVersion(operand)
-        | mir::RvalueKind::StringByteLength(operand)
-        | mir::RvalueKind::Cast(operand)
-        | mir::RvalueKind::Unary { operand, .. } => owned_operand_reads(operand, reads),
-        mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
-            for field in fields {
-                owned_operand_reads(&field.value, reads);
-            }
-        }
-        mir::RvalueKind::MakeInterface { object, .. } => owned_operand_reads(object, reads),
-        mir::RvalueKind::Binary { left, right, .. }
-        | mir::RvalueKind::Equality { left, right, .. } => {
-            owned_operand_reads(left, reads);
-            owned_operand_reads(right, reads);
-        }
-    }
-}
-
-fn owned_operand_reads(operand: &mir::Operand, reads: &mut HashSet<mir::LocalId>) {
-    if let mir::OperandKind::Copy(place) = &operand.kind {
-        owned_place_reads(place, reads);
-    }
-}
-
-fn owned_place_reads(place: &mir::Place, reads: &mut HashSet<mir::LocalId>) {
-    match place {
-        mir::Place::Local(local) => {
-            reads.insert(*local);
-        }
-        mir::Place::Field { base, .. } | mir::Place::EnumField { base, .. } => {
-            owned_place_reads(base, reads);
-        }
-        mir::Place::Index { array, index, .. } => {
-            owned_operand_reads(array, reads);
-            owned_operand_reads(index, reads);
-        }
-        mir::Place::ObjectField { object, .. } => owned_operand_reads(object, reads),
-        mir::Place::Symbol(_) => {}
-    }
-}
-
-#[allow(clippy::too_many_lines)]
-fn validate_executable_temporary_subregions(function: &mir::Function) -> Result<(), BackendError> {
-    let contains_subregion = function
-        .blocks
-        .iter()
-        .flat_map(|block| &block.instructions)
-        .any(|instruction| {
-            matches!(
-                instruction,
-                mir::Instruction::TemporarySubregionEnter { .. }
-                    | mir::Instruction::TemporarySubregionExit { .. }
-            )
-        });
-    if !contains_subregion {
-        return Ok(());
-    }
-
-    if function
-        .blocks
-        .iter()
-        .flat_map(|block| &block.instructions)
-        .any(|instruction| {
-            matches!(
-                instruction,
-                mir::Instruction::CallIntrinsic { intrinsic, .. }
-                    if is_concurrency_intrinsic(*intrinsic)
-            )
-        })
-    {
-        return Err(unsupported(
-            &function.name,
-            "concurrency in an executable AARM temporary subregion function",
-        ));
-    }
-
-    validate_executable_temporary_subregion_cfg(function)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum FineState {
-    Inactive,
-    Active(mir::TemporarySubregionId),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct FineExecutionState {
-    fine: FineState,
-    owned: BTreeMap<u32, FineOwnedKind>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FineOwnedKind {
-    StringBuilder,
-    List,
-    Dictionary,
-}
-
-impl FineExecutionState {
-    fn inactive() -> Self {
-        Self {
-            fine: FineState::Inactive,
-            owned: BTreeMap::new(),
-        }
-    }
-
-    fn enter(&mut self, id: mir::TemporarySubregionId) -> Result<(), &'static str> {
-        if self.fine != FineState::Inactive {
-            return Err("nested executable AARM temporary subregion enter");
-        }
-        self.fine = FineState::Active(id);
-        self.owned.clear();
-        Ok(())
-    }
-
-    fn exit(&mut self, id: mir::TemporarySubregionId) -> Result<(), &'static str> {
-        if self.fine != FineState::Active(id) {
-            return Err("unmatched executable AARM temporary subregion exit");
-        }
-        *self = Self::inactive();
-        Ok(())
-    }
-
-    fn validate_builder_instruction(
-        &mut self,
-        instruction: &mir::Instruction,
-    ) -> Result<(), &'static str> {
-        if self.fine == FineState::Inactive {
-            return Ok(());
-        }
-        match instruction {
-            mir::Instruction::AllocateStringBuilder {
-                destination: mir::Place::Local(local),
-                region: mir::AllocationRegion::Temporary,
-                ..
-            } => {
-                if self
-                    .owned
-                    .insert(local.0, FineOwnedKind::StringBuilder)
-                    .is_some()
-                {
-                    return Err("duplicate executable AARM StringBuilder local");
-                }
-            }
-            mir::Instruction::StringBuilderAppend { builder, .. }
-            | mir::Instruction::StringBuilderToString { builder, .. } => {
-                let mir::OperandKind::Copy(mir::Place::Local(local)) = builder.kind else {
-                    return Err("non-local executable AARM StringBuilder receiver");
-                };
-                if self.owned.get(&local.0) != Some(&FineOwnedKind::StringBuilder) {
-                    return Err("unowned executable AARM StringBuilder receiver");
-                }
-            }
-            mir::Instruction::AllocateList {
-                destination: mir::Place::Local(local),
-                region: mir::AllocationRegion::Temporary,
-                ..
-            } => {
-                if self.owned.insert(local.0, FineOwnedKind::List).is_some() {
-                    return Err("duplicate executable AARM List local");
-                }
-            }
-            mir::Instruction::AllocateDictionary {
-                destination: mir::Place::Local(local),
-                region: mir::AllocationRegion::Temporary,
-                ..
-            } => {
-                if self
-                    .owned
-                    .insert(local.0, FineOwnedKind::Dictionary)
-                    .is_some()
-                {
-                    return Err("duplicate executable AARM Dictionary local");
-                }
-            }
-            mir::Instruction::ListAdd { list, .. }
-            | mir::Instruction::ListGet { list, .. }
-            | mir::Instruction::ListRemoveAt { list, .. } => {
-                if !fine_receiver_is_owned(list, FineOwnedKind::List, &self.owned) {
-                    return Err("unowned executable AARM List receiver");
-                }
-            }
-            mir::Instruction::DictionaryAdd { dictionary, .. }
-            | mir::Instruction::DictionarySet { dictionary, .. }
-            | mir::Instruction::DictionaryTryGet { dictionary, .. }
-            | mir::Instruction::DictionaryContainsKey { dictionary, .. }
-            | mir::Instruction::DictionaryRemove { dictionary, .. } => {
-                if !fine_receiver_is_owned(dictionary, FineOwnedKind::Dictionary, &self.owned) {
-                    return Err("unowned executable AARM Dictionary receiver");
-                }
-            }
-            mir::Instruction::Assign { target, value }
-                if fine_rvalue_mentions_owned_builder(value, &self.owned)
-                    || matches!(target, mir::Place::Local(local) if self.owned.contains_key(&local.0)) =>
-            {
-                return Err("aliased or overwritten executable AARM StringBuilder local");
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-}
-
-fn fine_receiver_is_owned(
-    operand: &mir::Operand,
-    expected: FineOwnedKind,
-    owned: &BTreeMap<u32, FineOwnedKind>,
-) -> bool {
-    matches!(operand.kind, mir::OperandKind::Copy(mir::Place::Local(local))
-        if owned.get(&local.0) == Some(&expected))
-}
-
-fn fine_rvalue_mentions_owned_builder(
-    value: &mir::Rvalue,
-    owned: &BTreeMap<u32, FineOwnedKind>,
-) -> bool {
-    matches!(&value.kind, mir::RvalueKind::Use(operand) | mir::RvalueKind::Cast(operand)
-        if matches!(operand.kind, mir::OperandKind::Copy(mir::Place::Local(local)) if owned.contains_key(&local.0)))
-}
-
-#[allow(clippy::too_many_lines)]
-fn validate_executable_temporary_subregion_cfg(
-    function: &mir::Function,
-) -> Result<(), BackendError> {
-    let mut blocks = HashMap::new();
-    for (index, block) in function.blocks.iter().enumerate() {
-        if blocks.insert(block.id, index).is_some() {
-            return Err(unsupported(
-                &function.name,
-                "duplicate basic blocks in executable AARM temporary subregions",
-            ));
-        }
-    }
-    if !blocks.contains_key(&function.entry) {
-        return Err(unsupported(
-            &function.name,
-            "missing executable AARM temporary subregion entry",
-        ));
-    }
-    let successors = function
-        .blocks
-        .iter()
-        .map(|block| {
-            let successors = match block.terminator {
-                mir::Terminator::Goto(target) => vec![target],
-                mir::Terminator::Branch {
-                    then_block,
-                    else_block,
-                    ..
-                } => vec![then_block, else_block],
-                mir::Terminator::Return(_) | mir::Terminator::End => Vec::new(),
-                mir::Terminator::Unreachable => return None,
-            };
-            successors
-                .iter()
-                .all(|target| blocks.contains_key(target))
-                .then_some((block.id, successors))
-        })
-        .collect::<Option<HashMap<_, _>>>()
-        .ok_or_else(|| {
-            unsupported(
-                &function.name,
-                "malformed executable AARM temporary subregion CFG",
-            )
-        })?;
-    let mut reachable = HashSet::new();
-    let mut pending = vec![function.entry];
-    while let Some(block) = pending.pop() {
-        if !reachable.insert(block) {
-            continue;
-        }
-        pending.extend(successors[&block].iter().copied());
-    }
-    if reachable.len() != blocks.len() {
-        return Err(unsupported(
-            &function.name,
-            "unreachable executable AARM temporary subregion block",
-        ));
-    }
-    validate_executable_temporary_subregion_cycles(function, &successors, &reachable)?;
-    let mut state = HashMap::from([(function.entry, FineExecutionState::inactive())]);
-    let mut entered = HashMap::new();
-    let mut allocations = HashSet::new();
-    let mut pending = vec![function.entry];
-    while let Some(block_id) = pending.pop() {
-        let mut current = state[&block_id].clone();
-        let block = &function.blocks[blocks[&block_id]];
-        for (instruction_index, instruction) in block.instructions.iter().enumerate() {
-            match instruction {
-                mir::Instruction::TemporarySubregionEnter { id } => {
-                    if entered
-                        .insert(*id, (block_id, instruction_index))
-                        .is_some_and(|previous| previous != (block_id, instruction_index))
-                        || current.enter(*id).is_err()
-                    {
-                        return Err(unsupported(
-                            &function.name,
-                            "nested or duplicate executable AARM temporary subregion enter",
-                        ));
-                    }
-                }
-                mir::Instruction::TemporarySubregionExit { id } => {
-                    if current.exit(*id).is_err() {
-                        return Err(unsupported(
-                            &function.name,
-                            "unmatched executable AARM temporary subregion exit",
-                        ));
-                    }
-                }
-                instruction if current.fine != FineState::Inactive => {
-                    current
-                        .validate_builder_instruction(instruction)
-                        .map_err(|feature| unsupported(&function.name, feature))?;
-                    if temporary_subregion_allocation_is_executable(instruction) {
-                        allocations.insert(current.fine);
-                    }
-                    if !temporary_subregion_instruction_is_executable(instruction) {
-                        return Err(unsupported(
-                            &function.name,
-                            "instruction inside an executable AARM temporary subregion",
-                        ));
-                    }
-                }
-                _ => {}
-            }
-        }
-        if matches!(
-            block.terminator,
-            mir::Terminator::Return(_) | mir::Terminator::End
-        ) && current.fine != FineState::Inactive
-        {
-            return Err(unsupported(
-                &function.name,
-                "Return or End with an active executable AARM temporary subregion",
-            ));
-        }
-        for successor in &successors[&block_id] {
-            if let Some(existing) = state.insert(*successor, current.clone()) {
-                if existing != current {
-                    return Err(unsupported(
-                        &function.name,
-                        "inconsistent executable AARM temporary subregion state at CFG join",
-                    ));
-                }
-            } else {
-                pending.push(*successor);
-            }
-        }
-    }
-    if entered
-        .keys()
-        .any(|id| !allocations.contains(&FineState::Active(*id)))
-    {
-        return Err(unsupported(
-            &function.name,
-            "executable AARM temporary subregion without a Temporary allocation",
-        ));
-    }
-    Ok(())
-}
-
-fn temporary_subregion_allocation_is_executable(instruction: &mir::Instruction) -> bool {
-    matches!(
-        instruction,
-        mir::Instruction::AllocateObject {
-            region: mir::AllocationRegion::Temporary,
-            ..
-        } | mir::Instruction::AllocateArray {
-            region: mir::AllocationRegion::Temporary,
-            ..
-        } | mir::Instruction::AllocateStringBuilder {
-            region: mir::AllocationRegion::Temporary,
-            ..
-        } | mir::Instruction::StringBuilderToString {
-            region: mir::AllocationRegion::Temporary,
-            ..
-        } | mir::Instruction::AllocateList {
-            region: mir::AllocationRegion::Temporary,
-            ..
-        } | mir::Instruction::AllocateDictionary {
-            region: mir::AllocationRegion::Temporary,
-            ..
-        }
-    ) || matches!(
-        instruction,
-        mir::Instruction::CallIntrinsic {
-            intrinsic: mir::Intrinsic::StringConcatTemporary
-                | mir::Intrinsic::StringJoinTemporary
-                | mir::Intrinsic::StringSubstringFromTemporary
-                | mir::Intrinsic::StringSubstringRangeTemporary
-                | mir::Intrinsic::StringFromLongTemporary
-                | mir::Intrinsic::StringFromULongTemporary
-                | mir::Intrinsic::StringFromDoubleTemporary
-                | mir::Intrinsic::StringFromFloatTemporary
-                | mir::Intrinsic::StringFromBoolTemporary
-                | mir::Intrinsic::StringFromCharTemporary,
-            ..
-        }
-    )
-}
-
-#[allow(clippy::too_many_lines)]
-fn validate_executable_temporary_subregion_cycles(
-    function: &mir::Function,
-    successors: &HashMap<mir::BasicBlockId, Vec<mir::BasicBlockId>>,
-    reachable: &HashSet<mir::BasicBlockId>,
-) -> Result<(), BackendError> {
-    let mut predecessors = reachable
-        .iter()
-        .copied()
-        .map(|block| (block, Vec::new()))
-        .collect::<HashMap<_, _>>();
-    for (block, targets) in successors {
-        for target in targets {
-            predecessors
-                .get_mut(target)
-                .expect("validated target")
-                .push(*block);
-        }
-    }
-    let mut order = reachable.iter().copied().collect::<Vec<_>>();
-    order.sort_unstable_by_key(|block| block.0);
-    let mut dominators = order
-        .iter()
-        .map(|block| {
-            (
-                *block,
-                if *block == function.entry {
-                    HashSet::from([*block])
-                } else {
-                    reachable.clone()
-                },
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    loop {
-        let mut changed = false;
-        for block in &order {
-            if *block == function.entry {
-                continue;
-            }
-            let mut next = predecessors[block]
-                .iter()
-                .map(|predecessor| dominators[predecessor].clone())
-                .reduce(|left, right| left.intersection(&right).copied().collect())
-                .unwrap_or_default();
-            next.insert(*block);
-            if next != dominators[block] {
-                dominators.insert(*block, next);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    let mut backedges = successors
-        .iter()
-        .flat_map(|(source, targets)| targets.iter().map(move |target| (*source, *target)))
-        .filter(|(source, target)| dominators[source].contains(target))
-        .collect::<Vec<_>>();
-    backedges.sort_unstable_by_key(|(source, target)| (source.0, target.0));
-    let backedges = backedges.into_iter().collect::<HashSet<_>>();
-    let mut indegree = reachable
-        .iter()
-        .copied()
-        .map(|block| (block, 0_usize))
-        .collect::<HashMap<_, _>>();
-    for block in reachable {
-        for successor in &successors[block] {
-            if !backedges.contains(&(*block, *successor)) {
-                *indegree
-                    .get_mut(successor)
-                    .expect("reachable successor is in the CFG") += 1;
-            }
-        }
-    }
-    let mut ready = indegree
-        .iter()
-        .filter_map(|(block, degree)| (*degree == 0).then_some(*block))
-        .collect::<Vec<_>>();
-    ready.sort_unstable_by_key(|block| std::cmp::Reverse(block.0));
-    let mut visited = 0;
-    while let Some(block) = ready.pop() {
-        visited += 1;
-        for successor in &successors[&block] {
-            if backedges.contains(&(block, *successor)) {
-                continue;
-            }
-            let degree = indegree
-                .get_mut(successor)
-                .expect("reachable successor is in the CFG");
-            *degree -= 1;
-            if *degree == 0 {
-                ready.push(*successor);
-            }
-        }
-        ready.sort_unstable_by_key(|block| std::cmp::Reverse(block.0));
-    }
-    if visited != reachable.len() {
-        return Err(unsupported(
-            &function.name,
-            "irreducible executable AARM temporary-subregion CFG",
-        ));
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_lines)]
-fn temporary_subregion_instruction_is_executable(instruction: &mir::Instruction) -> bool {
-    match instruction {
-        mir::Instruction::Assign { target, value } => {
-            temporary_subregion_place_is_executable(target)
-                && temporary_subregion_rvalue_is_executable(value)
-        }
-        mir::Instruction::AllocateArray {
-            destination,
-            element_type,
-            length,
-            ..
-        } => {
-            matches!(destination, mir::Place::Local(_))
-                && temporary_subregion_type_is_executable(element_type)
-                && temporary_subregion_operand_is_executable(length)
-        }
-        mir::Instruction::AllocateObject { destination, .. } => {
-            matches!(destination, mir::Place::Local(_))
-        }
-        mir::Instruction::AllocateStringBuilder {
-            destination,
-            region: mir::AllocationRegion::Temporary,
-            ..
-        } => matches!(destination, mir::Place::Local(_)),
-        mir::Instruction::AllocateList {
-            destination,
-            element_type,
-            region: mir::AllocationRegion::Temporary,
-        } => {
-            matches!(destination, mir::Place::Local(_))
-                && temporary_subregion_type_is_executable(element_type)
-        }
-        mir::Instruction::AllocateDictionary {
-            destination,
-            key_type,
-            value_type,
-            region: mir::AllocationRegion::Temporary,
-        } => {
-            matches!(destination, mir::Place::Local(_))
-                && temporary_subregion_type_is_executable(key_type)
-                && temporary_subregion_type_is_executable(value_type)
-        }
-        mir::Instruction::StringBuilderAppend { builder, .. } => {
-            matches!(builder.kind, mir::OperandKind::Copy(mir::Place::Local(_)))
-        }
-        mir::Instruction::StringBuilderToString {
-            destination,
-            builder,
-            ..
-        } => {
-            matches!(destination, mir::Place::Local(_))
-                && matches!(builder.kind, mir::OperandKind::Copy(mir::Place::Local(_)))
-        }
-        mir::Instruction::ListAdd { list, value } => {
-            matches!(list.kind, mir::OperandKind::Copy(mir::Place::Local(_)))
-                && temporary_subregion_operand_is_executable(value)
-        }
-        mir::Instruction::ListGet {
-            destination,
-            list,
-            index,
-            element_type,
-        } => {
-            matches!(destination, mir::Place::Local(_))
-                && matches!(list.kind, mir::OperandKind::Copy(mir::Place::Local(_)))
-                && temporary_subregion_operand_is_executable(index)
-                && temporary_subregion_type_is_executable(element_type)
-        }
-        mir::Instruction::ListRemoveAt { list, index } => {
-            matches!(list.kind, mir::OperandKind::Copy(mir::Place::Local(_)))
-                && temporary_subregion_operand_is_executable(index)
-        }
-        mir::Instruction::ListSet { list, index, value } => {
-            matches!(list.kind, mir::OperandKind::Copy(mir::Place::Local(_)))
-                && temporary_subregion_operand_is_executable(index)
-                && temporary_subregion_operand_is_executable(value)
-        }
-        mir::Instruction::ListClear { list } => {
-            matches!(list.kind, mir::OperandKind::Copy(mir::Place::Local(_)))
-        }
-        mir::Instruction::DictionaryAdd {
-            destination,
-            dictionary,
-            key,
-            value,
-        }
-        | mir::Instruction::DictionarySet {
-            destination,
-            dictionary,
-            key,
-            value,
-        } => {
-            matches!(destination, mir::Place::Local(_))
-                && matches!(
-                    dictionary.kind,
-                    mir::OperandKind::Copy(mir::Place::Local(_))
-                )
-                && temporary_subregion_operand_is_executable(key)
-                && temporary_subregion_operand_is_executable(value)
-        }
-        mir::Instruction::DictionaryContainsKey {
-            destination,
-            dictionary,
-            key,
-        }
-        | mir::Instruction::DictionaryRemove {
-            destination,
-            dictionary,
-            key,
-        } => {
-            matches!(destination, mir::Place::Local(_))
-                && matches!(
-                    dictionary.kind,
-                    mir::OperandKind::Copy(mir::Place::Local(_))
-                )
-                && temporary_subregion_operand_is_executable(key)
-        }
-        mir::Instruction::DictionaryTryGet {
-            destination,
-            dictionary,
-            key,
-            value_type,
-            ..
-        } => {
-            matches!(destination, mir::Place::Local(_))
-                && matches!(
-                    dictionary.kind,
-                    mir::OperandKind::Copy(mir::Place::Local(_))
-                )
-                && temporary_subregion_operand_is_executable(key)
-                && temporary_subregion_type_is_executable(value_type)
-        }
-        mir::Instruction::DictionaryClear { dictionary } => matches!(
-            dictionary.kind,
-            mir::OperandKind::Copy(mir::Place::Local(_))
-        ),
-        mir::Instruction::CallIntrinsic {
-            destination,
-            intrinsic,
-            arguments,
-            return_type,
-        } => temporary_subregion_immutable_string_intrinsic_is_executable(
-            destination.as_ref(),
-            *intrinsic,
-            arguments,
-            return_type,
-        ),
-        mir::Instruction::TemporarySubregionEnter { .. }
-        | mir::Instruction::TemporarySubregionExit { .. }
-        | mir::Instruction::OwnedRegionEnter { .. }
-        | mir::Instruction::OwnedRegionExit { .. }
-        | mir::Instruction::Call { .. }
-        | mir::Instruction::ForeignCall { .. }
-        | mir::Instruction::CallInterface { .. }
-        | mir::Instruction::AllocateList {
-            region: mir::AllocationRegion::Persistent,
-            ..
-        }
-        | mir::Instruction::AllocateDictionary {
-            region: mir::AllocationRegion::Persistent,
-            ..
-        }
-        | mir::Instruction::AllocateStringBuilder {
-            region: mir::AllocationRegion::Persistent,
-            ..
-        }
-        | mir::Instruction::DictionaryEntries { .. }
-        | mir::Instruction::DictionaryKeys { .. }
-        | mir::Instruction::DictionaryValues { .. }
-        | mir::Instruction::ListToArray { .. }
-        | mir::Instruction::StringDecodeNext { .. } => false,
-    }
-}
-
-fn temporary_subregion_immutable_string_intrinsic_is_executable(
-    destination: Option<&mir::Place>,
-    intrinsic: mir::Intrinsic,
-    arguments: &[mir::Operand],
-    return_type: &mir::Type,
-) -> bool {
-    matches!(destination, Some(mir::Place::Local(_)))
-        && return_type == &mir::Type::String
-        && match intrinsic {
-            mir::Intrinsic::StringConcatTemporary => {
-                matches!(arguments, [left, right] if temporary_subregion_string_input_is_executable(left) && temporary_subregion_string_input_is_executable(right))
-            }
-            mir::Intrinsic::StringJoinTemporary => arguments
-                .iter()
-                .all(temporary_subregion_string_input_is_executable),
-            mir::Intrinsic::StringSubstringFromTemporary => {
-                matches!(arguments, [value, start]
-                    if temporary_subregion_string_input_is_executable(value)
-                        && start.type_ == mir::Type::Int
-                        && temporary_subregion_operand_is_executable(start))
-            }
-            mir::Intrinsic::StringSubstringRangeTemporary => {
-                matches!(arguments, [value, start, length]
-                    if temporary_subregion_string_input_is_executable(value)
-                        && start.type_ == mir::Type::Int
-                        && length.type_ == mir::Type::Int
-                        && temporary_subregion_operand_is_executable(start)
-                        && temporary_subregion_operand_is_executable(length))
-            }
-            mir::Intrinsic::StringFromLongTemporary | mir::Intrinsic::StringFromULongTemporary => {
-                matches!(arguments, [value]
-                if match intrinsic {
-                    mir::Intrinsic::StringFromLongTemporary => matches!(
-                        value.type_,
-                        mir::Type::SByte | mir::Type::Short | mir::Type::Int | mir::Type::Long
-                    ),
-                    mir::Intrinsic::StringFromULongTemporary => matches!(
-                        value.type_,
-                        mir::Type::Byte | mir::Type::UShort | mir::Type::UInt | mir::Type::ULong
-                    ),
-                    _ => false,
-                })
-            }
-            mir::Intrinsic::StringFromDoubleTemporary => {
-                matches!(arguments, [value] if value.type_ == mir::Type::Double)
-            }
-            mir::Intrinsic::StringFromFloatTemporary => {
-                matches!(arguments, [value] if value.type_ == mir::Type::Float)
-            }
-            mir::Intrinsic::StringFromBoolTemporary => {
-                matches!(arguments, [value] if value.type_ == mir::Type::Bool)
-            }
-            mir::Intrinsic::StringFromCharTemporary => {
-                matches!(arguments, [value] if value.type_ == mir::Type::Char)
-            }
-            _ => false,
-        }
-}
-
-fn temporary_subregion_string_input_is_executable(operand: &mir::Operand) -> bool {
-    operand.type_ == mir::Type::String
-        && matches!(
-            operand.kind,
-            mir::OperandKind::Constant(mir::Constant::String(_)) | mir::OperandKind::Copy(_)
-        )
-}
-
-fn temporary_subregion_rvalue_is_executable(value: &mir::Rvalue) -> bool {
-    if !temporary_subregion_type_is_executable(&value.type_) {
-        return false;
-    }
-    match &value.kind {
-        mir::RvalueKind::Use(operand)
-        | mir::RvalueKind::Cast(operand)
-        | mir::RvalueKind::Unary { operand, .. } => {
-            temporary_subregion_operand_is_executable(operand)
-        }
-        mir::RvalueKind::Binary {
-            left,
-            operator,
-            right,
-        } => {
-            !matches!(
-                operator,
-                mir::BinaryOperator::Divide | mir::BinaryOperator::Remainder
-            ) && temporary_subregion_operand_is_executable(left)
-                && temporary_subregion_operand_is_executable(right)
-        }
-        mir::RvalueKind::Equality { left, right, .. } => {
-            temporary_subregion_equality_type_is_executable(&left.type_)
-                && temporary_subregion_operand_is_executable(left)
-                && temporary_subregion_operand_is_executable(right)
-        }
-        mir::RvalueKind::ArrayLength(operand) => {
-            matches!(operand.type_, mir::Type::Array(_))
-                && temporary_subregion_operand_is_executable(operand)
-        }
-        mir::RvalueKind::Aggregate(_)
-        | mir::RvalueKind::EnumConstruct { .. }
-        | mir::RvalueKind::Discriminant(_)
-        | mir::RvalueKind::ListLength(_)
-        | mir::RvalueKind::DictionaryLength(_)
-        | mir::RvalueKind::ListVersion(_)
-        | mir::RvalueKind::StringByteLength(_)
-        | mir::RvalueKind::MakeInterface { .. } => false,
-    }
-}
-
-fn temporary_subregion_operand_is_executable(operand: &mir::Operand) -> bool {
-    temporary_subregion_type_is_executable(&operand.type_)
-        && match &operand.kind {
-            mir::OperandKind::Constant(mir::Constant::String(_)) => false,
-            mir::OperandKind::Constant(_) | mir::OperandKind::Function(_) => true,
-            mir::OperandKind::Copy(place) => temporary_subregion_place_is_executable(place),
-        }
-}
-
-fn temporary_subregion_place_is_executable(place: &mir::Place) -> bool {
-    match place {
-        mir::Place::Local(_) => true,
-        mir::Place::Index {
-            array,
-            index,
-            element_type,
-            ..
-        } => {
-            matches!(
-                &array.type_,
-                mir::Type::Array(array_element) if array_element.as_ref() == element_type
-            ) && temporary_subregion_type_is_executable(element_type)
-                && temporary_subregion_operand_is_executable(array)
-                && temporary_subregion_operand_is_executable(index)
-        }
-        mir::Place::ObjectField { object, .. } => {
-            matches!(object.type_, mir::Type::Class(_))
-                && temporary_subregion_operand_is_executable(object)
-        }
-        mir::Place::Symbol(_) | mir::Place::Field { .. } | mir::Place::EnumField { .. } => false,
-    }
-}
-
-fn temporary_subregion_type_is_executable(type_: &mir::Type) -> bool {
-    match type_ {
-        mir::Type::Array(element) => temporary_subregion_type_is_executable(element),
-        mir::Type::Bool
-        | mir::Type::SByte
-        | mir::Type::Byte
-        | mir::Type::Short
-        | mir::Type::UShort
-        | mir::Type::Int
-        | mir::Type::UInt
-        | mir::Type::Long
-        | mir::Type::ULong
-        | mir::Type::Float
-        | mir::Type::Double
-        | mir::Type::Char
-        | mir::Type::Class(_) => true,
-        mir::Type::String
-        | mir::Type::User(_)
-        | mir::Type::Interface(_)
-        | mir::Type::Enum(_)
-        | mir::Type::Task(_)
-        | mir::Type::List(_)
-        | mir::Type::Dictionary(_, _)
-        | mir::Type::Void
-        | mir::Type::Decimal
-        | mir::Type::Unknown => false,
-    }
-}
-
-fn temporary_subregion_equality_type_is_executable(type_: &mir::Type) -> bool {
-    matches!(
-        type_,
-        mir::Type::Bool
-            | mir::Type::SByte
-            | mir::Type::Byte
-            | mir::Type::Short
-            | mir::Type::UShort
-            | mir::Type::Int
-            | mir::Type::UInt
-            | mir::Type::Long
-            | mir::Type::ULong
-            | mir::Type::Float
-            | mir::Type::Double
-            | mir::Type::Char
-            | mir::Type::Class(_)
-            | mir::Type::Array(_)
-    )
-}
-
-fn is_concurrency_intrinsic(intrinsic: mir::Intrinsic) -> bool {
-    matches!(
-        intrinsic,
-        mir::Intrinsic::TaskRun
-            | mir::Intrinsic::TaskWait
-            | mir::Intrinsic::AsyncSpawn
-            | mir::Intrinsic::AsyncState
-            | mir::Intrinsic::AsyncSetState
-            | mir::Intrinsic::AsyncStoreSlot
-            | mir::Intrinsic::AsyncLoadSlot
-            | mir::Intrinsic::AsyncSpawnInner
-            | mir::Intrinsic::AsyncAwaitResult
-            | mir::Intrinsic::AsyncSetResult
-            | mir::Intrinsic::ParallelFor
-            | mir::Intrinsic::ParallelForEach
-            | mir::Intrinsic::ParallelReduce
-    )
 }
 
 fn declared_local_type<'a>(
@@ -4136,6 +1689,10 @@ fn is_string_method_intrinsic(intrinsic: mir::Intrinsic) -> bool {
             | mir::Intrinsic::StringTryParseDouble
             | mir::Intrinsic::ConsoleWrite
             | mir::Intrinsic::ConsoleWriteLine
+            | mir::Intrinsic::ConsoleWriteError
+            | mir::Intrinsic::EnvironmentHasVariable
+            | mir::Intrinsic::EnvironmentGetVariable
+            | mir::Intrinsic::EnvironmentGetVariableTemporary
             | mir::Intrinsic::ConsoleReadLine
             | mir::Intrinsic::ConsoleReadLineTemporary
     )
@@ -4789,6 +2346,32 @@ fn type_name_owned(type_: &mir::Type) -> String {
     }
 }
 
+/// Operand and destination shapes of a virtual call. The slot, the method that
+/// owns it and the exact argument types were checked against the receiver
+/// class's virtual table by the backend-neutral MIR validation.
+fn validate_virtual_call(
+    destination: Option<&mir::Place>,
+    receiver: &mir::Operand,
+    arguments: &[mir::Operand],
+    return_type: &mir::Type,
+    function_name: &str,
+) -> Result<(), BackendError> {
+    if let Some(destination) = destination {
+        validate_place(destination, function_name)?;
+    }
+    if !matches!(receiver.type_, mir::Type::Class(_)) {
+        return Err(BackendError::new(format!(
+            "function `{function_name}` has a virtual call with a non-class receiver"
+        )));
+    }
+    validate_operand(receiver, function_name)?;
+    validate_call_destination_shape(destination, return_type, function_name, "virtual method")?;
+    for argument in arguments {
+        validate_operand(argument, function_name)?;
+    }
+    validate_return_type(return_type, function_name)
+}
+
 fn validate_interface_call(
     destination: Option<&mir::Place>,
     receiver: &mir::Operand,
@@ -5121,10 +2704,23 @@ fn validate_intrinsic_shape(
                 && matches!(return_type, mir::Type::Enum(_))
                 && matches!(arguments, [receiver] if receiver.type_ == mir::Type::String)
         }
-        mir::Intrinsic::ConsoleWrite | mir::Intrinsic::ConsoleWriteLine => {
+        mir::Intrinsic::ConsoleWrite
+        | mir::Intrinsic::ConsoleWriteLine
+        | mir::Intrinsic::ConsoleWriteError => {
             destination.is_none()
                 && *return_type == mir::Type::Void
                 && matches!(arguments, [value] if value.type_ == mir::Type::String)
+        }
+        mir::Intrinsic::EnvironmentHasVariable => {
+            destination.is_some()
+                && *return_type == mir::Type::Bool
+                && matches!(arguments, [name] if name.type_ == mir::Type::String)
+        }
+        mir::Intrinsic::EnvironmentGetVariable
+        | mir::Intrinsic::EnvironmentGetVariableTemporary => {
+            destination.is_some()
+                && *return_type == mir::Type::String
+                && matches!(arguments, [name] if name.type_ == mir::Type::String)
         }
         // `aster.io.ReadLine()`: aridade zero, a destination whose type is
         // *some* concrete enum. `validate_string_try_parse_targets` (reused
@@ -5171,8 +2767,8 @@ fn validate_intrinsic_shape(
                     (mir::Type::Task(result), [function, values @ ..])
                         if matches!(function.kind, mir::OperandKind::Function(_))
                             && function.type_ == **result
-                            && is_worker_transferable(result)
-                            && values.iter().all(|value| task_argument_shape(&value.type_))
+                            && copy_result_shape(result)
+                            && values.iter().all(|value| copy_argument_shape(&value.type_))
                             && function_operand_matches(
                                 function,
                                 &values.iter().map(|value| value.type_.clone()).collect::<Vec<_>>(),
@@ -5183,7 +2779,7 @@ fn validate_intrinsic_shape(
         }
         mir::Intrinsic::TaskWait => {
             destination.is_some()
-                && is_worker_transferable(return_type)
+                && copy_result_shape(return_type)
                 && matches!(
                     arguments,
                     [argument] if matches!(
@@ -5197,7 +2793,7 @@ fn validate_intrinsic_shape(
                 && matches!(
                     (return_type, arguments),
                     (mir::Type::Array(result), [tasks])
-                        if is_worker_transferable(result)
+                        if copy_result_shape(result)
                             && tasks.type_ == mir::Type::Array(Box::new(mir::Type::Task(result.clone())))
                 )
         }
@@ -5415,19 +3011,6 @@ fn validate_rvalue(
     locals: &HashMap<mir::LocalId, mir::Type>,
 ) -> Result<(), BackendError> {
     validate_value_type(&value.type_, function_name)?;
-    if matches!(value.type_, mir::Type::Float | mir::Type::Double)
-        && matches!(
-            value.kind,
-            mir::RvalueKind::Binary {
-                operator: mir::BinaryOperator::Remainder,
-                ..
-            }
-        )
-    {
-        return Err(BackendError::new(format!(
-            "floating-point remainder is not yet supported by the JIT in function `{function_name}`"
-        )));
-    }
     match &value.kind {
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             for field in fields {
@@ -5520,9 +3103,44 @@ fn validate_rvalue(
             }
             validate_operand_with_proven_bounds(object, function_name, true)
         }
+        mir::RvalueKind::InterfaceTest { object, .. } => {
+            validate_operand_with_proven_bounds(object, function_name, true)?;
+            if !matches!(object.type_, mir::Type::Class(_) | mir::Type::Interface(_))
+                || value.type_ != mir::Type::Bool
+            {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` has a malformed interface test"
+                )));
+            }
+            Ok(())
+        }
+        mir::RvalueKind::InterfaceLookup { object, interface } => {
+            validate_operand_with_proven_bounds(object, function_name, true)?;
+            if !matches!(object.type_, mir::Type::Class(_) | mir::Type::Interface(_))
+                || value.type_ != mir::Type::Interface(*interface)
+            {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` has a malformed interface lookup"
+                )));
+            }
+            Ok(())
+        }
+        mir::RvalueKind::ClassTest { object, .. } => {
+            validate_operand_with_proven_bounds(object, function_name, true)?;
+            if !matches!(object.type_, mir::Type::Class(_) | mir::Type::Interface(_))
+                || value.type_ != mir::Type::Bool
+            {
+                return Err(BackendError::new(format!(
+                    "function `{function_name}` has a malformed class test"
+                )));
+            }
+            Ok(())
+        }
         mir::RvalueKind::Discriminant(operand)
         | mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
+        | mir::RvalueKind::Downcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => {
             validate_operand_with_proven_bounds(operand, function_name, true)
         }
@@ -5568,9 +3186,7 @@ fn validate_division_or_remainder_shape(
         )));
     }
     let integer = primitive(&left.type_).is_some_and(aster_types::Primitive::is_integer);
-    let supported = integer
-        || (operator == mir::BinaryOperator::Divide
-            && matches!(left.type_, mir::Type::Float | mir::Type::Double));
+    let supported = integer || matches!(left.type_, mir::Type::Float | mir::Type::Double);
     if supported {
         Ok(())
     } else {
@@ -5586,7 +3202,7 @@ fn validate_terminator(
     blocks: &HashSet<mir::BasicBlockId>,
 ) -> Result<(), BackendError> {
     match terminator {
-        mir::Terminator::Goto(target) => validate_block_target(*target, function_name, blocks),
+        mir::Terminator::Goto(target) => Ok(validate_block_target(*target, function_name, blocks)?),
         mir::Terminator::Branch {
             condition,
             then_block,
@@ -5599,7 +3215,7 @@ fn validate_terminator(
                 )));
             }
             validate_block_target(*then_block, function_name, blocks)?;
-            validate_block_target(*else_block, function_name, blocks)
+            Ok(validate_block_target(*else_block, function_name, blocks)?)
         }
         mir::Terminator::Return(Some(value)) => validate_operand(value, function_name),
         mir::Terminator::Return(None) | mir::Terminator::End | mir::Terminator::Unreachable => {
@@ -5608,55 +3224,8 @@ fn validate_terminator(
     }
 }
 
-fn validate_block_target(
-    target: mir::BasicBlockId,
-    function_name: &str,
-    blocks: &HashSet<mir::BasicBlockId>,
-) -> Result<(), BackendError> {
-    if blocks.contains(&target) {
-        Ok(())
-    } else {
-        Err(BackendError::new(format!(
-            "function `{function_name}` references unknown basic block {target:?}"
-        )))
-    }
-}
-
 fn validate_operand(operand: &mir::Operand, function_name: &str) -> Result<(), BackendError> {
     validate_operand_with_proven_bounds(operand, function_name, false)
-}
-
-fn validate_constant_type(
-    constant: &mir::Constant,
-    type_: &mir::Type,
-    function_name: &str,
-) -> Result<(), BackendError> {
-    let matches = match constant {
-        mir::Constant::Integer(_) => matches!(
-            type_,
-            mir::Type::SByte
-                | mir::Type::Byte
-                | mir::Type::Short
-                | mir::Type::UShort
-                | mir::Type::Int
-                | mir::Type::UInt
-                | mir::Type::Long
-                | mir::Type::ULong
-        ),
-        mir::Constant::Float(_) => matches!(type_, mir::Type::Float | mir::Type::Double),
-        mir::Constant::Decimal(_) => *type_ == mir::Type::Decimal,
-        mir::Constant::String(_) => *type_ == mir::Type::String,
-        mir::Constant::Character(_) => *type_ == mir::Type::Char,
-        mir::Constant::Boolean(_) => *type_ == mir::Type::Bool,
-    };
-    if matches {
-        Ok(())
-    } else {
-        Err(BackendError::new(format!(
-            "function `{function_name}` gives a MIR constant an incompatible type `{}`",
-            type_name(type_)
-        )))
-    }
 }
 
 fn validate_call_destination_shape(
@@ -5766,10 +3335,30 @@ fn is_worker_transferable(type_: &mir::Type) -> bool {
     primitive(type_).is_some_and(aster_types::Primitive::is_worker_transferable)
 }
 
+/// Shallow shape of a value that may cross `Task.Run` by deep copy: scalars,
+/// strings, collections, structs and enums. Contents are checked nominally by
+/// `validate_task_argument_transfer`.
+fn copy_argument_shape(type_: &mir::Type) -> bool {
+    task_argument_shape(type_)
+        || matches!(
+            type_,
+            mir::Type::String
+                | mir::Type::Array(_)
+                | mir::Type::List(_)
+                | mir::Type::Dictionary(_, _)
+        )
+}
+
+/// Shallow shape of a task result: any copy-transferable value.
+fn copy_result_shape(type_: &mir::Type) -> bool {
+    copy_argument_shape(type_)
+}
+
 fn task_argument_shape(type_: &mir::Type) -> bool {
     is_worker_transferable(type_) || matches!(type_, mir::Type::User(_) | mir::Type::Enum(_))
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_task_argument_transfer(
     module: &mir::Module,
     structs: &HashMap<mir::SymbolId, &mir::StructDefinition>,
@@ -5780,9 +3369,23 @@ fn validate_task_argument_transfer(
         structs: &HashMap<mir::SymbolId, &mir::StructDefinition>,
         enums: &HashMap<mir::SymbolId, &mir::EnumDefinition>,
         visiting: &mut HashSet<mir::SymbolId>,
+        deep: bool,
     ) -> bool {
         if is_worker_transferable(type_) {
             return true;
+        }
+        if deep {
+            match type_ {
+                mir::Type::String => return true,
+                mir::Type::Array(element) | mir::Type::List(element) => {
+                    return transferable(element, structs, enums, visiting, deep);
+                }
+                mir::Type::Dictionary(key, value) => {
+                    return transferable(key, structs, enums, visiting, deep)
+                        && transferable(value, structs, enums, visiting, deep);
+                }
+                _ => {}
+            }
         }
         let symbol = match type_ {
             mir::Type::User(symbol) | mir::Type::Enum(symbol) => *symbol,
@@ -5796,13 +3399,13 @@ fn validate_task_argument_transfer(
                 definition
                     .fields
                     .iter()
-                    .all(|field| transferable(&field.type_, structs, enums, visiting))
+                    .all(|field| transferable(&field.type_, structs, enums, visiting, deep))
             }),
             mir::Type::Enum(_) => enums.get(&symbol).is_some_and(|definition| {
                 definition.cases.iter().all(|case| {
                     case.fields
                         .iter()
-                        .all(|field| transferable(&field.type_, structs, enums, visiting))
+                        .all(|field| transferable(&field.type_, structs, enums, visiting, deep))
                 })
             }),
             _ => false,
@@ -5816,18 +3419,45 @@ fn validate_task_argument_transfer(
             let mir::Instruction::CallIntrinsic {
                 intrinsic,
                 arguments,
+                return_type,
                 ..
             } = instruction
             else {
                 continue;
             };
-            let skip = match intrinsic {
-                mir::Intrinsic::TaskRun => 1,
-                mir::Intrinsic::AsyncSpawnInner => 2,
+            let (skip, deep) = match intrinsic {
+                mir::Intrinsic::TaskRun => (1, true),
+                mir::Intrinsic::AsyncSpawnInner => (2, false),
+                mir::Intrinsic::TaskWait | mir::Intrinsic::TaskWaitAll => {
+                    let result = match return_type {
+                        mir::Type::Array(element) if *intrinsic == mir::Intrinsic::TaskWaitAll => {
+                            element
+                        }
+                        other => other,
+                    };
+                    if !transferable(result, structs, enums, &mut HashSet::new(), true) {
+                        return Err(BackendError::new(format!(
+                            "function `{}` contains a malformed {intrinsic:?} with non-transferable result type `{}`",
+                            function.name,
+                            type_name(result)
+                        )));
+                    }
+                    continue;
+                }
                 _ => continue,
             };
+            if *intrinsic == mir::Intrinsic::TaskRun
+                && let mir::Type::Task(result) = return_type
+                && !transferable(result, structs, enums, &mut HashSet::new(), true)
+            {
+                return Err(BackendError::new(format!(
+                    "function `{}` contains a malformed TaskRun with non-transferable result type `{}`",
+                    function.name,
+                    type_name(result)
+                )));
+            }
             for argument in arguments.iter().skip(skip) {
-                if !transferable(&argument.type_, structs, enums, &mut HashSet::new()) {
+                if !transferable(&argument.type_, structs, enums, &mut HashSet::new(), deep) {
                     return Err(BackendError::new(format!(
                         "function `{}` contains a malformed TaskRun with non-transferable argument type `{}`",
                         function.name,
@@ -6322,88 +3952,6 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_STRING_BUILDER_ID: AtomicU64 = AtomicU64::new(0);
-
-    fn fine_builder_allocation(local: u32, region: mir::AllocationRegion) -> mir::Instruction {
-        mir::Instruction::AllocateStringBuilder {
-            destination: mir::Place::Local(mir::LocalId(local)),
-            class: mir::SymbolId(900),
-            region,
-        }
-    }
-
-    fn fine_builder_append(local: u32) -> mir::Instruction {
-        mir::Instruction::StringBuilderAppend {
-            builder: mir::Operand {
-                type_: mir::Type::Class(mir::SymbolId(900)),
-                kind: mir::OperandKind::Copy(mir::Place::Local(mir::LocalId(local))),
-            },
-            value: mir::Operand {
-                type_: mir::Type::String,
-                kind: mir::OperandKind::Constant(mir::Constant::String("x".to_owned())),
-            },
-            class: mir::SymbolId(900),
-        }
-    }
-
-    #[test]
-    fn fine_builder_provenance_state_is_exact_at_joins_and_resets_per_region() {
-        let id = mir::TemporarySubregionId(7);
-        let allocation = fine_builder_allocation(1, mir::AllocationRegion::Temporary);
-        let append = fine_builder_append(1);
-        let mut state = FineExecutionState::inactive();
-
-        state.enter(id).expect("fine Enter starts ownership domain");
-        assert!(state.owned.is_empty());
-        state
-            .validate_builder_instruction(&allocation)
-            .expect("Temporary direct-local builder becomes owned");
-        assert_eq!(
-            state.owned,
-            BTreeMap::from([(1, FineOwnedKind::StringBuilder)])
-        );
-        state
-            .validate_builder_instruction(&append)
-            .expect("Append on the owned local is structurally valid");
-
-        let identical_join = state.clone();
-        assert_eq!(state, identical_join, "identical incoming sets join");
-        let mut mismatched_join = state.clone();
-        mismatched_join
-            .owned
-            .insert(2, FineOwnedKind::StringBuilder);
-        assert_ne!(
-            state, mismatched_join,
-            "different incoming sets cannot join"
-        );
-
-        state
-            .exit(id)
-            .expect("matching Exit closes ownership domain");
-        assert_eq!(state, FineExecutionState::inactive());
-        state
-            .enter(id)
-            .expect("next loop iteration starts a new domain");
-        assert!(state.owned.is_empty());
-        assert!(state.validate_builder_instruction(&append).is_err());
-        assert!(state.enter(mir::TemporarySubregionId(8)).is_err());
-        assert!(state.exit(mir::TemporarySubregionId(8)).is_err());
-
-        let persistent = fine_builder_allocation(1, mir::AllocationRegion::Persistent);
-        let mut persistent_state = FineExecutionState::inactive();
-        persistent_state.enter(id).expect("fine Enter");
-        persistent_state
-            .validate_builder_instruction(&persistent)
-            .expect("Persistent builder is observed but not owned");
-        assert!(persistent_state.owned.is_empty());
-        assert!(
-            persistent_state
-                .validate_builder_instruction(&append)
-                .is_err()
-        );
-
-        assert!(temporary_subregion_instruction_is_executable(&allocation));
-        assert!(temporary_subregion_instruction_is_executable(&append));
-    }
 
     fn string_builder_module() -> mir::Module {
         let id = NEXT_STRING_BUILDER_ID.fetch_add(1, Ordering::Relaxed);
@@ -8104,6 +5652,10 @@ mod tests {
             mir::Type::Class(class_symbol),
         );
         module.classes.push(mir::ClassDefinition {
+            base: None,
+            is_abstract: false,
+            is_sealed: false,
+            vtable: Vec::new(),
             symbol: class_symbol,
             name: "Widget".to_owned(),
             fields: Vec::new(),
@@ -8348,6 +5900,10 @@ mod tests {
             mir::Type::Class(class_symbol),
         );
         module.classes.push(mir::ClassDefinition {
+            base: None,
+            is_abstract: false,
+            is_sealed: false,
+            vtable: Vec::new(),
             symbol: class_symbol,
             name: "Widget".to_owned(),
             fields: Vec::new(),
@@ -8531,6 +6087,10 @@ mod tests {
             mir::Type::Class(class_symbol),
         );
         module.classes.push(mir::ClassDefinition {
+            base: None,
+            is_abstract: false,
+            is_sealed: false,
+            vtable: Vec::new(),
             symbol: class_symbol,
             name: "Widget".to_owned(),
             fields: Vec::new(),
@@ -8662,6 +6222,10 @@ mod tests {
             mir::Type::Int,
         );
         module.classes.push(mir::ClassDefinition {
+            base: None,
+            is_abstract: false,
+            is_sealed: false,
+            vtable: Vec::new(),
             symbol: class_symbol,
             name: "Widget".to_owned(),
             fields: Vec::new(),

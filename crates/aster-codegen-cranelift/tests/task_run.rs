@@ -160,7 +160,7 @@ fn an_instance_method_is_rejected() {
 }
 
 #[test]
-fn a_non_transferable_return_type_is_rejected() {
+fn a_string_return_type_crosses_by_copy() {
     let errors = compile_errors(
         r#"
         public string Text() { return "hi"; }
@@ -171,10 +171,8 @@ fn a_non_transferable_return_type_is_rejected() {
         "#,
     );
     assert!(
-        errors
-            .iter()
-            .any(|message| message.contains("cross a worker boundary")),
-        "expected the non-transferable-result diagnostic, got {errors:?}"
+        errors.is_empty(),
+        "the value must now cross by copy, got {errors:?}"
     );
 }
 
@@ -239,7 +237,7 @@ fn an_interface_return_type_is_rejected() {
 }
 
 #[test]
-fn an_enum_return_type_is_rejected() {
+fn an_enum_return_type_crosses_by_copy() {
     let errors = compile_errors(
         r"
         public enum Color { Red, Green, Blue }
@@ -251,15 +249,13 @@ fn an_enum_return_type_is_rejected() {
         ",
     );
     assert!(
-        errors
-            .iter()
-            .any(|message| message.contains("cross a worker boundary")),
-        "expected the non-transferable-result diagnostic for an enum, got {errors:?}"
+        errors.is_empty(),
+        "the value must now cross by copy, got {errors:?}"
     );
 }
 
 #[test]
-fn a_struct_return_type_is_rejected() {
+fn a_struct_return_type_crosses_by_copy() {
     let errors = compile_errors(
         r"
         public struct Point { public int x; public int y; }
@@ -271,10 +267,8 @@ fn a_struct_return_type_is_rejected() {
         ",
     );
     assert!(
-        errors
-            .iter()
-            .any(|message| message.contains("cross a worker boundary")),
-        "expected the non-transferable-result diagnostic for a struct, got {errors:?}"
+        errors.is_empty(),
+        "the value must now cross by copy, got {errors:?}"
     );
 }
 
@@ -296,7 +290,7 @@ fn a_struct_method_can_produce_an_already_transferable_scalar_result() {
 }
 
 #[test]
-fn generic_methods_do_not_disguise_non_transferable_worker_results() {
+fn generic_methods_do_not_disguise_worker_results() {
     let errors = compile_errors(
         r#"
         public class Tools {
@@ -308,10 +302,8 @@ fn generic_methods_do_not_disguise_non_transferable_worker_results() {
         "#,
     );
     assert!(
-        errors
-            .iter()
-            .any(|message| message.contains("cross a worker boundary")),
-        "expected the non-transferable-result diagnostic, got {errors:?}"
+        errors.is_empty(),
+        "the value must now cross by copy, got {errors:?}"
     );
 
     let reference_struct = compile_errors(
@@ -322,15 +314,13 @@ fn generic_methods_do_not_disguise_non_transferable_worker_results() {
         "#,
     );
     assert!(
-        reference_struct
-            .iter()
-            .any(|message| message.contains("cross a worker boundary")),
-        "expected reference-bearing struct rejection, got {reference_struct:?}"
+        reference_struct.is_empty(),
+        "the value must now cross by copy, got {reference_struct:?}"
     );
 }
 
 #[test]
-fn an_array_return_type_is_rejected() {
+fn an_array_return_type_crosses_by_copy() {
     let errors = compile_errors(
         r"
         public int[] Make() { return [1, 2, 3]; }
@@ -341,10 +331,8 @@ fn an_array_return_type_is_rejected() {
         ",
     );
     assert!(
-        errors
-            .iter()
-            .any(|message| message.contains("cross a worker boundary")),
-        "expected the non-transferable-result diagnostic for an array, got {errors:?}"
+        errors.is_empty(),
+        "the value must now cross by copy, got {errors:?}"
     );
 }
 
@@ -624,7 +612,7 @@ fn the_controlled_error_prefix_is_not_duplicated() {
 }
 
 #[test]
-fn a_list_return_type_is_rejected() {
+fn a_list_return_type_crosses_by_copy() {
     // `List<T>` (Lote List A) is a native reference type like `Class`/`Array`,
     // never mapped by `values::primitive`, so it fails the same
     // `is_worker_transferable` gate with no List-specific exception needed.
@@ -641,9 +629,7 @@ fn a_list_return_type_is_rejected() {
         ",
     );
     assert!(
-        errors
-            .iter()
-            .any(|message| message.contains("cross a worker boundary")),
-        "expected the non-transferable-result diagnostic for List<int>, got {errors:?}"
+        errors.is_empty(),
+        "the value must now cross by copy, got {errors:?}"
     );
 }

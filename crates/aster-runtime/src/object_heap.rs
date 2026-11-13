@@ -1,0 +1,471 @@
+//! MEM-EXP-1 experiment (stages B and C): a size-class heap for escaping class
+//! objects and the reference-count primitives that will release into it.
+//!
+//! Not part of default execution: compiled only with the `mem-exp-heap`
+//! feature. Fresh blocks come from the context's Persistent arena, so their
+//! addresses are stable and every page is still released with the context;
+//! released blocks return to a per-size-class free list and are zeroed again
+//! when reused. Debug builds poison a released block so a use after release
+//! reads an unmistakable pattern instead of plausible data.
+//!
+//! Object layout used by the primitives (H12, the stage A candidate):
+//! offset 0 holds a pointer to an immutable [`ObjectDescriptor`]; offset 8
+//! holds the strong count in the low 29 bits (three high bits are reserved
+//! flags). [`IMMORTAL`] marks objects that are never counted: region-owned,
+//! module-owned, or saturated.
+
+#![allow(
+    clippy::cast_ptr_alignment,
+    reason = "objects are 8-byte aligned by the allocator contract"
+)]
+
+use std::ptr;
+
+/// Number of small classes (16 B to 2 KiB): the only ones class objects and
+/// collection headers use.
+pub(crate) const SMALL_CLASS_COUNT: usize = 15;
+
+/// Block sizes, in bytes. A larger object is not managed by the heap.
+#[cfg(not(feature = "mem-exp-rc"))]
+pub(crate) const SIZE_CLASSES: [u32; SMALL_CLASS_COUNT] = [
+    16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048,
+];
+
+/// Block sizes, in bytes: the small classes, then (design section 12) the
+/// power-of-two large classes 4 KiB to 1 MiB that serve buffers and strings
+/// only. A larger block is not managed by the heap.
+#[cfg(feature = "mem-exp-rc")]
+pub(crate) const SIZE_CLASSES: [u32; SMALL_CLASS_COUNT + 9] = [
+    16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 4096, 8192, 16_384,
+    32_768, 65_536, 131_072, 262_144, 524_288, 1_048_576,
+];
+
+/// Offset of the count word in a counted object.
+pub const COUNT_OFFSET: usize = 8;
+/// Mask of the strong count inside the count word.
+pub const COUNT_MASK: u32 = (1 << 29) - 1;
+/// Count value meaning "never counted, never released".
+pub const IMMORTAL: u32 = COUNT_MASK;
+/// Bit position of the 3-bit object kind inside the count word (bits 29-31).
+pub const KIND_SHIFT: u32 = 29;
+/// Mask of the kind field inside the count word.
+pub const KIND_MASK: u32 = 0b111 << KIND_SHIFT;
+/// Kind 0: class object (descriptor word names the class descriptor).
+pub const KIND_OBJECT: u32 = 0;
+/// Kind 1: array header whose descriptor word names the element descriptor
+/// (MEM-EXP-1 U8).
+pub const KIND_ARRAY: u32 = 1;
+/// Kind 2: ABI string (no children; its block size follows from its length).
+pub const KIND_STRING: u32 = 2;
+/// Kind 3: list header whose descriptor word names the element descriptor
+/// (design section 10).
+pub const KIND_LIST: u32 = 3;
+/// Kind 4: dictionary header whose descriptor word names a
+/// [`DictionaryDescriptors`] pair (design section 11).
+pub const KIND_DICTIONARY: u32 = 4;
+/// Count-word bits of an array header.
+pub const ARRAY_FLAG: u32 = KIND_ARRAY << KIND_SHIFT;
+/// Count-word bits of a counted string.
+pub const STRING_FLAG: u32 = KIND_STRING << KIND_SHIFT;
+/// Count-word bits of a list header.
+pub const LIST_FLAG: u32 = KIND_LIST << KIND_SHIFT;
+/// Count-word bits of a dictionary header.
+pub const DICTIONARY_FLAG: u32 = KIND_DICTIONARY << KIND_SHIFT;
+
+#[cfg(feature = "mem-exp-rc")]
+static STRING_LEAF_OFFSETS: [u32; 1] = [0];
+
+/// Runtime-owned element descriptor for arrays of strings built by the runtime
+/// (split, directory listings): elements are 8 bytes with one leaf at offset 0.
+#[cfg(feature = "mem-exp-rc")]
+pub static STRING_ELEMENT_DESCRIPTOR: ObjectDescriptor = ObjectDescriptor {
+    size: 8,
+    reference_count: 1,
+    reference_offsets: STRING_LEAF_OFFSETS.as_ptr(),
+};
+
+#[cfg(debug_assertions)]
+const POISON: u8 = 0xDB;
+
+pub use crate::descriptor::ObjectDescriptor;
+
+/// Immutable `{ key, value }` pair of element descriptors a dictionary header
+/// points at (design section 11). Each side is null when its type has no
+/// reference leaves.
+#[repr(C)]
+pub struct DictionaryDescriptors {
+    pub key: *const ObjectDescriptor,
+    pub value: *const ObjectDescriptor,
+}
+
+// SAFETY: like `ObjectDescriptor`, the pair is immutable program data that is
+// only ever read.
+#[allow(unsafe_code)]
+unsafe impl Sync for DictionaryDescriptors {}
+
+/// Counters for the experiment report.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ObjectHeapStats {
+    pub fresh_blocks: u64,
+    pub reused_blocks: u64,
+    pub released_blocks: u64,
+    /// Retains that changed a count (non-null, non-immortal operand).
+    #[cfg(feature = "mem-exp-rc")]
+    pub retains: u64,
+    /// Releases that dropped a count (non-null, non-immortal operand).
+    #[cfg(feature = "mem-exp-rc")]
+    pub releases: u64,
+    /// Arrays whose header (and heap-served data block) were released.
+    #[cfg(feature = "mem-exp-rc")]
+    pub released_arrays: u64,
+    /// Array data blocks above the largest size class: never returned to the
+    /// heap, they stay reserved until the context drops.
+    #[cfg(feature = "mem-exp-rc")]
+    pub unreturned_array_blocks: u64,
+    /// Counted strings whose block went back to the heap.
+    #[cfg(feature = "mem-exp-rc")]
+    pub released_strings: u64,
+    /// Lists whose header (and heap-served buffer) were released.
+    #[cfg(feature = "mem-exp-rc")]
+    pub released_lists: u64,
+    /// List buffers above the largest size class: never returned to the heap.
+    #[cfg(feature = "mem-exp-rc")]
+    pub unreturned_list_buffers: u64,
+    /// Dictionaries whose header and heap-served storage were released.
+    #[cfg(feature = "mem-exp-rc")]
+    pub released_dictionaries: u64,
+    /// Dictionary storage blocks above the largest size class: never returned.
+    #[cfg(feature = "mem-exp-rc")]
+    pub unreturned_dictionary_blocks: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct ObjectHeap {
+    free: [Vec<*mut u8>; SIZE_CLASSES.len()],
+    pub(crate) stats: ObjectHeapStats,
+    /// Reused release work list: taken, cleared and restored by [`release`],
+    /// so steady-state releases allocate nothing. Release never runs user
+    /// code, so no nested use can observe the taken (empty) buffer.
+    work: Vec<*mut u8>,
+}
+
+impl ObjectHeap {
+    /// Index of the smallest small size class that holds `size` bytes (class
+    /// objects and collection headers).
+    pub(crate) fn class_of(size: u32) -> Option<usize> {
+        SIZE_CLASSES[..SMALL_CLASS_COUNT]
+            .iter()
+            .position(|&class| class >= size)
+    }
+
+    /// Index of the smallest size class, large ones included, that holds a
+    /// buffer or string block of `size` bytes. The single lookup every
+    /// buffer allocation, growth and release decision goes through.
+    #[cfg(feature = "mem-exp-rc")]
+    pub(crate) fn buffer_class_of(size: usize) -> Option<usize> {
+        let size = u32::try_from(size.max(1)).ok()?;
+        SIZE_CLASSES.iter().position(|&class| class >= size)
+    }
+
+    /// A zeroed released block of `class`, if one is available.
+    pub(crate) fn take_free(&mut self, class: usize) -> Option<*mut u8> {
+        let block = self.free[class].pop()?;
+        // SAFETY: `block` was handed out by this heap for exactly
+        // `SIZE_CLASSES[class]` bytes of arena storage that stays mapped until
+        // the owning context drops, and nothing references it while it is on
+        // the free list.
+        #[allow(unsafe_code)]
+        unsafe {
+            ptr::write_bytes(block, 0, SIZE_CLASSES[class] as usize);
+        }
+        self.stats.reused_blocks += 1;
+        Some(block)
+    }
+
+    /// Return a block of `class` to the heap. The caller guarantees that no
+    /// reference to it remains.
+    pub(crate) fn release(&mut self, block: *mut u8, class: usize) {
+        #[cfg(debug_assertions)]
+        // SAFETY: as in `take_free`; the block is owned by this heap again.
+        #[allow(unsafe_code)]
+        unsafe {
+            ptr::write_bytes(block, POISON, SIZE_CLASSES[class] as usize);
+        }
+        self.stats.released_blocks += 1;
+        self.free[class].push(block);
+    }
+}
+
+fn count_word(object: *mut u8) -> *mut u32 {
+    object.wrapping_add(COUNT_OFFSET).cast::<u32>()
+}
+
+/// Read an object's strong count.
+///
+/// # Safety
+///
+/// `object` must point to a live counted object with the H12 layout.
+#[allow(unsafe_code)]
+pub unsafe fn strong_count(object: *mut u8) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe { count_word(object).read() & COUNT_MASK }
+}
+
+/// Write an initial count (1 for a fresh counted object, [`IMMORTAL`] for an
+/// uncounted one).
+///
+/// # Safety
+///
+/// `object` must point to a live object with the H12 layout.
+#[allow(unsafe_code)]
+pub unsafe fn set_count(object: *mut u8, count: u32) {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let word = count_word(object);
+        word.write((word.read() & !COUNT_MASK) | (count & COUNT_MASK));
+    }
+}
+
+/// Add one strong reference. Saturates to [`IMMORTAL`]: an object referenced
+/// more than 2^29 - 2 times is never released, which leaks and never frees
+/// early.
+///
+/// # Safety
+///
+/// `object` must point to a live counted or immortal object.
+#[allow(unsafe_code)]
+pub unsafe fn retain(object: *mut u8) {
+    // SAFETY: the caller's contract.
+    let count = unsafe { strong_count(object) };
+    if count == IMMORTAL {
+        return;
+    }
+    // SAFETY: the caller's contract.
+    unsafe { set_count(object, (count + 1).min(IMMORTAL)) };
+}
+
+/// Drop one strong reference and release every object whose count reaches
+/// zero, with an explicit work list (no native recursion), releasing each
+/// object's reference fields before returning its block to `heap`.
+///
+/// Returns the number of objects released.
+///
+/// # Safety
+///
+/// `object` and every object reachable from it through descriptor reference
+/// offsets must be live counted or immortal objects whose descriptor word
+/// points to a valid [`ObjectDescriptor`], and whose blocks were allocated by
+/// `heap` when they are counted.
+#[allow(unsafe_code)]
+pub(crate) unsafe fn release(heap: &mut ObjectHeap, object: *mut u8) -> u64 {
+    let mut work = std::mem::take(&mut heap.work);
+    work.clear();
+    work.push(object);
+    let mut released = 0;
+    while let Some(current) = work.pop() {
+        if current.is_null() {
+            continue;
+        }
+        // SAFETY: the caller's contract covers every reachable object.
+        let count = unsafe { strong_count(current) };
+        if count == IMMORTAL {
+            continue;
+        }
+        debug_assert!(
+            count > 0,
+            "release of an object whose count is already zero"
+        );
+        if count > 1 {
+            // SAFETY: as above.
+            unsafe { set_count(current, count - 1) };
+            continue;
+        }
+        #[cfg(feature = "mem-exp-rc")]
+        {
+            // SAFETY: the count word carries the kind field by the layout contract.
+            let kind = unsafe { count_word(current).read() } >> KIND_SHIFT;
+            if kind == KIND_ARRAY {
+                // SAFETY: a kind 1 object is an array header of this heap.
+                unsafe { release_array(heap, current, &mut work) };
+                released += 1;
+                continue;
+            }
+            if kind == KIND_LIST {
+                // SAFETY: a kind 3 object is a list header of this heap.
+                unsafe { release_list(heap, current, &mut work) };
+                released += 1;
+                continue;
+            }
+            if kind == KIND_DICTIONARY {
+                // SAFETY: a kind 4 object is a dictionary header of this heap.
+                unsafe { release_dictionary(heap, current, &mut work) };
+                released += 1;
+                continue;
+            }
+            if kind == KIND_STRING {
+                // SAFETY: a kind 2 object is a counted string header of this heap.
+                let bytes = unsafe {
+                    crate::string::ASTER_STR_PAYLOAD_OFFSET
+                        + current
+                            .add(crate::string::ASTER_STR_LEN_OFFSET)
+                            .cast::<usize>()
+                            .read()
+                };
+                let class = ObjectHeap::buffer_class_of(bytes)
+                    .expect("counted strings are allocated from a size class");
+                heap.release(current, class);
+                heap.stats.released_strings += 1;
+                released += 1;
+                continue;
+            }
+        }
+        // SAFETY: offset 0 holds the descriptor pointer by the layout
+        // contract, and the descriptor and its offset table are immutable.
+        let descriptor = unsafe { &*current.cast::<*const ObjectDescriptor>().read() };
+        for index in 0..descriptor.reference_count as usize {
+            // SAFETY: each offset names an in-bounds, pointer-aligned field.
+            let child = unsafe {
+                let offset = descriptor.reference_offsets.add(index).read() as usize;
+                current.add(offset).cast::<*mut u8>().read()
+            };
+            work.push(child);
+        }
+        let class = ObjectHeap::class_of(descriptor.size)
+            .expect("counted objects are allocated from a size class");
+        heap.release(current, class);
+        released += 1;
+    }
+    heap.work = work;
+    released
+}
+
+/// Free a counted array whose count reached zero: push every leaf of every
+/// element, return the data block (when heap-served) and the header block.
+///
+/// # Safety
+///
+/// `array` must be a counted array header allocated by `heap` whose element
+/// descriptor is null or valid and whose storage holds `length` live elements.
+#[cfg(feature = "mem-exp-rc")]
+#[allow(unsafe_code)]
+unsafe fn release_array(heap: &mut ObjectHeap, array: *mut u8, work: &mut Vec<*mut u8>) {
+    use crate::context::AsterArray;
+    // SAFETY: the caller's contract.
+    let (descriptor, length, element_size, data) = unsafe {
+        let header = &*array.cast::<AsterArray>();
+        (
+            header.element_descriptor(),
+            usize::try_from(header.length()).unwrap_or(0),
+            header.element_size() as usize,
+            header.data_ptr(),
+        )
+    };
+    if !descriptor.is_null() && !data.is_null() {
+        // SAFETY: the descriptor is immutable program data and every offset
+        // lies inside one of the `length` elements.
+        unsafe {
+            let descriptor = &*descriptor;
+            for element in 0..length {
+                let base = data.add(element * element_size);
+                for index in 0..descriptor.reference_count as usize {
+                    let offset = descriptor.reference_offsets.add(index).read() as usize;
+                    work.push(base.add(offset).cast::<*mut u8>().read_unaligned());
+                }
+            }
+        }
+    }
+    let bytes = length.saturating_mul(element_size).max(1);
+    match ObjectHeap::buffer_class_of(bytes) {
+        Some(class) => heap.release(data, class),
+        None => heap.stats.unreturned_array_blocks += 1,
+    }
+    let header_class = ObjectHeap::class_of(u32::try_from(size_of::<AsterArray>()).unwrap_or(0))
+        .expect("array headers fit a size class");
+    heap.release(array, header_class);
+    heap.stats.released_arrays += 1;
+}
+
+/// Free a counted list whose count reached zero: push every leaf of every live
+/// element, return the buffer when it is heap-served, then the header block.
+///
+/// # Safety
+///
+/// `list` must be a counted Persistent list header allocated by `heap` whose
+/// element descriptor is null or valid and whose buffer holds `length` live
+/// elements.
+#[cfg(feature = "mem-exp-rc")]
+#[allow(unsafe_code)]
+unsafe fn release_list(heap: &mut ObjectHeap, list: *mut u8, work: &mut Vec<*mut u8>) {
+    use crate::context::AsterList;
+    // SAFETY: the caller's contract.
+    let (descriptor, length, capacity, element_size, data) = unsafe {
+        let header = &*list.cast::<AsterList>();
+        (
+            header.element_descriptor(),
+            usize::try_from(header.length()).unwrap_or(0),
+            usize::try_from(header.capacity()).unwrap_or(0),
+            header.element_size() as usize,
+            header.data_ptr(),
+        )
+    };
+    if !descriptor.is_null() && !data.is_null() {
+        // SAFETY: the descriptor is immutable program data and every offset
+        // lies inside one of the `length` elements.
+        unsafe {
+            let descriptor = &*descriptor;
+            for element in 0..length {
+                let base = data.add(element * element_size);
+                for index in 0..descriptor.reference_count as usize {
+                    let offset = descriptor.reference_offsets.add(index).read() as usize;
+                    work.push(base.add(offset).cast::<*mut u8>().read_unaligned());
+                }
+            }
+        }
+    }
+    if !data.is_null() {
+        // SAFETY: the caller's contract.
+        let align = unsafe { (*list.cast::<AsterList>()).element_align() };
+        if AsterList::buffer_is_heap_served(capacity * element_size, align) {
+            let class = ObjectHeap::buffer_class_of(capacity * element_size)
+                .expect("heap-served list buffers fit a size class");
+            heap.release(data, class);
+        } else {
+            heap.stats.unreturned_list_buffers += 1;
+        }
+    }
+    let header_class = ObjectHeap::class_of(u32::try_from(size_of::<AsterList>()).unwrap_or(0))
+        .expect("list headers fit a size class");
+    heap.release(list, header_class);
+    heap.stats.released_lists += 1;
+}
+
+/// Free a counted dictionary whose count reached zero: push the key and value
+/// leaves of every live entry, return the storage block when it is
+/// heap-served, then the header block.
+///
+/// # Safety
+///
+/// `dictionary` must be a counted Persistent dictionary header allocated by
+/// `heap` whose descriptor pair is null or valid.
+#[cfg(feature = "mem-exp-rc")]
+#[allow(unsafe_code)]
+unsafe fn release_dictionary(heap: &mut ObjectHeap, dictionary: *mut u8, work: &mut Vec<*mut u8>) {
+    use crate::context::AsterDictionary;
+    // SAFETY: the caller's contract.
+    let storage =
+        unsafe { AsterDictionary::drain_children(dictionary.cast::<AsterDictionary>(), work) };
+    if let Some(storage) = storage {
+        if crate::context::AsterList::buffer_is_heap_served(storage.bytes, storage.align) {
+            let class = ObjectHeap::buffer_class_of(storage.bytes)
+                .expect("heap-served dictionary storage fits a size class");
+            heap.release(storage.block, class);
+        } else {
+            heap.stats.unreturned_dictionary_blocks += 1;
+        }
+    }
+    let header_class =
+        ObjectHeap::class_of(u32::try_from(size_of::<AsterDictionary>()).unwrap_or(0))
+            .expect("dictionary headers fit a size class");
+    heap.release(dictionary, header_class);
+    heap.stats.released_dictionaries += 1;
+}

@@ -8,9 +8,10 @@ and prints the compiler's typed intermediate representations.
 | `aster new <NAME>` | Create a project in a new child directory. |
 | `aster doctor` | Diagnose the local toolchain and current project without modifying them. |
 | `aster check [FILE]` | Validate a project or source file without executing it. |
-| `aster run [FILE]` | Compile and run an application. |
+| `aster run [FILE] [-- ARGS...]` | Compile and run an application; `ARGS` go to `Main(string[] args)`. |
 | `aster test` | Compile and run root-package tests. |
 | `aster watch <FILE>` | Recompile and rerun when a loaded project file changes. |
+| `aster fmt [--check] [FILE...]` | Format sources in place with the single canonical style. |
 | `aster dump-hir [FILE]` | Print typed HIR after successful validation. |
 | `aster dump-mir [FILE]` | Print control-flow MIR after successful validation. |
 | `aster --help` | Print the command summary. |
@@ -39,8 +40,68 @@ aster run examples/hello.aster
 
 For an explicit source, the nearest `Aster.toml` in that source file's ancestors establishes the
 project root and application entry. Without a manifest, `run` finds one conventional public static
-`Main` in the root namespace. `Main` is parameterless and returns `void` or `int`. See
+`Main` in the root namespace. `Main` returns `void` or `int` and takes no parameters or one `string[] args`. See
 [application entry](application-entry.md) for the complete manifest and entry rules.
+
+## Running programs
+
+`aster run` starts the application entry. Arguments for the program go after a `--` separator and
+reach `Main(string[] args)` without the program name:
+
+```console
+aster run examples/greet.aster -- Ada Lovelace
+aster run -- Ada Lovelace              # nearest project, same arguments
+```
+
+Everything after the first `--` belongs to the program. Options of `run` itself must come before
+it, and a stray word without the separator is a usage error (exit `2`). Invalid Unicode in an
+argument is replaced with U+FFFD.
+
+The process exit status of `aster run` is the one of the program: the `int` returned by `Main`,
+passed to the operating system unchanged (Windows observes the whole value, POSIX the low 8 bits),
+or `0` for a `void` `Main`. The result is no longer printed. A compile, entry-selection or runtime
+failure still exits `1`.
+
+## Formatting
+
+`aster fmt` rewrites `.aster` files in place. There is one style and no options.
+
+```console
+aster fmt                     # every .aster file of the nearest project
+aster fmt app/main.aster      # explicit files; directories are searched recursively
+aster fmt --check             # list files that would change, change nothing
+```
+
+`--check` prints each file that is not already formatted to stdout and exits `1`; otherwise it
+exits `0`. Without `--check`, the command prints `formatted <path>` for each rewritten file. A
+source with lexical errors is reported on stderr, left untouched, and makes the command exit `1`.
+Directories named `target` and hidden directories are skipped. A flag other than `--check` exits
+`2`.
+
+The formatter is token based. It only rewrites whitespace between tokens, so the token stream is
+never changed, and every comment is preserved. Formatting is idempotent. The result is re-lexed and
+compared with the original tokens before a file is written.
+
+### Style
+
+- Four-space indentation, no tabs, no trailing whitespace, one final newline. CRLF input keeps CRLF.
+- Allman braces: the `{` of a multi-line block, type, namespace, property accessor or `else` is on
+  its own line, and `else` starts a line after a multi-line `}`. A block written on one line
+  (`if (x) { return 1; }`), an object initializer (`Pair<int, string> { First: 1, Second: "a" }`) and
+  a single-line accessor (`get { return x; }`) keep their line. An empty block is `{}`.
+- `case` and `default` labels are indented inside the `switch` braces; their statements are indented
+  one level further. A statement continued on a later line is indented one extra level
+  (`+ rest` lines, a braceless `if` body).
+- Single spaces around binary operators, `=`, `=>` and the ternary `?` and `:`; one space after
+  `,` and `;`; none inside `()` and `[]`. One space after control keywords (`if (`, `while (`),
+  none before call parentheses, indexers or generic arguments (`List<int>`, `Foo(x)`, `v[0]`).
+  No space after a cast (`(long)x`), a prefix operator (`-x`, `!x`, `++i`) or before a postfix
+  one (`i++`, `Parse(text)?`). `class A : B` and `where T : Constraint` are spaced; named
+  initializer fields and arguments are `Name: value`.
+- Existing line breaks are kept. Runs of blank lines collapse to one, and blank lines directly
+  inside a brace pair or at the start and end of the file are removed. Interpolated strings and
+  comments are never altered; own-line comments are re-indented to the following code and a trailing
+  comment is separated from the code by one space.
 
 ## Development options
 
@@ -52,7 +113,8 @@ aster run examples/expressions.aster --function Run
 
 The selected function takes precedence over the manifest and conventional `Main`, including when
 the relevant manifest is invalid. This option is intended for compiler development and focused
-examples. `--memory-stats` prints execution-context allocation metrics after a successful run.
+examples. Because it is not an application entry, it keeps printing a non-`void` result and exits
+`0`. `--memory-stats` prints execution-context allocation metrics after a successful run.
 
 `watch` accepts the same `--function <NAME>` selection but always requires a source file:
 
@@ -65,13 +127,17 @@ to stderr and the watcher keeps observing for a later valid edit. Press `Ctrl+C`
 
 ## Output and exit codes
 
-ASTER uses three process exit codes:
+Every command except `run` uses three process exit codes:
 
 | Code | Meaning |
 | --- | --- |
 | `0` | The command completed successfully. |
 | `1` | Valid command arguments led to an operational, compilation, or runtime failure. |
 | `2` | The command or its arguments were invalid. |
+
+`aster run` ends with the exit status of the program when it ran to completion (see
+[Running programs](#running-programs)), so `0`, `1` and other values then belong to the program;
+failures before or during execution use the codes above.
 
 Normal output, including program output and HIR/MIR dumps, goes to stdout. Usage, filesystem,
 compiler, runtime, manifest, and standard-library errors go to stderr. A failed dump does not emit

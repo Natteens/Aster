@@ -24,8 +24,9 @@ public class Program
 }
 ```
 
-`Main` takes no parameters and returns `void` or `int`. The `int` result is useful for examples and
-command-line programs because the CLI prints it after execution.
+`Main` returns `void` or `int` and takes no parameters or one `string[] args`. The `int` result is
+the process exit status, which command-line programs use to report success or failure; the CLI does
+not print it. See [application entry](reference/application-entry.md).
 
 ## Values say what they are
 
@@ -88,7 +89,7 @@ public class Program
 }
 ```
 
-Run it with `aster run examples/basics.aster`; it prints `12`.
+Run it with `aster run examples/basics.aster`; it exits with status `12`.
 
 ## Values and references are different on purpose
 

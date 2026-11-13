@@ -237,10 +237,13 @@ fn searches_do_not_allocate_and_local_substrings_are_reclaimed() {
     assert_eq!(value, ExecutionValue::Int(30_000));
     assert_eq!(stats.total_allocations, 10_000);
     assert_eq!(stats.string_allocations, 10_000);
-    assert_eq!(stats.requested_bytes, 160_000);
+    // One 8-byte payload per slice plus the string header (8 bytes in C0;
+    // 24 bytes with the MEM-EXP-1 counted header).
+    let per_slice = aster_runtime::ASTER_STR_PAYLOAD_OFFSET as u64 + 8;
+    assert_eq!(stats.requested_bytes, 10_000 * per_slice);
     assert_eq!(stats.used_bytes, 0);
     assert_eq!(stats.reserved_bytes, 4 * 1024);
-    assert_eq!(stats.peak_used_bytes, 16);
+    assert_eq!(stats.peak_used_bytes, per_slice);
 
     let persistent = compile(
         "internal string Slice(string text) { string alias = text.Substring(0, 5); return alias; } public string Run() { return Slice(\"aster language\"); }",
@@ -251,7 +254,14 @@ fn searches_do_not_allocate_and_local_substrings_are_reclaimed() {
     assert_eq!(value, ExecutionValue::String("aster".to_owned()));
     assert_eq!(stats.total_allocations, 1);
     assert_eq!(stats.string_allocations, 1);
-    assert_eq!(stats.requested_bytes, 13);
-    assert_eq!(stats.used_bytes, 13);
+    let aster_bytes = aster_runtime::ASTER_STR_PAYLOAD_OFFSET as u64 + 5;
+    assert_eq!(stats.requested_bytes, aster_bytes);
+    // MEM-EXP-1 serves counted strings from the 32-byte size class.
+    let used = if cfg!(feature = "mem-exp-rc-core") {
+        32
+    } else {
+        aster_bytes
+    };
+    assert_eq!(stats.used_bytes, used);
     assert_eq!(stats.reserved_bytes, 4 * 1024);
 }

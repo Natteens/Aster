@@ -1,5 +1,5 @@
 use super::declarations::visibility;
-use super::types::{constant_expression, convert};
+use super::types::{constant_expression, convert, is_scalar_switch_type};
 use super::{HashMap, Lowerer, ast, hir};
 use crate::constexpr::evaluate;
 
@@ -49,10 +49,23 @@ impl Lowerer<'_> {
             },
             ast::Statement::While {
                 condition, body, ..
-            } => hir::Statement::While {
-                condition: self.expression(condition),
-                body: self.block(body),
-            },
+            } => {
+                // Pattern variables of a loop condition are scoped to the loop.
+                self.scopes.push(HashMap::new());
+                let condition = self.expression(condition);
+                let body = self.block(body);
+                self.scopes.pop();
+                hir::Statement::While { condition, body }
+            }
+            ast::Statement::DoWhile {
+                body, condition, ..
+            } => {
+                let body = self.block(body);
+                self.scopes.push(HashMap::new());
+                let condition = self.expression(condition);
+                self.scopes.pop();
+                hir::Statement::DoWhile { body, condition }
+            }
             ast::Statement::For {
                 initializer,
                 condition,
@@ -124,17 +137,28 @@ impl Lowerer<'_> {
                 ..
             } => {
                 let value = self.expression(value);
+                let scalar = is_scalar_switch_type(&value.type_);
                 let mut lowered_cases = Vec::new();
                 for case in cases {
                     self.scopes.push(HashMap::new());
-                    let (case_symbol, tag, bindings) =
-                        self.switch_pattern(case.span, &case.bindings);
+                    let (case_symbol, tag, bindings, label) = if scalar {
+                        self.scalar_switch_pattern(case.label.as_ref(), &value.type_)
+                    } else {
+                        let (case_symbol, tag, bindings) =
+                            self.switch_pattern(case.span, &case.bindings);
+                        (case_symbol, tag, bindings, None)
+                    };
+                    // The guard sees the payload bindings, and its own pattern
+                    // variables stay visible in the body.
+                    let guard = case.guard.as_ref().map(|guard| self.expression(guard));
                     let body = self.block(&case.body);
                     self.scopes.pop();
                     lowered_cases.push(hir::SwitchCase {
                         case: case_symbol,
                         tag,
                         bindings,
+                        label,
+                        guard,
                         body,
                     });
                 }
@@ -150,15 +174,29 @@ impl Lowerer<'_> {
         })
     }
 
+    /// A constant label of an integer, `char` or `string` switch, converted
+    /// to the subject type, with placeholder case data.
+    pub(super) fn scalar_switch_pattern(
+        &mut self,
+        label: Option<&ast::Expression>,
+        subject: &hir::Type,
+    ) -> (
+        hir::SymbolId,
+        u32,
+        Vec<hir::Parameter>,
+        Option<hir::Expression>,
+    ) {
+        let label = label.expect("validated scalar switch case has a label");
+        let label = convert(self.expression(label), subject);
+        (self.allocate(), 0, Vec::new(), Some(label))
+    }
+
     pub(super) fn switch_pattern(
         &mut self,
         span: aster_diagnostics::Span,
         names: &[String],
     ) -> (hir::SymbolId, u32, Vec<hir::Parameter>) {
-        let key = crate::semantic::ModelNodeKey {
-            context: self.model_context.clone(),
-            span,
-        };
+        let key = self.model.node_key(&self.model_context, span);
         let resolved = &self.model.switch_cases[&key];
         let (case_symbol, field_symbols) =
             self.enum_cases[&(resolved.enum_name.clone(), resolved.case_index)].clone();

@@ -188,11 +188,18 @@ fn rejects_protected_module_declaration() {
     );
 }
 
+/// T-OBJ-2 supersedes the old "protected needs a future inheritance model"
+/// limitation: `protected` is a class-member modifier now.
 #[test]
-fn explains_protected_member_limitation() {
+fn protected_is_valid_only_for_class_members() {
+    assert_valid("public class Entity { protected int id; }");
     assert_error(
-        "public class Entity { protected int id; }",
-        "future inheritance or extension model",
+        "public struct Entity { protected int id; }",
+        "`protected` is only valid for class members",
+    );
+    assert_error(
+        "protected class Entity { }",
+        "`protected` is not valid on a namespace-level class",
     );
 }
 

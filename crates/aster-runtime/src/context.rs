@@ -18,6 +18,10 @@ use crate::arena::{DEFAULT_PAGE_SIZE, MIN_PAGE_SIZE};
 use crate::memory_governor::{MemoryGovernor, MemoryGovernorTelemetry};
 use crate::string::AsterStrHeader;
 
+mod transfer;
+#[cfg(test)]
+mod transfer_tests;
+
 /// Maximum arena capacity reserved by one execution context, shared by its
 /// persistent and temporary regions. One GiB preserves the externally
 /// validated 50,000,000-element `long` array (400,000,000 payload bytes plus
@@ -36,11 +40,26 @@ fn checked_allocation_size(count: usize, element_size: usize) -> Option<usize> {
 }
 
 /// Stable array header visible to generated code only through runtime calls.
+#[cfg(not(feature = "mem-exp-rc"))]
 #[repr(C)]
 pub struct AsterArray {
     data: *mut u8,
     length: i32,
     element_size: u32,
+}
+
+/// Counted array header (MEM-EXP-1 U8): the uniform object header (descriptor
+/// word, count word) followed by the array fields. The descriptor word names
+/// the immutable element descriptor, or is null when elements have no leaves.
+#[cfg(feature = "mem-exp-rc")]
+#[repr(C)]
+pub struct AsterArray {
+    descriptor: *const crate::object_heap::ObjectDescriptor,
+    #[allow(dead_code, reason = "read and written through the object header ABI")]
+    count_word: u32,
+    length: i32,
+    element_size: u32,
+    data: *mut u8,
 }
 
 /// Offsets in the private array header ABI shared with generated code.
@@ -50,6 +69,24 @@ pub struct AsterArray {
 /// foreign-function interface.
 pub const ASTER_ARRAY_DATA_OFFSET: usize = std::mem::offset_of!(AsterArray, data);
 pub const ASTER_ARRAY_LENGTH_OFFSET: usize = std::mem::offset_of!(AsterArray, length);
+/// Offset of the count word inside a counted array header.
+#[cfg(feature = "mem-exp-rc")]
+pub const ASTER_ARRAY_COUNT_OFFSET: usize = std::mem::offset_of!(AsterArray, count_word);
+
+/// Offset of the count word inside a counted list header.
+#[cfg(feature = "mem-exp-rc")]
+pub const ASTER_LIST_COUNT_OFFSET: usize = std::mem::offset_of!(AsterList, count_word);
+/// Offset of the element descriptor word inside a counted list header.
+#[cfg(feature = "mem-exp-rc")]
+pub const ASTER_LIST_DESCRIPTOR_OFFSET: usize = std::mem::offset_of!(AsterList, element_descriptor);
+
+/// Offset of the count word inside a counted dictionary header.
+#[cfg(feature = "mem-exp-rc")]
+pub const ASTER_DICTIONARY_COUNT_OFFSET: usize = std::mem::offset_of!(AsterDictionary, count_word);
+/// Offset of the descriptor-pair word inside a counted dictionary header.
+#[cfg(feature = "mem-exp-rc")]
+pub const ASTER_DICTIONARY_DESCRIPTOR_OFFSET: usize =
+    std::mem::offset_of!(AsterDictionary, descriptors);
 
 /// Offset of the one-byte error flag inside an [`ExecutionContext`], read
 /// directly by generated code after fallible runtime calls instead of calling
@@ -57,6 +94,22 @@ pub const ASTER_ARRAY_LENGTH_OFFSET: usize = std::mem::offset_of!(AsterArray, le
 /// backend; a private JIT ABI, not a foreign-function interface.
 pub const EXECUTION_CONTEXT_ERROR_FLAG_OFFSET: usize =
     std::mem::offset_of!(ExecutionContext, error_flag);
+
+/// Offset of the executed-`retains` counter (a `u64`) inside an
+/// [`ExecutionContext`], incremented directly by inline generated Retain.
+#[cfg(feature = "mem-exp-rc")]
+pub const EXECUTION_CONTEXT_RETAINS_OFFSET: usize =
+    std::mem::offset_of!(ExecutionContext, object_heap)
+        + std::mem::offset_of!(crate::object_heap::ObjectHeap, stats)
+        + std::mem::offset_of!(crate::object_heap::ObjectHeapStats, retains);
+
+/// Offset of the executed-`releases` counter (a `u64`) inside an
+/// [`ExecutionContext`], incremented directly by inline generated Release.
+#[cfg(feature = "mem-exp-rc")]
+pub const EXECUTION_CONTEXT_RELEASES_OFFSET: usize =
+    std::mem::offset_of!(ExecutionContext, object_heap)
+        + std::mem::offset_of!(crate::object_heap::ObjectHeap, stats)
+        + std::mem::offset_of!(crate::object_heap::ObjectHeapStats, releases);
 
 /// Copies one list element of `size` bytes. Behaves exactly like
 /// `ptr::copy_nonoverlapping(source, destination, size)`; the common element
@@ -98,6 +151,21 @@ impl AsterArray {
     #[must_use]
     pub fn element_size(&self) -> u32 {
         self.element_size
+    }
+
+    #[cfg(feature = "mem-exp-rc")]
+    pub(crate) fn element_descriptor(&self) -> *const crate::object_heap::ObjectDescriptor {
+        self.descriptor
+    }
+
+    #[cfg(feature = "mem-exp-rc")]
+    pub(crate) fn length(&self) -> i32 {
+        self.length
+    }
+
+    #[cfg(feature = "mem-exp-rc")]
+    pub(crate) fn data_ptr(&self) -> *mut u8 {
+        self.data
     }
 }
 
@@ -166,8 +234,44 @@ fn dictionary_key_kind_size(kind: DictionaryKeyKind) -> usize {
 /// allocated list has `capacity == 0`, and `data` is `null` in that case â€”
 /// an internal detail of this header, never a value observable from Aster
 /// (`List<T>` itself is never `null`; only this empty-buffer sentinel is).
+#[cfg(not(feature = "mem-exp-rc"))]
 #[repr(C)]
 pub struct AsterList {
+    data: *mut u8,
+    length: i32,
+    capacity: i32,
+    element_size: u32,
+    element_align: u32,
+    /// Deterministic structural identity of the concrete element type `T`
+    /// (see `aster_mir::type_key`), computed once by the compiler and never
+    /// recomputed or reinterpreted by this crate.
+    element_type_key: u64,
+    /// Structural-modification counter, incremented after every successful
+    /// `Add`/`RemoveAt` (never on a failed operation, never on `Length`/
+    /// `Get`). `foreach` captures this once and compares before each element
+    /// read to fail fast on structural mutation during iteration -- never
+    /// exposed as an Aster-level property. 64 bits wide so overflow within
+    /// one valid execution is not a practical concern; a wrapping increment
+    /// is safe because equality (not ordering) is all iteration ever checks.
+    version: u64,
+    region: ListRegion,
+    /// Depth of `temporary_scopes` when this header was allocated, or 0 for
+    /// Persistent lists. Buffer allocations in `grow_list_buffer` that happen
+    /// inside a deeper nested scope (i.e. a helper function) are promoted to
+    /// the permanent arena so they survive the helper's temp-scope rewind.
+    birth_scope_depth: u32,
+}
+
+/// Counted list header (MEM-EXP-1, design section 10): the uniform object
+/// prefix (element descriptor word @0, count word @8 with kind 3) followed by
+/// the list fields. The descriptor is immutable program data naming the
+/// element type's reference leaves; null when the element has none.
+#[cfg(feature = "mem-exp-rc")]
+#[repr(C)]
+pub struct AsterList {
+    element_descriptor: *const crate::object_heap::ObjectDescriptor,
+    #[allow(dead_code, reason = "read and written through the object header ABI")]
+    count_word: u32,
     data: *mut u8,
     length: i32,
     capacity: i32,
@@ -221,6 +325,14 @@ fn string_builder_growth_capacity(required: usize) -> Option<usize> {
 /// Hash seeds remain per-context; snapshots need no iterator/version state.
 #[repr(C)]
 pub struct AsterDictionary {
+    /// MEM-EXP-1 (design section 11): the uniform object prefix. The descriptor
+    /// word names an immutable `{ key, value }` descriptor pair (or is null
+    /// when neither type has reference leaves); the count word carries kind 4.
+    #[cfg(feature = "mem-exp-rc")]
+    descriptors: *const crate::object_heap::DictionaryDescriptors,
+    #[cfg(feature = "mem-exp-rc")]
+    #[allow(dead_code, reason = "read and written through the object header ABI")]
+    count_word: u32,
     buckets: *mut u32,
     entries: *mut u8,
     length: i32,
@@ -246,6 +358,59 @@ impl AsterDictionary {
     #[must_use]
     pub fn region(&self) -> ListRegion {
         self.region
+    }
+}
+
+/// The single combined bucket/entry block of a dictionary.
+#[cfg(feature = "mem-exp-rc")]
+pub(crate) struct DictionaryStorage {
+    pub(crate) block: *mut u8,
+    pub(crate) bytes: usize,
+    pub(crate) align: u32,
+}
+
+#[cfg(feature = "mem-exp-rc")]
+impl AsterDictionary {
+    /// Pushes the key and value leaves of every live entry onto `work` and
+    /// describes the storage block, for the release work list. Tombstones own
+    /// nothing.
+    ///
+    /// # Safety
+    ///
+    /// `this` must be a valid counted dictionary header whose descriptor pair
+    /// is null or valid and whose entry buffer holds `entry_count` entries.
+    #[allow(unsafe_code)]
+    pub(crate) unsafe fn drain_children(
+        this: *mut Self,
+        work: &mut Vec<*mut u8>,
+    ) -> Option<DictionaryStorage> {
+        // SAFETY: the caller's contract.
+        let header = unsafe { &*this };
+        if header.buckets.is_null() {
+            return None;
+        }
+        let layout = dictionary_entry_layout(
+            header.key_size,
+            header.key_align,
+            header.value_size,
+            header.value_align,
+        )?;
+        for index in 0..header.entry_count {
+            let entry = ExecutionContext::dictionary_entry_pointer(header.entries, index, layout)?;
+            // SAFETY: `index < entry_count <= entry_capacity`.
+            if unsafe { ExecutionContext::dictionary_entry_live(entry) } == 1 {
+                work.extend_from_slice(&ExecutionContext::dictionary_leaf_words(
+                    this,
+                    entry.wrapping_add(layout.key_offset),
+                    entry.wrapping_add(layout.value_offset),
+                ));
+            }
+        }
+        Some(DictionaryStorage {
+            block: header.buckets.cast::<u8>(),
+            bytes: dictionary_storage_bytes(header.bucket_capacity, header.entry_capacity, layout)?,
+            align: u32::try_from(layout.align).ok()?,
+        })
     }
 }
 
@@ -300,6 +465,22 @@ fn dictionary_entry_layout(
         stride,
         align,
     })
+}
+
+/// Size of the one block holding the buckets and the entries.
+#[cfg(feature = "mem-exp-rc")]
+fn dictionary_storage_bytes(
+    bucket_capacity: i32,
+    entry_capacity: i32,
+    layout: DictionaryEntryLayout,
+) -> Option<usize> {
+    let bucket_bytes = usize::try_from(bucket_capacity)
+        .ok()?
+        .checked_mul(size_of::<u32>())?;
+    let entry_bytes = usize::try_from(entry_capacity)
+        .ok()?
+        .checked_mul(layout.stride)?;
+    checked_align_up(bucket_bytes, layout.align)?.checked_add(entry_bytes)
 }
 
 fn dictionary_storage_fits(
@@ -398,6 +579,23 @@ impl AsterList {
     pub fn region(&self) -> ListRegion {
         self.region
     }
+
+    #[cfg(feature = "mem-exp-rc")]
+    pub(crate) fn element_descriptor(&self) -> *const crate::object_heap::ObjectDescriptor {
+        self.element_descriptor
+    }
+
+    #[cfg(feature = "mem-exp-rc")]
+    pub(crate) fn data_ptr(&self) -> *mut u8 {
+        self.data
+    }
+
+    /// Whether a Persistent list buffer of `bytes` with alignment `align` is
+    /// served by the size-class heap (otherwise it stays arena-reserved).
+    #[cfg(feature = "mem-exp-rc")]
+    pub(crate) fn buffer_is_heap_served(bytes: usize, align: u32) -> bool {
+        align <= 8 && crate::object_heap::ObjectHeap::buffer_class_of(bytes).is_some()
+    }
 }
 
 /// Immutable snapshot of allocation metrics for one execution.
@@ -412,6 +610,9 @@ pub struct MemoryStats {
     pub reserved_bytes: u64,
     pub peak_used_bytes: u64,
     pub peak_reserved_bytes: u64,
+    /// MEM-EXP-1 heap counters, refreshed on every heap event.
+    #[cfg(feature = "mem-exp-heap")]
+    pub object_heap: crate::object_heap::ObjectHeapStats,
 }
 
 /// Experimental allocator event counters used by the AARM research matrix.
@@ -603,11 +804,70 @@ impl TaskCancellation {
     }
 }
 
+/// Leaf object words copied out of collection storage before release or
+/// retain. Up to [`LeafWords::INLINE`] words are stored inline so the common
+/// single-element and entry glue allocates nothing; larger sets spill to a
+/// `Vec`. Each value is local to one glue call, so there is no shared scratch
+/// state and nested glue cannot corrupt another call's words.
+#[cfg(feature = "mem-exp-rc")]
+struct LeafWords {
+    inline: [*mut u8; Self::INLINE],
+    length: usize,
+    spill: Vec<*mut u8>,
+}
+
+#[cfg(feature = "mem-exp-rc")]
+impl LeafWords {
+    const INLINE: usize = 8;
+
+    fn new() -> Self {
+        Self {
+            inline: [std::ptr::null_mut(); Self::INLINE],
+            length: 0,
+            spill: Vec::new(),
+        }
+    }
+
+    fn extend_from(&mut self, words: &[*mut u8]) {
+        for &word in words {
+            self.push(word);
+        }
+    }
+
+    fn push(&mut self, word: *mut u8) {
+        if self.spill.is_empty() && self.length < Self::INLINE {
+            self.inline[self.length] = word;
+            self.length += 1;
+            return;
+        }
+        if self.spill.is_empty() {
+            self.spill.extend_from_slice(&self.inline[..self.length]);
+        }
+        self.spill.push(word);
+        self.length += 1;
+    }
+}
+
+#[cfg(feature = "mem-exp-rc")]
+impl std::ops::Deref for LeafWords {
+    type Target = [*mut u8];
+
+    fn deref(&self) -> &[*mut u8] {
+        if self.spill.is_empty() {
+            &self.inline[..self.length]
+        } else {
+            &self.spill
+        }
+    }
+}
+
 /// Owns every dynamic allocation made by one JIT invocation.
 /// Persistent allocations live in `arena`; function-local objects, arrays,
 /// and strings can use `temporary_arena`. Both arenas are released in bulk
 /// when the context is dropped, while temporary scopes rewind on return.
 pub struct ExecutionContext {
+    #[cfg(feature = "mem-exp-heap")]
+    object_heap: crate::object_heap::ObjectHeap,
     arena: PagedArena,
     temporary_arena: PagedArena,
     /// Compiler-authorized fine-grained checkpoint nested inside the current
@@ -652,6 +912,8 @@ pub struct ExecutionContext {
     dictionary_hash_k0: u64,
     dictionary_hash_k1: u64,
     dictionary_owner_id: u64,
+    /// Deep-copy transfers packed for the `Task.Run` call being assembled.
+    pending_transfers: Vec<crate::transfer::TransferItem>,
 }
 
 static NEXT_DICTIONARY_OWNER_ID: AtomicU64 = AtomicU64::new(1);
@@ -721,6 +983,8 @@ impl ExecutionContext {
             fine_temporary_subregion: None,
             temporary_scopes: Vec::new(),
             owned_regions: Vec::new(),
+            #[cfg(feature = "mem-exp-heap")]
+            object_heap: crate::object_heap::ObjectHeap::default(),
             allocation_limit_bytes,
             allocation_limit_kind: AllocationLimitKind::Execution,
             call_depth: 0,
@@ -735,6 +999,7 @@ impl ExecutionContext {
             dictionary_hash_k0,
             dictionary_hash_k1,
             dictionary_owner_id,
+            pending_transfers: Vec::new(),
         }
     }
 
@@ -853,6 +1118,14 @@ impl ExecutionContext {
     pub fn take_error(&mut self) -> Option<String> {
         self.error_flag = 0;
         self.error.take()
+    }
+
+    /// Publish the object-heap counters into [`Self::memory_stats`]. Inline
+    /// generated Retain/Release update the heap counters without a runtime
+    /// call, so a snapshot must be refreshed before it is read.
+    #[cfg(feature = "mem-exp-rc")]
+    pub fn refresh_object_heap_stats(&mut self) {
+        self.sync_heap_stats();
     }
 
     #[must_use]
@@ -1216,6 +1489,7 @@ impl ExecutionContext {
             Ok(Some(pointer)) => {
                 self.refresh_memory_usage();
                 self.record_allocation(AllocationCategory::Object, bytes);
+                Self::mark_temporary_object_immortal(pointer, bytes);
                 return pointer;
             }
             Ok(None) => {}
@@ -1228,8 +1502,23 @@ impl ExecutionContext {
             return ptr::null_mut();
         };
         self.record_allocation(AllocationCategory::Object, bytes);
+        Self::mark_temporary_object_immortal(pointer, bytes);
         pointer
     }
+
+    #[cfg(feature = "mem-exp-rc")]
+    fn mark_temporary_object_immortal(pointer: *mut u8, bytes: usize) {
+        if bytes >= crate::object_heap::COUNT_OFFSET + 4 {
+            // SAFETY: the allocation holds at least the header.
+            #[allow(unsafe_code)]
+            unsafe {
+                crate::object_heap::set_count(pointer, crate::object_heap::IMMORTAL);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "mem-exp-rc"))]
+    fn mark_temporary_object_immortal(_pointer: *mut u8, _bytes: usize) {}
 
     fn allocate_array_in_region(
         &mut self,
@@ -1255,6 +1544,11 @@ impl ExecutionContext {
             return ptr::null_mut();
         };
 
+        #[cfg(feature = "mem-exp-rc")]
+        if !temporary {
+            return self.allocate_counted_array(valid_length, valid_size, bytes);
+        }
+
         let allocation_align = align_of::<AsterArray>().max(8);
         let Some(header) = self.allocate_in_region(allocation_bytes, allocation_align, temporary)
         else {
@@ -1272,8 +1566,69 @@ impl ExecutionContext {
             (*header_ptr).data = data;
             (*header_ptr).length = valid_length;
             (*header_ptr).element_size = valid_size;
+            // Temporary arrays are region-owned: never counted, never released.
+            #[cfg(feature = "mem-exp-rc")]
+            {
+                (*header_ptr).count_word =
+                    crate::object_heap::IMMORTAL | crate::object_heap::ARRAY_FLAG;
+            }
         }
         self.record_allocation(AllocationCategory::Array, bytes);
+        header_ptr
+    }
+
+    /// A block of `size` bytes from the size-class heap when one fits, else a
+    /// fresh Persistent arena block. The block is zeroed.
+    #[cfg(feature = "mem-exp-rc")]
+    fn allocate_heap_block(&mut self, size: usize) -> Option<*mut u8> {
+        let size = size.max(1);
+        let class = crate::object_heap::ObjectHeap::buffer_class_of(size);
+        let Some(class) = class else {
+            return self.allocate_in_region(size, 8, false);
+        };
+        if let Some(block) = self.object_heap.take_free(class) {
+            return Some(block);
+        }
+        let block =
+            self.allocate_in_region(crate::object_heap::SIZE_CLASSES[class] as usize, 8, false)?;
+        self.object_heap.stats.fresh_blocks += 1;
+        Some(block)
+    }
+
+    /// Persistent counted array: the header is a size-class block with count 1,
+    /// the data block comes from the heap when it fits a class, else the arena.
+    #[cfg(feature = "mem-exp-rc")]
+    fn allocate_counted_array(
+        &mut self,
+        length: i32,
+        element_size: u32,
+        bytes: usize,
+    ) -> *mut AsterArray {
+        // The payload goes first: an oversized request then fails before any
+        // storage is published.
+        let Some(data) = self.allocate_heap_block(bytes) else {
+            return ptr::null_mut();
+        };
+        let Some(header) = self.allocate_heap_block(size_of::<AsterArray>()) else {
+            if let Some(class) = crate::object_heap::ObjectHeap::buffer_class_of(bytes) {
+                self.object_heap.release(data, class);
+                self.sync_heap_stats();
+            }
+            return ptr::null_mut();
+        };
+        #[allow(clippy::cast_ptr_alignment)]
+        let header_ptr = header.cast::<AsterArray>();
+        // SAFETY: `header_ptr` is a zeroed, 8-byte aligned block of at least
+        // `size_of::<AsterArray>()` bytes owned by this context.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*header_ptr).data = data;
+            (*header_ptr).length = length;
+            (*header_ptr).element_size = element_size;
+            (*header_ptr).count_word = 1 | crate::object_heap::ARRAY_FLAG;
+        }
+        self.record_allocation(AllocationCategory::Array, bytes);
+        self.sync_heap_stats();
         header_ptr
     }
 
@@ -1323,11 +1678,19 @@ impl ExecutionContext {
             return ptr::null_mut();
         }
 
-        let Some(header) = self.allocate_in_region(
+        #[cfg(feature = "mem-exp-rc")]
+        let header = if region == ListRegion::Persistent {
+            self.allocate_heap_block(size_of::<AsterList>())
+        } else {
+            self.allocate_in_region(size_of::<AsterList>(), align_of::<AsterList>(), true)
+        };
+        #[cfg(not(feature = "mem-exp-rc"))]
+        let header = self.allocate_in_region(
             size_of::<AsterList>(),
             align_of::<AsterList>(),
             region == ListRegion::Temporary,
-        ) else {
+        );
+        let Some(header) = header else {
             return ptr::null_mut();
         };
         #[allow(clippy::cast_ptr_alignment)]
@@ -1351,8 +1714,22 @@ impl ExecutionContext {
             } else {
                 0
             };
+            #[cfg(feature = "mem-exp-rc")]
+            {
+                (*header_ptr).element_descriptor = ptr::null();
+                // Persistent headers are size-class blocks with count 1;
+                // Temporary headers are region-owned and never counted.
+                (*header_ptr).count_word = crate::object_heap::LIST_FLAG
+                    | if region == ListRegion::Persistent {
+                        1
+                    } else {
+                        crate::object_heap::IMMORTAL
+                    };
+            }
         }
         self.record_allocation(AllocationCategory::Object, size_of::<AsterList>());
+        #[cfg(feature = "mem-exp-rc")]
+        self.sync_heap_stats();
         header_ptr
     }
 
@@ -1600,11 +1977,25 @@ impl ExecutionContext {
             self.fail("temporary dictionary allocation requires an active temporary scope");
             return ptr::null_mut();
         }
-        let Some(header) = self.allocate_in_region(
+        // Persistent counted headers are size-class blocks (count 1); Temporary
+        // headers are region-owned and never counted.
+        #[cfg(feature = "mem-exp-rc")]
+        let header = if region == ListRegion::Persistent {
+            self.allocate_heap_block(size_of::<AsterDictionary>())
+        } else {
+            self.allocate_in_region(
+                size_of::<AsterDictionary>(),
+                align_of::<AsterDictionary>(),
+                true,
+            )
+        };
+        #[cfg(not(feature = "mem-exp-rc"))]
+        let header = self.allocate_in_region(
             size_of::<AsterDictionary>(),
             align_of::<AsterDictionary>(),
             region == ListRegion::Temporary,
-        ) else {
+        );
+        let Some(header) = header else {
             return ptr::null_mut();
         };
         #[allow(clippy::cast_ptr_alignment)]
@@ -1613,6 +2004,15 @@ impl ExecutionContext {
         #[allow(unsafe_code)]
         unsafe {
             *header = AsterDictionary {
+                #[cfg(feature = "mem-exp-rc")]
+                descriptors: ptr::null(),
+                #[cfg(feature = "mem-exp-rc")]
+                count_word: crate::object_heap::DICTIONARY_FLAG
+                    | if region == ListRegion::Persistent {
+                        1
+                    } else {
+                        crate::object_heap::IMMORTAL
+                    },
                 buckets: ptr::null_mut(),
                 entries: ptr::null_mut(),
                 length: 0,
@@ -1636,6 +2036,8 @@ impl ExecutionContext {
             };
         }
         self.record_allocation(AllocationCategory::Object, size_of::<AsterDictionary>());
+        #[cfg(feature = "mem-exp-rc")]
+        self.sync_heap_stats();
         header
     }
 
@@ -1886,6 +2288,19 @@ impl ExecutionContext {
             return None;
         };
         let allocation_align = align_of::<u32>().max(layout.align);
+        #[cfg(feature = "mem-exp-rc")]
+        let storage = if region == ListRegion::Persistent
+            && AsterList::buffer_is_heap_served(
+                allocation_bytes,
+                u32::try_from(allocation_align).unwrap_or(u32::MAX),
+            ) {
+            let block = self.allocate_heap_block(allocation_bytes)?;
+            self.sync_heap_stats();
+            block
+        } else {
+            self.allocate_in_region(allocation_bytes, allocation_align, use_temporary)?
+        };
+        #[cfg(not(feature = "mem-exp-rc"))]
         let storage = self.allocate_in_region(allocation_bytes, allocation_align, use_temporary)?;
         let entries = storage.wrapping_add(entries_offset);
         #[allow(clippy::cast_ptr_alignment)]
@@ -2023,6 +2438,7 @@ impl ExecutionContext {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn dictionary_rebuild(
         &mut self,
         dictionary: *mut AsterDictionary,
@@ -2030,7 +2446,17 @@ impl ExecutionContext {
         new_entry_capacity: i32,
     ) -> bool {
         #[allow(unsafe_code)]
-        let (old_entries, old_count, length, region, birth_scope_depth, layout) = unsafe {
+        let (
+            old_entries,
+            old_count,
+            length,
+            region,
+            birth_scope_depth,
+            layout,
+            old_buckets,
+            old_bucket_capacity,
+            old_entry_capacity,
+        ) = unsafe {
             let Some(layout) = dictionary_entry_layout(
                 (*dictionary).key_size,
                 (*dictionary).key_align,
@@ -2047,6 +2473,9 @@ impl ExecutionContext {
                 (*dictionary).region,
                 (*dictionary).birth_scope_depth,
                 layout,
+                (*dictionary).buckets,
+                (*dictionary).bucket_capacity,
+                (*dictionary).entry_capacity,
             )
         };
         if new_bucket_capacity.count_ones() != 1
@@ -2116,7 +2545,84 @@ impl ExecutionContext {
             (*dictionary).entry_capacity = new_entry_capacity;
             (*dictionary).entry_count = new_count;
         }
+        // Entries were bit-moved (no count change); the old block is unreferenced.
+        #[cfg(feature = "mem-exp-rc")]
+        self.return_dictionary_storage(
+            old_buckets,
+            old_bucket_capacity,
+            old_entry_capacity,
+            layout,
+            region,
+        );
+        #[cfg(not(feature = "mem-exp-rc"))]
+        let _ = (old_buckets, old_bucket_capacity, old_entry_capacity);
         true
+    }
+
+    /// Return a replaced Persistent dictionary storage block to the size-class
+    /// heap. Blocks the heap did not serve (null, Temporary, over-aligned, or
+    /// above the largest class) are left alone.
+    #[cfg(feature = "mem-exp-rc")]
+    fn return_dictionary_storage(
+        &mut self,
+        buckets: *mut u32,
+        bucket_capacity: i32,
+        entry_capacity: i32,
+        layout: DictionaryEntryLayout,
+        region: ListRegion,
+    ) {
+        if buckets.is_null() || region != ListRegion::Persistent {
+            return;
+        }
+        let Some(bytes) = dictionary_storage_bytes(bucket_capacity, entry_capacity, layout) else {
+            return;
+        };
+        let align = u32::try_from(layout.align).unwrap_or(u32::MAX);
+        if !AsterList::buffer_is_heap_served(bytes, align) {
+            return;
+        }
+        if let Some(class) = crate::object_heap::ObjectHeap::buffer_class_of(bytes) {
+            self.object_heap.release(buckets.cast::<u8>(), class);
+            self.sync_heap_stats();
+        }
+    }
+
+    /// Descriptor pair of `dictionary`, each null when the type has no leaves.
+    #[cfg(feature = "mem-exp-rc")]
+    fn dictionary_descriptor_pair(
+        dictionary: *const AsterDictionary,
+    ) -> (
+        *const crate::object_heap::ObjectDescriptor,
+        *const crate::object_heap::ObjectDescriptor,
+    ) {
+        // SAFETY: callers pass a validated dictionary header whose pair, when
+        // set, is immutable program data.
+        #[allow(unsafe_code)]
+        unsafe {
+            let pair = (*dictionary).descriptors;
+            if pair.is_null() {
+                (ptr::null(), ptr::null())
+            } else {
+                ((*pair).key, (*pair).value)
+            }
+        }
+    }
+
+    /// Reads the object word of every leaf of one key (at `key`) and one value
+    /// (at `value`); a null address contributes nothing. The words are copied
+    /// out so the storage may be reused before they are released.
+    #[cfg(feature = "mem-exp-rc")]
+    fn dictionary_leaf_words(
+        dictionary: *const AsterDictionary,
+        key: *const u8,
+        value: *const u8,
+    ) -> LeafWords {
+        let (key_descriptor, value_descriptor) = Self::dictionary_descriptor_pair(dictionary);
+        let mut words = Self::collect_leaf_words(key_descriptor, key, 0, 1);
+        for &word in &*Self::collect_leaf_words(value_descriptor, value, 0, 1) {
+            words.push(word);
+        }
+        words
     }
 
     fn dictionary_prepare_insert(&mut self, dictionary: *mut AsterDictionary) -> bool {
@@ -2307,6 +2813,13 @@ impl ExecutionContext {
                     value_size as usize,
                 );
             }
+            // GetOrAdd consumed a count per leaf of the passed key and value;
+            // the entry keeps its own, so the passed ones are dropped.
+            #[cfg(feature = "mem-exp-rc")]
+            if add_missing {
+                let words = Self::dictionary_leaf_words(dictionary, key, supplied);
+                self.release_leaf_words(&words);
+            }
             return true;
         }
         if add_missing
@@ -2395,6 +2908,18 @@ impl ExecutionContext {
                     self.fail("Dictionary.Set entry offset overflow");
                     return 0;
                 };
+                // The old value and the passed key are read out before the
+                // store; they are released once the new value is in place.
+                #[cfg(feature = "mem-exp-rc")]
+                let dropped = {
+                    let mut words = Self::dictionary_leaf_words(
+                        dictionary,
+                        ptr::null(),
+                        entry.wrapping_add(layout.value_offset),
+                    );
+                    words.extend_from(&Self::dictionary_leaf_words(dictionary, key, ptr::null()));
+                    words
+                };
                 #[allow(unsafe_code)]
                 unsafe {
                     ptr::copy(
@@ -2403,11 +2928,25 @@ impl ExecutionContext {
                         usize::try_from(value_size).unwrap_or(0),
                     );
                 }
+                #[cfg(feature = "mem-exp-rc")]
+                self.release_leaf_words(&dropped);
                 return 1;
+            }
+            // Add on an existing key inserts nothing: the passed key and
+            // value are dropped.
+            #[cfg(feature = "mem-exp-rc")]
+            {
+                let words = Self::dictionary_leaf_words(dictionary, key, value);
+                self.release_leaf_words(&words);
             }
             return 0;
         }
         if !self.dictionary_prepare_insert(dictionary) {
+            #[cfg(feature = "mem-exp-rc")]
+            {
+                let words = Self::dictionary_leaf_words(dictionary, key, value);
+                self.release_leaf_words(&words);
+            }
             return 0;
         }
         #[allow(unsafe_code)]
@@ -2508,6 +3047,14 @@ impl ExecutionContext {
         let entry =
             Self::dictionary_entry_pointer(entries, i32::try_from(index).unwrap_or(-1), layout)
                 .expect("validated index");
+        // The removed key and value are read out first and released after the
+        // table invariants are restored.
+        #[cfg(feature = "mem-exp-rc")]
+        let removed = Self::dictionary_leaf_words(
+            dictionary,
+            entry.wrapping_add(layout.key_offset),
+            entry.wrapping_add(layout.value_offset),
+        );
         #[allow(unsafe_code)]
         let next = unsafe { Self::dictionary_entry_next(entry) };
         #[allow(unsafe_code)]
@@ -2526,6 +3073,8 @@ impl ExecutionContext {
             ptr::write(entry.add(12), 0);
             (*dictionary).length = length - 1;
         }
+        #[cfg(feature = "mem-exp-rc")]
+        self.release_leaf_words(&removed);
         1
     }
 
@@ -2781,6 +3330,28 @@ impl ExecutionContext {
             self.fail("Dictionary.Clear entry byte count overflow");
             return;
         };
+        // Every live key and value is read out before the table is emptied and
+        // released afterwards; tombstones own nothing.
+        #[cfg(feature = "mem-exp-rc")]
+        let former = {
+            #[allow(unsafe_code)]
+            let entry_count = unsafe { (*dictionary).entry_count };
+            let mut words = LeafWords::new();
+            for index in 0..entry_count {
+                let Some(entry) = Self::dictionary_entry_pointer(entries, index, layout) else {
+                    break;
+                };
+                #[allow(unsafe_code)]
+                if unsafe { Self::dictionary_entry_live(entry) } == 1 {
+                    words.extend_from(&Self::dictionary_leaf_words(
+                        dictionary,
+                        entry.wrapping_add(layout.key_offset),
+                        entry.wrapping_add(layout.value_offset),
+                    ));
+                }
+            }
+            words
+        };
         // SAFETY: validated header capacities precisely bound both backing
         // buffers. Clearing leaves capacity and allocation ownership intact.
         #[allow(unsafe_code)]
@@ -2794,6 +3365,8 @@ impl ExecutionContext {
             (*dictionary).length = 0;
             (*dictionary).entry_count = 0;
         }
+        #[cfg(feature = "mem-exp-rc")]
+        self.release_leaf_words(&former);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3001,6 +3574,15 @@ impl ExecutionContext {
         let use_temporary = region == ListRegion::Temporary
             && self.temporary_scopes.len() == birth_scope_depth as usize;
         let align = usize::try_from(element_align).unwrap_or(1);
+        #[cfg(feature = "mem-exp-rc")]
+        let new_data = if region == ListRegion::Persistent
+            && AsterList::buffer_is_heap_served(byte_size, element_align)
+        {
+            self.allocate_heap_block(byte_size)?
+        } else {
+            self.allocate_in_region(byte_size, align, use_temporary)?
+        };
+        #[cfg(not(feature = "mem-exp-rc"))]
         let new_data = self.allocate_in_region(byte_size, align, use_temporary)?;
         let old_byte_len =
             usize::try_from(length).unwrap_or(0) * usize::try_from(element_size).unwrap_or(0);
@@ -3015,7 +3597,79 @@ impl ExecutionContext {
             }
         }
         self.record_allocation(AllocationCategory::Object, byte_size);
+        #[cfg(feature = "mem-exp-rc")]
+        self.sync_heap_stats();
         Some((new_data, new_capacity))
+    }
+
+    /// Element descriptor of `list` (null when the element has no leaves).
+    #[cfg(feature = "mem-exp-rc")]
+    fn list_element_descriptor(
+        list: *const AsterList,
+    ) -> *const crate::object_heap::ObjectDescriptor {
+        // SAFETY: callers pass a validated list header.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*list).element_descriptor
+        }
+    }
+
+    /// Reads the object word of every leaf of `count` consecutive elements of
+    /// `element_size` bytes starting at `base`. The words are copied out so the
+    /// storage may be reused before they are released. Small results live
+    /// inline (no allocation); only large ones spill to the heap.
+    #[cfg(feature = "mem-exp-rc")]
+    fn collect_leaf_words(
+        descriptor: *const crate::object_heap::ObjectDescriptor,
+        base: *const u8,
+        element_size: usize,
+        count: usize,
+    ) -> LeafWords {
+        let mut words = LeafWords::new();
+        if descriptor.is_null() || base.is_null() || count == 0 {
+            return words;
+        }
+        // SAFETY: the descriptor is immutable program data; `base` covers
+        // `count` live elements and every offset lies inside one element.
+        #[allow(unsafe_code)]
+        unsafe {
+            let reference_count = (*descriptor).reference_count as usize;
+            let offsets = (*descriptor).reference_offsets;
+            for element in 0..count {
+                let element_base = base.add(element * element_size);
+                for index in 0..reference_count {
+                    let offset = offsets.add(index).read() as usize;
+                    words.push(element_base.add(offset).cast::<*mut u8>().read_unaligned());
+                }
+            }
+        }
+        words
+    }
+
+    #[cfg(feature = "mem-exp-rc")]
+    fn retain_leaf_words(&mut self, words: &[*mut u8]) {
+        for &word in words {
+            if !word.is_null() {
+                // SAFETY: a non-null leaf word is a live H12 object of this context.
+                #[allow(unsafe_code)]
+                unsafe {
+                    self.retain_object(word);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "mem-exp-rc")]
+    fn release_leaf_words(&mut self, words: &[*mut u8]) {
+        for &word in words {
+            if !word.is_null() {
+                // SAFETY: as in `retain_leaf_words`; immortal objects are ignored.
+                #[allow(unsafe_code)]
+                unsafe {
+                    self.release_counted_object(word);
+                }
+            }
+        }
     }
 
     /// Appends one element to `list`'s buffer, growing it geometrically
@@ -3088,6 +3742,8 @@ impl ExecutionContext {
             return;
         }
 
+        #[cfg(feature = "mem-exp-rc")]
+        let old_data = data;
         let (data, capacity) = if length == capacity {
             let Some(grown) = self.grow_list_buffer(
                 data,
@@ -3134,6 +3790,10 @@ impl ExecutionContext {
             (*list).capacity = capacity;
             (*list).length = new_length;
             (*list).version = (*list).version.wrapping_add(1);
+        }
+        #[cfg(feature = "mem-exp-rc")]
+        if old_data != data {
+            self.return_list_buffer(old_data, length, element_size, element_align, region);
         }
     }
 
@@ -3277,6 +3937,15 @@ impl ExecutionContext {
             self.fail("List.Set index * element size overflow");
             return;
         };
+        #[cfg(feature = "mem-exp-rc")]
+        #[allow(unsafe_code)]
+        let old_words = Self::collect_leaf_words(
+            Self::list_element_descriptor(list),
+            // SAFETY: `offset` lies inside the live prefix.
+            unsafe { data.add(offset) },
+            usize::try_from(element_size).unwrap_or(0),
+            1,
+        );
         // SAFETY: validation proved the selected slot and source are valid for
         // one concrete element representation. Replacing a value is not a
         // structural change, so the list version intentionally stays stable.
@@ -3288,6 +3957,8 @@ impl ExecutionContext {
                 usize::try_from(element_size).unwrap_or(0),
             );
         }
+        #[cfg(feature = "mem-exp-rc")]
+        self.release_leaf_words(&old_words);
     }
 
     fn list_clear(
@@ -3331,6 +4002,13 @@ impl ExecutionContext {
             self.fail("List.Clear byte count overflow");
             return;
         };
+        #[cfg(feature = "mem-exp-rc")]
+        let old_words = Self::collect_leaf_words(
+            Self::list_element_descriptor(list),
+            data,
+            usize::try_from(element_size).unwrap_or(0),
+            usize::try_from(length).unwrap_or(0),
+        );
         // SAFETY: `bytes` covers exactly the currently live prefix. Clearing
         // it releases logical reachability while retaining reusable capacity.
         #[allow(unsafe_code)]
@@ -3341,6 +4019,8 @@ impl ExecutionContext {
             (*list).length = 0;
             (*list).version = (*list).version.wrapping_add(1);
         }
+        #[cfg(feature = "mem-exp-rc")]
+        self.release_leaf_words(&old_words);
     }
 
     fn list_to_array(
@@ -3389,6 +4069,12 @@ impl ExecutionContext {
             self.fail("List.ToArray byte count overflow");
             return ptr::null_mut();
         };
+        #[cfg(feature = "mem-exp-rc")]
+        // SAFETY: `array` was just allocated and is not shared yet.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*array).descriptor = Self::list_element_descriptor(list);
+        }
         if bytes > 0 {
             // SAFETY: each header was validated and the array allocation has
             // exactly one slot per source element of the same concrete size.
@@ -3396,8 +4082,44 @@ impl ExecutionContext {
             unsafe {
                 ptr::copy_nonoverlapping(data, (*array).data, bytes);
             };
+            #[cfg(feature = "mem-exp-rc")]
+            {
+                let words = Self::collect_leaf_words(
+                    Self::list_element_descriptor(list),
+                    data,
+                    usize::try_from(element_size).unwrap_or(0),
+                    usize::try_from(length).unwrap_or(0),
+                );
+                self.retain_leaf_words(&words);
+            }
         }
         array
+    }
+
+    /// Return a replaced Persistent list buffer to the size-class heap after
+    /// its elements were bit-moved to the new buffer. Buffers the heap did not
+    /// serve (null, Temporary, over-aligned, or above the largest class) are
+    /// left alone.
+    #[cfg(feature = "mem-exp-rc")]
+    fn return_list_buffer(
+        &mut self,
+        buffer: *mut u8,
+        capacity: i32,
+        element_size: u32,
+        element_align: u32,
+        region: ListRegion,
+    ) {
+        if buffer.is_null() || region != ListRegion::Persistent {
+            return;
+        }
+        let bytes = usize::try_from(capacity).unwrap_or(0) * element_size as usize;
+        if !AsterList::buffer_is_heap_served(bytes, element_align) {
+            return;
+        }
+        if let Some(class) = crate::object_heap::ObjectHeap::buffer_class_of(bytes) {
+            self.object_heap.release(buffer, class);
+            self.sync_heap_stats();
+        }
     }
 
     fn list_capacity(&mut self, list: *const AsterList) -> i32 {
@@ -3456,6 +4178,15 @@ impl ExecutionContext {
         }
         let use_temporary = region == ListRegion::Temporary
             && self.temporary_scopes.len() == birth_scope_depth as usize;
+        #[cfg(feature = "mem-exp-rc")]
+        let new_data = if region == ListRegion::Persistent
+            && AsterList::buffer_is_heap_served(bytes, element_align)
+        {
+            self.allocate_heap_block(bytes)?
+        } else {
+            self.allocate_in_region(bytes, element_align as usize, use_temporary)?
+        };
+        #[cfg(not(feature = "mem-exp-rc"))]
         let new_data = self.allocate_in_region(bytes, element_align as usize, use_temporary)?;
         let Some(live_bytes) = usize::try_from(length)
             .ok()
@@ -3471,11 +4202,15 @@ impl ExecutionContext {
             }
         }
         self.record_allocation(AllocationCategory::Object, bytes);
+        #[cfg(feature = "mem-exp-rc")]
+        self.sync_heap_stats();
         #[allow(unsafe_code)]
         unsafe {
             (*list).data = new_data;
             (*list).capacity = target;
         }
+        #[cfg(feature = "mem-exp-rc")]
+        self.return_list_buffer(data, capacity, element_size, element_align, region);
         Some(target)
     }
 
@@ -3525,6 +4260,16 @@ impl ExecutionContext {
             ptr::copy_nonoverlapping(source, (*list).data.add(offset), byte_count);
             (*list).length = new_length;
             (*list).version = (*list).version.wrapping_add(1);
+        }
+        #[cfg(feature = "mem-exp-rc")]
+        {
+            let words = Self::collect_leaf_words(
+                Self::list_element_descriptor(list),
+                source,
+                element_size as usize,
+                usize::try_from(count).unwrap_or(0),
+            );
+            self.retain_leaf_words(&words);
         }
         true
     }
@@ -3630,6 +4375,18 @@ impl ExecutionContext {
             self.fail("List.RemoveRange clear byte count overflow");
             return false;
         };
+        #[cfg(feature = "mem-exp-rc")]
+        #[allow(unsafe_code)]
+        let old_words = {
+            // SAFETY: `destination_offset` lies inside the live prefix.
+            let data = unsafe { (*list).data };
+            Self::collect_leaf_words(
+                Self::list_element_descriptor(list),
+                unsafe { data.add(destination_offset) },
+                size,
+                usize::try_from(count).unwrap_or(0),
+            )
+        };
         #[allow(unsafe_code)]
         unsafe {
             let data = (*list).data;
@@ -3642,6 +4399,8 @@ impl ExecutionContext {
             (*list).length = new_length;
             (*list).version = (*list).version.wrapping_add(1);
         }
+        #[cfg(feature = "mem-exp-rc")]
+        self.release_leaf_words(&old_words);
         true
     }
 
@@ -3702,6 +4461,12 @@ impl ExecutionContext {
         if array.is_null() {
             return ptr::null_mut();
         }
+        #[cfg(feature = "mem-exp-rc")]
+        // SAFETY: `array` was just allocated and is not shared yet.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*array).descriptor = Self::list_element_descriptor(list);
+        }
         if count != 0 {
             let Some(source_offset) = usize::try_from(index)
                 .ok()
@@ -3720,6 +4485,17 @@ impl ExecutionContext {
             #[allow(unsafe_code)]
             unsafe {
                 ptr::copy_nonoverlapping(data.add(source_offset), (*array).data, copy_bytes);
+            }
+            #[cfg(feature = "mem-exp-rc")]
+            {
+                #[allow(unsafe_code)]
+                let words = Self::collect_leaf_words(
+                    Self::list_element_descriptor(list),
+                    unsafe { data.add(source_offset) },
+                    usize::try_from(size).unwrap_or(0),
+                    usize::try_from(count).unwrap_or(0),
+                );
+                self.retain_leaf_words(&words);
             }
         }
         array
@@ -3860,6 +4636,15 @@ impl ExecutionContext {
             return;
         };
 
+        #[cfg(feature = "mem-exp-rc")]
+        #[allow(unsafe_code)]
+        let old_words = Self::collect_leaf_words(
+            Self::list_element_descriptor(list),
+            // SAFETY: `index_offset` lies inside the live prefix.
+            unsafe { data.add(index_offset) },
+            element_size_usize,
+            1,
+        );
         if move_bytes > 0 {
             // SAFETY: `source_offset..source_offset+move_bytes` and
             // `index_offset..index_offset+move_bytes` both lie within the
@@ -3889,14 +4674,139 @@ impl ExecutionContext {
             (*list).length = new_length;
             (*list).version = (*list).version.wrapping_add(1);
         }
+        #[cfg(feature = "mem-exp-rc")]
+        self.release_leaf_words(&old_words);
+    }
+
+    #[cfg(feature = "mem-exp-heap")]
+    fn sync_heap_stats(&mut self) {
+        if self.collect_stats {
+            self.stats.object_heap = self.object_heap.stats;
+        }
+    }
+
+    /// MEM-EXP-1 heap counters.
+    #[cfg(feature = "mem-exp-heap")]
+    #[must_use]
+    pub fn object_heap_stats(&self) -> crate::object_heap::ObjectHeapStats {
+        self.object_heap.stats
+    }
+
+    /// Drop one strong reference to `object` (MEM-EXP-1 stage C) and return
+    /// the number of objects released.
+    ///
+    /// # Safety
+    ///
+    /// See [`crate::object_heap::release`]: `object` and everything reachable
+    /// from it must be live counted or immortal objects of this context.
+    #[cfg(feature = "mem-exp-heap")]
+    #[allow(unsafe_code)]
+    pub unsafe fn release_object(&mut self, object: *mut u8) -> u64 {
+        // SAFETY: forwarded caller contract.
+        let released = unsafe { crate::object_heap::release(&mut self.object_heap, object) };
+        self.sync_heap_stats();
+        released
+    }
+
+    /// Counted retain used by generated code; ignores immortal objects.
+    ///
+    /// # Safety
+    ///
+    /// `object` must be a non-null live H12 object of this context.
+    #[cfg(feature = "mem-exp-rc")]
+    #[allow(unsafe_code)]
+    pub unsafe fn retain_object(&mut self, object: *mut u8) {
+        // SAFETY: forwarded caller contract.
+        unsafe {
+            if crate::object_heap::strong_count(object) == crate::object_heap::IMMORTAL {
+                return;
+            }
+            crate::object_heap::retain(object);
+        }
+        self.object_heap.stats.retains += 1;
+        self.sync_heap_stats();
+    }
+
+    /// Counted release used by generated code; ignores immortal objects.
+    ///
+    /// # Safety
+    ///
+    /// `object` must be a non-null live H12 object of this context.
+    #[cfg(feature = "mem-exp-rc")]
+    #[allow(unsafe_code)]
+    pub unsafe fn release_counted_object(&mut self, object: *mut u8) {
+        // SAFETY: forwarded caller contract.
+        unsafe {
+            if crate::object_heap::strong_count(object) == crate::object_heap::IMMORTAL {
+                return;
+            }
+            self.object_heap.stats.releases += 1;
+            self.release_object(object);
+        }
+    }
+
+    /// Slow path of an inline Release whose count was one: the caller already
+    /// counted the operation, so this only releases the object graph.
+    ///
+    /// # Safety
+    ///
+    /// `object` must be a non-null live counted H12 object of this context.
+    #[cfg(feature = "mem-exp-rc")]
+    #[allow(unsafe_code)]
+    pub unsafe fn release_last_object(&mut self, object: *mut u8) {
+        // SAFETY: forwarded caller contract.
+        unsafe { self.release_object(object) };
+    }
+
+    /// Allocate one heap object (the generated-code path, for tests).
+    #[cfg(feature = "mem-exp-heap")]
+    #[must_use]
+    pub fn allocate_heap_object(&mut self, size: u32) -> *mut u8 {
+        self.allocate_object(size)
     }
 
     pub(crate) fn allocate_object(&mut self, size: u32) -> *mut u8 {
         let bytes = usize::try_from(size.max(1)).unwrap_or(1);
+        #[cfg(feature = "mem-exp-heap")]
+        if let Some(class) = crate::object_heap::ObjectHeap::class_of(size.max(1)) {
+            // MEM-EXP-1 C4: a released block of the same class is reused;
+            // otherwise a fresh block of the class size comes from the
+            // Persistent arena. Owned-region rewinds must not run in a
+            // configuration that releases blocks (stage C disables them).
+            let pointer = if let Some(pointer) = self.object_heap.take_free(class) {
+                pointer
+            } else {
+                let class_bytes = crate::object_heap::SIZE_CLASSES[class] as usize;
+                let Some(pointer) = self.allocate_in_region(class_bytes, 8, false) else {
+                    return ptr::null_mut();
+                };
+                self.object_heap.stats.fresh_blocks += 1;
+                pointer
+            };
+            self.record_allocation(AllocationCategory::Object, bytes);
+            #[cfg(feature = "mem-exp-rc")]
+            if bytes >= crate::object_heap::COUNT_OFFSET + 4 {
+                // SAFETY: the zeroed block holds at least the header.
+                #[allow(unsafe_code)]
+                unsafe {
+                    crate::object_heap::set_count(pointer, 1);
+                }
+            }
+            self.sync_heap_stats();
+            return pointer;
+        }
         let Some(pointer) = self.allocate_in_region(bytes, 8, false) else {
             return ptr::null_mut();
         };
         self.record_allocation(AllocationCategory::Object, bytes);
+        #[cfg(feature = "mem-exp-rc")]
+        if bytes >= crate::object_heap::COUNT_OFFSET + 4 {
+            // SAFETY: the allocation holds at least the header.
+            #[allow(unsafe_code)]
+            unsafe {
+                crate::object_heap::set_count(pointer, crate::object_heap::IMMORTAL);
+            }
+        }
         pointer
     }
 
@@ -3909,11 +4819,36 @@ impl ExecutionContext {
             self.fail("temporary string allocation requires an active temporary scope");
             return ptr::null_mut();
         }
-        let Some(total_bytes) = size_of::<usize>().checked_add(payload_bytes) else {
+        let Some(total_bytes) = size_of::<AsterStrHeader>().checked_add(payload_bytes) else {
             self.fail("string allocation exceeds the addressable range");
             return ptr::null_mut();
         };
 
+        // MEM-EXP-1 stage C (design section 9): the one construction path of
+        // a counted string. A Persistent string served by a size class starts
+        // at count 1; a Temporary string, or one above the largest size class
+        // (never heap-served, so never returned), is IMMORTAL.
+        #[cfg(feature = "mem-exp-rc")]
+        let (pointer, count_word) = if !temporary
+            && crate::object_heap::ObjectHeap::buffer_class_of(total_bytes).is_some()
+        {
+            let Some(block) = self.allocate_heap_block(total_bytes) else {
+                return ptr::null_mut();
+            };
+            self.sync_heap_stats();
+            (block, 1 | crate::object_heap::STRING_FLAG)
+        } else {
+            let Some(pointer) =
+                self.allocate_in_region(total_bytes, align_of::<AsterStrHeader>(), temporary)
+            else {
+                return ptr::null_mut();
+            };
+            (
+                pointer,
+                crate::object_heap::IMMORTAL | crate::object_heap::STRING_FLAG,
+            )
+        };
+        #[cfg(not(feature = "mem-exp-rc"))]
         let Some(pointer) =
             self.allocate_in_region(total_bytes, align_of::<AsterStrHeader>(), temporary)
         else {
@@ -3921,16 +4856,40 @@ impl ExecutionContext {
         };
 
         // SAFETY: `pointer` points to `total_bytes` of zeroed, correctly aligned
-        // memory owned by the selected arena. The caller initializes exactly the
-        // following `payload_bytes` payload bytes before publishing this string.
-        #[allow(unsafe_code)]
-        let bytes = unsafe { std::slice::from_raw_parts_mut(pointer, total_bytes) };
-        bytes[..size_of::<usize>()].copy_from_slice(&payload_bytes.to_ne_bytes());
+        // memory owned by the selected arena or heap. The caller initializes
+        // exactly the following `payload_bytes` payload bytes before publishing
+        // this string.
+        #[allow(unsafe_code, clippy::cast_ptr_alignment)]
+        unsafe {
+            pointer
+                .add(crate::string::ASTER_STR_LEN_OFFSET)
+                .cast::<usize>()
+                .write(payload_bytes);
+            #[cfg(feature = "mem-exp-rc")]
+            pointer
+                .add(crate::string::ASTER_STR_COUNT_OFFSET)
+                .cast::<u32>()
+                .write(count_word);
+        }
         self.record_allocation(AllocationCategory::String, total_bytes);
         // The arena allocates with `align_of::<AsterStrHeader>()`, so the
         // pointer is correctly aligned for this cast.
         #[allow(clippy::cast_ptr_alignment)]
         pointer.cast::<AsterStrHeader>()
+    }
+
+    /// Record the runtime-owned string element descriptor on an array of
+    /// strings the runtime just filled with owned (count 1) strings.
+    #[cfg(feature = "mem-exp-rc")]
+    pub(crate) fn set_string_array_descriptor(array: *mut AsterArray) {
+        if array.is_null() {
+            return;
+        }
+        // SAFETY: `array` is a header this runtime just allocated.
+        #[allow(unsafe_code)]
+        unsafe {
+            (*array).descriptor = &raw const crate::object_heap::STRING_ELEMENT_DESCRIPTOR;
+        }
     }
 
     fn allocate_string_parts_in_region(
@@ -3976,6 +4935,50 @@ impl ExecutionContext {
         parts: &[&str],
     ) -> *const AsterStrHeader {
         self.allocate_string_parts_in_region(parts, true)
+    }
+
+    /// Allocate a persistent `string[]` whose elements are fresh strings, the
+    /// same representation `String.Split` and `ListFiles` produce. The host
+    /// uses it to build the `args` array of `Main(string[] args)`. Returns a
+    /// null pointer after recording a runtime error when allocation fails.
+    pub fn allocate_string_array(&mut self, values: &[String]) -> *mut AsterArray {
+        let Ok(length) = i32::try_from(values.len()) else {
+            self.fail("string array length exceeds the ABI range");
+            return ptr::null_mut();
+        };
+        let Ok(element_size) = u32::try_from(size_of::<*const AsterStrHeader>()) else {
+            self.fail("string array element size exceeds the ABI range");
+            return ptr::null_mut();
+        };
+        let array = self.allocate_array(length, element_size);
+        if array.is_null() {
+            return array;
+        }
+        // Every element is a fresh owned string stored below: the array owns them.
+        #[cfg(feature = "mem-exp-rc")]
+        Self::set_string_array_descriptor(array);
+        for (index, value) in values.iter().enumerate() {
+            let string = self.allocate_string_parts(&[value.as_str()]);
+            if string.is_null() {
+                return ptr::null_mut();
+            }
+            let Ok(index) = i32::try_from(index) else {
+                self.fail("string array index exceeds the ABI range");
+                return ptr::null_mut();
+            };
+            let element = aster_rt_array_element(ptr::from_mut(self), array, index);
+            if element.is_null() {
+                return ptr::null_mut();
+            }
+            // SAFETY: `array` was allocated above with exactly pointer-sized
+            // elements and `index` is inside its checked length; no ASTER code
+            // can observe the array before it is returned complete.
+            #[allow(unsafe_code)]
+            unsafe {
+                ptr::write_unaligned(element.cast::<*const AsterStrHeader>(), string);
+            }
+        }
+        array
     }
 }
 
@@ -4228,6 +5231,88 @@ pub extern "C" fn aster_rt_list_new_temporary(
     #[allow(clippy::cast_sign_loss)]
     let type_key = element_type_key as u64;
     context.allocate_list_in_region(size, align, type_key, ListRegion::Temporary)
+}
+
+/// Record the element descriptor of a freshly allocated list (MEM-EXP-1 C5).
+#[cfg(feature = "mem-exp-rc")]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_list_set_element_descriptor(
+    context: *mut ExecutionContext,
+    list: *mut AsterList,
+    descriptor: *const crate::object_heap::ObjectDescriptor,
+) {
+    if context.is_null() || list.is_null() {
+        return;
+    }
+    // SAFETY: generated code passes its live context and a list it just allocated.
+    #[allow(unsafe_code)]
+    unsafe {
+        (*list).element_descriptor = descriptor;
+    }
+}
+
+/// Record the `{ key, value }` descriptor pair of a freshly allocated
+/// dictionary (MEM-EXP-1 C5, design section 11).
+#[cfg(feature = "mem-exp-rc")]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_dictionary_set_descriptors(
+    context: *mut ExecutionContext,
+    dictionary: *mut AsterDictionary,
+    pair: *const crate::object_heap::DictionaryDescriptors,
+) {
+    if context.is_null() || dictionary.is_null() {
+        return;
+    }
+    // SAFETY: generated code passes its live context and a dictionary it just allocated.
+    #[allow(unsafe_code)]
+    unsafe {
+        (*dictionary).descriptors = pair;
+    }
+}
+
+/// Record the element descriptor of a freshly allocated array without
+/// retaining anything (MEM-EXP-1 U8). The elements are zero or are stored by an
+/// explicit literal sequence whose pass already retained them.
+#[cfg(feature = "mem-exp-rc")]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_array_set_element_descriptor(
+    context: *mut ExecutionContext,
+    array: *mut AsterArray,
+    descriptor: *const crate::object_heap::ObjectDescriptor,
+) {
+    if context.is_null() || array.is_null() {
+        return;
+    }
+    // SAFETY: generated code passes its live context and an array it just allocated.
+    #[allow(unsafe_code)]
+    unsafe {
+        (*array).descriptor = descriptor;
+    }
+}
+
+/// Record the element descriptor of an array filled by the runtime and retain
+/// every leaf of every element it already holds (MEM-EXP-1 U8).
+#[cfg(feature = "mem-exp-rc")]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn aster_rt_array_adopt_elements(
+    context: *mut ExecutionContext,
+    array: *mut AsterArray,
+    descriptor: *const crate::object_heap::ObjectDescriptor,
+) {
+    if context.is_null() || array.is_null() {
+        return;
+    }
+    // SAFETY: generated code passes its live context and an array it just received.
+    #[allow(unsafe_code)]
+    let (context, array) = unsafe { (&mut *context, &mut *array) };
+    array.descriptor = descriptor;
+    let words = ExecutionContext::collect_leaf_words(
+        descriptor,
+        array.data,
+        array.element_size as usize,
+        usize::try_from(array.length).unwrap_or(0),
+    );
+    context.retain_leaf_words(&words);
 }
 
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -8686,7 +9771,10 @@ mod tests {
         // SAFETY: pointer points to 16 bytes of zeroed memory owned by the arena.
         #[allow(unsafe_code)]
         let bytes = unsafe { std::slice::from_raw_parts(pointer, 16) };
-        assert!(bytes.iter().all(|&b| b == 0));
+        // The H12 count word is initialized by the allocator under MEM-EXP-1 C5.
+        assert!(bytes.iter().enumerate().all(
+            |(index, &b)| b == 0 || (cfg!(feature = "mem-exp-rc") && (8..12).contains(&index))
+        ));
     }
 
     #[test]
@@ -8726,6 +9814,7 @@ mod tests {
         assert!(stats.reserved_bytes >= stats.used_bytes);
     }
 
+    #[cfg(not(feature = "mem-exp-rc"))]
     #[test]
     fn array_allocation_preflights_the_complete_header_and_payload() {
         let data_offset = checked_align_up(size_of::<AsterArray>(), 8).expect("array data offset");
@@ -8780,6 +9869,9 @@ mod tests {
                 .is_null()
         );
         assert_eq!(first.take_error().as_deref(), Some("earlier failure"));
+        // Counted arrays serve the payload and the header separately: a payload
+        // that exactly fills the page is committed before the header fails.
+        #[cfg(not(feature = "mem-exp-rc"))]
         assert_eq!(first.memory_stats(), &MemoryStats::default());
     }
 
@@ -9002,7 +10094,11 @@ mod tests {
         local.string_builder_append(builder, value);
         assert!(!local.string_builder_to_string(builder, true).is_null());
         aster_rt_temporary_scope_leave(&raw mut local);
-        assert_eq!(local.memory_stats().used_bytes, 13);
+        // Under mem-exp-rc the persistent string is a 32-byte size-class block.
+        assert_eq!(
+            local.memory_stats().used_bytes,
+            if cfg!(feature = "mem-exp-rc") { 32 } else { 13 }
+        );
     }
 
     #[test]
@@ -10383,7 +11479,8 @@ mod tests {
             // SAFETY: `allocation` is a live 64-byte object allocation.
             #[allow(unsafe_code)]
             let bytes = unsafe { std::slice::from_raw_parts(allocation, 64) };
-            assert!(bytes.iter().all(|byte| *byte == 0));
+            assert!(bytes.iter().enumerate().all(|(index, byte)| *byte == 0
+                || (cfg!(feature = "mem-exp-rc") && (8..12).contains(&index))));
             // SAFETY: the same live allocation is initialized before rewind.
             #[allow(unsafe_code)]
             unsafe {

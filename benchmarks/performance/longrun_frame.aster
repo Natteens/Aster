@@ -1,0 +1,67 @@
+// Long-running frame loop: a fixed set of entities is updated every frame and
+// expired entities are replaced by new objects stored back into the list.
+// `Run` and `RunLong` differ only in the frame count (1x and 10x).
+
+public class Entity
+{
+    private int x;
+    private int velocity;
+    private int life;
+
+    public Entity(int seed)
+    {
+        x = seed % 100;
+        velocity = seed % 7 + 1;
+        life = seed % 50 + 10;
+    }
+
+    public int X
+    {
+        get { return x; }
+    }
+
+    public bool Alive
+    {
+        get { return life > 0; }
+    }
+
+    public void Update()
+    {
+        x = (x + velocity) % 1000;
+        life = life - 1;
+    }
+}
+
+internal long Simulate(int frames)
+{
+    List<Entity> entities = new List<Entity>();
+    for (int index = 0; index < 64; index++)
+    {
+        entities.Add(new Entity(index));
+    }
+    long total = 0L;
+    for (int frame = 0; frame < frames; frame++)
+    {
+        for (int index = 0; index < 64; index++)
+        {
+            Entity entity = entities[index];
+            entity.Update();
+            total = total + (long)entity.X;
+            if (!entity.Alive)
+            {
+                entities[index] = new Entity(frame * 31 + index);
+            }
+        }
+    }
+    return total;
+}
+
+public long Run()
+{
+    return Simulate(2000);
+}
+
+public long RunLong()
+{
+    return Simulate(20000);
+}

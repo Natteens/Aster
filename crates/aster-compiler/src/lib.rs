@@ -8,6 +8,7 @@ mod escape_analysis;
 mod generics;
 mod git_source;
 mod hir_lowering;
+mod interface_inheritance;
 mod lifetime_analysis;
 mod local_object_elimination;
 mod lockfile;
@@ -27,6 +28,8 @@ mod type_names;
 use std::{any::Any, path::Path};
 
 use aster_diagnostics::{Diagnostic, Severity, Span};
+use aster_mir::validate::ValidationError;
+use aster_mir::validate::executable::Phase;
 use aster_syntax::{Module, Token, lex, parse};
 
 const COMPILER_STACK_BYTES: usize = 16 * 1024 * 1024;
@@ -226,6 +229,10 @@ fn compile_module(
     if !generic_diagnostics.is_empty() {
         return Err(generic_diagnostics);
     }
+    let interface_diagnostics = interface_inheritance::expand(&mut module);
+    if !interface_diagnostics.is_empty() {
+        return Err(interface_diagnostics);
+    }
     let (diagnostics, semantic_model) = semantic::validate(&module);
     if diagnostics
         .iter()
@@ -235,19 +242,31 @@ fn compile_module(
     } else {
         let hir = hir_lowering::lower(&module, &semantic_model, intrinsic_bindings);
         let mut mir = mir_lowering::lower(&hir);
+        check_mir(&mir, "MIR lowering");
         if rewrite_loop_string_concat {
             loop_string_concat_rewrite::rewrite(&mut mir);
+            check_mir(&mir, "loop string-concat rewrite");
         }
         if optimize_mir {
             mir_optimizer::optimize(&mut mir);
+            check_mir(&mir, "MIR optimizer");
         }
         if optimize_array_loops {
             array_loop_optimization::optimize(&mut mir);
+            check_mir(&mir, "array-loop optimization");
         }
         escape_analysis::assign_allocation_regions(&mut mir);
+        check_mir(&mir, "escape analysis");
         local_object_elimination::eliminate(&mut mir);
+        check_mir(&mir, "local object elimination");
         temporary_subregions::lower_production_aarm_temporary_subregions(&mut mir);
+        check_mir_at(
+            &mir,
+            "AARM temporary subregions",
+            Phase::TemporarySubregions,
+        );
         owned_regions::lower(&mut mir);
+        check_mir_at(&mir, "owned regions", Phase::Final);
         Ok(Compilation {
             tokens,
             module,
@@ -291,6 +310,8 @@ fn synthesize_default_constructors(module: &mut Module) {
             continue;
         }
         class.members.push(Member::Method(FunctionDeclaration {
+            base_call: None,
+            dispatch: aster_syntax::MemberDispatch::None,
             constructor: true,
             is_test: false,
             is_static: false,
@@ -367,5 +388,93 @@ mod tests {
                 [] as [aster_mir::Function; 0]
             );
         }
+    }
+}
+
+/// Debug builds validate MIR after every compiler pass with the backend-neutral
+/// validator, so a pass that breaks a MIR invariant fails where it happens
+/// instead of at code generation. A well-formed construct that no backend
+/// supports yet is left for the backend to reject. Release builds skip it.
+fn check_mir(mir: &aster_mir::Module, pass: &str) {
+    check_mir_at(mir, pass, Phase::Lowered);
+}
+
+/// [`check_mir`] for a pass after which the region checks of `phase` apply.
+fn check_mir_at(mir: &aster_mir::Module, pass: &str, phase: Phase) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    // Typing: a well-formed construct no backend supports yet (a module
+    // global) is the backend's to reject.
+    if let Err(ValidationError::Invalid(message)) = aster_mir::validate::validate_types(mir) {
+        panic!("invalid MIR after {pass}: {message}");
+    }
+    // Executability: the region checks report violations as unsupported for
+    // hand-built MIR, but a compiler pass never emits a region it cannot
+    // execute, so anything but a worker policy rejection is a pass defect.
+    match aster_mir::validate::executable::validate_module(mir, phase) {
+        Ok(()) | Err(ValidationError::Rejected(_)) => {}
+        Err(error) => panic!("invalid MIR after {pass}: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod check_mir_tests {
+    // A loop keeps typed assignments alive through constant propagation.
+    const SOURCE: &str =
+        "public int Run() { int t = 0; for (int i = 0; i < 4; i++) { t = t + i; } return t; }";
+
+    #[test]
+    fn pipeline_output_passes_the_per_pass_check() {
+        let compilation = super::compile(SOURCE).expect("valid program");
+        super::check_mir(&compilation.mir, "test");
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "invalid MIR after corrupting pass")
+    )]
+    fn a_pass_that_breaks_local_types_is_caught() {
+        let mut compilation = super::compile(SOURCE).expect("valid program");
+        let function = compilation
+            .mir
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Run")
+            .expect("entry function");
+        for local in &mut function.locals {
+            local.type_ = aster_mir::Type::Bool;
+        }
+        super::check_mir(&compilation.mir, "corrupting pass");
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "invalid MIR after owned regions")
+    )]
+    fn an_unbalanced_owned_region_is_caught_in_the_final_phase() {
+        let mut compilation = super::compile(SOURCE).expect("valid program");
+        let function = compilation
+            .mir
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Run")
+            .expect("entry function");
+        function.blocks[0].instructions.insert(
+            0,
+            aster_mir::Instruction::OwnedRegionExit {
+                id: aster_mir::OwnedRegionId(0),
+                invalidated: Vec::new(),
+            },
+        );
+        // Not yet applicable before owned-region lowering.
+        super::check_mir_at(
+            &compilation.mir,
+            "local object elimination",
+            super::Phase::Lowered,
+        );
+        super::check_mir_at(&compilation.mir, "owned regions", super::Phase::Final);
     }
 }

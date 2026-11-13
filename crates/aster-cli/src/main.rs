@@ -1,4 +1,5 @@
 mod doctor;
+mod fmt;
 mod new_project;
 mod stdlib_discovery;
 mod watch;
@@ -7,7 +8,6 @@ use std::{
     env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    process::ExitCode,
 };
 
 #[repr(u8)]
@@ -26,21 +26,44 @@ enum CliError {
 
 type CliResult = Result<(), CliError>;
 
-fn main() -> ExitCode {
-    let code = match run(env::args().skip(1)) {
-        Ok(()) => CliExitCode::Success,
-        Err(CliError::Failure) => CliExitCode::Failure,
-        Err(CliError::Usage) => CliExitCode::Usage,
+fn main() {
+    // Arguments that are not valid Unicode are replaced with U+FFFD rather
+    // than aborting the process (LANG-018).
+    let arguments = env::args_os()
+        .skip(1)
+        .map(|argument| argument.to_string_lossy().into_owned());
+    let status = match run(arguments) {
+        Ok(status) => status,
+        Err(CliError::Failure) => i32::from(CliExitCode::Failure as u8),
+        Err(CliError::Usage) => i32::from(CliExitCode::Usage as u8),
     };
-    ExitCode::from(code as u8)
+    // `ExitCode` carries only 8 bits. `exit` passes the full status to the
+    // operating system unchanged: Windows observes all 32 bits, POSIX the low
+    // 8. Flush first because `exit` skips destructors on this stack.
+    let _ = io::stdout().flush();
+    let _ = io::stderr().flush();
+    std::process::exit(status);
 }
 
-fn run(mut arguments: impl Iterator<Item = String>) -> CliResult {
+/// Run one CLI command and return the process exit status: `0` for every
+/// command except `run`, which returns the application's `int` status.
+fn run(mut arguments: impl Iterator<Item = String>) -> Result<i32, CliError> {
     match arguments.next().as_deref() {
-        Some("new") => run_new_command(&mut arguments),
-        Some("fetch") => run_fetch_command(&mut arguments),
+        Some("run") => run_execute_command(&mut arguments),
+        command => run_other_command(command, &mut arguments)
+            .map(|()| i32::from(CliExitCode::Success as u8)),
+    }
+}
+
+fn run_other_command(
+    command: Option<&str>,
+    arguments: &mut impl Iterator<Item = String>,
+) -> CliResult {
+    match command {
+        Some("new") => run_new_command(arguments),
+        Some("fetch") => run_fetch_command(arguments),
         Some("doctor") => {
-            reject_extra_argument(&mut arguments, "aster doctor")?;
+            reject_extra_argument(arguments, "aster doctor")?;
             if doctor::run() {
                 Ok(())
             } else {
@@ -48,11 +71,11 @@ fn run(mut arguments: impl Iterator<Item = String>) -> CliResult {
             }
         }
         Some(command @ ("check" | "dump-hir" | "dump-mir")) => {
-            run_validation_command(command, &mut arguments)
+            run_validation_command(command, arguments)
         }
-        Some("test") => run_test_command(&mut arguments),
-        Some("run") => run_execute_command(&mut arguments),
-        Some("watch") => run_watch_command(&mut arguments),
+        Some("test") => run_test_command(arguments),
+        Some("watch") => run_watch_command(arguments),
+        Some("fmt") => fmt::run(arguments),
         Some("--version" | "-V") => {
             if let Some(argument) = arguments.next() {
                 return Err(usage_error(
@@ -214,9 +237,22 @@ fn run_validation_command(
     process_file(command, &file_name, &stdlib).map_err(|()| CliError::Failure)
 }
 
-fn run_execute_command(arguments: &mut impl Iterator<Item = String>) -> CliResult {
-    const USAGE: &str = "aster run [FILE] [--function <NAME>] [--memory-stats]";
+/// `aster run [FILE] [--function <NAME>] [--memory-stats] [-- ARGS...]`.
+///
+/// Everything after the first `--` is passed to the program as the `args` of
+/// `Main(string[] args)`, unchanged. Returns the process exit status: the
+/// `int` result of `Main`, `0` for a `void` `Main`.
+fn run_execute_command(arguments: &mut impl Iterator<Item = String>) -> Result<i32, CliError> {
+    const USAGE: &str = "aster run [FILE] [--function <NAME>] [--memory-stats] [-- ARGS...]";
     let mut arguments = arguments.collect::<Vec<_>>();
+    let program_arguments = match arguments.iter().position(|argument| argument == "--") {
+        Some(separator) => {
+            let rest = arguments.split_off(separator + 1);
+            arguments.pop();
+            rest
+        }
+        None => Vec::new(),
+    };
     if matches!(arguments.first().map(String::as_str), Some("--help" | "-h")) {
         if let Some(argument) = arguments.get(1) {
             return Err(usage_error(
@@ -225,7 +261,7 @@ fn run_execute_command(arguments: &mut impl Iterator<Item = String>) -> CliResul
             ));
         }
         print_command_help("run");
-        return Ok(());
+        return Ok(0);
     }
     let file_name = if arguments
         .first()
@@ -239,8 +275,14 @@ fn run_execute_command(arguments: &mut impl Iterator<Item = String>) -> CliResul
         parse_execution_options(&mut arguments.into_iter(), USAGE, true)?;
     let file_name = resolve_source_argument(file_name)?;
     let stdlib = stdlib_discovery::discover().map_err(|()| CliError::Failure)?;
-    run_file(&file_name, function_name.as_deref(), memory_stats, &stdlib)
-        .map_err(|()| CliError::Failure)
+    run_file(
+        &file_name,
+        function_name.as_deref(),
+        memory_stats,
+        &program_arguments,
+        &stdlib,
+    )
+    .map_err(|()| CliError::Failure)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -429,7 +471,7 @@ fn reject_extra_argument(arguments: &mut impl Iterator<Item = String>, usage: &s
     Ok(())
 }
 
-fn usage_error(message: impl std::fmt::Display, usage: &str) -> CliError {
+pub(crate) fn usage_error(message: impl std::fmt::Display, usage: &str) -> CliError {
     eprintln!("error: {message}\nusage: {usage}");
     CliError::Usage
 }
@@ -563,12 +605,17 @@ fn process_file(
     }
 }
 
+/// Compile and run one program. Returns the exit status the process must end
+/// with: the `int` result of an application `Main` passed through unchanged,
+/// `0` for a `void` `Main`. An explicit `--function` is a development option
+/// that prints a non-void result and exits `0`.
 fn run_file(
     file_name: &str,
     function_name: Option<&str>,
     memory_stats: bool,
+    program_arguments: &[String],
     stdlib: &aster_compiler::StandardLibrary,
-) -> Result<(), ()> {
+) -> Result<i32, ()> {
     validate_source_file(Path::new(file_name))?;
     let project =
         match aster_compiler::compile_project_with_stdlib(Path::new(file_name), stdlib.clone()) {
@@ -583,24 +630,31 @@ fn run_file(
     for diagnostic in project_diagnostics(&project) {
         eprintln!("{}", diagnostic.render());
     }
-    match execute_project(&project, Path::new(file_name), function_name) {
-        Ok((value, _, stats)) => {
-            if !matches!(value, aster_codegen_cranelift::ExecutionValue::Void) {
-                println!("{value}");
-            }
-            if memory_stats {
-                print_memory_stats(&stats);
-            }
-            Ok(())
+    let (value, _, stats) = execute_project(
+        &project,
+        Path::new(file_name),
+        function_name,
+        program_arguments,
+    )?;
+    let exit_status = match (&value, function_name) {
+        (aster_codegen_cranelift::ExecutionValue::Int(result), None) => *result,
+        (aster_codegen_cranelift::ExecutionValue::Void, _) => 0,
+        (printed, _) => {
+            println!("{printed}");
+            0
         }
-        Err(()) => Err(()),
+    };
+    if memory_stats {
+        print_memory_stats(&stats);
     }
+    Ok(exit_status)
 }
 
 pub(crate) fn execute_project(
     project: &aster_compiler::ProjectCompilation,
     root_file: &Path,
     function_name: Option<&str>,
+    program_arguments: &[String],
 ) -> Result<
     (
         aster_codegen_cranelift::ExecutionValue,
@@ -630,9 +684,14 @@ pub(crate) fn execute_project(
                 eprintln!("{}", diagnostic.render());
             }
         })?;
-    aster_codegen_cranelift::execute_symbol_with_stats(&project.compilation.mir, entry.symbol)
-        .map(|(value, stats)| (value, entry.display_name, stats))
-        .map_err(|error| eprintln!("error: {error}"))
+    aster_codegen_cranelift::execute_entry_with_arguments(
+        &project.compilation.mir,
+        entry.symbol,
+        program_arguments,
+        None,
+    )
+    .map(|(value, stats)| (value, entry.display_name, stats))
+    .map_err(|error| eprintln!("error: {error}"))
 }
 
 pub(crate) fn project_diagnostics(
@@ -676,11 +735,11 @@ fn print_memory_stats(stats: &aster_codegen_cranelift::MemoryStats) {
 
 fn print_help() {
     println!(
-        "Aster compiler\n\nUsage:\n  aster <command> [arguments]\n\nCommands:\n  new <NAME>       Create a new ASTER project\n  fetch            Fetch and lock Git dependencies\n  doctor           Diagnose the ASTER installation and environment\n  check [FILE]     Check a project or source file\n  run [FILE]       Run a project or source file\n  test             Run root-package tests\n  watch <FILE>     Watch and rerun a source file\n  dump-hir [FILE]  Print HIR\n  dump-mir [FILE]  Print MIR\n\nOptions:\n  -h, --help\n  -V, --version"
+        "Aster compiler\n\nUsage:\n  aster <command> [arguments]\n\nCommands:\n  new <NAME>       Create a new ASTER project\n  fetch            Fetch and lock Git dependencies\n  doctor           Diagnose the ASTER installation and environment\n  check [FILE]     Check a project or source file\n  run [FILE]       Run a project or source file\n  test             Run root-package tests\n  watch <FILE>     Watch and rerun a source file\n  fmt [FILE...]    Format source files (--check to verify)\n  dump-hir [FILE]  Print HIR\n  dump-mir [FILE]  Print MIR\n\nOptions:\n  -h, --help\n  -V, --version"
     );
 }
 
-fn print_command_help(command: &str) {
+pub(crate) fn print_command_help(command: &str) {
     let (usage, description) = match command {
         "new" => (
             "aster new <NAME>",
@@ -707,12 +766,16 @@ fn print_command_help(command: &str) {
             "Run parameterless `test void` functions from tests/.",
         ),
         "run" => (
-            "aster run [FILE] [--function <NAME>] [--memory-stats]",
-            "Run the application entry point or an explicitly selected function.",
+            "aster run [FILE] [--function <NAME>] [--memory-stats] [-- ARGS...]",
+            "Run the application entry point or an explicitly selected function. Arguments after `--` become the `args` of `Main(string[] args)`; the `int` result of `Main` is the exit status.",
         ),
         "watch" => (
             "aster watch <FILE> [--function <NAME>]",
             "Recompile and rerun when a loaded project file changes.",
+        ),
+        "fmt" => (
+            "aster fmt [--check] [FILE...]",
+            "Format Aster sources in place with the one canonical style; --check lists files that would change and exits 1.",
         ),
         _ => unreachable!("help requested for a known command"),
     };
@@ -827,6 +890,7 @@ mod tests {
             path.to_str().expect("UTF-8 test path"),
             Some("Calculate"),
             false,
+            &[],
             &embedded(),
         );
         fs::remove_file(path).expect("remove test source");
@@ -843,10 +907,15 @@ mod tests {
             path.to_str().expect("UTF-8 test path"),
             None,
             false,
+            &[],
             &embedded(),
         );
         fs::remove_file(path).expect("remove test source");
-        assert!(result.is_ok());
+        assert_eq!(
+            result,
+            Ok(42),
+            "the int result of `Main` is the exit status"
+        );
     }
 
     #[test]
@@ -863,6 +932,7 @@ mod tests {
             root.to_str().expect("UTF-8 test path"),
             Some("Calculate"),
             false,
+            &[],
             &embedded(),
         );
         fs::remove_dir_all(directory).expect("remove test project");
@@ -895,10 +965,11 @@ mod tests {
             root.to_str().expect("UTF-8 test path"),
             None,
             false,
+            &[],
             &embedded(),
         );
         fs::remove_dir_all(directory).expect("remove test project");
-        assert!(result.is_ok());
+        assert_eq!(result, Ok(42));
     }
 
     #[test]
@@ -919,6 +990,7 @@ mod tests {
             root.to_str().expect("UTF-8 test path"),
             Some("app::Double"),
             false,
+            &[],
             &embedded(),
         );
         fs::remove_dir_all(directory).expect("remove test project");
@@ -940,12 +1012,14 @@ mod tests {
             path.to_str().expect("UTF-8"),
             Some("Run"),
             false,
+            &[],
             &embedded(),
         );
         let with = run_file(
             path.to_str().expect("UTF-8"),
             Some("Run"),
             true,
+            &[],
             &embedded(),
         );
         fs::remove_file(&path).expect("remove test file");
@@ -959,8 +1033,8 @@ mod tests {
             "stats-class",
             "public class Program { public static int Main() { return 1; } }",
         );
-        let result = run_file(path.to_str().expect("UTF-8"), None, true, &embedded());
+        let result = run_file(path.to_str().expect("UTF-8"), None, true, &[], &embedded());
         fs::remove_file(&path).expect("remove test file");
-        assert!(result.is_ok());
+        assert_eq!(result, Ok(1));
     }
 }

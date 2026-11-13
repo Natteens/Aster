@@ -1,0 +1,48 @@
+// Object graph: a complete binary tree of class nodes is built and traversed
+// recursively, repeatedly.
+
+public class Node
+{
+    private int value;
+    private Node[] children;
+
+    public Node(int value, Node[] children)
+    {
+        this.value = value;
+        this.children = children;
+    }
+
+    public int Sum()
+    {
+        int total = value;
+        foreach (Node child in children)
+        {
+            total = total + child.Sum();
+        }
+        return total;
+    }
+}
+
+internal Node Build(int depth, int seed)
+{
+    if (depth == 0)
+    {
+        Node[] none = [];
+        return new Node(seed % 10, none);
+    }
+    Node left = Build(depth - 1, seed * 2 + 1);
+    Node right = Build(depth - 1, seed * 2 + 2);
+    Node[] pair = [left, right];
+    return new Node(seed % 10, pair);
+}
+
+public long Run()
+{
+    long total = 0L;
+    for (int round = 0; round < 20; round++)
+    {
+        Node root = Build(10, round);
+        total = total + (long)root.Sum();
+    }
+    return total;
+}

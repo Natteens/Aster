@@ -106,6 +106,10 @@ fn collect_statement(statement: &hir::Statement, max: &mut u32) {
             collect_expression(condition, max);
             collect_block(body, max);
         }
+        hir::Statement::DoWhile { body, condition } => {
+            collect_block(body, max);
+            collect_expression(condition, max);
+        }
         hir::Statement::For {
             initializer,
             condition,
@@ -142,6 +146,9 @@ fn collect_statement(statement: &hir::Statement, max: &mut u32) {
                 note(max, case.case);
                 for binding in &case.bindings {
                     note(max, binding.symbol);
+                }
+                if let Some(guard) = &case.guard {
+                    collect_expression(guard, max);
                 }
                 collect_block(&case.body, max);
             }
@@ -203,6 +210,17 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
             note(max, *constructor);
             for argument in arguments {
                 collect_expression(argument, max);
+            }
+        }
+        hir::ExpressionKind::ObjectInitializer {
+            object,
+            receiver,
+            assignments,
+        } => {
+            collect_expression(object, max);
+            note(max, *receiver);
+            for assignment in assignments {
+                collect_expression(assignment, max);
             }
         }
         hir::ExpressionKind::ArrayLiteral(elements) => {
@@ -419,12 +437,42 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
             collect_expression(value, max);
         }
         hir::ExpressionKind::LogCall { argument, .. } => collect_expression(argument, max),
+        hir::ExpressionKind::UpcastClass { object }
+        | hir::ExpressionKind::BaseReceiver { object } => {
+            collect_expression(object, max);
+        }
+        hir::ExpressionKind::ClassTest {
+            value,
+            class,
+            binding,
+        } => {
+            note(max, *class);
+            if let Some(binding) = binding {
+                collect_variable(binding, max);
+            }
+            collect_expression(value, max);
+        }
+        hir::ExpressionKind::InterfaceTest {
+            value,
+            interface,
+            binding,
+        } => {
+            note(max, *interface);
+            if let Some(binding) = binding {
+                collect_variable(binding, max);
+            }
+            collect_expression(value, max);
+        }
         hir::ExpressionKind::UpcastInterface {
             object,
             class,
             interface,
         } => {
             note(max, *class);
+            note(max, *interface);
+            collect_expression(object, max);
+        }
+        hir::ExpressionKind::UpcastInterfaceValue { object, interface } => {
             note(max, *interface);
             collect_expression(object, max);
         }
@@ -448,6 +496,9 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
                 note(max, case.case);
                 for binding in &case.bindings {
                     note(max, binding.symbol);
+                }
+                if let Some(guard) = &case.guard {
+                    collect_expression(guard, max);
                 }
                 collect_expression(&case.value, max);
             }

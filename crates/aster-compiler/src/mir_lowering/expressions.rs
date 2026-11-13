@@ -76,6 +76,11 @@ impl FunctionLowerer {
                 arguments,
                 argument_order,
             )),
+            hir::ExpressionKind::ObjectInitializer {
+                object,
+                receiver,
+                assignments,
+            } => Some(self.lower_object_initializer(object, *receiver, assignments)),
             hir::ExpressionKind::ArrayLiteral(elements) => {
                 Some(self.lower_array_literal(&expression.type_, elements))
             }
@@ -786,6 +791,99 @@ impl FunctionLowerer {
                     .expect("validated conversion operand produces a value");
                 Some(self.temporary(expression.type_.clone(), mir::RvalueKind::Cast(value)))
             }
+            hir::ExpressionKind::UpcastClass { object }
+            | hir::ExpressionKind::BaseReceiver { object } => {
+                let object = self
+                    .lower_expression(object)
+                    .expect("validated class upcast has an object");
+                Some(self.temporary(expression.type_.clone(), mir::RvalueKind::Upcast(object)))
+            }
+            hir::ExpressionKind::ClassTest {
+                value,
+                class,
+                binding,
+            } => {
+                let object = self
+                    .lower_expression(value)
+                    .expect("validated class test operand produces a value");
+                let test = self.temporary(
+                    mir::Type::Bool,
+                    mir::RvalueKind::ClassTest {
+                        object: object.clone(),
+                        class: *class,
+                    },
+                );
+                if let Some(binding) = binding {
+                    // The binding is the same object pointer with the narrower
+                    // static type. It is assigned unconditionally (no extra
+                    // control flow); semantic analysis guarantees it is read
+                    // only where the test succeeded.
+                    let local = self.source_local(
+                        binding.symbol,
+                        binding.name.clone(),
+                        binding.type_.clone(),
+                        binding.mutable,
+                    );
+                    self.locals.push(local.clone());
+                    self.assign(
+                        mir::Place::Local(local.id),
+                        mir::Rvalue {
+                            type_: binding.type_.clone(),
+                            kind: mir::RvalueKind::Downcast(object),
+                        },
+                    );
+                }
+                Some(test)
+            }
+            hir::ExpressionKind::InterfaceTest {
+                value,
+                interface,
+                binding,
+            } => {
+                let object = self
+                    .lower_expression(value)
+                    .expect("validated interface test operand produces a value");
+                let test = self.temporary(
+                    mir::Type::Bool,
+                    mir::RvalueKind::InterfaceTest {
+                        object: object.clone(),
+                        interface: *interface,
+                    },
+                );
+                if let Some(binding) = binding {
+                    // The lookup is a controlled run-time error when the
+                    // descriptor has no table, so unlike a class binding it is
+                    // assigned only on the path where the test succeeded.
+                    let local = self.source_local(
+                        binding.symbol,
+                        binding.name.clone(),
+                        binding.type_.clone(),
+                        binding.mutable,
+                    );
+                    self.locals.push(local.clone());
+                    let lookup_id = self.new_block();
+                    let join_id = self.new_block();
+                    self.terminate_current(mir::Terminator::Branch {
+                        condition: test.clone(),
+                        then_block: lookup_id,
+                        else_block: join_id,
+                    });
+                    self.current = Some(lookup_id);
+                    self.assign(
+                        mir::Place::Local(local.id),
+                        mir::Rvalue {
+                            type_: binding.type_.clone(),
+                            kind: mir::RvalueKind::InterfaceLookup {
+                                object,
+                                interface: *interface,
+                            },
+                        },
+                    );
+                    self.terminate_current(mir::Terminator::Goto(join_id));
+                    self.current = Some(join_id);
+                }
+                Some(test)
+            }
             hir::ExpressionKind::UpcastInterface {
                 object,
                 class,
@@ -799,6 +897,18 @@ impl FunctionLowerer {
                     mir::RvalueKind::MakeInterface {
                         object,
                         class: *class,
+                        interface: *interface,
+                    },
+                ))
+            }
+            hir::ExpressionKind::UpcastInterfaceValue { object, interface } => {
+                let object = self
+                    .lower_expression(object)
+                    .expect("validated interface conversion has an object");
+                Some(self.temporary(
+                    expression.type_.clone(),
+                    mir::RvalueKind::InterfaceLookup {
+                        object,
                         interface: *interface,
                     },
                 ))
@@ -1360,6 +1470,41 @@ impl FunctionLowerer {
         receiver
     }
 
+    /// Construct first (arguments, then constructor), then run the member
+    /// assignments in source order against the new object, which is bound to
+    /// the hidden `receiver` symbol; the finished object is the result.
+    fn lower_object_initializer(
+        &mut self,
+        object: &hir::Expression,
+        receiver: hir::SymbolId,
+        assignments: &[hir::Expression],
+    ) -> mir::Operand {
+        let created = self
+            .lower_expression(object)
+            .expect("validated object creation produces a value");
+        let local = if let mir::OperandKind::Copy(mir::Place::Local(local)) = &created.kind {
+            *local
+        } else {
+            let local = self.new_temporary(object.type_.clone());
+            self.assign(
+                mir::Place::Local(local),
+                mir::Rvalue {
+                    type_: object.type_.clone(),
+                    kind: mir::RvalueKind::Use(created),
+                },
+            );
+            local
+        };
+        self.symbol_locals.insert(receiver, local);
+        for assignment in assignments {
+            self.lower_expression(assignment);
+        }
+        mir::Operand {
+            type_: object.type_.clone(),
+            kind: mir::OperandKind::Copy(mir::Place::Local(local)),
+        }
+    }
+
     fn lower_array_literal(
         &mut self,
         type_: &hir::Type,
@@ -1679,6 +1824,9 @@ pub(super) fn lower_intrinsic(intrinsic: hir::Intrinsic) -> mir::Intrinsic {
         hir::Intrinsic::AssertionEqual => mir::Intrinsic::AssertionEqual,
         hir::Intrinsic::ConsoleWrite => mir::Intrinsic::ConsoleWrite,
         hir::Intrinsic::ConsoleWriteLine => mir::Intrinsic::ConsoleWriteLine,
+        hir::Intrinsic::ConsoleWriteError => mir::Intrinsic::ConsoleWriteError,
+        hir::Intrinsic::EnvironmentHasVariable => mir::Intrinsic::EnvironmentHasVariable,
+        hir::Intrinsic::EnvironmentGetVariable => mir::Intrinsic::EnvironmentGetVariable,
         hir::Intrinsic::ConsoleReadLine => mir::Intrinsic::ConsoleReadLine,
         // `FileIoResultLayout` is the identical type re-exported by both
         // crates (`aster_mir::FileIoResultLayout` is `aster_hir`'s), so the
@@ -1812,6 +1960,7 @@ pub(super) fn compound_operator(operator: hir::AssignmentOperator) -> mir::Binar
         hir::AssignmentOperator::SubtractAssign => mir::BinaryOperator::Subtract,
         hir::AssignmentOperator::MultiplyAssign => mir::BinaryOperator::Multiply,
         hir::AssignmentOperator::DivideAssign => mir::BinaryOperator::Divide,
+        hir::AssignmentOperator::RemainderAssign => mir::BinaryOperator::Remainder,
         hir::AssignmentOperator::BitwiseAndAssign => mir::BinaryOperator::BitwiseAnd,
         hir::AssignmentOperator::BitwiseOrAssign => mir::BinaryOperator::BitwiseOr,
         hir::AssignmentOperator::BitwiseXorAssign => mir::BinaryOperator::BitwiseXor,

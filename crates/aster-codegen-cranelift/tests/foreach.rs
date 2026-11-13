@@ -1023,7 +1023,7 @@ fn foreach_over_an_array_stored_in_a_field() {
 // --- Section 7: workers ------------------------------------------------------------
 
 #[test]
-fn an_array_result_type_used_across_a_worker_boundary_is_still_rejected() {
+fn an_array_result_type_used_across_a_worker_boundary_is_copied() {
     let errors = compile_errors(
         r"
         public int[] Make() { return [1, 2, 3]; }
@@ -1034,10 +1034,8 @@ fn an_array_result_type_used_across_a_worker_boundary_is_still_rejected() {
         ",
     );
     assert!(
-        errors
-            .iter()
-            .any(|message| message.contains("cross a worker boundary")),
-        "foreach must not have changed array worker-transferability, got {errors:?}"
+        errors.is_empty(),
+        "arrays cross a worker boundary by copy, got {errors:?}"
     );
 }
 

@@ -91,6 +91,7 @@ impl Drop for Fixture {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn fetch_locks_transitives_and_builds_offline_until_an_explicit_update() {
     let fixture = Fixture::new("lifecycle");
     fixture.repository(
@@ -138,11 +139,16 @@ fn fetch_locks_transitives_and_builds_offline_until_an_explicit_update() {
     );
 
     let run = fixture.aster(&["run"]);
-    assert!(run.status.success(), "{}", stderr(&run));
-    assert_eq!(stdout(&run).trim(), "42");
+    assert_eq!(run.status.code(), Some(42), "{}", stderr(&run));
+    assert_eq!(stdout(&run), "");
     let nested_run = fixture.aster_in(&fixture.app.join("app"), &["run"]);
-    assert!(nested_run.status.success(), "{}", stderr(&nested_run));
-    assert_eq!(stdout(&nested_run).trim(), "42");
+    assert_eq!(
+        nested_run.status.code(),
+        Some(42),
+        "{}",
+        stderr(&nested_run)
+    );
+    assert_eq!(stdout(&nested_run), "");
 
     write(
         &math.join("math/answer.aster"),
@@ -153,8 +159,13 @@ fn fetch_locks_transitives_and_builds_offline_until_an_explicit_update() {
     let moved_commit = git_text(&math, ["rev-parse", "HEAD"]);
 
     let still_locked = fixture.aster(&["run"]);
-    assert!(still_locked.status.success(), "{}", stderr(&still_locked));
-    assert_eq!(stdout(&still_locked).trim(), "42");
+    assert_eq!(
+        still_locked.status.code(),
+        Some(42),
+        "{}",
+        stderr(&still_locked)
+    );
+    assert_eq!(stdout(&still_locked), "");
 
     let numbers_before = locked_commit(&first_lock, "numbers");
     let updated = fixture.aster(&["fetch", "--update", "math"]);
@@ -163,8 +174,8 @@ fn fetch_locks_transitives_and_builds_offline_until_an_explicit_update() {
     assert!(second_lock.contains(&moved_commit));
     assert_eq!(locked_commit(&second_lock, "numbers"), numbers_before);
     let rerun = fixture.aster(&["run"]);
-    assert!(rerun.status.success(), "{}", stderr(&rerun));
-    assert_eq!(stdout(&rerun).trim(), "43");
+    assert_eq!(rerun.status.code(), Some(43), "{}", stderr(&rerun));
+    assert_eq!(stdout(&rerun), "");
 
     fs::rename(&fixture.remotes, fixture.root.join("remotes-offline"))
         .expect("make remotes unavailable");
@@ -178,7 +189,14 @@ fn fetch_locks_transitives_and_builds_offline_until_an_explicit_update() {
     assert!(offline_fetch.status.success(), "{}", stderr(&offline_fetch));
     for command in [["check"].as_slice(), ["run"].as_slice()] {
         let offline = fixture.aster(command);
-        assert!(offline.status.success(), "{}", stderr(&offline));
+        // `run` ends with the program exit status (here 43), `check` with 0.
+        let expected = if command == ["run"] { 43 } else { 0 };
+        assert_eq!(
+            offline.status.code(),
+            Some(expected),
+            "{}",
+            stderr(&offline)
+        );
     }
     write(&root, "namespace app; public class Program {");
     let watch = fixture.aster(&["watch", root.to_str().expect("UTF-8 path")]);
@@ -250,8 +268,8 @@ fn targeted_update_rewrites_only_the_changed_reachable_graph() {
     assert!(second.contains("name = \"replacement\""));
     assert_eq!(locked_commit(&second, "unrelated"), unrelated);
     let run = fixture.aster(&["run", root.to_str().expect("UTF-8 root")]);
-    assert!(run.status.success(), "{}", stderr(&run));
-    assert_eq!(stdout(&run).trim(), "43");
+    assert_eq!(run.status.code(), Some(43), "{}", stderr(&run));
+    assert_eq!(stdout(&run), "");
 }
 
 #[test]
@@ -346,7 +364,7 @@ fn stale_or_corrupt_local_state_fails_closed_and_fetch_repairs_only_the_cache() 
     assert_eq!(corrupt.status.code(), Some(1));
     assert!(stderr(&corrupt).contains("corrupt"));
     assert!(fixture.aster(&["fetch"]).status.success());
-    assert_eq!(stdout(&fixture.aster(&["run"])).trim(), "42");
+    assert_eq!(fixture.aster(&["run"]).status.code(), Some(42));
 
     write(
         &cache_entry.join("math/ignored.aster"),
@@ -416,8 +434,8 @@ fn a_git_package_can_use_a_path_package_inside_its_immutable_source() {
     assert!(lockfile.contains("name = \"math\""));
     assert!(!lockfile.contains("name = \"helper\""));
     let run = fixture.aster(&["run"]);
-    assert!(run.status.success(), "{}", stderr(&run));
-    assert_eq!(stdout(&run).trim(), "42");
+    assert_eq!(run.status.code(), Some(42), "{}", stderr(&run));
+    assert_eq!(stdout(&run), "");
 }
 
 #[test]

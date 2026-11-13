@@ -108,7 +108,9 @@ pub(crate) fn evaluate(
         }
         ExpressionKind::StructLiteral { .. }
         | ExpressionKind::This
+        | ExpressionKind::Base
         | ExpressionKind::NewObject { .. }
+        | ExpressionKind::ObjectInitializer { .. }
         | ExpressionKind::ArrayLiteral(_)
         | ExpressionKind::NewArray { .. }
         | ExpressionKind::Index { .. }
@@ -118,6 +120,8 @@ pub(crate) fn evaluate(
         | ExpressionKind::Try { .. }
         | ExpressionKind::Await { .. }
         | ExpressionKind::Switch { .. }
+        | ExpressionKind::TypePattern { .. }
+        | ExpressionKind::TypeAs { .. }
         | ExpressionKind::Assignment { .. }
         | ExpressionKind::InterpolatedString { .. } => Err(ConstError::NotConstant(span)),
     }

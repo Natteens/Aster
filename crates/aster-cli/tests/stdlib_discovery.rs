@@ -80,7 +80,9 @@ fn stdout(output: &Output) -> String {
 }
 
 /// Minimal source that uses the stdlib (requires aster.math to be present).
-const STDLIB_PROGRAM: &str = "using aster.math; public class Program { public static int Main() { return Math.Max(0, 1); } }";
+// `Main` prints its result: an `int` returned from `Main` is the exit status (LANG-018),
+// so a success value of 1 would be indistinguishable from a failed run.
+const STDLIB_PROGRAM: &str = "using aster.io; using aster.math; public class Program { public static void Main() { WriteLine(Math.Max(0, 1).ToString()); } }";
 
 // ASTER_STDLIB tests (run against the subprocess, not the in-process env)
 

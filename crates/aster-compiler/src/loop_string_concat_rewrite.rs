@@ -26,6 +26,10 @@ pub(super) fn rewrite(module: &mut mir::Module) {
     }
     if rewritten && existing_class.is_none() {
         module.classes.push(mir::ClassDefinition {
+            base: None,
+            is_abstract: false,
+            is_sealed: false,
+            vtable: Vec::new(),
             symbol: class,
             name: STRING_BUILDER_NAME.to_owned(),
             fields: Vec::new(),
@@ -344,12 +348,23 @@ fn rvalue_uses_local(value: &mir::Rvalue, local: mir::LocalId) -> bool {
     match &value.kind {
         mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Discriminant(operand)
+        | mir::RvalueKind::ClassTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceLookup {
+            object: operand, ..
+        }
         | mir::RvalueKind::ArrayLength(operand)
         | mir::RvalueKind::ListLength(operand)
         | mir::RvalueKind::DictionaryLength(operand)
         | mir::RvalueKind::ListVersion(operand)
         | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
+        | mir::RvalueKind::Downcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => operand_uses_local(operand, local),
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             fields

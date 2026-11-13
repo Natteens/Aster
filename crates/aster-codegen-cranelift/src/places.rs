@@ -93,10 +93,58 @@ impl Codegen {
                 );
                 Ok(())
             }
+            mir::RvalueKind::InterfaceLookup { object, interface } => {
+                self.assign_interface_lookup(builder, destination, object, *interface, state)
+            }
             _ => Err(BackendError::new(
                 "aggregate values only support construction and value copies",
             )),
         }
+    }
+
+    /// `destination = { object, table }` where the table is found by the
+    /// bounded search of the object's descriptor. When the search finds
+    /// nothing (only reachable from hand-built MIR or descriptors: valid
+    /// source proves the interface is present) a controlled runtime error is
+    /// recorded and execution takes the runtime-failure path; nothing is
+    /// written through a missing table.
+    fn assign_interface_lookup(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: Value,
+        object: &mir::Operand,
+        interface: mir::SymbolId,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        /// Code passed to `aster_rt_math_domain_error`.
+        const MISSING_INTERFACE_TABLE: i64 = 10;
+        let object = self.object_pointer(builder, object, state)?;
+        let (found, table) = self.interface_search(builder, object, interface)?;
+        let missing = builder.create_block();
+        let present = builder.create_block();
+        builder.ins().brif(found, present, &[], missing, &[]);
+
+        builder.switch_to_block(missing);
+        let context = state
+            .execution_context
+            .ok_or_else(|| BackendError::new("interface lookup is missing its ExecutionContext"))?;
+        let report = self
+            .jit
+            .declare_func_in_func(self.runtime_ids["aster_rt_math_domain_error"], builder.func);
+        let code = builder.ins().iconst(types::I32, MISSING_INTERFACE_TABLE);
+        builder.ins().call(report, &[context, code]);
+        builder.ins().jump(state.runtime_failure, &[]);
+
+        builder.switch_to_block(present);
+        builder.ins().store(MemFlags::new(), object, destination, 0);
+        builder.ins().store(
+            MemFlags::new(),
+            table,
+            destination,
+            i32::try_from(self.pointer_type.bytes())
+                .map_err(|_| BackendError::new("pointer offset is too large"))?,
+        );
+        Ok(())
     }
 
     fn assign_operand_to_address(

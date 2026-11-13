@@ -27,3 +27,20 @@ fn rejects_interface_lists_on_value_types() {
             .contains("only classes can declare implemented interfaces")
     }));
 }
+
+#[test]
+fn parses_base_interface_lists_on_interfaces() {
+    let source = "public interface IA { int A(); } public interface IC { int C(); } public interface IB : IA, IC { int B(); }";
+    let module = parse(lex(source).expect("lexing")).expect("interface inheritance syntax");
+    let Item::Interface(interface) = &module.items[2] else {
+        panic!("interface")
+    };
+    assert_eq!(
+        interface
+            .interfaces
+            .iter()
+            .map(|base| base.name.as_str())
+            .collect::<Vec<_>>(),
+        ["IA", "IC"]
+    );
+}

@@ -1,0 +1,78 @@
+// Simulated request handling: each request builds an object with a list and a
+// string, is processed, and becomes unreachable. `RunLong` handles 10x requests.
+
+public class Request
+{
+    private int id;
+    private List<int> items;
+    private string path;
+
+    public Request(int id, List<int> items, string path)
+    {
+        this.id = id;
+        this.items = items;
+        this.path = path;
+    }
+
+    public int Id
+    {
+        get { return id; }
+    }
+
+    public int Count
+    {
+        get { return items.Length; }
+    }
+
+    public int Item(int index)
+    {
+        return items[index];
+    }
+
+    public int PathLength
+    {
+        get { return path.Length; }
+    }
+}
+
+internal Request Build(int id)
+{
+    List<int> items = new List<int>();
+    int count = id % 8 + 1;
+    for (int index = 0; index < count; index++)
+    {
+        items.Add(id % 1000 + index);
+    }
+    return new Request(id, items, $"/item/{id}");
+}
+
+internal int Handle(Request request)
+{
+    int sum = 0;
+    for (int index = 0; index < request.Count; index++)
+    {
+        sum = sum + request.Item(index);
+    }
+    return sum + request.PathLength + request.Id % 3;
+}
+
+internal long Serve(int requests)
+{
+    long total = 0L;
+    for (int id = 0; id < requests; id++)
+    {
+        Request request = Build(id);
+        total = total + (long)Handle(request);
+    }
+    return total;
+}
+
+public long Run()
+{
+    return Serve(20000);
+}
+
+public long RunLong()
+{
+    return Serve(200000);
+}

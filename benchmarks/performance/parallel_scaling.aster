@@ -1,0 +1,33 @@
+// Parallel scaling: `Parallel.Reduce` over 200,000 elements with independent
+// per-element work. The combine is associative, so the result does not depend on
+// the worker count or chunk plan.
+
+public long Accumulate(long accumulator, int value)
+{
+    int mixed = value;
+    for (int step = 0; step < 40; step++)
+    {
+        mixed = (mixed * 31 + step) % 65521;
+    }
+    return accumulator + (long)mixed;
+}
+
+public long Combine(long left, long right)
+{
+    return left + right;
+}
+
+public int[] Values()
+{
+    int[] values = new int[200000];
+    for (int index = 0; index < 200000; index++)
+    {
+        values[index] = index;
+    }
+    return values;
+}
+
+public long Run()
+{
+    return Parallel.Reduce(Values(), 0L, Accumulate, Combine);
+}

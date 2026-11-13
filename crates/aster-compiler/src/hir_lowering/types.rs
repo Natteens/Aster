@@ -138,9 +138,38 @@ pub(super) fn constant_expression(value: &ConstValue) -> hir::Expression {
     }
 }
 
+/// Subject types of an integer, `char` or `string` switch.
+pub(super) fn is_scalar_switch_type(type_: &hir::Type) -> bool {
+    matches!(
+        type_,
+        hir::Type::Char
+            | hir::Type::String
+            | hir::Type::SByte
+            | hir::Type::Byte
+            | hir::Type::Short
+            | hir::Type::UShort
+            | hir::Type::Int
+            | hir::Type::UInt
+            | hir::Type::Long
+            | hir::Type::ULong
+    )
+}
+
 /// Wrap an expression in a `Convert` node when its type differs from the
 /// validated target type. Only value types are ever converted.
 pub(super) fn convert(expression: hir::Expression, target: &hir::Type) -> hir::Expression {
+    // Semantic analysis only admits a class-to-class conversion along the
+    // declared base chain, where it is an identity-preserving upcast.
+    if let (hir::Type::Class(from), hir::Type::Class(to)) = (&expression.type_, target)
+        && from != to
+    {
+        return hir::Expression {
+            type_: target.clone(),
+            kind: hir::ExpressionKind::UpcastClass {
+                object: Box::new(expression),
+            },
+        };
+    }
     if let (hir::Type::Class(class), hir::Type::Interface(interface)) =
         (expression.type_.clone(), target)
     {
@@ -150,6 +179,19 @@ pub(super) fn convert(expression: hir::Expression, target: &hir::Type) -> hir::E
                 object: Box::new(expression),
                 class,
                 interface: *interface,
+            },
+        };
+    }
+    // Semantic analysis only admits an interface-to-interface conversion
+    // toward a base interface.
+    if let (hir::Type::Interface(from), hir::Type::Interface(to)) = (&expression.type_, target)
+        && from != to
+    {
+        return hir::Expression {
+            type_: target.clone(),
+            kind: hir::ExpressionKind::UpcastInterfaceValue {
+                object: Box::new(expression),
+                interface: *to,
             },
         };
     }
@@ -203,10 +245,12 @@ pub(super) fn unary_promoted(type_: &hir::Type) -> Option<hir::Type> {
     primitives::promote_unary(primitives::of_hir(type_)?).map(primitives::to_hir)
 }
 
+/// Result type of a binary expression whose operand type semantic analysis
+/// already selected (`operand`, absent when no numeric conversion applies).
 pub(super) fn binary_type(
     operator: ast::BinaryOperator,
+    operand: Option<&hir::Type>,
     left: &hir::Type,
-    right: &hir::Type,
 ) -> hir::Type {
     use ast::BinaryOperator::{
         Equal, Greater, GreaterEqual, Less, LessEqual, LogicalAnd, LogicalOr, NotEqual,
@@ -217,7 +261,5 @@ pub(super) fn binary_type(
     ) {
         return hir::Type::Bool;
     }
-    // Equal operand types still go through the central table: two equal small
-    // integers promote to `int`.
-    promoted(left, right).unwrap_or_else(|| left.clone())
+    operand.unwrap_or(left).clone()
 }

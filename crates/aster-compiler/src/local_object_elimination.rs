@@ -55,9 +55,20 @@ struct FieldInitialization {
 /// scalar MIR locals. This runs after escape-region assignment, so it never
 /// independently decides whether an object escapes.
 pub(super) fn eliminate(module: &mut mir::Module) {
+    // Classes in a hierarchy are never eliminated: an upcast aliases the
+    // object, a derived object has inherited fields this pass does not model,
+    // and later steps add virtual calls that treat the receiver as escaping.
+    let bases = module
+        .classes
+        .iter()
+        .filter_map(|class| class.base)
+        .collect::<HashSet<_>>();
     let scalar_classes = module
         .classes
         .iter()
+        .filter(|class| {
+            class.base.is_none() && !class.is_abstract && !bases.contains(&class.symbol)
+        })
         .filter(|class| class.fields.iter().all(|field| is_scalar(&field.type_)))
         .map(|class| (class.symbol, class.fields.clone()))
         .collect::<HashMap<_, _>>();
@@ -337,6 +348,9 @@ fn candidate_uses_are_scalarizable(function: &mir::Function, candidate: &Candida
 #[allow(clippy::too_many_lines)]
 fn instruction_is_legal(instruction: &mir::Instruction, candidate: &Candidate) -> bool {
     match instruction {
+        mir::Instruction::Retain { value } | mir::Instruction::Release { value } => {
+            operand_is_legal(value, candidate)
+        }
         mir::Instruction::Assign { target, value } => {
             place_is_legal(target, candidate) && rvalue_is_legal(value, candidate)
         }
@@ -359,6 +373,12 @@ fn instruction_is_legal(instruction: &mir::Instruction, candidate: &Candidate) -
         }
         mir::Instruction::ForeignCall { .. } => false,
         mir::Instruction::CallInterface {
+            destination,
+            receiver,
+            arguments,
+            ..
+        }
+        | mir::Instruction::CallVirtual {
             destination,
             receiver,
             arguments,
@@ -504,12 +524,23 @@ fn rvalue_is_legal(value: &mir::Rvalue, candidate: &Candidate) -> bool {
     match &value.kind {
         mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Discriminant(operand)
+        | mir::RvalueKind::ClassTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceLookup {
+            object: operand, ..
+        }
         | mir::RvalueKind::ArrayLength(operand)
         | mir::RvalueKind::ListLength(operand)
         | mir::RvalueKind::DictionaryLength(operand)
         | mir::RvalueKind::ListVersion(operand)
         | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
+        | mir::RvalueKind::Downcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => operand_is_legal(operand, candidate),
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             fields
@@ -668,6 +699,9 @@ fn rewrite_instruction(
     fields: &HashMap<(mir::LocalId, mir::SymbolId), mir::LocalId>,
 ) {
     match instruction {
+        mir::Instruction::Retain { value } | mir::Instruction::Release { value } => {
+            rewrite_operand(value, fields);
+        }
         mir::Instruction::Assign { target, value } => {
             rewrite_place(target, fields);
             rewrite_rvalue(value, fields);
@@ -690,6 +724,12 @@ fn rewrite_instruction(
             }
         }
         mir::Instruction::CallInterface {
+            destination,
+            receiver,
+            arguments,
+            ..
+        }
+        | mir::Instruction::CallVirtual {
             destination,
             receiver,
             arguments,
@@ -857,12 +897,23 @@ fn rewrite_rvalue(
     match &mut value.kind {
         mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Discriminant(operand)
+        | mir::RvalueKind::ClassTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceLookup {
+            object: operand, ..
+        }
         | mir::RvalueKind::ArrayLength(operand)
         | mir::RvalueKind::ListLength(operand)
         | mir::RvalueKind::DictionaryLength(operand)
         | mir::RvalueKind::ListVersion(operand)
         | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
+        | mir::RvalueKind::Downcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => rewrite_operand(operand, fields),
         mir::RvalueKind::Aggregate(values)
         | mir::RvalueKind::EnumConstruct { fields: values, .. } => {

@@ -21,10 +21,50 @@ It does not create a game loop, world, task, thread, or ECS runtime.
 ## The convention
 
 Without a manifest, `aster run FILE` looks in the root namespace for exactly one eligible method.
-The method must be `public`, `static`, have no parameters, and return `void` or `int`. Its
-declaring class must also be public. `int Main()` executes and produces an integer, which the CLI
-prints. `void Main()` executes without producing a value: only the logs the program writes appear,
-and the process ends successfully. Any other return type is rejected with a diagnostic.
+The method must be `public`, `static`, return `void` or `int`, and take either no parameters or
+exactly one `string[] args`. Its declaring class must also be public. Any other parameter list or
+return type is rejected with a diagnostic, and two eligible `Main` overloads in the candidate set
+are ambiguous.
+
+```aster
+public class Program
+{
+    public static int Main(string[] args)
+    {
+        return args.Length;
+    }
+}
+```
+
+### Arguments
+
+`Main(string[] args)` receives the program arguments. `args` never contains the program name, and
+`args.Length` is `0` when none are given. Each argument is passed unchanged, except that invalid
+Unicode (an unpaired UTF-16 surrogate on Windows, an invalid UTF-8 sequence on POSIX) is replaced
+with U+FFFD. A `Main()` that takes no parameters simply ignores any arguments.
+
+`aster run` takes the program arguments after a `--` separator:
+
+```console
+aster run app/main.aster -- first "second argument" --not-an-aster-flag
+```
+
+Everything after the first `--` belongs to the program, even words that look like `aster run`
+options. Options for `aster run` itself (`--function`, `--memory-stats`) go before the separator.
+
+### Exit status
+
+The `int` returned by `Main` is the process exit status. `aster run` passes it to the operating
+system unchanged: Windows observes the full 32-bit value, POSIX observes the low 8 bits (`256`
+looks like `0`, `-1` like `255`). It is not printed. `void Main()` ends the process with status `0`.
+A compile error, an entry-selection error or a runtime failure (an unhandled runtime error such
+as division by zero) ends it with status `1` and a diagnostic on standard error, and a command-line
+usage error ends it with `2`; see [the CLI reference](cli.md#output-and-exit-codes). A program
+whose own exit status is `1` therefore cannot be told apart from a runtime failure by the status
+alone; its own diagnostics belong on standard error ([`WriteError`](io.md#standard-error)).
+
+`--function NAME` is a development option and keeps its own behavior: a non-`void` result is
+printed and the process exits `0`.
 
 `Main` is `static`, so it has no current instance. Instance methods access the members of the
 current instance; to use instance members from `Main`, create an instance explicitly with `new`
@@ -39,6 +79,8 @@ public class Program
     }
 }
 ```
+
+`aster run` on this program prints nothing and exits with status `42`.
 
 Namespaces reached through `using` are compiled and callable, but their `Main` methods are not conventional entry
 candidates. This keeps the root file in control of the application.
@@ -56,7 +98,8 @@ entry = "app.Program.Main"
 ```
 
 The dotted value is `namespace.Class.Main`. The selected class and method must be public, and the
-method follows the same static, parameter, and return rules as the convention. When the root source
+method follows the same static, parameter (`Main()` or `Main(string[] args)`), and return rules as
+the convention. When the root source
 is below the manifest, the manifest directory is also the project root. For example,
 `app/main.aster` belongs to namespace `app` and may use `using app.math;` for sources under
 `app/math/`.

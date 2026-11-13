@@ -22,6 +22,35 @@ require `null` or an exception.
 
 Terminal I/O is rejected inside worker bodies.
 
+### Standard error
+
+```aster
+WriteError("warning: ");
+WriteErrorLine("config not found");
+```
+
+`WriteError` writes the UTF-8 bytes of its `string` argument to standard error and flushes;
+`WriteErrorLine` appends a line feed. Standard error is a separate stream from `Write`/`WriteLine`:
+a caller that redirects standard output still sees it. Like the rest of terminal I/O it is rejected
+inside worker bodies. `Log.Warning` and `Log.Error` also use standard error; see [logging](logging.md).
+
+## Environment
+
+```aster
+switch (Environment.GetVariable("HOME"))
+{
+    case Some(value): WriteLine(value);
+    case None: WriteLine("not set");
+}
+```
+
+`Environment.GetVariable(string name)` returns `Option<string>`: `Some(value)` when the process
+environment defines `name` (a defined but empty variable is `Some("")`) and `None` otherwise. A
+name that is empty or contains `=` or NUL is never defined. A value that is not valid Unicode has
+each invalid sequence replaced with U+FFFD. The lookup is the one of the operating system: names
+are case-insensitive on Windows and case-sensitive on POSIX. Environment access is rejected inside
+worker bodies. There is no way to set or enumerate variables.
+
 ## Paths and text files
 
 ```aster

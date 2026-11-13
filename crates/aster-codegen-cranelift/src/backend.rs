@@ -27,10 +27,12 @@ impl Codegen {
         }
         let (call_depth_guarded, runtime_fallible_functions, runtime_fallible_interface_methods) =
             analyze_calls(module);
+        let layouts = Layouts::new(module, pointer_bytes)?;
         let mut codegen = Self {
             jit,
             pointer_type,
             string_data: HashMap::new(),
+            transfer_data: HashMap::new(),
             runtime_ids,
             foreign_ids: HashMap::new(),
             interface_tables: HashMap::new(),
@@ -49,7 +51,8 @@ impl Codegen {
             call_depth_guarded,
             runtime_fallible_functions,
             runtime_fallible_interface_methods,
-            layouts: Layouts::new(module, pointer_bytes)?,
+            descriptors: super::layouts::ObjectDescriptors::build(&layouts, module)?,
+            layouts,
         };
         codegen.declare_task_functions()?;
         codegen.declare_async_functions()?;
@@ -57,6 +60,7 @@ impl Codegen {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn analyze_calls(
     module: &mir::Module,
 ) -> (
@@ -76,6 +80,22 @@ fn analyze_calls(
             interface_targets.insert(method.symbol, targets);
         }
     }
+    // Virtual slots: every implementation of a slot, keyed by the method that
+    // introduced it. A slot with an abstract entry may also fail on its own
+    // (the stub records a runtime error), so it counts as fallible.
+    let mut abstract_slot_methods = HashSet::new();
+    for slot in module.classes.iter().flat_map(|class| &class.vtable) {
+        let targets = interface_targets.entry(slot.method).or_default();
+        match slot.implementation {
+            Some(implementation) if !targets.contains(&implementation) => {
+                targets.push(implementation);
+            }
+            Some(_) => {}
+            None => {
+                abstract_slot_methods.insert(slot.method);
+            }
+        }
+    }
 
     let call_targets = module
         .functions
@@ -87,7 +107,8 @@ fn analyze_calls(
                     mir::Instruction::Call { function, .. } => {
                         targets.insert(*function);
                     }
-                    mir::Instruction::CallInterface { method, .. } => {
+                    mir::Instruction::CallInterface { method, .. }
+                    | mir::Instruction::CallVirtual { method, .. } => {
                         targets
                             .extend(interface_targets.get(method).into_iter().flatten().copied());
                     }
@@ -143,10 +164,12 @@ fn analyze_calls(
                 .flat_map(|block| &block.instructions)
                 .any(|instruction| match instruction {
                     mir::Instruction::Call { function, .. } => fallible.contains(function),
-                    mir::Instruction::CallInterface { method, .. } => {
-                        interface_targets.get(method).is_some_and(|targets| {
-                            targets.iter().any(|target| fallible.contains(target))
-                        })
+                    mir::Instruction::CallInterface { method, .. }
+                    | mir::Instruction::CallVirtual { method, .. } => {
+                        abstract_slot_methods.contains(method)
+                            || interface_targets.get(method).is_some_and(|targets| {
+                                targets.iter().any(|target| fallible.contains(target))
+                            })
                     }
                     _ => false,
                 });
@@ -162,10 +185,9 @@ fn analyze_calls(
     let fallible_interface_methods = interface_targets
         .into_iter()
         .filter_map(|(method, targets)| {
-            targets
-                .iter()
-                .any(|target| fallible.contains(target))
-                .then_some(method)
+            (abstract_slot_methods.contains(&method)
+                || targets.iter().any(|target| fallible.contains(target)))
+            .then_some(method)
         })
         .collect();
     (guarded, fallible, fallible_interface_methods)
@@ -175,12 +197,15 @@ fn instruction_can_fail_without_calling_aster(instruction: &mir::Instruction) ->
     match instruction {
         mir::Instruction::Assign { .. }
         | mir::Instruction::Call { .. }
-        | mir::Instruction::CallInterface { .. } => false,
+        | mir::Instruction::CallInterface { .. }
+        | mir::Instruction::CallVirtual { .. } => false,
         mir::Instruction::ForeignCall { .. }
         | mir::Instruction::TemporarySubregionEnter { .. }
         | mir::Instruction::TemporarySubregionExit { .. }
         | mir::Instruction::OwnedRegionEnter { .. }
         | mir::Instruction::OwnedRegionExit { .. }
+        | mir::Instruction::Retain { .. }
+        | mir::Instruction::Release { .. }
         | mir::Instruction::CallIntrinsic { .. }
         | mir::Instruction::AllocateArray { .. }
         | mir::Instruction::AllocateObject { .. }

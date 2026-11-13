@@ -50,6 +50,7 @@ impl Lexer<'_> {
         match character {
             c if c.is_whitespace() => {}
             '/' if self.peek() == Some('/') => self.skip_line_comment(),
+            '/' if self.peek() == Some('*') => self.skip_block_comment(start),
             c if c == '_' || c.is_alphabetic() => self.identifier(start),
             c if c.is_ascii_digit() => self.number(start),
             '$' if self.peek() == Some('"') => {
@@ -93,7 +94,7 @@ impl Lexer<'_> {
             },
             '*' => self.two_character(start, '=', TokenKind::StarEqual, TokenKind::Star),
             '/' => self.two_character(start, '=', TokenKind::SlashEqual, TokenKind::Slash),
-            '%' => self.token(TokenKind::Percent, start),
+            '%' => self.two_character(start, '=', TokenKind::PercentEqual, TokenKind::Percent),
             '!' => self.two_character(start, '=', TokenKind::BangEqual, TokenKind::Bang),
             '=' if self.peek() == Some('>') => {
                 self.bump();
@@ -330,6 +331,7 @@ impl Lexer<'_> {
             "return" => TokenKind::Return,
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
+            "do" => TokenKind::Do,
             "while" => TokenKind::While,
             "for" => TokenKind::For,
             "foreach" => TokenKind::Foreach,
@@ -341,11 +343,71 @@ impl Lexer<'_> {
             "default" => TokenKind::Default,
             "new" => TokenKind::New,
             "this" => TokenKind::This,
+            "base" => TokenKind::Base,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
             _ => TokenKind::Identifier(text.to_owned()),
         };
         self.token(kind, start);
+    }
+
+    /// Consume a run of decimal digits and `_` separators (the first digit, if
+    /// any, is already consumed). Returns `false` and reports a diagnostic when
+    /// the run ends with a separator, which C# also rejects.
+    fn separated_digits(&mut self, start: usize) -> bool {
+        while self.peek().is_some_and(|c| c.is_ascii_digit() || c == '_') {
+            self.bump();
+        }
+        if self.source[..self.cursor].ends_with('_') {
+            self.separator_error(
+                start,
+                "a digit separator `_` must be followed by a digit",
+                "remove the trailing `_` or add digits after it",
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Report a malformed numeric literal and skip the rest of its characters
+    /// so that the error does not cascade.
+    fn separator_error(&mut self, start: usize, message: &str, help: &str) {
+        while self
+            .peek()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            self.bump();
+        }
+        self.diagnostics.push(
+            Diagnostic::error(message, Span::new(start, self.cursor)).with_help(help.to_owned()),
+        );
+    }
+
+    /// Consume `e`/`E`, an optional sign and the exponent digits. Returns
+    /// `false` after reporting a diagnostic when the exponent is malformed.
+    fn exponent(&mut self, start: usize) -> bool {
+        self.bump();
+        if matches!(self.peek(), Some('+' | '-')) {
+            self.bump();
+        }
+        match self.peek() {
+            Some(c) if c.is_ascii_digit() => self.separated_digits(start),
+            Some('_') => {
+                self.separator_error(
+                    start,
+                    "a digit separator `_` cannot follow the exponent marker",
+                    "write a digit directly after `e` and its optional sign",
+                );
+                false
+            }
+            _ => {
+                self.diagnostics.push(
+                    Diagnostic::error("exponent has no digits", Span::new(start, self.cursor))
+                        .with_help("write at least one digit after `e`, `e+`, or `e-`"),
+                );
+                false
+            }
+        }
     }
 
     fn number(&mut self, start: usize) {
@@ -356,22 +418,38 @@ impl Lexer<'_> {
             self.prefixed_number(start);
             return;
         }
-        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
-            self.bump();
+        if !self.separated_digits(start) {
+            return;
         }
-        let is_float = self.peek() == Some('.')
-            && self
+        let mut is_float = false;
+        if self.peek() == Some('.') {
+            let next = self
                 .source
                 .get(self.cursor + 1..)
-                .and_then(|rest| rest.chars().next())
-                .is_some_and(|c| c.is_ascii_digit());
-        if is_float {
-            self.bump();
-            while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                .and_then(|rest| rest.chars().next());
+            if next.is_some_and(|c| c.is_ascii_digit()) {
+                is_float = true;
                 self.bump();
+                if !self.separated_digits(start) {
+                    return;
+                }
+            } else if next == Some('_') {
+                self.bump();
+                self.separator_error(
+                    start,
+                    "a digit separator `_` cannot follow a decimal point",
+                    "write a digit directly after the `.`",
+                );
+                return;
             }
         }
-        let text = self.source[start..self.cursor].to_owned();
+        if matches!(self.peek(), Some('e' | 'E')) {
+            is_float = true;
+            if !self.exponent(start) {
+                return;
+            }
+        }
+        let text = self.source[start..self.cursor].replace('_', "");
         let kind = match self.peek() {
             Some('L' | 'l' | 'U' | 'u') if is_float => {
                 self.bump();
@@ -434,15 +512,30 @@ impl Lexer<'_> {
             (2, "binary")
         };
         let digits_start = self.cursor;
-        while self.peek().is_some_and(|c| c.is_ascii_alphanumeric()) {
+        while self
+            .peek()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
             self.bump();
         }
         let run = self.source[digits_start..self.cursor].to_owned();
         let digit_count = run
             .chars()
-            .take_while(|character| character.is_digit(radix))
+            .take_while(|character| *character == '_' || character.is_digit(radix))
             .count();
         let (digits, suffix) = run.split_at(digit_count);
+        if digits.ends_with('_') {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "a digit separator `_` must be followed by a digit",
+                    Span::new(start, digits_start + digit_count),
+                )
+                .with_help("remove the trailing `_` or add digits after it"),
+            );
+            return;
+        }
+        let digits = digits.replace('_', "");
+        let digits = digits.as_str();
         if digits.is_empty() {
             self.diagnostics.push(
                 Diagnostic::error(
@@ -599,6 +692,22 @@ impl Lexer<'_> {
         } else {
             self.token(single, start);
         }
+    }
+
+    /// Skip a `/* ... */` comment. The cursor is on the `*` after the opening
+    /// `/`. Block comments do not nest (as in C#): the first `*/` closes it.
+    fn skip_block_comment(&mut self, start: usize) {
+        self.bump();
+        while let Some(character) = self.bump() {
+            if character == '*' && self.peek() == Some('/') {
+                self.bump();
+                return;
+            }
+        }
+        self.diagnostics.push(
+            Diagnostic::error("unterminated block comment", Span::new(start, self.cursor))
+                .with_help("close the comment with `*/`"),
+        );
     }
 
     fn skip_line_comment(&mut self) {

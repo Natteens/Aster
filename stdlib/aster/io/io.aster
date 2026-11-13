@@ -254,3 +254,34 @@ public Option<string> ReadLine()
 {
     return Option<string>.None;
 }
+
+/// Write `value`'s UTF-8 bytes verbatim to standard error and flush. Standard
+/// error is a separate stream from `Write`/`WriteLine`; it is not buffered
+/// behind them and not captured as program output.
+public void WriteError(string value)
+{
+}
+
+/// Like `WriteError`, plus a trailing LF.
+public void WriteErrorLine(string value)
+{
+    WriteError(value);
+    WriteError("\n");
+}
+
+internal bool __EnvironmentHas(string name) { return false; }
+internal string __EnvironmentGet(string name) { return ""; }
+
+/// Read access to the process environment.
+public static class Environment
+{
+    /// The value of the environment variable `name`, or `None` when it is not
+    /// defined. A defined but empty variable is `Some("")`. A name that is
+    /// empty or contains `=` or NUL is never defined. A value that is not
+    /// valid Unicode has each invalid sequence replaced with U+FFFD.
+    public static Option<string> GetVariable(string name)
+    {
+        if (!__EnvironmentHas(name)) { return Option<string>.None; }
+        return Option<string>.Some(__EnvironmentGet(name));
+    }
+}

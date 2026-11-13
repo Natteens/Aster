@@ -10,6 +10,23 @@ pub(super) struct ResolvedSwitch<'a> {
     pub(super) indices: &'a HashMap<&'a str, usize>,
 }
 
+/// Compile-time identity of an integer, `char` or `string` switch label;
+/// `char` labels compare by scalar value like integers.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) enum ScalarSwitchKey {
+    Integer(i128),
+    String(String),
+}
+
+/// Integer, `char` and `string` values may be switched on with constant
+/// labels (and a mandatory `default`), in addition to enums.
+pub(super) fn is_scalar_switch_subject(type_: &Type) -> bool {
+    matches!(type_, Type::Char | Type::String)
+        || type_
+            .primitive()
+            .is_some_and(aster_types::Primitive::is_integer)
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct Flow {
     pub(super) can_continue: bool,
@@ -116,7 +133,8 @@ impl Analyzer<'_> {
                         {
                             self.diagnostics.push(Diagnostic::error(
                                 format!(
-                                    "constructor returns before field `{field}` is initialized"
+                                    "constructor returns before {} is initialized",
+                                    super::field_display(field)
                                 ),
                                 *span,
                             ));
@@ -141,12 +159,19 @@ impl Analyzer<'_> {
                 else_block,
                 ..
             } => {
+                // Pattern variables declared by the condition belong to the
+                // enclosing scope (as in C#), but are definitely assigned only
+                // where the condition proves the test succeeded.
                 let condition_type = self.expression(condition);
                 self.require_bool_condition("if", &condition_type, condition.span);
+                let when_true = pattern_assigned(condition, true);
+                let when_false = pattern_assigned(condition, false);
                 let before = self.scopes.clone();
+                self.mark_assigned(&when_true);
                 let then_flow = self.block(then_block, true);
                 let then_scopes = self.scopes.clone();
                 self.scopes.clone_from(&before);
+                self.mark_assigned(&when_false);
                 let else_flow = else_block
                     .as_ref()
                     .map_or(Flow::CONTINUE, |block| self.block(block, true));
@@ -165,13 +190,31 @@ impl Analyzer<'_> {
             Statement::While {
                 condition, body, ..
             } => {
+                // Pattern variables of a loop condition are scoped to the loop.
+                self.scopes.push(HashMap::new());
                 let condition_type = self.expression(condition);
                 self.require_bool_condition("while", &condition_type, condition.span);
+                self.loop_depth += 1;
+                let before = self.scopes.clone();
+                self.mark_assigned(&pattern_assigned(condition, true));
+                self.block(body, true);
+                self.scopes = before;
+                self.loop_depth -= 1;
+                self.scopes.pop();
+                Flow::CONTINUE
+            }
+            Statement::DoWhile {
+                body, condition, ..
+            } => {
                 self.loop_depth += 1;
                 let before = self.scopes.clone();
                 self.block(body, true);
                 self.scopes = before;
                 self.loop_depth -= 1;
+                self.scopes.push(HashMap::new());
+                let condition_type = self.expression(condition);
+                self.require_bool_condition("do-while", &condition_type, condition.span);
+                self.scopes.pop();
                 Flow::CONTINUE
             }
             Statement::For {
@@ -185,10 +228,14 @@ impl Analyzer<'_> {
                 if let Some(initializer) = initializer {
                     self.statement(initializer);
                 }
+                let mut assigned = Vec::new();
                 if let Some(condition) = condition {
                     let condition_type = self.expression(condition);
                     self.require_bool_condition("for", &condition_type, condition.span);
+                    assigned = pattern_assigned(condition, true);
                 }
+                let before_update = self.scopes.clone();
+                self.mark_assigned(&assigned);
                 if let Some(update) = update {
                     self.expression(update);
                 }
@@ -196,6 +243,7 @@ impl Analyzer<'_> {
                 let before_body = self.scopes.clone();
                 self.block(body, true);
                 self.scopes = before_body;
+                self.scopes = before_update;
                 self.loop_depth -= 1;
                 self.scopes.pop();
                 Flow::CONTINUE
@@ -323,17 +371,50 @@ impl Analyzer<'_> {
         span: Span,
     ) -> Flow {
         let selected = self.expression(value);
+        if is_scalar_switch_subject(&selected) {
+            let mut seen = HashSet::new();
+            let mut any_continues = false;
+            for case in cases {
+                // A guarded case can fall through, so its label is only checked
+                // against earlier unguarded cases and is not recorded.
+                if case.guard.is_some() {
+                    let mut scratch = seen.clone();
+                    self.check_scalar_label(
+                        &selected,
+                        case.label.as_ref(),
+                        case.span,
+                        &mut scratch,
+                    );
+                } else {
+                    self.check_scalar_label(&selected, case.label.as_ref(), case.span, &mut seen);
+                }
+                self.scopes.push(HashMap::new());
+                let assigned = self.analyze_guard(case.guard.as_ref());
+                self.mark_assigned(&assigned);
+                any_continues |= self.block(&case.body, true).can_continue;
+                self.scopes.pop();
+            }
+            if let Some(default) = default {
+                any_continues |= self.block(default, true).can_continue;
+            } else {
+                self.require_scalar_default(&selected, span);
+                any_continues = true;
+            }
+            return Flow {
+                can_continue: any_continues,
+            };
+        }
         let Type::Enum(enum_name) = selected else {
             if selected != Type::Unknown {
                 self.diagnostics.push(
                     Diagnostic::error(
                         format!(
-                            "`switch` requires an enum value, found `{}`",
+                            "`switch` requires an enum, integer, `char` or `string` value, found `{}`",
                             selected.display()
                         ),
                         value.span,
                     )
-                    .with_help("select a declared enum value"),
+                    .with_help("select an enum, integer, `char` or `string` value"),
                 );
             }
             for case in cases {
@@ -363,13 +444,20 @@ impl Analyzer<'_> {
         let mut covered = HashSet::new();
         let mut any_continues = false;
         for case in cases {
+            // A guarded case can fall through, so it never counts as covering
+            // its enum case; it is still checked against the unguarded cases.
+            let mut scratch = covered.clone();
             let Some(info) = self.resolve_switch_pattern(
                 case.enum_name.as_deref(),
                 &case.case_name,
                 &case.bindings,
                 case.span,
                 &resolved,
-                &mut covered,
+                if case.guard.is_some() {
+                    &mut scratch
+                } else {
+                    &mut covered
+                },
             ) else {
                 self.block(&case.body, true);
                 any_continues = true;
@@ -389,6 +477,8 @@ impl Analyzer<'_> {
                     },
                 );
             }
+            let assigned = self.analyze_guard(case.guard.as_ref());
+            self.mark_assigned(&assigned);
             let flow = self.block(&case.body, false);
             self.scopes.pop();
             any_continues |= flow.can_continue;
@@ -402,6 +492,106 @@ impl Analyzer<'_> {
         Flow {
             can_continue: any_continues,
         }
+    }
+
+    /// Validate one constant label of an integer, `char` or `string` switch:
+    /// it must convert implicitly to the subject type (integer constants that
+    /// fit the subject range convert), be a compile-time constant, and not
+    /// repeat an earlier label.
+    pub(super) fn check_scalar_label(
+        &mut self,
+        subject: &Type,
+        label: Option<&Expression>,
+        span: Span,
+        seen: &mut HashSet<ScalarSwitchKey>,
+    ) {
+        let Some(label) = label else {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    format!(
+                        "a `{}` switch case must be a constant label, not an enum pattern",
+                        subject.display()
+                    ),
+                    span,
+                )
+                .with_help("use a literal or constant of the switch value's type"),
+            );
+            return;
+        };
+        let label_type = self.expression(label);
+        if label_type == Type::Unknown {
+            return;
+        }
+        let errors_before = self.diagnostics.len();
+        self.require_assignable_value(subject, &label_type, label);
+        if self.diagnostics.len() != errors_before {
+            return;
+        }
+        let resolve = |name: &str| self.binding(name).and_then(|binding| binding.value.clone());
+        let value = match evaluate(label, &resolve) {
+            Ok(value) => value,
+            Err(error) => {
+                let diagnostic = match error {
+                    ConstError::NotConstant(span) => {
+                        Diagnostic::error("a switch case label must be a constant expression", span)
+                            .with_help(
+                                "use literals, constants, operators, `?:`, or casts; calls and variables are not constant",
+                            )
+                    }
+                    ConstError::Overflow(span, type_name) => Diagnostic::error(
+                        format!("constant expression overflows `{type_name}`"),
+                        span,
+                    ),
+                    ConstError::DivisionByZero(span) => {
+                        Diagnostic::error("constant expression divides by zero", span)
+                    }
+                };
+                self.diagnostics.push(diagnostic);
+                return;
+            }
+        };
+        let (key, shown) = match value {
+            ConstValue::Integer(value, _) => (ScalarSwitchKey::Integer(value), value.to_string()),
+            ConstValue::Char(value) => (
+                ScalarSwitchKey::Integer(i128::from(u32::from(value))),
+                format!("'{}'", value.escape_default()),
+            ),
+            ConstValue::Str(value) => (
+                ScalarSwitchKey::String(value.clone()),
+                format!("\"{}\"", value.escape_default()),
+            ),
+            _ => {
+                self.diagnostics.push(Diagnostic::error(
+                    format!(
+                        "a switch case label cannot have type `{}` here",
+                        label_type.display()
+                    ),
+                    label.span,
+                ));
+                return;
+            }
+        };
+        if !seen.insert(key) {
+            self.diagnostics.push(Diagnostic::error(
+                format!("duplicate switch case `{shown}`"),
+                span,
+            ));
+        }
+    }
+
+    /// Only enums can be exhaustive, so an integer, `char` or `string` switch
+    /// always needs `default`.
+    pub(super) fn require_scalar_default(&mut self, subject: &Type, span: Span) {
+        self.diagnostics.push(
+            Diagnostic::error(
+                format!(
+                    "a `switch` on `{}` requires a `default` case",
+                    subject.display()
+                ),
+                span,
+            )
+            .with_help("only enum switches can be exhaustive; add a `default` case"),
+        );
     }
 
     pub(super) fn resolve_switch_pattern(
@@ -622,6 +812,17 @@ impl Analyzer<'_> {
         }
     }
 
+    /// A `when` guard: a `bool` expression evaluated after the pattern
+    /// matched. Returns the pattern variables assigned when it is true.
+    pub(super) fn analyze_guard(&mut self, guard: Option<&Expression>) -> Vec<String> {
+        let Some(guard) = guard else {
+            return Vec::new();
+        };
+        let guard_type = self.expression(guard);
+        self.require_bool_condition("when", &guard_type, guard.span);
+        pattern_assigned(guard, true)
+    }
+
     pub(super) fn declare(&mut self, name: &str, binding: Binding) {
         let scope = self
             .scopes
@@ -654,6 +855,47 @@ impl Analyzer<'_> {
             );
         }
         type_
+    }
+}
+
+/// Names of the pattern variables that are definitely assigned when
+/// `expression` evaluates to `when_true` (C# definite assignment for `is`
+/// patterns through `!`, `&&` and `||`).
+pub(super) fn pattern_assigned(expression: &Expression, when_true: bool) -> Vec<String> {
+    use aster_syntax::{BinaryOperator, ExpressionKind, UnaryOperator};
+    match &expression.kind {
+        ExpressionKind::TypePattern { binding, .. } => {
+            if when_true {
+                binding.iter().map(|binding| binding.name.clone()).collect()
+            } else {
+                Vec::new()
+            }
+        }
+        ExpressionKind::Unary {
+            operator: UnaryOperator::Not,
+            operand,
+        } => pattern_assigned(operand, !when_true),
+        ExpressionKind::Binary {
+            left,
+            operator: operator @ (BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr),
+            right,
+        } => {
+            let left = pattern_assigned(left, when_true);
+            let right = pattern_assigned(right, when_true);
+            // `a && b` is true only if both were, and `a || b` is false only
+            // if both were: the union. Otherwise either operand may have
+            // decided the result: the intersection.
+            if (*operator == BinaryOperator::LogicalAnd) == when_true {
+                let mut union = left;
+                union.extend(right);
+                union
+            } else {
+                left.into_iter()
+                    .filter(|name| right.contains(name))
+                    .collect()
+            }
+        }
+        _ => Vec::new(),
     }
 }
 

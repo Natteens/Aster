@@ -21,7 +21,9 @@ instances:
 - **Persistent** stores escaping or conservatively classified allocations until the whole context is
   dropped.
 
-`PagedArena` is a pointer-stable paged bump allocator built on Rust's zeroed host allocations.
+`PagedArena` is a pointer-stable paged bump allocator. Its pages come from the default page
+backend: `VirtualAlloc` on Windows, anonymous `mmap` on Linux, and Rust's zeroed system allocator on
+other hosts (see AARM-3A to AARM-3C).
 Regular pages grow from 4 KiB to 64 KiB. A request larger than 64 KiB receives a dedicated page.
 Rewind never moves surviving allocations and does not release retained pages. Dropping the context
 releases both arenas.

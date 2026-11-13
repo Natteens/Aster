@@ -46,7 +46,11 @@ impl Codegen {
         signature
             .params
             .push(super::AbiParam::new(self.pointer_type));
-        if function.return_type != mir::Type::Void && !is_aggregate(&function.return_type) {
+        signature
+            .params
+            .push(super::AbiParam::new(self.pointer_type));
+        let deep_result = super::transfer::is_deep_result_type(&function.return_type);
+        if function.return_type != mir::Type::Void && !deep_result {
             signature.returns.push(super::AbiParam::new(
                 self.clif_value_type(&function.return_type)?,
             ));
@@ -61,6 +65,7 @@ impl Codegen {
             builder.seal_block(entry);
             let context_value = builder.block_params(entry)[0];
             let payload = builder.block_params(entry)[1];
+            let result_out = builder.block_params(entry)[2];
             let layout = self.layouts.task_argument_layout(
                 &function
                     .parameters
@@ -69,6 +74,10 @@ impl Codegen {
                     .collect::<Vec<_>>(),
             )?;
             let mut values = vec![context_value];
+            if is_aggregate(&function.return_type) {
+                // Hidden return pointer: the host-provided result image.
+                values.push(result_out);
+            }
             for (parameter, offset) in function.parameters.iter().zip(layout.offsets) {
                 if is_aggregate(&parameter.type_) {
                     values.push(builder.ins().iadd_imm(payload, i64::from(offset)));
@@ -87,6 +96,11 @@ impl Codegen {
             let target = self.jit.declare_func_in_func(function_id, builder.func);
             let call = builder.ins().call(target, &values);
             if function.return_type == mir::Type::Void || is_aggregate(&function.return_type) {
+                builder.ins().return_(&[]);
+            } else if deep_result {
+                // String/array/list/dictionary: the pointer goes to the image.
+                let result = builder.inst_results(call)[0];
+                builder.ins().store(MemFlags::new(), result, result_out, 0);
                 builder.ins().return_(&[]);
             } else {
                 let result = builder.inst_results(call)[0];
@@ -155,6 +169,21 @@ impl Codegen {
             .ok_or_else(|| BackendError::new("Aster function is missing its ExecutionContext"))?;
         if is_aggregate(&function.return_type) {
             state.hidden_return = values.next();
+        }
+        #[cfg(feature = "mem-exp-rc-core")]
+        for local in function.parameters.iter().chain(&function.locals) {
+            if self.layouts.type_has_references(&local.type_) {
+                // Releasing or capturing a never-assigned slot must see null.
+                let layout = self.layouts.type_layout(&local.type_)?;
+                let zero = builder.ins().iconst(types::I64, 0);
+                for word in 0..layout.size.div_ceil(8) {
+                    let offset = i32::try_from(word * 8)
+                        .map_err(|_| BackendError::new("stack slot is too large"))?;
+                    builder
+                        .ins()
+                        .stack_store(zero, state.slots[&local.id], offset);
+                }
+            }
         }
         for parameter in &function.parameters {
             let value = values.next().ok_or_else(|| {
@@ -289,7 +318,7 @@ impl Codegen {
         builder.switch_to_block(continuation);
     }
 
-    fn return_after_failed_call_guard(
+    pub(super) fn return_after_failed_call_guard(
         &self,
         builder: &mut FunctionBuilder<'_>,
         return_type: &mir::Type,
@@ -346,6 +375,12 @@ impl Codegen {
                 self.leave_temporary_subregion(builder, state)?;
                 self.continue_if_runtime_ok(builder, state)
             }
+            mir::Instruction::Retain { value } => {
+                self.translate_reference_count(builder, value, true, state)
+            }
+            mir::Instruction::Release { value } => {
+                self.translate_reference_count(builder, value, false, state)
+            }
             mir::Instruction::Assign { target, value } => {
                 self.assign_rvalue(builder, target, value, state)
             }
@@ -378,6 +413,9 @@ impl Codegen {
             ),
             call @ mir::Instruction::CallInterface { .. } => {
                 self.translate_interface_call(builder, call, state)
+            }
+            call @ mir::Instruction::CallVirtual { .. } => {
+                self.translate_virtual_call(builder, call, state)
             }
             mir::Instruction::CallIntrinsic {
                 destination,
