@@ -1,0 +1,28 @@
+// Dictionary churn: a sliding window of 1000 live keys with steady insert,
+// lookup, and remove. `RunLong` performs 10x operations at the same live size.
+
+internal long Churn(int operations)
+{
+    Dictionary<int, int> cache = new Dictionary<int, int>();
+    long total = 0L;
+    for (int key = 0; key < operations; key++)
+    {
+        cache.Set(key, key * 3 % 1000);
+        if (key >= 1000)
+        {
+            cache.Remove(key - 1000);
+        }
+        total = total + (long)cache.GetOr(key - 500, 7);
+    }
+    return total + (long)cache.Length;
+}
+
+public long Run()
+{
+    return Churn(20000);
+}
+
+public long RunLong()
+{
+    return Churn(200000);
+}

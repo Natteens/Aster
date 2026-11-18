@@ -146,8 +146,9 @@ fn check_and_dumps_publish_output_only_after_success() {
         assert_ne!(stdout(&output), "");
     }
     let output = aster(&directory, ["run", language]);
-    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert_eq!(stdout(&output).trim(), "42");
+    // LANG-018: `Main`'s `int` is the exit status and is not printed.
+    assert_eq!(output.status.code(), Some(42), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "");
 
     let foreign = directory.join("foreign.aster");
     fs::write(
@@ -211,7 +212,7 @@ fn check_and_dumps_publish_output_only_after_success() {
 }
 
 #[test]
-fn run_keeps_main_value_on_stdout_and_reports_runtime_failure_on_stderr() {
+fn run_uses_main_value_as_exit_status_and_reports_runtime_failure_on_stderr() {
     let directory = temporary_directory("run contract");
     let valid = directory.join("valid.aster");
     fs::write(
@@ -223,8 +224,8 @@ fn run_keeps_main_value_on_stdout_and_reports_runtime_failure_on_stderr() {
         &directory,
         ["run", valid.to_str().expect("UTF-8 valid source")],
     );
-    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert_eq!(stdout(&output).trim(), "42");
+    assert_eq!(output.status.code(), Some(42), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "");
     assert!(stderr(&output).is_empty(), "{}", stderr(&output));
 
     let runtime_failure = directory.join("runtime.aster");

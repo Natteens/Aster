@@ -132,6 +132,22 @@ fn prepared_artifact_is_reusable_and_matches_production_execution() {
 }
 
 #[test]
+fn generated_program_is_deterministic_and_scales_with_units() {
+    let (first, first_expected) = baseline::generate_large_program(3);
+    let (second, second_expected) = baseline::generate_large_program(3);
+    assert_eq!(first, second);
+    assert_eq!(first_expected, second_expected);
+    let (larger, _) = baseline::generate_large_program(30);
+    assert!(larger.lines().count() > 9 * first.lines().count());
+    let compilation = compile(&first).expect("generated program compiles");
+    let value = aster_codegen_cranelift::execute(&compilation.mir, "Run").unwrap();
+    assert_eq!(
+        value,
+        aster_codegen_cranelift::ExecutionValue::Long(first_expected)
+    );
+}
+
+#[test]
 fn prepare_timed_fails_closed_for_unknown_entry() {
     let compilation = compile("public int Run() { return 1; }").unwrap();
     assert!(PreparedSequentialExecution::prepare_timed(&compilation.mir, "Missing").is_err());

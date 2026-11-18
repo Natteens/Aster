@@ -21,7 +21,8 @@ int length = message.Length;
 ```
 
 Both operands of `+` must be strings. ASTER does not silently turn numbers, booleans, characters,
-objects, arrays, or structs into text with `+`; use string interpolation instead.
+objects, arrays, or structs into text with `+`; use string interpolation instead. Non-optional
+`string` values are always non-null; optional absence uses `string?` (`Option<string>`).
 
 ## ✨ String interpolation
 
@@ -176,7 +177,7 @@ control flow retains normal pairwise concatenation; not every concat loop is rew
 
 ## 🚧 Current limits
 
-There is no general implicit `ToString`, regex, nullable string, or direct string indexing.
+There is no general implicit `ToString`, regex, or direct string indexing.
 `StringBuilder` does not expose capacity, insertion, replacement, a format language, or implicit
 conversion. ASTER exposes neither UTF-8 bytes nor raw string pointers. Interpolation has no format
 specifiers, alignment, culture, or raw/verbatim form.

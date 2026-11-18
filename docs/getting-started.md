@@ -81,8 +81,9 @@ aster run
 ```
 
 `check` validates the manifest, project sources, standard library, HIR, MIR, and executable
-boundary without running `Main`. `run` performs the same validation, executes the program, and
-prints its integer result after the program output.
+boundary without running `Main`. `run` performs the same validation and executes the program. The
+`int` returned by `Main` becomes the process exit status; it is not printed. See
+[application entry](reference/application-entry.md).
 
 ## Work with the project
 

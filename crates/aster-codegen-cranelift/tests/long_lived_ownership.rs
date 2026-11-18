@@ -7,6 +7,10 @@ fn run(source: &str) -> (ExecutionValue, MemoryStats) {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "mem-exp-rc-core",
+    ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
+)]
 fn returned_overwritten_arrays_are_bounded_by_the_live_working_set() {
     let (value, stats) = run(r"
             internal int[] Make() {
@@ -35,6 +39,10 @@ fn returned_overwritten_arrays_are_bounded_by_the_live_working_set() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "mem-exp-rc-core",
+    ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
+)]
 fn loop_break_and_continue_keep_owned_cleanup_balanced() {
     let (value, stats) = run(r"
             internal int[] Make(int value) { return [value]; }
@@ -56,6 +64,10 @@ fn loop_break_and_continue_keep_owned_cleanup_balanced() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "mem-exp-rc-core",
+    ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
+)]
 fn independent_objects_strings_lists_and_dictionaries_reclaim() {
     let (value, stats) = run(r#"
             public class Box {
@@ -104,6 +116,10 @@ fn independent_objects_strings_lists_and_dictionaries_reclaim() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "mem-exp-rc-core",
+    ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
+)]
 fn a_live_alias_prevents_the_overlapping_family_from_reclaiming() {
     let (value, stats) = run(r"
             public class Box {
@@ -124,8 +140,17 @@ fn a_live_alias_prevents_the_overlapping_family_from_reclaiming() {
         ");
 
     assert_eq!(value, ExecutionValue::Int(1_000_000));
-    assert!(stats.used_bytes >= 4_000);
-    assert!(stats.used_bytes < 16_000);
+    // One `int` field behind the object header: a 16-byte allocation stride
+    // with the default 8-byte header (and the 12-byte experiment header), 24
+    // with the 16-byte experiment header. The bounds scale with the stride so
+    // each configuration keeps the same check.
+    let stride: u64 = if cfg!(feature = "mem-exp-h16") {
+        24
+    } else {
+        16
+    };
+    assert!(stats.used_bytes >= 4_000 * stride / 8);
+    assert!(stats.used_bytes < 16_000 * stride / 8);
 }
 
 #[test]
@@ -179,6 +204,10 @@ fn generic_pass_through_cannot_disguise_a_shared_reference() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "mem-exp-rc-core",
+    ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
+)]
 fn persistent_owned_region_composes_with_temporary_callee_storage() {
     let (value, stats) = run(r"
             internal int[] Make(int value) { return [value]; }
@@ -227,6 +256,10 @@ fn worker_local_owned_regions_are_isolated_and_reusable() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "mem-exp-rc-core",
+    ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
+)]
 fn closed_generic_producers_keep_region_identity_function_local() {
     let compilation = compile(
         r"

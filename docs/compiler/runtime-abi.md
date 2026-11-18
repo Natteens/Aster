@@ -131,7 +131,18 @@ capacity. LF, CRLF, EOF, embedded NUL, and UTF-8 validation retain their existin
   controlled error and returns a neutral ABI value so native frames unwind normally; it does not
   unwind through `extern "C"`. Worker contexts use the same guard independently.
 - Object storage follows the same ownership rule. Generated constructors and methods receive the
-  object pointer directly; the runtime only allocates and owns the bytes.
+  object pointer directly; the runtime only allocates and owns the bytes. Generated code writes the
+  object header (the class descriptor address at offset 0) right after `aster_rt_object_new`
+  returns; the runtime never interprets it, and `aster_rt_object_new` keeps its signature.
+- Class descriptors (`aster_runtime::ClassDescriptor`, `#[repr(C)]`: size, reference-count slots that
+  stay zero/null in the default build, class identity `aster_mir::type_key(Type::Class)`, an
+  array of `{ interface identity, method table address }`, the base descriptor, depth and ancestor
+  array, and the virtual table: one function address per virtual slot plus its length) are owned by
+  the prepared program, live as long as its JIT module and are immutable once the interface table
+  and virtual table addresses are bound after `finalize_definitions` and before any code runs. A
+  virtual call loads the descriptor from the object header, the function from the virtual table at a
+  compile-time slot index, and calls it with the ordinary call ABI; an abstract slot holds a stub
+  that records a controlled runtime error.
 - Interface values do not allocate runtime memory. They copy a pair of pointers: the object owned
   by the ExecutionContext and a read-only method table owned by the live JIT module. Consequently,
   an interface value has exactly the same per-run lifetime boundary as its object and compiled code.

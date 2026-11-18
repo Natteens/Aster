@@ -372,3 +372,78 @@ fn manifest_cannot_select_an_official_standard_library_module() {
     );
     assert!(errors(&root)[0].contains("cannot point into standard library"));
 }
+
+#[test]
+fn selects_main_taking_string_array_arguments() {
+    for (label, source) in [
+        (
+            "args-void",
+            "public class Program { public static void Main(string[] args) {} }",
+        ),
+        (
+            "args-int",
+            "public class Program { public static int Main(string[] args) { return args.Length; } }",
+        ),
+    ] {
+        let project = Project::new(label);
+        let root = project.write("main.aster", source);
+        let entry = select(&root).expect("`Main(string[] args)` is an entry");
+        assert_eq!(entry.display_name, "Program.Main");
+    }
+}
+
+#[test]
+fn rejects_main_parameters_other_than_a_single_string_array() {
+    for (label, parameters) in [
+        ("int-array", "int[] args"),
+        ("plain-string", "string args"),
+        ("two", "string[] args, int extra"),
+        ("list", "List<string> args"),
+    ] {
+        let project = Project::new(label);
+        let root = project.write(
+            "main.aster",
+            &format!(
+                "using aster.collections; public class Program {{ public static int Main({parameters}) {{ return 0; }} }}"
+            ),
+        );
+        let messages = errors(&root);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message
+                    .contains("has parameters other than a single `string[] args`")),
+            "{label}: {messages:?}"
+        );
+    }
+}
+
+#[test]
+fn two_eligible_mains_in_one_class_are_ambiguous() {
+    let project = Project::new("two-mains");
+    let root = project.write(
+        "main.aster",
+        "public class Program { public static int Main() { return 0; } public static int Main(string[] args) { return args.Length; } }",
+    );
+    let messages = errors(&root);
+    assert!(
+        messages[0].contains("more than one conventional application entry"),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn manifest_entry_accepts_string_array_arguments() {
+    let (_project, root) = manifest_case(
+        "manifest-args",
+        "[package]\nname = \"app\"\n\n[application]\nentry = \"app.Program.Main\"\n",
+    );
+    // Rewrite the entry to the `args` form and select it again.
+    fs::write(
+        &root,
+        "namespace app; public class Program { public static int Main(string[] args) { return args.Length; } }",
+    )
+    .expect("rewrite entry");
+    let entry = select(&root).expect("manifest entry may take `string[] args`");
+    assert_eq!(entry.display_name, "app.Program.Main");
+}

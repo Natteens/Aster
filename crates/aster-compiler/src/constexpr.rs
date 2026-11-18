@@ -108,7 +108,9 @@ pub(crate) fn evaluate(
         }
         ExpressionKind::StructLiteral { .. }
         | ExpressionKind::This
+        | ExpressionKind::Base
         | ExpressionKind::NewObject { .. }
+        | ExpressionKind::ObjectInitializer { .. }
         | ExpressionKind::ArrayLiteral(_)
         | ExpressionKind::NewArray { .. }
         | ExpressionKind::Index { .. }
@@ -116,8 +118,13 @@ pub(crate) fn evaluate(
         | ExpressionKind::Call { .. }
         | ExpressionKind::IncrementDecrement { .. }
         | ExpressionKind::Try { .. }
+        | ExpressionKind::NullCoalesce { .. }
+        | ExpressionKind::NullConditional { .. }
+        | ExpressionKind::NullConditionalReceiver
         | ExpressionKind::Await { .. }
         | ExpressionKind::Switch { .. }
+        | ExpressionKind::TypePattern { .. }
+        | ExpressionKind::TypeAs { .. }
         | ExpressionKind::Assignment { .. }
         | ExpressionKind::InterpolatedString { .. } => Err(ConstError::NotConstant(span)),
     }
@@ -165,6 +172,7 @@ fn literal_value(literal: &Literal, span: Span) -> Result<ConstValue, ConstError
         Literal::String(value) => Ok(ConstValue::Str(value.clone())),
         Literal::Character(value) => Ok(ConstValue::Char(*value)),
         Literal::Boolean(value) => Ok(ConstValue::Bool(*value)),
+        Literal::Null => Err(ConstError::NotConstant(span)),
     }
 }
 

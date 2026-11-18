@@ -211,26 +211,18 @@ impl FunctionLowerer {
         let receiver = self
             .lower_expression(object)
             .expect("property receiver produces a value");
+        let direct = super::calls::is_base_receiver(object);
         let assigned = if operator == hir::AssignmentOperator::Assign {
             self.lower_expression(value)
                 .expect("property assignment value produces a value")
         } else {
             let getter = getter.expect("validated compound property assignment has a getter");
-            let current_local = self.new_temporary(type_.clone());
-            let current_place = mir::Place::Local(current_local);
-            self.instruction(mir::Instruction::Call {
-                destination: Some(current_place.clone()),
-                function: getter,
-                arguments: vec![receiver.clone()],
-                return_type: type_.clone(),
-            });
+            let left = self
+                .emit_method_call(getter, receiver.clone(), Vec::new(), type_, direct)
+                .expect("a getter returns a value");
             let right = self
                 .lower_expression(value)
                 .expect("property assignment value produces a value");
-            let left = mir::Operand {
-                type_: type_.clone(),
-                kind: mir::OperandKind::Copy(current_place),
-            };
             if type_ == &hir::Type::String && operator == hir::AssignmentOperator::AddAssign {
                 self.emit_string_concat(left, right)
             } else {
@@ -244,12 +236,13 @@ impl FunctionLowerer {
                 )
             }
         };
-        self.instruction(mir::Instruction::Call {
-            destination: None,
-            function: setter,
-            arguments: vec![receiver, assigned.clone()],
-            return_type: mir::Type::Void,
-        });
+        self.emit_method_call(
+            setter,
+            receiver,
+            vec![assigned.clone()],
+            &hir::Type::Void,
+            direct,
+        );
         assigned
     }
 

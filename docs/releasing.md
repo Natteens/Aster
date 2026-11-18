@@ -6,7 +6,8 @@ branch and no manual version bump in the normal flow.
 ## Automatic flow
 
 1. CI checks version consistency, formatting, Clippy, the workspace tests, the locked workspace,
-   and the pure release scripts.
+   and the pure release scripts. The memory experiment matrix checks C4, C5, C6 and C6-H16
+   separately; all verification jobs must pass before semantic-release.
 2. On a non-release push to `main`, semantic-release analyzes commits since the latest tag.
 3. When a release is needed, semantic-release updates the canonical version, crate requirements,
    lockfiles, extension version, and changelog; it then creates
@@ -69,13 +70,16 @@ Run the ordinary gates:
 npm ci
 node editors/vscode/scripts/sync-version.mjs --check
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --features aster-codegen-cranelift/aarm-telemetry -- -D warnings
 cargo test --workspace --all-targets
 cargo check --workspace --locked
 npm run test:release-core
 npm run test:installers
 git diff --check
 ```
+
+The ordinary Clippy gate enables telemetry without selecting an experimental header. For the
+separate memory experiment checks, see [compiler development](compiler/development.md).
 
 Preview the next semantic-release decision with:
 

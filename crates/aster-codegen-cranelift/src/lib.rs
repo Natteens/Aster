@@ -1,13 +1,16 @@
 //! Cranelift JIT backend for validated Aster MIR.
 //!
-//! This crate depends only on `aster-mir` from the Aster compiler pipeline and
-//! on `aster-runtime` for the execution ABI. It does not inspect syntax, AST,
+//! This crate depends only on `aster-mir` from the Aster compiler pipeline, on
+//! `aster-runtime` for the execution ABI and on `aster-exec` for the scheduler
+//! (worker pool, task runtime, task/async ABI), to which it supplies compiled
+//! code through a `CodeProvider`. It does not inspect syntax, AST,
 //! or HIR, and it exposes no Cranelift types to other crates.
+
+use aster_diagnostics::codes;
 
 mod async_abi;
 mod backend;
 mod calls;
-mod completion_queue;
 mod control_flow;
 mod declarations;
 mod execution;
@@ -17,20 +20,23 @@ mod host_memory;
 mod interfaces;
 mod layouts;
 mod places;
-mod scalar;
+mod provider;
+#[cfg(test)]
+mod scheduler_tests;
 mod task_abi;
-mod task_runtime;
+mod transfer;
 mod validation;
 mod values;
-mod worker_pool;
+mod virtuals;
 
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
-    error::Error,
     fmt,
 };
 
+pub use aster_exec::{BackendError, ExecutionValue};
+use aster_exec::{scalar, task_runtime};
 use aster_mir as mir;
 pub use aster_runtime::{
     AarmMemoryTelemetry, ForeignRegistry, ForeignRegistryError, ForeignSignature, ForeignType,
@@ -60,7 +66,9 @@ use execution::execute_resolved_with_aarm_parallel_workers;
 use execution::execute_resolved_with_aarm_task_governor;
 #[cfg(feature = "aarm-telemetry")]
 use execution::execute_resolved_with_aarm_telemetry;
-use execution::{execute_resolved, execute_resolved_with_foreign_registry};
+use execution::{
+    execute_resolved, execute_resolved_with_arguments, execute_resolved_with_foreign_registry,
+};
 #[cfg(feature = "aarm-telemetry")]
 #[doc(hidden)]
 pub use host_memory::{
@@ -70,14 +78,17 @@ pub use host_memory::{
     discover_aarm_auto_governor, discover_aarm_host_memory_capacity, resolve_aarm_auto_budget,
     resolve_aarm_explicit_budget,
 };
-use layouts::Layouts;
+use layouts::{EnumRepr, Layouts};
 #[cfg(feature = "aarm-telemetry")]
 #[doc(hidden)]
 pub use task_runtime::{
     AarmAsyncMemoryDomainTelemetry, AarmParallelPlanningTelemetry, AarmTaskMemoryDomainTelemetry,
     parallel_chunk_budgets,
 };
-use validation::{select_entry, validate_invocable_entry, validate_module};
+use validation::{
+    select_entry, validate_invocable_entry, validate_invocable_entry_with_arguments,
+    validate_module,
+};
 use values::{
     cast_value, integer_constant_bits, is_aggregate, primitive, scalar_from_bits, scalar_kind,
     scalar_to_bits, type_name,
@@ -87,6 +98,8 @@ struct Codegen {
     jit: JITModule,
     pointer_type: ClifType,
     string_data: HashMap<String, DataId>,
+    /// Interned encodings of deep-copy transfer shapes (CONC-005).
+    transfer_data: HashMap<Vec<u8>, DataId>,
     runtime_ids: HashMap<&'static str, FuncId>,
     foreign_ids: HashMap<mir::SymbolId, FuncId>,
     interface_tables: HashMap<(mir::SymbolId, mir::SymbolId), DataId>,
@@ -96,6 +109,7 @@ struct Codegen {
     runtime_fallible_functions: HashSet<mir::SymbolId>,
     runtime_fallible_interface_methods: HashSet<mir::SymbolId>,
     layouts: Layouts,
+    descriptors: layouts::ObjectDescriptors,
 }
 
 struct FunctionState {
@@ -107,102 +121,11 @@ struct FunctionState {
     runtime_failure: Block,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum ExecutionValue {
-    SByte(i8),
-    Byte(u8),
-    Short(i16),
-    UShort(u16),
-    Int(i32),
-    UInt(u32),
-    Long(i64),
-    ULong(u64),
-    Float(f32),
-    Double(f64),
-    Bool(bool),
-    Char(char),
-    String(String),
-    Void,
-}
-
-impl ExecutionValue {
-    #[must_use]
-    pub fn float(value: f32) -> Self {
-        Self::Float(value)
-    }
-
-    #[must_use]
-    pub fn double(value: f64) -> Self {
-        Self::Double(value)
-    }
-}
-
-impl fmt::Display for ExecutionValue {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::SByte(value) => write!(formatter, "{value}"),
-            Self::Byte(value) => write!(formatter, "{value}"),
-            Self::Short(value) => write!(formatter, "{value}"),
-            Self::UShort(value) => write!(formatter, "{value}"),
-            Self::Int(value) => write!(formatter, "{value}"),
-            Self::UInt(value) => write!(formatter, "{value}"),
-            Self::Long(value) => write!(formatter, "{value}"),
-            Self::ULong(value) => write!(formatter, "{value}"),
-            Self::Float(value) => write!(formatter, "{value}"),
-            Self::Double(value) => write!(formatter, "{value}"),
-            Self::Bool(value) => write!(formatter, "{value}"),
-            Self::Char(value) => write!(formatter, "{value}"),
-            Self::String(value) => formatter.write_str(value),
-            Self::Void => formatter.write_str("function completed successfully (void)"),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BackendError {
-    message: String,
-    cancellation: bool,
-}
-
-impl BackendError {
-    #[must_use]
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            cancellation: false,
-        }
-    }
-
-    fn cancellation() -> Self {
-        Self {
-            message: "task was cancelled".to_owned(),
-            cancellation: true,
-        }
-    }
-
-    fn is_cancellation(&self) -> bool {
-        self.cancellation
-    }
-
-    #[must_use]
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
-
-impl fmt::Display for BackendError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl Error for BackendError {}
-
 /// One validated module prepared once for sequential root-package tests.
 /// Machine code is reused, but every invocation receives an independent
 /// execution context and caller-owned console backend.
 pub struct PreparedTestProgram {
-    program: execution::PreparedProgram,
+    program: std::sync::Arc<execution::SharedProgram>,
     module: std::sync::Arc<mir::Module>,
     uses_tasks: bool,
 }
@@ -222,15 +145,19 @@ impl PreparedTestProgram {
                 .iter()
                 .find(|function| function.symbol == *symbol)
                 .ok_or_else(|| {
-                    BackendError::new(format!("test symbol {symbol:?} was not found"))
+                    BackendError::new(
+                        codes::BACKEND_ENTRY_NOT_FOUND,
+                        format!("test symbol {symbol:?} was not found"),
+                    )
                 })?;
             if !function.parameters.is_empty() || function.return_type != mir::Type::Void {
                 return Err(BackendError::new(
+                    codes::BACKEND_ENTRY_SIGNATURE_UNSUPPORTED,
                     "test symbol must be a parameterless void function",
                 ));
             }
         }
-        let program = execution::PreparedProgram::prepare(module)?;
+        let program = execution::SharedProgram::new(execution::PreparedProgram::prepare(module)?);
         Ok(Self {
             program,
             module: std::sync::Arc::new(module.clone()),
@@ -257,7 +184,13 @@ impl PreparedTestProgram {
             .then(|| {
                 let workers =
                     std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-                task_runtime::TaskRuntime::new(&self.module, workers)
+                task_runtime::TaskRuntime::with_program(
+                    &provider::provider(),
+                    &self.module,
+                    workers,
+                    &std::sync::Arc::new(aster_runtime::ForeignRegistry::new()),
+                    std::sync::Arc::<execution::SharedProgram>::clone(&self.program),
+                )
             })
             .transpose()?;
         let task_runtime = task_runtime
@@ -269,7 +202,10 @@ impl PreparedTestProgram {
         if value == ExecutionValue::Void {
             Ok(())
         } else {
-            Err(BackendError::new("test symbol must return void"))
+            Err(BackendError::new(
+                codes::BACKEND_ENTRY_SIGNATURE_UNSUPPORTED,
+                "test symbol must return void",
+            ))
         }
     }
 }
@@ -324,6 +260,7 @@ impl PreparedSequentialExecution {
         validate_module(module)?;
         if task_runtime::module_uses_tasks(module) {
             return Err(BackendError::new(
+                codes::BACKEND_UNSUPPORTED_CONSTRUCT,
                 "prepared sequential research execution does not support Task.Run",
             ));
         }
@@ -476,6 +413,31 @@ pub fn execute_with_stats(
     execute_resolved(module, entry, true, None, None)
 }
 
+/// Execute one entry with memory statistics on an explicit number of task
+/// workers instead of `available_parallelism()`. Benchmark seam only: the
+/// language and CLI expose no worker count.
+///
+/// # Errors
+///
+/// Returns an error for a zero worker count, and otherwise the same controlled
+/// validation, preparation, and runtime errors as [`execute_with_stats`].
+#[doc(hidden)]
+pub fn execute_with_worker_count(
+    module: &mir::Module,
+    function_name: &str,
+    worker_count: usize,
+) -> Result<(ExecutionValue, MemoryStats), BackendError> {
+    if worker_count == 0 {
+        return Err(BackendError::new(
+            codes::EXEC_POOL_INVALID_WORKER_CONFIG,
+            "worker count must be at least 1",
+        ));
+    }
+    validate_module(module)?;
+    let entry = select_entry(module, function_name)?;
+    execution::execute_resolved_with_worker_count(module, entry, worker_count)
+}
+
 /// Execute one entry with the opt-in experimental AARM allocator telemetry.
 /// Stable CLI memory-statistics output remains unchanged.
 ///
@@ -622,8 +584,9 @@ pub fn execute_with_aarm_auto_parallel_governor(
     function_name: &str,
     worker_count: usize,
 ) -> Result<AarmAutoParallelExecution, BackendError> {
-    let auto =
-        discover_aarm_auto_governor().map_err(|error| BackendError::new(error.to_string()))?;
+    let auto = discover_aarm_auto_governor().map_err(|error| {
+        BackendError::new(codes::BACKEND_AARM_GOVERNOR_FAILED, error.to_string())
+    })?;
     let telemetry = auto.telemetry();
     execute_with_aarm_parallel_governor(module, function_name, worker_count, auto.governor())
         .map(|(value, main, plans, workers)| (value, main, plans, workers, telemetry))
@@ -646,8 +609,9 @@ pub fn execute_with_aarm_auto_task_governor(
     ),
     BackendError,
 > {
-    let auto =
-        discover_aarm_auto_governor().map_err(|error| BackendError::new(error.to_string()))?;
+    let auto = discover_aarm_auto_governor().map_err(|error| {
+        BackendError::new(codes::BACKEND_AARM_GOVERNOR_FAILED, error.to_string())
+    })?;
     let telemetry = auto.telemetry();
     execute_with_aarm_task_governor(module, function_name, worker_count, auto.governor())
         .map(|(value, main, domain)| (value, main, domain, telemetry))
@@ -670,8 +634,9 @@ pub fn execute_with_aarm_auto_async_governor(
     ),
     BackendError,
 > {
-    let auto =
-        discover_aarm_auto_governor().map_err(|error| BackendError::new(error.to_string()))?;
+    let auto = discover_aarm_auto_governor().map_err(|error| {
+        BackendError::new(codes::BACKEND_AARM_GOVERNOR_FAILED, error.to_string())
+    })?;
     let telemetry = auto.telemetry();
     execute_with_aarm_async_governor(module, function_name, worker_count, auto.governor())
         .map(|(value, main, domain)| (value, main, domain, telemetry))
@@ -687,8 +652,9 @@ pub fn execute_with_aarm_exact_parallel_governor(
     worker_count: usize,
     requested_bytes: u64,
 ) -> Result<AarmAutoParallelExecution, BackendError> {
-    let explicit = aarm_explicit_governor(requested_bytes)
-        .map_err(|error| BackendError::new(error.to_string()))?;
+    let explicit = aarm_explicit_governor(requested_bytes).map_err(|error| {
+        BackendError::new(codes::BACKEND_AARM_GOVERNOR_FAILED, error.to_string())
+    })?;
     let telemetry = explicit.telemetry();
     execute_with_aarm_parallel_governor(module, function_name, worker_count, explicit.governor())
         .map(|(value, main, plans, workers)| (value, main, plans, workers, telemetry))
@@ -712,8 +678,9 @@ pub fn execute_with_aarm_exact_task_governor(
     ),
     BackendError,
 > {
-    let explicit = aarm_explicit_governor(requested_bytes)
-        .map_err(|error| BackendError::new(error.to_string()))?;
+    let explicit = aarm_explicit_governor(requested_bytes).map_err(|error| {
+        BackendError::new(codes::BACKEND_AARM_GOVERNOR_FAILED, error.to_string())
+    })?;
     let telemetry = explicit.telemetry();
     execute_with_aarm_task_governor(module, function_name, worker_count, explicit.governor())
         .map(|(value, main, domain)| (value, main, domain, telemetry))
@@ -737,8 +704,9 @@ pub fn execute_with_aarm_exact_async_governor(
     ),
     BackendError,
 > {
-    let explicit = aarm_explicit_governor(requested_bytes)
-        .map_err(|error| BackendError::new(error.to_string()))?;
+    let explicit = aarm_explicit_governor(requested_bytes).map_err(|error| {
+        BackendError::new(codes::BACKEND_AARM_GOVERNOR_FAILED, error.to_string())
+    })?;
     let telemetry = explicit.telemetry();
     execute_with_aarm_async_governor(module, function_name, worker_count, explicit.governor())
         .map(|(value, main, domain)| (value, main, domain, telemetry))
@@ -832,7 +800,12 @@ pub fn execute_symbol(
         .functions
         .iter()
         .find(|function| function.symbol == symbol)
-        .ok_or_else(|| BackendError::new(format!("entry symbol {symbol:?} was not found")))?;
+        .ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_ENTRY_NOT_FOUND,
+                format!("entry symbol {symbol:?} was not found"),
+            )
+        })?;
     validate_invocable_entry(entry, &entry.name)?;
     execute_resolved(module, entry, false, None, None).map(|(value, _)| value)
 }
@@ -852,9 +825,48 @@ pub fn execute_symbol_with_foreign_registry(
         .functions
         .iter()
         .find(|function| function.symbol == symbol)
-        .ok_or_else(|| BackendError::new(format!("entry symbol {symbol:?} was not found")))?;
+        .ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_ENTRY_NOT_FOUND,
+                format!("entry symbol {symbol:?} was not found"),
+            )
+        })?;
     validate_invocable_entry(entry, &entry.name)?;
     execute_resolved_with_foreign_registry(module, entry, registry, false).map(|(value, _)| value)
+}
+
+/// Compile validated MIR and invoke the application entry selected by the
+/// compiler (`Main()` or `Main(string[] args)`, returning `void` or `int`).
+/// An entry that declares `string[] args` receives `arguments` as a fresh
+/// array; an entry with no parameters ignores them. `console_backend`, when
+/// present, replaces the real stdin/stdout/stderr (for tests).
+///
+/// # Errors
+///
+/// Returns a controlled error if the symbol is missing, its signature is not
+/// an entry signature, or compilation or execution fails.
+pub fn execute_entry_with_arguments(
+    module: &mir::Module,
+    symbol: mir::SymbolId,
+    arguments: &[String],
+    console_backend: Option<Box<dyn aster_runtime::ConsoleBackend>>,
+) -> Result<(ExecutionValue, MemoryStats), BackendError> {
+    validate_module(module)?;
+    let entry = module
+        .functions
+        .iter()
+        .find(|function| function.symbol == symbol)
+        .ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_ENTRY_NOT_FOUND,
+                format!("entry symbol {symbol:?} was not found"),
+            )
+        })?;
+    validate_invocable_entry_with_arguments(entry, &entry.name)?;
+    if entry.parameters.is_empty() {
+        return execute_resolved(module, entry, true, console_backend, None);
+    }
+    execute_resolved_with_arguments(module, entry, arguments, true, console_backend)
 }
 
 /// Like [`execute_symbol`], but also returns runtime allocation metrics.
@@ -872,7 +884,12 @@ pub fn execute_symbol_with_stats(
         .functions
         .iter()
         .find(|function| function.symbol == symbol)
-        .ok_or_else(|| BackendError::new(format!("entry symbol {symbol:?} was not found")))?;
+        .ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_ENTRY_NOT_FOUND,
+                format!("entry symbol {symbol:?} was not found"),
+            )
+        })?;
     validate_invocable_entry(entry, &entry.name)?;
     execute_resolved(module, entry, true, None, None)
 }

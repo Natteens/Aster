@@ -12,7 +12,7 @@ intrinsics still resolve through official `aster.*` symbols rather than text or 
 
 - `aster.core` defines [`Option<T>`, `Result<T, E>`](option-result.md), and the explicit
   incremental [`StringBuilder`](strings.md#incremental-construction).
-- `aster.io` provides [terminal and host-managed filesystem operations](io.md).
+- `aster.io` provides [terminal (including standard error), environment and host-managed filesystem operations](io.md).
 - `aster.math` provides [practical scalar math](math.md), including constants, classification,
   logarithms, trigonometry, and interpolation.
 - `aster.random` provides the explicitly seeded, cross-platform deterministic

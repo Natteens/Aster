@@ -303,8 +303,10 @@ This model is designed for one bounded JIT execution. ASTER provides a narrow
 compiler-proven long-lived owned-region mechanism, but no general individual
 deallocation, reference counting, tracing garbage collector, finalizers, or
 source ownership syntax. Arena pages remain owned by the `ExecutionContext`;
-rewound capacity is reused and follows the existing delayed-purge/governor
-policy, while all remaining pages are released when the context is dropped.
+rewound capacity is retained for reuse, and all pages are released when the
+context is dropped. The delayed-purge and shared-governor policies described in
+the AARM research note are research code paths; default execution does not
+enable them.
 
 An escaping or uncertain allocation outside the accepted proof can therefore
 remain reserved after it is no longer reachable by source code. This is

@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt::Write};
 
-use aster_diagnostics::Diagnostic;
+use aster_diagnostics::{Diagnostic, codes};
 use aster_syntax::{
     BinaryOperator, Block, EnumDeclaration, Expression, ExpressionKind, FunctionDeclaration,
     InterpolatedPart, Item, Literal, Member, Module, Statement, SwitchCase, SwitchExpressionCase,
@@ -75,6 +75,7 @@ struct Monomorphizer {
     templates: HashMap<String, FunctionDeclaration>,
     type_templates: HashMap<String, GenericTypeTemplate>,
     enum_templates: HashMap<String, EnumDeclaration>,
+    enums: HashMap<String, EnumDeclaration>,
     returns: HashMap<String, String>,
     fields: HashMap<(String, String), String>,
     methods: HashMap<(String, String), String>,
@@ -96,7 +97,11 @@ struct Monomorphizer {
     /// satisfaction. Generated class specializations are added as they are
     /// produced, so `Wrapper<int>` keeps `Wrapper<T>`'s interface relation.
     class_interfaces: HashMap<String, Vec<String>>,
+    /// Declared base classes and base interfaces for every class and interface,
+    /// used to resolve inherited fields, properties, and methods during discovery.
+    type_bases: HashMap<String, Vec<String>>,
     constants: HashMap<String, crate::constexpr::ConstValue>,
+    null_conditional_receiver_types: Vec<String>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -140,6 +145,7 @@ impl Monomorphizer {
                 satisfied = false;
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::GENERIC_CONSTRAINT_NOT_SATISFIED,
                         format!(
                             "type argument `{argument}` does not satisfy constraint `{}: {}`",
                             parameter.name, required
@@ -264,6 +270,7 @@ impl Monomorphizer {
             if name == "Task" {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::GENERIC_RESERVED_TASK_TEMPLATE,
                         format!(
                             "`{name}` is reserved for the intrinsic task system and cannot be declared as a generic {kind} template"
                         ),
@@ -277,6 +284,7 @@ impl Monomorphizer {
             if name == "List" {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::GENERIC_RESERVED_LIST_TEMPLATE,
                         format!(
                             "`{name}` is reserved for the built-in `List<T>` type and cannot be declared as a generic {kind} template"
                         ),
@@ -290,6 +298,7 @@ impl Monomorphizer {
             if name == "Dictionary" {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::GENERIC_RESERVED_DICT_TEMPLATE,
                         format!("`{name}` is reserved for the built-in `Dictionary<K, V>` type and cannot be declared as a generic {kind} template"),
                         span,
                     )

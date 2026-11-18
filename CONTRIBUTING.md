@@ -16,11 +16,14 @@ Before opening a pull request, run:
 ```console
 node editors/vscode/scripts/sync-version.mjs --check
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets --features aster-codegen-cranelift/aarm-telemetry -- -D warnings
 cargo test --workspace --all-targets
 cargo check --workspace --locked
 git diff --check
 ```
+
+For experimental memory changes, run the compatible feature configurations separately as described
+in the [compiler development guide](docs/compiler/development.md). H12 and H16 cannot be enabled together.
 
 Use the installed `aster` binary when validating user-facing guides. For local CLI changes, use
 `cargo run -p aster-cli -- <COMMAND>`.

@@ -169,7 +169,7 @@ fn out_of_range_and_non_constant_arguments_are_controlled_errors() {
         errors(&format!(
             "{identity}public ulong F() {{ return Identity(1.5); }}"
         )),
-        ["expected `ulong`, found `float`"]
+        ["expected `ulong`, found `double`"]
     );
     assert_eq!(
         errors(&format!(

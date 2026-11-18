@@ -1,3 +1,5 @@
+use aster_diagnostics::codes;
+
 use super::{
     AbiParam, BackendError, ClifType, Codegen, FuncId, HashMap, HashSet, Linkage, Module,
     Primitive, RuntimeType, Signature, is_aggregate, mir, module_error, primitive, type_name,
@@ -66,7 +68,7 @@ impl Codegen {
                     intrinsic: mir::Intrinsic::TaskRun,
                     arguments,
                     ..
-                } if arguments.len() > 1 => arguments.first(),
+                } if !arguments.is_empty() => arguments.first(),
                 mir::Instruction::CallIntrinsic {
                     intrinsic: mir::Intrinsic::AsyncSpawnInner,
                     arguments,
@@ -81,16 +83,21 @@ impl Codegen {
             .collect::<HashSet<_>>();
         let mut functions = HashMap::new();
         for function in &mir_module.functions {
+            let deep_result = super::transfer::is_deep_result_type(&function.return_type);
             if !targets.contains(&function.symbol)
-                || function.parameters.is_empty()
-                || super::task_abi::wait_symbol_for(&function.return_type).is_none()
+                || (function.parameters.is_empty() && !deep_result)
+                || (super::task_abi::wait_symbol_for(&function.return_type).is_none()
+                    && !deep_result)
             {
                 continue;
             }
+            // `(context, payload, result_out)`: `result_out` receives a
+            // deep-copy result image (unused for scalar results).
             let mut signature = self.jit.make_signature();
             signature.params.push(AbiParam::new(self.pointer_type));
             signature.params.push(AbiParam::new(self.pointer_type));
-            if function.return_type != mir::Type::Void && !is_aggregate(&function.return_type) {
+            signature.params.push(AbiParam::new(self.pointer_type));
+            if function.return_type != mir::Type::Void && !deep_result {
                 signature
                     .returns
                     .push(AbiParam::new(self.clif_value_type(&function.return_type)?));
@@ -156,10 +163,13 @@ impl Codegen {
             Some(Primitive::Float) => Ok(types::F32),
             Some(Primitive::Double) => Ok(types::F64),
             Some(Primitive::String) => Ok(self.pointer_type),
-            Some(Primitive::Decimal) | None => Err(BackendError::new(format!(
-                "type `{}` cannot be represented by the current JIT",
-                type_name(type_)
-            ))),
+            Some(Primitive::Decimal) | None => Err(BackendError::new(
+                codes::BACKEND_UNSUPPORTED_CONSTRUCT,
+                format!(
+                    "type `{}` cannot be represented by the current JIT",
+                    type_name(type_)
+                ),
+            )),
         }
     }
 }

@@ -29,12 +29,16 @@ lowering until its exact contract exists.
 Use `int` for ordinary whole numbers and `long` when the 32-bit range is insufficient. Use `uint`
 when the unsigned range or bit-level meaning matters, not merely to forbid negative input. Use
 `float` for compact approximate calculations and `double` when its extra precision matters.
+Unsuffixed real literals (`1.5`, `1e9`, `1.5e2`) default to `double`; write `f`/`F` for `float`
+and `d`/`D` for `double` (`m`/`M` is reserved for `decimal`). Assigning an unsuffixed real literal
+to `float` is an error and requires the `f` suffix.
 
 ```aster
 int attempts = 3;
 long fileSize = 8000000000L;
 uint mask = 255u;
 float opacity = 0.5f;
+double gravity = 9.81;
 double ratio = 1.0d / 3.0d;
 ```
 
@@ -66,7 +70,9 @@ support the [bitwise and shift operators](operators.md) and can be written in de
 Arrays and generic specializations are implemented types, but they are not primitives. Classes,
 structs, interfaces, and [enums](enums.md) are user-defined types rather than primitives.
 
-`object`, `dynamic`, `null`, vectors, matrices, and quaternions are not supported.
+`object`, `dynamic`, vectors, matrices, and quaternions are not supported. Target-typed `null` is
+supported only with optional `T?` / `Option<T>` types (see [Option and Result](option-result.md));
+non-optional reference types remain non-null.
 
 `nint` and `nuint` are reserved for a future platform-dependent interop/low-level design. `half` is
 also unsupported. None of these names is accepted today.

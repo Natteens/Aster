@@ -8,10 +8,16 @@ aster-cli -> aster-compiler -> aster-syntax -> aster-diagnostics
           |                 -> aster-mir -> aster-hir
           |                 -> aster-types
           |                 -> aster-diagnostics
-          -> aster-codegen-cranelift -> aster-mir
+          -> aster-codegen-cranelift -> aster-exec -> aster-mir
+                                     |            -> aster-runtime
+                                     -> aster-mir
                                      -> aster-types
                                      -> aster-runtime
 ```
+
+`aster-exec` (the scheduler) depends on `aster-mir` and `aster-runtime` only. No Cranelift crate
+appears anywhere in its dependency tree; `cargo tree -p aster-exec | grep -i cranelift` prints nothing.
+`crates/aster-exec/tests/no_code_generator_dependency.rs` pins the same rule at the manifest level.
 
 ## Crates
 
@@ -72,6 +78,13 @@ overload, and callable identity resolution. A foreign call is accepted only insi
 After validation succeeds, the compiler lowers general-language AST nodes to typed HIR and then lowers
 HIR to control-flow-explicit MIR.
 
+Semantic analysis also records the numeric operand type of every binary expression (the promoted
+common type, or the promoted left operand of a shift). HIR lowering converts both operands to that
+recorded type and derives the result from it instead of re-applying the promotion table; debug
+builds assert that the recorded type equals the table's answer for every compiled program. Property
+accessor bodies are looked up under the same model context semantic analysis used for them, so
+every decision recorded inside a getter or setter reaches HIR.
+
 After the narrow loop-concat representation rewrite, one general MIR optimizer simplifies the
 already-typed control and scalar data flow. Its fixed, deterministic cycle propagates exact primitive
 constants and direct scalar copies, folds constant primitive operations, converts known branches to
@@ -100,6 +113,19 @@ as a fully typed `PropagateResult` node. MIR reuses the same tag test, payload p
 construction, and return machinery to evaluate the operand once, continue on `Ok`, and early-return
 the enclosing `Result`'s `Error` — so Cranelift sees only concrete branches and enum data
 (`docs/reference/result-propagation.md`).
+
+### Semantic model identity (internal)
+
+Semantic analysis records its decisions in side tables that HIR lowering consumes. Their keys are
+structural. A model context names a function by owner, name, and parameter type spelling (an
+accessor as `get_`/`set_` plus the property, a field initializer by owner and field), so overloads
+and generic specializations have distinct contexts and none depends on a source position. Within a
+context a node is identified by its pre-order ordinal among the context's expressions, statements,
+blocks, switch cases, and variable declarations; semantic analysis registers that index for every
+context it analyzes and HIR lowering obtains every key from the same constructor. A node shares an
+ordinal with another exactly when the two share a source span, so lookups behave as the earlier
+span keys did. Keys still carry the node's span, outside their identity, for diagnostics and report
+order. Editing whitespace, comments, or the position or order of declarations changes no key.
 
 ### Source declaration identity (internal)
 
@@ -135,6 +161,21 @@ fallthrough from `void` functions.
 edges between basic blocks. MIR remains backend-independent: it does not select machine instructions,
 define an ABI, invoke Cranelift, or execute programs.
 
+`aster_mir::validate` holds the backend-neutral checks: the nominal type index (unique type,
+field, and enum-case symbols); the typing of every instruction, rvalue, operand, place, and
+constant; and, in `validate::executable`, interface metadata, CFG structure (unique blocks, an
+existing entry, declared terminator targets), enum and struct construction shapes, worker
+host-operation reachability, and fine Temporary subregion and owned-region executability.
+Outcomes distinguish invalid MIR, a well-formed construct no backend supports yet, and a
+policy rejection (a host operation reachable from a worker).
+
+Debug builds of the compiler run the checks that apply at each phase after every MIR pass: typing,
+interface metadata, CFG, shapes, and worker reachability from MIR lowering on; subregion
+executability from the AARM pass on; owned-region executability after owned-region lowering. A
+pass that produces invalid or non-executable MIR stops compilation and names the pass; policy
+rejections are left to the backend. Release builds skip the per-pass checks. Backends run the same
+checks before code generation and keep their own checks for what they can lower.
+
 MIR has a typed foreign-declaration table and an opaque, effectful `ForeignCall` instruction. It
 contains no raw pointer, Cranelift signature, library path, or dynamic symbol name.
 
@@ -145,9 +186,73 @@ Executable structs use declaration-order natural layout. The JIT stores aggregat
 copies parameters into callee-owned storage and returns aggregates through a hidden destination
 pointer. This is an internal ASTER ABI, not the platform C aggregate ABI.
 
+### `aster-exec`
+
+Backend-neutral scheduler (ARCH-005): the worker pool (`worker_pool`), the host-side task runtime
+and async pump (`task_runtime`), the completion queue, the typed scalar transport (`scalar`), and
+the `extern "C"` task/async/parallel ABI functions that generated code calls (`task_abi`,
+`async_abi`). It also owns `BackendError` and `ExecutionValue`, which the code-generator crate
+re-exports unchanged. It depends only on `aster-mir` and `aster-runtime`, so an ahead-of-time
+backend can reuse it without a JIT.
+
+Task transfer (CONC-005) copies strings, arrays, `List<T>`, `Dictionary<K, V>` and structs/enums of
+those across the worker boundary. The backend describes each transferable type as a
+`aster_runtime::TransferShape` (memory-image only: scalar widths, pointer kinds, field offsets,
+enum tags, plus the counting descriptors). `ExecutionContext::transfer_pack` serializes a value in
+the source domain into a `TransferWire` (little-endian, depth first, no pointers); on the receiving
+domain `transfer_unpack` materializes it through the ordinary allocation paths. `Task.Run`
+arguments are packed by `aster_task_pack_arg` into the `TaskPayload` and unpacked into a
+worker-local frame copy in the worker's context; results are packed in the worker (`invoke_deep_task`)
+as `ExecutionValue::Transfer` and unpacked by `aster_task_wait_deep` / `aster_task_wait_all_deep`.
+Task trampolines take `(context, payload, result_out)`.
+
+Machine code reaches the scheduler through an injected code provider, never through a concrete
+code generator:
+
+- `ExecutableProgram` is one finalized program shared read-only by the host thread, the async
+  driver and every worker of a pool. Each method runs its entry in a fresh `ExecutionContext`:
+  `run_task`, `invoke_move_next_with_cancellation`, `run_for_chunk`, `run_for_each_chunk`,
+  `run_reduce_chunk`, `run_combine_step`.
+- `CodeProvider` is the factory: `validate(module)`, `resolve_entry(module, name)` and
+  `prepare(module, foreign_registry)`, which returns the pool's single `Arc<dyn ExecutableProgram>`
+  on first use (or the caller adopts an already prepared one). `ExecutionPool::new` and every
+  `TaskRuntime` constructor take the provider as their first argument.
+
+The Cranelift implementation is `aster-codegen-cranelift`'s private `provider` module; it compiles
+once per pool, exactly as before. Scheduler unit tests in `aster-exec` run against a fake provider
+(`test_support`) with no code generator; tests that compile and run real programs live in
+`aster-codegen-cranelift/src/scheduler_tests`.
+
+#### Scheduler queues, turn budget and helping wait (CONC-004)
+
+The pool keeps one injection queue (work submitted from the host thread or the async driver) and
+one FIFO local queue per worker (work submitted from that worker's own thread). A single mutex
+guards them; contention is a CONC-EXP-2 question. A worker serves its local queue first, but after
+`TURN_BUDGET` (64) consecutive turns from one queue it serves the other queue first when that one
+has work, so neither starves the other. A *turn* is one job, the unit that never yields: a task
+runs to completion in one turn, and `MoveNext` steps run on the host pump, so the budget is applied
+only at the choice of the next job. A running job is never interrupted.
+
+`task.Wait()` and `Task.WaitAll` (both through `TaskRuntime::wait`) call
+`ExecutionPool::join_helping` **only on a pool worker thread** (master plan §8.4); on the main
+thread they block and run nothing else. On a worker, while the awaited result is not ready the waiting thread runs queued
+plain tasks itself, nesting at most `MAX_HELP_DEPTH` (4) deep per thread; at the limit it blocks as
+before. Awaited async inner jobs are never helped (they wait for a gate the host pump opens).
+Deadlock freedom: the awaited task is queued (the waiter or a worker runs it), running on a worker
+that never waits on this thread, or done; a helped job never waits for the helper's result, and
+nesting is bounded, so a helped job delays a waiter only by its own running time. Results are
+per-task, so `WaitAll` result order and lowest-index failure are unchanged.
+
+Not implemented, conditional on CONC-EXP-2: work stealing between local queues and compensation
+threads. Without stealing a local job runs only on its own worker, so nothing in production submits
+from a worker yet: the static ban on nested `Task.Run` (and the worker-context rejection of
+`Task.Run`/`Wait`/`Parallel`) stays, because lifting it needs a per-domain task runtime in worker
+contexts (CONC-002/CONC-003).
+
 ### `aster-codegen-cranelift`
 
-Consumes validated `aster-mir` exclusively. It validates the supported JIT subset, declares all ASTER
+Consumes validated `aster-mir` exclusively (plus `aster-exec` for the scheduler it injects the
+Cranelift code provider into). It validates the supported JIT subset, declares all ASTER
 functions, translates MIR locals and basic blocks into Cranelift IR, finalizes native code in memory,
 and invokes a concrete function symbol already selected outside the backend.
 
@@ -172,7 +277,12 @@ calls with an explicit object receiver. An interface value is two pointer-sized 
 object reference and a pointer to a read-only method table owned by the JIT module. Interface calls
 load the concrete function from that table and use the checked ASTER calling convention. The backend
 frees each JIT session after
-its result is copied out. The JIT module remains alive during the call.
+its result is copied out. The JIT module remains alive during the call. An execution that uses
+tasks compiles its module once: the main thread's finalized program is shared, through reference
+counting, with the async driver and every worker thread, and its JIT memory is freed when the last
+holder releases it, after the pool has joined its workers. The pool and task runtime live in
+`aster-exec`; this backend supplies the program through its `CodeProvider` and only binds the
+scheduler's `extern "C"` ABI addresses into the JIT symbol table and declares their signatures.
 
 Semantic analysis owns overload selection and records a stable callable identity for every call.
 HIR receives an already resolved static, instance, interface, constructor, getter, or setter target;

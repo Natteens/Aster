@@ -1,3 +1,4 @@
+use aster_diagnostics::codes;
 use aster_runtime::EXECUTION_CONTEXT_ERROR_FLAG_OFFSET;
 
 use super::{
@@ -46,7 +47,11 @@ impl Codegen {
         signature
             .params
             .push(super::AbiParam::new(self.pointer_type));
-        if function.return_type != mir::Type::Void && !is_aggregate(&function.return_type) {
+        signature
+            .params
+            .push(super::AbiParam::new(self.pointer_type));
+        let deep_result = super::transfer::is_deep_result_type(&function.return_type);
+        if function.return_type != mir::Type::Void && !deep_result {
             signature.returns.push(super::AbiParam::new(
                 self.clif_value_type(&function.return_type)?,
             ));
@@ -61,6 +66,7 @@ impl Codegen {
             builder.seal_block(entry);
             let context_value = builder.block_params(entry)[0];
             let payload = builder.block_params(entry)[1];
+            let result_out = builder.block_params(entry)[2];
             let layout = self.layouts.task_argument_layout(
                 &function
                     .parameters
@@ -69,6 +75,10 @@ impl Codegen {
                     .collect::<Vec<_>>(),
             )?;
             let mut values = vec![context_value];
+            if is_aggregate(&function.return_type) {
+                // Hidden return pointer: the host-provided result image.
+                values.push(result_out);
+            }
             for (parameter, offset) in function.parameters.iter().zip(layout.offsets) {
                 if is_aggregate(&parameter.type_) {
                     values.push(builder.ins().iadd_imm(payload, i64::from(offset)));
@@ -79,7 +89,10 @@ impl Codegen {
                         MemFlags::new(),
                         payload,
                         i32::try_from(offset).map_err(|_| {
-                            BackendError::new("Task.Run argument offset exceeds the JIT ABI")
+                            BackendError::new(
+                                codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                                "Task.Run argument offset exceeds the JIT ABI",
+                            )
                         })?,
                     ));
                 }
@@ -87,6 +100,11 @@ impl Codegen {
             let target = self.jit.declare_func_in_func(function_id, builder.func);
             let call = builder.ins().call(target, &values);
             if function.return_type == mir::Type::Void || is_aggregate(&function.return_type) {
+                builder.ins().return_(&[]);
+            } else if deep_result {
+                // String/array/list/dictionary: the pointer goes to the image.
+                let result = builder.inst_results(call)[0];
+                builder.ins().store(MemFlags::new(), result, result_out, 0);
                 builder.ins().return_(&[]);
             } else {
                 let result = builder.inst_results(call)[0];
@@ -150,15 +168,40 @@ impl Codegen {
         let values = builder.block_params(abi_entry).to_vec();
         let mut values = values.into_iter();
         state.execution_context = values.next();
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("Aster function is missing its ExecutionContext"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "Aster function is missing its ExecutionContext",
+            )
+        })?;
         if is_aggregate(&function.return_type) {
             state.hidden_return = values.next();
         }
+        #[cfg(feature = "mem-exp-rc-core")]
+        for local in function.parameters.iter().chain(&function.locals) {
+            if self.layouts.type_has_references(&local.type_) {
+                // Releasing or capturing a never-assigned slot must see null.
+                let layout = self.layouts.type_layout(&local.type_)?;
+                let zero = builder.ins().iconst(types::I64, 0);
+                for word in 0..layout.size.div_ceil(8) {
+                    let offset = i32::try_from(word * 8).map_err(|_| {
+                        BackendError::new(
+                            codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                            "stack slot is too large",
+                        )
+                    })?;
+                    builder
+                        .ins()
+                        .stack_store(zero, state.slots[&local.id], offset);
+                }
+            }
+        }
         for parameter in &function.parameters {
             let value = values.next().ok_or_else(|| {
-                BackendError::new("missing Cranelift parameter for Aster function")
+                BackendError::new(
+                    codes::BACKEND_MISSING_DESTINATION_OR_RESULT,
+                    "missing Cranelift parameter for Aster function",
+                )
             })?;
             let destination =
                 self.place_address(builder, &mir::Place::Local(parameter.id), &state)?;
@@ -190,7 +233,10 @@ impl Codegen {
             builder.switch_to_block(clif_block);
             if block.id == function.entry && state.temporary_scope {
                 let context = state.execution_context.ok_or_else(|| {
-                    BackendError::new("temporary allocation scope is missing its ExecutionContext")
+                    BackendError::new(
+                        codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                        "temporary allocation scope is missing its ExecutionContext",
+                    )
                 })?;
                 let function_ref = self.jit.declare_func_in_func(
                     self.runtime_ids["aster_rt_temporary_scope_enter"],
@@ -240,11 +286,18 @@ impl Codegen {
         builder: &mut FunctionBuilder<'_>,
         state: &FunctionState,
     ) -> Result<(), BackendError> {
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("Aster function is missing its ExecutionContext"))?;
-        let flag_offset = i32::try_from(EXECUTION_CONTEXT_ERROR_FLAG_OFFSET)
-            .map_err(|_| BackendError::new("ExecutionContext error flag offset is too large"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "Aster function is missing its ExecutionContext",
+            )
+        })?;
+        let flag_offset = i32::try_from(EXECUTION_CONTEXT_ERROR_FLAG_OFFSET).map_err(|_| {
+            BackendError::new(
+                codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                "ExecutionContext error flag offset is too large",
+            )
+        })?;
         // A null context takes the failure path, exactly as `aster_rt_has_error`
         // reports it; only a non-null context is dereferenced.
         let load_flag = builder.create_block();
@@ -289,7 +342,7 @@ impl Codegen {
         builder.switch_to_block(continuation);
     }
 
-    fn return_after_failed_call_guard(
+    pub(super) fn return_after_failed_call_guard(
         &self,
         builder: &mut FunctionBuilder<'_>,
         return_type: &mir::Type,
@@ -318,7 +371,10 @@ impl Codegen {
         match instruction {
             mir::Instruction::OwnedRegionEnter { .. } => {
                 let context = state.execution_context.ok_or_else(|| {
-                    BackendError::new("owned region is missing its ExecutionContext")
+                    BackendError::new(
+                        codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                        "owned region is missing its ExecutionContext",
+                    )
                 })?;
                 let function_ref = self.jit.declare_func_in_func(
                     self.runtime_ids["aster_rt_owned_region_enter"],
@@ -333,7 +389,10 @@ impl Codegen {
             }
             mir::Instruction::TemporarySubregionEnter { .. } => {
                 let context = state.execution_context.ok_or_else(|| {
-                    BackendError::new("temporary subregion is missing its ExecutionContext")
+                    BackendError::new(
+                        codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                        "temporary subregion is missing its ExecutionContext",
+                    )
                 })?;
                 let function_ref = self.jit.declare_func_in_func(
                     self.runtime_ids["aster_rt_temporary_subregion_enter"],
@@ -345,6 +404,12 @@ impl Codegen {
             mir::Instruction::TemporarySubregionExit { .. } => {
                 self.leave_temporary_subregion(builder, state)?;
                 self.continue_if_runtime_ok(builder, state)
+            }
+            mir::Instruction::Retain { value } => {
+                self.translate_reference_count(builder, value, true, state)
+            }
+            mir::Instruction::Release { value } => {
+                self.translate_reference_count(builder, value, false, state)
             }
             mir::Instruction::Assign { target, value } => {
                 self.assign_rvalue(builder, target, value, state)
@@ -378,6 +443,9 @@ impl Codegen {
             ),
             call @ mir::Instruction::CallInterface { .. } => {
                 self.translate_interface_call(builder, call, state)
+            }
+            call @ mir::Instruction::CallVirtual { .. } => {
+                self.translate_virtual_call(builder, call, state)
             }
             mir::Instruction::CallIntrinsic {
                 destination,
@@ -625,10 +693,12 @@ impl Codegen {
         return_type: &mir::Type,
         state: &FunctionState,
     ) -> Result<(), BackendError> {
-        let id = *self
-            .foreign_ids
-            .get(&function)
-            .ok_or_else(|| BackendError::new("foreign call references an undeclared binding"))?;
+        let id = *self.foreign_ids.get(&function).ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_FOREIGN_ABI_INVALID,
+                "foreign call references an undeclared binding",
+            )
+        })?;
         let function_ref = self.jit.declare_func_in_func(id, builder.func);
         let mut values =
             Vec::with_capacity(arguments.len() + usize::from(*return_type != mir::Type::Void));
@@ -662,9 +732,12 @@ impl Codegen {
         builder.ins().brif(succeeded, success, &[], failure, &[]);
 
         builder.switch_to_block(failure);
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("foreign call is missing its ExecutionContext"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "foreign call is missing its ExecutionContext",
+            )
+        })?;
         let kind = builder.ins().iconst(types::I32, 0);
         let status = builder.ins().sextend(types::I64, status);
         let report = self
@@ -721,7 +794,10 @@ impl Codegen {
             .brif(invalid, invalid_block, &[], valid_block, &[]);
         builder.switch_to_block(invalid_block);
         let context = state.execution_context.ok_or_else(|| {
-            BackendError::new("foreign result validation is missing its ExecutionContext")
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "foreign result validation is missing its ExecutionContext",
+            )
         })?;
         let kind = builder.ins().iconst(types::I32, kind);
         let value = builder.ins().uextend(types::I64, value);
@@ -820,7 +896,10 @@ fn owned_active_instruction_positions(
                 }
                 mir::Instruction::OwnedRegionEnter { .. }
                 | mir::Instruction::OwnedRegionExit { .. } => {
-                    return Err(BackendError::new("malformed executable owned region"));
+                    return Err(BackendError::new(
+                        codes::BACKEND_SUBREGION_LOWERING_INVALID,
+                        "malformed executable owned region",
+                    ));
                 }
                 _ if active.is_some() => {
                     positions.insert((block.id, index));
@@ -830,6 +909,7 @@ fn owned_active_instruction_positions(
         }
         if active.is_some() {
             return Err(BackendError::new(
+                codes::BACKEND_SUBREGION_LOWERING_INVALID,
                 "executable owned region crosses a basic-block boundary",
             ));
         }
@@ -848,6 +928,7 @@ fn fine_active_instruction_positions(
     for (index, block) in function.blocks.iter().enumerate() {
         if blocks.insert(block.id, index).is_some() {
             return Err(BackendError::new(
+                codes::BACKEND_SUBREGION_LOWERING_INVALID,
                 "duplicate executable temporary-subregion block",
             ));
         }
@@ -864,6 +945,7 @@ fn fine_active_instruction_positions(
             mir::Terminator::Return(_) | mir::Terminator::End => Vec::new(),
             mir::Terminator::Unreachable => {
                 return Err(BackendError::new(
+                    codes::BACKEND_SUBREGION_LOWERING_INVALID,
                     "unreachable executable temporary subregion",
                 ));
             }
@@ -890,6 +972,7 @@ fn fine_active_instruction_positions(
             if let Some(previous) = state.insert(*successor, active) {
                 if previous != active {
                     return Err(BackendError::new(
+                        codes::BACKEND_SUBREGION_LOWERING_INVALID,
                         "inconsistent executable temporary-subregion state",
                     ));
                 }

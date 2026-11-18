@@ -40,6 +40,7 @@ import {
     sha256,
     validateArchiveEntries,
     verifyChecksum,
+    verifyRelocatableInstall,
 } from "./package-release.mjs";
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -555,9 +556,77 @@ test(
             });
             assert.equal(result.relocation.version, `aster ${canonicalVersion}`);
             assert.equal(result.relocation.runOutput, "40");
+            assert.equal(result.relocation.exitStatus, 40);
+            assert.ok(
+                result.relocation.hirOutputBytes > 1024 * 1024,
+                `expected dump-hir output > 1 MiB, got ${result.relocation.hirOutputBytes}`,
+            );
+            assert.ok(
+                result.relocation.mirOutputBytes > 1024 * 1024,
+                `expected dump-mir output > 1 MiB, got ${result.relocation.mirOutputBytes}`,
+            );
             assert.ok(statSync(result.archivePath).size > 0);
         } finally {
             rmSync(workspaceRoot, { recursive: true, force: true });
         }
     },
 );
+
+test(
+    "verifyRelocatableInstall checks large IR output, void Main stdout, and LANG-018 int Main exit status",
+    {
+        skip: hasCurrentReleaseBinary()
+            ? false
+            : "current release binary is absent; npm run bundle builds it before package:release",
+    },
+    () => {
+        const workspaceRoot = temporaryDirectory("verify-relocatable");
+        const distRoot = join(workspaceRoot, "dist");
+        try {
+            const bundle = buildBundle({
+                workspaceRoot: repositoryRoot,
+                distRoot,
+                version: canonicalVersion,
+                bundleTarget: currentTarget.bundleTarget,
+                binaryName: currentTarget.binaryName,
+            });
+            const verification = verifyRelocatableInstall({
+                extractedBundle: bundle.bundleDir,
+                version: canonicalVersion,
+                binaryName: currentTarget.binaryName,
+            });
+            assert.equal(verification.version, `aster ${canonicalVersion}`);
+            assert.equal(verification.runOutput, "40");
+            assert.equal(verification.exitStatus, 40);
+            assert.ok(verification.hirOutputBytes > 1024 * 1024);
+            assert.ok(verification.mirOutputBytes > 1024 * 1024);
+        } finally {
+            rmSync(workspaceRoot, { recursive: true, force: true });
+        }
+    },
+);
+
+test("verifyRelocatableInstall reports full process diagnostics on binary failure", () => {
+    const fake = createFakeBundle();
+    try {
+        assert.throws(
+            () =>
+                verifyRelocatableInstall({
+                    extractedBundle: fake.bundleDir,
+                    version: fake.version,
+                    binaryName: fake.binaryName,
+                }),
+            (err) => {
+                assert.match(err.message, /Relocated aster --version failed:/);
+                assert.match(err.message, /status=/);
+                assert.match(err.message, /signal=/);
+                assert.match(err.message, /error=/);
+                assert.match(err.message, /stdout=/);
+                assert.match(err.message, /stderr=/);
+                return true;
+            },
+        );
+    } finally {
+        rmSync(fake.workspaceRoot, { recursive: true, force: true });
+    }
+});

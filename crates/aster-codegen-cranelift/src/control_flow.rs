@@ -1,3 +1,5 @@
+use aster_diagnostics::codes;
+
 use super::{
     BackendError, Block, Codegen, FunctionBuilder, FunctionState, HashMap, InstBuilder, Module,
     TrapCode, is_aggregate, mir,
@@ -31,7 +33,10 @@ impl Codegen {
                 {
                     let source = self.translate_operand(builder, value, state)?;
                     let destination = state.hidden_return.ok_or_else(|| {
-                        BackendError::new("struct return is missing its hidden destination")
+                        BackendError::new(
+                            codes::BACKEND_MISSING_DESTINATION_OR_RESULT,
+                            "struct return is missing its hidden destination",
+                        )
                     })?;
                     self.copy_value(builder, &value.type_, source, destination)?;
                     self.leave_function(builder, state)?;
@@ -63,9 +68,12 @@ impl Codegen {
         builder: &mut FunctionBuilder<'_>,
         state: &FunctionState,
     ) -> Result<(), BackendError> {
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("Aster function is missing its ExecutionContext"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "Aster function is missing its ExecutionContext",
+            )
+        })?;
         if state.temporary_scope {
             let function_ref = self.jit.declare_func_in_func(
                 self.runtime_ids["aster_rt_temporary_scope_leave"],
@@ -88,7 +96,10 @@ impl Codegen {
         state: &FunctionState,
     ) -> Result<(), BackendError> {
         let context = state.execution_context.ok_or_else(|| {
-            BackendError::new("temporary subregion is missing its ExecutionContext")
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "temporary subregion is missing its ExecutionContext",
+            )
         })?;
         let function_ref = self.jit.declare_func_in_func(
             self.runtime_ids["aster_rt_temporary_subregion_exit"],
@@ -103,9 +114,12 @@ impl Codegen {
         builder: &mut FunctionBuilder<'_>,
         state: &FunctionState,
     ) -> Result<(), BackendError> {
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("owned region is missing its ExecutionContext"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "owned region is missing its ExecutionContext",
+            )
+        })?;
         let function_ref = self
             .jit
             .declare_func_in_func(self.runtime_ids["aster_rt_owned_region_exit"], builder.func);

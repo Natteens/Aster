@@ -75,8 +75,9 @@ a `switch` before compilation.
 
 ## 📍 Where `?` can appear
 
-`?` joins the postfix expression chain and binds tighter than arithmetic. It can appear anywhere the
-extracted payload is valid:
+`?` joins the postfix expression chain and binds tighter than arithmetic and `??` (so
+`p?.Bonus()? ?? 0` propagates `None` from `Bonus()` and `Read()? ?? 0` is parsed as `(Read()?) ?? 0`).
+It can appear anywhere the extracted payload is valid:
 
 ```aster
 int value = Read()?;
@@ -110,8 +111,7 @@ of suggesting an implicit conversion.
 There is no automatic `Option` ↔ `Result` conversion, customizable propagation trait/interface,
 automatic error conversion, or implicit fallback value.
 
-The ternary `?:` is a separate expression. `?.` and `??` are not propagation forms and are not part
-of the current language.
+The ternary `?:` is a separate expression. `?.` and `??` are not propagation forms.
 
 Generic functions may propagate official `Option` or `Result` values built from type parameters.
 Specialization substitutes those parameters before concrete HIR, MIR, layout, and backend execution,

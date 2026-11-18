@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
 
 /// Opaque per-await completion token, unique within one [`super::task_runtime::TaskRuntime`].
-pub(super) type CompletionToken = u64;
+pub type CompletionToken = u64;
 
 struct QueueState {
     tokens: VecDeque<CompletionToken>,
@@ -25,13 +25,19 @@ struct QueueState {
 /// a condition variable, with an explicit closed flag for shutdown. Shared
 /// across threads only as `Arc<CompletionQueue>`; workers get a clone solely
 /// to push, never any access to the `TaskRuntime` itself.
-pub(super) struct CompletionQueue {
+pub struct CompletionQueue {
     state: Mutex<QueueState>,
     ready: Condvar,
 }
 
+impl Default for CompletionQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CompletionQueue {
-    pub(super) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             state: Mutex::new(QueueState {
                 tokens: VecDeque::new(),
@@ -45,7 +51,7 @@ impl CompletionQueue {
     /// enqueued under the lock before the notify, so a pump about to block
     /// still observes it. Safe to call after `close`; the token is simply
     /// dropped once no pump can consume it.
-    pub(super) fn push(&self, token: CompletionToken) {
+    pub fn push(&self, token: CompletionToken) {
         let mut state = self
             .state
             .lock()
@@ -61,7 +67,7 @@ impl CompletionQueue {
     /// Block until a token is available or the queue is closed. Tolerant of
     /// spurious wakeups (re-checks the deque under the lock). Returns `None`
     /// only once the queue is closed and drained.
-    pub(super) fn pop(&self) -> Option<CompletionToken> {
+    pub fn pop(&self) -> Option<CompletionToken> {
         let mut state = self
             .state
             .lock()
@@ -82,7 +88,7 @@ impl CompletionQueue {
 
     /// Stop the queue and wake every blocked pump so it can observe the
     /// closure instead of blocking forever.
-    pub(super) fn close(&self) {
+    pub fn close(&self) {
         let mut state = self
             .state
             .lock()

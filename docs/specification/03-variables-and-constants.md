@@ -54,7 +54,7 @@ lives -= 1;
 var playerName = "Natte";
 playerName = "Aster";
 
-const float Pi = 3.14159;
+const double Pi = 3.14159;
 ```
 
 ## Invalid design examples

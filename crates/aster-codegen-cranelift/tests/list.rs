@@ -249,7 +249,7 @@ fn a_persistent_returned_list_grows_correctly() {
 }
 
 #[test]
-fn a_constructed_list_still_cannot_cross_a_worker_boundary_via_task_run() {
+fn a_constructed_list_crosses_a_worker_boundary_by_copy() {
     // Now that `new List<T>()` exists, this exercises the same fail-closed
     // `is_worker_transferable` gate (see
     // `aster-codegen-cranelift/tests/task_run.rs::a_list_return_type_is_rejected`)
@@ -258,12 +258,7 @@ fn a_constructed_list_still_cannot_cross_a_worker_boundary_via_task_run() {
         "public List<int> Make() { return new List<int>(); } \
          public int Main() { Task<List<int>> task = Task.Run(Make); return 0; }",
     );
-    assert!(
-        errors
-            .iter()
-            .any(|message| message.contains("cross a worker boundary")),
-        "expected the non-transferable-result diagnostic, got {errors:?}"
-    );
+    assert!(errors.is_empty(), "lists cross by copy, got {errors:?}");
 }
 
 #[test]
@@ -1098,17 +1093,12 @@ fn set_after_remove_at_checks_the_current_length() {
 }
 
 #[test]
-fn a_list_still_cannot_cross_a_worker_boundary_after_remove_at() {
+fn a_list_crosses_a_worker_boundary_by_copy_after_remove_at() {
     let errors = compile_errors(
         "public List<int> Make() { List<int> values = new List<int>(); values.Add(1); values.Add(2); values.RemoveAt(0); return values; } \
          public int Main() { Task<List<int>> task = Task.Run(Make); return 0; }",
     );
-    assert!(
-        errors
-            .iter()
-            .any(|message| message.contains("cross a worker boundary")),
-        "expected the non-transferable-result diagnostic, got {errors:?}"
-    );
+    assert!(errors.is_empty(), "lists cross by copy, got {errors:?}");
 }
 
 #[test]

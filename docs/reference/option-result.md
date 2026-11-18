@@ -20,10 +20,38 @@ Enum payload constructors use the ordinary named-argument rule, so a payload may
 | `Option<T>` | `Some(T value)` | `None` | `Option<U>` |
 | `Result<T, E>` | `Ok(T value)` | `Error(E error)` | `Result<U, E>` |
 
-## 🧩 `Option<T>`
+## 🧩 `Option<T>` and `T?`
 
-`Option<T>` is either `Some(T value)` or `None`. It does not introduce `null`: a class stored in
-`Some` is still a non-null class reference.
+`Option<T>` is either `Some(T value)` or `None`. `T?` is shorthand for `aster.core.Option<T>` and can
+be used without `using aster.core;` (`void?` is rejected; `T??` is `Option<Option<T>>`). Non-optional
+classes, strings, arrays, collections, and interfaces remain strictly non-null; `null` only inhabits
+explicit optional types `T?` / `Option<T>`.
+
+- **Target-typed `null`**: `null` produces `Option<T>.None` when an optional target type is known
+  (initialization, assignment, `return`, call arguments, ternary/array branches, `(T?)null`, or
+  `x == null` / `x != null`). `var x = null;` and `null == null` are rejected.
+- **Implicit wrapping**: any `T` implicitly converts to `Option<T>.Some(value)` (`T?`), while exact
+  `T` matches retain overload priority over `T?`. `Option<T>` does not implicitly unwrap to `T`.
+- **Null checks without flow narrowing**: `x == null` and `x != null` test the `None` discriminant.
+  They do **not** narrow `x`'s static type in `if (x != null)` — unwrap explicitly with `??`, `?.`,
+  `?`, or `switch`.
+- **Null-coalescing `??`**: short-circuiting and right-associative (`a ?? b ?? c`). Evaluates `a`
+  once; `T? ?? T` yields `T`, while `T? ?? T?` yields `T?`.
+- **Null-conditional `?.`**: short-circuiting (`a?.Member`, `a?.Call()`, chaining `a?.B?.C`). Evaluates
+  `a` once; if `Some`, accesses the member and lifts `V` to `V?` (flattening `Option<V>` to `V?`, so
+  `a?.Maybe()?.Next` stays one `Option` layer). Accessing a `void` method via `?.` (`a?.Reset();`)
+  is allowed only as a statement. `?.` results cannot be assigned to or incremented.
+- **Null-pointer niche layout**: `Option<Class>`, `Option<string>`, `Option<T[]>`, `Option<List<T>>`,
+  and `Option<Dictionary<K, V>>` use a single pointer-width word (8 bytes on 64-bit, `0` = `None`,
+  non-null pointer = `Some`). Nested `Option<Option<Class>>` (`Class??`) and `Option<Interface>` keep
+  tagged enum layouts so `None` and `Some(None)` never collide and fat interface pointers stay intact.
+
+```aster
+string? name = null;
+int? length = name?.Length;        // None (flattens nested Option<T> automatically)
+int finalLen = length ?? 0;        // 0; RHS only runs on None
+int? wrapped = 42;                 // implicit T -> T?
+```
 
 Use an exhaustive `switch` when both cases need different behavior:
 

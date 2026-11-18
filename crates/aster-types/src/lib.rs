@@ -128,6 +128,16 @@ impl Primitive {
         self.is_backend_executable() && self.bit_width().is_some()
     }
 
+    /// Whether one value of this primitive can cross a worker boundary by
+    /// deep copy (CONC-005 transfer): everything [`Self::is_worker_transferable`]
+    /// accepts plus `string`, whose bytes are serialized in the source domain
+    /// and materialized again in the destination domain. `decimal` still has no
+    /// runtime representation and stays excluded.
+    #[must_use]
+    pub const fn is_copy_transferable(self) -> bool {
+        self.is_worker_transferable() || matches!(self, Self::String)
+    }
+
     /// Inclusive mathematical range of an integer primitive.
     #[must_use]
     pub const fn integer_range(self) -> Option<(i128, i128)> {
@@ -314,6 +324,14 @@ mod tests {
     fn string_executes_but_is_not_worker_transferable() {
         assert!(Primitive::String.is_backend_executable());
         assert!(!Primitive::String.is_worker_transferable());
+    }
+
+    #[test]
+    fn copy_transfer_adds_string_but_never_decimal() {
+        assert!(Primitive::String.is_copy_transferable());
+        assert!(Primitive::Int.is_copy_transferable());
+        assert!(Primitive::Double.is_copy_transferable());
+        assert!(!Primitive::Decimal.is_copy_transferable());
     }
 
     #[test]

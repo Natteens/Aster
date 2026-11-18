@@ -81,6 +81,6 @@ Message message = Message.Move(10);
 
 ## Current limits
 
-Nested patterns, guards, general pattern matching, numeric discriminants, flags, enum casts, enum methods,
+Nested patterns, general pattern matching, numeric discriminants, flags, enum casts, enum methods,
 and implicit default values are not implemented. Nested structural patterns may be reconsidered
 after exhaustiveness diagnostics can remain equally precise.

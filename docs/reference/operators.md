@@ -97,7 +97,19 @@ C# accepts the commented line. This keeps one rule for every compound operator.
 2. Compound assignment never narrows implicitly (above).
 
 Masks and flags can be written as hexadecimal (`0xFF`) or binary (`0b1010`) literals; see the
-[type specification](../specification/02-types.md#hexadecimal-and-binary-integer-literals). An
+[type specification](../specification/02-types.md#hexadecimal-and-binary-integer-literals).
+
+## Null-handling operators (`??`, `?.`, `== null`, `!= null`)
+
+Optional values `T?` / `aster.core.Option<T>` support:
+
+| Operator | Precedence & associativity | Semantics |
+| --- | --- | --- |
+| `a?.M` / `a?.Call()` | Postfix chain | Short-circuits on `None` to `None`, lifts/flattens to `U?` (or statement-only `void`) |
+| `a ?? b` | Right-associative between `?:` and `\|\|` | Evaluates `a` once; evaluates `b` only on `None` (`T? ?? T -> T`, `T? ?? T? -> T?`) |
+| `a == null`, `a != null` | Equality | Tests `None` discriminant without flow narrowing |
+
+See [Option and Result](option-result.md) for the full nullable model. An
 unsuffixed literal above `int` is a `uint`, `long`, or `ulong`, so combine it with a matching operand:
 `flags |= 0xFFU;` for a `uint` and `0xFFFFFFFFFFFFFFFF ^ 0xFFUL` for a `ulong`, because an `int`
 operand does not join a `ulong`.

@@ -2,9 +2,9 @@ use aster_diagnostics::Span;
 use aster_syntax::{
     Accessor, Argument, AssignmentOperator, BinaryOperator, Block, EnumCase, EnumDeclaration,
     Expression, ExpressionKind, Field, FieldInitializer, FunctionDeclaration, IncrementOperator,
-    Item, Literal, Member, Module, NamespaceDeclaration, Parameter, Property, Statement,
-    SwitchCase, TypeDeclaration, TypeParameter, TypeRef, UnaryOperator, UsingDeclaration,
-    VariableDeclaration, VariableKind, Visibility,
+    Item, Literal, Member, MemberDispatch, Module, NamespaceDeclaration, Parameter, Property,
+    Statement, SwitchCase, TypeDeclaration, TypeParameter, TypeRef, UnaryOperator,
+    UsingDeclaration, VariableDeclaration, VariableKind, Visibility,
     visit::{
         AstVisitorMut, walk_enum_declaration_mut, walk_expression_mut,
         walk_function_declaration_mut, walk_item_mut, walk_switch_case_mut,
@@ -204,6 +204,8 @@ fn fixture() -> Module {
                     enum_name: Some("Choice<T>".to_owned()),
                     case_name: "Some".to_owned(),
                     bindings: vec!["binding".to_owned()],
+                    label: None,
+                    guard: None,
                     body: nested_block(46),
                     span: span(48),
                 }],
@@ -220,6 +222,8 @@ fn fixture() -> Module {
         span: span(56),
     };
     let function = FunctionDeclaration {
+        base_call: None,
+        dispatch: MemberDispatch::None,
         constructor: false,
         is_test: false,
         is_static: false,
@@ -243,24 +247,29 @@ fn fixture() -> Module {
         span: span(61),
     };
     let property = Property {
+        dispatch: MemberDispatch::None,
         visibility: Visibility::Public,
         type_ref: type_ref("Property<T>", 62),
         name: "Current".to_owned(),
         getter: Some(Accessor {
             visibility: Visibility::Public,
             explicit_visibility: false,
+            is_init: false,
             body: nested_block(63),
             span: span(65),
         }),
         setter: Some(Accessor {
             visibility: Visibility::Private,
             explicit_visibility: true,
+            is_init: false,
             body: nested_block(66),
             span: span(68),
         }),
         span: span(69),
     };
     let class = TypeDeclaration {
+        is_abstract: false,
+        is_sealed: false,
         visibility: Visibility::Public,
         is_static: false,
         name: "Container".to_owned(),
@@ -282,6 +291,8 @@ fn fixture() -> Module {
                 span: span(74),
             }),
             Member::Method(FunctionDeclaration {
+                base_call: None,
+                dispatch: MemberDispatch::None,
                 constructor: true,
                 is_test: false,
                 is_static: false,
@@ -317,6 +328,8 @@ fn fixture() -> Module {
         items: vec![
             Item::Class(class),
             Item::Struct(TypeDeclaration {
+                is_abstract: false,
+                is_sealed: false,
                 visibility: Visibility::Internal,
                 is_static: false,
                 name: "Record".to_owned(),
@@ -332,12 +345,16 @@ fn fixture() -> Module {
                 span: span(84),
             }),
             Item::Interface(TypeDeclaration {
+                is_abstract: false,
+                is_sealed: false,
                 visibility: Visibility::Public,
                 is_static: false,
                 name: "Contract".to_owned(),
                 type_parameters: Vec::new(),
                 interfaces: Vec::new(),
                 members: vec![Member::Method(FunctionDeclaration {
+                    base_call: None,
+                    dispatch: MemberDispatch::None,
                     body: None,
                     ..function.clone()
                 })],
@@ -534,6 +551,8 @@ fn traversal_reaches_defaults_named_values_target_new_and_inferred_foreach() {
         namespace: None,
         usings: Vec::new(),
         items: vec![Item::Function(FunctionDeclaration {
+            base_call: None,
+            dispatch: MemberDispatch::None,
             constructor: false,
             is_test: false,
             is_static: false,

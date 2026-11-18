@@ -82,12 +82,23 @@ fn object_fields(function: &mir::Function) -> usize {
         match &value.kind {
             mir::RvalueKind::Use(operand)
             | mir::RvalueKind::Discriminant(operand)
+            | mir::RvalueKind::ClassTest {
+                object: operand, ..
+            }
+            | mir::RvalueKind::InterfaceTest {
+                object: operand, ..
+            }
+            | mir::RvalueKind::InterfaceLookup {
+                object: operand, ..
+            }
             | mir::RvalueKind::ArrayLength(operand)
             | mir::RvalueKind::ListLength(operand)
             | mir::RvalueKind::DictionaryLength(operand)
             | mir::RvalueKind::ListVersion(operand)
             | mir::RvalueKind::StringByteLength(operand)
             | mir::RvalueKind::Cast(operand)
+            | mir::RvalueKind::Upcast(operand)
+            | mir::RvalueKind::Downcast(operand)
             | mir::RvalueKind::Unary { operand, .. } => operand_has_object_field(operand),
             mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
                 fields

@@ -646,10 +646,12 @@ fn constant_overflow_is_a_compile_time_diagnostic() {
 }
 
 #[test]
-fn compound_remainder_assignment_is_not_part_of_the_language_yet() {
-    // `docs/specification/04-expressions.md` lists `%=` only as proposed.
+fn compound_remainder_assignment_follows_the_compound_assignment_rules() {
+    // LANG-017 added `%=`; it types like `+=` and the binary `%`.
+    compile_valid("public int R(int a, int b) { a %= b; return a; }");
+    compile_valid("public double R(double a, double b) { a %= b; return a; }");
     assert_eq!(
-        diagnostics("public int R(int a, int b) { a %= b; return a; }").len(),
+        diagnostics("public int R(int a, long b) { a %= b; return a; }").len(),
         1
     );
 }

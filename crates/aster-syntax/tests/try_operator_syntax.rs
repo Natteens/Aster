@@ -161,11 +161,16 @@ fn disambiguation_is_whitespace_independent() {
 }
 
 #[test]
-fn null_conditional_is_a_controlled_syntax_error() {
-    assert!(parse(lex("public int F() { return fetch()?.length; }").expect("lex")).is_err());
-}
+fn try_precedes_null_coalesce_and_null_conditional_parses() {
+    let conditional = first_return("public int F() { return fetch()?.length; }");
+    assert!(matches!(
+        conditional.kind,
+        ExpressionKind::NullConditional { .. }
+    ));
 
-#[test]
-fn null_coalescing_is_a_controlled_syntax_error() {
-    assert!(parse(lex("public int F() { return fetch() ?? other; }").expect("lex")).is_err());
+    let coalesce = first_return("public int F() { return fetch()? ?? other; }");
+    let ExpressionKind::NullCoalesce { value, .. } = &coalesce.kind else {
+        panic!("expected null-coalesce")
+    };
+    assert!(matches!(value.kind, ExpressionKind::Try { .. }));
 }

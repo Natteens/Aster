@@ -822,7 +822,9 @@ fn malformed_dictionary_mir_is_rejected_before_jit() {
 }
 
 #[test]
-fn dictionary_cannot_cross_workers_but_local_worker_use_is_allowed() {
+fn dictionaries_cross_task_run_by_copy() {
+    // CONC-005: dictionaries (and lists/dictionaries of them) are copied
+    // across the worker boundary as Task.Run results.
     for source in [
         r#"using aster.core;
             public Dictionary<string, int> Work() { return new Dictionary<string, int>(); }
@@ -844,6 +846,17 @@ fn dictionary_cannot_cross_workers_but_local_worker_use_is_allowed() {
         r#"using aster.core;
             public Dictionary<string, List<int>> Work() { return new Dictionary<string, List<int>>(); }
             public int Main() { Task<Dictionary<string, List<int>>> task = Task.Run(Work); return 0; }"#,
+    ] {
+        assert!(
+            compile(source).is_ok(),
+            "Task.Run results of dictionaries must compile: {source}"
+        );
+    }
+}
+
+#[test]
+fn dictionary_parallel_and_async_boundaries_stay_rejected_but_local_worker_use_is_allowed() {
+    for source in [
         r#"public void Body(Dictionary<string, int> value) {}
             public int Main() {
                 Dictionary<string, int>[] values = new Dictionary<string, int>[0];

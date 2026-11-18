@@ -54,6 +54,13 @@ public enum Outcome
 - These type declarations have no automatic ECS, lifecycle, serialization, or engine behavior.
 - `static class` declares a non-instantiable container whose members must all be static methods.
   It cannot declare fields, constructors, properties, interfaces, or instance methods.
+- Classes and structs may declare auto-properties: `T Name { get; set; }`, `{ get; }`,
+  `{ get; init; }`, `{ get; private set; }`, optionally followed by `= initializer;` (classes only).
+  Each introduces a private backing field that source cannot name and trivial accessors over it. A
+  `get`-only property is assignable only in a constructor of its declaring class; an `init`
+  property only while the object is under construction. A statically bound auto-property is a
+  direct field access; a `virtual`/`override` one dispatches through its accessors. Static
+  auto-properties are not supported yet. See [classes](../reference/classes.md).
 
 ```aster
 public static class NumberTools

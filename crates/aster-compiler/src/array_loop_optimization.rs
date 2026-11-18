@@ -360,12 +360,23 @@ fn rvalue_has_matching_index(
     match &value.kind {
         mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Discriminant(operand)
+        | mir::RvalueKind::ClassTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceLookup {
+            object: operand, ..
+        }
         | mir::RvalueKind::ArrayLength(operand)
         | mir::RvalueKind::ListLength(operand)
         | mir::RvalueKind::DictionaryLength(operand)
         | mir::RvalueKind::ListVersion(operand)
         | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
+        | mir::RvalueKind::Downcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => {
             operand_has_matching_index(operand, array, index)
         }
@@ -437,12 +448,23 @@ fn mark_rvalue(
     match &mut value.kind {
         mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Discriminant(operand)
+        | mir::RvalueKind::ClassTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceLookup {
+            object: operand, ..
+        }
         | mir::RvalueKind::ArrayLength(operand)
         | mir::RvalueKind::ListLength(operand)
         | mir::RvalueKind::DictionaryLength(operand)
         | mir::RvalueKind::ListVersion(operand)
         | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
+        | mir::RvalueKind::Downcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => mark_operand(operand, array, index, header),
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             for field in fields {

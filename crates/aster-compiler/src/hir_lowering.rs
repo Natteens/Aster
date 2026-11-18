@@ -26,6 +26,10 @@ struct Lowerer<'a> {
     scopes: Vec<HashMap<String, hir::SymbolId>>,
     types: HashMap<String, hir::SymbolId>,
     class_types: HashSet<hir::SymbolId>,
+    /// Direct base class of every derived class, resolved from the first name
+    /// after `:` when it names a class. Semantic analysis already proved the
+    /// hierarchy acyclic.
+    class_bases: HashMap<hir::SymbolId, hir::SymbolId>,
     interface_types: HashSet<hir::SymbolId>,
     enum_types: HashSet<hir::SymbolId>,
     enum_cases: HashMap<(String, usize), (hir::SymbolId, Vec<hir::SymbolId>)>,
@@ -50,6 +54,16 @@ struct Lowerer<'a> {
     constant_values: HashMap<hir::SymbolId, ConstValue>,
     model_context: String,
     string_builder: Option<StringBuilderSymbols>,
+    option_meta: HashMap<hir::SymbolId, OptionMeta>,
+    null_conditional_receivers: Vec<hir::SymbolId>,
+}
+
+#[derive(Clone)]
+pub(super) struct OptionMeta {
+    pub(super) some_case: hir::SymbolId,
+    pub(super) some_tag: u32,
+    pub(super) some_field: hir::SymbolId,
+    pub(super) inner_type: hir::Type,
 }
 
 #[derive(Clone, Copy)]
@@ -71,6 +85,7 @@ impl<'a> Lowerer<'a> {
             scopes: Vec::new(),
             types: HashMap::new(),
             class_types: HashSet::new(),
+            class_bases: HashMap::new(),
             interface_types: HashSet::new(),
             enum_types: HashSet::new(),
             enum_cases: HashMap::new(),
@@ -88,6 +103,8 @@ impl<'a> Lowerer<'a> {
             constant_values: HashMap::new(),
             model_context: String::new(),
             string_builder: None,
+            option_meta: HashMap::new(),
+            null_conditional_receivers: Vec::new(),
         };
         lowerer.predeclare(module);
         lowerer.string_builder = lowerer
@@ -95,6 +112,58 @@ impl<'a> Lowerer<'a> {
             .get(crate::standard_library::STRING_BUILDER_NAME)
             .map(|class| StringBuilderSymbols { class: *class });
         lowerer
+    }
+
+    pub(super) fn convert_to(
+        &self,
+        expression: hir::Expression,
+        target: &hir::Type,
+    ) -> hir::Expression {
+        if &expression.type_ == target
+            || expression.type_ == hir::Type::Unknown
+            || *target == hir::Type::Unknown
+        {
+            return expression;
+        }
+        if let hir::Type::Enum(option_symbol) = target
+            && let Some(meta) = self.option_meta.get(option_symbol)
+        {
+            let value = self.convert_to(expression, &meta.inner_type);
+            return hir::Expression {
+                type_: target.clone(),
+                kind: hir::ExpressionKind::EnumValue {
+                    enum_symbol: *option_symbol,
+                    case: meta.some_case,
+                    tag: meta.some_tag,
+                    fields: vec![hir::FieldValue {
+                        field: meta.some_field,
+                        value,
+                    }],
+                },
+            };
+        }
+        types::convert(expression, target)
+    }
+
+    pub(super) fn convert_expression(
+        &mut self,
+        expression: &ast::Expression,
+        target: &hir::Type,
+    ) -> hir::Expression {
+        let value = self.expression(expression);
+        self.convert_to(value, target)
+    }
+
+    pub(super) fn option_depth(&self, type_: &hir::Type) -> usize {
+        let mut depth = 0;
+        let mut current = type_;
+        while let hir::Type::Enum(symbol) = current
+            && let Some(meta) = self.option_meta.get(symbol)
+        {
+            depth += 1;
+            current = &meta.inner_type;
+        }
+        depth
     }
 
     fn module(mut self, module: &ast::Module) -> hir::Module {

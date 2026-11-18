@@ -5,6 +5,9 @@
 
 use std::fmt;
 
+pub mod ownership;
+pub mod validate;
+
 pub use aster_hir::{
     DictionaryEntryLayout, DictionaryOptionLayout, FileIoResultLayout, SymbolId, Type, Visibility,
 };
@@ -105,7 +108,39 @@ pub struct StructDefinition {
 pub struct ClassDefinition {
     pub symbol: SymbolId,
     pub name: String,
+    /// The direct base class, if any (single inheritance). Derived objects
+    /// start with the complete base object: inherited fields keep the offsets
+    /// they have in the base.
+    pub base: Option<SymbolId>,
+    /// An abstract class has a layout and a descriptor but is never allocated.
+    pub is_abstract: bool,
+    /// No class may name a sealed class as its base.
+    pub is_sealed: bool,
+    /// The fields this class declares itself; inherited fields belong to the
+    /// base chain's definitions.
     pub fields: Vec<FieldDefinition>,
+    /// The complete virtual table (object model B1, section 4.2): the base
+    /// class's slots in order, with overridden implementations replaced,
+    /// followed by the slots this class introduces. Empty for a class with no
+    /// virtual member anywhere in its chain.
+    pub vtable: Vec<VirtualSlot>,
+}
+
+/// One virtual dispatch slot. The slot index is the same in every class that
+/// inherits it, and the signature is fixed by the class that introduced it:
+/// overrides match it exactly (B1 U8).
+#[derive(Clone, Debug, PartialEq)]
+pub struct VirtualSlot {
+    /// Symbol of the method that introduced the slot: the identity of the slot
+    /// across the hierarchy. For an abstract slot it names no function body.
+    pub method: SymbolId,
+    pub name: String,
+    /// Parameter types without the receiver.
+    pub parameters: Vec<Type>,
+    pub return_type: Type,
+    /// The function a call through this class runs; `None` for an abstract
+    /// slot, which only an abstract class may leave unimplemented.
+    pub implementation: Option<SymbolId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -250,6 +285,21 @@ pub enum Instruction {
         destination: Option<Place>,
         receiver: Operand,
         method: SymbolId,
+        arguments: Vec<Operand>,
+        return_type: Type,
+    },
+    /// Virtual call through the dynamic class descriptor of `receiver` (object
+    /// model B1): load the descriptor from the object header, the function at
+    /// `slot` of its virtual table, and call it with `receiver` first. The
+    /// receiver's static type is a class whose `vtable[slot]` was introduced by
+    /// `method`; validation rejects any other pairing, and the slot index is a
+    /// compile-time constant below that table's length.
+    CallVirtual {
+        destination: Option<Place>,
+        receiver: Operand,
+        /// The method that introduced the slot (see [`VirtualSlot::method`]).
+        method: SymbolId,
+        slot: u32,
         arguments: Vec<Operand>,
         return_type: Type,
     },
@@ -424,6 +474,17 @@ pub enum Instruction {
         char_destination: Place,
         next_cursor_destination: Place,
         ok_destination: Place,
+    },
+    /// MEM-EXP-1 (C5/C6): add one strong count to `value`'s object word.
+    /// `value` is a class or interface operand. Inserted only by the
+    /// ownership pass ([`ownership`]); never produced by lowering.
+    Retain {
+        value: Operand,
+    },
+    /// MEM-EXP-1 (C5/C6): drop one strong count from `value`'s object word,
+    /// releasing every object whose count reaches zero. Runs no user code.
+    Release {
+        value: Operand,
     },
 }
 
@@ -608,6 +669,18 @@ pub enum Intrinsic {
     ConsoleReadLine,
     /// Temporary-arena counterpart of [`Self::ConsoleReadLine`].
     ConsoleReadLineTemporary,
+    /// `aster.io.WriteError(string)`: writes the argument's UTF-8 bytes to the
+    /// standard error stream of the console backend and flushes. Argument:
+    /// `[value]`; `return_type` always `void`.
+    ConsoleWriteError,
+    /// Internal `Environment.GetVariable` helper: `[name]` -> `bool`, whether
+    /// the process environment defines `name`.
+    EnvironmentHasVariable,
+    /// Internal `Environment.GetVariable` helper: `[name]` -> `string`, the
+    /// variable's value (empty when absent or not valid Unicode-lossy text).
+    EnvironmentGetVariable,
+    /// Temporary-arena counterpart of [`Self::EnvironmentGetVariable`].
+    EnvironmentGetVariableTemporary,
     /// `aster.io.ReadAllText(string)`: reads an entire file via the host
     /// filesystem backend into a freshly allocated persistent
     /// `Result<string, IOError>`. Argument: `[path]` (a `string`, only ever
@@ -667,6 +740,7 @@ impl Intrinsic {
             | Self::StringReplace
             | Self::StringSplit
             | Self::ConsoleReadLine
+            | Self::EnvironmentGetVariable
             | Self::FileReadAllText(_)
             | Self::FileListDirectories(_)
             | Self::ListGetRange => Some(AllocationRegion::Persistent),
@@ -691,6 +765,7 @@ impl Intrinsic {
             | Self::StringReplaceTemporary
             | Self::StringSplitTemporary
             | Self::ConsoleReadLineTemporary
+            | Self::EnvironmentGetVariableTemporary
             | Self::FileReadAllTextTemporary(_)
             | Self::FileListDirectoriesTemporary(_)
             | Self::ListGetRangeTemporary => Some(AllocationRegion::Temporary),
@@ -761,6 +836,8 @@ impl Intrinsic {
             | Self::StringTryParseDouble
             | Self::ConsoleWrite
             | Self::ConsoleWriteLine
+            | Self::ConsoleWriteError
+            | Self::EnvironmentHasVariable
             | Self::FileWriteAllText(_)
             | Self::FileAppendAllText(_)
             | Self::FileExists(_)
@@ -946,6 +1023,14 @@ impl Intrinsic {
                 AllocationRegion::Temporary,
             ) => Self::ConsoleReadLineTemporary,
             (
+                Self::EnvironmentGetVariable | Self::EnvironmentGetVariableTemporary,
+                AllocationRegion::Persistent,
+            ) => Self::EnvironmentGetVariable,
+            (
+                Self::EnvironmentGetVariable | Self::EnvironmentGetVariableTemporary,
+                AllocationRegion::Temporary,
+            ) => Self::EnvironmentGetVariableTemporary,
+            (
                 Self::FileReadAllText(layout) | Self::FileReadAllTextTemporary(layout),
                 AllocationRegion::Persistent,
             ) => Self::FileReadAllText(layout),
@@ -1089,9 +1174,43 @@ pub enum RvalueKind {
     StringByteLength(Operand),
     /// Convert the operand to this rvalue's type.
     Cast(Operand),
+    /// Identity-preserving class upcast: the operand's class derives from this
+    /// rvalue's class and the result is the same object pointer. Validation
+    /// rejects any pair that is not a declared base chain.
+    Upcast(Operand),
+    /// Identity-preserving class narrowing that backs the binding of a class
+    /// type pattern: the result is the same object pointer, statically typed
+    /// as a class related to the operand's class (derived, equal or base), or
+    /// the object half of an interface-typed operand. It performs no check
+    /// and is only produced for a binding that is read where a dominating
+    /// `ClassTest` proved the test succeeded.
+    Downcast(Operand),
+    /// Run-time class test of a class reference: `true` when the object's
+    /// class is `class` or derives from it. The result type is `bool`.
+    ClassTest {
+        object: Operand,
+        class: SymbolId,
+    },
     MakeInterface {
         object: Operand,
         class: SymbolId,
+        interface: SymbolId,
+    },
+    /// Run-time interface test (object model B1, sections 4.5 and 7): `true`
+    /// when the class descriptor of `object` lists `interface`. `object` is a
+    /// class reference or an interface value (its object half is tested). The
+    /// search is bounded by the descriptor's interface count. The result type
+    /// is `bool`.
+    InterfaceTest {
+        object: Operand,
+        interface: SymbolId,
+    },
+    /// Dynamic class-to-interface conversion: an interface value made of the
+    /// object and the table found by searching the descriptor's interface
+    /// list for `interface`. A search that finds nothing records a controlled
+    /// run-time error. The result type is `Interface(interface)`.
+    InterfaceLookup {
+        object: Operand,
         interface: SymbolId,
     },
     Unary {
@@ -1213,6 +1332,62 @@ pub fn type_key(type_: &Type) -> u64 {
     }
 
     walk(type_, FNV_OFFSET)
+}
+
+/// Source spelling of a MIR type category, for diagnostics.
+#[must_use]
+pub fn type_name(type_: &Type) -> &'static str {
+    primitive(type_).map_or_else(
+        || match type_ {
+            Type::Void => "void",
+            Type::User(_) => "user type",
+            Type::Class(_) => "class",
+            Type::Interface(_) => "interface",
+            Type::Enum(_) => "enum",
+            Type::Array(_) => "array",
+            Type::Task(_) => "task",
+            Type::List(_) => "list",
+            Type::Dictionary(_, _) => "dictionary",
+            Type::Unknown => "unknown",
+            _ => unreachable!("every primitive MIR type has an aster-types adapter"),
+        },
+        aster_types::Primitive::name,
+    )
+}
+
+/// The single adapter between MIR's resolved type representation and the
+/// backend-neutral primitive model. Backend representation choices stay in
+/// each backend.
+#[must_use]
+pub fn primitive(type_: &Type) -> Option<aster_types::Primitive> {
+    Some(match type_ {
+        Type::Bool => aster_types::Primitive::Bool,
+        Type::Char => aster_types::Primitive::Char,
+        Type::SByte => aster_types::Primitive::SByte,
+        Type::Byte => aster_types::Primitive::Byte,
+        Type::Short => aster_types::Primitive::Short,
+        Type::UShort => aster_types::Primitive::UShort,
+        Type::Int => aster_types::Primitive::Int,
+        Type::UInt => aster_types::Primitive::UInt,
+        Type::Long => aster_types::Primitive::Long,
+        Type::ULong => aster_types::Primitive::ULong,
+        Type::Float => aster_types::Primitive::Float,
+        Type::Double => aster_types::Primitive::Double,
+        Type::Decimal => aster_types::Primitive::Decimal,
+        Type::String => aster_types::Primitive::String,
+        Type::Void
+        | Type::User(_)
+        | Type::Class(_)
+        | Type::Interface(_)
+        | Type::Enum(_)
+        | Type::Array(_)
+        | Type::Task(_)
+        | Type::List(_)
+        | Type::Dictionary(_, _)
+        | Type::Unknown => {
+            return None;
+        }
+    })
 }
 
 #[cfg(test)]

@@ -1193,6 +1193,9 @@ fn list_paths(
     if array.is_null() {
         return;
     }
+    // Every element is a fresh owned string stored below: the array owns them.
+    #[cfg(feature = "mem-exp-rc")]
+    ExecutionContext::set_string_array_descriptor(array);
     for (index, path) in paths.iter().enumerate() {
         let string = if temporary {
             context.allocate_temporary_string_parts(&[path])

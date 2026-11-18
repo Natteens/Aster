@@ -218,7 +218,8 @@ fn decimal_and_floating_point_lexing_is_unchanged() {
     assert_eq!(literal("007"), int("007"));
     assert_eq!(literal("10U"), uint("10"));
     assert_eq!(literal("10L"), long("10"));
-    assert_eq!(literal("0.5"), TokenKind::FloatLiteral("0.5".into()));
+    assert_eq!(literal("0.5"), TokenKind::DoubleLiteral("0.5".into()));
+    assert_eq!(literal("0.5f"), TokenKind::FloatLiteral("0.5".into()));
     assert_eq!(literal("1.5d"), TokenKind::DoubleLiteral("1.5".into()));
     assert_eq!(literal("2f"), TokenKind::FloatLiteral("2".into()));
     assert_eq!(literal("0f"), TokenKind::FloatLiteral("0".into()));

@@ -555,14 +555,8 @@ fn a_constructed_option_still_cannot_cross_a_worker_boundary_via_task_run() {
     let source = "using aster.core;\n\
         public Option<int> Make() { return \"1\".TryParseInt(); }\n\
         public int Main() { Task<Option<int>> task = Task.Run(Make); return 0; }";
-    let errors = match run(source, "Main") {
-        Err(message) => message,
-        Ok(value) => panic!("expected a compile error, got {value:?}"),
-    };
-    assert!(
-        errors.contains("cross a worker boundary"),
-        "expected the non-transferable-result diagnostic, got {errors}"
-    );
+    // An enum of scalars now crosses the worker boundary by copy (CONC-005).
+    assert_eq!(run(source, "Main"), Ok(ExecutionValue::Int(0)));
 }
 
 // --- Section 19.17-21: adulterated MIR must never reach the JIT -----------

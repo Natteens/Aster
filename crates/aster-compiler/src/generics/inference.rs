@@ -33,6 +33,7 @@ fn infer_type_name(
             if previous != &concrete {
                 diagnostics.push(
                     Diagnostic::error(
+                        super::codes::GENERIC_CONFLICTING_INFERENCE,
                         format!(
                             "conflicting inference for `{}`: `{previous}` and `{concrete}`",
                             pattern.base
@@ -61,6 +62,7 @@ fn infer_type_name(
             if previous != &concrete {
                 diagnostics.push(
                     Diagnostic::error(
+                        super::codes::GENERIC_CONFLICTING_INFERENCE,
                         format!(
                             "conflicting inference for `{}`: `{previous}` and `{concrete}`",
                             pattern.base
@@ -104,6 +106,7 @@ pub(super) fn literal_type(value: &Literal) -> String {
         Literal::String(_) => "string",
         Literal::Character(_) => "char",
         Literal::Boolean(_) => "bool",
+        Literal::Null => "",
     }
     .to_owned()
 }

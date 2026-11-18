@@ -76,13 +76,13 @@ Build-profile filtering and its manifest schema remain `PROPOSED`; see `12-loggi
 - `aster.core` exposes ordinary generic enums `Option<T>` and `Result<T, E>` without implicit
   logging, exceptions, unwrapping, or `null`.
 
-### Enums and switch â€” ACCEPTED
+### Enums and switch — ACCEPTED
 
 - An enum is a value type whose comma-separated cases may carry typed payloads.
 - Enum construction names the enum and case; there is no implicit integer representation in source.
 - `switch` matches enum cases, evaluates its input once, has no fallthrough, and must be exhaustive
   or contain `default`.
-- Restricted enum switch expressions are accepted. General pattern matching, guards, and explicit
+- Restricted enum switch expressions and `when` guards are accepted. General pattern matching and explicit
   discriminants are not accepted.
 
 ### ECS direction — ACCEPTED
@@ -124,7 +124,6 @@ The detailed active proposals are:
 - Logging formatting, sinks, and failures: `12-logging.md`.
 - Runtime linkage and boundaries between product layers: `14-platform-boundaries.md`.
 - Visibility package boundaries and the extension model behind `protected`: `15-visibility.md`.
-- Program entry-point selection: `05-functions.md`.
 
 Each indexed proposal is `PROPOSED`, not `ACCEPTED`, and contains alternatives, tradeoffs,
 and a recommendation. Earlier chapter-level open-question lists remain discovery backlogs; they

@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use aster_diagnostics::{Diagnostic, Span};
+use aster_diagnostics::{Diagnostic, Span, codes};
 use aster_syntax::{Block, FunctionDeclaration, Item, Member, Module, TypeDeclaration};
 
 use super::{CallableKey, Context, Dispatch, Model, callable_key};
@@ -136,6 +136,7 @@ pub(super) fn validate(
         ) {
             diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_CONC_ASYNC_PARALLEL_CALL,
                     format!(
                         "async function `{}` transitively calls `{}`, which uses {}",
                         fact.name, reachable.offender, reachable.reason
@@ -217,6 +218,7 @@ fn check_target(
     if let Some(reason) = direct_reason(target, facts, model) {
         diagnostics.push(
             Diagnostic::error(
+                codes::SEM_CONC_NESTED_TARGET_DIRECT,
                 format!("`{operation}` target `{target_name}` itself uses {reason}"),
                 submission_span,
             )
@@ -240,8 +242,12 @@ fn check_target(
             )
         };
         diagnostics.push(
-            Diagnostic::error(message, submission_span)
-                .with_help("nested concurrency is not supported in this version"),
+            Diagnostic::error(
+                codes::SEM_CONC_NESTED_TARGET_TRANSITIVE,
+                message,
+                submission_span,
+            )
+            .with_help("nested concurrency is not supported in this version"),
         );
     }
 }
@@ -275,10 +281,7 @@ fn direct_use_in_body(body: &Block, context: &str, model: &Model) -> Option<&'st
         if super::calls::is_task_run_callee(callee) {
             return Some("`Task.Run`");
         }
-        let key = crate::semantic::ModelNodeKey {
-            context: context.to_owned(),
-            span: call.span,
-        };
+        let key = model.node_key(context, call.span);
         if model.foreign_calls.contains(&key) {
             return Some("a foreign call");
         }
@@ -407,6 +410,7 @@ fn collect_interface_targets(
                 let required_key = callable_key(
                     &required_declaration.name,
                     required_declaration.span.start,
+                    &required_declaration.parameters,
                     None,
                     Some(interface_name),
                 );
@@ -482,7 +486,13 @@ fn insert_fact<'a>(
     context_to_key: &mut HashMap<String, CallableKey>,
 ) {
     let owner_name = owner.map(|owner| owner.name.as_str());
-    let key = super::callable_key(&function.name, function.span.start, None, owner_name);
+    let key = super::callable_key(
+        &function.name,
+        function.span.start,
+        &function.parameters,
+        None,
+        owner_name,
+    );
     let context = crate::semantic::function_context(function, owner);
     context_to_key.insert(context.clone(), key.clone());
     facts.insert(

@@ -99,6 +99,12 @@ pub enum Intrinsic {
     ConsoleWriteLine,
     /// `aster.io.ReadLine()`: reads one line into `Option<string>`; `None` on EOF.
     ConsoleReadLine,
+    /// `aster.io.WriteError(string)`: emits its argument's UTF-8 bytes to the
+    /// standard error stream verbatim.
+    ConsoleWriteError,
+    /// Internal `aster.io` environment helpers behind `Environment.GetVariable`.
+    EnvironmentHasVariable,
+    EnvironmentGetVariable,
     /// `aster.io.ReadAllText(string) -> Result<string, IOError>`: reads an
     /// entire UTF-8 text file via the host filesystem backend. The payload
     /// is resolved once, here in HIR lowering (never by the backend), from
@@ -170,6 +176,24 @@ pub struct DictionaryOptionLayout {
 pub struct DictionaryEntryLayout {
     pub key_field: SymbolId,
     pub value_field: SymbolId,
+}
+
+/// How a null-conditional `?.` expression turns its inner access result into
+/// the overall `?.` result after unwrapping a `Some` receiver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NullConditionalResult {
+    /// Statement-only `void` access (`a?.Reset();`): returns `void`.
+    Void,
+    /// Non-optional inner access `V` wrapped into `Option<V>`.
+    Wrap {
+        some_case: SymbolId,
+        some_field: SymbolId,
+        some_tag: u32,
+        none_case: SymbolId,
+        none_tag: u32,
+    },
+    /// Inner access already produces `Option<V>` and flattens into `Option<V>`.
+    Flatten { none_case: SymbolId, none_tag: u32 },
 }
 
 impl FileIoResultLayout {
@@ -245,6 +269,13 @@ pub struct TypeDeclaration {
     pub symbol: SymbolId,
     pub name: String,
     pub visibility: Visibility,
+    /// The base class of a class declaration (single inheritance); `None` for
+    /// a class without a base, and for structs and interfaces.
+    pub base: Option<SymbolId>,
+    pub is_abstract: bool,
+    pub is_sealed: bool,
+    /// Interfaces this class lists itself (a base's interfaces are inherited,
+    /// not repeated here).
     pub interfaces: Vec<SymbolId>,
     pub fields: Vec<Field>,
     pub methods: Vec<Function>,
@@ -259,10 +290,28 @@ pub struct Field {
     pub initializer: Option<Expression>,
 }
 
+/// How a class method (or property accessor) is bound (object model B1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MethodDispatch {
+    /// Statically bound.
+    #[default]
+    None,
+    /// Introduces a virtual slot.
+    Virtual,
+    /// Replaces the virtual, abstract or overriding method `SymbolId` (the
+    /// member semantic analysis matched it with) and reuses its slot.
+    Override(SymbolId),
+    /// Introduces a virtual slot and has no body; only an abstract class
+    /// declares one.
+    Abstract,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Function {
     pub constructor: bool,
+    /// Virtual dispatch of a class method; `None` for every other function.
+    pub dispatch: MethodDispatch,
     /// Compiler-only declaration metadata used by project test discovery.
     /// Test callables lower to ordinary MIR functions.
     pub is_test: bool,
@@ -314,6 +363,10 @@ pub enum Statement {
         condition: Expression,
         body: Block,
     },
+    DoWhile {
+        body: Block,
+        condition: Expression,
+    },
     For {
         initializer: Option<Box<Statement>>,
         condition: Option<Expression>,
@@ -344,6 +397,13 @@ pub struct SwitchCase {
     pub case: SymbolId,
     pub tag: u32,
     pub bindings: Vec<Parameter>,
+    /// Integer, `char` or `string` switch: the constant label, already
+    /// converted to the subject type. Then `case`/`tag` are placeholders and
+    /// `bindings` is empty; MIR compares the subject with this value.
+    pub label: Option<Expression>,
+    /// `when` guard, evaluated in the scope of `bindings` after the pattern
+    /// matched; when false, matching continues with the next case.
+    pub guard: Option<Expression>,
     pub body: Block,
 }
 
@@ -352,6 +412,13 @@ pub struct SwitchExpressionCase {
     pub case: SymbolId,
     pub tag: u32,
     pub bindings: Vec<Parameter>,
+    /// Integer, `char` or `string` switch: the constant label, already
+    /// converted to the subject type. Then `case`/`tag` are placeholders and
+    /// `bindings` is empty; MIR compares the subject with this value.
+    pub label: Option<Expression>,
+    /// `when` guard, evaluated in the scope of `bindings` after the pattern
+    /// matched; when false, matching continues with the next case.
+    pub guard: Option<Expression>,
     pub value: Expression,
 }
 
@@ -437,6 +504,16 @@ pub enum ExpressionKind {
         /// `arguments` left-to-right, then mechanically orders the resulting
         /// operands for the callee ABI.
         argument_order: Vec<usize>,
+    },
+    /// `new T(args) { A = e1, B = e2 }`: evaluates `object` (a `NewObject`),
+    /// binds the result to the hidden local `receiver`, evaluates each of
+    /// `assignments` in order (each a `receiver.member = value` expression,
+    /// result discarded) and yields the receiver. The object is not
+    /// observable before every assignment completes.
+    ObjectInitializer {
+        object: Box<Expression>,
+        receiver: SymbolId,
+        assignments: Vec<Expression>,
     },
     ArrayLiteral(Vec<Expression>),
     NewArray {
@@ -676,10 +753,52 @@ pub enum ExpressionKind {
     Convert {
         operand: Box<Expression>,
     },
+    /// `value is Class` / `value is Class name`: a `bool` run-time test that
+    /// the class reference `value` is an instance of `class` or of a class
+    /// derived from it. The optional `binding` is a local aliasing the same
+    /// object with the narrower static type `class` (no copy); it is meaningful
+    /// only where semantic analysis proved the test succeeded, and is assigned
+    /// unconditionally. Interface targets are not represented here.
+    ClassTest {
+        value: Box<Expression>,
+        class: SymbolId,
+        binding: Option<Box<Variable>>,
+    },
+    /// `value is Interface` / `value is Interface name`: a `bool` run-time
+    /// test that the object behind the class reference or interface value
+    /// `value` has a class whose descriptor lists `interface` (a bounded
+    /// search, object model B1 section 4.5). The optional `binding` is an
+    /// interface-typed local assigned `{object, table}` from that search only
+    /// when the test succeeded.
+    InterfaceTest {
+        value: Box<Expression>,
+        interface: SymbolId,
+        binding: Option<Box<Variable>>,
+    },
+    /// Identity-preserving implicit conversion from a class reference to one of
+    /// its base classes: the same object, no copy. This expression's type is
+    /// the target base class; semantic analysis already proved the relation.
+    UpcastClass {
+        object: Box<Expression>,
+    },
+    /// `this` viewed as its direct base class, as the receiver of a `base.Member`
+    /// access: the same object as an identity upcast, but a call or property
+    /// access whose receiver is this expression runs the base implementation
+    /// statically, with no virtual dispatch.
+    BaseReceiver {
+        object: Box<Expression>,
+    },
     /// Nominal, non-owning conversion from a class reference to an interface value.
     UpcastInterface {
         object: Box<Expression>,
         class: SymbolId,
+        interface: SymbolId,
+    },
+    /// Implicit conversion from an interface value to one of its base
+    /// interfaces (LANG-012): the same object with the base interface's table,
+    /// found by the bounded search of the object's descriptor.
+    UpcastInterfaceValue {
+        object: Box<Expression>,
         interface: SymbolId,
     },
     Unary {
@@ -737,6 +856,38 @@ pub enum ExpressionKind {
         return_type: Type,
         return_none_case: SymbolId,
         return_none_tag: u32,
+    },
+    /// `expr == null` (`negated == false`) or `expr != null` (`negated == true`)
+    /// on an `aster.core.Option<T>`.
+    IsNull {
+        operand: Box<Expression>,
+        none_tag: u32,
+        negated: bool,
+    },
+    /// Short-circuiting `value ?? fallback`: evaluates `value` once, and either
+    /// returns its `Some` payload (`unwraps == true`) / `value` (`unwraps == false`),
+    /// or evaluates `fallback`.
+    NullCoalesce {
+        value: Box<Expression>,
+        fallback: Box<Expression>,
+        some_case: SymbolId,
+        some_field: SymbolId,
+        some_tag: u32,
+        none_tag: u32,
+        unwraps: bool,
+    },
+    /// Short-circuiting `receiver?.access`: evaluates `receiver` once, binds the
+    /// unwrapped payload to `receiver_symbol` for `access`, and wraps/flattens
+    /// into `Option<V>` (or runs as statement `void`).
+    NullConditional {
+        receiver: Box<Expression>,
+        receiver_symbol: SymbolId,
+        receiver_some_case: SymbolId,
+        receiver_some_field: SymbolId,
+        receiver_some_tag: u32,
+        receiver_none_tag: u32,
+        access: Box<Expression>,
+        result: NullConditionalResult,
     },
     Binary {
         left: Box<Expression>,
@@ -899,6 +1050,7 @@ pub enum AssignmentOperator {
     SubtractAssign,
     MultiplyAssign,
     DivideAssign,
+    RemainderAssign,
     BitwiseAndAssign,
     BitwiseOrAssign,
     BitwiseXorAssign,

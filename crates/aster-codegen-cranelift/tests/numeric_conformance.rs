@@ -662,7 +662,7 @@ fn nonnumeric_binary_operations_are_unaffected() {
 }
 
 #[test]
-fn floating_point_remainder_is_rejected_before_execution() {
+fn floating_point_remainder_validates_and_executes() {
     for (parameters, left, right) in [
         ("float a, float b", "1.5f", "0.5f"),
         ("int a, double b", "3", "0.5d"),
@@ -671,11 +671,7 @@ fn floating_point_remainder_is_rejected_before_execution() {
             "public double R({parameters}) {{ return a % b; }} public double Main() {{ return R({left}, {right}); }}"
         );
         let compilation = compile(&source).expect("semantic analysis accepts the operation");
-        let error = validate(&compilation.mir).expect_err("the backend rejects floating remainder");
-        assert!(
-            error.to_string().contains("floating-point remainder"),
-            "{error}"
-        );
+        validate(&compilation.mir).expect("the backend accepts floating remainder");
     }
 }
 

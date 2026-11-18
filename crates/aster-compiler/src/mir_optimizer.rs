@@ -206,6 +206,9 @@ fn count_instruction_uses(instruction: &mir::Instruction, uses: &mut HashMap<mir
         count_place_input_uses(value, uses);
     };
     match instruction {
+        mir::Instruction::Retain { value } | mir::Instruction::Release { value } => {
+            operand(value, uses);
+        }
         mir::Instruction::OwnedRegionEnter { .. }
         | mir::Instruction::OwnedRegionExit { .. }
         | mir::Instruction::TemporarySubregionEnter { .. }
@@ -237,6 +240,12 @@ fn count_instruction_uses(instruction: &mir::Instruction, uses: &mut HashMap<mir
             }
         }
         mir::Instruction::CallInterface {
+            destination,
+            receiver,
+            arguments,
+            ..
+        }
+        | mir::Instruction::CallVirtual {
             destination,
             receiver,
             arguments,
@@ -380,12 +389,17 @@ fn count_rvalue_uses(value: &mir::Rvalue, uses: &mut HashMap<mir::LocalId, usize
     match &value.kind {
         mir::RvalueKind::Use(value)
         | mir::RvalueKind::Discriminant(value)
+        | mir::RvalueKind::ClassTest { object: value, .. }
+        | mir::RvalueKind::InterfaceTest { object: value, .. }
+        | mir::RvalueKind::InterfaceLookup { object: value, .. }
         | mir::RvalueKind::ArrayLength(value)
         | mir::RvalueKind::ListLength(value)
         | mir::RvalueKind::DictionaryLength(value)
         | mir::RvalueKind::ListVersion(value)
         | mir::RvalueKind::StringByteLength(value)
         | mir::RvalueKind::Cast(value)
+        | mir::RvalueKind::Upcast(value)
+        | mir::RvalueKind::Downcast(value)
         | mir::RvalueKind::Unary { operand: value, .. } => count_operand_uses(value, uses),
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             for field in fields {
@@ -581,11 +595,16 @@ fn pure_non_failing_rvalue(value: &mir::Rvalue) -> bool {
         mir::RvalueKind::Aggregate(_)
         | mir::RvalueKind::EnumConstruct { .. }
         | mir::RvalueKind::Discriminant(_)
+        | mir::RvalueKind::ClassTest { .. }
+        | mir::RvalueKind::InterfaceTest { .. }
+        | mir::RvalueKind::InterfaceLookup { .. }
         | mir::RvalueKind::ArrayLength(_)
         | mir::RvalueKind::ListLength(_)
         | mir::RvalueKind::DictionaryLength(_)
         | mir::RvalueKind::ListVersion(_)
         | mir::RvalueKind::StringByteLength(_)
+        | mir::RvalueKind::Upcast(_)
+        | mir::RvalueKind::Downcast(_)
         | mir::RvalueKind::MakeInterface { .. }
         | mir::RvalueKind::Equality { .. } => false,
     }
@@ -618,6 +637,9 @@ fn rewrite_instruction_operands(
     }
 
     match instruction {
+        mir::Instruction::Retain { value } | mir::Instruction::Release { value } => {
+            operand!(value);
+        }
         mir::Instruction::Assign { target, value } => {
             place!(target);
             rewrite_rvalue_operands(value, facts, copies);
@@ -644,6 +666,12 @@ fn rewrite_instruction_operands(
             // shapes, so their arguments stay opaque.
         }
         mir::Instruction::CallInterface {
+            destination,
+            receiver,
+            arguments,
+            ..
+        }
+        | mir::Instruction::CallVirtual {
             destination,
             receiver,
             arguments,
@@ -785,12 +813,17 @@ fn rewrite_rvalue_operands(
     match &mut value.kind {
         mir::RvalueKind::Use(value)
         | mir::RvalueKind::Discriminant(value)
+        | mir::RvalueKind::ClassTest { object: value, .. }
+        | mir::RvalueKind::InterfaceTest { object: value, .. }
+        | mir::RvalueKind::InterfaceLookup { object: value, .. }
         | mir::RvalueKind::ArrayLength(value)
         | mir::RvalueKind::ListLength(value)
         | mir::RvalueKind::DictionaryLength(value)
         | mir::RvalueKind::ListVersion(value)
         | mir::RvalueKind::StringByteLength(value)
         | mir::RvalueKind::Cast(value)
+        | mir::RvalueKind::Upcast(value)
+        | mir::RvalueKind::Downcast(value)
         | mir::RvalueKind::Unary { operand: value, .. } => operand(value),
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             for field in fields {

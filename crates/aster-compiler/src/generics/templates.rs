@@ -30,6 +30,7 @@ impl GenericTypeTemplate {
 /// correctly next to `a class`.
 fn not_an_interface(name: &str, description: &str, span: aster_diagnostics::Span) -> Diagnostic {
     Diagnostic::error(
+        super::codes::GENERIC_CONSTRAINT_NOT_INTERFACE,
         format!("`{name}` is not an interface; it is {description}"),
         span,
     )
@@ -50,12 +51,54 @@ fn builtin_constraint_description(base: &str) -> Option<&'static str> {
         .then_some("a reserved built-in type")
 }
 
+/// A base class that mentions the derived class's own type parameters
+/// (`class Box<T> : Container<T>`) is an open base: it is deferred until the
+/// generics-in-hierarchies step (object model B1, section 8). Closed bases
+/// such as `Container<int>` are ordinary specializations.
+fn reject_open_bases(
+    class: &TypeDeclaration,
+    declarations: &HashMap<String, DeclarationFacts>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    fn mentions(name: &TypeName, parameters: &[TypeParameter]) -> bool {
+        parameters
+            .iter()
+            .any(|parameter| parameter.name == name.base)
+            || name
+                .arguments
+                .iter()
+                .any(|argument| mentions(argument, parameters))
+    }
+    for entry in &class.interfaces {
+        let Some(name) = TypeName::parse(&entry.name) else {
+            continue;
+        };
+        let is_class = declarations
+            .get(&name.base)
+            .is_some_and(|facts| matches!(facts.kind, DeclarationKind::Class));
+        if is_class && mentions(&name, &class.type_parameters) {
+            diagnostics.push(
+                Diagnostic::error(
+                    super::codes::GENERIC_OPEN_BASE_UNSUPPORTED,
+                    format!(
+                        "generic class `{}` cannot derive from `{}`: an open base that mentions its own type parameters is not supported yet",
+                        class.name, entry.name
+                    ),
+                    entry.span,
+                )
+                .with_help("derive from a closed specialization such as `Container<int>`"),
+            );
+        }
+    }
+}
+
 impl Monomorphizer {
     #[allow(clippy::too_many_lines)]
     pub(super) fn new(module: &Module) -> Self {
         let mut templates = HashMap::new();
         let mut type_templates = HashMap::new();
         let mut enum_templates = HashMap::new();
+        let mut enums = HashMap::new();
         let mut returns = HashMap::new();
         let mut fields = HashMap::new();
         let mut methods = HashMap::new();
@@ -66,6 +109,7 @@ impl Monomorphizer {
         let mut diagnostics = Vec::new();
         let mut declarations = HashMap::new();
         let mut class_interfaces = HashMap::new();
+        let mut type_bases = HashMap::new();
         let mut constants = HashMap::new();
         // The constraint inventory is built in its own pass, ahead of template
         // discovery: a call site requesting a specialization can appear in
@@ -104,6 +148,19 @@ impl Monomorphizer {
                         .collect(),
                 );
             }
+            if let Item::Class(value) | Item::Interface(value) = item
+                && !value.interfaces.is_empty()
+                && value.type_parameters.is_empty()
+            {
+                type_bases.insert(
+                    value.name.clone(),
+                    value
+                        .interfaces
+                        .iter()
+                        .map(|interface| interface.name.clone())
+                        .collect(),
+                );
+            }
         }
         for item in &module.items {
             if let Item::Variable(variable) = item
@@ -124,6 +181,7 @@ impl Monomorphizer {
                     {
                         diagnostics.push(
                             Diagnostic::error(
+                                super::codes::GENERIC_DUPLICATE_FUNCTION,
                                 format!("duplicate function `{}`", function.name),
                                 function.span,
                             )
@@ -140,6 +198,9 @@ impl Monomorphizer {
                 | Item::Struct(declaration)
                 | Item::Interface(declaration) => {
                     if !declaration.type_parameters.is_empty() {
+                        if let Item::Class(class) = item {
+                            reject_open_bases(class, &declarations, &mut diagnostics);
+                        }
                         let template = match item {
                             Item::Class(value) => GenericTypeTemplate::Class(value.clone()),
                             Item::Struct(value) => GenericTypeTemplate::Struct(value.clone()),
@@ -151,6 +212,7 @@ impl Monomorphizer {
                             .is_some()
                         {
                             diagnostics.push(Diagnostic::error(
+                                super::codes::GENERIC_DUPLICATE_TYPE,
                                 format!("duplicate generic type `{}`", declaration.name),
                                 declaration.span,
                             ));
@@ -192,24 +254,28 @@ impl Monomorphizer {
                         }
                     }
                 }
-                Item::Enum(declaration)
-                    if !declaration.type_parameters.is_empty()
-                        && enum_templates
-                            .insert(declaration.name.clone(), declaration.clone())
-                            .is_some() =>
-                {
-                    diagnostics.push(Diagnostic::error(
-                        format!("duplicate generic enum `{}`", declaration.name),
-                        declaration.span,
-                    ));
+                Item::Enum(declaration) => {
+                    if declaration.type_parameters.is_empty() {
+                        enums.insert(declaration.name.clone(), declaration.clone());
+                    } else if enum_templates
+                        .insert(declaration.name.clone(), declaration.clone())
+                        .is_some()
+                    {
+                        diagnostics.push(Diagnostic::error(
+                            super::codes::GENERIC_DUPLICATE_ENUM,
+                            format!("duplicate generic enum `{}`", declaration.name),
+                            declaration.span,
+                        ));
+                    }
                 }
-                _ => {}
+                Item::Variable(_) => {}
             }
         }
         Self {
             templates,
             type_templates,
             enum_templates,
+            enums,
             returns,
             fields,
             methods,
@@ -226,7 +292,9 @@ impl Monomorphizer {
             generated_types: Vec::new(),
             declarations,
             class_interfaces,
+            type_bases,
             constants,
+            null_conditional_receiver_types: Vec::new(),
             diagnostics,
         }
     }
@@ -253,6 +321,7 @@ impl Monomorphizer {
                 {
                     reported.push(
                         Diagnostic::error(
+                            super::codes::GENERIC_INTERFACE_METHOD_UNIMPLEMENTED,
                             "generic interface methods are not implemented",
                             method.span,
                         )
@@ -268,6 +337,7 @@ impl Monomorphizer {
             if declaration.is_static {
                 reported.push(
                     Diagnostic::error(
+                        super::codes::GENERIC_STATIC_CLASS_UNIMPLEMENTED,
                         "generic static classes are not implemented",
                         declaration.span,
                     )
@@ -287,6 +357,7 @@ impl Monomorphizer {
                         if matches!(template, GenericTypeTemplate::Interface(_)) {
                             reported.push(
                                 Diagnostic::error(
+                                    super::codes::GENERIC_INTERFACE_METHOD_UNIMPLEMENTED,
                                     "generic interface methods are not implemented",
                                     method.span,
                                 )
@@ -299,6 +370,7 @@ impl Monomorphizer {
                     if method.is_static {
                         reported.push(
                             Diagnostic::error(
+                                super::codes::GENERIC_STATIC_METHOD_UNIMPLEMENTED,
                                 "static methods on generic types are not implemented",
                                 method.span,
                             )
@@ -328,6 +400,7 @@ impl Monomorphizer {
             {
                 reported.push(
                     Diagnostic::error(
+                        super::codes::GENERIC_DUPLICATE_TYPE_PARAM,
                         format!("duplicate type parameter `{}`", parameter.name),
                         parameter.span,
                     )
@@ -347,8 +420,12 @@ impl Monomorphizer {
             let name = constraint.name.as_str();
             if seen.contains(&name) {
                 reported.push(
-                    Diagnostic::error(format!("duplicate constraint `{name}`"), constraint.span)
-                        .with_help("remove the repeated interface from the `where` clause"),
+                    Diagnostic::error(
+                        super::codes::GENERIC_DUPLICATE_CONSTRAINT,
+                        format!("duplicate constraint `{name}`"),
+                        constraint.span,
+                    )
+                    .with_help("remove the repeated interface from the `where` clause"),
                 );
                 continue;
             }
@@ -356,6 +433,7 @@ impl Monomorphizer {
             let Some(type_name) = TypeName::parse(name) else {
                 reported.push(
                     Diagnostic::error(
+                        super::codes::GENERIC_MALFORMED_CONSTRAINT,
                         format!("malformed constraint type `{name}`"),
                         constraint.span,
                     )
@@ -373,6 +451,7 @@ impl Monomorphizer {
                 } else {
                     reported.push(
                         Diagnostic::error(
+                            super::codes::GENERIC_UNKNOWN_CONSTRAINT,
                             format!("unknown constraint type `{name}`"),
                             constraint.span,
                         )
@@ -392,6 +471,7 @@ impl Monomorphizer {
             if type_name.arguments.len() != facts.arity {
                 reported.push(
                     Diagnostic::error(
+                        super::codes::GENERIC_CONSTRAINT_ARITY_MISMATCH,
                         format!(
                             "generic interface constraint `{}` expects {} type argument(s), found {}",
                             type_name.base,
@@ -432,6 +512,7 @@ impl Monomorphizer {
                     if type_mentions_parameter(&parameter.type_ref.name, &parameter_names) {
                         reported.push(
                         Diagnostic::error(
+                            super::codes::GENERIC_DEFAULT_DEPENDENT_PARAM,
                             format!(
                                 "default for generic-dependent parameter `{}` cannot be proven valid for every specialization",
                                 parameter.name
@@ -450,6 +531,7 @@ impl Monomorphizer {
                         Ok(value) => {
                             if !constant_assignable(&value, &parameter.type_ref.name) {
                                 reported.push(Diagnostic::error(
+                                    super::codes::GENERIC_DEFAULT_TYPE_MISMATCH,
                                     format!(
                                         "expected `{}`, found `{}`",
                                         parameter.type_ref.name,
@@ -461,6 +543,7 @@ impl Monomorphizer {
                         }
                         Err(crate::constexpr::ConstError::NotConstant(span)) => reported.push(
                             Diagnostic::error(
+                                super::codes::GENERIC_DEFAULT_NON_CONSTANT,
                                 "default values must be compile-time constant expressions",
                                 span,
                             )
@@ -470,16 +553,22 @@ impl Monomorphizer {
                         ),
                         Err(crate::constexpr::ConstError::Overflow(span, type_name)) => reported
                             .push(Diagnostic::error(
+                                super::codes::GENERIC_DEFAULT_CONST_OVERFLOW,
                                 format!("default value overflows `{type_name}`"),
                                 span,
                             )),
                         Err(crate::constexpr::ConstError::DivisionByZero(span)) => {
-                            reported.push(Diagnostic::error("default value divides by zero", span));
+                            reported.push(Diagnostic::error(
+                                super::codes::GENERIC_DEFAULT_CONST_DIV_ZERO,
+                                "default value divides by zero",
+                                span,
+                            ));
                         }
                     }
                 }
                 None if saw_default => reported.push(
                     Diagnostic::error(
+                        super::codes::GENERIC_REQUIRED_AFTER_OPTIONAL,
                         format!(
                             "required parameter `{}` cannot follow an optional parameter",
                             parameter.name

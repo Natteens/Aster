@@ -904,11 +904,16 @@ pub(super) fn span_barrier_for_research(
 fn span_barrier(instructions: &[mir::Instruction]) -> Option<TemporarySubregionRejectionReason> {
     for instruction in instructions {
         let reason = match instruction {
+            mir::Instruction::Retain { .. } | mir::Instruction::Release { .. } => {
+                Some(TemporarySubregionRejectionReason::CallBarrier)
+            }
             mir::Instruction::TemporarySubregionEnter { .. }
             | mir::Instruction::TemporarySubregionExit { .. } => {
                 Some(TemporarySubregionRejectionReason::UnsupportedControlFlow)
             }
-            mir::Instruction::Call { .. } | mir::Instruction::CallInterface { .. } => {
+            mir::Instruction::Call { .. }
+            | mir::Instruction::CallInterface { .. }
+            | mir::Instruction::CallVirtual { .. } => {
                 Some(TemporarySubregionRejectionReason::CallBarrier)
             }
             mir::Instruction::ForeignCall { .. } => {
@@ -1248,12 +1253,23 @@ fn rvalue_mentions_fine_owned(value: &mir::Rvalue, owned: &BTreeMap<u32, FineOwn
     match &value.kind {
         mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Discriminant(operand)
+        | mir::RvalueKind::ClassTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceTest {
+            object: operand, ..
+        }
+        | mir::RvalueKind::InterfaceLookup {
+            object: operand, ..
+        }
         | mir::RvalueKind::ArrayLength(operand)
         | mir::RvalueKind::ListLength(operand)
         | mir::RvalueKind::DictionaryLength(operand)
         | mir::RvalueKind::ListVersion(operand)
         | mir::RvalueKind::StringByteLength(operand)
         | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
+        | mir::RvalueKind::Downcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => operand_mentions_owned_builder(operand, owned),
         mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
             fields
@@ -1344,6 +1360,8 @@ fn is_execution_safe_rvalue(value: &mir::Rvalue) -> bool {
     match &value.kind {
         mir::RvalueKind::Use(operand)
         | mir::RvalueKind::Cast(operand)
+        | mir::RvalueKind::Upcast(operand)
+        | mir::RvalueKind::Downcast(operand)
         | mir::RvalueKind::Unary { operand, .. } => is_execution_safe_operand(operand),
         mir::RvalueKind::Binary {
             left,
@@ -1367,6 +1385,9 @@ fn is_execution_safe_rvalue(value: &mir::Rvalue) -> bool {
         mir::RvalueKind::Aggregate(_)
         | mir::RvalueKind::EnumConstruct { .. }
         | mir::RvalueKind::Discriminant(_)
+        | mir::RvalueKind::ClassTest { .. }
+        | mir::RvalueKind::InterfaceTest { .. }
+        | mir::RvalueKind::InterfaceLookup { .. }
         | mir::RvalueKind::ListLength(_)
         | mir::RvalueKind::DictionaryLength(_)
         | mir::RvalueKind::ListVersion(_)
@@ -1463,12 +1484,23 @@ fn rvalue_contains_type(value: &mir::Rvalue, predicate: fn(&mir::Type) -> bool) 
         || match &value.kind {
             mir::RvalueKind::Use(operand)
             | mir::RvalueKind::Discriminant(operand)
+            | mir::RvalueKind::ClassTest {
+                object: operand, ..
+            }
+            | mir::RvalueKind::InterfaceTest {
+                object: operand, ..
+            }
+            | mir::RvalueKind::InterfaceLookup {
+                object: operand, ..
+            }
             | mir::RvalueKind::ArrayLength(operand)
             | mir::RvalueKind::ListLength(operand)
             | mir::RvalueKind::DictionaryLength(operand)
             | mir::RvalueKind::ListVersion(operand)
             | mir::RvalueKind::StringByteLength(operand)
             | mir::RvalueKind::Cast(operand)
+            | mir::RvalueKind::Upcast(operand)
+            | mir::RvalueKind::Downcast(operand)
             | mir::RvalueKind::Unary { operand, .. } => predicate(&operand.type_),
             mir::RvalueKind::Aggregate(fields) | mir::RvalueKind::EnumConstruct { fields, .. } => {
                 fields.iter().any(|field| predicate(&field.value.type_))

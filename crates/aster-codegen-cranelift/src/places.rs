@@ -2,9 +2,11 @@ use super::{
     BackendError, Codegen, FunctionBuilder, FunctionState, InstBuilder, IntCC, MemFlags, Module,
     Value, is_aggregate, mir, types,
 };
+use aster_diagnostics::codes;
 use aster_runtime::{ASTER_ARRAY_DATA_OFFSET, ASTER_ARRAY_LENGTH_OFFSET};
 
 impl Codegen {
+    #[allow(clippy::too_many_lines)]
     pub(super) fn assign_rvalue(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
@@ -24,12 +26,17 @@ impl Codegen {
             }
             mir::RvalueKind::Aggregate(fields) => {
                 for field in fields {
-                    let layout = self
-                        .layouts
-                        .fields
-                        .get(&field.field)
-                        .cloned()
-                        .ok_or_else(|| BackendError::new("unknown struct field in MIR"))?;
+                    let layout =
+                        self.layouts
+                            .fields
+                            .get(&field.field)
+                            .cloned()
+                            .ok_or_else(|| {
+                                BackendError::new(
+                                    codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                                    "unknown struct field in MIR",
+                                )
+                            })?;
                     let address = if layout.offset == 0 {
                         destination
                     } else {
@@ -48,15 +55,48 @@ impl Codegen {
                 Ok(())
             }
             mir::RvalueKind::EnumConstruct { tag, fields, .. } => {
+                if let mir::Type::Enum(symbol) = &value.type_
+                    && let Some(super::EnumRepr::NullPointerNiche {
+                        none_tag,
+                        payload_type,
+                        ..
+                    }) = self.layouts.enum_reprs.get(symbol).cloned()
+                {
+                    if *tag == none_tag {
+                        let null_ptr = builder.ins().iconst(self.pointer_type, 0);
+                        builder
+                            .ins()
+                            .store(MemFlags::new(), null_ptr, destination, 0);
+                        return Ok(());
+                    }
+                    let field = fields.first().ok_or_else(|| {
+                        BackendError::new(
+                            codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                            "missing niche enum payload field in MIR",
+                        )
+                    })?;
+                    return self.assign_operand_to_address(
+                        builder,
+                        &payload_type,
+                        &field.value,
+                        destination,
+                        state,
+                    );
+                }
                 let tag = builder.ins().iconst(types::I32, i64::from(*tag));
                 builder.ins().store(MemFlags::new(), tag, destination, 0);
                 for field in fields {
-                    let layout = self
-                        .layouts
-                        .fields
-                        .get(&field.field)
-                        .cloned()
-                        .ok_or_else(|| BackendError::new("unknown enum payload field in MIR"))?;
+                    let layout =
+                        self.layouts
+                            .fields
+                            .get(&field.field)
+                            .cloned()
+                            .ok_or_else(|| {
+                                BackendError::new(
+                                    codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                                    "unknown enum payload field in MIR",
+                                )
+                            })?;
                     let address = builder
                         .ins()
                         .iadd_imm(destination, i64::from(layout.offset));
@@ -81,22 +121,87 @@ impl Codegen {
                     .interface_tables
                     .get(&(*class, *interface))
                     .copied()
-                    .ok_or_else(|| BackendError::new("interface conversion has no method table"))?;
+                    .ok_or_else(|| {
+                        BackendError::new(
+                            codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                            "interface conversion has no method table",
+                        )
+                    })?;
                 let global = self.jit.declare_data_in_func(table, builder.func);
                 let table = builder.ins().global_value(self.pointer_type, global);
                 builder.ins().store(
                     MemFlags::new(),
                     table,
                     destination,
-                    i32::try_from(self.pointer_type.bytes())
-                        .map_err(|_| BackendError::new("pointer offset is too large"))?,
+                    i32::try_from(self.pointer_type.bytes()).map_err(|_| {
+                        BackendError::new(
+                            codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                            "pointer offset is too large",
+                        )
+                    })?,
                 );
                 Ok(())
             }
+            mir::RvalueKind::InterfaceLookup { object, interface } => {
+                self.assign_interface_lookup(builder, destination, object, *interface, state)
+            }
             _ => Err(BackendError::new(
+                codes::BACKEND_UNSUPPORTED_CONSTRUCT,
                 "aggregate values only support construction and value copies",
             )),
         }
+    }
+
+    /// `destination = { object, table }` where the table is found by the
+    /// bounded search of the object's descriptor. When the search finds
+    /// nothing (only reachable from hand-built MIR or descriptors: valid
+    /// source proves the interface is present) a controlled runtime error is
+    /// recorded and execution takes the runtime-failure path; nothing is
+    /// written through a missing table.
+    fn assign_interface_lookup(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+        destination: Value,
+        object: &mir::Operand,
+        interface: mir::SymbolId,
+        state: &FunctionState,
+    ) -> Result<(), BackendError> {
+        /// Code passed to `aster_rt_math_domain_error`.
+        const MISSING_INTERFACE_TABLE: i64 = 10;
+        let object = self.object_pointer(builder, object, state)?;
+        let (found, table) = self.interface_search(builder, object, interface)?;
+        let missing = builder.create_block();
+        let present = builder.create_block();
+        builder.ins().brif(found, present, &[], missing, &[]);
+
+        builder.switch_to_block(missing);
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "interface lookup is missing its ExecutionContext",
+            )
+        })?;
+        let report = self
+            .jit
+            .declare_func_in_func(self.runtime_ids["aster_rt_math_domain_error"], builder.func);
+        let code = builder.ins().iconst(types::I32, MISSING_INTERFACE_TABLE);
+        builder.ins().call(report, &[context, code]);
+        builder.ins().jump(state.runtime_failure, &[]);
+
+        builder.switch_to_block(present);
+        builder.ins().store(MemFlags::new(), object, destination, 0);
+        builder.ins().store(
+            MemFlags::new(),
+            table,
+            destination,
+            i32::try_from(self.pointer_type.bytes()).map_err(|_| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    "pointer offset is too large",
+                )
+            })?,
+        );
+        Ok(())
     }
 
     fn assign_operand_to_address(
@@ -143,12 +248,22 @@ impl Codegen {
             return Ok(());
         }
         if let mir::Type::Enum(symbol) = type_ {
-            let definition = self
-                .layouts
-                .enums
-                .get(symbol)
-                .cloned()
-                .ok_or_else(|| BackendError::new("unknown enum type in MIR"))?;
+            if matches!(
+                self.layouts.enum_reprs.get(symbol),
+                Some(super::EnumRepr::NullPointerNiche { .. })
+            ) {
+                let value = builder
+                    .ins()
+                    .load(self.pointer_type, MemFlags::new(), source, 0);
+                builder.ins().store(MemFlags::new(), value, destination, 0);
+                return Ok(());
+            }
+            let definition = self.layouts.enums.get(symbol).cloned().ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                    "unknown enum type in MIR",
+                )
+            })?;
             let tag = builder.ins().load(types::I32, MemFlags::new(), source, 0);
             builder.ins().store(MemFlags::new(), tag, destination, 0);
             let join = builder.create_block();
@@ -181,17 +296,19 @@ impl Codegen {
             builder.ins().store(MemFlags::new(), value, destination, 0);
             return Ok(());
         };
-        let definition = self
-            .layouts
-            .structs
-            .get(symbol)
-            .cloned()
-            .ok_or_else(|| BackendError::new("unknown struct type in MIR"))?;
+        let definition = self.layouts.structs.get(symbol).cloned().ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                "unknown struct type in MIR",
+            )
+        })?;
         for field in definition.fields {
-            let layout =
-                self.layouts.fields.get(&field.symbol).ok_or_else(|| {
-                    BackendError::new("struct field has no computed runtime layout")
-                })?;
+            let layout = self.layouts.fields.get(&field.symbol).ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    "struct field has no computed runtime layout",
+                )
+            })?;
             let (source, destination) = if layout.offset == 0 {
                 (source, destination)
             } else {
@@ -215,19 +332,22 @@ impl Codegen {
     ) -> Result<Value, BackendError> {
         match place {
             mir::Place::Local(local) => {
-                let slot = state
-                    .slots
-                    .get(local)
-                    .copied()
-                    .ok_or_else(|| BackendError::new("MIR references an unknown local"))?;
+                let slot = state.slots.get(local).copied().ok_or_else(|| {
+                    BackendError::new(
+                        codes::BACKEND_MALFORMED_CFG_OR_LOCAL,
+                        "MIR references an unknown local",
+                    )
+                })?;
                 Ok(builder.ins().stack_addr(self.pointer_type, slot, 0))
             }
             mir::Place::Field { base, field } => {
                 let base = self.place_address(builder, base, state)?;
-                let field =
-                    self.layouts.fields.get(field).ok_or_else(|| {
-                        BackendError::new("MIR references an unknown struct field")
-                    })?;
+                let field = self.layouts.fields.get(field).ok_or_else(|| {
+                    BackendError::new(
+                        codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                        "MIR references an unknown struct field",
+                    )
+                })?;
                 if field.offset == 0 {
                     Ok(base)
                 } else {
@@ -236,11 +356,12 @@ impl Codegen {
             }
             mir::Place::EnumField { base, field, .. } => {
                 let base = self.place_address(builder, base, state)?;
-                let field = self
-                    .layouts
-                    .fields
-                    .get(field)
-                    .ok_or_else(|| BackendError::new("MIR references an unknown enum field"))?;
+                let field = self.layouts.fields.get(field).ok_or_else(|| {
+                    BackendError::new(
+                        codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                        "MIR references an unknown enum field",
+                    )
+                })?;
                 Ok(builder.ins().iadd_imm(base, i64::from(field.offset)))
             }
             mir::Place::Index {
@@ -251,10 +372,12 @@ impl Codegen {
             } => self.array_element_address(builder, array, index, element_type, *bounds, state),
             mir::Place::ObjectField { object, field } => {
                 let object = self.translate_operand(builder, object, state)?;
-                let field =
-                    self.layouts.fields.get(field).ok_or_else(|| {
-                        BackendError::new("MIR references an unknown object field")
-                    })?;
+                let field = self.layouts.fields.get(field).ok_or_else(|| {
+                    BackendError::new(
+                        codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                        "MIR references an unknown object field",
+                    )
+                })?;
                 if field.offset == 0 {
                     Ok(object)
                 } else {
@@ -262,6 +385,7 @@ impl Codegen {
                 }
             }
             mir::Place::Symbol(_) => Err(BackendError::new(
+                codes::BACKEND_UNSUPPORTED_CONSTRUCT,
                 "module storage is not executable in the current JIT",
             )),
         }
@@ -276,13 +400,24 @@ impl Codegen {
         bounds: mir::ArrayBounds,
         state: &FunctionState,
     ) -> Result<Value, BackendError> {
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("array access is missing its ExecutionContext"))?;
-        let array_length_offset = i32::try_from(ASTER_ARRAY_LENGTH_OFFSET)
-            .map_err(|_| BackendError::new("array header length offset is too large"))?;
-        let array_data_offset = i32::try_from(ASTER_ARRAY_DATA_OFFSET)
-            .map_err(|_| BackendError::new("array header data offset is too large"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "array access is missing its ExecutionContext",
+            )
+        })?;
+        let array_length_offset = i32::try_from(ASTER_ARRAY_LENGTH_OFFSET).map_err(|_| {
+            BackendError::new(
+                codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                "array header length offset is too large",
+            )
+        })?;
+        let array_data_offset = i32::try_from(ASTER_ARRAY_DATA_OFFSET).map_err(|_| {
+            BackendError::new(
+                codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                "array header data offset is too large",
+            )
+        })?;
         let array = self.translate_operand(builder, array, state)?;
         let index = self.translate_operand(builder, index, state)?;
         if matches!(bounds, mir::ArrayBounds::Proven { .. }) {

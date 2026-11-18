@@ -217,12 +217,16 @@ fn empty_array_literal_uses_assignment_return_and_argument_contexts() {
 }
 
 #[test]
-fn empty_reference_arrays_do_not_bypass_type_based_worker_transfer() {
-    let diagnostics = aster_compiler::compile(
+fn empty_reference_arrays_are_transferred_by_type_not_by_length() {
+    aster_compiler::compile(
         "public int Count(string[] values) { return values.Length; } \
          public int Run() { return Task.Run(Count, new string[0]).Wait(); }",
     )
-    .expect_err("zero runtime length does not make a reference array transferable");
+    .expect("string arrays are copied across the worker boundary");
+    let diagnostics = aster_compiler::compile(
+        "public class Box { public Box() {} } public int Count(Box[] values) { return values.Length; } public int Run() { return Task.Run(Count, new Box[0]).Wait(); }",
+    )
+    .expect_err("arrays of class instances cannot cross");
     assert!(diagnostics.iter().any(|diagnostic| {
         diagnostic
             .message

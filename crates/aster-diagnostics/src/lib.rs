@@ -1,6 +1,12 @@
 //! Source spans and diagnostics shared by the Aster front-end.
 
+pub mod codes;
+
 use std::fmt::Write;
+
+pub use codes::{
+    DiagnosticCode, DiagnosticCodeMeta, DiagnosticLayer, RegistryError, validate_registry,
+};
 
 /// A half-open byte range in a UTF-8 source file.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -33,6 +39,7 @@ pub enum Severity {
 /// A compile-time diagnostic tied to source text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diagnostic {
+    pub code: DiagnosticCode,
     pub severity: Severity,
     pub message: String,
     pub span: Span,
@@ -41,8 +48,9 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     #[must_use]
-    pub fn error(message: impl Into<String>, span: Span) -> Self {
+    pub fn error(code: DiagnosticCode, message: impl Into<String>, span: Span) -> Self {
         Self {
+            code,
             severity: Severity::Error,
             message: message.into(),
             span,
@@ -51,8 +59,9 @@ impl Diagnostic {
     }
 
     #[must_use]
-    pub fn warning(message: impl Into<String>, span: Span) -> Self {
+    pub fn warning(code: DiagnosticCode, message: impl Into<String>, span: Span) -> Self {
         Self {
+            code,
             severity: Severity::Warning,
             message: message.into(),
             span,
@@ -89,7 +98,8 @@ impl Diagnostic {
             Severity::Error => "error",
             Severity::Warning => "warning",
         };
-        writeln!(output, "{severity}: {}", self.message).expect("writing to a String cannot fail");
+        writeln!(output, "{severity}[{}]: {}", self.code, self.message)
+            .expect("writing to a String cannot fail");
         writeln!(
             output,
             " --> {file_name}:{}:{}",
@@ -129,7 +139,7 @@ fn char_boundary_at_or_before(source: &str, offset: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{Diagnostic, Location, Span, locate};
+    use super::{Diagnostic, Location, Span, codes, locate};
 
     #[test]
     fn finds_unicode_location() {
@@ -139,27 +149,60 @@ mod tests {
 
     #[test]
     fn renders_line_and_column() {
-        let diagnostic = Diagnostic::error("expected a name", Span::new(10, 11));
+        let diagnostic = Diagnostic::error(
+            codes::PARSE_EXPECTED_IDENTIFIER,
+            "expected a name",
+            Span::new(10, 11),
+        );
         let rendered = diagnostic.render("sample.aster", "component {\n}");
         assert!(rendered.contains("sample.aster:1:11"));
         assert!(rendered.contains('^'));
     }
 
     #[test]
+    fn renders_golden_error_and_warning_with_help() {
+        let error = Diagnostic::error(
+            codes::LEX_UNEXPECTED_CHAR,
+            "unexpected character `@`",
+            Span::new(0, 1),
+        );
+        assert_eq!(
+            error.render("sample.aster", "@"),
+            "error[A1001]: unexpected character `@`\n --> sample.aster:1:1\n  |\n1 | @\n  | ^"
+        );
+
+        let warning = Diagnostic::warning(
+            codes::PARSE_SWITCH_CASE_AFTER_DEFAULT,
+            "unreachable code",
+            Span::new(4, 13),
+        )
+        .with_help("remove the unreachable statement");
+        assert_eq!(
+            warning.render("sample.aster", "    return 1;"),
+            "warning[A1133]: unreachable code\n --> sample.aster:1:5\n  |\n1 |     return 1;\n  |     ^^^^^^^^^\nhelp: remove the unreachable statement"
+        );
+    }
+
+    #[test]
     fn arbitrary_byte_offsets_do_not_panic_inside_unicode_scalars() {
         assert_eq!(locate("é", 1), Location { line: 1, column: 1 });
-        let rendered = Diagnostic::error("bad span", Span::new(1, 1)).render("sample.aster", "é");
+        let rendered = Diagnostic::error(codes::LEX_UNEXPECTED_CHAR, "bad span", Span::new(1, 1))
+            .render("sample.aster", "é");
         assert!(rendered.contains("sample.aster:1:1"));
     }
 
     #[test]
     fn marker_width_counts_unicode_scalars_and_stops_at_the_line_boundary() {
-        let unicode =
-            Diagnostic::error("unicode", Span::new(0, "é".len())).render("sample.aster", "é");
+        let unicode = Diagnostic::error(
+            codes::LEX_UNEXPECTED_CHAR,
+            "unicode",
+            Span::new(0, "é".len()),
+        )
+        .render("sample.aster", "é");
         assert!(unicode.ends_with("  | ^"), "{unicode}");
 
-        let multiline =
-            Diagnostic::error("multiline", Span::new(0, 5)).render("sample.aster", "ab\ncd");
+        let multiline = Diagnostic::error(codes::LEX_UNEXPECTED_CHAR, "multiline", Span::new(0, 5))
+            .render("sample.aster", "ab\ncd");
         assert!(multiline.ends_with("  | ^^"), "{multiline}");
     }
 }

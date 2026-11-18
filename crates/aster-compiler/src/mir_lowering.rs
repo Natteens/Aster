@@ -38,6 +38,10 @@ struct FunctionLowerer {
     next_temporary: u32,
     intrinsics: HashMap<hir::SymbolId, hir::Intrinsic>,
     enum_cases: Arc<HashMap<hir::SymbolId, mir::EnumCaseDefinition>>,
+    /// Virtual slot of every virtual, abstract and overriding method: the slot
+    /// index and the method that introduced it. A call to one of these through
+    /// an ordinary receiver is a virtual call; through `base`, a direct call.
+    virtual_slots: Arc<HashMap<hir::SymbolId, (u32, hir::SymbolId)>>,
     /// Set while lowering an async `MoveNext` state machine. When present,
     /// `await` lowers to a use of this pre-materialized result operand and
     /// `return` stores the value as the async task's candidate result before
@@ -65,6 +69,7 @@ impl FunctionLowerer {
             next_temporary: 0,
             intrinsics,
             enum_cases,
+            virtual_slots: Arc::new(HashMap::new()),
             async_await_result: None,
             async_handle: None,
         };
@@ -89,6 +94,14 @@ impl FunctionLowerer {
             lowerer.parameters.push(local);
         }
         lowerer
+    }
+
+    fn with_virtual_slots(
+        mut self,
+        virtual_slots: Arc<HashMap<hir::SymbolId, (u32, hir::SymbolId)>>,
+    ) -> Self {
+        self.virtual_slots = virtual_slots;
+        self
     }
 
     fn lower(mut self, function: &hir::Function, owner: Option<hir::SymbolId>) -> mir::Function {

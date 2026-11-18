@@ -177,7 +177,10 @@ fn string_builder_is_not_worker_transferable() {
         public int Main() { Task<StringBuilder> task = Task.Run(Build); return 0; }
     ";
     let diagnostics = compile(source).expect_err("mutable builder cannot cross worker boundary");
-    assert!(diagnostics.contains("scalar results"), "{diagnostics}");
+    assert!(
+        format!("{diagnostics:?}").contains("cannot cross a worker boundary"),
+        "{diagnostics:?}"
+    );
 }
 
 #[test]

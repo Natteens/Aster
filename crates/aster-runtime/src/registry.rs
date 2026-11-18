@@ -5,6 +5,11 @@
 //! runtime module (files, time, windowing, audio, networking, ECS) means
 //! adding entries here — never special cases inside a backend.
 
+#[cfg(feature = "mem-exp-rc")]
+use crate::context::{
+    aster_rt_array_adopt_elements, aster_rt_array_set_element_descriptor,
+    aster_rt_dictionary_set_descriptors, aster_rt_list_set_element_descriptor,
+};
 use crate::context::{
     aster_rt_array_element, aster_rt_array_length, aster_rt_array_new,
     aster_rt_array_new_temporary, aster_rt_call_enter, aster_rt_call_leave,
@@ -36,6 +41,9 @@ use crate::filesystem::{
     aster_rt_io_read_all_text_temporary, aster_rt_io_write_all_text,
 };
 use crate::foreign::aster_rt_foreign_error;
+use crate::host::{
+    aster_rt_env_get, aster_rt_env_get_temporary, aster_rt_env_has, aster_rt_io_write_error,
+};
 use crate::io::{
     aster_rt_io_read_line, aster_rt_io_read_line_temporary, aster_rt_io_write,
     aster_rt_io_write_line,
@@ -49,6 +57,10 @@ use crate::math::{
     aster_rt_random_mix,
 };
 use crate::object::{aster_rt_object_new, aster_rt_object_new_temporary};
+#[cfg(feature = "mem-exp-rc")]
+use crate::object::{
+    aster_rt_object_release, aster_rt_object_release_last, aster_rt_object_retain,
+};
 use crate::string::{
     aster_rt_string_byte_length, aster_rt_string_concat, aster_rt_string_concat_array,
     aster_rt_string_concat_array_temporary, aster_rt_string_concat_temporary,
@@ -163,6 +175,85 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             signature: RuntimeSignature {
                 parameters: &[RuntimeType::Pointer, RuntimeType::I32],
                 result: Some(RuntimeType::Pointer),
+            },
+        },
+        #[cfg(feature = "mem-exp-rc")]
+        RuntimeFunction {
+            name: "aster_rt_object_retain",
+            address: aster_rt_object_retain as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: None,
+            },
+        },
+        #[cfg(feature = "mem-exp-rc")]
+        RuntimeFunction {
+            name: "aster_rt_object_release",
+            address: aster_rt_object_release as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: None,
+            },
+        },
+        #[cfg(feature = "mem-exp-rc")]
+        RuntimeFunction {
+            name: "aster_rt_object_release_last",
+            address: aster_rt_object_release_last as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: None,
+            },
+        },
+        #[cfg(feature = "mem-exp-rc")]
+        RuntimeFunction {
+            name: "aster_rt_array_set_element_descriptor",
+            address: aster_rt_array_set_element_descriptor as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                ],
+                result: None,
+            },
+        },
+        #[cfg(feature = "mem-exp-rc")]
+        RuntimeFunction {
+            name: "aster_rt_array_adopt_elements",
+            address: aster_rt_array_adopt_elements as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                ],
+                result: None,
+            },
+        },
+        #[cfg(feature = "mem-exp-rc")]
+        RuntimeFunction {
+            name: "aster_rt_dictionary_set_descriptors",
+            address: aster_rt_dictionary_set_descriptors as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                ],
+                result: None,
+            },
+        },
+        #[cfg(feature = "mem-exp-rc")]
+        RuntimeFunction {
+            name: "aster_rt_list_set_element_descriptor",
+            address: aster_rt_list_set_element_descriptor as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                    RuntimeType::Pointer,
+                ],
+                result: None,
             },
         },
         RuntimeFunction {
@@ -1205,6 +1296,22 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             },
         },
         RuntimeFunction {
+            name: "aster_rt_fmod_f32",
+            address: crate::math::aster_rt_fmod_f32 as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::F32, RuntimeType::F32],
+                result: Some(RuntimeType::F32),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_fmod_f64",
+            address: crate::math::aster_rt_fmod_f64 as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::F64, RuntimeType::F64],
+                result: Some(RuntimeType::F64),
+            },
+        },
+        RuntimeFunction {
             name: "aster_rt_math_pow_float",
             address: aster_rt_math_pow_float as *const u8,
             signature: RuntimeSignature {
@@ -1594,6 +1701,38 @@ pub fn runtime_functions() -> Vec<RuntimeFunction> {
             signature: RuntimeSignature {
                 parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
                 result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_io_write_error",
+            address: aster_rt_io_write_error as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: None,
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_env_has",
+            address: aster_rt_env_has as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::I8),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_env_get",
+            address: aster_rt_env_get as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::Pointer),
+            },
+        },
+        RuntimeFunction {
+            name: "aster_rt_env_get_temporary",
+            address: aster_rt_env_get_temporary as *const u8,
+            signature: RuntimeSignature {
+                parameters: &[RuntimeType::Pointer, RuntimeType::Pointer],
+                result: Some(RuntimeType::Pointer),
             },
         },
         RuntimeFunction {

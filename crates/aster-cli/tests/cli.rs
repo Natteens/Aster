@@ -72,8 +72,9 @@ fn conventional_main_and_explicit_function_remain_supported() {
     )
     .expect("write conventional entry");
     let main_output = aster(["run", main.to_str().expect("UTF-8 temporary path")]);
-    assert!(main_output.status.success());
-    assert_eq!(stdout(&main_output).trim(), "42");
+    // `Main`'s `int` is the exit status and is not printed (LANG-018).
+    assert_eq!(main_output.status.code(), Some(42));
+    assert_eq!(stdout(&main_output), "");
 
     let function = directory.join("function.aster");
     fs::write(&function, "public int Calculate() { return 42; }").expect("write explicit function");
@@ -170,8 +171,14 @@ fn field_initializer_construction_runs_without_panicking() {
     let run_output = aster(["run", main.to_str().expect("UTF-8 temporary path")]);
     fs::remove_dir_all(&directory).expect("remove temporary directory");
     assert!(check_output.status.success(), "{}", stderr(&check_output));
-    assert!(run_output.status.success(), "{}", stderr(&run_output));
-    assert_eq!(stdout(&run_output).trim(), "42");
+    // The `int` returned by `Main` is the exit status (LANG-018), not output.
+    assert_eq!(
+        run_output.status.code(),
+        Some(42),
+        "{}",
+        stderr(&run_output)
+    );
+    assert_eq!(stdout(&run_output), "");
 }
 
 #[test]
@@ -207,8 +214,8 @@ fn absolute_source_path_and_embedded_stdlib_work_outside_the_repository() {
         .output()
         .expect("run Aster binary outside repository");
     fs::remove_dir_all(&directory).expect("remove temporary directory");
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(stdout(&output).trim(), "42");
+    assert_eq!(output.status.code(), Some(42), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "");
 }
 
 #[test]
@@ -991,6 +998,95 @@ fn m4f_dictionary_program_runs_via_cli_on_real_filesystem() {
         written.as_deref(),
         Some("files=4;total=12;unique=10;categories=invalid,valid")
     );
+}
+
+#[test]
+fn cli_diagnostics_emit_golden_layer_codes_for_all_layers() {
+    let directory = temporary_directory("golden-diagnostic-codes");
+
+    // A1xxx — Syntax error (lexer & parser)
+    let lex_file = directory.join("lex_err.aster");
+    fs::write(&lex_file, "public int Main() { return @; }").expect("write lex error source");
+    let lex_out = aster(["check", lex_file.to_str().expect("UTF-8 path")]);
+    assert!(!lex_out.status.success());
+    let lex_err = stderr(&lex_out);
+    assert!(
+        lex_err.starts_with("error[A1001]: unexpected character `@`"),
+        "unexpected A1xxx lex stderr: {lex_err}"
+    );
+
+    let parse_file = directory.join("parse_err.aster");
+    fs::write(&parse_file, "public int ( ) { return 0; }").expect("write parse error source");
+    let parse_out = aster(["check", parse_file.to_str().expect("UTF-8 path")]);
+    assert!(!parse_out.status.success());
+    let parse_err = stderr(&parse_out);
+    assert!(
+        parse_err.starts_with("error[A1156]: expected identifier, found `(`"),
+        "unexpected A1xxx parse stderr: {parse_err}"
+    );
+
+    // A2xxx — Semantic error & warning
+    let sem_err_file = directory.join("sem_err.aster");
+    fs::write(
+        &sem_err_file,
+        "public class Program { public static Missing Main() { return 0; } }",
+    )
+    .expect("write semantic error source");
+    let sem_out = aster(["check", sem_err_file.to_str().expect("UTF-8 path")]);
+    assert!(!sem_out.status.success());
+    let sem_err = stderr(&sem_out);
+    assert!(
+        sem_err.starts_with("error[A2476]: unknown type `Missing`"),
+        "unexpected A2xxx error stderr: {sem_err}"
+    );
+
+    let sem_warn_file = directory.join("sem_warn.aster");
+    fs::write(
+        &sem_warn_file,
+        "public class Program { public static int Main() { return 0; int dead = 1; } }",
+    )
+    .expect("write semantic warning source");
+    let warn_out = aster(["check", sem_warn_file.to_str().expect("UTF-8 path")]);
+    assert!(warn_out.status.success(), "{}", stderr(&warn_out));
+    let warn_err = stderr(&warn_out);
+    assert!(
+        warn_err.starts_with("warning[A2435]: unreachable code"),
+        "unexpected A2xxx warning stderr: {warn_err}"
+    );
+
+    // A3xxx — Lowering / MIR validation rejection
+    let mir_err_file = directory.join("mir_err.aster");
+    fs::write(
+        &mir_err_file,
+        "using aster.io;\n\
+         public int Worker() { WriteLine(\"hi\"); return 1; }\n\
+         public class Program { public static int Main() { Task<int> t = Task.Run(Worker); return t.Wait(); } }",
+    )
+    .expect("write MIR rejection source");
+    let mir_out = aster(["check", mir_err_file.to_str().expect("UTF-8 path")]);
+    assert!(!mir_out.status.success());
+    let mir_err = stderr(&mir_out);
+    assert!(
+        mir_err.starts_with("error[A3002]:"),
+        "unexpected A3xxx stderr: {mir_err}"
+    );
+
+    // A4xxx — Backend validation / runtime execution error
+    let backend_err_file = directory.join("backend_err.aster");
+    fs::write(
+        &backend_err_file,
+        "public class Program { public static int Main() { int zero = 0; return 1 / zero; } }",
+    )
+    .expect("write runtime trap source");
+    let backend_out = aster(["run", backend_err_file.to_str().expect("UTF-8 path")]);
+    assert!(!backend_out.status.success());
+    let backend_err = stderr(&backend_out);
+    assert!(
+        backend_err.starts_with("error[A4130]:"),
+        "unexpected A4xxx stderr: {backend_err}"
+    );
+
+    fs::remove_dir_all(&directory).expect("remove temporary directory");
 }
 
 fn aster<const N: usize>(arguments: [&str; N]) -> Output {

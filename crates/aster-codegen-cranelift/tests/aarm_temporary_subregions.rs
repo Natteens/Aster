@@ -222,6 +222,10 @@ fn module(functions: Vec<mir::Function>) -> mir::Module {
         structs: Vec::new(),
         classes: vec![
             mir::ClassDefinition {
+                base: None,
+                is_abstract: false,
+                is_sealed: false,
+                vtable: Vec::new(),
                 symbol: BOX_CLASS,
                 name: "Box".to_owned(),
                 fields: vec![mir::FieldDefinition {
@@ -231,6 +235,10 @@ fn module(functions: Vec<mir::Function>) -> mir::Module {
                 }],
             },
             mir::ClassDefinition {
+                base: None,
+                is_abstract: false,
+                is_sealed: false,
+                vtable: Vec::new(),
                 symbol: STRING_BUILDER_CLASS,
                 name: "aster.core::StringBuilder".to_owned(),
                 fields: Vec::new(),
@@ -365,6 +373,10 @@ fn acyclic_diamond_executes_both_paths_with_one_dynamic_fine_exit() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "mem-exp-rc-core",
+    ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
+)]
 fn simple_natural_array_loop_rewinds_each_iteration_without_changing_result() {
     let mut run = function(
         RUN,
@@ -448,6 +460,10 @@ fn simple_natural_array_loop_rewinds_each_iteration_without_changing_result() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "mem-exp-rc-core",
+    ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
+)]
 fn loop_continue_paths_and_break_after_several_iterations_rewind_exactly_once() {
     let mut run = function(
         RUN,
@@ -730,6 +746,10 @@ fn early_return_from_a_loop_body_exits_the_active_fine_region() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+#[cfg_attr(
+    feature = "mem-exp-rc-core",
+    ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
+)]
 fn nested_outer_temporary_survives_repeated_inner_fine_rewinds() {
     let mut run = function(
         RUN,
@@ -838,6 +858,10 @@ fn nested_outer_temporary_survives_repeated_inner_fine_rewinds() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "mem-exp-rc-core",
+    ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
+)]
 fn simple_natural_object_loop_reclaims_a_bounded_working_set() {
     let mut run = function(
         RUN,
@@ -903,6 +927,10 @@ fn simple_natural_object_loop_reclaims_a_bounded_working_set() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "mem-exp-rc-core",
+    ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
+)]
 fn simple_natural_loop_supports_conditional_and_both_branch_temporary_work() {
     for condition in [true, false] {
         let mut run = function(
@@ -1051,6 +1079,10 @@ fn acyclic_early_returns_exit_the_active_fine_mark_on_each_path() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "mem-exp-rc-core",
+    ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
+)]
 fn sequential_acyclic_diamonds_lower_to_disjoint_fine_regions() {
     let mut run = function(
         RUN,
@@ -1163,6 +1195,10 @@ fn immediate_death_object_subregion_executes_without_a_stale_read() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+#[cfg_attr(
+    feature = "mem-exp-rc-core",
+    ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
+)]
 fn sequential_fine_rewinds_reduce_peak_and_retained_capacity_without_changing_results() {
     use std::time::Instant;
 
@@ -1735,6 +1771,10 @@ fn immutable_temporary_concat_reclaims_without_invalidating_an_older_string() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "mem-exp-rc-core",
+    ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
+)]
 fn immutable_temporary_formatting_reclaims_each_loop_iteration() {
     let string = mir::Type::String;
     let mut run = function(
@@ -1896,6 +1936,10 @@ fn fine_owned_list_and_dictionary_growth_execute_safely() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+#[cfg_attr(
+    feature = "mem-exp-rc-core",
+    ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
+)]
 fn fine_owned_hidden_backing_loop_reclaim_is_bounded_and_checksum_stable() {
     let iterations = std::env::var("ASTER_AARM_HIDDEN_ITERATIONS")
         .ok()
@@ -2004,6 +2048,10 @@ fn fine_owned_hidden_backing_loop_reclaim_is_bounded_and_checksum_stable() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "mem-exp-rc-core",
+    ignore = "MEM-EXP-1 C5 disables region rewinds; this test measures region reclamation"
+)]
 fn mixed_object_array_and_immutable_string_subregions_preserve_results() {
     let string = mir::Type::String;
     let mut module = module(vec![function(

@@ -200,6 +200,7 @@ fn owned_return_producers(
                                 function: callee, ..
                             } => !effects.get(callee).copied().unwrap_or(true),
                             mir::Instruction::CallInterface { .. }
+                            | mir::Instruction::CallVirtual { .. }
                             | mir::Instruction::OwnedRegionEnter { .. }
                             | mir::Instruction::OwnedRegionExit { .. } => false,
                             mir::Instruction::CallIntrinsic { intrinsic, .. } => {
@@ -230,7 +231,11 @@ fn persistent_effects(module: &mir::Module) -> HashMap<mir::SymbolId, bool> {
                 .any(|instruction| {
                     escape_analysis::dynamic_allocation_region(instruction)
                         == Some(mir::AllocationRegion::Persistent)
-                        || matches!(instruction, mir::Instruction::CallInterface { .. })
+                        || matches!(
+                            instruction,
+                            mir::Instruction::CallInterface { .. }
+                                | mir::Instruction::CallVirtual { .. }
+                        )
                         || matches!(instruction,
                             mir::Instruction::CallIntrinsic { intrinsic, .. }
                                 if concurrency_intrinsic(*intrinsic))
@@ -303,6 +308,7 @@ fn supported_span(
                 !effects.get(function).copied().unwrap_or(true)
             }
             mir::Instruction::CallInterface { .. }
+            | mir::Instruction::CallVirtual { .. }
             | mir::Instruction::OwnedRegionEnter { .. }
             | mir::Instruction::OwnedRegionExit { .. }
             | mir::Instruction::TemporarySubregionEnter { .. }

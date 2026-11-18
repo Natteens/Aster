@@ -1271,7 +1271,7 @@ fn dynamic_strings_are_owned_by_each_execution_context() {
 
 #[test]
 fn executes_long_arithmetic_and_returns() {
-    let source = "public long Big() { long base = 4000000000L; return base + 1; }";
+    let source = "public long Big() { long origin = 4000000000L; return origin + 1; }";
     assert_eq!(run(source, "Big"), Ok(ExecutionValue::Long(4_000_000_001)));
 }
 
@@ -1629,13 +1629,14 @@ fn public_execution_apis_return_controlled_integer_errors() {
 }
 
 #[test]
-fn rejects_float_remainder_with_clear_diagnostic() {
-    let error = run(
-        "public float Bad() { float a = 5f; float b = 2f; return a % b; }",
-        "Bad",
-    )
-    .unwrap_err();
-    assert!(error.contains("floating-point remainder"));
+fn executes_float_remainder() {
+    assert_eq!(
+        run(
+            "public float Ok() { float a = 5f; float b = 2f; return a % b; }",
+            "Ok",
+        ),
+        Ok(ExecutionValue::Float(1.0))
+    );
 }
 
 #[test]
@@ -2288,7 +2289,11 @@ fn static_string_concat_chain_allocates_once() {
     assert_eq!(value, ExecutionValue::String("abcde".into()));
     assert_eq!(stats.string_allocations, 1);
     assert_eq!(stats.total_allocations, 1);
-    assert_eq!(stats.requested_bytes, 13);
+    // Header plus the five-byte payload (the header is wider under mem-exp-rc).
+    assert_eq!(
+        stats.requested_bytes,
+        u64::try_from(aster_runtime::ASTER_STR_PAYLOAD_OFFSET + 5).unwrap()
+    );
 }
 
 #[test]

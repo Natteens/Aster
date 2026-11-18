@@ -349,8 +349,11 @@ validate_cli() {
     version=$2
     project=$(mktemp -d "${TMPDIR:-/tmp}/aster-install-project.XXXXXX")
     printf '%s\n' \
-        'using aster.math; public class Program { public static int Main() { return Math.Max(40, 2); } }' \
+        'using aster.io; using aster.math; public class Program { public static void Main() { WriteLine(Math.Max(40, 2).ToString()); } }' \
         > "$project/main.aster"
+    printf '%s\n' \
+        'using aster.math; public class Program { public static int Main() { return Math.Max(40, 2); } }' \
+        > "$project/exit_status.aster"
     old_stdlib_set=0
     if [ "${ASTER_STDLIB+x}" = x ]; then
         old_stdlib_set=1
@@ -359,11 +362,16 @@ validate_cli() {
     unset ASTER_STDLIB
     (
         cd "$project"
-        "$install/bin/aster" --version | grep -F "$version" >/dev/null
-        "$install/bin/aster" check "$project/main.aster" >/dev/null
-        "$install/bin/aster" dump-hir "$project/main.aster" >/dev/null
-        "$install/bin/aster" dump-mir "$project/main.aster" >/dev/null
-        [ "$("$install/bin/aster" run "$project/main.aster")" = 40 ]
+        "$install/bin/aster" --version | grep -F "$version" >/dev/null &&
+        "$install/bin/aster" check "$project/main.aster" >/dev/null &&
+        "$install/bin/aster" dump-hir "$project/main.aster" >/dev/null &&
+        "$install/bin/aster" dump-mir "$project/main.aster" >/dev/null &&
+        [ "$("$install/bin/aster" run "$project/main.aster")" = 40 ] &&
+        {
+            exit_status=0
+            exit_output=$("$install/bin/aster" run "$project/exit_status.aster") || exit_status=$?
+            [ "$exit_status" -eq 40 ] && [ -z "$exit_output" ]
+        }
     ) || {
         rm -rf -- "$project"
         fail "Installed ASTER failed functional validation."

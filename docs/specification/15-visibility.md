@@ -75,8 +75,8 @@ public class Player
 
 Accessible from the declaring class and related derived types. It is valid only for class members
 and related nested types, never for ordinary namespace-level declarations. `protected` is accepted as
-part of the visibility system, but its practical use depends on a future accepted inheritance or
-extension model. Class inheritance itself remains unaccepted.
+part of the visibility system. Single class inheritance (object model B1, pull request 1) gives it
+its meaning: see [classes](../reference/classes.md).
 
 ```aster
 public class Entity

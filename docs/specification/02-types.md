@@ -84,8 +84,8 @@ rejected; write `(int)0x80000000` (an explicit constant cast wraps) for `-214748
 `0xFFFFFFFF | 1` is a `long`; write `0xFFFFFFFF | 1U` to stay unsigned. Digit separators are not
 implemented.
 
-A decimal-point literal without a suffix is currently `float`. This differs from C# and is
-kept for compatibility with existing ASTER source. Floating literals that parse as infinity
+An unsuffixed real literal (with a decimal point or exponent, such as `1.5`, `1e9`, or `1.5e2`)
+defaults to `double`; use `f`/`F` for `float` or `d`/`D` for `double`. Floating literals that parse as infinity
 because they exceed their type's finite range are rejected rather than rounded silently to
 infinity. Normal IEEE 754 rounding still applies to representable source literals.
 
@@ -242,4 +242,3 @@ type. Arrays and monomorphized generics are current language features. Root `obj
   wrapping?
 - **OPEN QUESTION:** What runtime validation model should permit dynamic integer-to-`char`
   conversions while guaranteeing a valid Unicode scalar?
-- **OPEN QUESTION:** Will unsuffixed decimal-point literals remain `float` before ASTER 1.0?

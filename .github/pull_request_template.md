@@ -10,7 +10,7 @@
 
 - [ ] `node editors/vscode/scripts/sync-version.mjs --check`
 - [ ] `cargo fmt --all --check`
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- [ ] `cargo clippy --workspace --all-targets --features aster-codegen-cranelift/aarm-telemetry -- -D warnings`
 - [ ] `cargo test --workspace --all-targets`
 - [ ] `git diff --check`
 - [ ] Commits follow Conventional Commits

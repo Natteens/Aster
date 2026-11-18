@@ -305,7 +305,8 @@ fn decimal_literal_typing_is_unchanged() {
     assert_eq!(literal_type("4294967295U"), hir::Type::UInt);
     assert_eq!(literal_type("4294967296U"), hir::Type::ULong);
     assert_eq!(literal_type("0"), hir::Type::Int);
-    assert_eq!(literal_type("0.5"), hir::Type::Float);
+    assert_eq!(literal_type("0.5"), hir::Type::Double);
+    assert_eq!(literal_type("0.5f"), hir::Type::Float);
     assert_eq!(literal_type("2.5d"), hir::Type::Double);
     assert_eq!(literal_type("-9223372036854775808"), hir::Type::Long);
     // A decimal value above `long` is still rejected without a suffix.

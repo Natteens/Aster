@@ -18,6 +18,7 @@ impl Monomorphizer {
     ) -> String {
         let Some(mut type_name) = TypeName::parse(name) else {
             self.diagnostics.push(Diagnostic::error(
+                super::codes::GENERIC_MALFORMED_TYPE,
                 format!("malformed generic type `{name}`"),
                 span,
             ));
@@ -45,6 +46,7 @@ impl Monomorphizer {
             if type_name.arguments.len() != 1 {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        super::codes::GENERIC_LIST_ARITY,
                         format!(
                             "`List` expects 1 type argument, found {}",
                             type_name.arguments.len()
@@ -59,14 +61,19 @@ impl Monomorphizer {
             if element.arguments.is_empty() && element.array_depth == 0 {
                 if element.base == "void" {
                     self.diagnostics.push(
-                        Diagnostic::error("`List<void>` is not supported", span)
-                            .with_help("use a concrete, non-`void` element type"),
+                        Diagnostic::error(
+                            super::codes::GENERIC_LIST_VOID_ELEMENT,
+                            "`List<void>` is not supported",
+                            span,
+                        )
+                        .with_help("use a concrete, non-`void` element type"),
                     );
                     return type_name.to_string();
                 }
                 if element.base == "decimal" {
                     self.diagnostics.push(
                         Diagnostic::error(
+                            super::codes::GENERIC_LIST_DECIMAL_ELEMENT,
                             "`List<decimal>` cannot be used until `decimal` is executable",
                             span,
                         )
@@ -80,6 +87,7 @@ impl Monomorphizer {
         if type_name.base == "Dictionary" {
             if type_name.arguments.len() != 2 {
                 self.diagnostics.push(Diagnostic::error(
+                    super::codes::GENERIC_DICT_ARITY,
                     format!(
                         "`Dictionary` expects 2 type arguments, found {}",
                         type_name.arguments.len()
@@ -107,6 +115,7 @@ impl Monomorphizer {
                 );
             if !supported_key {
                 self.diagnostics.push(Diagnostic::error(
+                    super::codes::GENERIC_DICT_INVALID_KEY,
                     format!("type `{key}` is not supported as a Dictionary key in ASTER 1.0"),
                     span,
                 ));
@@ -114,10 +123,29 @@ impl Monomorphizer {
             let value = &type_name.arguments[1];
             if value.arguments.is_empty() && value.array_depth == 0 && value.base == "void" {
                 self.diagnostics.push(Diagnostic::error(
+                    super::codes::GENERIC_DICT_VOID_VALUE,
                     "`Dictionary<K, void>` is not supported",
                     span,
                 ));
             }
+            return type_name.to_string();
+        }
+        let is_core_option = type_name.base == "?Option"
+            || type_name.base == format!("{}::Option", crate::standard_library::CORE_NAMESPACE);
+        if is_core_option
+            && type_name.arguments.len() == 1
+            && type_name.arguments[0].base == "void"
+            && type_name.arguments[0].arguments.is_empty()
+            && type_name.arguments[0].array_depth == 0
+        {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    super::codes::SEM_TYPE_VOID_NULLABLE,
+                    "`void` cannot be nullable",
+                    span,
+                )
+                .with_help("use a non-`void` type with `?` or `Option<T>`"),
+            );
             return type_name.to_string();
         }
         let template_arity = self
@@ -132,8 +160,12 @@ impl Monomorphizer {
         let Some(expected) = template_arity else {
             if !type_name.arguments.is_empty() {
                 self.diagnostics.push(
-                    Diagnostic::error(format!("type `{}` is not generic", type_name.base), span)
-                        .with_help("remove the type arguments"),
+                    Diagnostic::error(
+                        super::codes::GENERIC_TYPE_NOT_GENERIC,
+                        format!("type `{}` is not generic", type_name.base),
+                        span,
+                    )
+                    .with_help("remove the type arguments"),
                 );
             }
             return type_name.to_string();
@@ -141,6 +173,7 @@ impl Monomorphizer {
         if type_name.arguments.len() != expected {
             self.diagnostics.push(
                 Diagnostic::error(
+                    super::codes::GENERIC_TYPE_ARITY_MISMATCH,
                     format!(
                         "generic type `{}` expects {expected} type argument(s), found {}",
                         type_name.base,
@@ -207,6 +240,7 @@ impl Monomorphizer {
         {
             self.diagnostics.push(
                 Diagnostic::error(
+                    super::codes::GENERIC_INFINITE_TYPE_EXPANSION,
                     format!("generic type `{name}` creates an infinitely expanding specialization"),
                     span,
                 )
@@ -315,6 +349,7 @@ impl Monomorphizer {
             if let Some(missing) = missing {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        super::codes::GENERIC_CANNOT_INFER_FN_PARAM,
                         format!(
                             "cannot infer type parameter `{missing}` for generic function `{name}`"
                         ),
@@ -331,6 +366,7 @@ impl Monomorphizer {
         } else {
             if explicit.len() != parameter_names.len() {
                 self.diagnostics.push(Diagnostic::error(
+                    super::codes::GENERIC_FN_ARITY_MISMATCH,
                     format!(
                         "generic function `{name}` expects {} type argument(s), found {}",
                         parameter_names.len(),
@@ -344,6 +380,7 @@ impl Monomorphizer {
         };
         if concrete.iter().any(String::is_empty) {
             self.diagnostics.push(Diagnostic::error(
+                super::codes::GENERIC_CANNOT_INFER_FN_CONCRETE,
                 format!("cannot infer concrete types for generic function `{name}`"),
                 span,
             ));
@@ -369,6 +406,7 @@ impl Monomorphizer {
         {
             self.diagnostics.push(
                 Diagnostic::error(
+                    super::codes::GENERIC_RECURSIVE_FN_SPECIALIZATION,
                     format!(
                         "generic function `{name}` recursively creates a different specialization"
                     ),
@@ -436,6 +474,7 @@ impl Monomorphizer {
             {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        super::codes::GENERIC_CANNOT_INFER_METHOD_PARAM,
                         format!(
                             "cannot infer type parameter `{missing}` for generic method `{display_name}`"
                         ),
@@ -452,6 +491,7 @@ impl Monomorphizer {
         } else {
             if explicit.len() != parameter_names.len() {
                 self.diagnostics.push(Diagnostic::error(
+                    super::codes::GENERIC_METHOD_ARITY_MISMATCH,
                     format!(
                         "generic method `{display_name}` expects {} type argument(s), found {}",
                         parameter_names.len(),
@@ -468,6 +508,7 @@ impl Monomorphizer {
         };
         if concrete.iter().any(String::is_empty) {
             self.diagnostics.push(Diagnostic::error(
+                super::codes::GENERIC_CANNOT_INFER_METHOD_CONCRETE,
                 format!("cannot infer concrete types for generic method `{display_name}`"),
                 span,
             ));
@@ -506,6 +547,7 @@ impl Monomorphizer {
         {
             self.diagnostics.push(
                 Diagnostic::error(
+                    super::codes::GENERIC_RECURSIVE_METHOD_SPECIALIZATION,
                     format!(
                         "generic method `{display_name}` recursively creates a different specialization"
                     ),
@@ -537,12 +579,7 @@ impl Monomorphizer {
                     .collect(),
             ],
         );
-        let fields = self
-            .fields
-            .iter()
-            .filter(|((field_owner, _), _)| field_owner == owner)
-            .map(|((_, name), type_)| (name.clone(), type_.clone()))
-            .collect::<HashMap<_, _>>();
+        let fields = self.collect_owner_fields(owner);
         self.method_active.push(key.clone());
         self.analyze_method(owner, &mut method, &fields);
         self.method_active.pop();
