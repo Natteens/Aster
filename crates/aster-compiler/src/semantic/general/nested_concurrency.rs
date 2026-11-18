@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use aster_diagnostics::{Diagnostic, Span};
+use aster_diagnostics::{Diagnostic, Span, codes};
 use aster_syntax::{Block, FunctionDeclaration, Item, Member, Module, TypeDeclaration};
 
 use super::{CallableKey, Context, Dispatch, Model, callable_key};
@@ -136,6 +136,7 @@ pub(super) fn validate(
         ) {
             diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_CONC_ASYNC_PARALLEL_CALL,
                     format!(
                         "async function `{}` transitively calls `{}`, which uses {}",
                         fact.name, reachable.offender, reachable.reason
@@ -217,6 +218,7 @@ fn check_target(
     if let Some(reason) = direct_reason(target, facts, model) {
         diagnostics.push(
             Diagnostic::error(
+                codes::SEM_CONC_NESTED_TARGET_DIRECT,
                 format!("`{operation}` target `{target_name}` itself uses {reason}"),
                 submission_span,
             )
@@ -240,8 +242,12 @@ fn check_target(
             )
         };
         diagnostics.push(
-            Diagnostic::error(message, submission_span)
-                .with_help("nested concurrency is not supported in this version"),
+            Diagnostic::error(
+                codes::SEM_CONC_NESTED_TARGET_TRANSITIVE,
+                message,
+                submission_span,
+            )
+            .with_help("nested concurrency is not supported in this version"),
         );
     }
 }

@@ -993,6 +993,47 @@ impl FunctionLowerer {
                 *return_none_case,
                 *return_none_tag,
             )),
+            hir::ExpressionKind::IsNull {
+                operand,
+                none_tag,
+                negated,
+            } => Some(self.lower_is_null(operand, *none_tag, *negated)),
+            hir::ExpressionKind::NullCoalesce {
+                value,
+                fallback,
+                some_case,
+                some_field,
+                none_tag,
+                unwraps,
+                ..
+            } => Some(self.lower_null_coalesce(
+                value,
+                fallback,
+                &expression.type_,
+                *some_case,
+                *some_field,
+                *none_tag,
+                *unwraps,
+            )),
+            hir::ExpressionKind::NullConditional {
+                receiver,
+                receiver_symbol,
+                receiver_some_case,
+                receiver_some_field,
+                receiver_none_tag,
+                access,
+                result,
+                ..
+            } => self.lower_null_conditional(
+                receiver,
+                *receiver_symbol,
+                *receiver_some_case,
+                *receiver_some_field,
+                *receiver_none_tag,
+                access,
+                result,
+                &expression.type_,
+            ),
             hir::ExpressionKind::Binary {
                 left,
                 operator,

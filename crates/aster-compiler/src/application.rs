@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use aster_diagnostics::{DiagnosticCode, codes};
 use aster_hir::{self as hir, SymbolId, Type, Visibility};
 
 use crate::{
@@ -21,6 +22,7 @@ pub struct ApplicationEntry {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApplicationDiagnostic {
+    pub code: DiagnosticCode,
     pub path: PathBuf,
     pub message: String,
     pub help: String,
@@ -30,9 +32,10 @@ impl ApplicationDiagnostic {
     #[must_use]
     pub fn render(&self) -> String {
         format!(
-            "error[{}]: {}\nhelp: {}",
-            self.path.display(),
+            "error[{}]: {}\n --> {}\nhelp: {}",
+            self.code,
             self.message,
+            self.path.display(),
             self.help
         )
     }
@@ -54,6 +57,7 @@ pub fn select_application_entry(
             select_manifest_entry(project, &path, &entry)
         }
         ManifestApplication::Library(path) => Err(vec![diagnostic(
+            codes::APP_NO_APPLICATION_ENTRY,
             &path,
             "this package does not define an `[application]` entry",
             "add `[application]` with `entry = \"app.Program.Main\"`, or use `aster check` for a library package",
@@ -77,7 +81,7 @@ fn load_manifest_entry(
     let path = manifest.path;
     let manifest = manifest
         .result
-        .map_err(|error| vec![diagnostic(&path, error.message, error.help)])?;
+        .map_err(|error| vec![diagnostic(error.code, &path, error.message, error.help)])?;
     Ok(match manifest.application {
         Some(application) => ManifestApplication::Configured(path, application.entry),
         None => ManifestApplication::Library(path),
@@ -91,6 +95,7 @@ fn select_manifest_entry(
 ) -> Result<ApplicationEntry, Vec<ApplicationDiagnostic>> {
     if crate::standard_library::is_official_name(&entry.namespace) {
         return Err(vec![diagnostic(
+            codes::APP_ENTRY_IN_STDLIB,
             path,
             format!(
                 "application entry cannot point into standard library namespace `{}`",
@@ -104,6 +109,7 @@ fn select_manifest_entry(
         .find(|class| candidates.iter().any(|candidate| candidate == &class.name))
     else {
         return Err(vec![diagnostic(
+            codes::APP_ENTRY_TYPE_NOT_FOUND,
             path,
             format!(
                 "entry type `{}.{}` was not found in the root namespace or its using graph",
@@ -114,6 +120,7 @@ fn select_manifest_entry(
     };
     if class.visibility != Visibility::Public {
         return Err(vec![diagnostic(
+            codes::APP_ENTRY_CLASS_NOT_PUBLIC,
             path,
             format!(
                 "entry class `{}.{}` is not public",
@@ -184,6 +191,7 @@ fn select_conventional_entry(
             .collect::<Vec<_>>()
             .join(", ");
         return Err(vec![diagnostic(
+            codes::APP_MULTIPLE_CONVENTIONAL_ENTRIES,
             root_file,
             format!("more than one conventional application entry was found: {names}"),
             "keep one eligible `public static Main`, or choose one with `Aster.toml`",
@@ -191,6 +199,7 @@ fn select_conventional_entry(
     }
     if candidates.is_empty() {
         return Err(vec![diagnostic(
+            codes::APP_NO_CONVENTIONAL_ENTRY,
             root_file,
             "no application entry was found in the root namespace",
             "add `public static void Main()`, `public static int Main()` or the `string[] args` form to a public class, or pass `--function NAME`",
@@ -201,6 +210,7 @@ fn select_conventional_entry(
         .flat_map(|(class, method)| {
             entry_problems(class, method).into_iter().map(move |problem| {
                 diagnostic(
+                    codes::APP_INVALID_CONVENTIONAL_ENTRY,
                     root_file,
                     format!("`{}.Main` cannot be used as the application entry: {problem}", class.name),
                     "use a public class and declare `public static void Main()` or `public static int Main()`, optionally taking `string[] args`",
@@ -224,6 +234,7 @@ fn select_named_methods(
         .collect::<Vec<_>>();
     if methods.is_empty() {
         return Err(vec![diagnostic(
+            codes::APP_ENTRY_METHOD_NOT_FOUND,
             path,
             format!("entry method `{display_name}` was not found"),
             "declare the configured method as `public static void Main()` or `public static int Main()`, optionally taking `string[] args`",
@@ -241,6 +252,7 @@ fn select_named_methods(
     }
     if valid.len() > 1 {
         return Err(vec![diagnostic(
+            codes::APP_ENTRY_METHOD_AMBIGUOUS,
             path,
             format!("entry `{display_name}` resolves to more than one eligible method"),
             "leave only one eligible public static `Main` overload (`Main()` or `Main(string[] args)`)",
@@ -251,6 +263,7 @@ fn select_named_methods(
         .flat_map(|method| {
             entry_problems(class, method).into_iter().map(|problem| {
                 diagnostic(
+                    codes::APP_INVALID_MANIFEST_ENTRY,
                     path,
                     format!("entry `{display_name}` is invalid: {problem}"),
                     "use a public class and declare `public static void Main()` or `public static int Main()`, optionally taking `string[] args`",
@@ -292,11 +305,13 @@ fn classes(module: &hir::Module) -> impl Iterator<Item = &hir::TypeDeclaration> 
 }
 
 fn diagnostic(
+    code: DiagnosticCode,
     path: &Path,
     message: impl Into<String>,
     help: impl Into<String>,
 ) -> ApplicationDiagnostic {
     ApplicationDiagnostic {
+        code,
         path: path.to_path_buf(),
         message: message.into(),
         help: help.into(),

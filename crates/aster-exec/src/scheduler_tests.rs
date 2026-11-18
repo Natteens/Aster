@@ -6,6 +6,7 @@
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use aster_diagnostics::codes;
 use aster_mir as mir;
 
 use crate::test_support::FakeProvider;
@@ -101,7 +102,13 @@ impl ExecutableProgram for ScriptProgram {
         Result<(ExecutionValue, aster_runtime::MemoryStats), BackendError>,
         Option<aster_runtime::AarmMemoryTelemetry>,
     ) {
-        (Err(BackendError::new("no async steps")), None)
+        (
+            Err(BackendError::new(
+                codes::EXEC_ASYNC_NO_STEPS,
+                "no async steps",
+            )),
+            None,
+        )
     }
 
     fn run_for_chunk(

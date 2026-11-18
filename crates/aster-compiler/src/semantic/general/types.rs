@@ -1,3 +1,5 @@
+use aster_diagnostics::codes;
+
 use super::{
     Context, Diagnostic, Expression, ExpressionKind, HashSet, Literal, Primitive, TypeKind,
     TypeRef, UnaryOperator, primitives,
@@ -132,6 +134,7 @@ pub(super) fn resolve_type(
         {
             diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_TYPE_STATIC_CLASS_AS_VALUE,
                     format!(
                         "static class `{}` cannot be used as a value type",
                         type_ref.name
@@ -142,8 +145,12 @@ pub(super) fn resolve_type(
             );
         } else {
             diagnostics.push(
-                Diagnostic::error(format!("unknown type `{}`", type_ref.name), type_ref.span)
-                    .with_help("declare the type or use a known basic type"),
+                Diagnostic::error(
+                    codes::SEM_TYPE_UNKNOWN,
+                    format!("unknown type `{}`", type_ref.name),
+                    type_ref.span,
+                )
+                .with_help("declare the type or use a known basic type"),
             );
         }
     }

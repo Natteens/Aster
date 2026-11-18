@@ -1,3 +1,4 @@
+use aster_diagnostics::codes;
 use aster_syntax::auto_property_backing_field;
 
 use super::{
@@ -105,6 +106,7 @@ pub(super) fn collect_declarations(
                 let mut cases = Vec::new();
                 if declaration.cases.is_empty() {
                     diagnostics.push(Diagnostic::error(
+                        codes::SEM_DECL_EMPTY_ENUM,
                         format!("enum `{}` must declare at least one case", declaration.name),
                         declaration.span,
                     ));
@@ -112,6 +114,7 @@ pub(super) fn collect_declarations(
                 for case in &declaration.cases {
                     if !names.insert(case.name.as_str()) {
                         diagnostics.push(Diagnostic::error(
+                            codes::SEM_DECL_DUPLICATE_ENUM_CASE,
                             format!("duplicate enum case `{}`", case.name),
                             case.span,
                         ));
@@ -122,6 +125,7 @@ pub(super) fn collect_declarations(
                         if field.default.is_some() {
                             diagnostics.push(
                                 Diagnostic::error(
+                                    codes::SEM_DECL_ENUM_FIELD_DEFAULT,
                                     "enum payload fields cannot declare default values",
                                     field.span,
                                 )
@@ -130,6 +134,7 @@ pub(super) fn collect_declarations(
                         }
                         if !field_names.insert(field.name.as_str()) {
                             diagnostics.push(Diagnostic::error(
+                                codes::SEM_DECL_DUPLICATE_ENUM_PAYLOAD,
                                 format!("duplicate payload name `{}`", field.name),
                                 field.span,
                             ));
@@ -137,6 +142,7 @@ pub(super) fn collect_declarations(
                         let type_ = resolve_type(&field.type_ref, context, diagnostics);
                         if type_ == Type::Void {
                             diagnostics.push(Diagnostic::error(
+                                codes::SEM_DECL_VOID_ENUM_PAYLOAD,
                                 "enum payload cannot have type `void`",
                                 field.type_ref.span,
                             ));
@@ -193,6 +199,7 @@ pub(super) fn collect_declarations(
                 {
                     diagnostics.push(
                         Diagnostic::error(
+                            codes::SEM_DECL_DUPLICATE_OVERLOAD,
                             format!("duplicate overload `{}` with the same parameter types", function.name),
                             function.span,
                         )
@@ -225,6 +232,7 @@ fn collect_type_members(
     if declaration.is_static && !declaration.interfaces.is_empty() {
         diagnostics.push(
             Diagnostic::error(
+                codes::SEM_DECL_STATIC_CLASS_INTERFACE,
                 "a static class cannot implement instance interfaces",
                 declaration.span,
             )
@@ -244,14 +252,22 @@ fn collect_type_members(
                 validate_member_visibility(field.visibility, field.span, kind, diagnostics);
                 if kind == TypeKind::Interface {
                     diagnostics.push(
-                        Diagnostic::error("interfaces cannot declare instance fields", field.span)
-                            .with_help("replace the field with a parameterless method contract"),
+                        Diagnostic::error(
+                            codes::SEM_DECL_INTERFACE_FIELD,
+                            "interfaces cannot declare instance fields",
+                            field.span,
+                        )
+                        .with_help("replace the field with a parameterless method contract"),
                     );
                 }
                 if declaration.is_static {
                     diagnostics.push(
-                        Diagnostic::error("a static class cannot declare fields", field.span)
-                            .with_help("keep state outside the static utility class"),
+                        Diagnostic::error(
+                            codes::SEM_DECL_STATIC_CLASS_FIELD,
+                            "a static class cannot declare fields",
+                            field.span,
+                        )
+                        .with_help("keep state outside the static utility class"),
                     );
                 }
                 if methods.contains_key(&field.name) || !names.insert(field.name.as_str()) {
@@ -260,6 +276,7 @@ fn collect_type_members(
                 let type_ = resolve_type(&field.type_ref, context, diagnostics);
                 if type_ == Type::Void {
                     diagnostics.push(Diagnostic::error(
+                        codes::SEM_DECL_VOID_FIELD,
                         "fields cannot have type `void`",
                         field.type_ref.span,
                     ));
@@ -272,6 +289,7 @@ fn collect_type_members(
                 validate_member_visibility(method.visibility, method.span, kind, diagnostics);
                 if kind == TypeKind::Interface && method.is_static {
                     diagnostics.push(Diagnostic::error(
+                        codes::SEM_DECL_STATIC_INTERFACE_METHOD,
                         "static interface methods are not implemented",
                         method.span,
                     ));
@@ -279,6 +297,7 @@ fn collect_type_members(
                 if method.is_async && method.body.is_none() {
                     diagnostics.push(
                         Diagnostic::error(
+                            codes::SEM_DECL_ASYNC_BODY_REQUIRED,
                             "an `async` function must have a body",
                             method.span,
                         )
@@ -290,6 +309,7 @@ fn collect_type_members(
                 if kind == TypeKind::Interface && method.visibility != Visibility::Public {
                     diagnostics.push(
                         Diagnostic::error(
+                            codes::SEM_DECL_INTERFACE_VISIBILITY,
                             "required interface members are public by contract",
                             method.span,
                         )
@@ -299,6 +319,7 @@ fn collect_type_members(
                 if method.constructor {
                     if kind != TypeKind::Class {
                         diagnostics.push(Diagnostic::error(
+                            codes::SEM_DECL_CTOR_CLASS_ONLY,
                             "constructors are valid only in classes",
                             method.span,
                         ));
@@ -306,6 +327,7 @@ fn collect_type_members(
                     if declaration.is_static {
                         diagnostics.push(
                             Diagnostic::error(
+                                codes::SEM_DECL_STATIC_CLASS_CTOR,
                                 "a static class cannot declare a constructor",
                                 method.span,
                             )
@@ -343,6 +365,7 @@ fn collect_type_members(
                     }) {
                         diagnostics.push(
                             Diagnostic::error(
+                                codes::SEM_DECL_DUPLICATE_OVERLOAD,
                                 format!(
                                     "duplicate constructor `{}` with the same parameter types",
                                     declaration.name
@@ -357,8 +380,12 @@ fn collect_type_members(
                 }
                 if declaration.is_static && !method.is_static {
                     diagnostics.push(
-                        Diagnostic::error("members of a static class must be static", method.span)
-                            .with_help("add `static` to the method"),
+                        Diagnostic::error(
+                            codes::SEM_DECL_STATIC_CLASS_INSTANCE_MEMBER,
+                            "members of a static class must be static",
+                            method.span,
+                        )
+                        .with_help("add `static` to the method"),
                     );
                 }
                 if names.contains(method.name.as_str()) {
@@ -408,6 +435,7 @@ fn collect_type_members(
                 {
                     diagnostics.push(
                         Diagnostic::error(
+                            codes::SEM_DECL_DUPLICATE_OVERLOAD,
                             format!(
                                 "duplicate overload `{}.{}` with the same parameter types",
                                 declaration.name, method.name
@@ -432,6 +460,7 @@ fn collect_type_members(
                 if kind != TypeKind::Class && !(kind == TypeKind::Struct && auto_backing.is_some())
                 {
                     diagnostics.push(Diagnostic::error(
+                        codes::SEM_DECL_PROPERTY_CLASS_ONLY,
                         "properties are currently supported only in classes",
                         property.span,
                     ));
@@ -441,6 +470,7 @@ fn collect_type_members(
                 {
                     diagnostics.push(
                         Diagnostic::error(
+                            codes::SEM_DECL_STRUCT_AUTO_PROP_INIT,
                             "struct auto-property initializers are not supported yet",
                             property.span,
                         )
@@ -450,6 +480,7 @@ fn collect_type_members(
                 if declaration.is_static {
                     diagnostics.push(
                         Diagnostic::error(
+                            codes::SEM_DECL_STATIC_CLASS_PROPERTY,
                             "static-class properties are not implemented",
                             property.span,
                         )
@@ -462,12 +493,14 @@ fn collect_type_members(
                 let type_ = resolve_type(&property.type_ref, context, diagnostics);
                 if type_ == Type::Void {
                     diagnostics.push(Diagnostic::error(
+                        codes::SEM_DECL_VOID_PROPERTY,
                         "properties cannot have type `void`",
                         property.type_ref.span,
                     ));
                 }
                 if property.getter.is_none() && property.setter.is_none() {
                     diagnostics.push(Diagnostic::error(
+                        codes::SEM_DECL_EMPTY_PROPERTY,
                         "a property requires a getter or setter",
                         property.span,
                     ));
@@ -479,6 +512,7 @@ fn collect_type_members(
                     {
                         diagnostics.push(
                             Diagnostic::error(
+                                codes::SEM_DECL_ACCESSOR_VISIBILITY,
                                 "an accessor cannot be more visible than its property",
                                 accessor.span,
                             )
@@ -539,6 +573,7 @@ fn collect_type_members(
                         if accessor.visibility == Visibility::Private {
                             diagnostics.push(
                                 Diagnostic::error(
+                                    codes::SEM_DECL_VIRTUAL_ACCESSOR_PRIVATE,
                                     "an accessor of a `virtual`, `override` or `abstract` property cannot be private",
                                     accessor.span,
                                 )
@@ -629,6 +664,7 @@ pub(super) fn validate_interface_implementations(
             if !seen.insert(interface_ref.name.as_str()) {
                 diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_DECL_DUPLICATE_INTERFACE,
                         format!(
                             "interface `{}` is implemented more than once",
                             interface_ref.name
@@ -642,6 +678,7 @@ pub(super) fn validate_interface_implementations(
             let Some(interface_info) = context.types.get(&interface_ref.name) else {
                 diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_DECL_UNKNOWN_INTERFACE,
                         format!("unknown interface `{}`", interface_ref.name),
                         interface_ref.span,
                     )
@@ -659,6 +696,7 @@ pub(super) fn validate_interface_implementations(
                     let Some(actual_overloads) = class_info.methods.get(method_name) else {
                         diagnostics.push(
                         Diagnostic::error(
+                            codes::SEM_DECL_INTERFACE_MEMBER_MISSING,
                             format!(
                                 "class `{}` does not implement required method `{}.{method_name}`",
                                 class.name, interface_ref.name
@@ -677,6 +715,7 @@ pub(super) fn validate_interface_implementations(
                     if actual.is_none() {
                         diagnostics.push(
                             Diagnostic::error(
+                                codes::SEM_DECL_INTERFACE_MEMBER_MISMATCH,
                                 format!(
                                     "method `{}.{method_name}` does not match interface `{}`",
                                     class.name, interface_ref.name
@@ -691,6 +730,7 @@ pub(super) fn validate_interface_implementations(
                     if actual.is_some_and(|actual| actual.visibility != Visibility::Public) {
                         diagnostics.push(
                             Diagnostic::error(
+                                codes::SEM_DECL_INTERFACE_MEMBER_NOT_PUBLIC,
                                 format!(
                                     "method `{}.{method_name}` must be public to implement `{}`",
                                     class.name, interface_ref.name
@@ -766,6 +806,7 @@ pub(super) fn validate_struct_cycles(
         if let Some(cycle) = visit(name, context, &mut Vec::new(), &mut complete) {
             diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_DECL_VALUE_TYPE_CYCLE,
                     format!("{label}: {}", cycle.join(" -> ")),
                     span,
                 )
@@ -791,6 +832,7 @@ fn signature(
             if !names.insert(parameter.name.as_str()) {
                 diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_DECL_DUPLICATE_PARAM,
                         format!("duplicate parameter `{}`", parameter.name),
                         parameter.span,
                     )
@@ -800,6 +842,7 @@ fn signature(
             let type_ = resolve_type(&parameter.type_ref, context, diagnostics);
             if type_ == Type::Void {
                 diagnostics.push(Diagnostic::error(
+                    codes::SEM_DECL_VOID_PARAM,
                     "parameters cannot have type `void`",
                     parameter.type_ref.span,
                 ));
@@ -809,6 +852,7 @@ fn signature(
             } else if saw_optional {
                 diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_DECL_REQUIRED_AFTER_OPTIONAL,
                         format!(
                             "required parameter `{}` cannot follow an optional parameter",
                             parameter.name
@@ -837,8 +881,12 @@ fn validate_foreign_declaration(
     }
     if function.is_async {
         diagnostics.push(
-            Diagnostic::error("foreign functions cannot be `async`", function.span)
-                .with_help("wrap the foreign call in an ordinary safe function if needed"),
+            Diagnostic::error(
+                codes::SEM_DECL_FOREIGN_ASYNC,
+                "foreign functions cannot be `async`",
+                function.span,
+            )
+            .with_help("wrap the foreign call in an ordinary safe function if needed"),
         );
     }
     let supported = |type_: &Type, allow_void: bool| {
@@ -862,6 +910,7 @@ fn validate_foreign_declaration(
     if !supported(&signature.result, true) {
         diagnostics.push(
             Diagnostic::error(
+                codes::SEM_DECL_FOREIGN_UNSUPPORTED_RESULT,
                 format!(
                     "foreign function result type `{}` is not supported",
                     signature.result.display()
@@ -875,6 +924,7 @@ fn validate_foreign_declaration(
         if !supported(type_, false) {
             diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_DECL_FOREIGN_UNSUPPORTED_PARAM,
                     format!(
                         "foreign parameter type `{}` is not supported",
                         type_.display()
@@ -1001,6 +1051,7 @@ pub(super) fn validate_bodies(
                             validate_property(property, declaration, context, diagnostics, model);
                         } else {
                             diagnostics.push(Diagnostic::error(
+                                codes::SEM_DECL_PROPERTY_CLASS_ONLY,
                                 "properties are currently supported only in classes",
                                 property.span,
                             ));
@@ -1112,7 +1163,12 @@ fn validate_function_with_initialized_fields(
     let initialized_fields = &initialized_fields;
     if function.is_async && function.body.is_none() {
         diagnostics.push(
-            Diagnostic::error("an `async` function must have a body", function.span).with_help(
+            Diagnostic::error(
+                codes::SEM_DECL_ASYNC_BODY_REQUIRED,
+                "an `async` function must have a body",
+                function.span,
+            )
+            .with_help(
                 "`async` is only valid on free functions or static methods with a block body",
             ),
         );
@@ -1178,6 +1234,7 @@ fn validate_function_with_initialized_fields(
             {
                 analyzer.diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_DECL_CTOR_UNINITIALIZED_FIELD,
                         format!(
                             "constructor does not initialize {}",
                             super::field_display(&field)
@@ -1192,6 +1249,7 @@ fn validate_function_with_initialized_fields(
     if return_type != Type::Void && flow.can_continue {
         analyzer.diagnostics.push(
             Diagnostic::error(
+                codes::SEM_DECL_MISSING_RETURN,
                 format!(
                     "function `{}` must return `{}`",
                     function.name,
@@ -1280,6 +1338,7 @@ fn validate_parameter_defaults(
         if type_mentions_parameter(&parameter.type_ref.name, &generic_parameters) {
             analyzer.diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_DECL_DEFAULT_GENERIC_DEPENDENT,
                     format!(
                         "default for generic-dependent parameter `{}` cannot be proven valid for every specialization",
                         parameter.name
@@ -1303,17 +1362,26 @@ fn validate_parameter_defaults(
             Ok(_) => {}
             Err(super::ConstError::NotConstant(span)) => analyzer.diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_DECL_DEFAULT_NON_CONSTANT,
                     "default values must be compile-time constant expressions",
                     span,
                 )
                 .with_help("use literals, namespace constants, operators, `?:`, or casts"),
             ),
-            Err(super::ConstError::Overflow(span, type_name)) => analyzer.diagnostics.push(
-                Diagnostic::error(format!("default value overflows `{type_name}`"), span),
-            ),
-            Err(super::ConstError::DivisionByZero(span)) => analyzer
-                .diagnostics
-                .push(Diagnostic::error("default value divides by zero", span)),
+            Err(super::ConstError::Overflow(span, type_name)) => {
+                analyzer.diagnostics.push(Diagnostic::error(
+                    codes::SEM_DECL_DEFAULT_CONST_OVERFLOW,
+                    format!("default value overflows `{type_name}`"),
+                    span,
+                ));
+            }
+            Err(super::ConstError::DivisionByZero(span)) => {
+                analyzer.diagnostics.push(Diagnostic::error(
+                    codes::SEM_DECL_DEFAULT_CONST_DIV_ZERO,
+                    "default value divides by zero",
+                    span,
+                ));
+            }
         }
     }
     diagnostics.append(&mut analyzer.diagnostics);
@@ -1341,6 +1409,7 @@ fn validate_test_function(
     if owner.is_some() {
         diagnostics.push(
             Diagnostic::error(
+                codes::SEM_DECL_TEST_TOP_LEVEL_ONLY,
                 "test functions must be declared at namespace level",
                 function.span,
             )
@@ -1349,13 +1418,18 @@ fn validate_test_function(
     }
     if function.visibility == Visibility::Public {
         diagnostics.push(
-            Diagnostic::error("test functions cannot be public", function.span)
-                .with_help("tests are package-owned runner metadata; remove `public`"),
+            Diagnostic::error(
+                codes::SEM_DECL_TEST_PUBLIC,
+                "test functions cannot be public",
+                function.span,
+            )
+            .with_help("tests are package-owned runner metadata; remove `public`"),
         );
     }
     if function.is_static || function.is_async || function.is_foreign || function.constructor {
         diagnostics.push(
             Diagnostic::error(
+                codes::SEM_DECL_TEST_INVALID_MODIFIER,
                 "a test function must be synchronous and ordinary",
                 function.span,
             )
@@ -1364,19 +1438,28 @@ fn validate_test_function(
     }
     if !function.type_parameters.is_empty() {
         diagnostics.push(
-            Diagnostic::error("test functions cannot be generic", function.span)
-                .with_help("declare one concrete parameterless test"),
+            Diagnostic::error(
+                codes::SEM_DECL_TEST_GENERIC,
+                "test functions cannot be generic",
+                function.span,
+            )
+            .with_help("declare one concrete parameterless test"),
         );
     }
     if !function.parameters.is_empty() {
         diagnostics.push(
-            Diagnostic::error("test functions cannot declare parameters", function.span)
-                .with_help("write `test void Name() { ... }`"),
+            Diagnostic::error(
+                codes::SEM_DECL_TEST_PARAMS,
+                "test functions cannot declare parameters",
+                function.span,
+            )
+            .with_help("write `test void Name() { ... }`"),
         );
     }
     if function.return_type.name != "void" {
         diagnostics.push(
             Diagnostic::error(
+                codes::SEM_DECL_TEST_RETURN,
                 "test functions must return `void`",
                 function.return_type.span,
             )
@@ -1385,8 +1468,12 @@ fn validate_test_function(
     }
     if function.body.is_none() {
         diagnostics.push(
-            Diagnostic::error("test functions must have a body", function.span)
-                .with_help("write a block body for the test"),
+            Diagnostic::error(
+                codes::SEM_DECL_TEST_BODY,
+                "test functions must have a body",
+                function.span,
+            )
+            .with_help("write a block body for the test"),
         );
     }
 }
@@ -1403,6 +1490,7 @@ fn validate_async_function(
     if let Some(parameter) = function.parameters.first() {
         diagnostics.push(
             Diagnostic::error(
+                codes::SEM_DECL_ASYNC_PARAMS,
                 "an `async` function cannot declare parameters in this version",
                 parameter.span,
             )
@@ -1412,6 +1500,7 @@ fn validate_async_function(
     if !function.is_static && owner.is_some() {
         diagnostics.push(
             Diagnostic::error(
+                codes::SEM_DECL_ASYNC_INSTANCE_METHOD,
                 "`async` instance methods are not supported in this version",
                 function.span,
             )
@@ -1423,6 +1512,7 @@ fn validate_async_function(
             if matches!(**inner, Type::Void) {
                 diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_DECL_ASYNC_VOID_TASK,
                         "`async Task<void>` is not supported in this version",
                         function.return_type.span,
                     )
@@ -1431,6 +1521,7 @@ fn validate_async_function(
             } else if !super::calls::transferable(inner) {
                 diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_DECL_ASYNC_NON_SCALAR_TASK,
                         format!(
                             "`async Task<{}>` requires a scalar result `T` in this version",
                             inner.display()
@@ -1445,6 +1536,7 @@ fn validate_async_function(
         other => {
             diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_DECL_ASYNC_RETURN_TYPE,
                     "an `async` function must return `Task<T>`",
                     function.return_type.span,
                 )
@@ -1477,6 +1569,7 @@ fn validate_async_body(body: &aster_syntax::Block, diagnostics: &mut Vec<Diagnos
             if !direct {
                 diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_DECL_ASYNC_AWAIT_SHAPE,
                         "`await` must directly await `Task.Run(...)` in this version",
                         operand.span,
                     )
@@ -1486,6 +1579,7 @@ fn validate_async_body(body: &aster_syntax::Block, diagnostics: &mut Vec<Diagnos
         }
         [] => diagnostics.push(
             Diagnostic::error(
+                codes::SEM_DECL_ASYNC_AWAIT_COUNT,
                 "an `async` function must contain exactly one `await` in this version",
                 body.span,
             )
@@ -1493,6 +1587,7 @@ fn validate_async_body(body: &aster_syntax::Block, diagnostics: &mut Vec<Diagnos
         ),
         [_, second, ..] => diagnostics.push(
             Diagnostic::error(
+                codes::SEM_DECL_ASYNC_AWAIT_COUNT,
                 "an `async` function may contain only one `await` in this version",
                 second.span,
             )
@@ -1520,6 +1615,7 @@ fn validate_async_body(body: &aster_syntax::Block, diagnostics: &mut Vec<Diagnos
         {
             diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_DECL_ASYNC_PARALLEL,
                     "`Parallel` is not supported inside an `async` function in this version",
                     call.span,
                 )
@@ -1540,6 +1636,7 @@ fn validate_async_statement(statement: &Statement, diagnostics: &mut Vec<Diagnos
         | Statement::Break(span)
         | Statement::Continue(span) => diagnostics.push(
             Diagnostic::error(
+                codes::SEM_DECL_ASYNC_NON_LINEAR_FLOW,
                 "an `async` function must have linear control flow in this version",
                 *span,
             )
@@ -1663,6 +1760,7 @@ pub(super) fn collect_statement_calls<'a>(statement: &'a Statement, out: &mut Ve
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn collect_expression_calls<'a>(expression: &'a Expression, out: &mut Vec<&'a Expression>) {
     if matches!(expression.kind, ExpressionKind::Call { .. }) {
         out.push(expression);
@@ -1671,7 +1769,8 @@ fn collect_expression_calls<'a>(expression: &'a Expression, out: &mut Vec<&'a Ex
         ExpressionKind::Literal(_)
         | ExpressionKind::Name(_)
         | ExpressionKind::This
-        | ExpressionKind::Base => {}
+        | ExpressionKind::Base
+        | ExpressionKind::NullConditionalReceiver => {}
         ExpressionKind::StructLiteral { fields, .. } => {
             for field in fields {
                 collect_expression_calls(&field.value, out);
@@ -1740,7 +1839,15 @@ fn collect_expression_calls<'a>(expression: &'a Expression, out: &mut Vec<&'a Ex
                 collect_expression_calls(default, out);
             }
         }
-        ExpressionKind::Binary { left, right, .. } => {
+        ExpressionKind::Binary { left, right, .. }
+        | ExpressionKind::NullCoalesce {
+            value: left,
+            fallback: right,
+        }
+        | ExpressionKind::NullConditional {
+            receiver: left,
+            access: right,
+        } => {
             collect_expression_calls(left, out);
             collect_expression_calls(right, out);
         }
@@ -1794,6 +1901,7 @@ fn collect_statement_awaits<'a>(statement: &'a Statement, out: &mut Vec<&'a Expr
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn collect_expression_awaits<'a>(expression: &'a Expression, out: &mut Vec<&'a Expression>) {
     match &expression.kind {
         ExpressionKind::Await { operand } => {
@@ -1807,7 +1915,15 @@ fn collect_expression_awaits<'a>(expression: &'a Expression, out: &mut Vec<&'a E
         ExpressionKind::TypePattern { value, .. } | ExpressionKind::TypeAs { value, .. } => {
             collect_expression_awaits(value, out);
         }
-        ExpressionKind::Binary { left, right, .. } => {
+        ExpressionKind::Binary { left, right, .. }
+        | ExpressionKind::NullCoalesce {
+            value: left,
+            fallback: right,
+        }
+        | ExpressionKind::NullConditional {
+            receiver: left,
+            access: right,
+        } => {
             collect_expression_awaits(left, out);
             collect_expression_awaits(right, out);
         }
@@ -1885,7 +2001,8 @@ fn collect_expression_awaits<'a>(expression: &'a Expression, out: &mut Vec<&'a E
         ExpressionKind::Literal(_)
         | ExpressionKind::Name(_)
         | ExpressionKind::This
-        | ExpressionKind::Base => {}
+        | ExpressionKind::Base
+        | ExpressionKind::NullConditionalReceiver => {}
     }
 }
 
@@ -1980,6 +2097,7 @@ fn validate_module_visibility(
     match visibility {
         Visibility::Private => diagnostics.push(
             Diagnostic::error(
+                codes::SEM_DECL_TOP_LEVEL_VISIBILITY,
                 format!("`private` is not valid on a namespace-level {declaration}"),
                 span,
             )
@@ -1987,6 +2105,7 @@ fn validate_module_visibility(
         ),
         Visibility::Protected => diagnostics.push(
             Diagnostic::error(
+                codes::SEM_DECL_TOP_LEVEL_VISIBILITY,
                 format!("`protected` is not valid on a namespace-level {declaration}"),
                 span,
             )
@@ -2005,8 +2124,12 @@ fn validate_member_visibility(
     if visibility == Visibility::Protected && owner != TypeKind::Class {
         let span = explicit_visibility_span(visibility, span);
         diagnostics.push(
-            Diagnostic::error("`protected` is only valid for class members", span)
-                .with_help("use `private`, `internal`, or `public`"),
+            Diagnostic::error(
+                codes::SEM_DECL_PROTECTED_CLASS_ONLY,
+                "`protected` is only valid for class members",
+                span,
+            )
+            .with_help("use `private`, `internal`, or `public`"),
         );
     }
 }
@@ -2030,8 +2153,12 @@ fn explicit_visibility_span(visibility: Visibility, declaration_span: Span) -> S
 
 fn duplicate_member(name: &str, span: Span, diagnostics: &mut Vec<Diagnostic>) {
     diagnostics.push(
-        Diagnostic::error(format!("duplicate member `{name}`"), span)
-            .with_help("rename or remove one of the members"),
+        Diagnostic::error(
+            codes::SEM_DECL_DUPLICATE_MEMBER,
+            format!("duplicate member `{name}`"),
+            span,
+        )
+        .with_help("rename or remove one of the members"),
     );
 }
 
@@ -2058,17 +2185,30 @@ fn check_dispatch_modifier(
     };
     if kind != TypeKind::Class {
         diagnostics.push(
-            Diagnostic::error(format!("only a class {what} can be `{word}`"), span)
-                .with_help("remove the modifier"),
+            Diagnostic::error(
+                codes::SEM_DECL_MODIFIER_CLASS_ONLY,
+                format!("only a class {what} can be `{word}`"),
+                span,
+            )
+            .with_help("remove the modifier"),
         );
     } else if is_static || declaration.is_static {
         diagnostics.push(
-            Diagnostic::error(format!("a static {what} cannot be `{word}`"), span)
-                .with_help("static members are bound statically; remove `static` or the modifier"),
+            Diagnostic::error(
+                codes::SEM_DECL_STATIC_DISPATCH,
+                format!("a static {what} cannot be `{word}`"),
+                span,
+            )
+            .with_help("static members are bound statically; remove `static` or the modifier"),
         );
     } else if visibility == Visibility::Private && dispatch != MemberDispatch::Override {
         diagnostics.push(
-            Diagnostic::error(format!("a private {what} cannot be `{word}`"), span).with_help(
+            Diagnostic::error(
+                codes::SEM_DECL_PRIVATE_DISPATCH,
+                format!("a private {what} cannot be `{word}`"),
+                span,
+            )
+            .with_help(
                 "a derived class cannot see a private member; make it `protected` or `public`",
             ),
         );
@@ -2076,6 +2216,7 @@ fn check_dispatch_modifier(
     if dispatch == MemberDispatch::Abstract && !declaration.is_abstract && kind == TypeKind::Class {
         diagnostics.push(
             Diagnostic::error(
+                codes::SEM_DECL_ABSTRACT_IN_CONCRETE_CLASS,
                 format!(
                     "abstract {what} in class `{}`, which is not abstract",
                     declaration.name

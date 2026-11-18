@@ -3120,7 +3120,10 @@ impl ExecutionContext {
             self.fail("Dictionary.TryGet Option payload layout overflow");
             return;
         };
-        if total_size < 4 || payload_end > total_size {
+        let is_niche = payload_offset == 0
+            && total_size == value_size
+            && value_size as usize == size_of::<*const u8>();
+        if (!is_niche && (payload_offset < 4 || total_size < 4)) || payload_end > total_size {
             self.fail("Dictionary.TryGet Option payload lies outside its destination");
             return;
         }
@@ -3158,9 +3161,11 @@ impl ExecutionContext {
         } else {
             none_tag
         };
-        #[allow(unsafe_code)]
-        unsafe {
-            ptr::write_unaligned(destination.cast::<u32>(), tag);
+        if !is_niche {
+            #[allow(unsafe_code)]
+            unsafe {
+                ptr::write_unaligned(destination.cast::<u32>(), tag);
+            }
         }
     }
 

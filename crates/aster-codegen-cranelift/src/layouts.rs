@@ -1,3 +1,5 @@
+use aster_diagnostics::codes;
+
 use super::{BackendError, HashMap, Primitive, mir, primitive};
 
 #[derive(Clone, Debug)]
@@ -140,7 +142,12 @@ impl ObjectDescriptors {
             let size = layouts
                 .types
                 .get(&class.symbol)
-                .ok_or_else(|| BackendError::new("class has no computed object layout"))?
+                .ok_or_else(|| {
+                    BackendError::new(
+                        codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                        "class has no computed object layout",
+                    )
+                })?
                 .size;
             #[cfg(feature = "mem-exp-rc-core")]
             let offsets = layouts
@@ -148,8 +155,12 @@ impl ObjectDescriptors {
                 .into_boxed_slice();
             #[cfg(feature = "mem-exp-rc-core")]
             let (reference_count, reference_offsets) = (
-                u32::try_from(offsets.len())
-                    .map_err(|_| BackendError::new("class has too many reference fields"))?,
+                u32::try_from(offsets.len()).map_err(|_| {
+                    BackendError::new(
+                        codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                        "class has too many reference fields",
+                    )
+                })?,
                 offsets.as_ptr(),
             );
             #[cfg(not(feature = "mem-exp-rc-core"))]
@@ -181,8 +192,12 @@ impl ObjectDescriptors {
                     reference_offsets,
                 },
                 class_id: mir::type_key(&mir::Type::Class(class.symbol)),
-                interface_count: u32::try_from(entry_count)
-                    .map_err(|_| BackendError::new("class implements too many interfaces"))?,
+                interface_count: u32::try_from(entry_count).map_err(|_| {
+                    BackendError::new(
+                        codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                        "class implements too many interfaces",
+                    )
+                })?,
                 flags,
                 interfaces: if entry_count == 0 {
                     std::ptr::null()
@@ -198,8 +213,12 @@ impl ObjectDescriptors {
                 } else {
                     vtable.as_ptr().cast_const().cast()
                 },
-                vtable_count: u32::try_from(class.vtable.len())
-                    .map_err(|_| BackendError::new("class has too many virtual slots"))?,
+                vtable_count: u32::try_from(class.vtable.len()).map_err(|_| {
+                    BackendError::new(
+                        codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                        "class has too many virtual slots",
+                    )
+                })?,
             }));
             // Every later write and read goes through this raw pointer.
             store
@@ -231,7 +250,10 @@ impl ObjectDescriptors {
             let mut chain = vec![class.symbol];
             while let Some(base) = bases.get(chain.last().expect("chain starts with the class")) {
                 if chain.contains(base) {
-                    return Err(BackendError::new("class inheritance contains a cycle"));
+                    return Err(BackendError::new(
+                        codes::BACKEND_INHERITANCE_LAYOUT_INVALID,
+                        "class inheritance contains a cycle",
+                    ));
                 }
                 chain.push(*base);
             }
@@ -239,10 +261,12 @@ impl ObjectDescriptors {
             let ancestors = chain
                 .iter()
                 .map(|symbol| {
-                    self.by_class
-                        .get(symbol)
-                        .copied()
-                        .ok_or_else(|| BackendError::new("class base has no descriptor"))
+                    self.by_class.get(symbol).copied().ok_or_else(|| {
+                        BackendError::new(
+                            codes::BACKEND_INHERITANCE_LAYOUT_INVALID,
+                            "class base has no descriptor",
+                        )
+                    })
                 })
                 .collect::<Result<Vec<_>, _>>()?
                 .into_boxed_slice();
@@ -253,8 +277,12 @@ impl ObjectDescriptors {
             } else {
                 std::ptr::null()
             };
-            let depth = u32::try_from(chain.len() - 1)
-                .map_err(|_| BackendError::new("class hierarchy is too deep"))?;
+            let depth = u32::try_from(chain.len() - 1).map_err(|_| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    "class hierarchy is too deep",
+                )
+            })?;
             // SAFETY: `own` is the published raw pointer of a descriptor owned
             // by `self.classes` (`RawOwned`), no reference to it is live, and
             // no generated code runs before the program is prepared.
@@ -287,12 +315,14 @@ impl ObjectDescriptors {
                     || !std::ptr::eq(ancestors[ancestors.len() - 1], own)
                 {
                     return Err(BackendError::new(
+                        codes::BACKEND_INHERITANCE_LAYOUT_INVALID,
                         "class descriptor has a malformed ancestor array",
                     ));
                 }
                 if descriptor.base.is_null() {
                     if descriptor.depth != 0 {
                         return Err(BackendError::new(
+                            codes::BACKEND_INHERITANCE_LAYOUT_INVALID,
                             "class descriptor without a base has a non-zero depth",
                         ));
                     }
@@ -300,11 +330,13 @@ impl ObjectDescriptors {
                     let base = &*descriptor.base;
                     if descriptor.depth != base.depth + 1 {
                         return Err(BackendError::new(
+                            codes::BACKEND_INHERITANCE_LAYOUT_INVALID,
                             "class descriptor depth is not its base depth plus one",
                         ));
                     }
                     if base.ancestor_entries() != &ancestors[..ancestors.len() - 1] {
                         return Err(BackendError::new(
+                            codes::BACKEND_INHERITANCE_LAYOUT_INVALID,
                             "class descriptor ancestors do not begin with its base ancestors",
                         ));
                     }
@@ -329,15 +361,28 @@ impl ObjectDescriptors {
             let slot = next.entry(implementation.class).or_default();
             let id = tables
                 .get(&(implementation.class, implementation.interface))
-                .ok_or_else(|| BackendError::new("interface table was not defined"))?;
+                .ok_or_else(|| {
+                    BackendError::new(
+                        codes::BACKEND_INHERITANCE_LAYOUT_INVALID,
+                        "interface table was not defined",
+                    )
+                })?;
             let (address, _) = jit.get_finalized_data(*id);
             let entries = self
                 .interface_entries
                 .get(&implementation.class)
                 .map(RawOwned::as_ptr)
-                .ok_or_else(|| BackendError::new("class descriptor has no interface entry"))?;
+                .ok_or_else(|| {
+                    BackendError::new(
+                        codes::BACKEND_INHERITANCE_LAYOUT_INVALID,
+                        "class descriptor has no interface entry",
+                    )
+                })?;
             if *slot >= entries.len() {
-                return Err(BackendError::new("class descriptor has no interface entry"));
+                return Err(BackendError::new(
+                    codes::BACKEND_INHERITANCE_LAYOUT_INVALID,
+                    "class descriptor has no interface entry",
+                ));
             }
             // SAFETY: `entries` is the published raw pointer of an array owned
             // by `self`, `slot` is in bounds, and no generated code runs yet.
@@ -371,10 +416,14 @@ impl ObjectDescriptors {
     ) -> Result<(), BackendError> {
         for class in &module.classes {
             let Some(table) = self.vtables.get(&class.symbol).map(RawOwned::as_ptr) else {
-                return Err(BackendError::new("class descriptor has no virtual table"));
+                return Err(BackendError::new(
+                    codes::BACKEND_INHERITANCE_LAYOUT_INVALID,
+                    "class descriptor has no virtual table",
+                ));
             };
             if table.len() != class.vtable.len() {
                 return Err(BackendError::new(
+                    codes::BACKEND_INHERITANCE_LAYOUT_INVALID,
                     "class descriptor virtual table has the wrong slot count",
                 ));
             }
@@ -409,11 +458,13 @@ impl ObjectDescriptors {
                 || unsafe { (*own).vtable_count } as usize != entries.len()
             {
                 return Err(BackendError::new(
+                    codes::BACKEND_INHERITANCE_LAYOUT_INVALID,
                     "class descriptor virtual table has the wrong slot count",
                 ));
             }
             if entries.iter().any(|entry| entry.is_null()) {
                 return Err(BackendError::new(
+                    codes::BACKEND_INHERITANCE_LAYOUT_INVALID,
                     "class descriptor virtual table has an unbound slot",
                 ));
             }
@@ -425,6 +476,7 @@ impl ObjectDescriptors {
             let base_entries = unsafe { (*base_descriptor).vtable_entries() };
             if entries.len() < base_entries.len() {
                 return Err(BackendError::new(
+                    codes::BACKEND_INHERITANCE_LAYOUT_INVALID,
                     "class virtual table is shorter than its base class's",
                 ));
             }
@@ -433,6 +485,7 @@ impl ObjectDescriptors {
                     && entries[index] != base_entries[index]
                 {
                     return Err(BackendError::new(
+                        codes::BACKEND_INHERITANCE_LAYOUT_INVALID,
                         "class virtual table does not inherit its base class's slot",
                     ));
                 }
@@ -515,8 +568,12 @@ impl ObjectDescriptors {
             let offsets = offsets.into_boxed_slice();
             let descriptor = Box::new(aster_runtime::object_heap::ObjectDescriptor {
                 size: layouts.type_layout(element_type)?.size,
-                reference_count: u32::try_from(offsets.len())
-                    .map_err(|_| BackendError::new("element has too many reference leaves"))?,
+                reference_count: u32::try_from(offsets.len()).map_err(|_| {
+                    BackendError::new(
+                        codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                        "element has too many reference leaves",
+                    )
+                })?,
                 reference_offsets: offsets.as_ptr(),
             });
             store
@@ -568,6 +625,16 @@ impl ObjectDescriptors {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(super) enum EnumRepr {
+    Tagged,
+    NullPointerNiche {
+        none_tag: u32,
+        some_tag: u32,
+        payload_type: mir::Type,
+    },
+}
+
 pub(super) struct Layouts {
     classes: std::collections::HashSet<mir::SymbolId>,
     /// Direct base of every derived class. A derived object starts with the
@@ -576,6 +643,7 @@ pub(super) struct Layouts {
     pub(super) pointer_bytes: u32,
     pub(super) structs: HashMap<mir::SymbolId, mir::StructDefinition>,
     pub(super) enums: HashMap<mir::SymbolId, mir::EnumDefinition>,
+    pub(super) enum_reprs: HashMap<mir::SymbolId, EnumRepr>,
     pub(super) types: HashMap<mir::SymbolId, TypeLayout>,
     pub(super) fields: HashMap<mir::SymbolId, FieldLayout>,
 }
@@ -610,6 +678,7 @@ impl Layouts {
                 .iter()
                 .map(|definition| (definition.symbol, definition.clone()))
                 .collect(),
+            enum_reprs: HashMap::new(),
             types: HashMap::new(),
             fields: HashMap::new(),
         };
@@ -637,6 +706,7 @@ impl Layouts {
     ///   aligned, do not overlap each other or any inherited field, and end
     ///   inside the object;
     /// * every inherited field keeps exactly the offset it has in the base.
+    #[allow(clippy::too_many_lines)]
     fn validate_class_hierarchy(&self, module: &mir::Module) -> Result<(), BackendError> {
         let definitions = module
             .classes
@@ -651,36 +721,50 @@ impl Layouts {
                 .and_then(|definition| definition.base)
             {
                 if !definitions.contains_key(&base) {
-                    return Err(BackendError::new("class base is not a declared class"));
+                    return Err(BackendError::new(
+                        codes::BACKEND_INHERITANCE_LAYOUT_INVALID,
+                        "class base is not a declared class",
+                    ));
                 }
                 if chain.contains(&base) {
-                    return Err(BackendError::new("class inheritance contains a cycle"));
+                    return Err(BackendError::new(
+                        codes::BACKEND_INHERITANCE_LAYOUT_INVALID,
+                        "class inheritance contains a cycle",
+                    ));
                 }
                 chain.push(base);
             }
-            let layout = self
-                .types
-                .get(&class.symbol)
-                .ok_or_else(|| BackendError::new("class has no computed object layout"))?;
+            let layout = self.types.get(&class.symbol).ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    "class has no computed object layout",
+                )
+            })?;
             let alignment = 1_u32 << layout.align_shift;
             let mut taken: Vec<(u32, u32, mir::SymbolId)> = Vec::new();
             // Root first: each class's own fields must lie at or after the
             // complete size of its base.
             for member in chain.iter().rev() {
                 let definition = definitions[member];
-                let member_layout = self
-                    .types
-                    .get(member)
-                    .ok_or_else(|| BackendError::new("class has no computed object layout"))?;
+                let member_layout = self.types.get(member).ok_or_else(|| {
+                    BackendError::new(
+                        codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                        "class has no computed object layout",
+                    )
+                })?;
                 let floor = match definition.base {
                     Some(base) => {
                         let base_layout = self.types.get(&base).ok_or_else(|| {
-                            BackendError::new("class has no computed object layout")
+                            BackendError::new(
+                                codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                                "class has no computed object layout",
+                            )
                         })?;
                         if member_layout.size < base_layout.size
                             || member_layout.align_shift < base_layout.align_shift
                         {
                             return Err(BackendError::new(
+                                codes::BACKEND_INHERITANCE_LAYOUT_INVALID,
                                 "derived class layout is smaller or less aligned than its base",
                             ));
                         }
@@ -689,25 +773,35 @@ impl Layouts {
                     None => OBJECT_HEADER_BYTES,
                 };
                 for field in &definition.fields {
-                    let field_layout = self
-                        .fields
-                        .get(&field.symbol)
-                        .ok_or_else(|| BackendError::new("field has no computed layout"))?;
+                    let field_layout = self.fields.get(&field.symbol).ok_or_else(|| {
+                        BackendError::new(
+                            codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                            "field has no computed layout",
+                        )
+                    })?;
                     let size = self.type_layout(&field.type_)?.size;
                     let field_alignment = 1_u32 << self.type_layout(&field.type_)?.align_shift;
                     let end = field_layout.offset.checked_add(size).ok_or_else(|| {
-                        BackendError::new("field layout exceeds addressable size")
+                        BackendError::new(
+                            codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                            "field layout exceeds addressable size",
+                        )
                     })?;
                     if field_layout.offset < floor {
                         return Err(BackendError::new(
+                            codes::BACKEND_INHERITANCE_LAYOUT_INVALID,
                             "field starts inside the header or the complete layout of its base",
                         ));
                     }
                     if field_layout.offset % field_alignment != 0 {
-                        return Err(BackendError::new("field offset is not naturally aligned"));
+                        return Err(BackendError::new(
+                            codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                            "field offset is not naturally aligned",
+                        ));
                     }
                     if end > member_layout.size || end > layout.size {
                         return Err(BackendError::new(
+                            codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
                             "field extends past the end of its object",
                         ));
                     }
@@ -716,6 +810,7 @@ impl Layouts {
                             || (field_layout.offset < *other_end && *start < end)
                     }) {
                         return Err(BackendError::new(
+                            codes::BACKEND_INHERITANCE_LAYOUT_INVALID,
                             "class fields overlap or repeat within one inheritance chain",
                         ));
                     }
@@ -724,6 +819,7 @@ impl Layouts {
             }
             if layout.size % alignment != 0 {
                 return Err(BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
                     "class size is not a multiple of its alignment",
                 ));
             }
@@ -772,10 +868,12 @@ impl Layouts {
         native: &std::collections::HashSet<mir::SymbolId>,
         offsets: &mut Vec<u32>,
     ) -> Result<(), BackendError> {
-        let definition = self
-            .structs
-            .get(&aggregate)
-            .ok_or_else(|| BackendError::new("unknown executable struct type"))?;
+        let definition = self.structs.get(&aggregate).ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                "unknown executable struct type",
+            )
+        })?;
         // A derived object starts with its complete base object, so the
         // inherited reference leaves come first, at the offsets they have in
         // the base.
@@ -787,7 +885,12 @@ impl Layouts {
                 + self
                     .fields
                     .get(&field.symbol)
-                    .ok_or_else(|| BackendError::new("field has no computed layout"))?
+                    .ok_or_else(|| {
+                        BackendError::new(
+                            codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                            "field has no computed layout",
+                        )
+                    })?
                     .offset;
             self.collect_type_offsets(&field.type_, offset, native, offsets)?;
         }
@@ -823,6 +926,7 @@ impl Layouts {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn compute_enum(
         &mut self,
         symbol: mir::SymbolId,
@@ -832,14 +936,59 @@ impl Layouts {
             return Ok(layout.clone());
         }
         if visiting.contains(&symbol) {
-            return Err(BackendError::new("recursive enum layout reached the JIT"));
+            return Err(BackendError::new(
+                codes::BACKEND_VALUE_TYPE_LAYOUT_CYCLE,
+                "recursive enum layout reached the JIT",
+            ));
         }
-        let definition = self
-            .enums
-            .get(&symbol)
-            .cloned()
-            .ok_or_else(|| BackendError::new("unknown executable enum type"))?;
+        let definition = self.enums.get(&symbol).cloned().ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                "unknown executable enum type",
+            )
+        })?;
         visiting.push(symbol);
+        if definition.cases.len() == 2 {
+            let (first, second) = (&definition.cases[0], &definition.cases[1]);
+            let matched = if first.fields.is_empty() && second.fields.len() == 1 {
+                Some((first.tag, second.tag, &second.fields[0]))
+            } else if second.fields.is_empty() && first.fields.len() == 1 {
+                Some((second.tag, first.tag, &first.fields[0]))
+            } else {
+                None
+            };
+            if let Some((none_tag, some_tag, some_field)) = matched
+                && matches!(
+                    some_field.type_,
+                    mir::Type::Class(_)
+                        | mir::Type::String
+                        | mir::Type::Array(_)
+                        | mir::Type::List(_)
+                        | mir::Type::Dictionary(_, _)
+                )
+            {
+                let payload_layout = self.layout_of(&some_field.type_, visiting)?;
+                self.enum_reprs.insert(
+                    symbol,
+                    EnumRepr::NullPointerNiche {
+                        none_tag,
+                        some_tag,
+                        payload_type: some_field.type_.clone(),
+                    },
+                );
+                self.fields.insert(
+                    some_field.symbol,
+                    FieldLayout {
+                        offset: 0,
+                        type_: some_field.type_.clone(),
+                    },
+                );
+                visiting.pop();
+                self.types.insert(symbol, payload_layout.clone());
+                return Ok(payload_layout);
+            }
+        }
+        self.enum_reprs.insert(symbol, EnumRepr::Tagged);
         let mut payload_size = 0_u32;
         let mut payload_alignment = 1_u32;
         let mut case_layouts = Vec::new();
@@ -852,9 +1001,12 @@ impl Layouts {
                 payload_alignment = payload_alignment.max(alignment);
                 offset = align_up(offset, alignment)?;
                 fields.push((field, offset));
-                offset = offset
-                    .checked_add(layout.size)
-                    .ok_or_else(|| BackendError::new("enum payload layout is too large"))?;
+                offset = offset.checked_add(layout.size).ok_or_else(|| {
+                    BackendError::new(
+                        codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                        "enum payload layout is too large",
+                    )
+                })?;
             }
             payload_size = payload_size.max(offset);
             case_layouts.push(fields);
@@ -876,8 +1028,12 @@ impl Layouts {
         let size = align_up(payload_offset + payload_size, alignment)?;
         let layout = TypeLayout {
             size,
-            align_shift: u8::try_from(alignment.trailing_zeros())
-                .map_err(|_| BackendError::new("enum alignment is too large"))?,
+            align_shift: u8::try_from(alignment.trailing_zeros()).map_err(|_| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    "enum alignment is too large",
+                )
+            })?,
         };
         self.types.insert(symbol, layout.clone());
         Ok(layout)
@@ -892,10 +1048,16 @@ impl Layouts {
             return Ok(layout.clone());
         }
         if visiting.contains(&symbol) {
-            return Err(BackendError::new("recursive struct layout reached the JIT"));
+            return Err(BackendError::new(
+                codes::BACKEND_VALUE_TYPE_LAYOUT_CYCLE,
+                "recursive struct layout reached the JIT",
+            ));
         }
         let definition = self.structs.get(&symbol).cloned().ok_or_else(|| {
-            BackendError::new(format!("user type {symbol:?} is not an executable struct"))
+            BackendError::new(
+                codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                format!("user type {symbol:?} is not an executable struct"),
+            )
         })?;
         visiting.push(symbol);
         let header = if self.classes.contains(&symbol) {
@@ -924,9 +1086,12 @@ impl Layouts {
                     type_: field.type_,
                 },
             );
-            offset = offset
-                .checked_add(field_layout.size)
-                .ok_or_else(|| BackendError::new("struct layout exceeds addressable size"))?;
+            offset = offset.checked_add(field_layout.size).ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    "struct layout exceeds addressable size",
+                )
+            })?;
         }
         visiting.pop();
         let size = if offset == 0 {
@@ -936,8 +1101,12 @@ impl Layouts {
         };
         let layout = TypeLayout {
             size,
-            align_shift: u8::try_from(alignment.trailing_zeros())
-                .map_err(|_| BackendError::new("struct alignment is too large"))?,
+            align_shift: u8::try_from(alignment.trailing_zeros()).map_err(|_| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    "struct alignment is too large",
+                )
+            })?,
         };
         self.types.insert(symbol, layout.clone());
         Ok(layout)
@@ -957,8 +1126,12 @@ impl Layouts {
         if let mir::Type::Interface(_) = type_ {
             return Ok(TypeLayout {
                 size: self.pointer_bytes * 2,
-                align_shift: u8::try_from(self.pointer_bytes.trailing_zeros())
-                    .map_err(|_| BackendError::new("pointer alignment is too large"))?,
+                align_shift: u8::try_from(self.pointer_bytes.trailing_zeros()).map_err(|_| {
+                    BackendError::new(
+                        codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                        "pointer alignment is too large",
+                    )
+                })?,
             });
         }
         if matches!(
@@ -970,8 +1143,12 @@ impl Layouts {
         ) {
             return Ok(TypeLayout {
                 size: self.pointer_bytes,
-                align_shift: u8::try_from(self.pointer_bytes.trailing_zeros())
-                    .map_err(|_| BackendError::new("pointer alignment is too large"))?,
+                align_shift: u8::try_from(self.pointer_bytes.trailing_zeros()).map_err(|_| {
+                    BackendError::new(
+                        codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                        "pointer alignment is too large",
+                    )
+                })?,
             });
         }
         // `Task<T>` is a plain `i64` handle id (see `declarations::clif_value_type`),
@@ -986,41 +1163,57 @@ impl Layouts {
             Some(Primitive::String) => self.pointer_bytes,
             Some(Primitive::Decimal) => {
                 return Err(BackendError::new(
+                    codes::BACKEND_DECIMAL_UNSUPPORTED,
                     "`decimal` cannot be used in an executable struct until its runtime layout exists",
                 ));
             }
             Some(primitive) => {
                 u32::from(primitive.bit_width().expect("fixed scalar has a width") / 8)
             }
-            None => return Err(BackendError::new("non-value type has no runtime layout")),
+            None => {
+                return Err(BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    "non-value type has no runtime layout",
+                ));
+            }
         };
         Ok(TypeLayout {
             size,
-            align_shift: u8::try_from(size.trailing_zeros())
-                .map_err(|_| BackendError::new("scalar alignment is too large"))?,
+            align_shift: u8::try_from(size.trailing_zeros()).map_err(|_| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    "scalar alignment is too large",
+                )
+            })?,
         })
     }
 
     pub(super) fn type_layout(&self, type_: &mir::Type) -> Result<TypeLayout, BackendError> {
         if let mir::Type::User(symbol) = type_ {
-            return self
-                .types
-                .get(symbol)
-                .cloned()
-                .ok_or_else(|| BackendError::new("unknown executable struct type"));
+            return self.types.get(symbol).cloned().ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                    "unknown executable struct type",
+                )
+            });
         }
         if let mir::Type::Enum(symbol) = type_ {
-            return self
-                .types
-                .get(symbol)
-                .cloned()
-                .ok_or_else(|| BackendError::new("unknown executable enum type"));
+            return self.types.get(symbol).cloned().ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                    "unknown executable enum type",
+                )
+            });
         }
         if let mir::Type::Interface(_) = type_ {
             return Ok(TypeLayout {
                 size: self.pointer_bytes * 2,
-                align_shift: u8::try_from(self.pointer_bytes.trailing_zeros())
-                    .map_err(|_| BackendError::new("pointer alignment is too large"))?,
+                align_shift: u8::try_from(self.pointer_bytes.trailing_zeros()).map_err(|_| {
+                    BackendError::new(
+                        codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                        "pointer alignment is too large",
+                    )
+                })?,
             });
         }
         if matches!(
@@ -1032,8 +1225,12 @@ impl Layouts {
         ) {
             return Ok(TypeLayout {
                 size: self.pointer_bytes,
-                align_shift: u8::try_from(self.pointer_bytes.trailing_zeros())
-                    .map_err(|_| BackendError::new("pointer alignment is too large"))?,
+                align_shift: u8::try_from(self.pointer_bytes.trailing_zeros()).map_err(|_| {
+                    BackendError::new(
+                        codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                        "pointer alignment is too large",
+                    )
+                })?,
             });
         }
         // `Task<T>` is a plain `i64` handle id (see `declarations::clif_value_type`),
@@ -1047,17 +1244,28 @@ impl Layouts {
         let size = match primitive(type_) {
             Some(Primitive::String) => self.pointer_bytes,
             Some(primitive) => u32::from(
-                primitive
-                    .bit_width()
-                    .ok_or_else(|| BackendError::new("type has no executable layout"))?
-                    / 8,
+                primitive.bit_width().ok_or_else(|| {
+                    BackendError::new(
+                        codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                        "type has no executable layout",
+                    )
+                })? / 8,
             ),
-            None => return Err(BackendError::new("type has no executable layout")),
+            None => {
+                return Err(BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    "type has no executable layout",
+                ));
+            }
         };
         Ok(TypeLayout {
             size,
-            align_shift: u8::try_from(size.trailing_zeros())
-                .map_err(|_| BackendError::new("scalar alignment is too large"))?,
+            align_shift: u8::try_from(size.trailing_zeros()).map_err(|_| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    "scalar alignment is too large",
+                )
+            })?,
         })
     }
 
@@ -1076,9 +1284,12 @@ impl Layouts {
             let alignment = 1_u32 << layout.align_shift;
             size = align_up(size, alignment)?;
             offsets.push(size);
-            size = size
-                .checked_add(layout.size)
-                .ok_or_else(|| BackendError::new("Task.Run argument frame is too large"))?;
+            size = size.checked_add(layout.size).ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    "Task.Run argument frame is too large",
+                )
+            })?;
         }
         let size = if size == 0 { 0 } else { align_up(size, 8)? };
         Ok(TaskArgumentLayout { offsets, size })
@@ -1111,7 +1322,12 @@ fn align_up(value: u32, alignment: u32) -> Result<u32, BackendError> {
     value
         .checked_add(alignment - 1)
         .map(|value| value & !(alignment - 1))
-        .ok_or_else(|| BackendError::new("struct layout exceeds addressable size"))
+        .ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                "struct layout exceeds addressable size",
+            )
+        })
 }
 
 #[cfg(test)]
@@ -1367,6 +1583,113 @@ mod layout_tests {
         assert_eq!(layout.offsets, vec![0, 8, 16, 24]);
         assert_eq!(layout.size, 32);
         assert!(super::align_up(u32::MAX, 8).is_err());
+    }
+
+    #[test]
+    fn option_reference_niche_and_nested_tagged_layouts() {
+        fn option_enum(
+            symbol: u32,
+            some_case: u32,
+            some_field: u32,
+            none_case: u32,
+            payload: mir::Type,
+        ) -> mir::EnumDefinition {
+            mir::EnumDefinition {
+                symbol: mir::SymbolId(symbol),
+                name: format!("aster.core::Option<{symbol}>"),
+                cases: vec![
+                    mir::EnumCaseDefinition {
+                        symbol: mir::SymbolId(some_case),
+                        name: "Some".to_owned(),
+                        tag: 0,
+                        fields: vec![mir::FieldDefinition {
+                            symbol: mir::SymbolId(some_field),
+                            name: "value".to_owned(),
+                            type_: payload,
+                        }],
+                    },
+                    mir::EnumCaseDefinition {
+                        symbol: mir::SymbolId(none_case),
+                        name: "None".to_owned(),
+                        tag: 1,
+                        fields: Vec::new(),
+                    },
+                ],
+            }
+        }
+
+        let mut module = empty_module();
+        module.classes.push(mir::ClassDefinition {
+            symbol: mir::SymbolId(1),
+            name: "Item".to_owned(),
+            base: None,
+            is_abstract: false,
+            is_sealed: false,
+            vtable: Vec::new(),
+            fields: Vec::new(),
+        });
+        module.interfaces.push(mir::InterfaceDefinition {
+            symbol: mir::SymbolId(2),
+            name: "Iface".to_owned(),
+            methods: Vec::new(),
+        });
+        module.enums = vec![
+            option_enum(10, 101, 102, 103, mir::Type::Class(mir::SymbolId(1))),
+            option_enum(11, 111, 112, 113, mir::Type::String),
+            option_enum(
+                12,
+                121,
+                122,
+                123,
+                mir::Type::Array(Box::new(mir::Type::Int)),
+            ),
+            option_enum(13, 131, 132, 133, mir::Type::List(Box::new(mir::Type::Int))),
+            option_enum(
+                14,
+                141,
+                142,
+                143,
+                mir::Type::Dictionary(Box::new(mir::Type::String), Box::new(mir::Type::Int)),
+            ),
+            option_enum(15, 151, 152, 153, mir::Type::Enum(mir::SymbolId(10))),
+            option_enum(16, 161, 162, 163, mir::Type::Interface(mir::SymbolId(2))),
+            option_enum(17, 171, 172, 173, mir::Type::Int),
+        ];
+
+        let layouts = Layouts::new(&module, 8).expect("option layouts");
+        for (sym, field) in [(10, 102), (11, 112), (12, 122), (13, 132), (14, 142)] {
+            assert_eq!(layouts.types[&mir::SymbolId(sym)].size, 8);
+            assert!(matches!(
+                layouts.enum_reprs[&mir::SymbolId(sym)],
+                super::EnumRepr::NullPointerNiche { .. }
+            ));
+            assert_eq!(layouts.fields[&mir::SymbolId(field)].offset, 0);
+            assert!(!layouts.zero_initializable(&mir::Type::Enum(mir::SymbolId(sym))));
+        }
+
+        // Option<Option<Class>> must stay 16-byte tagged so None vs Some(None) never collide.
+        assert_eq!(layouts.types[&mir::SymbolId(15)].size, 16);
+        assert!(matches!(
+            layouts.enum_reprs[&mir::SymbolId(15)],
+            super::EnumRepr::Tagged
+        ));
+        assert_eq!(layouts.fields[&mir::SymbolId(152)].offset, 8);
+
+        // Option<Interface> is a 2-word fat pointer -> stays 24-byte tagged.
+        assert_eq!(layouts.types[&mir::SymbolId(16)].size, 24);
+        assert!(matches!(
+            layouts.enum_reprs[&mir::SymbolId(16)],
+            super::EnumRepr::Tagged
+        ));
+        assert_eq!(layouts.fields[&mir::SymbolId(162)].offset, 8);
+
+        // Option<int> stays 8-byte tagged (4B tag + 4B int).
+        assert_eq!(layouts.types[&mir::SymbolId(17)].size, 8);
+        assert!(matches!(
+            layouts.enum_reprs[&mir::SymbolId(17)],
+            super::EnumRepr::Tagged
+        ));
+        assert_eq!(layouts.fields[&mir::SymbolId(172)].offset, 4);
     }
 }
 

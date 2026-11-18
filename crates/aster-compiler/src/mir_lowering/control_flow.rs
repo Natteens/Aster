@@ -1183,6 +1183,248 @@ impl FunctionLowerer {
         self.enum_field(value_local, some_case, some_field, success_type)
     }
 
+    pub(super) fn lower_is_null(
+        &mut self,
+        operand: &hir::Expression,
+        none_tag: u32,
+        negated: bool,
+    ) -> mir::Operand {
+        let operand = self
+            .lower_expression(operand)
+            .expect("validated `== null` operand produces a value");
+        let discriminant = self.temporary(mir::Type::UInt, mir::RvalueKind::Discriminant(operand));
+        let operator = if negated {
+            mir::BinaryOperator::NotEqual
+        } else {
+            mir::BinaryOperator::Equal
+        };
+        self.temporary(
+            mir::Type::Bool,
+            mir::RvalueKind::Binary {
+                left: discriminant,
+                operator,
+                right: mir::Operand {
+                    type_: mir::Type::UInt,
+                    kind: mir::OperandKind::Constant(mir::Constant::Integer(none_tag.to_string())),
+                },
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn lower_null_coalesce(
+        &mut self,
+        value: &hir::Expression,
+        fallback: &hir::Expression,
+        result_type: &hir::Type,
+        some_case: hir::SymbolId,
+        some_field: hir::SymbolId,
+        none_tag: u32,
+        unwraps: bool,
+    ) -> mir::Operand {
+        let result = self.new_temporary(result_type.clone());
+        let value_operand = self
+            .lower_expression(value)
+            .expect("validated `??` LHS produces a value");
+        let value_local = self.new_temporary(value.type_.clone());
+        self.assign(
+            mir::Place::Local(value_local),
+            mir::Rvalue {
+                type_: value.type_.clone(),
+                kind: mir::RvalueKind::Use(value_operand),
+            },
+        );
+        let discriminant = self.temporary(
+            mir::Type::UInt,
+            mir::RvalueKind::Discriminant(mir::Operand {
+                type_: value.type_.clone(),
+                kind: mir::OperandKind::Copy(mir::Place::Local(value_local)),
+            }),
+        );
+        let is_none = self.temporary(
+            mir::Type::Bool,
+            mir::RvalueKind::Binary {
+                left: discriminant,
+                operator: mir::BinaryOperator::Equal,
+                right: mir::Operand {
+                    type_: mir::Type::UInt,
+                    kind: mir::OperandKind::Constant(mir::Constant::Integer(none_tag.to_string())),
+                },
+            },
+        );
+        let none_block = self.new_block();
+        let some_block = self.new_block();
+        let join_block = self.new_block();
+        self.terminate_current(mir::Terminator::Branch {
+            condition: is_none,
+            then_block: none_block,
+            else_block: some_block,
+        });
+        self.current = Some(some_block);
+        let some_value = if unwraps {
+            self.enum_field(value_local, some_case, some_field, result_type)
+        } else {
+            mir::Operand {
+                type_: result_type.clone(),
+                kind: mir::OperandKind::Copy(mir::Place::Local(value_local)),
+            }
+        };
+        self.assign(
+            mir::Place::Local(result),
+            mir::Rvalue {
+                type_: result_type.clone(),
+                kind: mir::RvalueKind::Use(some_value),
+            },
+        );
+        self.terminate_current(mir::Terminator::Goto(join_block));
+        self.current = Some(none_block);
+        let fallback_value = self
+            .lower_expression(fallback)
+            .expect("validated `??` fallback produces a value");
+        self.assign(
+            mir::Place::Local(result),
+            mir::Rvalue {
+                type_: result_type.clone(),
+                kind: mir::RvalueKind::Use(fallback_value),
+            },
+        );
+        self.terminate_current(mir::Terminator::Goto(join_block));
+        self.current = Some(join_block);
+        mir::Operand {
+            type_: result_type.clone(),
+            kind: mir::OperandKind::Copy(mir::Place::Local(result)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(super) fn lower_null_conditional(
+        &mut self,
+        receiver: &hir::Expression,
+        receiver_symbol: hir::SymbolId,
+        receiver_some_case: hir::SymbolId,
+        receiver_some_field: hir::SymbolId,
+        receiver_none_tag: u32,
+        access: &hir::Expression,
+        result: &hir::NullConditionalResult,
+        result_type: &hir::Type,
+    ) -> Option<mir::Operand> {
+        let receiver_operand = self
+            .lower_expression(receiver)
+            .expect("validated `?.` receiver produces a value");
+        let receiver_local = self.new_temporary(receiver.type_.clone());
+        self.assign(
+            mir::Place::Local(receiver_local),
+            mir::Rvalue {
+                type_: receiver.type_.clone(),
+                kind: mir::RvalueKind::Use(receiver_operand),
+            },
+        );
+        let discriminant = self.temporary(
+            mir::Type::UInt,
+            mir::RvalueKind::Discriminant(mir::Operand {
+                type_: receiver.type_.clone(),
+                kind: mir::OperandKind::Copy(mir::Place::Local(receiver_local)),
+            }),
+        );
+        let is_none = self.temporary(
+            mir::Type::Bool,
+            mir::RvalueKind::Binary {
+                left: discriminant,
+                operator: mir::BinaryOperator::Equal,
+                right: mir::Operand {
+                    type_: mir::Type::UInt,
+                    kind: mir::OperandKind::Constant(mir::Constant::Integer(
+                        receiver_none_tag.to_string(),
+                    )),
+                },
+            },
+        );
+        let result_local = (!matches!(result, hir::NullConditionalResult::Void))
+            .then(|| self.new_temporary(result_type.clone()));
+        let none_block = self.new_block();
+        let some_block = self.new_block();
+        let join_block = self.new_block();
+        self.terminate_current(mir::Terminator::Branch {
+            condition: is_none,
+            then_block: none_block,
+            else_block: some_block,
+        });
+        self.current = Some(none_block);
+        if let Some(result_local) = result_local {
+            let (none_case, none_tag) = match result {
+                hir::NullConditionalResult::Wrap {
+                    none_case,
+                    none_tag,
+                    ..
+                }
+                | hir::NullConditionalResult::Flatten {
+                    none_case,
+                    none_tag,
+                } => (*none_case, *none_tag),
+                hir::NullConditionalResult::Void => unreachable!(),
+            };
+            self.assign(
+                mir::Place::Local(result_local),
+                mir::Rvalue {
+                    type_: result_type.clone(),
+                    kind: mir::RvalueKind::EnumConstruct {
+                        case: none_case,
+                        tag: none_tag,
+                        fields: Vec::new(),
+                    },
+                },
+            );
+        }
+        self.terminate_current(mir::Terminator::Goto(join_block));
+        self.current = Some(some_block);
+        let inner_type = self.enum_cases[&receiver_some_case].fields[0].type_.clone();
+        let unwrapped_operand = self.enum_field(
+            receiver_local,
+            receiver_some_case,
+            receiver_some_field,
+            &inner_type,
+        );
+        let mir::OperandKind::Copy(mir::Place::Local(unwrapped_local)) = unwrapped_operand.kind
+        else {
+            unreachable!("enum_field produces a temporary local")
+        };
+        self.symbol_locals.insert(receiver_symbol, unwrapped_local);
+        let access_value = self.lower_expression(access);
+        if let Some(result_local) = result_local {
+            let access_value = access_value.expect("non-void `?.` access produces a value");
+            let rvalue = match result {
+                hir::NullConditionalResult::Wrap {
+                    some_case,
+                    some_field,
+                    some_tag,
+                    ..
+                } => mir::Rvalue {
+                    type_: result_type.clone(),
+                    kind: mir::RvalueKind::EnumConstruct {
+                        case: *some_case,
+                        tag: *some_tag,
+                        fields: vec![mir::FieldOperand {
+                            field: *some_field,
+                            value: access_value,
+                        }],
+                    },
+                },
+                hir::NullConditionalResult::Flatten { .. } => mir::Rvalue {
+                    type_: result_type.clone(),
+                    kind: mir::RvalueKind::Use(access_value),
+                },
+                hir::NullConditionalResult::Void => unreachable!(),
+            };
+            self.assign(mir::Place::Local(result_local), rvalue);
+        }
+        self.terminate_current(mir::Terminator::Goto(join_block));
+        self.current = Some(join_block);
+        result_local.map(|local| mir::Operand {
+            type_: result_type.clone(),
+            kind: mir::OperandKind::Copy(mir::Place::Local(local)),
+        })
+    }
+
     fn enum_field(
         &mut self,
         base: mir::LocalId,

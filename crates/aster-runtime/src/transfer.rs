@@ -45,6 +45,7 @@ const TAG_LIST: u8 = 3;
 const TAG_DICTIONARY: u8 = 4;
 const TAG_STRUCT: u8 = 5;
 const TAG_ENUM: u8 = 6;
+const TAG_NICHE_ENUM: u8 = 7;
 
 /// One enum case of a [`TransferShape::Enum`]: its tag and the fields that
 /// are live when the tag is set (offsets are from the start of the enum value).
@@ -89,6 +90,12 @@ pub enum TransferShape {
     },
     /// An inline tagged enum of `size` bytes; the tag is a `u32` at offset 0.
     Enum { size: u32, cases: Vec<TransferCase> },
+    /// A pointer-width null-pointer-niche enum of `size` bytes (`None` is null
+    /// at offset 0; `Some(payload)` holds the non-null `payload` at offset 0).
+    NicheEnum {
+        size: u32,
+        payload: Box<TransferShape>,
+    },
 }
 
 impl TransferShape {
@@ -101,9 +108,10 @@ impl TransferShape {
             Self::String | Self::Array { .. } | Self::List { .. } | Self::Dictionary { .. } => {
                 size_of::<*const u8>()
             }
-            Self::Scalar { size } | Self::Struct { size, .. } | Self::Enum { size, .. } => {
-                *size as usize
-            }
+            Self::Scalar { size }
+            | Self::Struct { size, .. }
+            | Self::Enum { size, .. }
+            | Self::NicheEnum { size, .. } => *size as usize,
         }
     }
 
@@ -118,6 +126,7 @@ impl TransferShape {
             Self::Enum { cases, .. } => cases
                 .iter()
                 .any(|case| case.fields.iter().any(|(_, field)| field.has_references())),
+            Self::NicheEnum { payload, .. } => payload.has_references(),
         }
     }
 
@@ -183,6 +192,11 @@ impl TransferShape {
                         field.encode_into(out);
                     }
                 }
+            }
+            Self::NicheEnum { size, payload } => {
+                out.push(TAG_NICHE_ENUM);
+                out.extend_from_slice(&size.to_le_bytes());
+                payload.encode_into(out);
             }
         }
     }
@@ -313,6 +327,20 @@ impl ShapeCursor<'_> {
                     return Err("transfer shape enum is smaller than its tag".to_owned());
                 }
                 TransferShape::Enum { size, cases }
+            }
+            TAG_NICHE_ENUM => {
+                let size = self.u32()?;
+                let payload = self.shape(depth + 1)?;
+                if size as usize != size_of::<*const u8>() || payload.image_size() != size as usize
+                {
+                    return Err(
+                        "transfer shape niche enum size must match its pointer payload".to_owned(),
+                    );
+                }
+                TransferShape::NicheEnum {
+                    size,
+                    payload: Box::new(payload),
+                }
             }
             other => return Err(format!("transfer shape has unknown tag {other}")),
         })
@@ -450,5 +478,13 @@ mod tests {
             fields: vec![(0, TransferShape::Scalar { size: 8 })],
         };
         assert!(!plain.has_references());
+
+        let niche = TransferShape::NicheEnum {
+            size: u32::try_from(size_of::<*const u8>()).expect("pointer width"),
+            payload: Box::new(TransferShape::String),
+        };
+        assert_eq!(TransferShape::decode(&niche.encode()), Ok(niche.clone()));
+        assert_eq!(niche.image_size(), size_of::<*const u8>());
+        assert!(niche.has_references());
     }
 }

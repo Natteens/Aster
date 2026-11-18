@@ -159,7 +159,7 @@ fn rejects_labels_of_the_wrong_type_or_out_of_range() {
     );
     rejected_with(
         "public int F(int v) { switch (v) { case 1.5: return 1; default: return 0; } }",
-        "expected `int`, found `float`",
+        "expected `int`, found `double`",
     );
 }
 

@@ -27,7 +27,15 @@ impl TypeName {
 
 impl fmt::Display for TypeName {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.base)?;
+        if self.base == "?Option" {
+            write!(
+                formatter,
+                "{}::Option",
+                crate::standard_library::CORE_NAMESPACE
+            )?;
+        } else {
+            formatter.write_str(&self.base)?;
+        }
         if !self.arguments.is_empty() {
             formatter.write_str("<")?;
             for (index, argument) in self.arguments.iter().enumerate() {
@@ -85,18 +93,28 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        let mut array_depth = 0usize;
-        while self.take(b'[') {
-            if !self.take(b']') {
-                return None;
-            }
-            array_depth += 1;
-        }
-        Some(TypeName {
+        let mut current = TypeName {
             base,
             arguments,
-            array_depth,
-        })
+            array_depth: 0,
+        };
+        loop {
+            if self.take(b'[') {
+                if !self.take(b']') {
+                    return None;
+                }
+                current.array_depth += 1;
+            } else if self.take(b'?') {
+                current = TypeName {
+                    base: "?Option".to_owned(),
+                    arguments: vec![current],
+                    array_depth: 0,
+                };
+            } else {
+                break;
+            }
+        }
+        Some(current)
     }
 
     fn peek(&self) -> Option<u8> {
@@ -121,5 +139,29 @@ mod tests {
     fn parses_and_renders_nested_generic_types() {
         let value = "app::Box<app::Pair<int,string[]>>[]";
         assert_eq!(TypeName::parse(value).unwrap().to_string(), value);
+    }
+
+    #[test]
+    fn parses_nullable_and_array_suffix_ordering() {
+        assert_eq!(
+            TypeName::parse("int?").unwrap().to_string(),
+            "aster.core::Option<int>"
+        );
+        assert_eq!(
+            TypeName::parse("int?[]").unwrap().to_string(),
+            "aster.core::Option<int>[]"
+        );
+        assert_eq!(
+            TypeName::parse("int[]?").unwrap().to_string(),
+            "aster.core::Option<int[]>"
+        );
+        assert_eq!(
+            TypeName::parse("int??").unwrap().to_string(),
+            "aster.core::Option<aster.core::Option<int>>"
+        );
+        assert_eq!(
+            TypeName::parse("int?[]?").unwrap().to_string(),
+            "aster.core::Option<aster.core::Option<int>[]>"
+        );
     }
 }

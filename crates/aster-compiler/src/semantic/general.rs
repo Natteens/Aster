@@ -243,6 +243,12 @@ struct Analyzer<'a> {
     /// Analyzing a member reached through `base`: a static call to the base
     /// implementation, never dispatched dynamically.
     base_access: bool,
+    /// Unwrapped receiver types active while analyzing the `access` tail of
+    /// `receiver?.access`.
+    null_conditional_receiver_types: Vec<Type>,
+    /// True only for the outermost expression of `Statement::Expression`, so
+    /// `void`-returning `?.` is accepted as a statement and rejected in values.
+    allow_void_null_conditional: bool,
 }
 
 impl<'a> Analyzer<'a> {
@@ -303,6 +309,8 @@ impl<'a> Analyzer<'a> {
             base_arguments: false,
             chain_label: "base",
             base_access: false,
+            null_conditional_receiver_types: Vec::new(),
+            allow_void_null_conditional: false,
         }
     }
 

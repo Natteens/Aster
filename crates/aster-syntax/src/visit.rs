@@ -433,7 +433,15 @@ pub fn walk_expression_mut<V: AstVisitorMut + ?Sized>(
             visitor.visit_expression_mut(value);
             visitor.visit_type_ref_mut(target);
         }
-        ExpressionKind::Binary { left, right, .. } => {
+        ExpressionKind::Binary { left, right, .. }
+        | ExpressionKind::NullCoalesce {
+            value: left,
+            fallback: right,
+        }
+        | ExpressionKind::NullConditional {
+            receiver: left,
+            access: right,
+        } => {
             visitor.visit_expression_mut(left);
             visitor.visit_expression_mut(right);
         }
@@ -451,7 +459,8 @@ pub fn walk_expression_mut<V: AstVisitorMut + ?Sized>(
         ExpressionKind::Literal(_)
         | ExpressionKind::Name(_)
         | ExpressionKind::This
-        | ExpressionKind::Base => {}
+        | ExpressionKind::Base
+        | ExpressionKind::NullConditionalReceiver => {}
     }
 }
 

@@ -9,6 +9,8 @@
 //! `CallableKey` or `field_owner`, which is what HIR lowering and the access
 //! rules use.
 
+use aster_diagnostics::codes;
+
 use super::{
     Analyzer, Argument, Binding, Callable, Context, Diagnostic, FunctionDeclaration, HashMap,
     HashSet, Item, Member, MemberDispatch, Model, Module, ResolvedBaseConstructor, Span, Type,
@@ -55,6 +57,7 @@ fn validate_heritage(
                     if info.is_static {
                         diagnostics.push(
                             Diagnostic::error(
+                                codes::SEM_INH_STATIC_BASE_CLASS,
                                 format!("static class `{}` cannot be a base class", entry.name),
                                 entry.span,
                             )
@@ -65,6 +68,7 @@ fn validate_heritage(
                     } else if info.is_sealed {
                         diagnostics.push(
                             Diagnostic::error(
+                                codes::SEM_INH_SEALED_BASE_CLASS,
                                 format!(
                                     "class `{}` is sealed and cannot be derived from",
                                     entry.name
@@ -79,6 +83,7 @@ fn validate_heritage(
                     if seen_base {
                         diagnostics.push(
                             Diagnostic::error(
+                                codes::SEM_INH_MULTIPLE_BASE_CLASSES,
                                 format!(
                                     "class `{}` cannot have a second base class `{}`",
                                     class.name, entry.name
@@ -90,6 +95,7 @@ fn validate_heritage(
                     } else if index > 0 {
                         diagnostics.push(
                             Diagnostic::error(
+                                codes::SEM_INH_BASE_AFTER_INTERFACE,
                                 format!(
                                     "the base class `{}` must be listed before the interfaces",
                                     entry.name
@@ -105,6 +111,7 @@ fn validate_heritage(
                 }
                 Some(TypeKind::Struct | TypeKind::Enum) => diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_INH_NON_CLASS_BASE,
                         format!(
                             "`{}` is a {} and cannot be a base class",
                             entry.name,
@@ -149,6 +156,7 @@ fn break_cycles(
                 path.push_str(&current);
                 diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_INH_CYCLE,
                         format!("cyclic inheritance: {path}"),
                         spans.get(current.as_str()).copied().unwrap_or(class.span),
                     )
@@ -212,6 +220,7 @@ fn merge(
         {
             diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_INH_DUPLICATE_BASE_INTERFACE,
                     format!(
                         "interface `{}` is already implemented by base class `{base}`",
                         entry.name
@@ -240,6 +249,7 @@ fn merge(
                     diagnostics: &mut Vec<Diagnostic>| {
         diagnostics.push(
             Diagnostic::error(
+                codes::SEM_INH_MEMBER_CONFLICT,
                 format!(
                     "member `{member}` of `{name}` conflicts with the inherited {what} `{inherited}.{member}`"
                 ),
@@ -325,6 +335,7 @@ fn merge(
         }
         diagnostics.push(
             Diagnostic::error(
+                codes::SEM_INH_UNMARKED_OVERRIDE,
                 format!(
                     "method `{name}.{method_name}` has the signature of the inherited method `{declared_in}.{method_name}`"
                 ),
@@ -387,6 +398,7 @@ fn merge(
         if own.type_ != property.type_ {
             diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_INH_OVERRIDE_TYPE_MISMATCH,
                     format!(
                         "{what} overrides {target} with a different type (`{}` instead of `{}`)",
                         own.type_.display(),
@@ -408,6 +420,7 @@ fn merge(
             let Some(base_accessor) = base_accessor else {
                 diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_INH_OVERRIDE_ACCESSOR_MISMATCH,
                         format!("{what} adds a {kind} that {target} does not have"),
                         span,
                     )
@@ -459,6 +472,7 @@ fn check_override(
     if base.dispatch == MemberDispatch::None {
         diagnostics.push(
             Diagnostic::error(
+                codes::SEM_INH_OVERRIDE_NON_VIRTUAL,
                 format!(
                     "{what} cannot override {target}, which is not virtual, abstract or an override"
                 ),
@@ -471,6 +485,7 @@ fn check_override(
     if own.signature.result != base.signature.result {
         diagnostics.push(
             Diagnostic::error(
+                codes::SEM_INH_OVERRIDE_TYPE_MISMATCH,
                 format!(
                     "{what} overrides {target} with a different return type (`{}` instead of `{}`)",
                     own.signature.result.display(),
@@ -487,6 +502,7 @@ fn check_override(
     if own.visibility != base.visibility {
         diagnostics.push(
             Diagnostic::error(
+                codes::SEM_INH_OVERRIDE_VISIBILITY,
                 format!("{what} overrides {target} with a different visibility"),
                 span,
             )
@@ -588,6 +604,7 @@ pub(super) fn validate_overrides(
         for member in missing {
             diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_INH_MISSING_ABSTRACT_OVERRIDE,
                     format!(
                         "class `{}` does not override the inherited abstract member `{member}`",
                         class.name
@@ -632,9 +649,11 @@ fn unmatched_override(
             class.name
         )
     };
-    diagnostics.push(Diagnostic::error(message, span).with_help(
-        "an override must match an inherited `virtual`, `abstract` or `override` member exactly",
-    ));
+    diagnostics.push(
+        Diagnostic::error(codes::SEM_INH_OVERRIDE_NO_TARGET, message, span).with_help(
+            "an override must match an inherited `virtual`, `abstract` or `override` member exactly",
+        ),
+    );
 }
 
 /// Resolve and validate the constructor a constructor runs first: the target
@@ -667,6 +686,7 @@ pub(super) fn analyze_base_call(
             if let Some(call) = &function.base_call {
                 diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_INH_BASE_CALL_NO_BASE,
                         format!("`base(...)` requires `{}` to have a base class", owner.name),
                         call.span,
                     )
@@ -685,6 +705,7 @@ pub(super) fn analyze_base_call(
         if base_info.constructors.is_empty() {
             diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_INH_BASE_NO_CTOR,
                     format!("base class `{base}` has no constructor to call"),
                     call_span,
                 )
@@ -703,6 +724,7 @@ pub(super) fn analyze_base_call(
         if accessible.is_empty() {
             diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_INH_BASE_CTOR_PRIVATE,
                     format!("constructor of base class `{base}` is private"),
                     call_span,
                 )
@@ -717,6 +739,7 @@ pub(super) fn analyze_base_call(
         {
             diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_INH_BASE_CTOR_REQUIRED,
                     format!(
                         "constructor of `{}` must call `base(...)`: base class `{base}` has no constructor without required arguments",
                         owner.name
@@ -849,6 +872,7 @@ pub(super) fn check_delegation_cycles(
                     let first = *cycle.iter().min().expect("a cycle has a constructor");
                     diagnostics.push(
                         Diagnostic::error(
+                            codes::SEM_INH_CTOR_DELEGATION_CYCLE,
                             format!(
                                 "constructors of `{}` delegate to each other in a cycle through `this(...)`",
                                 declaration.name
@@ -911,7 +935,7 @@ impl Analyzer<'_> {
             "`base` requires the class to have a base class"
         };
         self.diagnostics.push(
-            Diagnostic::error(message, span)
+            Diagnostic::error(codes::SEM_INH_BASE_INVALID_CONTEXT, message, span)
                 .with_help("name a base class after `:` in the class declaration"),
         );
         Type::Unknown
@@ -949,14 +973,19 @@ impl Analyzer<'_> {
             Visibility::Private => {
                 if self.owner.as_deref() != Some(declared_in) {
                     self.diagnostics.push(
-                        Diagnostic::error(format!("{member} is private"), span)
-                            .with_help("access the value through a public member"),
+                        Diagnostic::error(
+                            codes::SEM_INH_PRIVATE_ACCESS,
+                            format!("{member} is private"),
+                            span,
+                        )
+                        .with_help("access the value through a public member"),
                     );
                 }
             }
             Visibility::Protected => {
                 let Some(current) = self.owner.clone() else {
                     self.diagnostics.push(Diagnostic::error(
+                        codes::SEM_INH_PROTECTED_ACCESS,
                         format!("{member} is protected and not accessible here"),
                         span,
                     ));
@@ -965,6 +994,7 @@ impl Analyzer<'_> {
                 if !self.derives_from(&current, declared_in) {
                     self.diagnostics.push(
                         Diagnostic::error(
+                            codes::SEM_INH_PROTECTED_ACCESS,
                             format!(
                                 "{member} is protected and accessible only inside `{declared_in}` and its derived classes"
                             ),
@@ -975,6 +1005,7 @@ impl Analyzer<'_> {
                 } else if !self.derives_from(receiver, &current) {
                     self.diagnostics.push(
                         Diagnostic::error(
+                            codes::SEM_INH_PROTECTED_ACCESS,
                             format!(
                                 "{member} is protected: inside `{current}` it can only be reached through a `{current}` (or derived) receiver, not a `{receiver}`"
                             ),
@@ -1007,6 +1038,7 @@ impl Analyzer<'_> {
         };
         self.diagnostics.push(
             Diagnostic::error(
+                codes::SEM_INH_PRIVATE_ACCESS,
                 format!("{kind} `{declared_in}.{member}` is private to its base class"),
                 span,
             )

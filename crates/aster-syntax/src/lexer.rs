@@ -1,4 +1,4 @@
-use aster_diagnostics::{Diagnostic, Span};
+use aster_diagnostics::{Diagnostic, Span, codes};
 
 use crate::{Token, TokenKind};
 
@@ -20,6 +20,13 @@ pub fn lex(source: &str) -> Result<Vec<Token>, Vec<Diagnostic>> {
     } else {
         Err(lexer.diagnostics)
     }
+}
+
+enum PrefixedIntSuffix {
+    Unspecified,
+    UInt,
+    Long,
+    ULong,
 }
 
 struct Lexer<'a> {
@@ -67,7 +74,17 @@ impl Lexer<'_> {
             ']' => self.token(TokenKind::RightBracket, start),
             ',' => self.token(TokenKind::Comma, start),
             ':' => self.token(TokenKind::Colon, start),
-            '?' => self.token(TokenKind::Question, start),
+            '?' => match self.peek() {
+                Some('?') => {
+                    self.bump();
+                    self.token(TokenKind::QuestionQuestion, start);
+                }
+                Some('.') => {
+                    self.bump();
+                    self.token(TokenKind::QuestionDot, start);
+                }
+                _ => self.token(TokenKind::Question, start),
+            },
             ';' => self.token(TokenKind::Semicolon, start),
             '.' => self.token(TokenKind::Dot, start),
             '+' => match self.peek() {
@@ -120,6 +137,7 @@ impl Lexer<'_> {
             '^' => self.two_character(start, '=', TokenKind::CaretEqual, TokenKind::Caret),
             '~' => self.token(TokenKind::Tilde, start),
             _ => self.diagnostics.push(Diagnostic::error(
+                codes::LEX_UNEXPECTED_CHAR,
                 format!("unexpected character `{character}`"),
                 Span::new(start, self.cursor),
             )),
@@ -145,6 +163,7 @@ impl Lexer<'_> {
                 let Some(character) = self.peek() else {
                     self.diagnostics.push(
                         Diagnostic::error(
+                            codes::LEX_UNTERMINATED_INTERP_STRING,
                             "unterminated interpolated string literal",
                             Span::new(start, self.cursor),
                         )
@@ -156,6 +175,7 @@ impl Lexer<'_> {
                 if character == '\n' || character == '\r' {
                     self.diagnostics.push(
                         Diagnostic::error(
+                            codes::LEX_UNTERMINATED_INTERP_STRING,
                             "unterminated interpolated string literal",
                             Span::new(start, self.cursor),
                         )
@@ -204,6 +224,7 @@ impl Lexer<'_> {
                     }
                     self.diagnostics.push(
                         Diagnostic::error(
+                            codes::LEX_UNMATCHED_INTERP_BRACE,
                             "unmatched `}` in interpolated string",
                             Span::new(brace_start, self.cursor),
                         )
@@ -217,6 +238,7 @@ impl Lexer<'_> {
                     let Some(escaped) = self.bump() else {
                         self.diagnostics.push(
                             Diagnostic::error(
+                                codes::LEX_UNTERMINATED_INTERP_STRING,
                                 "unterminated interpolated string literal",
                                 Span::new(start, self.cursor),
                             )
@@ -235,6 +257,7 @@ impl Lexer<'_> {
                         _ => {
                             self.diagnostics.push(
                                 Diagnostic::error(
+                                    codes::LEX_UNSUPPORTED_ESCAPE,
                                     format!("unsupported escape sequence `\\{escaped}`"),
                                     Span::new(self.cursor - escaped.len_utf8() - 1, self.cursor),
                                 )
@@ -260,6 +283,7 @@ impl Lexer<'_> {
                 if self.cursor >= self.source.len() {
                     self.diagnostics.push(
                         Diagnostic::error(
+                            codes::LEX_UNTERMINATED_INTERP_STRING,
                             "unterminated interpolated string literal",
                             Span::new(start, self.cursor),
                         )
@@ -346,6 +370,7 @@ impl Lexer<'_> {
             "base" => TokenKind::Base,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
+            "null" => TokenKind::Null,
             _ => TokenKind::Identifier(text.to_owned()),
         };
         self.token(kind, start);
@@ -360,6 +385,7 @@ impl Lexer<'_> {
         }
         if self.source[..self.cursor].ends_with('_') {
             self.separator_error(
+                codes::LEX_TRAILING_UNDERSCORE,
                 start,
                 "a digit separator `_` must be followed by a digit",
                 "remove the trailing `_` or add digits after it",
@@ -371,7 +397,13 @@ impl Lexer<'_> {
 
     /// Report a malformed numeric literal and skip the rest of its characters
     /// so that the error does not cascade.
-    fn separator_error(&mut self, start: usize, message: &str, help: &str) {
+    fn separator_error(
+        &mut self,
+        code: aster_diagnostics::DiagnosticCode,
+        start: usize,
+        message: &str,
+        help: &str,
+    ) {
         while self
             .peek()
             .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -379,7 +411,8 @@ impl Lexer<'_> {
             self.bump();
         }
         self.diagnostics.push(
-            Diagnostic::error(message, Span::new(start, self.cursor)).with_help(help.to_owned()),
+            Diagnostic::error(code, message, Span::new(start, self.cursor))
+                .with_help(help.to_owned()),
         );
     }
 
@@ -394,6 +427,7 @@ impl Lexer<'_> {
             Some(c) if c.is_ascii_digit() => self.separated_digits(start),
             Some('_') => {
                 self.separator_error(
+                    codes::LEX_SEPARATOR_AFTER_EXPONENT,
                     start,
                     "a digit separator `_` cannot follow the exponent marker",
                     "write a digit directly after `e` and its optional sign",
@@ -402,8 +436,12 @@ impl Lexer<'_> {
             }
             _ => {
                 self.diagnostics.push(
-                    Diagnostic::error("exponent has no digits", Span::new(start, self.cursor))
-                        .with_help("write at least one digit after `e`, `e+`, or `e-`"),
+                    Diagnostic::error(
+                        codes::LEX_EXPONENT_NO_DIGITS,
+                        "exponent has no digits",
+                        Span::new(start, self.cursor),
+                    )
+                    .with_help("write at least one digit after `e`, `e+`, or `e-`"),
                 );
                 false
             }
@@ -436,6 +474,7 @@ impl Lexer<'_> {
             } else if next == Some('_') {
                 self.bump();
                 self.separator_error(
+                    codes::LEX_SEPARATOR_AFTER_DECIMAL,
                     start,
                     "a digit separator `_` cannot follow a decimal point",
                     "write a digit directly after the `.`",
@@ -455,6 +494,7 @@ impl Lexer<'_> {
                 self.bump();
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::LEX_INT_SUFFIX_ON_FLOAT,
                         "integer suffixes are not valid on literals with a decimal point",
                         Span::new(start, self.cursor),
                     )
@@ -492,7 +532,7 @@ impl Lexer<'_> {
                 self.bump();
                 TokenKind::DecimalLiteral(text)
             }
-            _ if is_float => TokenKind::FloatLiteral(text),
+            _ if is_float => TokenKind::DoubleLiteral(text),
             _ => TokenKind::IntegerLiteral(text),
         };
         self.token(kind, start);
@@ -527,6 +567,7 @@ impl Lexer<'_> {
         if digits.ends_with('_') {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::LEX_TRAILING_UNDERSCORE,
                     "a digit separator `_` must be followed by a digit",
                     Span::new(start, digits_start + digit_count),
                 )
@@ -539,6 +580,7 @@ impl Lexer<'_> {
         if digits.is_empty() {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::LEX_PREFIX_NO_DIGITS,
                     format!("{name} literal has no digits"),
                     Span::new(start, digits_start),
                 )
@@ -547,35 +589,8 @@ impl Lexer<'_> {
             return;
         }
         let suffix_start = digits_start + digit_count;
-        let suffix_kind = match suffix.to_ascii_lowercase().as_str() {
-            "" => None,
-            "u" => Some(TokenKind::UIntLiteral as fn(String) -> TokenKind),
-            "l" => Some(TokenKind::LongLiteral as fn(String) -> TokenKind),
-            "ul" | "lu" => Some(TokenKind::ULongLiteral as fn(String) -> TokenKind),
-            _ => {
-                let first = suffix.chars().next().expect("a non-empty suffix");
-                if matches!(first, 'u' | 'U' | 'l' | 'L') {
-                    self.diagnostics.push(
-                        Diagnostic::error(
-                            format!("invalid integer literal suffix `{suffix}`"),
-                            Span::new(suffix_start, self.cursor),
-                        )
-                        .with_help("the valid suffixes are `U`, `L`, `UL`, and `LU`"),
-                    );
-                } else {
-                    let mut diagnostic = Diagnostic::error(
-                        format!("invalid digit `{first}` in {name} literal"),
-                        Span::new(suffix_start, suffix_start + first.len_utf8()),
-                    );
-                    if matches!(first, 'f' | 'F' | 'd' | 'D' | 'm' | 'M') {
-                        diagnostic = diagnostic.with_help(
-                            "the `f`, `d`, and `m` suffixes apply only to decimal literals",
-                        );
-                    }
-                    self.diagnostics.push(diagnostic);
-                }
-                return;
-            }
+        let Some(suffix_kind) = self.prefixed_suffix_kind(suffix, name, suffix_start) else {
+            return;
         };
         let mut value: u128 = 0;
         for digit in digits.chars() {
@@ -583,6 +598,7 @@ impl Lexer<'_> {
             if value > u128::from(u64::MAX) {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::LEX_PREFIX_INT_OVERFLOW,
                         format!("{name} literal exceeds the range of `ulong`"),
                         Span::new(start, self.cursor),
                     )
@@ -593,15 +609,62 @@ impl Lexer<'_> {
         }
         let text = value.to_string();
         let kind = match suffix_kind {
-            Some(constructor) => constructor(text),
-            None if value <= u128::from(i32::MAX.cast_unsigned()) => {
+            PrefixedIntSuffix::UInt => TokenKind::UIntLiteral(text),
+            PrefixedIntSuffix::Long => TokenKind::LongLiteral(text),
+            PrefixedIntSuffix::Unspecified if value <= u128::from(i32::MAX.cast_unsigned()) => {
                 TokenKind::IntegerLiteral(text)
             }
-            None if value <= u128::from(u32::MAX) => TokenKind::UIntLiteral(text),
-            None if value <= u128::from(i64::MAX.cast_unsigned()) => TokenKind::LongLiteral(text),
-            None => TokenKind::ULongLiteral(text),
+            PrefixedIntSuffix::Unspecified if value <= u128::from(u32::MAX) => {
+                TokenKind::UIntLiteral(text)
+            }
+            PrefixedIntSuffix::Unspecified if value <= u128::from(i64::MAX.cast_unsigned()) => {
+                TokenKind::LongLiteral(text)
+            }
+            PrefixedIntSuffix::ULong | PrefixedIntSuffix::Unspecified => {
+                TokenKind::ULongLiteral(text)
+            }
         };
         self.token(kind, start);
+    }
+
+    fn prefixed_suffix_kind(
+        &mut self,
+        suffix: &str,
+        name: &str,
+        suffix_start: usize,
+    ) -> Option<PrefixedIntSuffix> {
+        match suffix.to_ascii_lowercase().as_str() {
+            "" => Some(PrefixedIntSuffix::Unspecified),
+            "u" => Some(PrefixedIntSuffix::UInt),
+            "l" => Some(PrefixedIntSuffix::Long),
+            "ul" | "lu" => Some(PrefixedIntSuffix::ULong),
+            _ => {
+                let first = suffix.chars().next().expect("a non-empty suffix");
+                if matches!(first, 'u' | 'U' | 'l' | 'L') {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::LEX_INVALID_INT_SUFFIX,
+                            format!("invalid integer literal suffix `{suffix}`"),
+                            Span::new(suffix_start, self.cursor),
+                        )
+                        .with_help("the valid suffixes are `U`, `L`, `UL`, and `LU`"),
+                    );
+                } else {
+                    let mut diagnostic = Diagnostic::error(
+                        codes::LEX_INVALID_BASE_DIGIT,
+                        format!("invalid digit `{first}` in {name} literal"),
+                        Span::new(suffix_start, suffix_start + first.len_utf8()),
+                    );
+                    if matches!(first, 'f' | 'F' | 'd' | 'D' | 'm' | 'M') {
+                        diagnostic = diagnostic.with_help(
+                            "the `f`, `d`, and `m` suffixes apply only to decimal literals",
+                        );
+                    }
+                    self.diagnostics.push(diagnostic);
+                }
+                None
+            }
+        }
     }
 
     fn string(&mut self, start: usize) {
@@ -621,6 +684,7 @@ impl Lexer<'_> {
             } else {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::LEX_CHAR_LITERAL_LENGTH,
                         "character literal must contain exactly one character",
                         Span::new(start, self.cursor),
                     )
@@ -653,6 +717,7 @@ impl Lexer<'_> {
                     _ => {
                         self.diagnostics.push(
                             Diagnostic::error(
+                                codes::LEX_UNSUPPORTED_ESCAPE,
                                 format!("unsupported escape sequence `\\{escaped}`"),
                                 Span::new(self.cursor - escaped.len_utf8() - 1, self.cursor),
                             )
@@ -665,16 +730,20 @@ impl Lexer<'_> {
                 value.push(character);
             }
         }
-        self.diagnostics.push(
-            Diagnostic::error(
-                if delimiter == '"' {
-                    "unterminated string literal"
-                } else {
-                    "unterminated character literal"
-                },
-                Span::new(start, self.cursor),
+        let (code, message) = if delimiter == '"' {
+            (
+                codes::LEX_UNTERMINATED_STRING,
+                "unterminated string literal",
             )
-            .with_help(format!("close the literal with `{delimiter}`")),
+        } else {
+            (
+                codes::LEX_UNTERMINATED_CHAR,
+                "unterminated character literal",
+            )
+        };
+        self.diagnostics.push(
+            Diagnostic::error(code, message, Span::new(start, self.cursor))
+                .with_help(format!("close the literal with `{delimiter}`")),
         );
         None
     }
@@ -705,8 +774,12 @@ impl Lexer<'_> {
             }
         }
         self.diagnostics.push(
-            Diagnostic::error("unterminated block comment", Span::new(start, self.cursor))
-                .with_help("close the comment with `*/`"),
+            Diagnostic::error(
+                codes::LEX_UNTERMINATED_BLOCK_COMMENT,
+                "unterminated block comment",
+                Span::new(start, self.cursor),
+            )
+            .with_help("close the comment with `*/`"),
         );
     }
 
@@ -813,7 +886,7 @@ mod tests {
         let tokens = lex(source).expect("valid tokens");
         assert_eq!(tokens[0].kind, TokenKind::IntegerLiteral("42".into()));
         assert_eq!(tokens[0].span, Span::new(0, 2));
-        assert_eq!(tokens[1].kind, TokenKind::FloatLiteral("3.14".into()));
+        assert_eq!(tokens[1].kind, TokenKind::DoubleLiteral("3.14".into()));
         assert_eq!(tokens[2].kind, TokenKind::StringLiteral("text".into()));
         assert_eq!(tokens[3].kind, TokenKind::CharacterLiteral('x'));
         assert_eq!(tokens[4].kind, TokenKind::PlusEqual);

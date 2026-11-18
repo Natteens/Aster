@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use aster_diagnostics::codes;
 use aster_mir as mir;
 
 use super::super::BackendError;
@@ -337,10 +338,13 @@ fn validate_access(
 }
 
 fn invalid(function: &mir::Function) -> BackendError {
-    BackendError::new(format!(
-        "function `{}` contains an invalid proven array-bounds contract",
-        function.name
-    ))
+    BackendError::new(
+        codes::BACKEND_ARRAY_BOUNDS_CONTRACT_INVALID,
+        format!(
+            "function `{}` contains an invalid proven array-bounds contract",
+            function.name
+        ),
+    )
 }
 
 fn unique_assignment(

@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aster_diagnostics::codes;
+
 use super::task_runtime::{TaskRuntime, module_uses_tasks};
 #[cfg(feature = "aarm-telemetry")]
 use super::task_runtime::{module_uses_async, module_uses_parallel, module_uses_plain_task_run};
@@ -18,7 +20,7 @@ fn foreign_signature(
         .map(foreign_type)
         .collect::<Result<Vec<_>, _>>()?;
     aster_runtime::ForeignSignature::new(parameters, foreign_type(&function.return_type)?)
-        .map_err(|error| BackendError::new(error.to_string()))
+        .map_err(|error| BackendError::new(codes::BACKEND_FOREIGN_ABI_INVALID, error.to_string()))
 }
 
 fn foreign_type(type_: &mir::Type) -> Result<aster_runtime::ForeignType, BackendError> {
@@ -37,9 +39,10 @@ fn foreign_type(type_: &mir::Type) -> Result<aster_runtime::ForeignType, Backend
         mir::Type::Float => aster_runtime::ForeignType::Float,
         mir::Type::Double => aster_runtime::ForeignType::Double,
         other => {
-            return Err(BackendError::new(format!(
-                "foreign ABI does not support MIR type `{other:?}`"
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_FOREIGN_ABI_INVALID,
+                format!("foreign ABI does not support MIR type `{other:?}`"),
+            ));
         }
     })
 }
@@ -90,6 +93,7 @@ fn prepare_ownership_module(module: &mir::Module) -> Result<mir::Module, Backend
     let (transformed, _stats) = mir::ownership::insert_ownership(module);
     mir::validate::ownership::validate_ownership(&transformed).map_err(|findings| {
         BackendError::new(
+            codes::BACKEND_REFCOUNT_INVALID,
             findings
                 .iter()
                 .map(ToString::to_string)
@@ -139,7 +143,9 @@ impl PreparedProgram {
             let signature = foreign_signature(function)?;
             let address = registry
                 .resolve_address(&function.name, &signature)
-                .map_err(|error| BackendError::new(error.to_string()))?;
+                .map_err(|error| {
+                    BackendError::new(codes::BACKEND_FOREIGN_ABI_INVALID, error.to_string())
+                })?;
             let symbol = format!("aster_foreign_{}", function.symbol.0);
             builder.symbol(&symbol, address as *const u8);
         }
@@ -183,13 +189,18 @@ impl PreparedProgram {
             let id = match slot.implementation {
                 Some(implementation) => {
                     function_ids.get(&implementation).copied().ok_or_else(|| {
-                        BackendError::new("virtual slot references an unknown implementation")
+                        BackendError::new(
+                            codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                            "virtual slot references an unknown implementation",
+                        )
                     })?
                 }
-                None => abstract_stubs
-                    .get(&slot.method)
-                    .copied()
-                    .ok_or_else(|| BackendError::new("abstract virtual slot has no stub"))?,
+                None => abstract_stubs.get(&slot.method).copied().ok_or_else(|| {
+                    BackendError::new(
+                        codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                        "abstract virtual slot has no stub",
+                    )
+                })?,
             };
             Ok(codegen.jit.get_finalized_function(id))
         })?;
@@ -338,10 +349,12 @@ impl PreparedProgram {
         ),
         BackendError,
     > {
-        let (pointer, return_type) = self
-            .entries
-            .get(&symbol)
-            .ok_or_else(|| BackendError::new(format!("symbol {symbol:?} was not prepared")))?;
+        let (pointer, return_type) = self.entries.get(&symbol).ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_SYMBOL_NOT_PREPARED,
+                format!("symbol {symbol:?} was not prepared"),
+            )
+        })?;
         let mut execution_context = governor.map_or_else(
             || {
                 if collect_stats {
@@ -383,7 +396,10 @@ impl PreparedProgram {
         let stats = execution_context.memory_stats().clone();
         let telemetry = execution_context.aarm_memory_telemetry();
         if let Some(error) = runtime_error {
-            Err(BackendError::new(format!("Aster runtime error: {error}")))
+            Err(BackendError::new(
+                codes::BACKEND_RUNTIME_TRAP_OR_ERROR,
+                format!("Aster runtime error: {error}"),
+            ))
         } else {
             value.map(|v| (v, stats, telemetry))
         }
@@ -400,10 +416,12 @@ impl PreparedProgram {
         symbol: mir::SymbolId,
         context: &mut aster_runtime::ExecutionContext,
     ) -> Result<ExecutionValue, BackendError> {
-        let (pointer, return_type) = self
-            .entries
-            .get(&symbol)
-            .ok_or_else(|| BackendError::new(format!("symbol {symbol:?} was not prepared")))?;
+        let (pointer, return_type) = self.entries.get(&symbol).ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_SYMBOL_NOT_PREPARED,
+                format!("symbol {symbol:?} was not prepared"),
+            )
+        })?;
         invoke_finalized(*pointer, return_type, context)
     }
 
@@ -425,9 +443,10 @@ impl PreparedProgram {
 
         let Some((pointer, return_type)) = self.task_entries.get(&symbol) else {
             return (
-                TaskOutcome::Failed(BackendError::new(format!(
-                    "symbol {symbol:?} was not prepared"
-                ))),
+                TaskOutcome::Failed(BackendError::new(
+                    codes::BACKEND_SYMBOL_NOT_PREPARED,
+                    format!("symbol {symbol:?} was not prepared"),
+                )),
                 None,
             );
         };
@@ -477,7 +496,10 @@ impl PreparedProgram {
         }
         let deep_result = self.task_result_shapes.get(&symbol);
         let value = if context.has_failed() {
-            Err(BackendError::new("task arguments could not be transferred"))
+            Err(BackendError::new(
+                codes::BACKEND_TRANSFER_TYPE_INVALID,
+                "task arguments could not be transferred",
+            ))
         } else if let Some(shape) = deep_result {
             invoke_deep_task(*pointer, shape, frame, &mut context)
         } else if payload.is_empty() {
@@ -491,9 +513,10 @@ impl PreparedProgram {
         let stats = context.memory_stats().clone();
         let telemetry = context.aarm_memory_telemetry();
         let outcome = match runtime_error {
-            Some(error) => {
-                TaskOutcome::Failed(BackendError::new(format!("Aster runtime error: {error}")))
-            }
+            Some(error) => TaskOutcome::Failed(BackendError::new(
+                codes::BACKEND_RUNTIME_TRAP_OR_ERROR,
+                format!("Aster runtime error: {error}"),
+            )),
             None => match value {
                 Ok(value) => TaskOutcome::Completed(value, stats),
                 Err(error) => TaskOutcome::Failed(error),
@@ -520,9 +543,10 @@ impl PreparedProgram {
     ) {
         let Some((pointer, _return_type)) = self.entries.get(&symbol) else {
             return (
-                Err(BackendError::new(format!(
-                    "MoveNext symbol {symbol:?} was not prepared"
-                ))),
+                Err(BackendError::new(
+                    codes::BACKEND_SYMBOL_NOT_PREPARED,
+                    format!("MoveNext symbol {symbol:?} was not prepared"),
+                )),
                 None,
             );
         };
@@ -546,7 +570,10 @@ impl PreparedProgram {
         context.refresh_object_heap_stats();
         let stats = context.memory_stats().clone();
         let result = match context.take_error() {
-            Some(error) => Err(BackendError::new(format!("Aster runtime error: {error}"))),
+            Some(error) => Err(BackendError::new(
+                codes::BACKEND_RUNTIME_TRAP_OR_ERROR,
+                format!("Aster runtime error: {error}"),
+            )),
             None => Ok((ExecutionValue::Int(move_next_status), stats)),
         };
         let telemetry = context.aarm_memory_telemetry();
@@ -579,11 +606,10 @@ impl PreparedProgram {
                 return aster_exec::worker_pool::ChunkOutcome {
                     first_error: Some((
                         logical,
-                        BackendError::new(parallel_runtime_error(
-                            logical,
-                            &error,
-                            memory_budget.is_some(),
-                        )),
+                        BackendError::new(
+                            codes::BACKEND_RUNTIME_TRAP_OR_ERROR,
+                            parallel_runtime_error(logical, &error, memory_budget.is_some()),
+                        ),
                     )),
                     #[cfg(feature = "aarm-telemetry")]
                     telemetry: context.aarm_memory_telemetry(),
@@ -618,11 +644,10 @@ impl PreparedProgram {
                 return aster_exec::worker_pool::ChunkOutcome {
                     first_error: Some((
                         logical,
-                        BackendError::new(parallel_runtime_error(
-                            logical,
-                            &error,
-                            memory_budget.is_some(),
-                        )),
+                        BackendError::new(
+                            codes::BACKEND_RUNTIME_TRAP_OR_ERROR,
+                            parallel_runtime_error(logical, &error, memory_budget.is_some()),
+                        ),
                     )),
                     #[cfg(feature = "aarm-telemetry")]
                     telemetry: context.aarm_memory_telemetry(),
@@ -655,7 +680,10 @@ impl PreparedProgram {
             return ReduceChunkOutcome {
                 result: Err((
                     logical(0),
-                    BackendError::new("Parallel.Reduce Accumulate was not prepared"),
+                    BackendError::new(
+                        codes::BACKEND_SYMBOL_NOT_PREPARED,
+                        "Parallel.Reduce Accumulate was not prepared",
+                    ),
                 )),
                 #[cfg(feature = "aarm-telemetry")]
                 telemetry: None,
@@ -679,11 +707,10 @@ impl PreparedProgram {
                 return ReduceChunkOutcome {
                     result: Err((
                         logical,
-                        BackendError::new(parallel_runtime_error(
-                            logical,
-                            &error,
-                            memory_budget.is_some(),
-                        )),
+                        BackendError::new(
+                            codes::BACKEND_RUNTIME_TRAP_OR_ERROR,
+                            parallel_runtime_error(logical, &error, memory_budget.is_some()),
+                        ),
                     )),
                     #[cfg(feature = "aarm-telemetry")]
                     telemetry: context.aarm_memory_telemetry(),
@@ -712,6 +739,7 @@ impl PreparedProgram {
         let Some((pointer, _)) = self.entries.get(&symbol) else {
             return CombineOutcome {
                 result: Err(BackendError::new(
+                    codes::BACKEND_SYMBOL_NOT_PREPARED,
                     "Parallel.Reduce Combine was not prepared",
                 )),
                 #[cfg(feature = "aarm-telemetry")]
@@ -731,7 +759,10 @@ impl PreparedProgram {
         };
         if let Some(error) = context.take_error() {
             return CombineOutcome {
-                result: Err(BackendError::new(format!("Aster runtime error: {error}"))),
+                result: Err(BackendError::new(
+                    codes::BACKEND_RUNTIME_TRAP_OR_ERROR,
+                    format!("Aster runtime error: {error}"),
+                )),
                 #[cfg(feature = "aarm-telemetry")]
                 telemetry: context.aarm_memory_telemetry(),
             };
@@ -761,7 +792,10 @@ fn jit_builder() -> Result<JITBuilder, BackendError> {
 
 fn chunk_error(index: i64, message: impl Into<String>) -> aster_exec::worker_pool::ChunkOutcome {
     aster_exec::worker_pool::ChunkOutcome {
-        first_error: Some((index, BackendError::new(message))),
+        first_error: Some((
+            index,
+            BackendError::new(codes::BACKEND_SYMBOL_NOT_PREPARED, message),
+        )),
         #[cfg(feature = "aarm-telemetry")]
         telemetry: None,
     }
@@ -974,6 +1008,7 @@ fn invoke_binary_scalar(
                 }
                 ExecutionValue::String(_) | ExecutionValue::Transfer(_) | ExecutionValue::Void => {
                     return Err(BackendError::new(
+                        codes::BACKEND_TRANSFER_TYPE_INVALID,
                         "Parallel.Reduce received a non-scalar element",
                     ));
                 }
@@ -999,13 +1034,17 @@ fn invoke_binary_scalar(
         ExecutionValue::Char(value) => {
             let raw: u32 = call_with_element!(u32, *value as u32);
             return char::from_u32(raw).map(ExecutionValue::Char).ok_or_else(|| {
-                BackendError::new(format!(
-                    "Parallel.Reduce Accumulate/Combine returned invalid Unicode scalar value U+{raw:08X} as `char`"
-                ))
+                BackendError::new(
+                    codes::BACKEND_INVALID_CHAR_RETURN,
+                    format!(
+                        "Parallel.Reduce Accumulate/Combine returned invalid Unicode scalar value U+{raw:08X} as `char`"
+                    ),
+                )
             });
         }
         ExecutionValue::String(_) | ExecutionValue::Transfer(_) | ExecutionValue::Void => {
             return Err(BackendError::new(
+                codes::BACKEND_RUNTIME_TRAP_OR_ERROR,
                 "Parallel.Reduce received a non-scalar accumulator",
             ));
         }
@@ -1292,11 +1331,13 @@ pub(super) fn execute_resolved_with_aarm_task_governor(
 > {
     if module_uses_async(module) {
         return Err(BackendError::new(
+            codes::BACKEND_GOVERNED_EXECUTION_UNSUPPORTED,
             "experimental governed Task.Run does not support async execution",
         ));
     }
     if module_uses_parallel(module) {
         return Err(BackendError::new(
+            codes::BACKEND_GOVERNED_EXECUTION_UNSUPPORTED,
             "experimental governed Task.Run does not support mixed Parallel execution",
         ));
     }
@@ -1335,11 +1376,13 @@ pub(super) fn execute_resolved_with_aarm_async_governor(
 > {
     if module_uses_plain_task_run(module) {
         return Err(BackendError::new(
+            codes::BACKEND_GOVERNED_EXECUTION_UNSUPPORTED,
             "experimental governed async does not support independent plain Task.Run execution",
         ));
     }
     if module_uses_parallel(module) {
         return Err(BackendError::new(
+            codes::BACKEND_GOVERNED_EXECUTION_UNSUPPORTED,
             "experimental governed async does not support mixed Parallel execution",
         ));
     }
@@ -1422,9 +1465,12 @@ fn invoke_finalized_with_arguments(
             // The function returns a Unicode scalar value as `i32`.
             let value = call!(u32);
             let value = char::from_u32(value).ok_or_else(|| {
-                BackendError::new(format!(
-                    "Aster function returned invalid Unicode scalar value U+{value:08X} as `char`"
-                ))
+                BackendError::new(
+                    codes::BACKEND_INVALID_CHAR_RETURN,
+                    format!(
+                        "Aster function returned invalid Unicode scalar value U+{value:08X} as `char`"
+                    ),
+                )
             })?;
             ExecutionValue::Char(value)
         }
@@ -1481,7 +1527,12 @@ fn invoke_deep_task(
     }
     // SAFETY: the trampoline left a value of exactly this shape in `image`.
     let wire = unsafe { context.transfer_pack(shape, image.as_ptr().cast::<u8>()) }.map_err(
-        |message| BackendError::new(format!("task result cannot be transferred: {message}")),
+        |message| {
+            BackendError::new(
+                codes::BACKEND_TRANSFER_TYPE_INVALID,
+                format!("task result cannot be transferred: {message}"),
+            )
+        },
     )?;
     Ok(ExecutionValue::Transfer(wire))
 }
@@ -1523,13 +1574,15 @@ fn invoke_task_finalized(
         mir::Type::Char => {
             let raw = invoke!(u32);
             ExecutionValue::Char(char::from_u32(raw).ok_or_else(|| {
-                BackendError::new(format!(
-                    "Task.Run returned invalid Unicode scalar value U+{raw:08X} as `char`"
-                ))
+                BackendError::new(
+                    codes::BACKEND_INVALID_CHAR_RETURN,
+                    format!("Task.Run returned invalid Unicode scalar value U+{raw:08X} as `char`"),
+                )
             })?)
         }
         _ => {
             return Err(BackendError::new(
+                codes::BACKEND_TRANSFER_TYPE_INVALID,
                 "parameterized Task.Run produced a non-transferable result type",
             ));
         }

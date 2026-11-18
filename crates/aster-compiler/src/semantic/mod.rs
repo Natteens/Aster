@@ -207,6 +207,45 @@ pub(crate) struct ResolvedTypeAs {
     pub none_index: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedNullLiteral {
+    pub option_type: String,
+    pub none_index: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedNullCheck {
+    pub option_type: String,
+    pub none_index: usize,
+    pub null_on_left: bool,
+    pub negated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedNullCoalesce {
+    pub option_type: String,
+    pub some_index: usize,
+    pub none_index: usize,
+    pub result_type: String,
+    pub result_is_option: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedNullConditionalResult {
+    pub option_type: String,
+    pub some_index: usize,
+    pub none_index: usize,
+    pub flattened: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedNullConditional {
+    pub receiver_option_type: String,
+    pub receiver_some_index: usize,
+    pub receiver_none_index: usize,
+    pub result: Option<ResolvedNullConditionalResult>,
+}
+
 /// The constructor of the base class a derived constructor runs: an explicit
 /// `: base(arguments)` or the implicit call of a base constructor whose
 /// parameters all have defaults. `arguments` binds the source-ordered
@@ -302,6 +341,10 @@ pub(crate) struct Model {
     pub propagations: HashMap<ModelNodeKey, ResolvedPropagation>,
     /// `value as T` sites and the `Option<T>` specialization each produces.
     pub type_as: HashMap<ModelNodeKey, ResolvedTypeAs>,
+    pub null_literals: HashMap<ModelNodeKey, ResolvedNullLiteral>,
+    pub null_checks: HashMap<ModelNodeKey, ResolvedNullCheck>,
+    pub null_coalesces: HashMap<ModelNodeKey, ResolvedNullCoalesce>,
+    pub null_conditionals: HashMap<ModelNodeKey, ResolvedNullConditional>,
     pub string_operations: HashMap<ModelNodeKey, StringOperation>,
     pub dictionary_operations: HashMap<ModelNodeKey, ResolvedDictionaryOperation>,
     /// Intrinsic operations on the official `aster.core.StringBuilder`,
@@ -578,6 +621,7 @@ fn contains_decimal(type_name: &TypeName) -> bool {
 
 fn decimal_deferred(span: Span) -> Diagnostic {
     Diagnostic::error(
+        aster_diagnostics::codes::SEM_DECIMAL_DEFERRED,
         "`decimal` is reserved but not supported until its exact precision, scale, rounding, overflow, formatting, layout, and ABI contract is specified",
         span,
     )
@@ -603,6 +647,7 @@ fn validate_no_reserved_type_names(module: &Module, diagnostics: &mut Vec<Diagno
         if name == "Task" || name == "Parallel" {
             diagnostics.push(
                 Diagnostic::error(
+                    aster_diagnostics::codes::SEM_RESERVED_CONCURRENCY_TYPE,
                     format!("`{name}` is reserved for the intrinsic concurrency system and cannot be declared as a {kind}"),
                     span,
                 )
@@ -612,6 +657,7 @@ fn validate_no_reserved_type_names(module: &Module, diagnostics: &mut Vec<Diagno
         if name == "List" {
             diagnostics.push(
                 Diagnostic::error(
+                    aster_diagnostics::codes::SEM_RESERVED_LIST_TYPE,
                     format!(
                         "`List` is reserved for the built-in `List<T>` type and cannot be declared as a {kind}"
                     ),
@@ -623,6 +669,7 @@ fn validate_no_reserved_type_names(module: &Module, diagnostics: &mut Vec<Diagno
         if name == "Dictionary" {
             diagnostics.push(
                 Diagnostic::error(
+                    aster_diagnostics::codes::SEM_RESERVED_DICTIONARY_TYPE,
                     format!("`Dictionary` is reserved for the built-in `Dictionary<K, V>` type and cannot be declared as a {kind}"),
                     span,
                 )
@@ -642,8 +689,12 @@ fn validate_declaration_names(module: &Module, diagnostics: &mut Vec<Diagnostic>
             .is_some_and(|(_, previous)| !overloadable || !previous)
         {
             diagnostics.push(
-                Diagnostic::error(format!("duplicate declaration `{name}`"), span)
-                    .with_help("rename or remove one of the declarations"),
+                Diagnostic::error(
+                    aster_diagnostics::codes::SEM_DUPLICATE_DECLARATION,
+                    format!("duplicate declaration `{name}`"),
+                    span,
+                )
+                .with_help("rename or remove one of the declarations"),
             );
         }
     }
@@ -696,6 +747,10 @@ impl Model {
             switch_cases,
             propagations,
             type_as,
+            null_literals,
+            null_checks,
+            null_coalesces,
+            null_conditionals,
             string_operations,
             dictionary_operations,
             string_builder_operations

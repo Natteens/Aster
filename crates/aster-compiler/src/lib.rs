@@ -27,7 +27,7 @@ mod type_names;
 
 use std::{any::Any, path::Path};
 
-use aster_diagnostics::{Diagnostic, Severity, Span};
+use aster_diagnostics::{Diagnostic, Severity, Span, codes};
 use aster_mir::validate::ValidationError;
 use aster_mir::validate::executable::Phase;
 use aster_syntax::{Module, Token, lex, parse};
@@ -191,7 +191,13 @@ fn compile_with_options(
             optimize_array_loops,
         )
     })
-    .map_err(|error| vec![Diagnostic::error(error.to_string(), Span::default())])?
+    .map_err(|error| {
+        vec![Diagnostic::error(
+            codes::COMPILER_WORKER_FAILED,
+            error.to_string(),
+            Span::default(),
+        )]
+    })?
 }
 
 fn compile_with_options_inner(
@@ -406,14 +412,15 @@ fn check_mir_at(mir: &aster_mir::Module, pass: &str, phase: Phase) {
     }
     // Typing: a well-formed construct no backend supports yet (a module
     // global) is the backend's to reject.
-    if let Err(ValidationError::Invalid(message)) = aster_mir::validate::validate_types(mir) {
+    if let Err(ValidationError::Invalid { message, .. }) = aster_mir::validate::validate_types(mir)
+    {
         panic!("invalid MIR after {pass}: {message}");
     }
     // Executability: the region checks report violations as unsupported for
     // hand-built MIR, but a compiler pass never emits a region it cannot
     // execute, so anything but a worker policy rejection is a pass defect.
     match aster_mir::validate::executable::validate_module(mir, phase) {
-        Ok(()) | Err(ValidationError::Rejected(_)) => {}
+        Ok(()) | Err(ValidationError::Rejected { .. }) => {}
         Err(error) => panic!("invalid MIR after {pass}: {error}"),
     }
 }

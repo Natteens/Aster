@@ -11,6 +11,8 @@ pub mod ownership;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use aster_diagnostics::{DiagnosticCode, codes};
+
 use crate as mir;
 use crate::type_name;
 
@@ -21,20 +23,50 @@ use crate::type_name;
 /// operation reachable from a worker; the message is final.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValidationError {
-    Invalid(String),
-    Unsupported { function: String, feature: String },
-    Rejected(String),
+    Invalid {
+        code: DiagnosticCode,
+        message: String,
+    },
+    Unsupported {
+        code: DiagnosticCode,
+        function: String,
+        feature: String,
+    },
+    Rejected {
+        code: DiagnosticCode,
+        message: String,
+    },
 }
 
 impl ValidationError {
-    fn invalid(message: impl Into<String>) -> Self {
-        Self::Invalid(message.into())
+    #[must_use]
+    pub const fn code(&self) -> DiagnosticCode {
+        match self {
+            Self::Invalid { code, .. }
+            | Self::Unsupported { code, .. }
+            | Self::Rejected { code, .. } => *code,
+        }
     }
 
-    fn unsupported(function_name: &str, feature: &str) -> Self {
+    fn invalid(code: DiagnosticCode, message: impl Into<String>) -> Self {
+        Self::Invalid {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn unsupported(code: DiagnosticCode, function_name: &str, feature: &str) -> Self {
         Self::Unsupported {
+            code,
             function: function_name.to_owned(),
             feature: feature.to_owned(),
+        }
+    }
+
+    fn rejected(code: DiagnosticCode, message: impl Into<String>) -> Self {
+        Self::Rejected {
+            code,
+            message: message.into(),
         }
     }
 }
@@ -42,8 +74,12 @@ impl ValidationError {
 impl fmt::Display for ValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Invalid(message) | Self::Rejected(message) => formatter.write_str(message),
-            Self::Unsupported { function, feature } => {
+            Self::Invalid { message, .. } | Self::Rejected { message, .. } => {
+                formatter.write_str(message)
+            }
+            Self::Unsupported {
+                function, feature, ..
+            } => {
                 write!(formatter, "unsupported {feature} in function `{function}`")
             }
         }
@@ -88,10 +124,10 @@ pub fn validate_types(module: &mir::Module) -> Result<(), ValidationError> {
     let mut signatures = HashMap::new();
     for function in &module.functions {
         if signatures.insert(function.symbol, function).is_some() {
-            return Err(ValidationError::invalid(format!(
-                "duplicate function symbol {:?} in MIR",
-                function.symbol
-            )));
+            return Err(ValidationError::invalid(
+                codes::MIR_DUPLICATE_FUNCTION_SYMBOL,
+                format!("duplicate function symbol {:?} in MIR", function.symbol),
+            ));
         }
     }
     for function in &module.functions {
@@ -139,7 +175,10 @@ impl MirTypeIndex {
             index.insert_type(definition.symbol, NominalKind::Struct)?;
             for field in &definition.fields {
                 if !field_symbols.insert(field.symbol) {
-                    return Err(ValidationError::invalid("duplicate field symbol in MIR"));
+                    return Err(ValidationError::invalid(
+                        codes::MIR_DUPLICATE_FIELD_SYMBOL,
+                        "duplicate field symbol in MIR",
+                    ));
                 }
                 if index
                     .struct_fields
@@ -147,6 +186,7 @@ impl MirTypeIndex {
                     .is_some()
                 {
                     return Err(ValidationError::invalid(
+                        codes::MIR_DUPLICATE_STRUCT_FIELD_SYMBOL,
                         "duplicate struct field symbol in MIR",
                     ));
                 }
@@ -156,7 +196,10 @@ impl MirTypeIndex {
             index.insert_type(definition.symbol, NominalKind::Class)?;
             for field in &definition.fields {
                 if !field_symbols.insert(field.symbol) {
-                    return Err(ValidationError::invalid("duplicate field symbol in MIR"));
+                    return Err(ValidationError::invalid(
+                        codes::MIR_DUPLICATE_FIELD_SYMBOL,
+                        "duplicate field symbol in MIR",
+                    ));
                 }
                 if index
                     .class_fields
@@ -164,6 +207,7 @@ impl MirTypeIndex {
                     .is_some()
                 {
                     return Err(ValidationError::invalid(
+                        codes::MIR_DUPLICATE_CLASS_FIELD_SYMBOL,
                         "duplicate class field symbol in MIR",
                     ));
                 }
@@ -183,12 +227,16 @@ impl MirTypeIndex {
                     .is_some()
                 {
                     return Err(ValidationError::invalid(
+                        codes::MIR_DUPLICATE_ENUM_CASE_SYMBOL,
                         "duplicate enum case symbol in MIR",
                     ));
                 }
                 for field in &case.fields {
                     if !field_symbols.insert(field.symbol) {
-                        return Err(ValidationError::invalid("duplicate field symbol in MIR"));
+                        return Err(ValidationError::invalid(
+                            codes::MIR_DUPLICATE_FIELD_SYMBOL,
+                            "duplicate field symbol in MIR",
+                        ));
                     }
                     if index
                         .enum_fields
@@ -196,6 +244,7 @@ impl MirTypeIndex {
                         .is_some()
                     {
                         return Err(ValidationError::invalid(
+                            codes::MIR_DUPLICATE_ENUM_FIELD_SYMBOL,
                             "duplicate enum field symbol in MIR",
                         ));
                     }
@@ -221,6 +270,7 @@ impl MirTypeIndex {
             }
             if definition.is_abstract && definition.is_sealed {
                 return Err(ValidationError::invalid(
+                    codes::MIR_CLASS_ABSTRACT_AND_SEALED,
                     "MIR class is both abstract and sealed",
                 ));
             }
@@ -229,11 +279,13 @@ impl MirTypeIndex {
             };
             let Some(base_definition) = definitions.get(&base) else {
                 return Err(ValidationError::invalid(
+                    codes::MIR_CLASS_INVALID_BASE,
                     "MIR class names a base that is not a declared class",
                 ));
             };
             if base_definition.is_sealed {
                 return Err(ValidationError::invalid(
+                    codes::MIR_CLASS_SEALED_BASE,
                     "MIR class derives from a sealed class",
                 ));
             }
@@ -246,6 +298,7 @@ impl MirTypeIndex {
                 steps += 1;
                 if *base == definition.symbol || steps > module.classes.len() {
                     return Err(ValidationError::invalid(
+                        codes::MIR_CLASS_INHERITANCE_CYCLE,
                         "MIR class inheritance contains a cycle",
                     ));
                 }
@@ -281,18 +334,24 @@ impl MirTypeIndex {
                 .and_then(|base| definitions.get(&base))
                 .map_or(&[][..], |base| base.vtable.as_slice());
             if own.len() < inherited.len() {
-                return Err(ValidationError::invalid(format!(
-                    "virtual table of class `{}` is shorter than its base class's",
-                    definition.name
-                )));
+                return Err(ValidationError::invalid(
+                    codes::MIR_VTABLE_SHORTER_THAN_BASE,
+                    format!(
+                        "virtual table of class `{}` is shorter than its base class's",
+                        definition.name
+                    ),
+                ));
             }
             let mut introduced = HashSet::new();
             for (index, slot) in own.iter().enumerate() {
                 if !introduced.insert(slot.method) {
-                    return Err(ValidationError::invalid(format!(
-                        "virtual table of class `{}` lists method {:?} twice",
-                        definition.name, slot.method
-                    )));
+                    return Err(ValidationError::invalid(
+                        codes::MIR_VTABLE_DUPLICATE_METHOD,
+                        format!(
+                            "virtual table of class `{}` lists method {:?} twice",
+                            definition.name, slot.method
+                        ),
+                    ));
                 }
                 let base_slot = inherited.get(index);
                 if let Some(base_slot) = base_slot
@@ -301,20 +360,26 @@ impl MirTypeIndex {
                         || slot.parameters != base_slot.parameters
                         || slot.return_type != base_slot.return_type)
                 {
-                    return Err(ValidationError::invalid(format!(
-                        "virtual slot {index} of class `{}` does not match the slot it inherits from its base class",
-                        definition.name
-                    )));
+                    return Err(ValidationError::invalid(
+                        codes::MIR_VTABLE_SLOT_MISMATCH,
+                        format!(
+                            "virtual slot {index} of class `{}` does not match the slot it inherits from its base class",
+                            definition.name
+                        ),
+                    ));
                 }
                 match (
                     base_slot.and_then(|base| base.implementation),
                     slot.implementation,
                 ) {
                     (Some(_), None) => {
-                        return Err(ValidationError::invalid(format!(
-                            "virtual slot {index} of class `{}` re-abstracts an implemented slot",
-                            definition.name
-                        )));
+                        return Err(ValidationError::invalid(
+                            codes::MIR_VTABLE_REABSTRACTED_SLOT,
+                            format!(
+                                "virtual slot {index} of class `{}` re-abstracts an implemented slot",
+                                definition.name
+                            ),
+                        ));
                     }
                     (inherited_implementation, Some(implementation))
                         if inherited_implementation != Some(implementation) =>
@@ -322,10 +387,13 @@ impl MirTypeIndex {
                         // A new implementation is declared by this class and
                         // matches the slot signature exactly.
                         let function = functions.get(&implementation).ok_or_else(|| {
-                            ValidationError::invalid(format!(
-                                "virtual slot {index} of class `{}` names an unknown implementation",
-                                definition.name
-                            ))
+                            ValidationError::invalid(
+                                codes::MIR_VTABLE_UNKNOWN_IMPL,
+                                format!(
+                                    "virtual slot {index} of class `{}` names an unknown implementation",
+                                    definition.name
+                                ),
+                            )
                         })?;
                         let receiver = function
                             .parameters
@@ -340,19 +408,25 @@ impl MirTypeIndex {
                                 .ne(slot.parameters.iter())
                             || function.return_type != slot.return_type
                         {
-                            return Err(ValidationError::invalid(format!(
-                                "implementation of virtual slot {index} of class `{}` does not match the slot signature exactly",
-                                definition.name
-                            )));
+                            return Err(ValidationError::invalid(
+                                codes::MIR_VTABLE_IMPL_SIGNATURE_MISMATCH,
+                                format!(
+                                    "implementation of virtual slot {index} of class `{}` does not match the slot signature exactly",
+                                    definition.name
+                                ),
+                            ));
                         }
                     }
                     _ => {}
                 }
                 if slot.implementation.is_none() && !definition.is_abstract {
-                    return Err(ValidationError::invalid(format!(
-                        "non-abstract class `{}` has the abstract virtual slot {index}",
-                        definition.name
-                    )));
+                    return Err(ValidationError::invalid(
+                        codes::MIR_CONCRETE_CLASS_ABSTRACT_SLOT,
+                        format!(
+                            "non-abstract class `{}` has the abstract virtual slot {index}",
+                            definition.name
+                        ),
+                    ));
                 }
             }
             self.vtables.insert(definition.symbol, own.clone());
@@ -417,6 +491,7 @@ impl MirTypeIndex {
     ) -> Result<(), ValidationError> {
         if self.kinds.insert(symbol, kind).is_some() {
             Err(ValidationError::invalid(
+                codes::MIR_DUPLICATE_NOMINAL_SYMBOL,
                 "duplicate nominal type symbol in MIR",
             ))
         } else {
@@ -442,9 +517,12 @@ impl MirTypeIndex {
         if valid {
             Ok(())
         } else {
-            Err(ValidationError::invalid(format!(
-                "function `{function_name}` references an unknown or mismatched nominal type"
-            )))
+            Err(ValidationError::invalid(
+                codes::MIR_UNKNOWN_NOMINAL_TYPE,
+                format!(
+                    "function `{function_name}` references an unknown or mismatched nominal type"
+                ),
+            ))
         }
     }
 }
@@ -466,19 +544,25 @@ fn validate_typed_function(
             mir::Terminator::Return(Some(value)) => {
                 validate_typed_operand(value, &function.name, locals, signatures, types)?;
                 if value.type_ != function.return_type {
-                    return Err(ValidationError::invalid(format!(
-                        "function `{}` returns `{}` from a function declared `{}`",
-                        function.name,
-                        type_name(&value.type_),
-                        type_name(&function.return_type)
-                    )));
+                    return Err(ValidationError::invalid(
+                        codes::MIR_RETURN_TYPE_MISMATCH,
+                        format!(
+                            "function `{}` returns `{}` from a function declared `{}`",
+                            function.name,
+                            type_name(&value.type_),
+                            type_name(&function.return_type)
+                        ),
+                    ));
                 }
             }
             mir::Terminator::Return(None) if function.return_type != mir::Type::Void => {
-                return Err(ValidationError::invalid(format!(
-                    "function `{}` returns no value from a non-void function",
-                    function.name
-                )));
+                return Err(ValidationError::invalid(
+                    codes::MIR_MISSING_RETURN_VALUE,
+                    format!(
+                        "function `{}` returns no value from a non-void function",
+                        function.name
+                    ),
+                ));
             }
             mir::Terminator::Goto(_)
             | mir::Terminator::Return(None)
@@ -507,11 +591,14 @@ fn validate_typed_instruction(
         if &actual == expected {
             Ok(())
         } else {
-            Err(ValidationError::invalid(format!(
-                "function `{function_name}` stores `{}` into a destination declared `{}`",
-                type_name(expected),
-                type_name(&actual)
-            )))
+            Err(ValidationError::invalid(
+                codes::MIR_DESTINATION_TYPE_MISMATCH,
+                format!(
+                    "function `{function_name}` stores `{}` into a destination declared `{}`",
+                    type_name(expected),
+                    type_name(&actual)
+                ),
+            ))
         }
     };
 
@@ -526,11 +613,14 @@ fn validate_typed_instruction(
             if target_type == value.type_ {
                 Ok(())
             } else {
-                Err(ValidationError::invalid(format!(
-                    "function `{function_name}` assigns `{}` into a place declared `{}`",
-                    type_name(&value.type_),
-                    type_name(&target_type)
-                )))
+                Err(ValidationError::invalid(
+                    codes::MIR_ASSIGNMENT_TYPE_MISMATCH,
+                    format!(
+                        "function `{function_name}` assigns `{}` into a place declared `{}`",
+                        type_name(&value.type_),
+                        type_name(&target_type)
+                    ),
+                ))
             }
         }
         mir::Instruction::Call {
@@ -588,9 +678,10 @@ fn validate_typed_instruction(
                 operand(argument)?;
             }
             let invalid = |what: &str| {
-                ValidationError::invalid(format!(
-                    "function `{function_name}` has a virtual call that {what}"
-                ))
+                ValidationError::invalid(
+                    codes::MIR_VIRTUAL_CALL_INVALID,
+                    format!("function `{function_name}` has a virtual call that {what}"),
+                )
             };
             let mir::Type::Class(class) = &receiver.type_ else {
                 return Err(invalid("has a receiver that is not a class"));
@@ -634,9 +725,10 @@ fn validate_typed_instruction(
             destination: result,
             class,
             ..
-        } if types.is_abstract_class(*class) => Err(ValidationError::invalid(format!(
-            "function `{function_name}` allocates an abstract class"
-        ))),
+        } if types.is_abstract_class(*class) => Err(ValidationError::invalid(
+            codes::MIR_ALLOCATE_ABSTRACT_CLASS,
+            format!("function `{function_name}` allocates an abstract class"),
+        )),
         mir::Instruction::AllocateObject {
             destination: result,
             class,
@@ -722,9 +814,12 @@ fn validate_typed_instruction(
             let expected_dictionary =
                 mir::Type::Dictionary(Box::new(key_type.clone()), Box::new(value_type.clone()));
             if dictionary.type_ != expected_dictionary {
-                return Err(ValidationError::invalid(format!(
-                    "function `{function_name}` has Dictionary entries metadata that does not match its receiver"
-                )));
+                return Err(ValidationError::invalid(
+                    codes::MIR_DICTIONARY_ENTRIES_MISMATCH,
+                    format!(
+                        "function `{function_name}` has Dictionary entries metadata that does not match its receiver"
+                    ),
+                ));
             }
             destination(result, &mir::Type::Array(Box::new(entry_type.clone())))
         }
@@ -806,10 +901,13 @@ fn validate_typed_instruction(
             ) {
                 Ok(())
             } else {
-                Err(ValidationError::invalid(format!(
-                    "function `{function_name}` counts a non-reference value of type `{}`",
-                    type_name(&value.type_)
-                )))
+                Err(ValidationError::invalid(
+                    codes::MIR_COUNT_NON_REFERENCE,
+                    format!(
+                        "function `{function_name}` counts a non-reference value of type `{}`",
+                        type_name(&value.type_)
+                    ),
+                ))
             }
         }
     }
@@ -843,9 +941,10 @@ fn validate_typed_rvalue(
             if matches!(input.type_, mir::Type::Enum(_)) && value.type_ == mir::Type::UInt {
                 Ok(())
             } else {
-                Err(ValidationError::invalid(format!(
-                    "function `{function_name}` has a malformed enum discriminant"
-                )))
+                Err(ValidationError::invalid(
+                    codes::MIR_MALFORMED_ENUM_DISCRIMINANT,
+                    format!("function `{function_name}` has a malformed enum discriminant"),
+                ))
             }
         }
         mir::RvalueKind::ArrayLength(input) => {
@@ -853,9 +952,10 @@ fn validate_typed_rvalue(
             if matches!(input.type_, mir::Type::Array(_)) && value.type_ == mir::Type::Int {
                 Ok(())
             } else {
-                Err(ValidationError::invalid(format!(
-                    "function `{function_name}` has a malformed array length read"
-                )))
+                Err(ValidationError::invalid(
+                    codes::MIR_MALFORMED_ARRAY_LENGTH,
+                    format!("function `{function_name}` has a malformed array length read"),
+                ))
             }
         }
         mir::RvalueKind::Unary {
@@ -867,10 +967,13 @@ fn validate_typed_rvalue(
             // narrower operands are promoted first, and no 8- or 16-bit shape
             // may be emitted.
             if !is_wide_integer(&input.type_) {
-                return Err(ValidationError::invalid(format!(
-                    "function `{function_name}` has a bitwise complement of unsupported type `{}`",
-                    type_name(&input.type_)
-                )));
+                return Err(ValidationError::invalid(
+                    codes::MIR_BITWISE_NOT_UNSUPPORTED_TYPE,
+                    format!(
+                        "function `{function_name}` has a bitwise complement of unsupported type `{}`",
+                        type_name(&input.type_)
+                    ),
+                ));
             }
             ensure_same_type(
                 &value.type_,
@@ -894,9 +997,12 @@ fn validate_typed_rvalue(
                 {
                     Ok(())
                 }
-                _ => Err(ValidationError::invalid(format!(
-                    "function `{function_name}` upcasts to a class that is not a base of its operand"
-                ))),
+                _ => Err(ValidationError::invalid(
+                    codes::MIR_INVALID_UPCAST,
+                    format!(
+                        "function `{function_name}` upcasts to a class that is not a base of its operand"
+                    ),
+                )),
             }
         }
         mir::RvalueKind::Downcast(input) => {
@@ -909,9 +1015,12 @@ fn validate_typed_rvalue(
                 }
                 // The object half of an interface value, viewed as a class.
                 (mir::Type::Interface(_), mir::Type::Class(_)) => Ok(()),
-                _ => Err(ValidationError::invalid(format!(
-                    "function `{function_name}` narrows a class reference to an unrelated class"
-                ))),
+                _ => Err(ValidationError::invalid(
+                    codes::MIR_INVALID_DOWNCAST,
+                    format!(
+                        "function `{function_name}` narrows a class reference to an unrelated class"
+                    ),
+                )),
             }
         }
         mir::RvalueKind::InterfaceTest { object, interface } => {
@@ -922,9 +1031,10 @@ fn validate_typed_rvalue(
             {
                 Ok(())
             } else {
-                Err(ValidationError::invalid(format!(
-                    "function `{function_name}` has a malformed interface test"
-                )))
+                Err(ValidationError::invalid(
+                    codes::MIR_MALFORMED_INTERFACE_TEST,
+                    format!("function `{function_name}` has a malformed interface test"),
+                ))
             }
         }
         mir::RvalueKind::InterfaceLookup { object, interface } => {
@@ -935,9 +1045,10 @@ fn validate_typed_rvalue(
             {
                 Ok(())
             } else {
-                Err(ValidationError::invalid(format!(
-                    "function `{function_name}` has a malformed interface lookup"
-                )))
+                Err(ValidationError::invalid(
+                    codes::MIR_MALFORMED_INTERFACE_LOOKUP,
+                    format!("function `{function_name}` has a malformed interface lookup"),
+                ))
             }
         }
         mir::RvalueKind::ClassTest { object, class } => {
@@ -954,9 +1065,10 @@ fn validate_typed_rvalue(
                 {
                     Ok(())
                 }
-                _ => Err(ValidationError::invalid(format!(
-                    "function `{function_name}` has a malformed class test"
-                ))),
+                _ => Err(ValidationError::invalid(
+                    codes::MIR_MALFORMED_CLASS_TEST,
+                    format!("function `{function_name}` has a malformed class test"),
+                )),
             }
         }
         mir::RvalueKind::Binary {
@@ -1033,10 +1145,13 @@ fn validate_bitwise_operands(
     if valid {
         Ok(())
     } else {
-        Err(ValidationError::invalid(format!(
-            "function `{function_name}` has a bitwise or shift operation on unsupported type `{}`",
-            type_name(operand_type)
-        )))
+        Err(ValidationError::invalid(
+            codes::MIR_BITWISE_SHIFT_UNSUPPORTED_TYPE,
+            format!(
+                "function `{function_name}` has a bitwise or shift operation on unsupported type `{}`",
+                type_name(operand_type)
+            ),
+        ))
     }
 }
 
@@ -1070,9 +1185,10 @@ fn validate_typed_operand(
             if signatures.contains_key(symbol) {
                 Ok(())
             } else {
-                Err(ValidationError::invalid(format!(
-                    "function `{function_name}` references an unknown function value"
-                )))
+                Err(ValidationError::invalid(
+                    codes::MIR_UNKNOWN_FUNCTION_VALUE,
+                    format!("function `{function_name}` references an unknown function value"),
+                ))
             }
         }
     }
@@ -1087,24 +1203,31 @@ fn validate_typed_place(
 ) -> Result<mir::Type, ValidationError> {
     match place {
         mir::Place::Local(local) => locals.get(local).cloned().ok_or_else(|| {
-            ValidationError::invalid(format!(
-                "function `{function_name}` references undeclared local {local:?}"
-            ))
+            ValidationError::invalid(
+                codes::MIR_UNDECLARED_LOCAL,
+                format!("function `{function_name}` references undeclared local {local:?}"),
+            )
         }),
         mir::Place::Field { base, field } => {
             let mir::Type::User(owner) =
                 validate_typed_place(base, function_name, locals, signatures, types)?
             else {
-                return Err(ValidationError::invalid(format!(
-                    "function `{function_name}` reads a struct field from a non-struct place"
-                )));
+                return Err(ValidationError::invalid(
+                    codes::MIR_NON_STRUCT_FIELD_PLACE,
+                    format!(
+                        "function `{function_name}` reads a struct field from a non-struct place"
+                    ),
+                ));
             };
             types
                 .struct_fields
                 .get(&(owner, *field))
                 .cloned()
                 .ok_or_else(|| {
-                    ValidationError::invalid("MIR struct field does not belong to its base")
+                    ValidationError::invalid(
+                        codes::MIR_STRUCT_FIELD_OWNER_MISMATCH,
+                        "MIR struct field does not belong to its base",
+                    )
                 })
         }
         mir::Place::Index {
@@ -1118,37 +1241,46 @@ fn validate_typed_place(
             if array.type_ != mir::Type::Array(Box::new(element_type.clone()))
                 || index.type_ != mir::Type::Int
             {
-                return Err(ValidationError::invalid(format!(
-                    "function `{function_name}` contains malformed array index metadata"
-                )));
+                return Err(ValidationError::invalid(
+                    codes::MIR_MALFORMED_ARRAY_INDEX,
+                    format!("function `{function_name}` contains malformed array index metadata"),
+                ));
             }
             Ok(element_type.clone())
         }
         mir::Place::ObjectField { object, field } => {
             validate_typed_operand(object, function_name, locals, signatures, types)?;
             let mir::Type::Class(owner) = object.type_ else {
-                return Err(ValidationError::invalid(format!(
-                    "function `{function_name}` reads an object field from a non-class value"
-                )));
+                return Err(ValidationError::invalid(
+                    codes::MIR_NON_CLASS_FIELD_PLACE,
+                    format!(
+                        "function `{function_name}` reads an object field from a non-class value"
+                    ),
+                ));
             };
             types
                 .class_fields
                 .get(&(owner, *field))
                 .cloned()
                 .ok_or_else(|| {
-                    ValidationError::invalid("MIR class field does not belong to its object")
+                    ValidationError::invalid(
+                        codes::MIR_CLASS_FIELD_OWNER_MISMATCH,
+                        "MIR class field does not belong to its object",
+                    )
                 })
         }
         mir::Place::EnumField { base, case, field } => {
             let mir::Type::Enum(owner) =
                 validate_typed_place(base, function_name, locals, signatures, types)?
             else {
-                return Err(ValidationError::invalid(format!(
-                    "function `{function_name}` reads an enum field from a non-enum place"
-                )));
+                return Err(ValidationError::invalid(
+                    codes::MIR_NON_ENUM_FIELD_PLACE,
+                    format!("function `{function_name}` reads an enum field from a non-enum place"),
+                ));
             };
             if types.enum_cases.get(case) != Some(&owner) {
                 return Err(ValidationError::invalid(
+                    codes::MIR_ENUM_CASE_OWNER_MISMATCH,
                     "MIR enum case does not belong to its base",
                 ));
             }
@@ -1157,10 +1289,14 @@ fn validate_typed_place(
                 .get(&(*case, *field))
                 .cloned()
                 .ok_or_else(|| {
-                    ValidationError::invalid("MIR enum field does not belong to its case")
+                    ValidationError::invalid(
+                        codes::MIR_ENUM_FIELD_CASE_MISMATCH,
+                        "MIR enum field does not belong to its case",
+                    )
                 })
         }
         mir::Place::Symbol(_) => Err(ValidationError::unsupported(
+            codes::MIR_UNSUPPORTED_GLOBAL_SYMBOL,
             function_name,
             "module globals, classes, and objects",
         )),
@@ -1176,11 +1312,14 @@ fn ensure_same_type(
     if actual == expected {
         Ok(())
     } else {
-        Err(ValidationError::invalid(format!(
-            "function `{function_name}` has mismatched types for {operation}: `{}` and `{}`",
-            type_name(actual),
-            type_name(expected)
-        )))
+        Err(ValidationError::invalid(
+            codes::MIR_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has mismatched types for {operation}: `{}` and `{}`",
+                type_name(actual),
+                type_name(expected)
+            ),
+        ))
     }
 }
 
@@ -1210,9 +1349,12 @@ fn validate_constant_type(
     if matches {
         Ok(())
     } else {
-        Err(ValidationError::invalid(format!(
-            "function `{function_name}` gives a MIR constant an incompatible type `{}`",
-            type_name(type_)
-        )))
+        Err(ValidationError::invalid(
+            codes::MIR_CONSTANT_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` gives a MIR constant an incompatible type `{}`",
+                type_name(type_)
+            ),
+        ))
     }
 }

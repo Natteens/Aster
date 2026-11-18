@@ -303,6 +303,11 @@ fn read_line_into_option(
         context.fail("aster.io.ReadLine received a negative layout size");
         return;
     };
+    let is_niche = payload_offset == 0 && total_size == size_of::<*const AsterStrHeader>();
+    if !is_niche && payload_offset < 4 {
+        context.fail("aster.io.ReadLine payload overlaps Option tag");
+        return;
+    }
     let Some(payload_end) = payload_offset.checked_add(size_of::<*const AsterStrHeader>()) else {
         context.fail("aster.io.ReadLine payload offset overflows");
         return;
@@ -321,14 +326,18 @@ fn read_line_into_option(
             // `payload_offset` were bounds-checked above.
             #[allow(unsafe_code)]
             unsafe {
-                write_option_result::<*const AsterStrHeader>(
-                    destination,
-                    total_size,
-                    payload_offset,
-                    None,
-                    some_tag,
-                    none_tag,
-                );
+                if is_niche {
+                    std::ptr::write_bytes(destination, 0, total_size);
+                } else {
+                    write_option_result::<*const AsterStrHeader>(
+                        destination,
+                        total_size,
+                        payload_offset,
+                        None,
+                        some_tag,
+                        none_tag,
+                    );
+                }
             }
         }
         Ok(Some(bytes)) => {
@@ -345,14 +354,18 @@ fn read_line_into_option(
             // SAFETY: as above.
             #[allow(unsafe_code)]
             unsafe {
-                write_option_result(
-                    destination,
-                    total_size,
-                    payload_offset,
-                    Some(pointer),
-                    some_tag,
-                    none_tag,
-                );
+                if is_niche {
+                    std::ptr::write_unaligned(destination.cast::<*const AsterStrHeader>(), pointer);
+                } else {
+                    write_option_result(
+                        destination,
+                        total_size,
+                        payload_offset,
+                        Some(pointer),
+                        some_tag,
+                        none_tag,
+                    );
+                }
             }
         }
         Err(error) => context.fail(format!("aster.io.ReadLine failed: {error}")),
@@ -706,5 +719,33 @@ mod tests {
         backend.write(b"abc").unwrap();
         backend.write(b"\n").unwrap();
         assert_eq!(backend.output(), b"abc\n");
+    }
+
+    #[test]
+    fn read_line_supports_niche_option_string_layout() {
+        let mut context = ExecutionContext::new();
+        context.set_console_backend(Box::new(MemoryConsoleBackend::new(
+            b"niche-line\n".to_vec(),
+        )));
+        let mut destination = 0_usize;
+        let destination_ptr = (&raw mut destination).cast::<u8>();
+        let ptr_size = i32::try_from(size_of::<*const AsterStrHeader>()).expect("pointer width");
+        aster_rt_io_read_line(&raw mut context, destination_ptr, ptr_size, 0, 1, 0);
+        assert!(context.take_error().is_none());
+        #[allow(unsafe_code)]
+        unsafe {
+            let string_pointer =
+                std::ptr::read_unaligned(destination_ptr.cast::<*const AsterStrHeader>());
+            assert!(!string_pointer.is_null());
+            assert_eq!(view(string_pointer), Some("niche-line"));
+        }
+        aster_rt_io_read_line(&raw mut context, destination_ptr, ptr_size, 0, 1, 0);
+        assert!(context.take_error().is_none());
+        #[allow(unsafe_code)]
+        unsafe {
+            let eof_pointer =
+                std::ptr::read_unaligned(destination_ptr.cast::<*const AsterStrHeader>());
+            assert!(eof_pointer.is_null());
+        }
     }
 }

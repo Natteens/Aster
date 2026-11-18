@@ -1,3 +1,5 @@
+use aster_diagnostics::codes;
+
 use super::{
     Analyzer, Binding, Block, ConstError, ConstValue, Diagnostic, EnumCaseInfo, Expression,
     HashMap, HashSet, ResolvedEnumCase, Span, Statement, Type, TypeRef, VariableDeclaration,
@@ -48,8 +50,12 @@ impl Analyzer<'_> {
         for statement in &block.statements {
             if !flow.can_continue {
                 self.diagnostics.push(
-                    Diagnostic::warning("unreachable code", statement.span())
-                        .with_help("remove the statement or change the preceding control flow"),
+                    Diagnostic::warning(
+                        codes::SEM_WARN_UNREACHABLE_CODE,
+                        "unreachable code",
+                        statement.span(),
+                    )
+                    .with_help("remove the statement or change the preceding control flow"),
                 );
             }
             let statement_flow = self.statement(statement);
@@ -75,6 +81,7 @@ impl Analyzer<'_> {
                         if super::declarations::is_reference_type(&binding.type_) {
                             self.diagnostics.push(
                                 Diagnostic::error(
+                                    codes::SEM_STMT_REF_LOCAL_BEFORE_AWAIT,
                                     "a reference-typed local cannot be declared before `await` in this version",
                                     variable.span,
                                 )
@@ -88,6 +95,7 @@ impl Analyzer<'_> {
                             // or an enum/struct value type.
                             self.diagnostics.push(
                                 Diagnostic::error(
+                                    codes::SEM_STMT_NON_SCALAR_BEFORE_AWAIT,
                                     format!(
                                         "a `{}` local cannot be declared before `await` in this version",
                                         binding.type_.display()
@@ -105,12 +113,17 @@ impl Analyzer<'_> {
             Statement::Return { value, span } => {
                 match (&self.return_type, value) {
                     (Type::Void, Some(_)) => self.diagnostics.push(
-                        Diagnostic::error("a `void` function cannot return a value", *span)
-                            .with_help("use `return;` without a value"),
+                        Diagnostic::error(
+                            codes::SEM_STMT_VOID_RETURN_VALUE,
+                            "a `void` function cannot return a value",
+                            *span,
+                        )
+                        .with_help("use `return;` without a value"),
                     ),
                     (Type::Void, None) => {}
                     (_, None) => self.diagnostics.push(
                         Diagnostic::error(
+                            codes::SEM_STMT_MISSING_RETURN_VALUE,
                             format!(
                                 "return value of type `{}` is required",
                                 self.return_type.display()
@@ -132,6 +145,7 @@ impl Analyzer<'_> {
                             .is_some_and(|binding| !binding.initialized)
                         {
                             self.diagnostics.push(Diagnostic::error(
+                                codes::SEM_STMT_CTOR_RETURN_UNINIT,
                                 format!(
                                     "constructor returns before {} is initialized",
                                     super::field_display(field)
@@ -144,7 +158,7 @@ impl Analyzer<'_> {
                 Flow::TERMINATE
             }
             Statement::Expression(expression) => {
-                self.expression(expression);
+                self.statement_expression(expression);
                 Flow::CONTINUE
             }
             Statement::Unsafe { body, .. } => {
@@ -269,6 +283,7 @@ impl Analyzer<'_> {
                     other => {
                         self.diagnostics.push(
                             Diagnostic::error(
+                                codes::SEM_STMT_FOREACH_NOT_ITERABLE,
                                 format!("type `{}` is not iterable", other.display()),
                                 collection.span,
                             )
@@ -288,6 +303,7 @@ impl Analyzer<'_> {
                     if collection_is_string {
                         self.diagnostics.push(
                             Diagnostic::error(
+                                codes::SEM_STMT_FOREACH_ELEMENT_MISMATCH,
                                 format!(
                                     "foreach over string requires element type `char`, found `{}`",
                                     declared_type.display()
@@ -301,6 +317,7 @@ impl Analyzer<'_> {
                     } else {
                         self.diagnostics.push(
                             Diagnostic::error(
+                                codes::SEM_STMT_FOREACH_ELEMENT_MISMATCH,
                                 format!(
                                     "foreach element type `{}` does not match array element type `{}`",
                                     declared_type.display(),
@@ -349,6 +366,7 @@ impl Analyzer<'_> {
                     };
                     self.diagnostics.push(
                         Diagnostic::error(
+                            codes::SEM_STMT_LOOP_CONTROL_OUTSIDE_LOOP,
                             format!("`{keyword}` is only valid inside a loop"),
                             *span,
                         )
@@ -408,6 +426,7 @@ impl Analyzer<'_> {
             if selected != Type::Unknown {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_STMT_SWITCH_INVALID_SUBJECT,
                         format!(
                             "`switch` requires an enum, integer, `char` or `string` value, found `{}`",
                             selected.display()
@@ -508,6 +527,7 @@ impl Analyzer<'_> {
         let Some(label) = label else {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_STMT_SWITCH_PATTERN_NOT_CONST,
                     format!(
                         "a `{}` switch case must be a constant label, not an enum pattern",
                         subject.display()
@@ -533,18 +553,25 @@ impl Analyzer<'_> {
             Err(error) => {
                 let diagnostic = match error {
                     ConstError::NotConstant(span) => {
-                        Diagnostic::error("a switch case label must be a constant expression", span)
-                            .with_help(
-                                "use literals, constants, operators, `?:`, or casts; calls and variables are not constant",
-                            )
+                        Diagnostic::error(
+                            codes::SEM_STMT_SWITCH_NON_CONST_CASE,
+                            "a switch case label must be a constant expression",
+                            span,
+                        )
+                        .with_help(
+                            "use literals, constants, operators, `?:`, or casts; calls and variables are not constant",
+                        )
                     }
                     ConstError::Overflow(span, type_name) => Diagnostic::error(
+                        codes::SEM_STMT_SWITCH_CONST_OVERFLOW,
                         format!("constant expression overflows `{type_name}`"),
                         span,
                     ),
-                    ConstError::DivisionByZero(span) => {
-                        Diagnostic::error("constant expression divides by zero", span)
-                    }
+                    ConstError::DivisionByZero(span) => Diagnostic::error(
+                        codes::SEM_STMT_SWITCH_CONST_DIV_ZERO,
+                        "constant expression divides by zero",
+                        span,
+                    ),
                 };
                 self.diagnostics.push(diagnostic);
                 return;
@@ -562,6 +589,7 @@ impl Analyzer<'_> {
             ),
             _ => {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_STMT_SWITCH_CASE_TYPE_MISMATCH,
                     format!(
                         "a switch case label cannot have type `{}` here",
                         label_type.display()
@@ -573,6 +601,7 @@ impl Analyzer<'_> {
         };
         if !seen.insert(key) {
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_STMT_SWITCH_DUPLICATE_CASE,
                 format!("duplicate switch case `{shown}`"),
                 span,
             ));
@@ -584,6 +613,7 @@ impl Analyzer<'_> {
     pub(super) fn require_scalar_default(&mut self, subject: &Type, span: Span) {
         self.diagnostics.push(
             Diagnostic::error(
+                codes::SEM_STMT_SWITCH_MISSING_DEFAULT,
                 format!(
                     "a `switch` on `{}` requires a `default` case",
                     subject.display()
@@ -607,6 +637,7 @@ impl Analyzer<'_> {
             && owner != resolved.enum_name
         {
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_STMT_SWITCH_CASE_WRONG_ENUM,
                 format!(
                     "case `{case_name}` belongs to `{owner}`, not `{}`",
                     resolved.enum_name
@@ -617,6 +648,7 @@ impl Analyzer<'_> {
         let Some(&case_index) = resolved.indices.get(case_name) else {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_STMT_SWITCH_UNKNOWN_ENUM_CASE,
                     format!("enum `{}` has no case `{case_name}`", resolved.enum_name),
                     span,
                 )
@@ -627,6 +659,7 @@ impl Analyzer<'_> {
         let info = &resolved.cases[case_index];
         if !covered.insert(case_index) {
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_STMT_SWITCH_DUPLICATE_CASE,
                 format!("duplicate switch case `{case_name}`"),
                 span,
             ));
@@ -634,6 +667,7 @@ impl Analyzer<'_> {
         if bindings.len() != info.fields.len() {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_STMT_SWITCH_ENUM_BINDING_ARITY,
                     format!(
                         "case `{case_name}` expects {} binding(s), found {}",
                         info.fields.len(),
@@ -665,8 +699,12 @@ impl Analyzer<'_> {
         if let Some(default_span) = default_span {
             if covered.len() == enum_cases.len() {
                 self.diagnostics.push(
-                    Diagnostic::warning("unreachable `default` case", default_span)
-                        .with_help("remove `default`; every enum case is already covered"),
+                    Diagnostic::warning(
+                        codes::SEM_WARN_UNREACHABLE_DEFAULT,
+                        "unreachable `default` case",
+                        default_span,
+                    )
+                    .with_help("remove `default`; every enum case is already covered"),
                 );
             }
             return true;
@@ -683,6 +721,7 @@ impl Analyzer<'_> {
             .join(", ");
         self.diagnostics.push(
             Diagnostic::error(
+                codes::SEM_STMT_SWITCH_NON_EXHAUSTIVE,
                 format!("non-exhaustive switch; missing case(s): {missing}"),
                 span,
             )
@@ -695,6 +734,7 @@ impl Analyzer<'_> {
         if *actual != Type::Bool && *actual != Type::Unknown {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_STMT_CONDITION_NOT_BOOL,
                     format!(
                         "`{construct}` condition must be `bool`, found `{}`",
                         actual.display()
@@ -728,8 +768,12 @@ impl Analyzer<'_> {
             VariableKind::Inferred => {
                 let Some(type_) = initializer_type else {
                     self.diagnostics.push(
-                        Diagnostic::error("`var` requires an initializer", variable.span)
-                            .with_help("add `= expression` so the type can be inferred"),
+                        Diagnostic::error(
+                            codes::SEM_STMT_VAR_NO_INITIALIZER,
+                            "`var` requires an initializer",
+                            variable.span,
+                        )
+                        .with_help("add `= expression` so the type can be inferred"),
                     );
                     return None;
                 };
@@ -739,8 +783,12 @@ impl Analyzer<'_> {
                 let expected = declared_type.expect("constant has a declared type");
                 let Some(actual) = &initializer_type else {
                     self.diagnostics.push(
-                        Diagnostic::error("constants require an initializer", variable.span)
-                            .with_help("add a compile-time-compatible initializer"),
+                        Diagnostic::error(
+                            codes::SEM_STMT_CONST_NO_INITIALIZER,
+                            "constants require an initializer",
+                            variable.span,
+                        )
+                        .with_help("add a compile-time-compatible initializer"),
                     );
                     return None;
                 };
@@ -786,6 +834,7 @@ impl Analyzer<'_> {
             Err(ConstError::NotConstant(span)) => {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_STMT_CONST_NON_CONSTANT,
                         "constant initializers must be compile-time constant expressions",
                         span,
                     )
@@ -797,15 +846,23 @@ impl Analyzer<'_> {
             }
             Err(ConstError::Overflow(span, type_name)) => {
                 self.diagnostics.push(
-                    Diagnostic::error(format!("constant expression overflows `{type_name}`"), span)
-                        .with_help("adjust the expression so the value fits its type"),
+                    Diagnostic::error(
+                        codes::SEM_STMT_CONST_OVERFLOW,
+                        format!("constant expression overflows `{type_name}`"),
+                        span,
+                    )
+                    .with_help("adjust the expression so the value fits its type"),
                 );
                 None
             }
             Err(ConstError::DivisionByZero(span)) => {
                 self.diagnostics.push(
-                    Diagnostic::error("constant expression divides by zero", span)
-                        .with_help("division and remainder by zero are undefined"),
+                    Diagnostic::error(
+                        codes::SEM_STMT_CONST_DIV_ZERO,
+                        "constant expression divides by zero",
+                        span,
+                    )
+                    .with_help("division and remainder by zero are undefined"),
                 );
                 None
             }
@@ -831,6 +888,7 @@ impl Analyzer<'_> {
         if scope.contains_key(name) {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_STMT_DUPLICATE_LOCAL,
                     format!("duplicate name `{name}` in this scope"),
                     binding.span,
                 )
@@ -845,13 +903,21 @@ impl Analyzer<'_> {
         let type_ = resolve_type_readonly(type_ref, self.context);
         if type_ == Type::Unknown {
             self.diagnostics.push(
-                Diagnostic::error(format!("unknown type `{}`", type_ref.name), type_ref.span)
-                    .with_help("declare the type or use a known basic type"),
+                Diagnostic::error(
+                    codes::SEM_TYPE_UNKNOWN,
+                    format!("unknown type `{}`", type_ref.name),
+                    type_ref.span,
+                )
+                .with_help("declare the type or use a known basic type"),
             );
         } else if type_ == Type::Void {
             self.diagnostics.push(
-                Diagnostic::error("variables cannot have type `void`", type_ref.span)
-                    .with_help("use a value type for the variable"),
+                Diagnostic::error(
+                    codes::SEM_STMT_VOID_VARIABLE,
+                    "variables cannot have type `void`",
+                    type_ref.span,
+                )
+                .with_help("use a value type for the variable"),
             );
         }
         type_

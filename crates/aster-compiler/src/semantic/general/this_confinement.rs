@@ -21,6 +21,8 @@
 
 use std::collections::BTreeSet;
 
+use aster_diagnostics::codes;
+
 use super::{
     Analyzer, CallableKey, Context, Diagnostic, HashMap, HashSet, Model, Span, ThisSummary,
 };
@@ -109,6 +111,7 @@ impl Analyzer<'_> {
                 .is_some_and(|binding| !binding.initialized)
         {
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_THIS_UNINIT_PROPERTY,
                 format!("property `{property}` is used before initialization"),
                 span,
             ));
@@ -189,6 +192,7 @@ impl Analyzer<'_> {
         if self.constructor {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_THIS_ESCAPE_IN_CTOR,
                     "`this` cannot be passed, stored, returned or converted while the object is under construction",
                     span,
                 )
@@ -212,7 +216,7 @@ impl Analyzer<'_> {
             "`this` is valid only inside an instance method"
         };
         self.diagnostics.push(
-            Diagnostic::error(message, span)
+            Diagnostic::error(codes::SEM_THIS_OUTSIDE_INSTANCE, message, span)
                 .with_help("access the object through an explicit variable"),
         );
         super::Type::Unknown
@@ -277,6 +281,7 @@ pub(super) fn validate(context: &Context, model: &Model, diagnostics: &mut Vec<D
         if call.virtual_dispatch {
             diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_THIS_VIRTUAL_CALL_IN_CTOR,
                     format!(
                         "constructor of `{}` calls the virtual member `{name}` on `this`",
                         call.class
@@ -292,6 +297,7 @@ pub(super) fn validate(context: &Context, model: &Model, diagnostics: &mut Vec<D
         if !confined.contains(&call.callable) {
             diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_THIS_UNCONFINED_CALL_IN_CTOR,
                     format!(
                         "constructor of `{}` calls `{name}`, which is not this-confined",
                         call.class
@@ -310,6 +316,7 @@ pub(super) fn validate(context: &Context, model: &Model, diagnostics: &mut Vec<D
         if !blocked.is_empty() {
             diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_THIS_READ_UNASSIGNED_FIELD,
                     format!(
                         "`{name}` reads {} before the constructor of `{}` has assigned {}",
                         blocked

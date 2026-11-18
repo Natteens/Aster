@@ -379,7 +379,8 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
         | hir::ExpressionKind::DictionaryLength(operand)
         | hir::ExpressionKind::DictionaryCapacity(operand)
         | hir::ExpressionKind::Convert { operand }
-        | hir::ExpressionKind::Unary { operand, .. } => {
+        | hir::ExpressionKind::Unary { operand, .. }
+        | hir::ExpressionKind::IsNull { operand, .. } => {
             collect_expression(operand, max);
         }
         hir::ExpressionKind::StringOperation {
@@ -535,6 +536,49 @@ fn collect_expression(expression: &hir::Expression, max: &mut u32) {
             note(max, *some_field);
             note(max, *return_none_case);
             collect_expression(operand, max);
+        }
+        hir::ExpressionKind::NullCoalesce {
+            value,
+            fallback,
+            some_case,
+            some_field,
+            ..
+        } => {
+            note(max, *some_case);
+            note(max, *some_field);
+            collect_expression(value, max);
+            collect_expression(fallback, max);
+        }
+        hir::ExpressionKind::NullConditional {
+            receiver,
+            receiver_symbol,
+            receiver_some_case,
+            receiver_some_field,
+            access,
+            result,
+            ..
+        } => {
+            note(max, *receiver_symbol);
+            note(max, *receiver_some_case);
+            note(max, *receiver_some_field);
+            match result {
+                hir::NullConditionalResult::Void => {}
+                hir::NullConditionalResult::Wrap {
+                    some_case,
+                    some_field,
+                    none_case,
+                    ..
+                } => {
+                    note(max, *some_case);
+                    note(max, *some_field);
+                    note(max, *none_case);
+                }
+                hir::NullConditionalResult::Flatten { none_case, .. } => {
+                    note(max, *none_case);
+                }
+            }
+            collect_expression(receiver, max);
+            collect_expression(access, max);
         }
         hir::ExpressionKind::Binary { left, right, .. } => {
             collect_expression(left, max);

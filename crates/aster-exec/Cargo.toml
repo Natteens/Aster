@@ -12,6 +12,7 @@ description = "Backend-neutral scheduler, task runtime and concurrency ABI for A
 aarm-telemetry = ["aster-runtime/aarm-telemetry"]
 
 [dependencies]
+aster-diagnostics = { path = "../aster-diagnostics", version = "0.71.0" }
 aster-mir = { path = "../aster-mir", version = "0.71.0" }
 aster-runtime = { path = "../aster-runtime", version = "0.71.0" }
 

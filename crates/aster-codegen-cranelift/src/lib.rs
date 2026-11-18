@@ -6,6 +6,8 @@
 //! code through a `CodeProvider`. It does not inspect syntax, AST,
 //! or HIR, and it exposes no Cranelift types to other crates.
 
+use aster_diagnostics::codes;
+
 mod async_abi;
 mod backend;
 mod calls;
@@ -76,7 +78,7 @@ pub use host_memory::{
     discover_aarm_auto_governor, discover_aarm_host_memory_capacity, resolve_aarm_auto_budget,
     resolve_aarm_explicit_budget,
 };
-use layouts::Layouts;
+use layouts::{EnumRepr, Layouts};
 #[cfg(feature = "aarm-telemetry")]
 #[doc(hidden)]
 pub use task_runtime::{
@@ -143,10 +145,14 @@ impl PreparedTestProgram {
                 .iter()
                 .find(|function| function.symbol == *symbol)
                 .ok_or_else(|| {
-                    BackendError::new(format!("test symbol {symbol:?} was not found"))
+                    BackendError::new(
+                        codes::BACKEND_ENTRY_NOT_FOUND,
+                        format!("test symbol {symbol:?} was not found"),
+                    )
                 })?;
             if !function.parameters.is_empty() || function.return_type != mir::Type::Void {
                 return Err(BackendError::new(
+                    codes::BACKEND_ENTRY_SIGNATURE_UNSUPPORTED,
                     "test symbol must be a parameterless void function",
                 ));
             }
@@ -196,7 +202,10 @@ impl PreparedTestProgram {
         if value == ExecutionValue::Void {
             Ok(())
         } else {
-            Err(BackendError::new("test symbol must return void"))
+            Err(BackendError::new(
+                codes::BACKEND_ENTRY_SIGNATURE_UNSUPPORTED,
+                "test symbol must return void",
+            ))
         }
     }
 }
@@ -251,6 +260,7 @@ impl PreparedSequentialExecution {
         validate_module(module)?;
         if task_runtime::module_uses_tasks(module) {
             return Err(BackendError::new(
+                codes::BACKEND_UNSUPPORTED_CONSTRUCT,
                 "prepared sequential research execution does not support Task.Run",
             ));
         }
@@ -418,7 +428,10 @@ pub fn execute_with_worker_count(
     worker_count: usize,
 ) -> Result<(ExecutionValue, MemoryStats), BackendError> {
     if worker_count == 0 {
-        return Err(BackendError::new("worker count must be at least 1"));
+        return Err(BackendError::new(
+            codes::EXEC_POOL_INVALID_WORKER_CONFIG,
+            "worker count must be at least 1",
+        ));
     }
     validate_module(module)?;
     let entry = select_entry(module, function_name)?;
@@ -571,8 +584,9 @@ pub fn execute_with_aarm_auto_parallel_governor(
     function_name: &str,
     worker_count: usize,
 ) -> Result<AarmAutoParallelExecution, BackendError> {
-    let auto =
-        discover_aarm_auto_governor().map_err(|error| BackendError::new(error.to_string()))?;
+    let auto = discover_aarm_auto_governor().map_err(|error| {
+        BackendError::new(codes::BACKEND_AARM_GOVERNOR_FAILED, error.to_string())
+    })?;
     let telemetry = auto.telemetry();
     execute_with_aarm_parallel_governor(module, function_name, worker_count, auto.governor())
         .map(|(value, main, plans, workers)| (value, main, plans, workers, telemetry))
@@ -595,8 +609,9 @@ pub fn execute_with_aarm_auto_task_governor(
     ),
     BackendError,
 > {
-    let auto =
-        discover_aarm_auto_governor().map_err(|error| BackendError::new(error.to_string()))?;
+    let auto = discover_aarm_auto_governor().map_err(|error| {
+        BackendError::new(codes::BACKEND_AARM_GOVERNOR_FAILED, error.to_string())
+    })?;
     let telemetry = auto.telemetry();
     execute_with_aarm_task_governor(module, function_name, worker_count, auto.governor())
         .map(|(value, main, domain)| (value, main, domain, telemetry))
@@ -619,8 +634,9 @@ pub fn execute_with_aarm_auto_async_governor(
     ),
     BackendError,
 > {
-    let auto =
-        discover_aarm_auto_governor().map_err(|error| BackendError::new(error.to_string()))?;
+    let auto = discover_aarm_auto_governor().map_err(|error| {
+        BackendError::new(codes::BACKEND_AARM_GOVERNOR_FAILED, error.to_string())
+    })?;
     let telemetry = auto.telemetry();
     execute_with_aarm_async_governor(module, function_name, worker_count, auto.governor())
         .map(|(value, main, domain)| (value, main, domain, telemetry))
@@ -636,8 +652,9 @@ pub fn execute_with_aarm_exact_parallel_governor(
     worker_count: usize,
     requested_bytes: u64,
 ) -> Result<AarmAutoParallelExecution, BackendError> {
-    let explicit = aarm_explicit_governor(requested_bytes)
-        .map_err(|error| BackendError::new(error.to_string()))?;
+    let explicit = aarm_explicit_governor(requested_bytes).map_err(|error| {
+        BackendError::new(codes::BACKEND_AARM_GOVERNOR_FAILED, error.to_string())
+    })?;
     let telemetry = explicit.telemetry();
     execute_with_aarm_parallel_governor(module, function_name, worker_count, explicit.governor())
         .map(|(value, main, plans, workers)| (value, main, plans, workers, telemetry))
@@ -661,8 +678,9 @@ pub fn execute_with_aarm_exact_task_governor(
     ),
     BackendError,
 > {
-    let explicit = aarm_explicit_governor(requested_bytes)
-        .map_err(|error| BackendError::new(error.to_string()))?;
+    let explicit = aarm_explicit_governor(requested_bytes).map_err(|error| {
+        BackendError::new(codes::BACKEND_AARM_GOVERNOR_FAILED, error.to_string())
+    })?;
     let telemetry = explicit.telemetry();
     execute_with_aarm_task_governor(module, function_name, worker_count, explicit.governor())
         .map(|(value, main, domain)| (value, main, domain, telemetry))
@@ -686,8 +704,9 @@ pub fn execute_with_aarm_exact_async_governor(
     ),
     BackendError,
 > {
-    let explicit = aarm_explicit_governor(requested_bytes)
-        .map_err(|error| BackendError::new(error.to_string()))?;
+    let explicit = aarm_explicit_governor(requested_bytes).map_err(|error| {
+        BackendError::new(codes::BACKEND_AARM_GOVERNOR_FAILED, error.to_string())
+    })?;
     let telemetry = explicit.telemetry();
     execute_with_aarm_async_governor(module, function_name, worker_count, explicit.governor())
         .map(|(value, main, domain)| (value, main, domain, telemetry))
@@ -781,7 +800,12 @@ pub fn execute_symbol(
         .functions
         .iter()
         .find(|function| function.symbol == symbol)
-        .ok_or_else(|| BackendError::new(format!("entry symbol {symbol:?} was not found")))?;
+        .ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_ENTRY_NOT_FOUND,
+                format!("entry symbol {symbol:?} was not found"),
+            )
+        })?;
     validate_invocable_entry(entry, &entry.name)?;
     execute_resolved(module, entry, false, None, None).map(|(value, _)| value)
 }
@@ -801,7 +825,12 @@ pub fn execute_symbol_with_foreign_registry(
         .functions
         .iter()
         .find(|function| function.symbol == symbol)
-        .ok_or_else(|| BackendError::new(format!("entry symbol {symbol:?} was not found")))?;
+        .ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_ENTRY_NOT_FOUND,
+                format!("entry symbol {symbol:?} was not found"),
+            )
+        })?;
     validate_invocable_entry(entry, &entry.name)?;
     execute_resolved_with_foreign_registry(module, entry, registry, false).map(|(value, _)| value)
 }
@@ -827,7 +856,12 @@ pub fn execute_entry_with_arguments(
         .functions
         .iter()
         .find(|function| function.symbol == symbol)
-        .ok_or_else(|| BackendError::new(format!("entry symbol {symbol:?} was not found")))?;
+        .ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_ENTRY_NOT_FOUND,
+                format!("entry symbol {symbol:?} was not found"),
+            )
+        })?;
     validate_invocable_entry_with_arguments(entry, &entry.name)?;
     if entry.parameters.is_empty() {
         return execute_resolved(module, entry, true, console_backend, None);
@@ -850,7 +884,12 @@ pub fn execute_symbol_with_stats(
         .functions
         .iter()
         .find(|function| function.symbol == symbol)
-        .ok_or_else(|| BackendError::new(format!("entry symbol {symbol:?} was not found")))?;
+        .ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_ENTRY_NOT_FOUND,
+                format!("entry symbol {symbol:?} was not found"),
+            )
+        })?;
     validate_invocable_entry(entry, &entry.name)?;
     execute_resolved(module, entry, true, None, None)
 }

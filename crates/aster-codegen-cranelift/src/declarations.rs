@@ -1,3 +1,5 @@
+use aster_diagnostics::codes;
+
 use super::{
     AbiParam, BackendError, ClifType, Codegen, FuncId, HashMap, HashSet, Linkage, Module,
     Primitive, RuntimeType, Signature, is_aggregate, mir, module_error, primitive, type_name,
@@ -161,10 +163,13 @@ impl Codegen {
             Some(Primitive::Float) => Ok(types::F32),
             Some(Primitive::Double) => Ok(types::F64),
             Some(Primitive::String) => Ok(self.pointer_type),
-            Some(Primitive::Decimal) | None => Err(BackendError::new(format!(
-                "type `{}` cannot be represented by the current JIT",
-                type_name(type_)
-            ))),
+            Some(Primitive::Decimal) | None => Err(BackendError::new(
+                codes::BACKEND_UNSUPPORTED_CONSTRUCT,
+                format!(
+                    "type `{}` cannot be represented by the current JIT",
+                    type_name(type_)
+                ),
+            )),
         }
     }
 }

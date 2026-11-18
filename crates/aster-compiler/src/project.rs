@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use aster_diagnostics::{Diagnostic, Span};
+use aster_diagnostics::{Diagnostic, DiagnosticCode, Span, codes};
 use aster_syntax::{
     Expression, ExpressionKind, FunctionDeclaration, Item, Member, Module, Property, Statement,
     SwitchCase, Token, TypeDeclaration, TypeRef, VariableDeclaration, Visibility, lex, parse,
@@ -241,24 +241,27 @@ pub fn fetch_dependencies(
 ) -> Result<FetchSummary, Vec<ProjectDiagnostic>> {
     let manifest_path = fs::canonicalize(manifest_path).map_err(|error| {
         vec![plain_error(
+            codes::MANIFEST_READ_ERROR,
             manifest_path,
             format!("could not read Aster.toml: {error}"),
         )]
     })?;
     if manifest_path.file_name().and_then(|name| name.to_str()) != Some("Aster.toml") {
         return Err(vec![plain_error(
+            codes::FETCH_INVALID_MANIFEST_PATH,
             &manifest_path,
             "fetch requires the root Aster.toml",
         )]);
     }
     let Some(project_root) = manifest_path.parent() else {
         return Err(vec![plain_error(
+            codes::PROJECT_ROOT_NO_PARENT,
             &manifest_path,
             "Aster.toml has no parent directory",
         )]);
     };
     if let Err(error) = crate::manifest::read_manifest(&manifest_path) {
-        return Err(vec![plain_error(&manifest_path, error.message)]);
+        return Err(vec![plain_error(error.code, &manifest_path, error.message)]);
     }
     let resolved = resolve_packages(
         Some(&manifest_path),
@@ -268,7 +271,7 @@ pub fn fetch_dependencies(
     .map_err(|errors| {
         errors
             .into_iter()
-            .map(|error| plain_error(&error.path, error.message))
+            .map(|error| plain_error(error.code, &error.path, error.message))
             .collect::<Vec<_>>()
     })?;
     let ResolutionState::Fetch {
@@ -279,8 +282,15 @@ pub fn fetch_dependencies(
     };
     let lockfile_path = project_root.join("Aster.lock");
     if packages.is_empty() {
-        let changed = crate::lockfile::remove_atomic(&lockfile_path, previous.as_ref())
-            .map_err(|message| vec![plain_error(&lockfile_path, message)])?;
+        let changed = crate::lockfile::remove_atomic(&lockfile_path, previous.as_ref()).map_err(
+            |message| {
+                vec![plain_error(
+                    codes::FETCH_LOCKFILE_WRITE_FAILED,
+                    &lockfile_path,
+                    message,
+                )]
+            },
+        )?;
         return Ok(FetchSummary {
             package_count: 0,
             lockfile_path: None,
@@ -289,7 +299,13 @@ pub fn fetch_dependencies(
     }
     let lockfile = crate::lockfile::Lockfile { packages };
     let changed = crate::lockfile::write_atomic(&lockfile_path, &lockfile, previous.as_ref())
-        .map_err(|message| vec![plain_error(&lockfile_path, message)])?;
+        .map_err(|message| {
+            vec![plain_error(
+                codes::FETCH_LOCKFILE_WRITE_FAILED,
+                &lockfile_path,
+                message,
+            )]
+        })?;
     Ok(FetchSummary {
         package_count: lockfile.packages.len(),
         lockfile_path: Some(lockfile_path),
@@ -326,7 +342,13 @@ fn compile_project_on_dedicated_stack(
             &mut |_| {},
         )
     })
-    .map_err(|error| vec![plain_error(&diagnostic_path, error.to_string())])?
+    .map_err(|error| {
+        vec![plain_error(
+            codes::COMPILER_WORKER_FAILED,
+            &diagnostic_path,
+            error.to_string(),
+        )]
+    })?
 }
 
 #[allow(clippy::too_many_lines)]
@@ -336,15 +358,18 @@ fn compile_project_with_standard_library_inner(
     include_tests: bool,
     observe_linked: &mut dyn FnMut(&Module),
 ) -> Result<ProjectCompilation, Vec<ProjectDiagnostic>> {
-    let root_path = absolute_path(path).map_err(|message| vec![plain_error(path, message)])?;
+    let root_path = absolute_path(path)
+        .map_err(|message| vec![plain_error(codes::PROJECT_ROOT_PATH_INVALID, path, message)])?;
     if root_path.extension().and_then(|value| value.to_str()) != Some("aster") {
         return Err(vec![plain_error(
+            codes::PROJECT_ROOT_EXTENSION,
             &root_path,
             "expected a file with the `.aster` extension",
         )]);
     }
     let Some(source_directory) = root_path.parent() else {
         return Err(vec![plain_error(
+            codes::PROJECT_ROOT_NO_PARENT,
             &root_path,
             "the root file has no parent directory",
         )]);
@@ -363,7 +388,7 @@ fn compile_project_with_standard_library_inner(
         Err(errors) => {
             return Err(errors
                 .into_iter()
-                .map(|error| plain_error(&error.path, error.message))
+                .map(|error| plain_error(error.code, &error.path, error.message))
                 .collect());
         }
     };
@@ -510,6 +535,7 @@ fn test_source_files(project_root: &Path) -> Result<Vec<PathBuf>, Vec<ProjectDia
     let mut files = Vec::new();
     collect(&directory, &mut files).map_err(|error| {
         vec![plain_error(
+            codes::PROJECT_TEST_DISCOVERY_FAILED,
             &directory,
             format!("could not discover test sources: {error}"),
         )]
@@ -519,6 +545,7 @@ fn test_source_files(project_root: &Path) -> Result<Vec<PathBuf>, Vec<ProjectDia
 
 /// A package-graph failure, reported against the manifest that caused it.
 struct GraphError {
+    code: DiagnosticCode,
     path: PathBuf,
     message: String,
 }
@@ -599,6 +626,7 @@ fn resolve_packages(
         Ok(lockfile) => lockfile,
         Err(message) => {
             return Err(vec![GraphError {
+                code: codes::GRAPH_LOCKFILE_READ_FAILED,
                 path: lock_path,
                 message,
             }]);
@@ -708,8 +736,9 @@ impl ResolutionState {
 }
 
 impl GraphBuilder {
-    fn fail(&mut self, path: &Path, message: impl Into<String>) {
+    fn fail(&mut self, code: DiagnosticCode, path: &Path, message: impl Into<String>) {
         self.errors.push(GraphError {
+            code,
             path: path.to_path_buf(),
             message: message.into(),
         });
@@ -726,6 +755,7 @@ impl GraphBuilder {
         }
         if self.packages[owner].name.is_empty() {
             self.fail(
+                codes::GRAPH_MISSING_PACKAGE_NAME,
                 owner_manifest,
                 "a manifest with `[dependencies]` must declare `[package] name`",
             );
@@ -774,6 +804,7 @@ impl GraphBuilder {
             self.resolve_dependency_source(owner, owner_manifest, owner_directory, dependency)?;
         if !root.is_dir() {
             self.fail(
+                codes::GRAPH_DEPENDENCY_NOT_DIRECTORY,
                 owner_manifest,
                 format!("dependency `{name}` source is not a directory"),
             );
@@ -782,6 +813,7 @@ impl GraphBuilder {
         let manifest_path = root.join("Aster.toml");
         if !manifest_path.is_file() {
             self.fail(
+                codes::GRAPH_DEPENDENCY_MISSING_MANIFEST,
                 owner_manifest,
                 format!(
                     "dependency `{name}` at `{}` is not an ASTER package: no Aster.toml",
@@ -799,6 +831,7 @@ impl GraphBuilder {
                 .collect::<Vec<_>>();
             cycle.push(manifest_path.display().to_string());
             self.fail(
+                codes::GRAPH_DEPENDENCY_CYCLE,
                 owner_manifest,
                 format!("dependency cycle: {}", cycle.join(" -> ")),
             );
@@ -807,13 +840,14 @@ impl GraphBuilder {
         let manifest = match crate::manifest::read_manifest(&manifest_path) {
             Ok(manifest) => manifest,
             Err(error) => {
-                self.fail(&manifest_path, error.message);
+                self.fail(error.code, &manifest_path, error.message);
                 return None;
             }
         };
         let declared_package = &manifest.package;
         if &declared_package.name != name {
             self.fail(
+                codes::GRAPH_DEPENDENCY_NAME_MISMATCH,
                 owner_manifest,
                 format!(
                     "dependency `{name}` resolves to a package named `{}`",
@@ -833,6 +867,7 @@ impl GraphBuilder {
             && previous != &root
         {
             self.fail(
+                codes::GRAPH_DUPLICATE_PACKAGE_IDENTITY,
                 owner_manifest,
                 format!(
                     "duplicate package identity `{name}`: `{}` and `{}`",
@@ -877,6 +912,7 @@ impl GraphBuilder {
                 };
                 if requested_update {
                     self.fail(
+                        codes::GRAPH_PATH_UPDATE_UNSUPPORTED,
                         owner_manifest,
                         format!(
                             "dependency `{name}` is not a Git dependency and cannot be updated"
@@ -889,6 +925,7 @@ impl GraphBuilder {
                 let declared = owner_directory.join(path);
                 let Ok(root) = fs::canonicalize(&declared) else {
                     self.fail(
+                        codes::GRAPH_PATH_MISSING,
                         owner_manifest,
                         format!(
                             "dependency `{name}` path `{path}` does not exist (resolved to `{}`)",
@@ -901,6 +938,7 @@ impl GraphBuilder {
                     && !root.starts_with(immutable_root)
                 {
                     self.fail(
+                        codes::GRAPH_PATH_ESCAPES_GIT_SOURCE,
                         owner_manifest,
                         format!(
                             "path dependency `{name}` escapes the immutable Git package source"
@@ -928,6 +966,7 @@ impl GraphBuilder {
             ResolutionState::Offline { lockfile, used } => {
                 let Some(lockfile) = lockfile else {
                     self.fail(
+                        codes::GRAPH_GIT_NOT_LOCKED_OR_STALE,
                         owner_manifest,
                         format!("Git dependency `{name}` is not locked; run `aster fetch`"),
                     );
@@ -939,6 +978,7 @@ impl GraphBuilder {
                     .find(|package| package.name == name)
                 else {
                     self.fail(
+                        codes::GRAPH_GIT_NOT_LOCKED_OR_STALE,
                         owner_manifest,
                         format!("Aster.lock is stale: Git dependency `{name}` is missing; run `aster fetch`"),
                     );
@@ -946,6 +986,7 @@ impl GraphBuilder {
                 };
                 if package.git != git || package.rev != rev {
                     self.fail(
+                        codes::GRAPH_GIT_NOT_LOCKED_OR_STALE,
                         owner_manifest,
                         format!(
                             "Aster.lock is stale for Git dependency `{name}`; run `aster fetch`"
@@ -966,6 +1007,7 @@ impl GraphBuilder {
                     && (package.git != git || package.rev != rev)
                 {
                     self.errors.push(GraphError {
+                        code: codes::GRAPH_GIT_SOURCE_CONFLICT,
                         path: owner_manifest.to_path_buf(),
                         message: format!(
                             "Git dependency `{name}` is declared with conflicting sources"
@@ -993,6 +1035,7 @@ impl GraphBuilder {
                     Ok(commit) => commit,
                     Err(message) => {
                         self.errors.push(GraphError {
+                            code: codes::GRAPH_GIT_SOURCE_CONFLICT,
                             path: owner_manifest.to_path_buf(),
                             message,
                         });
@@ -1013,7 +1056,7 @@ impl GraphBuilder {
         match result {
             Ok(path) => Some(path),
             Err(message) => {
-                self.fail(owner_manifest, message);
+                self.fail(codes::GRAPH_GIT_SOURCE_CONFLICT, owner_manifest, message);
                 None
             }
         }
@@ -1029,6 +1072,7 @@ impl GraphBuilder {
                         .find(|package| !used.contains(&package.name))
                 }) {
                     self.fail(
+                        codes::GRAPH_GIT_NOT_LOCKED_OR_STALE,
                         root_manifest,
                         format!(
                             "Aster.lock is stale: package `{}` is no longer in the Git dependency graph; run `aster fetch`",
@@ -1042,6 +1086,7 @@ impl GraphBuilder {
                 update_seen: false,
                 ..
             } => self.fail(
+                codes::GRAPH_GIT_SOURCE_CONFLICT,
                 root_manifest,
                 format!("Git dependency `{update}` was not found"),
             ),
@@ -1085,6 +1130,7 @@ impl Loader {
                 Ok(_) => {
                     self.diagnostics.push(
                         Diagnostic::error(
+                            codes::PROJECT_USING_OUTSIDE_ROOT,
                             "a using resolved outside its package root",
                             using_span.unwrap_or_default(),
                         )
@@ -1106,6 +1152,7 @@ impl Loader {
             let Some(source) = self.standard_library.source(namespace) else {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::PROJECT_MISSING_STDLIB_NAMESPACE,
                         format!(
                             "official standard library namespace `{namespace}` is unavailable; the Aster installation is incomplete"
                         ),
@@ -1122,6 +1169,7 @@ impl Loader {
                 Err(error) => {
                     let diagnostic = if root {
                         Diagnostic::error(
+                            codes::PROJECT_LOAD_ROOT_FILE,
                             format!(
                                 "could not load root source file `{}`: {error}",
                                 path.display()
@@ -1131,6 +1179,7 @@ impl Loader {
                         .with_help("ensure the input source file is valid UTF-8")
                     } else {
                         Diagnostic::error(
+                            codes::PROJECT_LOAD_NAMESPACE_FILE,
                             format!(
                                 "could not load namespace file `{}`: {error}",
                                 path.display()
@@ -1191,8 +1240,12 @@ impl Loader {
                 Ok(namespace) => namespace,
                 Err(message) => {
                     self.diagnostics.push(
-                        Diagnostic::error(message, using_span.unwrap_or_default())
-                            .with_help("keep source files below the project root"),
+                        Diagnostic::error(
+                            codes::PROJECT_INVALID_NAMESPACE_PATH,
+                            message,
+                            using_span.unwrap_or_default(),
+                        )
+                        .with_help("keep source files below the project root"),
                     );
                     return None;
                 }
@@ -1204,6 +1257,7 @@ impl Loader {
         {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::PROJECT_NAMESPACE_MISMATCH,
                     format!(
                         "namespace `{declared}` does not match the directory namespace `{}`",
                         display_namespace(&inferred)
@@ -1224,6 +1278,7 @@ impl Loader {
         if !standard_library && is_official_name(&namespace) {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::PROJECT_RESERVED_ASTER_NAMESPACE,
                     format!(
                         "namespace `{namespace}` uses the reserved `aster.*` standard-library namespace"
                     ),
@@ -1254,6 +1309,7 @@ impl Loader {
             if standard_library && !is_official_name(&using.name) {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::PROJECT_STDLIB_USING_PROJECT,
                         format!(
                             "standard library namespace `{namespace}` cannot use project namespace `{}`",
                             using.name
@@ -1266,12 +1322,19 @@ impl Loader {
             }
             if !seen.insert(using.name.clone()) {
                 self.diagnostics.push(
-                    Diagnostic::error(format!("duplicate using `{}`", using.name), using.span)
-                        .with_help("remove the repeated using"),
+                    Diagnostic::error(
+                        codes::PROJECT_DUPLICATE_USING,
+                        format!("duplicate using `{}`", using.name),
+                        using.span,
+                    )
+                    .with_help("remove the repeated using"),
                 );
                 continue;
             }
             self.load_namespace(&using.name, package, Some(using.span));
+        }
+        if !standard_library && module_uses_nullable_syntax(&mut self.units[unit_index].module) {
+            self.load_standard_library_namespace(crate::standard_library::CORE_NAMESPACE, None);
         }
         Some(namespace)
     }
@@ -1361,6 +1424,7 @@ impl Loader {
                 let directory = self.namespace_path(from, name);
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::PROJECT_UNKNOWN_NAMESPACE,
                         format!(
                             "namespace `{}` was not found in package `{}` or its dependencies",
                             display_namespace(name),
@@ -1384,6 +1448,7 @@ impl Loader {
                     .join(", ");
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::PROJECT_AMBIGUOUS_NAMESPACE,
                         format!(
                             "namespace `{}` is provided by more than one package: {owners}",
                             display_namespace(name)
@@ -1425,6 +1490,7 @@ impl Loader {
             cycle.push(display_namespace(name).to_owned());
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::PROJECT_CIRCULAR_USING,
                     format!("circular using: {}", cycle.join(" -> ")),
                     using_span.unwrap_or_default(),
                 )
@@ -1511,11 +1577,11 @@ fn absolute_path(path: &Path) -> Result<PathBuf, String> {
         .map_err(|error| format!("could not read `{}`: {error}", absolute.display()))
 }
 
-fn plain_error(path: &Path, message: impl Into<String>) -> ProjectDiagnostic {
+fn plain_error(code: DiagnosticCode, path: &Path, message: impl Into<String>) -> ProjectDiagnostic {
     ProjectDiagnostic {
         path: path.to_path_buf(),
         source: String::new(),
-        diagnostic: Diagnostic::error(message, Span::default()),
+        diagnostic: Diagnostic::error(code, message, Span::default()),
     }
 }
 
@@ -1636,6 +1702,7 @@ fn link(
     for (linked, left, right) in collisions {
         diagnostics.push(
             Diagnostic::error(
+                codes::PROJECT_DUPLICATE_LINKED_DECL,
                 format!(
                     "declaration `{linked}` is provided by more than one package: `{}` and `{}`",
                     display_package(&packages[left]),
@@ -1710,6 +1777,7 @@ fn link(
                     {
                         diagnostics.push(
                             Diagnostic::error(
+                                codes::PROJECT_STDLIB_EXPORT_CONFLICT,
                                 format!(
                                     "local declaration `{name}` conflicts with the official export from `{}`",
                                     using.name
@@ -1727,6 +1795,7 @@ fn link(
                     if previous != using.name {
                         diagnostics.push(
                             Diagnostic::error(
+                                codes::PROJECT_AMBIGUOUS_IMPORTED_NAME,
                                 format!(
                                     "name `{name}` is ambiguous between namespaces `{previous}` and `{}`",
                                     using.name
@@ -1847,6 +1916,9 @@ impl Rewriter<'_> {
             return name.to_owned();
         };
         type_name.map_names(&mut |base| {
+            if base == "?Option" {
+                return format!("{}::Option", crate::standard_library::CORE_NAMESPACE);
+            }
             if self.type_parameters.contains(base) {
                 return base.to_owned();
             }
@@ -1854,8 +1926,10 @@ impl Rewriter<'_> {
                 linked.clone()
             } else if let Some(origin) = self.inaccessible.get(base) {
                 let (message, help) = origin.describe(base);
-                self.diagnostics
-                    .push(Diagnostic::error(message, span).with_help(help));
+                self.diagnostics.push(
+                    Diagnostic::error(codes::PROJECT_INACCESSIBLE_SYMBOL, message, span)
+                        .with_help(help),
+                );
                 base.to_owned()
             } else {
                 base.to_owned()
@@ -2043,8 +2117,14 @@ impl AstVisitorMut for Rewriter<'_> {
                     && let Some(origin) = self.inaccessible.get(name)
                 {
                     let (message, help) = origin.describe(name);
-                    self.diagnostics
-                        .push(Diagnostic::error(message, expression.span).with_help(help));
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            codes::PROJECT_INACCESSIBLE_SYMBOL,
+                            message,
+                            expression.span,
+                        )
+                        .with_help(help),
+                    );
                 }
             }
             ExpressionKind::StructLiteral { type_name, .. }
@@ -2062,6 +2142,45 @@ impl AstVisitorMut for Rewriter<'_> {
     fn visit_type_ref_mut(&mut self, type_ref: &mut TypeRef) {
         type_ref.name = self.rewrite_type_name(&type_ref.name, type_ref.span);
     }
+}
+
+fn module_uses_nullable_syntax(module: &mut Module) -> bool {
+    struct NullableSyntaxScanner {
+        found: bool,
+    }
+    impl AstVisitorMut for NullableSyntaxScanner {
+        fn visit_type_ref_mut(&mut self, type_ref: &mut TypeRef) {
+            if type_ref.name.contains('?') {
+                self.found = true;
+            }
+        }
+        fn visit_expression_mut(&mut self, expression: &mut Expression) {
+            match &expression.kind {
+                ExpressionKind::Literal(aster_syntax::Literal::Null)
+                | ExpressionKind::NullCoalesce { .. }
+                | ExpressionKind::NullConditional { .. } => {
+                    self.found = true;
+                }
+                ExpressionKind::Name(name)
+                | ExpressionKind::StructLiteral {
+                    type_name: name, ..
+                }
+                | ExpressionKind::NewObject {
+                    type_name: Some(name),
+                    ..
+                } if name.contains('?') => {
+                    self.found = true;
+                }
+                _ => {}
+            }
+            if !self.found {
+                walk_expression_mut(self, expression);
+            }
+        }
+    }
+    let mut scanner = NullableSyntaxScanner { found: false };
+    scanner.visit_module_mut(module);
+    scanner.found
 }
 
 /// Test-only: compile `path` as a project and return the linked,

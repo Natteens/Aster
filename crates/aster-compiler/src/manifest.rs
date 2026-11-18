@@ -10,6 +10,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use aster_diagnostics::{DiagnosticCode, codes};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProjectManifest {
     /// Declared package identity for every manifest-backed package.
@@ -56,6 +58,7 @@ pub(crate) struct ManifestEntry {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ManifestDiagnostic {
+    pub code: DiagnosticCode,
     pub message: String,
     pub help: String,
 }
@@ -95,6 +98,7 @@ pub(crate) fn load_manifest(root_file: &Path) -> Option<LoadedManifest> {
 pub(crate) fn read_manifest(path: &Path) -> Result<ProjectManifest, ManifestDiagnostic> {
     fs::read_to_string(path)
         .map_err(|error| ManifestDiagnostic {
+            code: codes::MANIFEST_READ_ERROR,
             message: format!("could not read Aster.toml: {error}"),
             help: "make sure `Aster.toml` is readable UTF-8 text".to_owned(),
         })
@@ -114,12 +118,14 @@ fn find_manifest_in_ancestors(start: &Path) -> Option<PathBuf> {
 fn parse_manifest(source: &str) -> Result<ProjectManifest, ManifestDiagnostic> {
     let document = source.parse::<toml::Value>().map_err(|error| {
         manifest_error(
+            codes::MANIFEST_INVALID_TOML,
             format!("invalid Aster.toml: {error}"),
             "use `[package]` and, for an application, `[application]`",
         )
     })?;
     let table = document.as_table().ok_or_else(|| {
         manifest_error(
+            codes::MANIFEST_NOT_A_TABLE,
             "Aster.toml must contain a TOML table",
             "use a `[package]` table",
         )
@@ -127,6 +133,7 @@ fn parse_manifest(source: &str) -> Result<ProjectManifest, ManifestDiagnostic> {
 
     if table.contains_key("schema") {
         return Err(manifest_error(
+            codes::MANIFEST_REMOVED_SCHEMA,
             "Aster.toml no longer uses a `schema` field; remove it",
             "start the manifest with a `[package]` table",
         ));
@@ -136,6 +143,7 @@ fn parse_manifest(source: &str) -> Result<ProjectManifest, ManifestDiagnostic> {
         .find(|key| !matches!(key.as_str(), "package" | "application" | "dependencies"))
     {
         return Err(manifest_error(
+            codes::MANIFEST_UNKNOWN_TOP_FIELD,
             format!("unknown top-level Aster.toml field `{key}`"),
             "Aster.toml supports only `[package]`, `[application]`, and `[dependencies]`",
         ));
@@ -143,6 +151,7 @@ fn parse_manifest(source: &str) -> Result<ProjectManifest, ManifestDiagnostic> {
 
     let package = table.get("package").ok_or_else(|| {
         manifest_error(
+            codes::MANIFEST_MISSING_PACKAGE,
             "Aster.toml does not define a `[package]` table",
             "add `[package]` and `name = \"my_package\"`",
         )
@@ -168,30 +177,35 @@ fn parse_manifest(source: &str) -> Result<ProjectManifest, ManifestDiagnostic> {
 fn parse_package(value: &toml::Value) -> Result<PackageManifest, ManifestDiagnostic> {
     let table = value.as_table().ok_or_else(|| {
         manifest_error(
+            codes::MANIFEST_INVALID_PACKAGE,
             "Aster.toml `package` must be a table",
             "use `[package]` followed by `name = \"my_package\"`",
         )
     })?;
     if let Some(key) = table.keys().find(|key| key.as_str() != "name") {
         return Err(manifest_error(
+            codes::MANIFEST_INVALID_PACKAGE,
             format!("unknown Aster.toml package field `{key}`"),
             "a `[package]` table supports only `name`",
         ));
     }
     let name = table.get("name").ok_or_else(|| {
         manifest_error(
+            codes::MANIFEST_INVALID_PACKAGE,
             "Aster.toml does not define `package.name`",
             "add `name = \"my_package\"` below `[package]`",
         )
     })?;
     let name = name.as_str().ok_or_else(|| {
         manifest_error(
+            codes::MANIFEST_INVALID_PACKAGE,
             "Aster.toml `package.name` must be a string",
             "write `name = \"my_package\"`",
         )
     })?;
     if !valid_identifier(name) {
         return Err(manifest_error(
+            codes::MANIFEST_INVALID_PACKAGE_NAME,
             format!("package name `{name}` is not a valid ASTER identifier"),
             "use letters, digits, and underscores, starting with a letter or underscore",
         ));
@@ -201,9 +215,11 @@ fn parse_package(value: &toml::Value) -> Result<PackageManifest, ManifestDiagnos
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_dependencies(value: &toml::Value) -> Result<Vec<DependencyManifest>, ManifestDiagnostic> {
     let table = value.as_table().ok_or_else(|| {
         manifest_error(
+            codes::MANIFEST_INVALID_DEPENDENCIES,
             "Aster.toml `dependencies` must be a table",
             "use `[dependencies]` followed by `name = { path = \"../name\" }`",
         )
@@ -212,12 +228,14 @@ fn parse_dependencies(value: &toml::Value) -> Result<Vec<DependencyManifest>, Ma
     for (name, entry) in table {
         if !valid_identifier(name) {
             return Err(manifest_error(
+                codes::MANIFEST_INVALID_DEPENDENCY_NAME,
                 format!("dependency name `{name}` is not a valid ASTER identifier"),
                 "use letters, digits, and underscores, starting with a letter or underscore",
             ));
         }
         let entry = entry.as_table().ok_or_else(|| {
             manifest_error(
+                codes::MANIFEST_INVALID_DEPENDENCY_ENTRY,
                 format!("dependency `{name}` must be a table"),
                 format!("write `{name} = {{ path = \"../{name}\" }}`"),
             )
@@ -227,6 +245,7 @@ fn parse_dependencies(value: &toml::Value) -> Result<Vec<DependencyManifest>, Ma
             .find(|key| !matches!(key.as_str(), "path" | "git" | "rev"))
         {
             return Err(manifest_error(
+                codes::MANIFEST_INVALID_DEPENDENCY_ENTRY,
                 format!("unknown field `{key}` in dependency `{name}`"),
                 "dependencies support only `path`, or `git` together with `rev`",
             ));
@@ -234,6 +253,7 @@ fn parse_dependencies(value: &toml::Value) -> Result<Vec<DependencyManifest>, Ma
         let source = match (entry.get("path"), entry.get("git"), entry.get("rev")) {
             (Some(_), Some(_), _) => {
                 return Err(manifest_error(
+                    codes::MANIFEST_DEPENDENCY_SOURCE_CONFLICT,
                     format!("dependency `{name}` cannot define both `path` and `git`"),
                     "choose one dependency source",
                 ));
@@ -242,6 +262,7 @@ fn parse_dependencies(value: &toml::Value) -> Result<Vec<DependencyManifest>, Ma
                 let path = dependency_string(path, name, "path")?;
                 if path.is_empty() {
                     return Err(manifest_error(
+                        codes::MANIFEST_INVALID_DEPENDENCY_PATH,
                         format!("dependency `{name}` has an empty path"),
                         format!("write `{name} = {{ path = \"../{name}\" }}`"),
                     ));
@@ -250,6 +271,7 @@ fn parse_dependencies(value: &toml::Value) -> Result<Vec<DependencyManifest>, Ma
             }
             (Some(_), None, Some(_)) => {
                 return Err(manifest_error(
+                    codes::MANIFEST_INVALID_DEPENDENCY_PATH,
                     format!("path dependency `{name}` cannot define `rev`"),
                     "remove `rev` from the path dependency",
                 ));
@@ -259,12 +281,14 @@ fn parse_dependencies(value: &toml::Value) -> Result<Vec<DependencyManifest>, Ma
                 let rev = dependency_string(rev, name, "rev")?;
                 validate_git_url(&git).map_err(|message| {
                     manifest_error(
+                        codes::MANIFEST_INVALID_DEPENDENCY_GIT,
                         format!("dependency `{name}` {message}"),
                         "use a public HTTPS repository URL",
                     )
                 })?;
                 validate_git_rev(&rev).map_err(|message| {
                     manifest_error(
+                        codes::MANIFEST_INVALID_DEPENDENCY_GIT,
                         format!("dependency `{name}` {message}"),
                         "use a branch, tag, or full commit SHA",
                     )
@@ -273,18 +297,21 @@ fn parse_dependencies(value: &toml::Value) -> Result<Vec<DependencyManifest>, Ma
             }
             (None, Some(_), None) => {
                 return Err(manifest_error(
+                    codes::MANIFEST_INVALID_DEPENDENCY_GIT,
                     format!("Git dependency `{name}` does not define `rev`"),
                     format!("write `{name} = {{ git = \"https://...\", rev = \"main\" }}"),
                 ));
             }
             (None, None, Some(_)) => {
                 return Err(manifest_error(
+                    codes::MANIFEST_INVALID_DEPENDENCY_GIT,
                     format!("dependency `{name}` defines `rev` without `git`"),
                     "add `git` or remove `rev`",
                 ));
             }
             (None, None, None) => {
                 return Err(manifest_error(
+                    codes::MANIFEST_DEPENDENCY_SOURCE_CONFLICT,
                     format!("dependency `{name}` does not define a source"),
                     "define either `path`, or `git` together with `rev`",
                 ));
@@ -307,6 +334,7 @@ fn dependency_string(
 ) -> Result<String, ManifestDiagnostic> {
     value.as_str().map(str::to_owned).ok_or_else(|| {
         manifest_error(
+            codes::MANIFEST_INVALID_DEPENDENCY_ENTRY,
             format!("dependency `{name}` {field} must be a string"),
             format!("write `{field} = \"...\"`"),
         )
@@ -369,6 +397,7 @@ pub(crate) fn validate_git_rev(rev: &str) -> Result<(), &'static str> {
 fn parse_application(value: &toml::Value) -> Result<ApplicationManifest, ManifestDiagnostic> {
     let application = value.as_table().ok_or_else(|| {
         manifest_error(
+            codes::MANIFEST_INVALID_APPLICATION,
             "Aster.toml `application` must be a table",
             "use `[application]` followed by `entry = \"app.Program.Main\"`",
         )
@@ -376,6 +405,7 @@ fn parse_application(value: &toml::Value) -> Result<ApplicationManifest, Manifes
 
     if let Some(key) = application.keys().find(|key| key.as_str() != "entry") {
         return Err(manifest_error(
+            codes::MANIFEST_INVALID_APPLICATION,
             format!("unknown Aster.toml application field `{key}`"),
             "an `[application]` table supports only `entry`",
         ));
@@ -383,12 +413,14 @@ fn parse_application(value: &toml::Value) -> Result<ApplicationManifest, Manifes
 
     let entry = application.get("entry").ok_or_else(|| {
         manifest_error(
+            codes::MANIFEST_INVALID_APPLICATION,
             "Aster.toml does not define `application.entry`",
             "add `entry = \"app.Program.Main\"` below `[application]`",
         )
     })?;
     let entry = entry.as_str().ok_or_else(|| {
         manifest_error(
+            codes::MANIFEST_INVALID_APPLICATION,
             "Aster.toml `application.entry` must be a string",
             "write a dotted entry such as `entry = \"app.Program.Main\"`",
         )
@@ -396,6 +428,7 @@ fn parse_application(value: &toml::Value) -> Result<ApplicationManifest, Manifes
     let parts = entry.split('.').collect::<Vec<_>>();
     if parts.len() < 3 || parts.iter().any(|part| !valid_identifier(part)) {
         return Err(manifest_error(
+            codes::MANIFEST_INVALID_APPLICATION_ENTRY,
             format!("application entry `{entry}` has an invalid format"),
             "use a dotted `namespace.Class.Main` name such as `app.Program.Main`",
         ));
@@ -403,6 +436,7 @@ fn parse_application(value: &toml::Value) -> Result<ApplicationManifest, Manifes
     let method = parts[parts.len() - 1].to_owned();
     if method != "Main" {
         return Err(manifest_error(
+            codes::MANIFEST_INVALID_APPLICATION_ENTRY,
             format!("application entry must end in `.Main`, but found `.{method}`"),
             "point `application.entry` at a public static `Main` method",
         ));
@@ -423,8 +457,13 @@ pub(crate) fn valid_identifier(value: &str) -> bool {
         && characters.all(|character| matches!(character, '_' | 'a'..='z' | 'A'..='Z' | '0'..='9'))
 }
 
-fn manifest_error(message: impl Into<String>, help: impl Into<String>) -> ManifestDiagnostic {
+fn manifest_error(
+    code: DiagnosticCode,
+    message: impl Into<String>,
+    help: impl Into<String>,
+) -> ManifestDiagnostic {
     ManifestDiagnostic {
+        code,
         message: message.into(),
         help: help.into(),
     }

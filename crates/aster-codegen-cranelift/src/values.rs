@@ -1,3 +1,5 @@
+use aster_diagnostics::codes;
+
 use super::{
     BackendError, ClifType, Codegen, DataDescription, DataId, FloatCC, FunctionBuilder,
     FunctionState, InstBuilder, IntCC, MemFlags, Module, Ordering, Primitive, Value, mir,
@@ -21,26 +23,49 @@ impl Codegen {
         let target_address = self
             .descriptors
             .address(class)
-            .ok_or_else(|| BackendError::new("class test target has no object descriptor"))?
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    "class test target has no object descriptor",
+                )
+            })?
             .cast_signed();
-        let target_depth = self
-            .descriptors
-            .depth(class)
-            .ok_or_else(|| BackendError::new("class test target has no object descriptor"))?;
+        let target_depth = self.descriptors.depth(class).ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                "class test target has no object descriptor",
+            )
+        })?;
         let object = self.object_pointer(builder, object, state)?;
         let depth_offset = i32::try_from(std::mem::offset_of!(
             aster_runtime::descriptor::ClassDescriptor,
             depth
         ))
-        .map_err(|_| BackendError::new("descriptor depth offset is too large"))?;
+        .map_err(|_| {
+            BackendError::new(
+                codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                "descriptor depth offset is too large",
+            )
+        })?;
         let ancestors_offset = i32::try_from(std::mem::offset_of!(
             aster_runtime::descriptor::ClassDescriptor,
             ancestors
         ))
-        .map_err(|_| BackendError::new("descriptor ancestors offset is too large"))?;
-        let entry_offset =
-            i32::try_from(u64::from(target_depth) * u64::from(self.pointer_type.bytes()))
-                .map_err(|_| BackendError::new("class test ancestor offset is too large"))?;
+        .map_err(|_| {
+            BackendError::new(
+                codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                "descriptor ancestors offset is too large",
+            )
+        })?;
+        let entry_offset = i32::try_from(
+            u64::from(target_depth) * u64::from(self.pointer_type.bytes()),
+        )
+        .map_err(|_| {
+            BackendError::new(
+                codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                "class test ancestor offset is too large",
+            )
+        })?;
 
         let inspect = builder.create_block();
         let compare = builder.create_block();
@@ -118,8 +143,12 @@ impl Codegen {
     ) -> Result<(Value, Value), BackendError> {
         use aster_runtime::descriptor::{ClassDescriptor, InterfaceEntry};
         let offset = |value: usize, what: &str| {
-            i32::try_from(value)
-                .map_err(|_| BackendError::new(format!("descriptor {what} offset is too large")))
+            i32::try_from(value).map_err(|_| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    format!("descriptor {what} offset is too large"),
+                )
+            })
         };
         let count_offset = offset(
             std::mem::offset_of!(ClassDescriptor, interface_count),
@@ -137,8 +166,12 @@ impl Codegen {
             std::mem::offset_of!(InterfaceEntry, table),
             "interface table",
         )?;
-        let entry_size = i64::try_from(std::mem::size_of::<InterfaceEntry>())
-            .map_err(|_| BackendError::new("interface entry size is too large"))?;
+        let entry_size = i64::try_from(std::mem::size_of::<InterfaceEntry>()).map_err(|_| {
+            BackendError::new(
+                codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                "interface entry size is too large",
+            )
+        })?;
         let key = mir::type_key(&mir::Type::Interface(interface)).cast_signed();
 
         let inspect = builder.create_block();
@@ -234,19 +267,36 @@ impl Codegen {
                 Ok(self.interface_search(builder, object, *interface)?.0)
             }
             mir::RvalueKind::InterfaceLookup { .. } => Err(BackendError::new(
+                codes::BACKEND_TYPE_OP_INVALID,
                 "interface lookup reached scalar translation",
             )),
             mir::RvalueKind::Aggregate(_) => Err(BackendError::new(
+                codes::BACKEND_UNSUPPORTED_CONSTRUCT,
                 "aggregate rvalue reached scalar translation",
             )),
             mir::RvalueKind::EnumConstruct { .. } => Err(BackendError::new(
+                codes::BACKEND_UNSUPPORTED_CONSTRUCT,
                 "enum construction reached scalar translation",
             )),
             mir::RvalueKind::Discriminant(operand) => {
                 let address = self.translate_operand(builder, operand, state)?;
+                if let mir::Type::Enum(symbol) = &operand.type_
+                    && let Some(super::EnumRepr::NullPointerNiche {
+                        none_tag, some_tag, ..
+                    }) = self.layouts.enum_reprs.get(symbol)
+                {
+                    let ptr = builder
+                        .ins()
+                        .load(self.pointer_type, MemFlags::new(), address, 0);
+                    let is_null = builder.ins().icmp_imm(IntCC::Equal, ptr, 0);
+                    let none = builder.ins().iconst(types::I32, i64::from(*none_tag));
+                    let some = builder.ins().iconst(types::I32, i64::from(*some_tag));
+                    return Ok(builder.ins().select(is_null, none, some));
+                }
                 Ok(builder.ins().load(types::I32, MemFlags::new(), address, 0))
             }
             mir::RvalueKind::MakeInterface { .. } => Err(BackendError::new(
+                codes::BACKEND_TYPE_OP_INVALID,
                 "interface conversion reached scalar translation",
             )),
             mir::RvalueKind::ArrayLength(array) => {
@@ -254,7 +304,10 @@ impl Codegen {
                     .jit
                     .declare_func_in_func(self.runtime_ids["aster_rt_array_length"], builder.func);
                 let context = state.execution_context.ok_or_else(|| {
-                    BackendError::new("array length is missing its ExecutionContext")
+                    BackendError::new(
+                        codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                        "array length is missing its ExecutionContext",
+                    )
                 })?;
                 let array = self.translate_operand(builder, array, state)?;
                 let call = builder.ins().call(function_ref, &[context, array]);
@@ -265,7 +318,10 @@ impl Codegen {
                     .jit
                     .declare_func_in_func(self.runtime_ids["aster_rt_list_length"], builder.func);
                 let context = state.execution_context.ok_or_else(|| {
-                    BackendError::new("list length is missing its ExecutionContext")
+                    BackendError::new(
+                        codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                        "list length is missing its ExecutionContext",
+                    )
                 })?;
                 let list = self.translate_operand(builder, list, state)?;
                 let call = builder.ins().call(function_ref, &[context, list]);
@@ -277,7 +333,10 @@ impl Codegen {
                     builder.func,
                 );
                 let context = state.execution_context.ok_or_else(|| {
-                    BackendError::new("dictionary length is missing its ExecutionContext")
+                    BackendError::new(
+                        codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                        "dictionary length is missing its ExecutionContext",
+                    )
                 })?;
                 let dictionary = self.translate_operand(builder, dictionary, state)?;
                 let call = builder.ins().call(function_ref, &[context, dictionary]);
@@ -288,7 +347,10 @@ impl Codegen {
                     .jit
                     .declare_func_in_func(self.runtime_ids["aster_rt_list_version"], builder.func);
                 let context = state.execution_context.ok_or_else(|| {
-                    BackendError::new("list version is missing its ExecutionContext")
+                    BackendError::new(
+                        codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                        "list version is missing its ExecutionContext",
+                    )
                 })?;
                 let list = self.translate_operand(builder, list, state)?;
                 let call = builder.ins().call(function_ref, &[context, list]);
@@ -300,7 +362,10 @@ impl Codegen {
                     builder.func,
                 );
                 let context = state.execution_context.ok_or_else(|| {
-                    BackendError::new("string byte length is missing its ExecutionContext")
+                    BackendError::new(
+                        codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                        "string byte length is missing its ExecutionContext",
+                    )
                 })?;
                 let value = self.translate_operand(builder, value, state)?;
                 let call = builder.ins().call(function_ref, &[context, value]);
@@ -391,10 +456,15 @@ impl Codegen {
         const DIVISION_OVERFLOW: i64 = 2;
         const REMAINDER_OVERFLOW: i64 = 3;
 
-        let primitive = primitive(operand_type)
-            .ok_or_else(|| BackendError::new("integer operation has a non-primitive type"))?;
+        let primitive = primitive(operand_type).ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_ARITHMETIC_OR_BRANCH_INVALID,
+                "integer operation has a non-primitive type",
+            )
+        })?;
         if !primitive.is_integer() && primitive != Primitive::Char {
             return Err(BackendError::new(
+                codes::BACKEND_ARITHMETIC_OR_BRANCH_INVALID,
                 "integer operation has a non-integer operand type",
             ));
         }
@@ -403,6 +473,7 @@ impl Codegen {
             mir::BinaryOperator::Remainder => (REMAINDER_BY_ZERO, REMAINDER_OVERFLOW),
             _ => {
                 return Err(BackendError::new(
+                    codes::BACKEND_ARITHMETIC_OR_BRANCH_INVALID,
                     "integer division guard received an invalid operator",
                 ));
             }
@@ -415,17 +486,24 @@ impl Codegen {
                     .ushr_imm(left, i64::from(divisor.trailing_zeros()))),
                 mir::BinaryOperator::Remainder => {
                     let mask = i64::try_from(divisor - 1).map_err(|_| {
-                        BackendError::new("power-of-two remainder mask exceeds Cranelift immediate")
+                        BackendError::new(
+                            codes::BACKEND_ARITHMETIC_OR_BRANCH_INVALID,
+                            "power-of-two remainder mask exceeds Cranelift immediate",
+                        )
                     })?;
                     Ok(builder.ins().band_imm(left, mask))
                 }
                 _ => Err(BackendError::new(
+                    codes::BACKEND_ARITHMETIC_OR_BRANCH_INVALID,
                     "power-of-two integer lowering received an invalid operator",
                 )),
             };
         }
         let context = state.execution_context.ok_or_else(|| {
-            BackendError::new("integer operation is missing its ExecutionContext")
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "integer operation is missing its ExecutionContext",
+            )
         })?;
         let reporter = self.jit.declare_func_in_func(
             self.runtime_ids["aster_rt_integer_arithmetic_error"],
@@ -473,6 +551,7 @@ impl Codegen {
             (mir::BinaryOperator::Remainder, false) => builder.ins().srem(left, right),
             _ => {
                 return Err(BackendError::new(
+                    codes::BACKEND_ARITHMETIC_OR_BRANCH_INVALID,
                     "integer division guard received an invalid operator",
                 ));
             }
@@ -501,7 +580,10 @@ impl Codegen {
             }
             mir::Type::User(symbol) => {
                 let definition = self.layouts.structs.get(symbol).cloned().ok_or_else(|| {
-                    BackendError::new("struct equality references an unknown layout")
+                    BackendError::new(
+                        codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                        "struct equality references an unknown layout",
+                    )
                 })?;
                 let mut result = builder.ins().iconst(types::I8, 1);
                 for field in definition.fields {
@@ -526,10 +608,43 @@ impl Codegen {
                 Ok(result)
             }
             mir::Type::Enum(symbol) => {
-                let definition =
-                    self.layouts.enums.get(symbol).cloned().ok_or_else(|| {
-                        BackendError::new("enum equality references unknown layout")
-                    })?;
+                if let Some(super::EnumRepr::NullPointerNiche { payload_type, .. }) =
+                    self.layouts.enum_reprs.get(symbol).cloned()
+                {
+                    let left_ptr =
+                        builder
+                            .ins()
+                            .load(self.pointer_type, MemFlags::new(), left_address, 0);
+                    let right_ptr =
+                        builder
+                            .ins()
+                            .load(self.pointer_type, MemFlags::new(), right_address, 0);
+                    let left_null = builder.ins().icmp_imm(IntCC::Equal, left_ptr, 0);
+                    let right_null = builder.ins().icmp_imm(IntCC::Equal, right_ptr, 0);
+                    let either_null = builder.ins().bor(left_null, right_null);
+                    let null_case = builder.create_block();
+                    let both_present = builder.create_block();
+                    let join = builder.create_block();
+                    builder.append_block_param(join, types::I8);
+                    builder
+                        .ins()
+                        .brif(either_null, null_case, &[], both_present, &[]);
+                    builder.switch_to_block(null_case);
+                    let both_null = builder.ins().band(left_null, right_null);
+                    builder.ins().jump(join, &[both_null.into()]);
+                    builder.switch_to_block(both_present);
+                    let present_eq =
+                        self.compare_value_at(builder, &payload_type, left_address, right_address)?;
+                    builder.ins().jump(join, &[present_eq.into()]);
+                    builder.switch_to_block(join);
+                    return Ok(builder.block_params(join)[0]);
+                }
+                let definition = self.layouts.enums.get(symbol).cloned().ok_or_else(|| {
+                    BackendError::new(
+                        codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                        "enum equality references unknown layout",
+                    )
+                })?;
                 let left_tag = builder
                     .ins()
                     .load(types::I32, MemFlags::new(), left_address, 0);
@@ -617,12 +732,18 @@ impl Codegen {
             mir::OperandKind::Constant(mir::Constant::Float(value)) => {
                 if operand.type_ == mir::Type::Double {
                     let value = value.parse::<f64>().map_err(|_| {
-                        BackendError::new(format!("`{value}` is not a valid `double` literal"))
+                        BackendError::new(
+                            codes::BACKEND_ARITHMETIC_OR_BRANCH_INVALID,
+                            format!("`{value}` is not a valid `double` literal"),
+                        )
                     })?;
                     Ok(builder.ins().f64const(value))
                 } else {
                     let value = value.parse::<f32>().map_err(|_| {
-                        BackendError::new(format!("`{value}` is not a valid `float` literal"))
+                        BackendError::new(
+                            codes::BACKEND_ARITHMETIC_OR_BRANCH_INVALID,
+                            format!("`{value}` is not a valid `float` literal"),
+                        )
                     })?;
                     Ok(builder.ins().f32const(value))
                 }
@@ -648,6 +769,7 @@ impl Codegen {
                 }
             }
             _ => Err(BackendError::new(
+                codes::BACKEND_UNSUPPORTED_CONSTRUCT,
                 "unsupported operand reached Cranelift after backend validation",
             )),
         }
@@ -694,10 +816,13 @@ fn unsigned_power_of_two_divisor(
         _ => return Ok(None),
     }
     .map_err(|_| {
-        BackendError::new(format!(
-            "integer `{value}` is outside `{}` range",
-            type_name(&operand.type_)
-        ))
+        BackendError::new(
+            codes::BACKEND_ARITHMETIC_OR_BRANCH_INVALID,
+            format!(
+                "integer `{value}` is outside `{}` range",
+                type_name(&operand.type_)
+            ),
+        )
     })?;
     Ok(divisor.is_power_of_two().then_some(divisor))
 }
@@ -720,10 +845,10 @@ pub(super) fn scalar_kind(type_: &mir::Type) -> Result<i64, BackendError> {
         mir::Type::Double => scalar::DOUBLE,
         mir::Type::Char => scalar::CHAR,
         _ => {
-            return Err(BackendError::new(format!(
-                "type `{}` is not a transferable scalar",
-                type_name(type_)
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_TRANSFER_TYPE_INVALID,
+                format!("type `{}` is not a transferable scalar", type_name(type_)),
+            ));
         }
     }))
 }
@@ -752,10 +877,10 @@ pub(super) fn scalar_to_bits(
         }
         mir::Type::Double => builder.ins().bitcast(types::I64, MemFlags::new(), value),
         _ => {
-            return Err(BackendError::new(format!(
-                "type `{}` is not a transferable scalar",
-                type_name(type_)
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_TRANSFER_TYPE_INVALID,
+                format!("type `{}` is not a transferable scalar", type_name(type_)),
+            ));
         }
     })
 }
@@ -782,10 +907,10 @@ pub(super) fn scalar_from_bits(
         }
         mir::Type::Double => builder.ins().bitcast(types::F64, MemFlags::new(), bits),
         _ => {
-            return Err(BackendError::new(format!(
-                "type `{}` is not a transferable scalar",
-                type_name(type_)
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_TRANSFER_TYPE_INVALID,
+                format!("type `{}` is not a transferable scalar", type_name(type_)),
+            ));
         }
     })
 }
@@ -814,6 +939,7 @@ fn translate_binary(
         mir::BinaryOperator::Multiply => builder.ins().imul(left, right),
         mir::BinaryOperator::Divide | mir::BinaryOperator::Remainder => {
             return Err(BackendError::new(
+                codes::BACKEND_ARITHMETIC_OR_BRANCH_INVALID,
                 "integer division or remainder reached codegen without a guard",
             ));
         }
@@ -888,6 +1014,7 @@ fn signed_integer_minimum(type_: &mir::Type) -> Result<i64, BackendError> {
         Some(32) => Ok(i64::from(i32::MIN)),
         Some(64) => Ok(i64::MIN),
         _ => Err(BackendError::new(
+            codes::BACKEND_ARITHMETIC_OR_BRANCH_INVALID,
             "signed integer operation has an unsupported width",
         )),
     }
@@ -908,10 +1035,10 @@ pub(super) fn integer_constant_bits(text: &str, type_: &mir::Type) -> Result<i64
         _ => None,
     };
     bits.ok_or_else(|| {
-        BackendError::new(format!(
-            "integer `{text}` is outside `{}` range",
-            type_name(type_)
-        ))
+        BackendError::new(
+            codes::BACKEND_ARITHMETIC_OR_BRANCH_INVALID,
+            format!("integer `{text}` is outside `{}` range", type_name(type_)),
+        )
     })
 }
 
@@ -938,11 +1065,13 @@ fn translate_float_binary(
         mir::BinaryOperator::NotEqual => builder.ins().fcmp(FloatCC::NotEqual, left, right),
         mir::BinaryOperator::Remainder => {
             return Err(BackendError::new(
+                codes::BACKEND_ARITHMETIC_OR_BRANCH_INVALID,
                 "floating-point remainder must be lowered to a runtime call",
             ));
         }
         mir::BinaryOperator::LogicalAnd | mir::BinaryOperator::LogicalOr => {
             return Err(BackendError::new(
+                codes::BACKEND_ARITHMETIC_OR_BRANCH_INVALID,
                 "logical operators require boolean operands",
             ));
         }
@@ -953,6 +1082,7 @@ fn translate_float_binary(
         | mir::BinaryOperator::ShiftRight
         | mir::BinaryOperator::UnsignedShiftRight => {
             return Err(BackendError::new(
+                codes::BACKEND_ARITHMETIC_OR_BRANCH_INVALID,
                 "bitwise and shift operators require integer operands",
             ));
         }
@@ -1032,11 +1162,14 @@ pub(super) fn cast_value(
             builder.ins().fdemote(types::F32, value)
         }
         _ => {
-            return Err(BackendError::new(format!(
-                "cannot convert `{}` to `{}` in the current JIT",
-                type_name(source),
-                type_name(target)
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_UNSUPPORTED_CONSTRUCT,
+                format!(
+                    "cannot convert `{}` to `{}` in the current JIT",
+                    type_name(source),
+                    type_name(target)
+                ),
+            ));
         }
     })
 }
@@ -1047,9 +1180,10 @@ fn clif_integer(width: u16) -> Result<ClifType, BackendError> {
         16 => Ok(types::I16),
         32 => Ok(types::I32),
         64 => Ok(types::I64),
-        _ => Err(BackendError::new(format!(
-            "unsupported integer width `{width}` reached Cranelift"
-        ))),
+        _ => Err(BackendError::new(
+            codes::BACKEND_ARITHMETIC_OR_BRANCH_INVALID,
+            format!("unsupported integer width `{width}` reached Cranelift"),
+        )),
     }
 }
 

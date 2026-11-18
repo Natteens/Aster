@@ -85,6 +85,7 @@ path = "examples/array_loop_matrix.rs"
 required-features = ["aarm-telemetry"]
 
 [dependencies]
+aster-diagnostics = { path = "../aster-diagnostics", version = "0.71.0" }
 aster-exec = { path = "../aster-exec", version = "0.71.0" }
 aster-mir = { path = "../aster-mir", version = "0.71.0" }
 aster-runtime = { path = "../aster-runtime", version = "0.71.0" }

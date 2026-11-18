@@ -14,6 +14,7 @@ use std::{
     fmt,
 };
 
+use aster_diagnostics::{DiagnosticCode, codes};
 use aster_mir as mir;
 
 use crate::{escape_analysis, lifetime_analysis::LifetimeAnalysisReport};
@@ -83,12 +84,18 @@ pub enum AarmTemporarySubregionProfitabilityPolicy {
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AarmTemporarySubregionLoweringError {
+    code: DiagnosticCode,
     message: &'static str,
 }
 
 impl AarmTemporarySubregionLoweringError {
-    const fn new(message: &'static str) -> Self {
-        Self { message }
+    const fn new(code: DiagnosticCode, message: &'static str) -> Self {
+        Self { code, message }
+    }
+
+    #[must_use]
+    pub const fn code(&self) -> DiagnosticCode {
+        self.code
     }
 
     #[must_use]
@@ -151,6 +158,7 @@ pub fn lower_aarm_temporary_subregions_with_policy_for_research(
         .any(function_contains_executable_subregion_instruction)
     {
         return Err(AarmTemporarySubregionLoweringError::new(
+            codes::LOWER_AARM_REQUIRES_UNTRANSFORMED_MIR,
             "AARM executable subregion lowering requires untransformed MIR",
         ));
     }
@@ -329,6 +337,7 @@ pub fn estimate_aarm_temporary_subregion_costs_for_research(
         .any(function_contains_executable_subregion_instruction)
     {
         return Err(AarmTemporarySubregionLoweringError::new(
+            codes::LOWER_AARM_REQUIRES_UNTRANSFORMED_MIR,
             "AARM cost estimation requires untransformed MIR",
         ));
     }
@@ -359,6 +368,7 @@ pub fn estimate_aarm_coalescing_opportunities_for_research(
         .any(function_contains_executable_subregion_instruction)
     {
         return Err(AarmTemporarySubregionLoweringError::new(
+            codes::LOWER_AARM_REQUIRES_UNTRANSFORMED_MIR,
             "AARM coalescing estimation requires untransformed MIR",
         ));
     }
@@ -421,6 +431,7 @@ fn estimate_validated_subregion_cost(
         .find(|function| function.symbol == subregion.function)
         .ok_or_else(|| {
             AarmTemporarySubregionLoweringError::new(
+                codes::LOWER_AARM_UNKNOWN_FUNCTION,
                 "validated AARM cost candidate references an unknown function",
             )
         })?;
@@ -435,6 +446,7 @@ fn estimate_validated_subregion_cost(
             .and_then(|block| block.instructions.get(site.instruction_index))
             .ok_or_else(|| {
                 AarmTemporarySubregionLoweringError::new(
+                    codes::LOWER_AARM_SNAPSHOT_MISMATCH,
                     "validated AARM cost candidate no longer matches its MIR snapshot",
                 )
             })?;
@@ -444,6 +456,7 @@ fn estimate_validated_subregion_cost(
                     .checked_add(bytes)
                     .ok_or_else(|| {
                         AarmTemporarySubregionLoweringError::new(
+                            codes::LOWER_AARM_RANGE_OVERFLOW,
                             "AARM cost estimate exceeds the addressable range",
                         )
                     })?;
@@ -544,6 +557,7 @@ fn lower_validated_exact_snapshot(
             for (index, block) in function.blocks.iter().enumerate() {
                 if blocks.insert(block.id, index).is_some() {
                     return Err(AarmTemporarySubregionLoweringError::new(
+                        codes::LOWER_AARM_DUPLICATE_BLOCK,
                         "validated AARM subregion no longer has unique basic blocks",
                     ));
                 }
@@ -552,6 +566,7 @@ fn lower_validated_exact_snapshot(
             for subregion in &subregions {
                 let Some(&checkpoint_index) = blocks.get(&subregion.checkpoint.block) else {
                     return Err(AarmTemporarySubregionLoweringError::new(
+                        codes::LOWER_AARM_SNAPSHOT_MISMATCH,
                         "validated AARM subregion no longer matches its MIR snapshot",
                     ));
                 };
@@ -588,6 +603,7 @@ fn lower_validated_exact_snapshot(
                     })
                 {
                     return Err(AarmTemporarySubregionLoweringError::new(
+                        codes::LOWER_AARM_SNAPSHOT_MISMATCH,
                         "validated AARM subregion no longer matches its MIR snapshot",
                     ));
                 }
@@ -600,11 +616,13 @@ fn lower_validated_exact_snapshot(
                 })
                 .ok_or_else(|| {
                     AarmTemporarySubregionLoweringError::new(
+                        codes::LOWER_AARM_RANGE_OVERFLOW,
                         "AARM subregion instruction count exceeds the addressable range",
                     )
                 })?;
             let _inserted = subregions.len().checked_add(exits).ok_or_else(|| {
                 AarmTemporarySubregionLoweringError::new(
+                    codes::LOWER_AARM_RANGE_OVERFLOW,
                     "AARM subregion instruction count exceeds the addressable range",
                 )
             })?;
@@ -626,6 +644,7 @@ fn lower_validated_exact_snapshot(
                         .sum::<usize>();
                 let capacity = original.len().checked_add(additional).ok_or_else(|| {
                     AarmTemporarySubregionLoweringError::new(
+                        codes::LOWER_AARM_RANGE_OVERFLOW,
                         "AARM subregion instruction count exceeds the addressable range",
                     )
                 })?;
@@ -667,6 +686,7 @@ fn lower_validated_exact_snapshot(
         || report.exit_instructions_inserted < report.subregions_lowered
     {
         return Err(AarmTemporarySubregionLoweringError::new(
+            codes::LOWER_AARM_UNKNOWN_FUNCTION,
             "validated AARM subregion references an unknown function",
         ));
     }

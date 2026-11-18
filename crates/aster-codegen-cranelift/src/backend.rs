@@ -1,3 +1,5 @@
+use aster_diagnostics::codes;
+
 use super::{
     AbiParam, BackendError, Codegen, HashMap, HashSet, JITModule, Layouts, Linkage, Module, fmt,
     mir, runtime_functions, runtime_type,
@@ -234,5 +236,8 @@ fn instruction_can_fail_without_calling_aster(instruction: &mir::Instruction) ->
 }
 
 pub(super) fn module_error(error: impl fmt::Debug + fmt::Display) -> BackendError {
-    BackendError::new(format!("Cranelift JIT error: {error}\n{error:?}"))
+    BackendError::new(
+        codes::BACKEND_JIT_INTERNAL_ERROR,
+        format!("Cranelift JIT error: {error}\n{error:?}"),
+    )
 }

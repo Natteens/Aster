@@ -1,5 +1,15 @@
 using aster.core;
 
+public class Bonus
+{
+    public int Amount;
+
+    public Bonus(int amount)
+    {
+        Amount = amount;
+    }
+}
+
 public int ValueOr(Option<int> option, int fallback)
 {
     switch (option)
@@ -27,8 +37,11 @@ public class Program
 {
     public static int Main()
     {
-        Option<int> value = Option<int>.Some(40);
-        Result<int, string> result = Result<int, string>.Ok(ValueOr(value, 0) + 2);
+        int? maybe = 40;
+        Bonus? empty = null;
+        int extra = empty?.Amount ?? 2;
+        int total = ValueOr(maybe, 0) + extra;
+        Result<int, string> result = Result<int, string>.Ok(total);
         return Read(result);
     }
 }

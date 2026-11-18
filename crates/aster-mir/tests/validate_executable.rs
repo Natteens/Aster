@@ -58,7 +58,7 @@ fn assign_rvalue(type_: Type, kind: RvalueKind) -> Instruction {
 
 fn message(result: Result<(), ValidationError>) -> String {
     match result {
-        Err(ValidationError::Invalid(message)) => message,
+        Err(ValidationError::Invalid { message, .. }) => message,
         other => panic!("expected invalid MIR, got {other:?}"),
     }
 }
@@ -155,7 +155,9 @@ fn a_worker_body_that_reaches_console_output_is_a_policy_rejection() {
         foreign_functions: Vec::new(),
         functions: vec![main, worker, helper],
     };
-    let Err(ValidationError::Rejected(error)) = validate_no_console_io_in_workers(&module) else {
+    let Err(ValidationError::Rejected { message: error, .. }) =
+        validate_no_console_io_in_workers(&module)
+    else {
         panic!("a worker host operation is a policy rejection, not invalid MIR");
     };
     assert!(error.contains("`Task.Run` with a worker body"), "{error}");
@@ -186,7 +188,7 @@ mod phased {
     }
 
     fn is_invalid(result: &Result<(), ValidationError>) -> bool {
-        matches!(result, Err(ValidationError::Invalid(_)))
+        matches!(result, Err(ValidationError::Invalid { .. }))
     }
 
     /// Region violations are reported as unsupported (the backend's wording);
@@ -194,7 +196,7 @@ mod phased {
     fn is_violation(result: &Result<(), ValidationError>) -> bool {
         matches!(
             result,
-            Err(ValidationError::Invalid(_) | ValidationError::Unsupported { .. })
+            Err(ValidationError::Invalid { .. } | ValidationError::Unsupported { .. })
         )
     }
 

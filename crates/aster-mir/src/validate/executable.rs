@@ -13,6 +13,8 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use aster_diagnostics::codes;
+
 use super::ValidationError;
 use crate as mir;
 
@@ -122,18 +124,24 @@ pub fn validate_no_console_io_in_workers(module: &mir::Module) -> Result<(), Val
                     if let mir::OperandKind::Function(target) = argument.kind
                         && reaches(target, &foreign_users)
                     {
-                        return Err(ValidationError::Rejected(format!(
-                            "function `{}` uses `{worker_name}` with a worker body that (directly or transitively) performs a foreign call, which is rejected in this version",
-                            function.name
-                        )));
+                        return Err(ValidationError::rejected(
+                            codes::MIR_WORKER_FOREIGN_CALL_REJECTED,
+                            format!(
+                                "function `{}` uses `{worker_name}` with a worker body that (directly or transitively) performs a foreign call, which is rejected in this version",
+                                function.name
+                            ),
+                        ));
                     }
                     if let mir::OperandKind::Function(target) = argument.kind
                         && reaches(target, &io_users)
                     {
-                        return Err(ValidationError::Rejected(format!(
-                            "function `{}` uses `{worker_name}` with a worker body that (directly or transitively) calls `aster.io.Write`/`WriteLine`/`ReadLine`/`ReadAllText`/`WriteAllText`/`ListFiles`, another filesystem operation, a clock host operation through `aster.time.Clock`, or an entropy host operation through `Random.FromEntropy`, which is rejected in this version",
-                            function.name
-                        )));
+                        return Err(ValidationError::rejected(
+                            codes::MIR_WORKER_HOST_IO_REJECTED,
+                            format!(
+                                "function `{}` uses `{worker_name}` with a worker body that (directly or transitively) calls `aster.io.Write`/`WriteLine`/`ReadLine`/`ReadAllText`/`WriteAllText`/`ListFiles`, another filesystem operation, a clock host operation through `aster.time.Clock`, or an entropy host operation through `Random.FromEntropy`, which is rejected in this version",
+                                function.name
+                            ),
+                        ));
                     }
                 }
             }
@@ -162,48 +170,66 @@ pub fn validate_enum_construct_shapes(
                 continue;
             };
             let mir::Type::Enum(symbol) = &value.type_ else {
-                return Err(ValidationError::invalid(format!(
-                    "function `{}` has an `EnumConstruct` whose declared type is not an enum",
-                    function.name
-                )));
+                return Err(ValidationError::invalid(
+                    codes::MIR_ENUM_CONSTRUCT_SHAPE,
+                    format!(
+                        "function `{}` has an `EnumConstruct` whose declared type is not an enum",
+                        function.name
+                    ),
+                ));
             };
             let definition = enum_definitions.get(symbol).ok_or_else(|| {
-                ValidationError::invalid(format!(
-                    "function `{}` has an `EnumConstruct` for an unknown enum type",
-                    function.name
-                ))
+                ValidationError::invalid(
+                    codes::MIR_ENUM_CONSTRUCT_SHAPE,
+                    format!(
+                        "function `{}` has an `EnumConstruct` for an unknown enum type",
+                        function.name
+                    ),
+                )
             })?;
             let matched = definition
                 .cases
                 .iter()
                 .find(|case_definition| case_definition.symbol == *case);
             let Some(matched) = matched else {
-                return Err(ValidationError::invalid(format!(
-                    "function `{}` has an `EnumConstruct` whose case symbol is not one of `{}`'s cases",
-                    function.name, definition.name
-                )));
+                return Err(ValidationError::invalid(
+                    codes::MIR_ENUM_CONSTRUCT_SHAPE,
+                    format!(
+                        "function `{}` has an `EnumConstruct` whose case symbol is not one of `{}`'s cases",
+                        function.name, definition.name
+                    ),
+                ));
             };
             if matched.tag != *tag {
-                return Err(ValidationError::invalid(format!(
-                    "function `{}` has an `EnumConstruct` for case `{}` with tag {tag}, expected {}",
-                    function.name, matched.name, matched.tag
-                )));
+                return Err(ValidationError::invalid(
+                    codes::MIR_ENUM_CONSTRUCT_SHAPE,
+                    format!(
+                        "function `{}` has an `EnumConstruct` for case `{}` with tag {tag}, expected {}",
+                        function.name, matched.name, matched.tag
+                    ),
+                ));
             }
             if fields.len() != matched.fields.len() {
-                return Err(ValidationError::invalid(format!(
-                    "function `{}` has an `EnumConstruct` for case `{}` with {} field(s), expected {}",
-                    function.name,
-                    matched.name,
-                    fields.len(),
-                    matched.fields.len()
-                )));
+                return Err(ValidationError::invalid(
+                    codes::MIR_ENUM_CONSTRUCT_SHAPE,
+                    format!(
+                        "function `{}` has an `EnumConstruct` for case `{}` with {} field(s), expected {}",
+                        function.name,
+                        matched.name,
+                        fields.len(),
+                        matched.fields.len()
+                    ),
+                ));
             }
             for (provided, expected) in fields.iter().zip(&matched.fields) {
                 if provided.field != expected.symbol || provided.value.type_ != expected.type_ {
-                    return Err(ValidationError::invalid(format!(
-                        "function `{}` has an `EnumConstruct` for case `{}` with a field that does not match its declaration",
-                        function.name, matched.name
-                    )));
+                    return Err(ValidationError::invalid(
+                        codes::MIR_ENUM_CONSTRUCT_SHAPE,
+                        format!(
+                            "function `{}` has an `EnumConstruct` for case `{}` with a field that does not match its declaration",
+                            function.name, matched.name
+                        ),
+                    ));
                 }
             }
         }
@@ -232,32 +258,44 @@ pub fn validate_struct_literal_shapes(
                 continue;
             };
             let mir::Type::User(symbol) = &value.type_ else {
-                return Err(ValidationError::invalid(format!(
-                    "function `{}` has an `Aggregate` whose declared type is not a struct",
-                    function.name
-                )));
+                return Err(ValidationError::invalid(
+                    codes::MIR_STRUCT_AGGREGATE_SHAPE,
+                    format!(
+                        "function `{}` has an `Aggregate` whose declared type is not a struct",
+                        function.name
+                    ),
+                ));
             };
             let definition = struct_definitions.get(symbol).ok_or_else(|| {
-                ValidationError::invalid(format!(
-                    "function `{}` has an `Aggregate` for an unknown struct type",
-                    function.name
-                ))
+                ValidationError::invalid(
+                    codes::MIR_STRUCT_AGGREGATE_SHAPE,
+                    format!(
+                        "function `{}` has an `Aggregate` for an unknown struct type",
+                        function.name
+                    ),
+                )
             })?;
             if fields.len() != definition.fields.len() {
-                return Err(ValidationError::invalid(format!(
-                    "function `{}` has an `Aggregate` for `{}` with {} field(s), expected {}",
-                    function.name,
-                    definition.name,
-                    fields.len(),
-                    definition.fields.len()
-                )));
+                return Err(ValidationError::invalid(
+                    codes::MIR_STRUCT_AGGREGATE_SHAPE,
+                    format!(
+                        "function `{}` has an `Aggregate` for `{}` with {} field(s), expected {}",
+                        function.name,
+                        definition.name,
+                        fields.len(),
+                        definition.fields.len()
+                    ),
+                ));
             }
             for (provided, expected) in fields.iter().zip(&definition.fields) {
                 if provided.field != expected.symbol || provided.value.type_ != expected.type_ {
-                    return Err(ValidationError::invalid(format!(
-                        "function `{}` has an `Aggregate` for `{}` with a field that does not match its declaration",
-                        function.name, definition.name
-                    )));
+                    return Err(ValidationError::invalid(
+                        codes::MIR_STRUCT_AGGREGATE_SHAPE,
+                        format!(
+                            "function `{}` has an `Aggregate` for `{}` with a field that does not match its declaration",
+                            function.name, definition.name
+                        ),
+                    ));
                 }
             }
         }
@@ -285,6 +323,7 @@ pub fn validate_executable_owned_regions(
                 mir::Instruction::OwnedRegionEnter { id } => {
                     if active.is_some() || !entered.insert(*id) {
                         return Err(ValidationError::unsupported(
+                            codes::MIR_OWNED_REGION_NESTED_ENTER,
                             &function.name,
                             "nested or duplicate executable owned-region enter",
                         ));
@@ -294,6 +333,7 @@ pub fn validate_executable_owned_regions(
                 mir::Instruction::OwnedRegionExit { id, invalidated } => {
                     let Some((active_id, produced)) = active.take() else {
                         return Err(ValidationError::unsupported(
+                            codes::MIR_OWNED_REGION_UNMATCHED_EXIT,
                             &function.name,
                             "owned-region exit without a matching enter",
                         ));
@@ -311,6 +351,7 @@ pub fn validate_executable_owned_regions(
                         || !produced.is_subset(&invalidated_set)
                     {
                         return Err(ValidationError::unsupported(
+                            codes::MIR_OWNED_REGION_MISMATCHED_EXIT,
                             &function.name,
                             "mismatched executable owned-region exit",
                         ));
@@ -321,6 +362,7 @@ pub fn validate_executable_owned_regions(
                     if active.is_some() =>
                 {
                     return Err(ValidationError::unsupported(
+                        codes::MIR_OWNED_REGION_TEMP_RECLAIM,
                         &function.name,
                         "Temporary reclaim inside an executable owned region",
                     ));
@@ -335,12 +377,14 @@ pub fn validate_executable_owned_regions(
                         } = instruction
                         else {
                             return Err(ValidationError::unsupported(
+                                codes::MIR_OWNED_REGION_MISSING_PRODUCER,
                                 &function.name,
                                 "owned-region checkpoint not followed by its producer call",
                             ));
                         };
                         if !owned_region_result_type(return_type) {
                             return Err(ValidationError::unsupported(
+                                codes::MIR_OWNED_REGION_NON_REF_PRODUCER,
                                 &function.name,
                                 "owned-region producer with a non-reference result",
                             ));
@@ -350,6 +394,7 @@ pub fn validate_executable_owned_regions(
                     }
                     if owned_region_barrier(instruction, effects) {
                         return Err(ValidationError::unsupported(
+                            codes::MIR_OWNED_REGION_PERSISTENT_BARRIER,
                             &function.name,
                             "unrelated Persistent effect inside an executable owned region",
                         ));
@@ -368,6 +413,7 @@ pub fn validate_executable_owned_regions(
         }
         if active.is_some() {
             return Err(ValidationError::unsupported(
+                codes::MIR_OWNED_REGION_CROSS_BLOCK,
                 &function.name,
                 "executable owned region crosses a basic-block boundary",
             ));
@@ -507,6 +553,7 @@ pub fn validate_owned_region_invalidated_uses(
     while let Some(block_id) = pending.pop() {
         let Some(block) = blocks.get(&block_id) else {
             return Err(ValidationError::unsupported(
+                codes::MIR_OWNED_REGION_MALFORMED_CFG,
                 &function.name,
                 "malformed owned-region CFG",
             ));
@@ -517,6 +564,7 @@ pub fn validate_owned_region_invalidated_uses(
             owned_instruction_reads(instruction, &mut reads);
             if reads.iter().any(|local| invalid.contains(local)) {
                 return Err(ValidationError::unsupported(
+                    codes::MIR_OWNED_REGION_USE_AFTER_RECLAIM,
                     &function.name,
                     "use of a reclaimed owned-region local before redefinition",
                 ));
@@ -538,6 +586,7 @@ pub fn validate_owned_region_invalidated_uses(
         }
         if terminator_reads.iter().any(|local| invalid.contains(local)) {
             return Err(ValidationError::unsupported(
+                codes::MIR_OWNED_REGION_TERMINATOR_USE,
                 &function.name,
                 "use of a reclaimed owned-region local in a terminator",
             ));
@@ -556,6 +605,7 @@ pub fn validate_owned_region_invalidated_uses(
         for successor in successors {
             if !blocks.contains_key(&successor) {
                 return Err(ValidationError::unsupported(
+                    codes::MIR_OWNED_REGION_MALFORMED_CFG,
                     &function.name,
                     "malformed owned-region CFG",
                 ));
@@ -966,6 +1016,7 @@ pub fn validate_executable_temporary_subregions(
         })
     {
         return Err(ValidationError::unsupported(
+            codes::MIR_TEMP_SUBREGION_CONCURRENCY,
             &function.name,
             "concurrency in an executable AARM temporary subregion function",
         ));
@@ -1123,6 +1174,7 @@ pub fn validate_executable_temporary_subregion_cfg(
     for (index, block) in function.blocks.iter().enumerate() {
         if blocks.insert(block.id, index).is_some() {
             return Err(ValidationError::unsupported(
+                codes::MIR_TEMP_SUBREGION_CFG,
                 &function.name,
                 "duplicate basic blocks in executable AARM temporary subregions",
             ));
@@ -1130,6 +1182,7 @@ pub fn validate_executable_temporary_subregion_cfg(
     }
     if !blocks.contains_key(&function.entry) {
         return Err(ValidationError::unsupported(
+            codes::MIR_TEMP_SUBREGION_CFG,
             &function.name,
             "missing executable AARM temporary subregion entry",
         ));
@@ -1156,6 +1209,7 @@ pub fn validate_executable_temporary_subregion_cfg(
         .collect::<Option<HashMap<_, _>>>()
         .ok_or_else(|| {
             ValidationError::unsupported(
+                codes::MIR_TEMP_SUBREGION_CFG,
                 &function.name,
                 "malformed executable AARM temporary subregion CFG",
             )
@@ -1170,6 +1224,7 @@ pub fn validate_executable_temporary_subregion_cfg(
     }
     if reachable.len() != blocks.len() {
         return Err(ValidationError::unsupported(
+            codes::MIR_TEMP_SUBREGION_UNREACHABLE_BLOCK,
             &function.name,
             "unreachable executable AARM temporary subregion block",
         ));
@@ -1191,6 +1246,7 @@ pub fn validate_executable_temporary_subregion_cfg(
                         || current.enter(*id).is_err()
                     {
                         return Err(ValidationError::unsupported(
+                            codes::MIR_TEMP_SUBREGION_ENTER,
                             &function.name,
                             "nested or duplicate executable AARM temporary subregion enter",
                         ));
@@ -1199,6 +1255,7 @@ pub fn validate_executable_temporary_subregion_cfg(
                 mir::Instruction::TemporarySubregionExit { id } => {
                     if current.exit(*id).is_err() {
                         return Err(ValidationError::unsupported(
+                            codes::MIR_TEMP_SUBREGION_EXIT,
                             &function.name,
                             "unmatched executable AARM temporary subregion exit",
                         ));
@@ -1207,12 +1264,19 @@ pub fn validate_executable_temporary_subregion_cfg(
                 instruction if current.fine != FineState::Inactive => {
                     current
                         .validate_builder_instruction(instruction)
-                        .map_err(|feature| ValidationError::unsupported(&function.name, feature))?;
+                        .map_err(|feature| {
+                            ValidationError::unsupported(
+                                codes::MIR_TEMP_SUBREGION_UNSUPPORTED_INST,
+                                &function.name,
+                                feature,
+                            )
+                        })?;
                     if temporary_subregion_allocation_is_executable(instruction) {
                         allocations.insert(current.fine);
                     }
                     if !temporary_subregion_instruction_is_executable(instruction) {
                         return Err(ValidationError::unsupported(
+                            codes::MIR_TEMP_SUBREGION_UNSUPPORTED_INST,
                             &function.name,
                             "instruction inside an executable AARM temporary subregion",
                         ));
@@ -1227,6 +1291,7 @@ pub fn validate_executable_temporary_subregion_cfg(
         ) && current.fine != FineState::Inactive
         {
             return Err(ValidationError::unsupported(
+                codes::MIR_TEMP_SUBREGION_ACTIVE_EXIT,
                 &function.name,
                 "Return or End with an active executable AARM temporary subregion",
             ));
@@ -1235,6 +1300,7 @@ pub fn validate_executable_temporary_subregion_cfg(
             if let Some(existing) = state.insert(*successor, current.clone()) {
                 if existing != current {
                     return Err(ValidationError::unsupported(
+                        codes::MIR_TEMP_SUBREGION_JOIN_MISMATCH,
                         &function.name,
                         "inconsistent executable AARM temporary subregion state at CFG join",
                     ));
@@ -1249,6 +1315,7 @@ pub fn validate_executable_temporary_subregion_cfg(
         .any(|id| !allocations.contains(&FineState::Active(*id)))
     {
         return Err(ValidationError::unsupported(
+            codes::MIR_TEMP_SUBREGION_NO_ALLOCATION,
             &function.name,
             "executable AARM temporary subregion without a Temporary allocation",
         ));
@@ -1396,6 +1463,7 @@ pub fn validate_executable_temporary_subregion_cycles(
     }
     if visited != reachable.len() {
         return Err(ValidationError::unsupported(
+            codes::MIR_TEMP_SUBREGION_CFG,
             &function.name,
             "irreducible executable AARM temporary-subregion CFG",
         ));
@@ -1803,9 +1871,10 @@ pub fn validate_block_target(
     if blocks.contains(&target) {
         Ok(())
     } else {
-        Err(ValidationError::invalid(format!(
-            "function `{function_name}` references unknown basic block {target:?}"
-        )))
+        Err(ValidationError::invalid(
+            codes::MIR_UNKNOWN_BASIC_BLOCK,
+            format!("function `{function_name}` references unknown basic block {target:?}"),
+        ))
     }
 }
 
@@ -1858,25 +1927,34 @@ pub fn validate_interface_metadata<'a>(
     for implementation in &module.interface_implementations {
         if !classes.contains(&implementation.class) {
             return Err(ValidationError::invalid(
+                codes::MIR_INTERFACE_IMPL_UNKNOWN_CLASS,
                 "interface implementation references an unknown class",
             ));
         }
         let interface = interfaces.get(&implementation.interface).ok_or_else(|| {
-            ValidationError::invalid("interface implementation references an unknown interface")
+            ValidationError::invalid(
+                codes::MIR_INTERFACE_IMPL_UNKNOWN_INTERFACE,
+                "interface implementation references an unknown interface",
+            )
         })?;
         if !implementations.insert((implementation.class, implementation.interface)) {
             return Err(ValidationError::invalid(
+                codes::MIR_INTERFACE_IMPL_DUPLICATE,
                 "duplicate interface implementation in MIR",
             ));
         }
         if implementation.methods.len() != interface.methods.len() {
             return Err(ValidationError::invalid(
+                codes::MIR_INTERFACE_IMPL_METHOD_COUNT,
                 "interface implementation has the wrong method count",
             ));
         }
         for (required, concrete_symbol) in interface.methods.iter().zip(&implementation.methods) {
             let concrete = signatures.get(concrete_symbol).ok_or_else(|| {
-                ValidationError::invalid("interface implementation references an unknown method")
+                ValidationError::invalid(
+                    codes::MIR_INTERFACE_IMPL_UNKNOWN_METHOD,
+                    "interface implementation references an unknown method",
+                )
             })?;
             // The concrete method belongs to the implementing class or to a
             // base class it inherits it from (no member is virtual yet, so the
@@ -1894,10 +1972,13 @@ pub fn validate_interface_metadata<'a>(
                     .map(|parameter| &parameter.type_)
                     .ne(required.parameters.iter())
             {
-                return Err(ValidationError::invalid(format!(
-                    "concrete method `{}` does not match interface method `{}`",
-                    concrete.name, required.name
-                )));
+                return Err(ValidationError::invalid(
+                    codes::MIR_INTERFACE_IMPL_METHOD_MISMATCH,
+                    format!(
+                        "concrete method `{}` does not match interface method `{}`",
+                        concrete.name, required.name
+                    ),
+                ));
             }
         }
     }
@@ -1922,10 +2003,13 @@ pub fn validate_cfg(function: &mir::Function) -> Result<(), ValidationError> {
     let mut blocks = HashSet::new();
     for block in &function.blocks {
         if !blocks.insert(block.id) {
-            return Err(ValidationError::invalid(format!(
-                "function `{}` declares basic block {:?} twice",
-                function.name, block.id
-            )));
+            return Err(ValidationError::invalid(
+                codes::MIR_DUPLICATE_BASIC_BLOCK,
+                format!(
+                    "function `{}` declares basic block {:?} twice",
+                    function.name, block.id
+                ),
+            ));
         }
     }
     if !function.blocks.is_empty() {

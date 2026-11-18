@@ -6,6 +6,7 @@
 //! `WaitAll` lowering. The runtime (`aster-runtime`) does the actual
 //! serialization and materialization; nothing here is domain-specific.
 
+use aster_diagnostics::codes;
 use aster_runtime::{TransferCase, TransferShape};
 
 use super::{
@@ -48,11 +49,12 @@ impl Codegen {
                 descriptors: self.dictionary_descriptor_bits(key, value),
             },
             mir::Type::User(symbol) => {
-                let definition = self
-                    .layouts
-                    .structs
-                    .get(symbol)
-                    .ok_or_else(|| BackendError::new("unknown struct in a transfer shape"))?;
+                let definition = self.layouts.structs.get(symbol).ok_or_else(|| {
+                    BackendError::new(
+                        codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                        "unknown struct in a transfer shape",
+                    )
+                })?;
                 let mut fields = Vec::new();
                 for field in &definition.fields {
                     fields.push((
@@ -66,11 +68,20 @@ impl Codegen {
                 }
             }
             mir::Type::Enum(symbol) => {
-                let definition = self
-                    .layouts
-                    .enums
-                    .get(symbol)
-                    .ok_or_else(|| BackendError::new("unknown enum in a transfer shape"))?;
+                if let Some(super::EnumRepr::NullPointerNiche { payload_type, .. }) =
+                    self.layouts.enum_reprs.get(symbol)
+                {
+                    return Ok(TransferShape::NicheEnum {
+                        size: self.layouts.type_layout(type_)?.size,
+                        payload: Box::new(self.transfer_shape(payload_type)?),
+                    });
+                }
+                let definition = self.layouts.enums.get(symbol).ok_or_else(|| {
+                    BackendError::new(
+                        codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                        "unknown enum in a transfer shape",
+                    )
+                })?;
                 let mut cases = Vec::new();
                 for case in &definition.cases {
                     let mut fields = Vec::new();
@@ -95,10 +106,13 @@ impl Codegen {
                     size: self.layouts.type_layout(other)?.size,
                 },
                 _ => {
-                    return Err(BackendError::new(format!(
-                        "type `{}` cannot cross a worker boundary",
-                        super::type_name(other)
-                    )));
+                    return Err(BackendError::new(
+                        codes::BACKEND_TRANSFER_TYPE_INVALID,
+                        format!(
+                            "type `{}` cannot cross a worker boundary",
+                            super::type_name(other)
+                        ),
+                    ));
                 }
             },
         })
@@ -109,7 +123,12 @@ impl Codegen {
             .fields
             .get(&symbol)
             .map(|layout| layout.offset)
-            .ok_or_else(|| BackendError::new("field has no computed layout"))
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    "field has no computed layout",
+                )
+            })
     }
 
     /// Element descriptor address of the counting configuration (`0` when the
@@ -154,8 +173,12 @@ impl Codegen {
         shape: &TransferShape,
     ) -> Result<(Value, Value), BackendError> {
         let bytes = shape.encode();
-        let length = i64::try_from(bytes.len())
-            .map_err(|_| BackendError::new("transfer shape is too large"))?;
+        let length = i64::try_from(bytes.len()).map_err(|_| {
+            BackendError::new(
+                codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                "transfer shape is too large",
+            )
+        })?;
         let id = if let Some(id) = self.transfer_data.get(&bytes) {
             *id
         } else {
@@ -201,8 +224,12 @@ impl Codegen {
         builder: &mut FunctionBuilder<'_>,
         shape: &TransferShape,
     ) -> Result<Value, BackendError> {
-        let size = u32::try_from(shape.image_size().max(8))
-            .map_err(|_| BackendError::new("transfer image is too large"))?;
+        let size = u32::try_from(shape.image_size().max(8)).map_err(|_| {
+            BackendError::new(
+                codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                "transfer image is too large",
+            )
+        })?;
         let slot = builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
             size.next_multiple_of(8),
@@ -213,8 +240,12 @@ impl Codegen {
             builder.ins().stack_store(
                 zero,
                 slot,
-                i32::try_from(offset)
-                    .map_err(|_| BackendError::new("transfer image is too large"))?,
+                i32::try_from(offset).map_err(|_| {
+                    BackendError::new(
+                        codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                        "transfer image is too large",
+                    )
+                })?,
             );
         }
         Ok(builder.ins().stack_addr(self.pointer_type, slot, 0))

@@ -73,7 +73,7 @@ fn int(value: &str) -> Operand {
 
 fn invalid(result: Result<(), ValidationError>) -> String {
     match result {
-        Err(ValidationError::Invalid(message)) => message,
+        Err(ValidationError::Invalid { message, .. }) => message,
         other => panic!("expected an invalid-MIR error, got {other:?}"),
     }
 }
@@ -388,7 +388,7 @@ mod virtual_tables {
 
     fn message(result: Result<(), ValidationError>) -> String {
         match result {
-            Err(ValidationError::Invalid(message)) => message,
+            Err(ValidationError::Invalid { message, .. }) => message,
             other => panic!("expected an invalid-MIR error, found {other:?}"),
         }
     }

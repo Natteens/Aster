@@ -1,3 +1,5 @@
+use aster_diagnostics::codes;
+
 use super::{BackendError, HashMap, HashSet, integer_constant_bits, mir, primitive, type_name};
 use mir::validate::executable::{
     InterfaceMethods, owned_instruction_definitions, owned_instruction_reads, owned_operand_reads,
@@ -17,7 +19,12 @@ pub(super) fn select_entry<'a>(
         .functions
         .iter()
         .find(|function| function.name == function_name && function.owner.is_none())
-        .ok_or_else(|| BackendError::new(format!("function `{function_name}` was not found")))?;
+        .ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_ENTRY_NOT_FOUND,
+                format!("function `{function_name}` was not found"),
+            )
+        })?;
     validate_invocable_entry(function, function_name)?;
     Ok(function)
 }
@@ -45,9 +52,10 @@ fn validate_entry_shape(
     allow_arguments: bool,
 ) -> Result<(), BackendError> {
     if function.visibility != mir::Visibility::Public {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` is not public"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_ENTRY_NOT_PUBLIC,
+            format!("function `{function_name}` is not public"),
+        ));
     }
     let takes_arguments = matches!(
         function.parameters.as_slice(),
@@ -56,49 +64,74 @@ fn validate_entry_shape(
     let parameters_accepted =
         function.parameters.is_empty() || (allow_arguments && takes_arguments);
     if !parameters_accepted {
-        return Err(BackendError::new(format!(
-            "entry function `{function_name}` must have no parameters"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_ENTRY_SIGNATURE_UNSUPPORTED,
+            format!("entry function `{function_name}` must have no parameters"),
+        ));
     }
     if matches!(function.return_type, mir::Type::User(_)) {
-        return Err(BackendError::new(format!(
-            "entry function `{function_name}` returns a struct; call it from a scalar entry function instead"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_ENTRY_SIGNATURE_UNSUPPORTED,
+            format!(
+                "entry function `{function_name}` returns a struct; call it from a scalar entry function instead"
+            ),
+        ));
     }
     if matches!(function.return_type, mir::Type::Array(_)) {
-        return Err(BackendError::new(format!(
-            "entry function `{function_name}` returns an array; call it from a scalar entry function instead"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_ENTRY_SIGNATURE_UNSUPPORTED,
+            format!(
+                "entry function `{function_name}` returns an array; call it from a scalar entry function instead"
+            ),
+        ));
     }
     if matches!(function.return_type, mir::Type::Class(_)) {
-        return Err(BackendError::new(format!(
-            "entry function `{function_name}` returns an object reference; call it from a scalar entry function instead"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_ENTRY_SIGNATURE_UNSUPPORTED,
+            format!(
+                "entry function `{function_name}` returns an object reference; call it from a scalar entry function instead"
+            ),
+        ));
     }
     if matches!(function.return_type, mir::Type::Interface(_)) {
-        return Err(BackendError::new(format!(
-            "entry function `{function_name}` returns an interface reference; call it from a scalar entry function instead"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_ENTRY_SIGNATURE_UNSUPPORTED,
+            format!(
+                "entry function `{function_name}` returns an interface reference; call it from a scalar entry function instead"
+            ),
+        ));
     }
     if matches!(function.return_type, mir::Type::Enum(_)) {
-        return Err(BackendError::new(format!(
-            "entry function `{function_name}` returns an enum; handle it in a scalar entry function instead"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_ENTRY_SIGNATURE_UNSUPPORTED,
+            format!(
+                "entry function `{function_name}` returns an enum; handle it in a scalar entry function instead"
+            ),
+        ));
     }
     if matches!(function.return_type, mir::Type::Task(_)) {
-        return Err(BackendError::new(format!(
-            "entry function `{function_name}` returns a Task<T>; call it from a scalar entry function and `Wait()` there instead"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_ENTRY_SIGNATURE_UNSUPPORTED,
+            format!(
+                "entry function `{function_name}` returns a Task<T>; call it from a scalar entry function and `Wait()` there instead"
+            ),
+        ));
     }
     if matches!(function.return_type, mir::Type::List(_)) {
-        return Err(BackendError::new(format!(
-            "entry function `{function_name}` returns a List<T>; call it from a scalar entry function instead"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_ENTRY_SIGNATURE_UNSUPPORTED,
+            format!(
+                "entry function `{function_name}` returns a List<T>; call it from a scalar entry function instead"
+            ),
+        ));
     }
     if matches!(function.return_type, mir::Type::Dictionary(_, _)) {
-        return Err(BackendError::new(format!(
-            "entry function `{function_name}` returns a Dictionary<K, V>; call it from a scalar entry function instead"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_ENTRY_SIGNATURE_UNSUPPORTED,
+            format!(
+                "entry function `{function_name}` returns a Dictionary<K, V>; call it from a scalar entry function instead"
+            ),
+        ));
     }
     Ok(())
 }
@@ -108,10 +141,10 @@ pub(super) fn validate_module(module: &mir::Module) -> Result<(), BackendError> 
     let mut signatures = HashMap::new();
     for function in &module.functions {
         if signatures.insert(function.symbol, function).is_some() {
-            return Err(BackendError::new(format!(
-                "duplicate function symbol {:?} in MIR",
-                function.symbol
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_DUPLICATE_FUNCTION_SYMBOL,
+                format!("duplicate function symbol {:?} in MIR", function.symbol),
+            ));
         }
     }
     validate_foreign_abi(module, &signatures)?;
@@ -207,10 +240,13 @@ fn validate_foreign_abi(
                 .insert(declaration.symbol, declaration)
                 .is_some()
         {
-            return Err(BackendError::new(format!(
-                "duplicate foreign function symbol {:?} in MIR",
-                declaration.symbol
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_DUPLICATE_FUNCTION_SYMBOL,
+                format!(
+                    "duplicate foreign function symbol {:?} in MIR",
+                    declaration.symbol
+                ),
+            ));
         }
         if declaration.name.is_empty()
             || !foreign_scalar(&declaration.return_type, true)
@@ -219,10 +255,13 @@ fn validate_foreign_abi(
                 .iter()
                 .any(|parameter| !foreign_scalar(parameter, false))
         {
-            return Err(BackendError::new(format!(
-                "foreign declaration `{}` has an invalid scalar ABI signature",
-                declaration.name
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_FOREIGN_ABI_INVALID,
+                format!(
+                    "foreign declaration `{}` has an invalid scalar ABI signature",
+                    declaration.name
+                ),
+            ));
         }
         if binding_signatures.iter().any(
             |(name, parameters, result): &(&str, &[mir::Type], &mir::Type)| {
@@ -231,10 +270,13 @@ fn validate_foreign_abi(
                     && *result == &declaration.return_type
             },
         ) {
-            return Err(BackendError::new(format!(
-                "duplicate foreign binding identity `{}` with the same signature in MIR",
-                declaration.name
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_DUPLICATE_FUNCTION_SYMBOL,
+                format!(
+                    "duplicate foreign binding identity `{}` with the same signature in MIR",
+                    declaration.name
+                ),
+            ));
         }
         binding_signatures.push((
             declaration.name.as_str(),
@@ -260,10 +302,13 @@ fn validate_foreign_abi(
                 continue;
             };
             let declaration = declarations.get(target).ok_or_else(|| {
-                BackendError::new(format!(
-                    "function `{}` calls undeclared foreign symbol {:?}",
-                    function.name, target
-                ))
+                BackendError::new(
+                    codes::BACKEND_FOREIGN_ABI_INVALID,
+                    format!(
+                        "function `{}` calls undeclared foreign symbol {:?}",
+                        function.name, target
+                    ),
+                )
             })?;
             if return_type != &declaration.return_type
                 || arguments.len() != declaration.parameters.len()
@@ -272,10 +317,13 @@ fn validate_foreign_abi(
                     .zip(&declaration.parameters)
                     .any(|(argument, parameter)| &argument.type_ != parameter)
             {
-                return Err(BackendError::new(format!(
-                    "function `{}` calls foreign declaration `{}` with an invalid signature",
-                    function.name, declaration.name
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_FOREIGN_ABI_INVALID,
+                    format!(
+                        "function `{}` calls foreign declaration `{}` with an invalid signature",
+                        function.name, declaration.name
+                    ),
+                ));
             }
             for argument in arguments {
                 validate_operand(argument, &function.name)?;
@@ -283,18 +331,24 @@ fn validate_foreign_abi(
             match (return_type, destination) {
                 (mir::Type::Void, None) => {}
                 (mir::Type::Void, Some(_)) | (_, None) => {
-                    return Err(BackendError::new(format!(
-                        "function `{}` has an invalid foreign result destination",
-                        function.name
-                    )));
+                    return Err(BackendError::new(
+                        codes::BACKEND_FOREIGN_ABI_INVALID,
+                        format!(
+                            "function `{}` has an invalid foreign result destination",
+                            function.name
+                        ),
+                    ));
                 }
                 (_, Some(mir::Place::Local(local)))
                     if locals.get(local).is_some_and(|type_| *type_ == return_type) => {}
                 _ => {
-                    return Err(BackendError::new(format!(
-                        "function `{}` has a foreign result destination with the wrong type",
-                        function.name
-                    )));
+                    return Err(BackendError::new(
+                        codes::BACKEND_FOREIGN_ABI_INVALID,
+                        format!(
+                            "function `{}` has a foreign result destination with the wrong type",
+                            function.name
+                        ),
+                    ));
                 }
             }
         }
@@ -342,18 +396,24 @@ fn validate_string_try_parse_targets(
                 _ => continue,
             };
             let mir::Type::Enum(symbol) = return_type else {
-                return Err(BackendError::new(format!(
-                    "function `{}` has {intrinsic:?} returning `{}`, expected `Option<{}>`",
-                    function.name,
-                    type_name_owned(return_type),
-                    type_name(&expected)
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_INTRINSIC_INVALID_SHAPE,
+                    format!(
+                        "function `{}` has {intrinsic:?} returning `{}`, expected `Option<{}>`",
+                        function.name,
+                        type_name_owned(return_type),
+                        type_name(&expected)
+                    ),
+                ));
             };
             let definition = enum_definitions.get(symbol).ok_or_else(|| {
-                BackendError::new(format!(
-                    "function `{}` has {intrinsic:?} returning an unknown enum type",
-                    function.name
-                ))
+                BackendError::new(
+                    codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                    format!(
+                        "function `{}` has {intrinsic:?} returning an unknown enum type",
+                        function.name
+                    ),
+                )
             })?;
             let none_case = definition.cases.iter().find(|case| case.fields.is_empty());
             let some_case = definition
@@ -361,12 +421,15 @@ fn validate_string_try_parse_targets(
                 .iter()
                 .find(|case| case.fields.len() == 1 && case.fields[0].type_ == expected);
             if definition.cases.len() != 2 || none_case.is_none() || some_case.is_none() {
-                return Err(BackendError::new(format!(
-                    "function `{}` has {intrinsic:?} returning `{}`, which is not `Option<{}>`",
-                    function.name,
-                    definition.name,
-                    type_name(&expected)
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_INTRINSIC_MISSING_STDLIB_TYPE,
+                    format!(
+                        "function `{}` has {intrinsic:?} returning `{}`, which is not `Option<{}>`",
+                        function.name,
+                        definition.name,
+                        type_name(&expected)
+                    ),
+                ));
             }
         }
     }
@@ -418,12 +481,15 @@ fn validate_file_io_result_shapes(
                 _ => continue,
             };
             let malformed = || {
-                BackendError::new(format!(
-                    "function `{}` has {intrinsic:?} returning `{}`, which is not `Result<{}, IOError>`",
-                    function.name,
-                    type_name_owned(return_type),
-                    type_name(&expected_ok)
-                ))
+                BackendError::new(
+                    codes::BACKEND_INTRINSIC_MISSING_STDLIB_TYPE,
+                    format!(
+                        "function `{}` has {intrinsic:?} returning `{}`, which is not `Result<{}, IOError>`",
+                        function.name,
+                        type_name_owned(return_type),
+                        type_name(&expected_ok)
+                    ),
+                )
             };
             let mir::Type::Enum(symbol) = return_type else {
                 return Err(malformed());
@@ -495,10 +561,10 @@ fn validate_function(
         && !classes.contains(&owner)
         && !structs.contains(&owner)
     {
-        return Err(BackendError::new(format!(
-            "function `{}` has an unknown method owner",
-            function.name
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+            format!("function `{}` has an unknown method owner", function.name),
+        ));
     }
     validate_return_type(&function.return_type, &function.name)?;
     for parameter in &function.parameters {
@@ -513,16 +579,22 @@ fn validate_function(
         .map(|block| block.id)
         .collect::<HashSet<_>>();
     if blocks.len() != function.blocks.len() {
-        return Err(BackendError::new(format!(
-            "function `{}` has duplicate basic block identifiers",
-            function.name
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_MALFORMED_CFG_OR_LOCAL,
+            format!(
+                "function `{}` has duplicate basic block identifiers",
+                function.name
+            ),
+        ));
     }
     if !blocks.contains(&function.entry) {
-        return Err(BackendError::new(format!(
-            "function `{}` references unknown entry block {:?}",
-            function.name, function.entry
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_MALFORMED_CFG_OR_LOCAL,
+            format!(
+                "function `{}` references unknown entry block {:?}",
+                function.name, function.entry
+            ),
+        ));
     }
     let declared_local_count = function.parameters.len() + function.locals.len();
     let locals = function
@@ -532,10 +604,13 @@ fn validate_function(
         .map(|local| (local.id, local.type_.clone()))
         .collect::<HashMap<_, _>>();
     if locals.len() != declared_local_count {
-        return Err(BackendError::new(format!(
-            "function `{}` has duplicate local identifiers",
-            function.name
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_MALFORMED_CFG_OR_LOCAL,
+            format!(
+                "function `{}` has duplicate local identifiers",
+                function.name
+            ),
+        ));
     }
     for block in &function.blocks {
         for instruction in &block.instructions {
@@ -594,9 +669,12 @@ fn validate_instruction(
             {
                 Ok(())
             } else {
-                Err(BackendError::new(format!(
-                    "function `{function_name}` contains a reference-count instruction that is not a class, interface, array, list, dictionary or string operand under MEM-EXP-1 C5"
-                )))
+                Err(BackendError::new(
+                    codes::BACKEND_REFCOUNT_INVALID,
+                    format!(
+                        "function `{function_name}` contains a reference-count instruction that is not a class, interface, array, list, dictionary or string operand under MEM-EXP-1 C5"
+                    ),
+                ))
             }
         }
         mir::Instruction::Assign { target, value } => {
@@ -919,14 +997,20 @@ fn declared_local_type<'a>(
     locals: &'a HashMap<mir::LocalId, mir::Type>,
 ) -> Result<&'a mir::Type, BackendError> {
     let mir::Place::Local(local) = place else {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a `{operation}` destination that is not a local"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_MALFORMED_CFG_OR_LOCAL,
+            format!(
+                "function `{function_name}` has a `{operation}` destination that is not a local"
+            ),
+        ));
     };
     locals.get(local).ok_or_else(|| {
-        BackendError::new(format!(
-            "function `{function_name}` has a `{operation}` destination that is undeclared"
-        ))
+        BackendError::new(
+            codes::BACKEND_MALFORMED_CFG_OR_LOCAL,
+            format!(
+                "function `{function_name}` has a `{operation}` destination that is undeclared"
+            ),
+        )
     })
 }
 
@@ -942,15 +1026,21 @@ fn validate_dictionary_receiver_and_key<'a>(
     validate_dictionary_operand_locals(dictionary, operation, function_name, locals)?;
     validate_dictionary_operand_locals(key, operation, function_name, locals)?;
     let mir::Type::Dictionary(key_type, value_type) = &dictionary.type_ else {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a `{operation}` receiver that is not `Dictionary<K, V>`"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has a `{operation}` receiver that is not `Dictionary<K, V>`"
+            ),
+        ));
     };
     validate_dictionary_key_type(key_type, function_name)?;
     if key.type_ != **key_type {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a `{operation}` key incompatible with its Dictionary specialization"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has a `{operation}` key incompatible with its Dictionary specialization"
+            ),
+        ));
     }
     Ok((key_type, value_type))
 }
@@ -972,15 +1062,21 @@ fn validate_dictionary_mutation(
     )?;
     validate_operand(value, function_name)?;
     if value.type_ != *value_type {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a Dictionary value incompatible with its specialization"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has a Dictionary value incompatible with its specialization"
+            ),
+        ));
     }
     let declared = declared_local_type(destination, function_name, "Dictionary mutation", locals)?;
     if *declared != mir::Type::Bool {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a Dictionary mutation destination that is not `bool`"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has a Dictionary mutation destination that is not `bool`"
+            ),
+        ));
     }
     Ok(())
 }
@@ -1006,9 +1102,12 @@ fn validate_dictionary_key_operation(
         locals,
     )?;
     if *declared != mir::Type::Bool {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a Dictionary key-operation destination that is not `bool`"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has a Dictionary key-operation destination that is not `bool`"
+            ),
+        ));
     }
     Ok(())
 }
@@ -1032,20 +1131,29 @@ fn validate_dictionary_try_get(
         locals,
     )?;
     if dictionary_value_type != value_type {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a `DictionaryTryGet` value type incompatible with its specialization"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has a `DictionaryTryGet` value type incompatible with its specialization"
+            ),
+        ));
     }
     let declared = declared_local_type(destination, function_name, "DictionaryTryGet", locals)?;
     let mir::Type::Enum(symbol) = declared else {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a `DictionaryTryGet` destination that is not an enum"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has a `DictionaryTryGet` destination that is not an enum"
+            ),
+        ));
     };
     if !enums.contains(symbol) || option_layout.some_tag == option_layout.none_tag {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has invalid nominal Option metadata for `DictionaryTryGet`"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_INTRINSIC_MISSING_STDLIB_TYPE,
+            format!(
+                "function `{function_name}` has invalid nominal Option metadata for `DictionaryTryGet`"
+            ),
+        ));
     }
     Ok(())
 }
@@ -1067,27 +1175,39 @@ fn validate_dictionary_entries(
     let expected_dictionary =
         mir::Type::Dictionary(Box::new(key_type.clone()), Box::new(value_type.clone()));
     if dictionary.type_ != expected_dictionary {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has `DictionaryEntries` metadata incompatible with its receiver"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has `DictionaryEntries` metadata incompatible with its receiver"
+            ),
+        ));
     }
     validate_dictionary_key_type(key_type, function_name)?;
     let mir::Type::User(entry_symbol) = entry_type else {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a `DictionaryEntries` entry type that is not a concrete struct"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_INTRINSIC_MISSING_STDLIB_TYPE,
+            format!(
+                "function `{function_name}` has a `DictionaryEntries` entry type that is not a concrete struct"
+            ),
+        ));
     };
     if !structs.contains(entry_symbol) || entry_layout.key_field == entry_layout.value_field {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has invalid nominal `DictionaryEntry<K, V>` metadata"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_INTRINSIC_MISSING_STDLIB_TYPE,
+            format!(
+                "function `{function_name}` has invalid nominal `DictionaryEntry<K, V>` metadata"
+            ),
+        ));
     }
     let declared = declared_local_type(destination, function_name, "DictionaryEntries", locals)?;
     let expected = mir::Type::Array(Box::new(entry_type.clone()));
     if *declared != expected {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a `DictionaryEntries` destination with the wrong array element type"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has a `DictionaryEntries` destination with the wrong array element type"
+            ),
+        ));
     }
     Ok(())
 }
@@ -1108,9 +1228,12 @@ fn validate_dictionary_snapshot(
     validate_operand(dictionary, function_name)?;
     validate_dictionary_operand_locals(dictionary, "Dictionary snapshot", function_name, locals)?;
     let mir::Type::Dictionary(key_type, value_type) = &dictionary.type_ else {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a Dictionary snapshot receiver that is not `Dictionary<K, V>`"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has a Dictionary snapshot receiver that is not `Dictionary<K, V>`"
+            ),
+        ));
     };
     let expected_component = if keys {
         key_type.as_ref()
@@ -1118,9 +1241,12 @@ fn validate_dictionary_snapshot(
         value_type.as_ref()
     };
     if component_type != expected_component {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has Dictionary snapshot metadata incompatible with its receiver"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has Dictionary snapshot metadata incompatible with its receiver"
+            ),
+        ));
     }
     validate_list_element_type(
         component_type,
@@ -1132,9 +1258,12 @@ fn validate_dictionary_snapshot(
     )?;
     let declared = declared_local_type(destination, function_name, "Dictionary snapshot", locals)?;
     if declared != &mir::Type::Array(Box::new(component_type.clone())) {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a Dictionary snapshot destination with the wrong array element type"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has a Dictionary snapshot destination with the wrong array element type"
+            ),
+        ));
     }
     Ok(())
 }
@@ -1152,10 +1281,13 @@ fn validate_dictionary_operand_locals(
     if let mir::Place::Local(local) = place {
         let declared = &locals[local];
         if declared != &operand.type_ {
-            return Err(BackendError::new(format!(
-                "function `{function_name}` passes a `{operation}` operand declared `{declared:?}` but typed `{:?}`",
-                operand.type_
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+                format!(
+                    "function `{function_name}` passes a `{operation}` operand declared `{declared:?}` but typed `{:?}`",
+                    operand.type_
+                ),
+            ));
         }
     }
     Ok(())
@@ -1172,9 +1304,12 @@ fn validate_dictionary_place_locals(
             if locals.contains_key(local) {
                 Ok(())
             } else {
-                Err(BackendError::new(format!(
-                    "function `{function_name}` passes undeclared local {local:?} to {operation}"
-                )))
+                Err(BackendError::new(
+                    codes::BACKEND_MALFORMED_CFG_OR_LOCAL,
+                    format!(
+                        "function `{function_name}` passes undeclared local {local:?} to {operation}"
+                    ),
+                ))
             }
         }
         mir::Place::Field { base, .. } | mir::Place::EnumField { base, .. } => {
@@ -1207,16 +1342,22 @@ fn validate_string_decode_next(
     validate_place(next_cursor_destination, function_name)?;
     validate_place(ok_destination, function_name)?;
     if string.type_ != mir::Type::String {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a `StringDecodeNext` on a non-`string` receiver (found `{}`)",
-            type_name_owned(&string.type_)
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_STRING_OPERATION_INVALID,
+            format!(
+                "function `{function_name}` has a `StringDecodeNext` on a non-`string` receiver (found `{}`)",
+                type_name_owned(&string.type_)
+            ),
+        ));
     }
     if cursor.type_ != mir::Type::Int {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a `StringDecodeNext` whose cursor is not `int` (found `{}`)",
-            type_name_owned(&cursor.type_)
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_STRING_OPERATION_INVALID,
+            format!(
+                "function `{function_name}` has a `StringDecodeNext` whose cursor is not `int` (found `{}`)",
+                type_name_owned(&cursor.type_)
+            ),
+        ));
     }
     let destinations = [
         (char_destination, mir::Type::Char, "char_destination"),
@@ -1230,26 +1371,38 @@ fn validate_string_decode_next(
     let mut seen_locals = HashSet::new();
     for (place, expected_type, label) in destinations {
         let mir::Place::Local(local) = place else {
-            return Err(BackendError::new(format!(
-                "function `{function_name}` has a `StringDecodeNext` whose `{label}` is not a local"
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_STRING_OPERATION_INVALID,
+                format!(
+                    "function `{function_name}` has a `StringDecodeNext` whose `{label}` is not a local"
+                ),
+            ));
         };
         let declared = locals.get(local).ok_or_else(|| {
-            BackendError::new(format!(
-                "function `{function_name}` has a `StringDecodeNext` writing `{label}` into an undeclared local"
-            ))
+            BackendError::new(
+                codes::BACKEND_STRING_OPERATION_INVALID,
+                format!(
+                    "function `{function_name}` has a `StringDecodeNext` writing `{label}` into an undeclared local"
+                ),
+            )
         })?;
         if *declared != expected_type {
-            return Err(BackendError::new(format!(
-                "function `{function_name}` has a `StringDecodeNext` whose `{label}` is declared `{}`, expected `{}`",
-                type_name_owned(declared),
-                type_name_owned(&expected_type),
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_STRING_OPERATION_INVALID,
+                format!(
+                    "function `{function_name}` has a `StringDecodeNext` whose `{label}` is declared `{}`, expected `{}`",
+                    type_name_owned(declared),
+                    type_name_owned(&expected_type),
+                ),
+            ));
         }
         if !seen_locals.insert(*local) {
-            return Err(BackendError::new(format!(
-                "function `{function_name}` has a `StringDecodeNext` writing more than one destination into the same local"
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_STRING_OPERATION_INVALID,
+                format!(
+                    "function `{function_name}` has a `StringDecodeNext` writing more than one destination into the same local"
+                ),
+            ));
         }
     }
     Ok(())
@@ -1267,28 +1420,36 @@ fn validate_allocate_array(
     validate_value_type(element_type, function_name)?;
     validate_operand(length, function_name)?;
     let mir::Place::Local(destination_local) = destination else {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` allocates an array into a non-local destination"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_MALFORMED_CFG_OR_LOCAL,
+            format!("function `{function_name}` allocates an array into a non-local destination"),
+        ));
     };
     let declared_destination = locals.get(destination_local).ok_or_else(|| {
-        BackendError::new(format!(
-            "function `{function_name}` allocates an array into an undeclared local"
-        ))
+        BackendError::new(
+            codes::BACKEND_MALFORMED_CFG_OR_LOCAL,
+            format!("function `{function_name}` allocates an array into an undeclared local"),
+        )
     })?;
     let expected_destination = mir::Type::Array(Box::new(element_type.clone()));
     if *declared_destination != expected_destination {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` allocates `{}` elements into destination `{}`",
-            type_name(element_type),
-            type_name(declared_destination)
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_ARRAY_ALLOCATION_INVALID,
+            format!(
+                "function `{function_name}` allocates `{}` elements into destination `{}`",
+                type_name(element_type),
+                type_name(declared_destination)
+            ),
+        ));
     }
     if length.type_ != mir::Type::Int {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` allocates an array with non-`int` length `{}`",
-            type_name(&length.type_)
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_ARRAY_ALLOCATION_INVALID,
+            format!(
+                "function `{function_name}` allocates an array with non-`int` length `{}`",
+                type_name(&length.type_)
+            ),
+        ));
     }
     if initialization == mir::ArrayInitialization::Empty
         && !matches!(
@@ -1297,9 +1458,12 @@ fn validate_allocate_array(
                 if matches!(integer_constant_bits(value, &length.type_), Ok(0))
         )
     {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` marks a non-zero or dynamic array allocation as proven empty"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_ARRAY_ALLOCATION_INVALID,
+            format!(
+                "function `{function_name}` marks a non-zero or dynamic array allocation as proven empty"
+            ),
+        ));
     }
     Ok(())
 }
@@ -1368,6 +1532,7 @@ fn merge_explicit_array_state(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_one_explicit_array_initialization(
     function: &mir::Function,
     allocation_block: mir::BasicBlockId,
@@ -1391,16 +1556,22 @@ fn validate_one_explicit_array_initialization(
 
     while let Some(block_id) = pending.pop() {
         let block = blocks.get(&block_id).ok_or_else(|| {
-            BackendError::new(format!(
-                "function `{}` has malformed explicit array initialization CFG",
-                function.name
-            ))
+            BackendError::new(
+                codes::BACKEND_ARRAY_ALLOCATION_INVALID,
+                format!(
+                    "function `{}` has malformed explicit array initialization CFG",
+                    function.name
+                ),
+            )
         })?;
         let mut initialized = incoming.get(&block_id).cloned().ok_or_else(|| {
-            BackendError::new(format!(
-                "function `{}` has missing explicit array initialization state",
-                function.name
-            ))
+            BackendError::new(
+                codes::BACKEND_ARRAY_ALLOCATION_INVALID,
+                format!(
+                    "function `{}` has missing explicit array initialization state",
+                    function.name
+                ),
+            )
         })?;
         let start = if first_visit && block_id == allocation_block {
             first_visit = false;
@@ -1414,10 +1585,13 @@ fn validate_one_explicit_array_initialization(
                 explicit_array_element_assignment(instruction, array_local, element_type)
             {
                 if index >= element_count {
-                    return Err(BackendError::new(format!(
-                        "function `{}` initializes explicit array element {index} outside length {element_count}",
-                        function.name
-                    )));
+                    return Err(BackendError::new(
+                        codes::BACKEND_ARRAY_ALLOCATION_INVALID,
+                        format!(
+                            "function `{}` initializes explicit array element {index} outside length {element_count}",
+                            function.name
+                        ),
+                    ));
                 }
                 initialized.insert(index);
                 if initialized.len() == element_count {
@@ -1432,10 +1606,13 @@ fn validate_one_explicit_array_initialization(
             let mut definitions = HashSet::new();
             owned_instruction_definitions(instruction, &mut definitions);
             if reads.contains(&array_local) || definitions.contains(&array_local) {
-                return Err(BackendError::new(format!(
-                    "function `{}` uses or replaces an explicitly initialized array before every element is written",
-                    function.name
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_ARRAY_ALLOCATION_INVALID,
+                    format!(
+                        "function `{}` uses or replaces an explicitly initialized array before every element is written",
+                        function.name
+                    ),
+                ));
             }
         }
         if complete {
@@ -1451,10 +1628,13 @@ fn validate_one_explicit_array_initialization(
             _ => {}
         }
         if terminator_reads.contains(&array_local) {
-            return Err(BackendError::new(format!(
-                "function `{}` uses an explicitly initialized array in control flow before every element is written",
-                function.name
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_ARRAY_ALLOCATION_INVALID,
+                format!(
+                    "function `{}` uses an explicitly initialized array in control flow before every element is written",
+                    function.name
+                ),
+            ));
         }
         let successors = match block.terminator {
             mir::Terminator::Goto(target) => vec![target],
@@ -1464,10 +1644,13 @@ fn validate_one_explicit_array_initialization(
                 ..
             } => vec![then_block, else_block],
             mir::Terminator::Return(_) | mir::Terminator::End | mir::Terminator::Unreachable => {
-                return Err(BackendError::new(format!(
-                    "function `{}` terminates before every explicit array element is initialized",
-                    function.name
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_ARRAY_ALLOCATION_INVALID,
+                    format!(
+                        "function `{}` terminates before every explicit array element is initialized",
+                        function.name
+                    ),
+                ));
             }
         };
         for successor in successors {
@@ -1491,10 +1674,13 @@ fn validate_explicit_array_initialization(function: &mir::Function) -> Result<()
                 continue;
             };
             let element_count = constant_nonnegative_int(length).ok_or_else(|| {
-                BackendError::new(format!(
-                    "function `{}` has explicit array initialization without a constant non-negative length",
-                    function.name
-                ))
+                BackendError::new(
+                    codes::BACKEND_ARRAY_ALLOCATION_INVALID,
+                    format!(
+                        "function `{}` has explicit array initialization without a constant non-negative length",
+                        function.name
+                    ),
+                )
             })?;
             validate_one_explicit_array_initialization(
                 function,
@@ -1519,16 +1705,20 @@ fn validate_assign(
     validate_place_with_proven_bounds(target, function_name, true)?;
     if let mir::Place::Local(id) = target {
         let declared = locals.get(id).ok_or_else(|| {
-            BackendError::new(format!(
-                "function `{function_name}` assigns into undeclared local {id:?}"
-            ))
+            BackendError::new(
+                codes::BACKEND_MALFORMED_CFG_OR_LOCAL,
+                format!("function `{function_name}` assigns into undeclared local {id:?}"),
+            )
         })?;
         if *declared != value.type_ {
-            return Err(BackendError::new(format!(
-                "function `{function_name}` assigns a value of type `{}` into a local declared `{}`",
-                type_name(&value.type_),
-                type_name(declared)
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_ASSIGNMENT_TYPE_MISMATCH,
+                format!(
+                    "function `{function_name}` assigns a value of type `{}` into a local declared `{}`",
+                    type_name(&value.type_),
+                    type_name(declared)
+                ),
+            ));
         }
     }
     validate_rvalue(value, function_name, implementations, locals)
@@ -1553,26 +1743,33 @@ fn validate_call(
         validate_operand(argument, function_name)?;
     }
     let called = signatures.get(&function).ok_or_else(|| {
-        BackendError::new(format!(
-            "function `{function_name}` calls an unsupported external function with symbol {}",
-            function.0
-        ))
+        BackendError::new(
+            codes::BACKEND_CALL_SIGNATURE_MISMATCH,
+            format!(
+                "function `{function_name}` calls an unsupported external function with symbol {}",
+                function.0
+            ),
+        )
     })?;
     if called
         .owner
         .is_some_and(|owner| !classes.contains(&owner) && !structs.contains(&owner))
     {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` calls a method with an unknown owner"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+            format!("function `{function_name}` calls a method with an unknown owner"),
+        ));
     }
     if called.return_type != *return_type {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` calls `{}` with return type `{}`, but the declaration returns `{}`",
-            called.name,
-            type_name(return_type),
-            type_name(&called.return_type)
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_CALL_SIGNATURE_MISMATCH,
+            format!(
+                "function `{function_name}` calls `{}` with return type `{}`, but the declaration returns `{}`",
+                called.name,
+                type_name(return_type),
+                type_name(&called.return_type)
+            ),
+        ));
     }
     validate_call_destination_shape(destination, return_type, function_name, &called.name)?;
     if arguments.len() != called.parameters.len()
@@ -1581,10 +1778,13 @@ fn validate_call(
             .zip(&called.parameters)
             .any(|(argument, parameter)| argument.type_ != parameter.type_)
     {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` calls `{}` with an invalid argument signature",
-            called.name
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_CALL_SIGNATURE_MISMATCH,
+            format!(
+                "function `{function_name}` calls `{}` with an invalid argument signature",
+                called.name
+            ),
+        ));
     }
     Ok(())
 }
@@ -1616,19 +1816,28 @@ fn validate_call_intrinsic(
         validate_place(destination, function_name)?;
         if is_string_method_intrinsic(intrinsic) || is_math_intrinsic(intrinsic) {
             let mir::Place::Local(local) = destination else {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` stores {intrinsic:?} into a non-local destination"
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_MALFORMED_CFG_OR_LOCAL,
+                    format!(
+                        "function `{function_name}` stores {intrinsic:?} into a non-local destination"
+                    ),
+                ));
             };
             let declared = locals.get(local).ok_or_else(|| {
-                BackendError::new(format!(
-                    "function `{function_name}` stores {intrinsic:?} into undeclared local {local:?}"
-                ))
+                BackendError::new(
+                    codes::BACKEND_MALFORMED_CFG_OR_LOCAL,
+                    format!(
+                        "function `{function_name}` stores {intrinsic:?} into undeclared local {local:?}"
+                    ),
+                )
             })?;
             if declared != return_type {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` stores {intrinsic:?} result expected `{return_type:?}`, found destination `{declared:?}`"
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_INTRINSIC_INVALID_SHAPE,
+                    format!(
+                        "function `{function_name}` stores {intrinsic:?} result expected `{return_type:?}`, found destination `{declared:?}`"
+                    ),
+                ));
             }
         }
     }
@@ -1721,10 +1930,13 @@ fn validate_string_operand_locals(
     if let mir::Place::Local(local) = place {
         let declared = &locals[local];
         if declared != &operand.type_ {
-            return Err(BackendError::new(format!(
-                "function `{function_name}` passes {intrinsic:?} operand expected `{:?}`, found local `{declared:?}`",
-                operand.type_
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_STRING_OPERATION_INVALID,
+                format!(
+                    "function `{function_name}` passes {intrinsic:?} operand expected `{:?}`, found local `{declared:?}`",
+                    operand.type_
+                ),
+            ));
         }
     }
     Ok(())
@@ -1741,9 +1953,12 @@ fn validate_string_place_locals(
             if locals.contains_key(local) {
                 Ok(())
             } else {
-                Err(BackendError::new(format!(
-                    "function `{function_name}` passes undeclared local {local:?} to {intrinsic:?}"
-                )))
+                Err(BackendError::new(
+                    codes::BACKEND_MALFORMED_CFG_OR_LOCAL,
+                    format!(
+                        "function `{function_name}` passes undeclared local {local:?} to {intrinsic:?}"
+                    ),
+                ))
             }
         }
         mir::Place::Field { base, .. } | mir::Place::EnumField { base, .. } => {
@@ -1782,17 +1997,23 @@ fn validate_allocate_list(
     )?;
     if let mir::Place::Local(local) = destination {
         let declared = locals.get(local).ok_or_else(|| {
-            BackendError::new(format!(
-                "function `{function_name}` allocates a `List<T>` into an undeclared local"
-            ))
+            BackendError::new(
+                codes::BACKEND_MALFORMED_CFG_OR_LOCAL,
+                format!(
+                    "function `{function_name}` allocates a `List<T>` into an undeclared local"
+                ),
+            )
         })?;
         let expected = mir::Type::List(Box::new(element_type.clone()));
         if *declared != expected {
-            return Err(BackendError::new(format!(
-                "function `{function_name}` has an `AllocateList` whose destination is declared `{}`, but the instruction constructs `{}`",
-                type_name_owned(declared),
-                type_name_owned(&expected),
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+                format!(
+                    "function `{function_name}` has an `AllocateList` whose destination is declared `{}`, but the instruction constructs `{}`",
+                    type_name_owned(declared),
+                    type_name_owned(&expected),
+                ),
+            ));
         }
     }
     Ok(())
@@ -1822,16 +2043,22 @@ fn validate_allocate_dictionary(
     )?;
     if let mir::Place::Local(local) = destination {
         let declared = locals.get(local).ok_or_else(|| {
-            BackendError::new(format!(
-                "function `{function_name}` allocates a `Dictionary<K, V>` into an undeclared local"
-            ))
+            BackendError::new(
+                codes::BACKEND_MALFORMED_CFG_OR_LOCAL,
+                format!(
+                    "function `{function_name}` allocates a `Dictionary<K, V>` into an undeclared local"
+                ),
+            )
         })?;
         let expected =
             mir::Type::Dictionary(Box::new(key_type.clone()), Box::new(value_type.clone()));
         if *declared != expected {
-            return Err(BackendError::new(format!(
-                "function `{function_name}` has an `AllocateDictionary` whose destination type does not match its concrete specialization"
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+                format!(
+                    "function `{function_name}` has an `AllocateDictionary` whose destination type does not match its concrete specialization"
+                ),
+            ));
         }
     }
     Ok(())
@@ -1846,19 +2073,28 @@ fn validate_allocate_string_builder(
 ) -> Result<(), BackendError> {
     validate_place(destination, function_name)?;
     if !classes.contains(&class) {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` allocates a StringBuilder with an unknown class identity"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+            format!(
+                "function `{function_name}` allocates a StringBuilder with an unknown class identity"
+            ),
+        ));
     }
     let mir::Place::Local(local) = destination else {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` allocates a StringBuilder into a non-local destination"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_MALFORMED_CFG_OR_LOCAL,
+            format!(
+                "function `{function_name}` allocates a StringBuilder into a non-local destination"
+            ),
+        ));
     };
     if locals.get(local) != Some(&mir::Type::Class(class)) {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` allocates a StringBuilder into an incompatible destination"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_STRING_OPERATION_INVALID,
+            format!(
+                "function `{function_name}` allocates a StringBuilder into an incompatible destination"
+            ),
+        ));
     }
     Ok(())
 }
@@ -1891,9 +2127,10 @@ fn validate_string_builder_append(
         )
         || !matches!(builder.kind, mir::OperandKind::Copy(_))
     {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has an invalid StringBuilder.Append operation"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_STRING_OPERATION_INVALID,
+            format!("function `{function_name}` has an invalid StringBuilder.Append operation"),
+        ));
     }
     validate_operand(builder, function_name)?;
     validate_operand(value, function_name)?;
@@ -1915,20 +2152,27 @@ fn validate_string_builder_to_string(
         || builder.type_ != mir::Type::Class(class)
         || !matches!(builder.kind, mir::OperandKind::Copy(_))
     {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has an invalid StringBuilder.ToString receiver"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_STRING_OPERATION_INVALID,
+            format!("function `{function_name}` has an invalid StringBuilder.ToString receiver"),
+        ));
     }
     validate_builder_operand_local(builder, function_name, locals)?;
     let mir::Place::Local(local) = destination else {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` writes StringBuilder.ToString into a non-local destination"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_MALFORMED_CFG_OR_LOCAL,
+            format!(
+                "function `{function_name}` writes StringBuilder.ToString into a non-local destination"
+            ),
+        ));
     };
     if locals.get(local) != Some(&mir::Type::String) {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` writes StringBuilder.ToString into a non-string destination"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_STRING_OPERATION_INVALID,
+            format!(
+                "function `{function_name}` writes StringBuilder.ToString into a non-string destination"
+            ),
+        ));
     }
     Ok(())
 }
@@ -1942,9 +2186,12 @@ fn validate_builder_operand_local(
         return Ok(());
     };
     if locals.get(local) != Some(&operand.type_) {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a StringBuilder operation whose operand type does not match its local"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_STRING_OPERATION_INVALID,
+            format!(
+                "function `{function_name}` has a StringBuilder operation whose operand type does not match its local"
+            ),
+        ));
     }
     Ok(())
 }
@@ -1966,10 +2213,13 @@ fn validate_dictionary_key_type(key: &mir::Type, function_name: &str) -> Result<
     ) {
         Ok(())
     } else {
-        Err(BackendError::new(format!(
-            "function `{function_name}` has a Dictionary key type unsupported in ASTER 1.0: `{}`",
-            type_name_owned(key)
-        )))
+        Err(BackendError::new(
+            codes::BACKEND_UNSUPPORTED_DICTIONARY_KEY,
+            format!(
+                "function `{function_name}` has a Dictionary key type unsupported in ASTER 1.0: `{}`",
+                type_name_owned(key)
+            ),
+        ))
     }
 }
 
@@ -1983,24 +2233,36 @@ fn validate_dictionary_value_type(
 ) -> Result<(), BackendError> {
     match value {
         mir::Type::User(symbol) if !structs.contains(symbol) => {
-            return Err(BackendError::new(format!(
-                "function `{function_name}` has a Dictionary value struct unknown to the module"
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                format!(
+                    "function `{function_name}` has a Dictionary value struct unknown to the module"
+                ),
+            ));
         }
         mir::Type::Class(symbol) if !classes.contains(symbol) => {
-            return Err(BackendError::new(format!(
-                "function `{function_name}` has a Dictionary value class unknown to the module"
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                format!(
+                    "function `{function_name}` has a Dictionary value class unknown to the module"
+                ),
+            ));
         }
         mir::Type::Interface(symbol) if !interfaces.contains(symbol) => {
-            return Err(BackendError::new(format!(
-                "function `{function_name}` has a Dictionary value interface unknown to the module"
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                format!(
+                    "function `{function_name}` has a Dictionary value interface unknown to the module"
+                ),
+            ));
         }
         mir::Type::Enum(symbol) if !enums.contains(symbol) => {
-            return Err(BackendError::new(format!(
-                "function `{function_name}` has a Dictionary value enum unknown to the module"
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                format!(
+                    "function `{function_name}` has a Dictionary value enum unknown to the module"
+                ),
+            ));
         }
         mir::Type::Dictionary(key, nested) => {
             validate_dictionary_key_type(key, function_name)?;
@@ -2045,18 +2307,24 @@ fn validate_list_get(
     validate_operand(list, function_name)?;
     validate_operand(index, function_name)?;
     if index.type_ != mir::Type::Int {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a `ListGet` whose index is not `int` (found `{}`)",
-            type_name_owned(&index.type_)
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has a `ListGet` whose index is not `int` (found `{}`)",
+                type_name_owned(&index.type_)
+            ),
+        ));
     }
     let expected_list_type = mir::Type::List(Box::new(element_type.clone()));
     if list.type_ != expected_list_type {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a `ListGet` on `{}`, but the instruction constructs `{}`",
-            type_name_owned(&list.type_),
-            type_name_owned(&expected_list_type),
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has a `ListGet` on `{}`, but the instruction constructs `{}`",
+                type_name_owned(&list.type_),
+                type_name_owned(&expected_list_type),
+            ),
+        ));
     }
     validate_list_element_type(
         element_type,
@@ -2068,16 +2336,22 @@ fn validate_list_get(
     )?;
     if let mir::Place::Local(local) = destination {
         let declared = locals.get(local).ok_or_else(|| {
-            BackendError::new(format!(
-                "function `{function_name}` has a `ListGet` writing into an undeclared local"
-            ))
+            BackendError::new(
+                codes::BACKEND_MALFORMED_CFG_OR_LOCAL,
+                format!(
+                    "function `{function_name}` has a `ListGet` writing into an undeclared local"
+                ),
+            )
         })?;
         if *declared != *element_type {
-            return Err(BackendError::new(format!(
-                "function `{function_name}` has a `ListGet` whose destination is declared `{}`, but the instruction produces `{}`",
-                type_name_owned(declared),
-                type_name_owned(element_type),
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+                format!(
+                    "function `{function_name}` has a `ListGet` whose destination is declared `{}`, but the instruction produces `{}`",
+                    type_name_owned(declared),
+                    type_name_owned(element_type),
+                ),
+            ));
         }
     }
     Ok(())
@@ -2095,10 +2369,13 @@ fn validate_list_add(
     validate_operand(list, function_name)?;
     validate_operand(value, function_name)?;
     let mir::Type::List(element_type) = &list.type_ else {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a `ListAdd` whose receiver is not `List<T>` (found `{}`)",
-            type_name_owned(&list.type_)
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has a `ListAdd` whose receiver is not `List<T>` (found `{}`)",
+                type_name_owned(&list.type_)
+            ),
+        ));
     };
     validate_list_element_type(
         element_type,
@@ -2109,11 +2386,14 @@ fn validate_list_add(
         enums,
     )?;
     if value.type_ != **element_type {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a `ListAdd` on `{}` receiving a value of type `{}`",
-            type_name_owned(&list.type_),
-            type_name_owned(&value.type_),
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has a `ListAdd` on `{}` receiving a value of type `{}`",
+                type_name_owned(&list.type_),
+                type_name_owned(&value.type_),
+            ),
+        ));
     }
     Ok(())
 }
@@ -2130,16 +2410,22 @@ fn validate_list_remove_at(
     validate_operand(list, function_name)?;
     validate_operand(index, function_name)?;
     if index.type_ != mir::Type::Int {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a `ListRemoveAt` whose index is not `int` (found `{}`)",
-            type_name_owned(&index.type_)
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has a `ListRemoveAt` whose index is not `int` (found `{}`)",
+                type_name_owned(&index.type_)
+            ),
+        ));
     }
     let mir::Type::List(element_type) = &list.type_ else {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a `ListRemoveAt` whose receiver is not `List<T>` (found `{}`)",
-            type_name_owned(&list.type_)
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has a `ListRemoveAt` whose receiver is not `List<T>` (found `{}`)",
+                type_name_owned(&list.type_)
+            ),
+        ));
     };
     validate_list_element_type(
         element_type,
@@ -2173,9 +2459,10 @@ fn validate_list_set(
         enums,
     )?;
     if index.type_ != mir::Type::Int {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a `ListSet` whose index is not `int`"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!("function `{function_name}` has a `ListSet` whose index is not `int`"),
+        ));
     }
     validate_operand(index, function_name)?;
     validate_direct_operand_local(list, "ListSet receiver", function_name, locals)?;
@@ -2194,9 +2481,10 @@ fn validate_list_clear(
 ) -> Result<(), BackendError> {
     validate_operand(list, function_name)?;
     let mir::Type::List(element_type) = &list.type_ else {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a `ListClear` whose receiver is not `List<T>`"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!("function `{function_name}` has a `ListClear` whose receiver is not `List<T>`"),
+        ));
     };
     validate_list_element_type(
         element_type,
@@ -2224,14 +2512,20 @@ fn validate_list_to_array(
     validate_operand(list, function_name)?;
     validate_direct_operand_local(list, "ListToArray receiver", function_name, locals)?;
     let mir::Type::List(receiver_element) = &list.type_ else {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a `ListToArray` whose receiver is not `List<T>`"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has a `ListToArray` whose receiver is not `List<T>`"
+            ),
+        ));
     };
     if receiver_element.as_ref() != element_type {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has `ListToArray` metadata incompatible with its receiver"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has `ListToArray` metadata incompatible with its receiver"
+            ),
+        ));
     }
     validate_list_element_type(
         element_type,
@@ -2243,9 +2537,12 @@ fn validate_list_to_array(
     )?;
     let declared = declared_local_type(destination, function_name, "ListToArray", locals)?;
     if declared != &mir::Type::Array(Box::new(element_type.clone())) {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a `ListToArray` destination with the wrong array element type"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has a `ListToArray` destination with the wrong array element type"
+            ),
+        ));
     }
     Ok(())
 }
@@ -2262,9 +2559,12 @@ fn validate_direct_operand_local(
     if locals.get(local) == Some(&operand.type_) {
         Ok(())
     } else {
-        Err(BackendError::new(format!(
-            "function `{function_name}` has a {operation} whose operand type does not match its local"
-        )))
+        Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!(
+                "function `{function_name}` has a {operation} whose operand type does not match its local"
+            ),
+        ))
     }
 }
 
@@ -2292,30 +2592,41 @@ fn validate_list_element_type(
     enums: &HashSet<mir::SymbolId>,
 ) -> Result<(), BackendError> {
     if *element_type == mir::Type::Void {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a `List<void>`, which is not a value type"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+            format!("function `{function_name}` has a `List<void>`, which is not a value type"),
+        ));
     }
     match element_type {
         mir::Type::User(symbol) if !structs.contains(symbol) => {
-            return Err(BackendError::new(format!(
-                "function `{function_name}` has a `List<T>` whose element struct is unknown"
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                format!(
+                    "function `{function_name}` has a `List<T>` whose element struct is unknown"
+                ),
+            ));
         }
         mir::Type::Class(symbol) if !classes.contains(symbol) => {
-            return Err(BackendError::new(format!(
-                "function `{function_name}` has a `List<T>` whose element class is unknown"
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                format!(
+                    "function `{function_name}` has a `List<T>` whose element class is unknown"
+                ),
+            ));
         }
         mir::Type::Interface(symbol) if !interfaces.contains(symbol) => {
-            return Err(BackendError::new(format!(
-                "function `{function_name}` has a `List<T>` whose element interface is unknown"
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                format!(
+                    "function `{function_name}` has a `List<T>` whose element interface is unknown"
+                ),
+            ));
         }
         mir::Type::Enum(symbol) if !enums.contains(symbol) => {
-            return Err(BackendError::new(format!(
-                "function `{function_name}` has a `List<T>` whose element enum is unknown"
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                format!("function `{function_name}` has a `List<T>` whose element enum is unknown"),
+            ));
         }
         mir::Type::List(inner) => {
             return validate_list_element_type(
@@ -2360,9 +2671,10 @@ fn validate_virtual_call(
         validate_place(destination, function_name)?;
     }
     if !matches!(receiver.type_, mir::Type::Class(_)) {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has a virtual call with a non-class receiver"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_CALL_RECEIVER_INVALID,
+            format!("function `{function_name}` has a virtual call with a non-class receiver"),
+        ));
     }
     validate_operand(receiver, function_name)?;
     validate_call_destination_shape(destination, return_type, function_name, "virtual method")?;
@@ -2385,14 +2697,20 @@ fn validate_interface_call(
         validate_place(destination, function_name)?;
     }
     let mir::Type::Interface(receiver_interface) = receiver.type_ else {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has an interface call with a non-interface receiver"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_CALL_RECEIVER_INVALID,
+            format!(
+                "function `{function_name}` has an interface call with a non-interface receiver"
+            ),
+        ));
     };
     validate_operand(receiver, function_name)?;
-    let (method_interface, definition) = interface_methods
-        .get(&method)
-        .ok_or_else(|| BackendError::new("interface call references an unknown contract method"))?;
+    let (method_interface, definition) = interface_methods.get(&method).ok_or_else(|| {
+        BackendError::new(
+            codes::BACKEND_CALL_SIGNATURE_MISMATCH,
+            "interface call references an unknown contract method",
+        )
+    })?;
     let incompatible = *method_interface != receiver_interface
         || definition.return_type != *return_type
         || definition.parameters.len() != arguments.len()
@@ -2402,9 +2720,12 @@ fn validate_interface_call(
             .zip(arguments)
             .any(|(expected, actual)| expected != &actual.type_);
     if incompatible {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` contains an interface call with an incompatible signature"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_CALL_SIGNATURE_MISMATCH,
+            format!(
+                "function `{function_name}` contains an interface call with an incompatible signature"
+            ),
+        ));
     }
     validate_call_destination_shape(destination, return_type, function_name, "interface method")?;
     for argument in arguments {
@@ -2961,9 +3282,12 @@ fn validate_intrinsic_shape(
             .map(|argument| format!("{:?}", argument.type_))
             .collect::<Vec<_>>()
             .join(", ");
-        Err(BackendError::new(format!(
-            "function `{function_name}` contains a malformed {intrinsic:?} runtime intrinsic: found ({arguments}) -> {return_type:?}"
-        )))
+        Err(BackendError::new(
+            codes::BACKEND_INTRINSIC_INVALID_SHAPE,
+            format!(
+                "function `{function_name}` contains a malformed {intrinsic:?} runtime intrinsic: found ({arguments}) -> {return_type:?}"
+            ),
+        ))
     }
 }
 
@@ -3024,14 +3348,20 @@ fn validate_rvalue(
         mir::RvalueKind::ListLength(list) => {
             validate_operand_with_proven_bounds(list, function_name, true)?;
             if !matches!(list.type_, mir::Type::List(_)) {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` has a `ListLength` reading a non-`List<T>` receiver"
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+                    format!(
+                        "function `{function_name}` has a `ListLength` reading a non-`List<T>` receiver"
+                    ),
+                ));
             }
             if value.type_ != mir::Type::Int {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` has a `ListLength` whose result type is not `int`"
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+                    format!(
+                        "function `{function_name}` has a `ListLength` whose result type is not `int`"
+                    ),
+                ));
             }
             Ok(())
         }
@@ -3044,42 +3374,60 @@ fn validate_rvalue(
                 locals,
             )?;
             if !matches!(dictionary.type_, mir::Type::Dictionary(_, _)) {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` has a `DictionaryLength` reading a non-`Dictionary<K, V>` receiver"
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+                    format!(
+                        "function `{function_name}` has a `DictionaryLength` reading a non-`Dictionary<K, V>` receiver"
+                    ),
+                ));
             }
             if value.type_ != mir::Type::Int {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` has a `DictionaryLength` whose result type is not `int`"
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+                    format!(
+                        "function `{function_name}` has a `DictionaryLength` whose result type is not `int`"
+                    ),
+                ));
             }
             Ok(())
         }
         mir::RvalueKind::ListVersion(list) => {
             validate_operand_with_proven_bounds(list, function_name, true)?;
             if !matches!(list.type_, mir::Type::List(_)) {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` has a `ListVersion` reading a non-`List<T>` receiver"
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+                    format!(
+                        "function `{function_name}` has a `ListVersion` reading a non-`List<T>` receiver"
+                    ),
+                ));
             }
             if value.type_ != mir::Type::Long {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` has a `ListVersion` whose result type is not `long`"
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+                    format!(
+                        "function `{function_name}` has a `ListVersion` whose result type is not `long`"
+                    ),
+                ));
             }
             Ok(())
         }
         mir::RvalueKind::StringByteLength(operand) => {
             validate_operand_with_proven_bounds(operand, function_name, true)?;
             if operand.type_ != mir::Type::String {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` has a `StringByteLength` reading a non-`string` receiver"
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_STRING_OPERATION_INVALID,
+                    format!(
+                        "function `{function_name}` has a `StringByteLength` reading a non-`string` receiver"
+                    ),
+                ));
             }
             if value.type_ != mir::Type::Int {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` has a `StringByteLength` whose result type is not `int`"
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_STRING_OPERATION_INVALID,
+                    format!(
+                        "function `{function_name}` has a `StringByteLength` whose result type is not `int`"
+                    ),
+                ));
             }
             Ok(())
         }
@@ -3089,17 +3437,23 @@ fn validate_rvalue(
             interface,
         } => {
             if !matches!(object.type_, mir::Type::Class(_)) {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` converts a non-class value to an interface"
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_TYPE_OP_INVALID,
+                    format!(
+                        "function `{function_name}` converts a non-class value to an interface"
+                    ),
+                ));
             }
             if object.type_ != mir::Type::Class(*class)
                 || value.type_ != mir::Type::Interface(*interface)
                 || !implementations.contains(&(*class, *interface))
             {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` contains an invalid class-to-interface conversion"
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_TYPE_OP_INVALID,
+                    format!(
+                        "function `{function_name}` contains an invalid class-to-interface conversion"
+                    ),
+                ));
             }
             validate_operand_with_proven_bounds(object, function_name, true)
         }
@@ -3108,9 +3462,10 @@ fn validate_rvalue(
             if !matches!(object.type_, mir::Type::Class(_) | mir::Type::Interface(_))
                 || value.type_ != mir::Type::Bool
             {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` has a malformed interface test"
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_TYPE_OP_INVALID,
+                    format!("function `{function_name}` has a malformed interface test"),
+                ));
             }
             Ok(())
         }
@@ -3119,9 +3474,10 @@ fn validate_rvalue(
             if !matches!(object.type_, mir::Type::Class(_) | mir::Type::Interface(_))
                 || value.type_ != mir::Type::Interface(*interface)
             {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` has a malformed interface lookup"
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_TYPE_OP_INVALID,
+                    format!("function `{function_name}` has a malformed interface lookup"),
+                ));
             }
             Ok(())
         }
@@ -3130,9 +3486,10 @@ fn validate_rvalue(
             if !matches!(object.type_, mir::Type::Class(_) | mir::Type::Interface(_))
                 || value.type_ != mir::Type::Bool
             {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` has a malformed class test"
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_TYPE_OP_INVALID,
+                    format!("function `{function_name}` has a malformed class test"),
+                ));
             }
             Ok(())
         }
@@ -3181,18 +3538,24 @@ fn validate_division_or_remainder_shape(
         return Ok(());
     }
     if left.type_ != right.type_ || value.type_ != left.type_ {
-        return Err(BackendError::new(format!(
-            "function `{function_name}` has division or remainder operands and result with mismatched types"
-        )));
+        return Err(BackendError::new(
+            codes::BACKEND_ARITHMETIC_OR_BRANCH_INVALID,
+            format!(
+                "function `{function_name}` has division or remainder operands and result with mismatched types"
+            ),
+        ));
     }
     let integer = primitive(&left.type_).is_some_and(aster_types::Primitive::is_integer);
     let supported = integer || matches!(left.type_, mir::Type::Float | mir::Type::Double);
     if supported {
         Ok(())
     } else {
-        Err(BackendError::new(format!(
-            "function `{function_name}` has division or remainder with an unsupported operand type"
-        )))
+        Err(BackendError::new(
+            codes::BACKEND_ARITHMETIC_OR_BRANCH_INVALID,
+            format!(
+                "function `{function_name}` has division or remainder with an unsupported operand type"
+            ),
+        ))
     }
 }
 
@@ -3210,9 +3573,12 @@ fn validate_terminator(
         } => {
             validate_operand(condition, function_name)?;
             if condition.type_ != mir::Type::Bool {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` has a `Branch` whose condition is not `bool`"
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_ARITHMETIC_OR_BRANCH_INVALID,
+                    format!(
+                        "function `{function_name}` has a `Branch` whose condition is not `bool`"
+                    ),
+                ));
             }
             validate_block_target(*then_block, function_name, blocks)?;
             Ok(validate_block_target(*else_block, function_name, blocks)?)
@@ -3242,9 +3608,12 @@ fn validate_call_destination_shape(
     if valid {
         Ok(())
     } else {
-        Err(BackendError::new(format!(
-            "function `{function_name}` calls `{called_name}` with a destination that does not match its return type"
-        )))
+        Err(BackendError::new(
+            codes::BACKEND_CALL_SIGNATURE_MISMATCH,
+            format!(
+                "function `{function_name}` calls `{called_name}` with a destination that does not match its return type"
+            ),
+        ))
     }
 }
 
@@ -3261,18 +3630,24 @@ fn validate_operand_with_proven_bounds(
         )
         .map(|_| ())
         .map_err(|_| {
-            BackendError::new(format!(
-                "integer constant `{value}` in function `{function_name}` does not fit `{}`",
-                type_name(&operand.type_)
-            ))
+            BackendError::new(
+                codes::BACKEND_ARITHMETIC_OR_BRANCH_INVALID,
+                format!(
+                    "integer constant `{value}` in function `{function_name}` does not fit `{}`",
+                    type_name(&operand.type_)
+                ),
+            )
         }),
         mir::OperandKind::Constant(_) | mir::OperandKind::Copy(mir::Place::Local(_)) => Ok(()),
         mir::OperandKind::Copy(place @ mir::Place::Index { element_type, .. }) => {
             validate_place_with_proven_bounds(place, function_name, allow_proven)?;
             if operand.type_ != *element_type {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` has an array-index read whose result type does not match the indexed place's element type"
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_ARRAY_BOUNDS_CONTRACT_INVALID,
+                    format!(
+                        "function `{function_name}` has an array-index read whose result type does not match the indexed place's element type"
+                    ),
+                ));
             }
             Ok(())
         }
@@ -3304,9 +3679,12 @@ fn validate_place_with_proven_bounds(
             bounds,
         } => {
             if matches!(bounds, mir::ArrayBounds::Proven { .. }) && !allow_proven {
-                return Err(BackendError::new(format!(
-                    "function `{function_name}` uses proven array bounds outside an assignment"
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_ARRAY_BOUNDS_CONTRACT_INVALID,
+                    format!(
+                        "function `{function_name}` uses proven array bounds outside an assignment"
+                    ),
+                ));
             }
             validate_operand_with_proven_bounds(array, function_name, allow_proven)?;
             validate_operand_with_proven_bounds(index, function_name, allow_proven)?;
@@ -3436,11 +3814,14 @@ fn validate_task_argument_transfer(
                         other => other,
                     };
                     if !transferable(result, structs, enums, &mut HashSet::new(), true) {
-                        return Err(BackendError::new(format!(
-                            "function `{}` contains a malformed {intrinsic:?} with non-transferable result type `{}`",
-                            function.name,
-                            type_name(result)
-                        )));
+                        return Err(BackendError::new(
+                            codes::BACKEND_TRANSFER_TYPE_INVALID,
+                            format!(
+                                "function `{}` contains a malformed {intrinsic:?} with non-transferable result type `{}`",
+                                function.name,
+                                type_name(result)
+                            ),
+                        ));
                     }
                     continue;
                 }
@@ -3450,19 +3831,25 @@ fn validate_task_argument_transfer(
                 && let mir::Type::Task(result) = return_type
                 && !transferable(result, structs, enums, &mut HashSet::new(), true)
             {
-                return Err(BackendError::new(format!(
-                    "function `{}` contains a malformed TaskRun with non-transferable result type `{}`",
-                    function.name,
-                    type_name(result)
-                )));
+                return Err(BackendError::new(
+                    codes::BACKEND_TRANSFER_TYPE_INVALID,
+                    format!(
+                        "function `{}` contains a malformed TaskRun with non-transferable result type `{}`",
+                        function.name,
+                        type_name(result)
+                    ),
+                ));
             }
             for argument in arguments.iter().skip(skip) {
                 if !transferable(&argument.type_, structs, enums, &mut HashSet::new(), deep) {
-                    return Err(BackendError::new(format!(
-                        "function `{}` contains a malformed TaskRun with non-transferable argument type `{}`",
-                        function.name,
-                        type_name(&argument.type_)
-                    )));
+                    return Err(BackendError::new(
+                        codes::BACKEND_TRANSFER_TYPE_INVALID,
+                        format!(
+                            "function `{}` contains a malformed TaskRun with non-transferable argument type `{}`",
+                            function.name,
+                            type_name(&argument.type_)
+                        ),
+                    ));
                 }
             }
         }
@@ -3506,9 +3893,12 @@ fn validate_value_type(type_: &mir::Type, function_name: &str) -> Result<(), Bac
     {
         Ok(())
     } else if *type_ == mir::Type::Decimal {
-        Err(BackendError::new(format!(
-            "`decimal` is checked by the compiler but cannot execute yet in function `{function_name}`; a dedicated decimal runtime representation is the planned next step"
-        )))
+        Err(BackendError::new(
+            codes::BACKEND_DECIMAL_UNSUPPORTED,
+            format!(
+                "`decimal` is checked by the compiler but cannot execute yet in function `{function_name}`; a dedicated decimal runtime representation is the planned next step"
+            ),
+        ))
     } else {
         Err(unsupported(
             function_name,
@@ -3526,9 +3916,10 @@ fn validate_return_type(type_: &mir::Type, function_name: &str) -> Result<(), Ba
 }
 
 fn unsupported(function_name: &str, feature: &str) -> BackendError {
-    BackendError::new(format!(
-        "Cranelift JIT does not yet support {feature} in function `{function_name}`"
-    ))
+    BackendError::new(
+        codes::BACKEND_UNSUPPORTED_CONSTRUCT,
+        format!("Cranelift JIT does not yet support {feature} in function `{function_name}`"),
+    )
 }
 
 #[cfg(test)]

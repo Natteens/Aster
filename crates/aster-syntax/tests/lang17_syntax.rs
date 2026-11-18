@@ -164,7 +164,7 @@ fn digit_separators_are_stripped_from_decimal_and_prefixed_literals() {
     );
     assert_eq!(
         kinds("1_0.2_5"),
-        vec![TokenKind::FloatLiteral("10.25".into())]
+        vec![TokenKind::DoubleLiteral("10.25".into())]
     );
     assert_eq!(
         kinds("1_0.2_5d"),
@@ -174,15 +174,15 @@ fn digit_separators_are_stripped_from_decimal_and_prefixed_literals() {
 
 #[test]
 fn exponent_makes_the_literal_real() {
-    assert_eq!(kinds("1e3"), vec![TokenKind::FloatLiteral("1e3".into())]);
+    assert_eq!(kinds("1e3"), vec![TokenKind::DoubleLiteral("1e3".into())]);
     assert_eq!(
         kinds("2.5E-3"),
-        vec![TokenKind::FloatLiteral("2.5E-3".into())]
+        vec![TokenKind::DoubleLiteral("2.5E-3".into())]
     );
-    assert_eq!(kinds("1E+3"), vec![TokenKind::FloatLiteral("1E+3".into())]);
+    assert_eq!(kinds("1E+3"), vec![TokenKind::DoubleLiteral("1E+3".into())]);
     assert_eq!(
         kinds("1_0e1_0"),
-        vec![TokenKind::FloatLiteral("10e10".into())]
+        vec![TokenKind::DoubleLiteral("10e10".into())]
     );
     assert_eq!(kinds("1e3f"), vec![TokenKind::FloatLiteral("1e3".into())]);
     assert_eq!(kinds("1e3d"), vec![TokenKind::DoubleLiteral("1e3".into())]);

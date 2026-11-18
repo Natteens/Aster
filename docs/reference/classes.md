@@ -111,8 +111,9 @@ public static class NumberTools
 The standard library uses this form for `aster.math.Math`.
 
 Assigning a class variable copies its reference. `==` and `!=` therefore compare object identity,
-not fields. Objects are non-null in the current language and live in the per-run ExecutionContext.
-There is no `(Derived)value` cast, static fields, finalizers, independent freeing, or `null`. A checked downcast
+not fields. Non-optional class variables are always non-null and live in the per-run ExecutionContext;
+optional absence uses `T?` / `Option<T>` (see [Option and Result](option-result.md)).
+There is no `(Derived)value` cast, static fields, finalizers, or independent freeing. A checked downcast
 is the pattern `value is Derived d` or `value as Derived` (see [downcast](#downcast-and-interface-tests)).
 Single inheritance and virtual dispatch are described in the next sections.
 
@@ -241,13 +242,13 @@ if (shape is Square square)          // primary form: test and bind the same obj
     Use(square.Side);
 }
 
-Option<Square> maybe = shape as Square;   // Some(square) or None (needs `using aster.core;`)
+Option<Square> maybe = shape as Square;   // Some(square) or None (`Square?` works without `using aster.core;`)
 ```
 
 - `value is Derived d` and `value is Derived` test the run-time class of a class reference; `d` is an
   identity alias of the same object, as in [type patterns](../specification/06-control-flow.md).
-- `value as T` yields the official `Option<T>`: `Some` holding the same object when the run-time type
-  matches, `None` otherwise. It requires `aster.core`; the `T?` spelling is not available.
+- `value as T` yields the official `Option<T>` (`T?`): `Some` holding the same object when the run-time type
+  matches, `None` otherwise.
 - The target may be a class or an interface. For an interface, `shape is IShape s` and `shape as IShape`
   search the interface list in the object's class descriptor, bounded by the descriptor's interface
   count, and the binding is an interface value (the object and the table found). The search is linear;

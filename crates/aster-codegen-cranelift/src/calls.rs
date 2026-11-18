@@ -1,3 +1,5 @@
+use aster_diagnostics::codes;
+
 use super::{
     BackendError, Codegen, FuncId, FunctionBuilder, FunctionState, HashMap, InstBuilder, IntCC,
     MemFlags, Module, StackSlotData, StackSlotKind, Value, cast_value, integer_constant_bits,
@@ -37,14 +39,19 @@ impl Codegen {
         let function_ref = self
             .jit
             .declare_func_in_func(function_ids[&function], builder.func);
-        let mut values = vec![
-            state
-                .execution_context
-                .ok_or_else(|| BackendError::new("function is missing its ExecutionContext"))?,
-        ];
+        let mut values = vec![state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "function is missing its ExecutionContext",
+            )
+        })?];
         if is_aggregate(return_type) {
-            let destination = destination
-                .ok_or_else(|| BackendError::new("struct call result requires a destination"))?;
+            let destination = destination.ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_MISSING_DESTINATION_OR_RESULT,
+                    "struct call result requires a destination",
+                )
+            })?;
             values.push(self.place_address(builder, destination, state)?);
         }
         for argument in arguments {
@@ -58,7 +65,10 @@ impl Codegen {
             && !is_aggregate(return_type)
         {
             let result = builder.inst_results(call).first().copied().ok_or_else(|| {
-                BackendError::new("Cranelift call did not produce its declared result")
+                BackendError::new(
+                    codes::BACKEND_MISSING_DESTINATION_OR_RESULT,
+                    "Cranelift call did not produce its declared result",
+                )
             })?;
             self.store_scalar(builder, destination, result, state)?;
         }
@@ -427,7 +437,10 @@ impl Codegen {
         let mut values = Vec::with_capacity(arguments.len() + 1);
         if needs_context {
             values.push(state.execution_context.ok_or_else(|| {
-                BackendError::new("runtime intrinsic requires an execution context")
+                BackendError::new(
+                    codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                    "runtime intrinsic requires an execution context",
+                )
             })?);
         }
         if let Some(immediate) = immediate {
@@ -447,7 +460,10 @@ impl Codegen {
         }
         if let Some(destination) = destination {
             let result = builder.inst_results(call).first().copied().ok_or_else(|| {
-                BackendError::new("runtime intrinsic did not produce its declared result")
+                BackendError::new(
+                    codes::BACKEND_MISSING_DESTINATION_OR_RESULT,
+                    "runtime intrinsic did not produce its declared result",
+                )
             })?;
             self.store_scalar(builder, destination, result, state)?;
         }
@@ -457,6 +473,7 @@ impl Codegen {
     /// `aster.core.Task.Run(function, arguments...)`. Runtime arguments are
     /// copied into one caller stack frame in source order, and the ABI copies
     /// that frame into host-owned storage before returning.
+    #[allow(clippy::too_many_lines)]
     fn translate_task_run(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
@@ -466,17 +483,22 @@ impl Codegen {
     ) -> Result<(), BackendError> {
         let Some((target, arguments)) = arguments.split_first() else {
             return Err(BackendError::new(
+                codes::BACKEND_INTRINSIC_INVALID_SHAPE,
                 "Task.Run requires one resolved function argument",
             ));
         };
         let mir::OperandKind::Function(symbol) = target.kind else {
             return Err(BackendError::new(
+                codes::BACKEND_INTRINSIC_INVALID_SHAPE,
                 "Task.Run requires one resolved function argument",
             ));
         };
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("Task.Run requires an execution context"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "Task.Run requires an execution context",
+            )
+        })?;
         let symbol_constant = builder.ins().iconst(types::I32, i64::from(symbol.0));
         let call = if arguments.is_empty() {
             let function_ref = self
@@ -508,7 +530,10 @@ impl Codegen {
                     zero,
                     frame,
                     i32::try_from(offset).map_err(|_| {
-                        BackendError::new("Task.Run argument offset exceeds the JIT ABI")
+                        BackendError::new(
+                            codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                            "Task.Run argument offset exceeds the JIT ABI",
+                        )
                     })?,
                 );
             }
@@ -557,10 +582,12 @@ impl Codegen {
         };
         self.continue_if_runtime_ok(builder, state)?;
         if let Some(destination) = destination {
-            let result =
-                builder.inst_results(call).first().copied().ok_or_else(|| {
-                    BackendError::new("Task.Run did not produce its declared result")
-                })?;
+            let result = builder.inst_results(call).first().copied().ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_MISSING_DESTINATION_OR_RESULT,
+                    "Task.Run did not produce its declared result",
+                )
+            })?;
             self.store_scalar(builder, destination, result, state)?;
         }
         Ok(())
@@ -575,14 +602,23 @@ impl Codegen {
         state: &FunctionState,
     ) -> Result<(), BackendError> {
         let [tasks] = arguments else {
-            return Err(BackendError::new("Task.WaitAll requires one task array"));
+            return Err(BackendError::new(
+                codes::BACKEND_INTRINSIC_INVALID_SHAPE,
+                "Task.WaitAll requires one task array",
+            ));
         };
         let mir::Type::Array(result_type) = return_type else {
-            return Err(BackendError::new("Task.WaitAll requires an array result"));
+            return Err(BackendError::new(
+                codes::BACKEND_INTRINSIC_INVALID_SHAPE,
+                "Task.WaitAll requires an array result",
+            ));
         };
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("Task.WaitAll requires an execution context"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "Task.WaitAll requires an execution context",
+            )
+        })?;
         let tasks = self.translate_operand(builder, tasks, state)?;
         let Some(symbol) = super::task_abi::wait_all_symbol_for(result_type) else {
             // Deep-copy results (CONC-005): each element is materialized.
@@ -622,12 +658,18 @@ impl Codegen {
         state: &FunctionState,
     ) -> Result<(), BackendError> {
         let context = state.execution_context.ok_or_else(|| {
-            BackendError::new("Task cancellation operation requires an execution context")
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "Task cancellation operation requires an execution context",
+            )
         })?;
         let (symbol, values) = match intrinsic {
             mir::Intrinsic::TaskCancel => {
                 let [task] = arguments else {
-                    return Err(BackendError::new("Task.Cancel requires one task handle"));
+                    return Err(BackendError::new(
+                        codes::BACKEND_INTRINSIC_INVALID_SHAPE,
+                        "Task.Cancel requires one task handle",
+                    ));
                 };
                 (
                     "aster_task_cancel",
@@ -637,6 +679,7 @@ impl Codegen {
             mir::Intrinsic::TaskCancellationRequested => {
                 if !arguments.is_empty() {
                     return Err(BackendError::new(
+                        codes::BACKEND_INTRINSIC_INVALID_SHAPE,
                         "Task.IsCancellationRequested takes no arguments",
                     ));
                 }
@@ -667,12 +710,16 @@ impl Codegen {
     ) -> Result<(), BackendError> {
         let [task] = arguments else {
             return Err(BackendError::new(
+                codes::BACKEND_INTRINSIC_INVALID_SHAPE,
                 "Task<T>.Wait requires exactly one task argument",
             ));
         };
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("Task<T>.Wait requires an execution context"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "Task<T>.Wait requires an execution context",
+            )
+        })?;
         let handle = self.translate_operand(builder, task, state)?;
         if super::task_abi::wait_symbol_for(return_type).is_none() {
             // Deep-copy result (CONC-005): materialize into this context.
@@ -680,7 +727,10 @@ impl Codegen {
             let (shape_pointer, shape_length) = self.transfer_shape_operands(builder, &shape)?;
             let image = if is_aggregate(return_type) {
                 let destination = destination.ok_or_else(|| {
-                    BackendError::new("aggregate Task<T>.Wait result requires a destination")
+                    BackendError::new(
+                        codes::BACKEND_MISSING_DESTINATION_OR_RESULT,
+                        "aggregate Task<T>.Wait result requires a destination",
+                    )
                 })?;
                 self.place_address(builder, destination, state)?
             } else {
@@ -701,10 +751,10 @@ impl Codegen {
             return Ok(());
         }
         let symbol = super::task_abi::wait_symbol_for(return_type).ok_or_else(|| {
-            BackendError::new(format!(
-                "`Task<{}>.Wait` cannot execute yet",
-                type_name(return_type)
-            ))
+            BackendError::new(
+                codes::BACKEND_UNSUPPORTED_CONSTRUCT,
+                format!("`Task<{}>.Wait` cannot execute yet", type_name(return_type)),
+            )
         })?;
         let function_ref = self
             .jit
@@ -713,7 +763,10 @@ impl Codegen {
         self.continue_if_runtime_ok(builder, state)?;
         if let Some(destination) = destination {
             let result = builder.inst_results(call).first().copied().ok_or_else(|| {
-                BackendError::new("Task<T>.Wait did not produce its declared result")
+                BackendError::new(
+                    codes::BACKEND_MISSING_DESTINATION_OR_RESULT,
+                    "Task<T>.Wait did not produce its declared result",
+                )
             })?;
             self.store_scalar(builder, destination, result, state)?;
         }
@@ -734,9 +787,12 @@ impl Codegen {
         return_type: &mir::Type,
         state: &FunctionState,
     ) -> Result<(), BackendError> {
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("async intrinsic requires an execution context"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "async intrinsic requires an execution context",
+            )
+        })?;
         match intrinsic {
             mir::Intrinsic::AsyncSpawn => {
                 let move_next = builder
@@ -822,7 +878,10 @@ impl Codegen {
                             zero,
                             frame,
                             i32::try_from(offset).map_err(|_| {
-                                BackendError::new("Task.Run argument offset exceeds the JIT ABI")
+                                BackendError::new(
+                                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                                    "Task.Run argument offset exceeds the JIT ABI",
+                                )
                             })?,
                         );
                     }
@@ -963,7 +1022,10 @@ impl Codegen {
     ) -> Result<(), BackendError> {
         if let Some(destination) = destination {
             let bits = builder.inst_results(call).first().copied().ok_or_else(|| {
-                BackendError::new("async intrinsic did not produce its declared result")
+                BackendError::new(
+                    codes::BACKEND_MISSING_DESTINATION_OR_RESULT,
+                    "async intrinsic did not produce its declared result",
+                )
             })?;
             let value = scalar_from_bits(builder, type_, bits)?;
             self.store_scalar(builder, destination, value, state)?;
@@ -995,16 +1057,22 @@ impl Codegen {
             _ => unreachable!("caller matched only integer-to-string intrinsics"),
         };
         let argument = arguments.first().ok_or_else(|| {
-            BackendError::new("string interpolation conversion requires one argument")
+            BackendError::new(
+                codes::BACKEND_INTRINSIC_INVALID_SHAPE,
+                "string interpolation conversion requires one argument",
+            )
         })?;
         let value = self.translate_operand(builder, argument, state)?;
         let value = cast_value(builder, &argument.type_, &widened_type, value)?;
         let function_ref = self
             .jit
             .declare_func_in_func(self.runtime_ids[symbol], builder.func);
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("runtime intrinsic requires an execution context"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "runtime intrinsic requires an execution context",
+            )
+        })?;
         let call = builder.ins().call(function_ref, &[context, value]);
         self.continue_if_runtime_ok(builder, state)?;
         self.store_intrinsic_result(builder, destination, call, state)
@@ -1021,7 +1089,10 @@ impl Codegen {
         state: &FunctionState,
     ) -> Result<(), BackendError> {
         let argument = arguments.first().ok_or_else(|| {
-            BackendError::new("string interpolation conversion requires one argument")
+            BackendError::new(
+                codes::BACKEND_INTRINSIC_INVALID_SHAPE,
+                "string interpolation conversion requires one argument",
+            )
         })?;
         let value = self.translate_operand(builder, argument, state)?;
         let value = cast_value(builder, &argument.type_, &mir::Type::Double, value)?;
@@ -1033,9 +1104,12 @@ impl Codegen {
         let function_ref = self
             .jit
             .declare_func_in_func(self.runtime_ids[symbol], builder.func);
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("runtime intrinsic requires an execution context"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "runtime intrinsic requires an execution context",
+            )
+        })?;
         let call = builder.ins().call(function_ref, &[context, value]);
         self.continue_if_runtime_ok(builder, state)?;
         self.store_intrinsic_result(builder, destination, call, state)
@@ -1053,7 +1127,10 @@ impl Codegen {
         state: &FunctionState,
     ) -> Result<(), BackendError> {
         let argument = arguments.first().ok_or_else(|| {
-            BackendError::new("string interpolation conversion requires one argument")
+            BackendError::new(
+                codes::BACKEND_INTRINSIC_INVALID_SHAPE,
+                "string interpolation conversion requires one argument",
+            )
         })?;
         let value = self.translate_operand(builder, argument, state)?;
         let symbol = match intrinsic {
@@ -1064,9 +1141,12 @@ impl Codegen {
         let function_ref = self
             .jit
             .declare_func_in_func(self.runtime_ids[symbol], builder.func);
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("runtime intrinsic requires an execution context"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "runtime intrinsic requires an execution context",
+            )
+        })?;
         let call = builder.ins().call(function_ref, &[context, value]);
         self.continue_if_runtime_ok(builder, state)?;
         self.store_intrinsic_result(builder, destination, call, state)
@@ -1089,10 +1169,18 @@ impl Codegen {
         let count = u32::try_from(arguments.len())
             .ok()
             .filter(|count| i32::try_from(*count).is_ok())
-            .ok_or_else(|| BackendError::new("too many interpolated string segments"))?;
-        let size = count
-            .checked_mul(pointer_bytes)
-            .ok_or_else(|| BackendError::new("too many interpolated string segments"))?;
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_STRING_OPERATION_INVALID,
+                    "too many interpolated string segments",
+                )
+            })?;
+        let size = count.checked_mul(pointer_bytes).ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_STRING_OPERATION_INVALID,
+                "too many interpolated string segments",
+            )
+        })?;
         let align_shift = u8::try_from(pointer_bytes.trailing_zeros()).unwrap_or(3);
         let slot = builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
@@ -1104,7 +1192,12 @@ impl Codegen {
             let offset = i32::try_from(index)
                 .ok()
                 .and_then(|index| index.checked_mul(i32::try_from(pointer_bytes).ok()?))
-                .ok_or_else(|| BackendError::new("too many interpolated string segments"))?;
+                .ok_or_else(|| {
+                    BackendError::new(
+                        codes::BACKEND_STRING_OPERATION_INVALID,
+                        "too many interpolated string segments",
+                    )
+                })?;
             builder.ins().stack_store(value, slot, offset);
         }
         let array_pointer = builder.ins().stack_addr(self.pointer_type, slot, 0);
@@ -1116,9 +1209,12 @@ impl Codegen {
         let function_ref = self
             .jit
             .declare_func_in_func(self.runtime_ids[symbol], builder.func);
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("runtime intrinsic requires an execution context"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "runtime intrinsic requires an execution context",
+            )
+        })?;
         let count_value = builder.ins().iconst(types::I32, i64::from(count));
         let call = builder
             .ins()
@@ -1133,6 +1229,7 @@ impl Codegen {
     /// `ListGet`). `total_size`, `some_tag`/`none_tag`, and `payload_offset`
     /// all come from `Layouts`, the same shared layout system every other
     /// aggregate uses -- never a parallel, TryParse-specific computation.
+    #[allow(clippy::too_many_lines)]
     fn translate_string_try_parse(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
@@ -1144,33 +1241,48 @@ impl Codegen {
     ) -> Result<(), BackendError> {
         let [receiver] = arguments else {
             return Err(BackendError::new(
+                codes::BACKEND_INTRINSIC_INVALID_SHAPE,
                 "string.TryParse* requires exactly one receiver argument",
             ));
         };
-        let destination = destination
-            .ok_or_else(|| BackendError::new("string.TryParse* requires a destination"))?;
+        let destination = destination.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_DESTINATION_OR_RESULT,
+                "string.TryParse* requires a destination",
+            )
+        })?;
         let mir::Type::Enum(symbol) = return_type else {
             return Err(BackendError::new(
+                codes::BACKEND_INTRINSIC_INVALID_SHAPE,
                 "string.TryParse* must return a concrete Option<T>",
             ));
         };
         let (some_tag, none_tag, payload_offset) = {
             let definition = self.layouts.enums.get(symbol).ok_or_else(|| {
-                BackendError::new("string.TryParse* returns an unknown enum type")
+                BackendError::new(
+                    codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                    "string.TryParse* returns an unknown enum type",
+                )
             })?;
             let none_case = definition
                 .cases
                 .iter()
                 .find(|case| case.fields.is_empty())
                 .ok_or_else(|| {
-                    BackendError::new("string.TryParse* target is not shaped like Option<T>")
+                    BackendError::new(
+                        codes::BACKEND_INTRINSIC_MISSING_STDLIB_TYPE,
+                        "string.TryParse* target is not shaped like Option<T>",
+                    )
                 })?;
             let some_case = definition
                 .cases
                 .iter()
                 .find(|case| case.fields.len() == 1)
                 .ok_or_else(|| {
-                    BackendError::new("string.TryParse* target is not shaped like Option<T>")
+                    BackendError::new(
+                        codes::BACKEND_INTRINSIC_MISSING_STDLIB_TYPE,
+                        "string.TryParse* target is not shaped like Option<T>",
+                    )
                 })?;
             let value_field = &some_case.fields[0];
             let field_layout = self
@@ -1178,7 +1290,10 @@ impl Codegen {
                 .fields
                 .get(&value_field.symbol)
                 .ok_or_else(|| {
-                    BackendError::new("string.TryParse* payload field has no computed layout")
+                    BackendError::new(
+                        codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                        "string.TryParse* payload field has no computed layout",
+                    )
                 })?;
             (some_case.tag, none_case.tag, field_layout.offset)
         };
@@ -1186,9 +1301,12 @@ impl Codegen {
 
         let receiver_value = self.translate_operand(builder, receiver, state)?;
         let destination_address = self.place_address(builder, destination, state)?;
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("string.TryParse* is missing its ExecutionContext"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "string.TryParse* is missing its ExecutionContext",
+            )
+        })?;
         let symbol_name = match intrinsic {
             mir::Intrinsic::StringTryParseBool => "aster_rt_string_try_parse_bool",
             mir::Intrinsic::StringTryParseChar => "aster_rt_string_try_parse_char",
@@ -1232,6 +1350,7 @@ impl Codegen {
     /// `WriteLine` pass their `string` argument straight through, unchanged,
     /// to the runtime; `ReadLine` writes a full `Option<string>` into its
     /// destination using the same layout-driven ABI as `string.TryParse*`.
+    #[allow(clippy::too_many_lines)]
     fn translate_console_io(
         &mut self,
         builder: &mut FunctionBuilder<'_>,
@@ -1242,12 +1361,16 @@ impl Codegen {
         state: &FunctionState,
     ) -> Result<(), BackendError> {
         let context = state.execution_context.ok_or_else(|| {
-            BackendError::new("aster.io intrinsic is missing its ExecutionContext")
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "aster.io intrinsic is missing its ExecutionContext",
+            )
         })?;
         match intrinsic {
             mir::Intrinsic::ConsoleWrite | mir::Intrinsic::ConsoleWriteLine => {
                 let [value] = arguments else {
                     return Err(BackendError::new(
+                        codes::BACKEND_INTRINSIC_INVALID_SHAPE,
                         "aster.io.Write/WriteLine requires exactly one argument",
                     ));
                 };
@@ -1265,16 +1388,24 @@ impl Codegen {
                 Ok(())
             }
             mir::Intrinsic::ConsoleReadLine | mir::Intrinsic::ConsoleReadLineTemporary => {
-                let destination = destination
-                    .ok_or_else(|| BackendError::new("aster.io.ReadLine requires a destination"))?;
+                let destination = destination.ok_or_else(|| {
+                    BackendError::new(
+                        codes::BACKEND_MISSING_DESTINATION_OR_RESULT,
+                        "aster.io.ReadLine requires a destination",
+                    )
+                })?;
                 let mir::Type::Enum(symbol) = return_type else {
                     return Err(BackendError::new(
+                        codes::BACKEND_INTRINSIC_INVALID_SHAPE,
                         "aster.io.ReadLine must return a concrete Option<string>",
                     ));
                 };
                 let (some_tag, none_tag, payload_offset) = {
                     let definition = self.layouts.enums.get(symbol).ok_or_else(|| {
-                        BackendError::new("aster.io.ReadLine returns an unknown enum type")
+                        BackendError::new(
+                            codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                            "aster.io.ReadLine returns an unknown enum type",
+                        )
                     })?;
                     let none_case = definition
                         .cases
@@ -1282,6 +1413,7 @@ impl Codegen {
                         .find(|case| case.fields.is_empty())
                         .ok_or_else(|| {
                             BackendError::new(
+                                codes::BACKEND_INTRINSIC_MISSING_STDLIB_TYPE,
                                 "aster.io.ReadLine target is not shaped like Option<T>",
                             )
                         })?;
@@ -1291,6 +1423,7 @@ impl Codegen {
                         .find(|case| case.fields.len() == 1)
                         .ok_or_else(|| {
                             BackendError::new(
+                                codes::BACKEND_INTRINSIC_MISSING_STDLIB_TYPE,
                                 "aster.io.ReadLine target is not shaped like Option<T>",
                             )
                         })?;
@@ -1301,6 +1434,7 @@ impl Codegen {
                             .get(&value_field.symbol)
                             .ok_or_else(|| {
                                 BackendError::new(
+                                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
                                     "aster.io.ReadLine payload field has no computed layout",
                                 )
                             })?;
@@ -1356,9 +1490,10 @@ impl Codegen {
         operation: &str,
     ) -> Result<ResultIoErrorLayout, BackendError> {
         let mir::Type::Enum(result_symbol) = return_type else {
-            return Err(BackendError::new(format!(
-                "{operation} must return a concrete Result<T, IOError>"
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_INTRINSIC_INVALID_SHAPE,
+                format!("{operation} must return a concrete Result<T, IOError>"),
+            ));
         };
         let result_definition =
             self.layouts
@@ -1366,60 +1501,80 @@ impl Codegen {
                 .get(result_symbol)
                 .cloned()
                 .ok_or_else(|| {
-                    BackendError::new(format!("{operation} returns an unknown enum type"))
+                    BackendError::new(
+                        codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                        format!("{operation} returns an unknown enum type"),
+                    )
                 })?;
         let ok_case = result_definition
             .cases
             .iter()
             .find(|case| case.symbol == symbols.ok_case)
             .ok_or_else(|| {
-                BackendError::new(format!(
-                    "{operation} Ok case symbol does not match the resolved Result specialization"
-                ))
+                BackendError::new(
+                    codes::BACKEND_INTRINSIC_MISSING_STDLIB_TYPE,
+                    format!("{operation} Ok case symbol does not match the resolved Result specialization"),
+                )
             })?;
         let error_case = result_definition
             .cases
             .iter()
             .find(|case| case.symbol == symbols.error_case)
             .ok_or_else(|| {
-                BackendError::new(format!(
-                    "{operation} Error case symbol does not match the resolved Result specialization"
-                ))
+                BackendError::new(
+                    codes::BACKEND_INTRINSIC_MISSING_STDLIB_TYPE,
+                    format!("{operation} Error case symbol does not match the resolved Result specialization"),
+                )
             })?;
         let ok_field = ok_case
             .fields
             .iter()
             .find(|field| field.symbol == symbols.ok_field)
             .ok_or_else(|| {
-                BackendError::new(format!(
-                    "{operation} Ok field symbol does not match the resolved Ok case"
-                ))
+                BackendError::new(
+                    codes::BACKEND_INTRINSIC_MISSING_STDLIB_TYPE,
+                    format!("{operation} Ok field symbol does not match the resolved Ok case"),
+                )
             })?;
         let error_field = error_case
             .fields
             .iter()
             .find(|field| field.symbol == symbols.error_field)
             .ok_or_else(|| {
-                BackendError::new(format!(
-                    "{operation} Error field symbol does not match the resolved Error case"
-                ))
+                BackendError::new(
+                    codes::BACKEND_INTRINSIC_MISSING_STDLIB_TYPE,
+                    format!(
+                        "{operation} Error field symbol does not match the resolved Error case"
+                    ),
+                )
             })?;
         let ok_offset = self
             .layouts
             .fields
             .get(&ok_field.symbol)
-            .ok_or_else(|| BackendError::new(format!("{operation} Ok payload has no layout")))?
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    format!("{operation} Ok payload has no layout"),
+                )
+            })?
             .offset;
         let error_offset = self
             .layouts
             .fields
             .get(&error_field.symbol)
-            .ok_or_else(|| BackendError::new(format!("{operation} Error payload has no layout")))?
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    format!("{operation} Error payload has no layout"),
+                )
+            })?
             .offset;
         let mir::Type::User(io_error_symbol) = &error_field.type_ else {
-            return Err(BackendError::new(format!(
-                "{operation} Error payload is not a concrete IOError"
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_INTRINSIC_MISSING_STDLIB_TYPE,
+                format!("{operation} Error payload is not a concrete IOError"),
+            ));
         };
         let io_error_definition = self
             .layouts
@@ -1427,42 +1582,62 @@ impl Codegen {
             .get(io_error_symbol)
             .cloned()
             .ok_or_else(|| {
-                BackendError::new(format!("{operation} Error payload is not a known struct"))
+                BackendError::new(
+                    codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                    format!("{operation} Error payload is not a known struct"),
+                )
             })?;
         let kind_field = io_error_definition
             .fields
             .iter()
             .find(|field| field.symbol == symbols.io_error_kind_field)
             .ok_or_else(|| {
-                BackendError::new(format!(
-                    "{operation} IOError.Kind field symbol does not match the resolved struct"
-                ))
+                BackendError::new(
+                    codes::BACKEND_INTRINSIC_MISSING_STDLIB_TYPE,
+                    format!(
+                        "{operation} IOError.Kind field symbol does not match the resolved struct"
+                    ),
+                )
             })?;
         let oscode_field = io_error_definition
             .fields
             .iter()
             .find(|field| field.symbol == symbols.io_error_os_code_field)
             .ok_or_else(|| {
-                BackendError::new(format!(
-                    "{operation} IOError.OsCode field symbol does not match the resolved struct"
-                ))
+                BackendError::new(
+                    codes::BACKEND_INTRINSIC_MISSING_STDLIB_TYPE,
+                    format!(
+                        "{operation} IOError.OsCode field symbol does not match the resolved struct"
+                    ),
+                )
             })?;
         let kind_offset = self
             .layouts
             .fields
             .get(&kind_field.symbol)
-            .ok_or_else(|| BackendError::new(format!("{operation} IOError.Kind has no layout")))?
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    format!("{operation} IOError.Kind has no layout"),
+                )
+            })?
             .offset;
         let oscode_offset = self
             .layouts
             .fields
             .get(&oscode_field.symbol)
-            .ok_or_else(|| BackendError::new(format!("{operation} IOError.OsCode has no layout")))?
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    format!("{operation} IOError.OsCode has no layout"),
+                )
+            })?
             .offset;
         let mir::Type::Enum(kind_symbol) = &kind_field.type_ else {
-            return Err(BackendError::new(format!(
-                "{operation} IOError.Kind is not a concrete enum"
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_INTRINSIC_MISSING_STDLIB_TYPE,
+                format!("{operation} IOError.Kind is not a concrete enum"),
+            ));
         };
         let kind_definition = self
             .layouts
@@ -1470,7 +1645,10 @@ impl Codegen {
             .get(kind_symbol)
             .cloned()
             .ok_or_else(|| {
-                BackendError::new(format!("{operation} IOErrorKind is not a known enum"))
+                BackendError::new(
+                    codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                    format!("{operation} IOErrorKind is not a known enum"),
+                )
             })?;
         let mut kind_case_tags = [0_u32; 9];
         for (index, case_symbol) in symbols.portable_kind_cases.iter().enumerate() {
@@ -1479,9 +1657,10 @@ impl Codegen {
                 .iter()
                 .find(|case| case.symbol == *case_symbol)
                 .ok_or_else(|| {
-                    BackendError::new(format!(
-                        "{operation} IOErrorKind case symbol at index {index} does not match the resolved enum"
-                    ))
+                    BackendError::new(
+                        codes::BACKEND_INTRINSIC_MISSING_STDLIB_TYPE,
+                        format!("{operation} IOErrorKind case symbol at index {index} does not match the resolved enum"),
+                    )
                 })?;
             kind_case_tags[index] = case.tag;
         }
@@ -1536,11 +1715,18 @@ impl Codegen {
             _ => unreachable!("caller matched only file-io intrinsics"),
         };
         let layout = self.result_io_error_layout(return_type, &symbols, operation)?;
-        let destination = destination
-            .ok_or_else(|| BackendError::new(format!("{operation} requires a destination")))?;
+        let destination = destination.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_DESTINATION_OR_RESULT,
+                format!("{operation} requires a destination"),
+            )
+        })?;
         let destination_address = self.place_address(builder, destination, state)?;
         let context = state.execution_context.ok_or_else(|| {
-            BackendError::new(format!("{operation} is missing its ExecutionContext"))
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                format!("{operation} is missing its ExecutionContext"),
+            )
         })?;
 
         let tags_slot = builder.create_sized_stack_slot(StackSlotData::new(
@@ -1550,9 +1736,12 @@ impl Codegen {
         ));
         for (index, tag) in layout.kind_case_tags.iter().enumerate() {
             let value = builder.ins().iconst(types::I32, i64::from(*tag));
-            let offset = i32::try_from(index * 4)
-                .ok()
-                .ok_or_else(|| BackendError::new(format!("{operation} tag table overflowed")))?;
+            let offset = i32::try_from(index * 4).ok().ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    format!("{operation} tag table overflowed"),
+                )
+            })?;
             builder.ins().stack_store(value, tags_slot, offset);
         }
         let tags_pointer = builder.ins().stack_addr(self.pointer_type, tags_slot, 0);
@@ -1581,6 +1770,7 @@ impl Codegen {
             mir::Intrinsic::FileReadAllText(_) | mir::Intrinsic::FileReadAllTextTemporary(_) => {
                 let [path] = arguments else {
                     return Err(BackendError::new(
+                        codes::BACKEND_INTRINSIC_INVALID_SHAPE,
                         "aster.io.ReadAllText requires exactly one argument",
                     ));
                 };
@@ -1618,6 +1808,7 @@ impl Codegen {
             | mir::Intrinsic::FileListDirectoriesTemporary(_) => {
                 let [directory] = arguments else {
                     return Err(BackendError::new(
+                        codes::BACKEND_INTRINSIC_INVALID_SHAPE,
                         "aster.io.ListFiles requires exactly one argument",
                     ));
                 };
@@ -1654,6 +1845,7 @@ impl Codegen {
             mir::Intrinsic::FileWriteAllText(_) | mir::Intrinsic::FileAppendAllText(_) => {
                 let [path, content] = arguments else {
                     return Err(BackendError::new(
+                        codes::BACKEND_INTRINSIC_INVALID_SHAPE,
                         "aster.io.WriteAllText requires exactly two arguments",
                     ));
                 };
@@ -1692,6 +1884,7 @@ impl Codegen {
             | mir::Intrinsic::FileDeleteDirectory(_) => {
                 let [path] = arguments else {
                     return Err(BackendError::new(
+                        codes::BACKEND_INTRINSIC_INVALID_SHAPE,
                         "aster.io path operation requires one argument",
                     ));
                 };
@@ -1741,7 +1934,10 @@ impl Codegen {
     ) -> Result<(), BackendError> {
         if let Some(destination) = destination {
             let result = builder.inst_results(call).first().copied().ok_or_else(|| {
-                BackendError::new("runtime intrinsic did not produce its declared result")
+                BackendError::new(
+                    codes::BACKEND_MISSING_DESTINATION_OR_RESULT,
+                    "runtime intrinsic did not produce its declared result",
+                )
             })?;
             self.store_scalar(builder, destination, result, state)?;
         }
@@ -1762,10 +1958,13 @@ impl Codegen {
         if initialization == mir::ArrayInitialization::Default
             && !self.layouts.zero_initializable(element_type)
         {
-            return Err(BackendError::new(format!(
-                "`new {}[length]` has no safe all-zero default; initialize every element with an array literal",
-                type_name(element_type)
-            )));
+            return Err(BackendError::new(
+                codes::BACKEND_ARRAY_ALLOCATION_INVALID,
+                format!(
+                    "`new {}[length]` has no safe all-zero default; initialize every element with an array literal",
+                    type_name(element_type)
+                ),
+            ));
         }
         if initialization == mir::ArrayInitialization::Empty
             && !matches!(
@@ -1775,6 +1974,7 @@ impl Codegen {
             )
         {
             return Err(BackendError::new(
+                codes::BACKEND_ARRAY_ALLOCATION_INVALID,
                 "empty array initialization requires a constant zero length",
             ));
         }
@@ -1785,9 +1985,12 @@ impl Codegen {
         let function_ref = self
             .jit
             .declare_func_in_func(self.runtime_ids[symbol], builder.func);
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("array allocation is missing its ExecutionContext"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "array allocation is missing its ExecutionContext",
+            )
+        })?;
         let length = self.translate_operand(builder, length, state)?;
         let size = i64::from(self.layouts.type_layout(element_type)?.size);
         let size = builder.ins().iconst(types::I32, size);
@@ -1822,9 +2025,12 @@ impl Codegen {
         let function_ref = self
             .jit
             .declare_func_in_func(self.runtime_ids[symbol], builder.func);
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("array ownership is missing its ExecutionContext"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "array ownership is missing its ExecutionContext",
+            )
+        })?;
         let descriptor = builder
             .ins()
             .iconst(self.pointer_type, address.cast_signed());
@@ -1850,13 +2056,17 @@ impl Codegen {
             .jit
             .declare_func_in_func(self.runtime_ids[symbol], builder.func);
         let context = state.execution_context.ok_or_else(|| {
-            BackendError::new("object allocation is missing its ExecutionContext")
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "object allocation is missing its ExecutionContext",
+            )
         })?;
-        let layout = self
-            .layouts
-            .types
-            .get(&class)
-            .ok_or_else(|| BackendError::new("class has no computed object layout"))?;
+        let layout = self.layouts.types.get(&class).ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                "class has no computed object layout",
+            )
+        })?;
         let size = builder.ins().iconst(types::I32, i64::from(layout.size));
         let call = builder.ins().call(function_ref, &[context, size]);
         let object = builder.inst_results(call)[0];
@@ -1866,7 +2076,12 @@ impl Codegen {
         let descriptor_bits = self
             .descriptors
             .address(class)
-            .ok_or_else(|| BackendError::new("class has no object descriptor"))?
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                    "class has no object descriptor",
+                )
+            })?
             .cast_signed();
         let descriptor = builder.ins().iconst(types::I64, descriptor_bits);
         builder.ins().store(
@@ -1902,7 +2117,10 @@ impl Codegen {
                 operand
             };
             let context = state.execution_context.ok_or_else(|| {
-                BackendError::new("reference count is missing its ExecutionContext")
+                BackendError::new(
+                    codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                    "reference count is missing its ExecutionContext",
+                )
             })?;
             self.emit_inline_reference_count(builder, context, object, retain)?;
             Ok(())
@@ -1911,6 +2129,7 @@ impl Codegen {
         {
             let _ = (builder, value, retain, state);
             Err(BackendError::new(
+                codes::BACKEND_REFCOUNT_INVALID,
                 "ownership instructions require MEM-EXP-1 C5",
             ))
         }
@@ -1931,14 +2150,23 @@ impl Codegen {
         use aster_runtime::object_heap::{COUNT_MASK, COUNT_OFFSET, IMMORTAL};
         use aster_runtime::{EXECUTION_CONTEXT_RELEASES_OFFSET, EXECUTION_CONTEXT_RETAINS_OFFSET};
         use cranelift_codegen::ir::MemFlags;
-        let count_offset = i32::try_from(COUNT_OFFSET)
-            .map_err(|_| BackendError::new("count word offset is too large"))?;
+        let count_offset = i32::try_from(COUNT_OFFSET).map_err(|_| {
+            BackendError::new(
+                codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                "count word offset is too large",
+            )
+        })?;
         let counter_offset = i32::try_from(if retain {
             EXECUTION_CONTEXT_RETAINS_OFFSET
         } else {
             EXECUTION_CONTEXT_RELEASES_OFFSET
         })
-        .map_err(|_| BackendError::new("counter offset is too large"))?;
+        .map_err(|_| {
+            BackendError::new(
+                codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                "counter offset is too large",
+            )
+        })?;
         let inspect = builder.create_block();
         let update = builder.create_block();
         let continuation = builder.create_block();
@@ -2010,9 +2238,12 @@ impl Codegen {
         let function_ref = self
             .jit
             .declare_func_in_func(self.runtime_ids[symbol], builder.func);
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("list allocation is missing its ExecutionContext"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "list allocation is missing its ExecutionContext",
+            )
+        })?;
         let layout = self.layouts.type_layout(element_type)?;
         let size = builder.ins().iconst(types::I32, i64::from(layout.size));
         let align = builder
@@ -2062,7 +2293,10 @@ impl Codegen {
             .jit
             .declare_func_in_func(self.runtime_ids[symbol], builder.func);
         let context = state.execution_context.ok_or_else(|| {
-            BackendError::new("StringBuilder allocation is missing its ExecutionContext")
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "StringBuilder allocation is missing its ExecutionContext",
+            )
         })?;
         let call = builder.ins().call(function_ref, &[context]);
         let value = builder.inst_results(call)[0];
@@ -2091,6 +2325,7 @@ impl Codegen {
             mir::Type::Double => "aster_rt_string_builder_append_double",
             _ => {
                 return Err(BackendError::new(
+                    codes::BACKEND_STRING_OPERATION_INVALID,
                     "StringBuilder.Append received an unsupported MIR value type",
                 ));
             }
@@ -2099,7 +2334,10 @@ impl Codegen {
             .jit
             .declare_func_in_func(self.runtime_ids[symbol], builder.func);
         let context = state.execution_context.ok_or_else(|| {
-            BackendError::new("StringBuilder.Append is missing its ExecutionContext")
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "StringBuilder.Append is missing its ExecutionContext",
+            )
         })?;
         let receiver = self.translate_operand(builder, receiver, state)?;
         let mut translated_value = self.translate_operand(builder, value, state)?;
@@ -2141,7 +2379,10 @@ impl Codegen {
             .jit
             .declare_func_in_func(self.runtime_ids[symbol], builder.func);
         let context = state.execution_context.ok_or_else(|| {
-            BackendError::new("StringBuilder.ToString is missing its ExecutionContext")
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "StringBuilder.ToString is missing its ExecutionContext",
+            )
         })?;
         let receiver = self.translate_operand(builder, receiver, state)?;
         let call = builder.ins().call(function_ref, &[context, receiver]);
@@ -2167,7 +2408,10 @@ impl Codegen {
             .jit
             .declare_func_in_func(self.runtime_ids[symbol], builder.func);
         let context = state.execution_context.ok_or_else(|| {
-            BackendError::new("dictionary allocation is missing its ExecutionContext")
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "dictionary allocation is missing its ExecutionContext",
+            )
         })?;
         let key = self.layouts.type_layout(key_type)?;
         let value = self.layouts.type_layout(value_type)?;
@@ -2295,6 +2539,7 @@ impl Codegen {
     ) -> Result<(), BackendError> {
         let mir::Type::Dictionary(key_type, value_type) = &dictionary.type_ else {
             return Err(BackendError::new(
+                codes::BACKEND_COLLECTION_TYPE_MISMATCH,
                 "Dictionary Add/Set receiver is not Dictionary<K, V>",
             ));
         };
@@ -2303,7 +2548,10 @@ impl Codegen {
         let value_address = self.dictionary_operand_address(builder, value, state)?;
         let metadata = self.dictionary_runtime_metadata(builder, key_type, value_type)?;
         let context = state.execution_context.ok_or_else(|| {
-            BackendError::new("Dictionary Add/Set is missing its ExecutionContext")
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "Dictionary Add/Set is missing its ExecutionContext",
+            )
         })?;
         let symbol = if replace {
             "aster_rt_dictionary_set"
@@ -2338,6 +2586,7 @@ impl Codegen {
     ) -> Result<(), BackendError> {
         let mir::Type::Dictionary(key_type, value_type) = &dictionary.type_ else {
             return Err(BackendError::new(
+                codes::BACKEND_COLLECTION_TYPE_MISMATCH,
                 "Dictionary ContainsKey/Remove receiver is not Dictionary<K, V>",
             ));
         };
@@ -2345,7 +2594,10 @@ impl Codegen {
         let key_address = self.dictionary_operand_address(builder, key, state)?;
         let metadata = self.dictionary_runtime_metadata(builder, key_type, value_type)?;
         let context = state.execution_context.ok_or_else(|| {
-            BackendError::new("Dictionary operation is missing its ExecutionContext")
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "Dictionary operation is missing its ExecutionContext",
+            )
         })?;
         let symbol = if remove {
             "aster_rt_dictionary_remove"
@@ -2381,11 +2633,13 @@ impl Codegen {
     ) -> Result<(), BackendError> {
         let mir::Type::Dictionary(key_type, dictionary_value_type) = &dictionary.type_ else {
             return Err(BackendError::new(
+                codes::BACKEND_COLLECTION_TYPE_MISMATCH,
                 "Dictionary.TryGet receiver is not Dictionary<K, V>",
             ));
         };
         if dictionary_value_type.as_ref() != value_type {
             return Err(BackendError::new(
+                codes::BACKEND_COLLECTION_TYPE_MISMATCH,
                 "Dictionary.TryGet value metadata disagrees with its receiver",
             ));
         }
@@ -2399,7 +2653,10 @@ impl Codegen {
         let metadata =
             self.dictionary_runtime_metadata(builder, key_type, dictionary_value_type)?;
         let context = state.execution_context.ok_or_else(|| {
-            BackendError::new("Dictionary.TryGet is missing its ExecutionContext")
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "Dictionary.TryGet is missing its ExecutionContext",
+            )
         })?;
         let function_ref = self.jit.declare_func_in_func(
             self.runtime_ids["aster_rt_dictionary_try_get"],
@@ -2444,12 +2701,16 @@ impl Codegen {
             });
             if some.is_some() && none.is_some() {
                 let field = self.layouts.fields.get(&layout.some_field).ok_or_else(|| {
-                    BackendError::new("Dictionary.TryGet payload has no computed layout")
+                    BackendError::new(
+                        codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                        "Dictionary.TryGet payload has no computed layout",
+                    )
                 })?;
                 return Ok((*symbol, field.offset));
             }
         }
         Err(BackendError::new(
+            codes::BACKEND_INTRINSIC_MISSING_STDLIB_TYPE,
             "Dictionary.TryGet carries invalid nominal Option metadata",
         ))
     }
@@ -2469,21 +2730,27 @@ impl Codegen {
     ) -> Result<(), BackendError> {
         let mir::Type::Dictionary(receiver_key, receiver_value) = &dictionary.type_ else {
             return Err(BackendError::new(
+                codes::BACKEND_COLLECTION_TYPE_MISMATCH,
                 "Dictionary.Entries receiver is not Dictionary<K, V>",
             ));
         };
         if receiver_key.as_ref() != key_type || receiver_value.as_ref() != value_type {
             return Err(BackendError::new(
+                codes::BACKEND_COLLECTION_TYPE_MISMATCH,
                 "Dictionary.Entries metadata disagrees with its receiver",
             ));
         }
         let mir::Type::User(entry_symbol) = entry_type else {
             return Err(BackendError::new(
+                codes::BACKEND_INTRINSIC_MISSING_STDLIB_TYPE,
                 "Dictionary.Entries entry type is not a concrete struct",
             ));
         };
         let entry_definition = self.layouts.structs.get(entry_symbol).ok_or_else(|| {
-            BackendError::new("Dictionary.Entries entry type is not defined by the module")
+            BackendError::new(
+                codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                "Dictionary.Entries entry type is not defined by the module",
+            )
         })?;
         if !entry_definition
             .fields
@@ -2495,6 +2762,7 @@ impl Codegen {
                 .any(|field| field.symbol == entry_layout.value_field)
         {
             return Err(BackendError::new(
+                codes::BACKEND_INTRINSIC_MISSING_STDLIB_TYPE,
                 "Dictionary.Entries fields do not belong to its nominal entry type",
             ));
         }
@@ -2502,14 +2770,25 @@ impl Codegen {
             .layouts
             .fields
             .get(&entry_layout.key_field)
-            .ok_or_else(|| BackendError::new("DictionaryEntry.Key has no computed layout"))?;
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    "DictionaryEntry.Key has no computed layout",
+                )
+            })?;
         let value_field = self
             .layouts
             .fields
             .get(&entry_layout.value_field)
-            .ok_or_else(|| BackendError::new("DictionaryEntry.Value has no computed layout"))?;
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    "DictionaryEntry.Value has no computed layout",
+                )
+            })?;
         if key_field.type_ != *key_type || value_field.type_ != *value_type {
             return Err(BackendError::new(
+                codes::BACKEND_COLLECTION_TYPE_MISMATCH,
                 "Dictionary.Entries carries incompatible field metadata",
             ));
         }
@@ -2519,7 +2798,10 @@ impl Codegen {
         let dictionary_value = self.translate_operand(builder, dictionary, state)?;
         let metadata = self.dictionary_runtime_metadata(builder, key_type, value_type)?;
         let context = state.execution_context.ok_or_else(|| {
-            BackendError::new("Dictionary.Entries is missing its ExecutionContext")
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "Dictionary.Entries is missing its ExecutionContext",
+            )
         })?;
         let function_ref = self.jit.declare_func_in_func(
             self.runtime_ids["aster_rt_dictionary_entries"],
@@ -2552,14 +2834,18 @@ impl Codegen {
     ) -> Result<(), BackendError> {
         let mir::Type::Dictionary(key_type, value_type) = &dictionary.type_ else {
             return Err(BackendError::new(
+                codes::BACKEND_COLLECTION_TYPE_MISMATCH,
                 "Dictionary.Clear receiver is not Dictionary<K, V>",
             ));
         };
         let dictionary_value = self.translate_operand(builder, dictionary, state)?;
         let metadata = self.dictionary_runtime_metadata(builder, key_type, value_type)?;
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("Dictionary.Clear is missing its ExecutionContext"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "Dictionary.Clear is missing its ExecutionContext",
+            )
+        })?;
         let function_ref = self
             .jit
             .declare_func_in_func(self.runtime_ids["aster_rt_dictionary_clear"], builder.func);
@@ -2583,6 +2869,7 @@ impl Codegen {
     ) -> Result<(), BackendError> {
         let mir::Type::Dictionary(key_type, value_type) = &dictionary.type_ else {
             return Err(BackendError::new(
+                codes::BACKEND_COLLECTION_TYPE_MISMATCH,
                 "Dictionary snapshot receiver is not Dictionary<K, V>",
             ));
         };
@@ -2590,13 +2877,17 @@ impl Codegen {
             || (!keys && component_type != value_type.as_ref())
         {
             return Err(BackendError::new(
+                codes::BACKEND_COLLECTION_TYPE_MISMATCH,
                 "Dictionary snapshot component type disagrees with receiver",
             ));
         }
         let dictionary_value = self.translate_operand(builder, dictionary, state)?;
         let metadata = self.dictionary_runtime_metadata(builder, key_type, value_type)?;
         let context = state.execution_context.ok_or_else(|| {
-            BackendError::new("Dictionary snapshot is missing its ExecutionContext")
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "Dictionary snapshot is missing its ExecutionContext",
+            )
         })?;
         let symbol = if keys {
             "aster_rt_dictionary_keys"
@@ -2650,9 +2941,12 @@ impl Codegen {
         let function_ref = self
             .jit
             .declare_func_in_func(self.runtime_ids["aster_rt_list_add"], builder.func);
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("list.Add is missing its ExecutionContext"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "list.Add is missing its ExecutionContext",
+            )
+        })?;
         let size = builder.ins().iconst(types::I32, i64::from(layout.size));
         let align = builder
             .ins()
@@ -2678,7 +2972,10 @@ impl Codegen {
         state: &FunctionState,
     ) -> Result<(), BackendError> {
         let context = state.execution_context.ok_or_else(|| {
-            BackendError::new("collection utility intrinsic is missing its ExecutionContext")
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "collection utility intrinsic is missing its ExecutionContext",
+            )
         })?;
         let mut values = vec![context];
         let symbol = match intrinsic {
@@ -2698,6 +2995,7 @@ impl Codegen {
             }
             _ => {
                 return Err(BackendError::new(
+                    codes::BACKEND_UNSUPPORTED_CONSTRUCT,
                     "unsupported collection utility intrinsic",
                 ));
             }
@@ -2709,11 +3007,13 @@ impl Codegen {
         ) {
             let [dictionary, key, supplied] = arguments else {
                 return Err(BackendError::new(
+                    codes::BACKEND_INTRINSIC_INVALID_SHAPE,
                     "Dictionary.GetOr requires three operands",
                 ));
             };
             let mir::Type::Dictionary(key_type, value_type) = &dictionary.type_ else {
                 return Err(BackendError::new(
+                    codes::BACKEND_COLLECTION_TYPE_MISMATCH,
                     "Dictionary.GetOr receiver is not Dictionary<K, V>",
                 ));
             };
@@ -2721,8 +3021,12 @@ impl Codegen {
             values.extend(self.dictionary_runtime_metadata(builder, key_type, value_type)?);
             values.push(self.dictionary_operand_address(builder, key, state)?);
             values.push(self.dictionary_operand_address(builder, supplied, state)?);
-            let destination = destination
-                .ok_or_else(|| BackendError::new("Dictionary.GetOr requires a destination"))?;
+            let destination = destination.ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_MISSING_DESTINATION_OR_RESULT,
+                    "Dictionary.GetOr requires a destination",
+                )
+            })?;
             values.push(self.place_address(builder, destination, state)?);
             values.push(builder.ins().iconst(
                 types::I8,
@@ -2783,7 +3087,10 @@ impl Codegen {
         } else {
             self.continue_if_runtime_ok(builder, state)?;
             let destination = destination.ok_or_else(|| {
-                BackendError::new("collection utility result requires a destination")
+                BackendError::new(
+                    codes::BACKEND_MISSING_DESTINATION_OR_RESULT,
+                    "collection utility result requires a destination",
+                )
             })?;
             self.store_scalar(builder, destination, result, state)?;
         }
@@ -2802,7 +3109,10 @@ impl Codegen {
         state: &FunctionState,
     ) -> Result<(), BackendError> {
         let mir::Type::List(element_type) = &list.type_ else {
-            return Err(BackendError::new("ListRemoveAt receiver is not List<T>"));
+            return Err(BackendError::new(
+                codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+                "ListRemoveAt receiver is not List<T>",
+            ));
         };
         let list_value = self.translate_operand(builder, list, state)?;
         let index_value = self.translate_operand(builder, index, state)?;
@@ -2810,9 +3120,12 @@ impl Codegen {
         let function_ref = self
             .jit
             .declare_func_in_func(self.runtime_ids["aster_rt_list_remove_at"], builder.func);
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("list.RemoveAt is missing its ExecutionContext"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "list.RemoveAt is missing its ExecutionContext",
+            )
+        })?;
         let size = builder.ins().iconst(types::I32, i64::from(layout.size));
         let align = builder
             .ins()
@@ -2837,10 +3150,14 @@ impl Codegen {
         state: &FunctionState,
     ) -> Result<(), BackendError> {
         let mir::Type::List(element_type) = &list.type_ else {
-            return Err(BackendError::new("List.Set receiver is not List<T>"));
+            return Err(BackendError::new(
+                codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+                "List.Set receiver is not List<T>",
+            ));
         };
         if value.type_ != **element_type {
             return Err(BackendError::new(
+                codes::BACKEND_COLLECTION_TYPE_MISMATCH,
                 "List.Set value does not match its List<T> receiver",
             ));
         }
@@ -2859,9 +3176,12 @@ impl Codegen {
             builder.ins().stack_store(value_ssa, slot, 0);
             builder.ins().stack_addr(self.pointer_type, slot, 0)
         };
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("List.Set is missing its ExecutionContext"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "List.Set is missing its ExecutionContext",
+            )
+        })?;
         let function_ref = self
             .jit
             .declare_func_in_func(self.runtime_ids["aster_rt_list_set"], builder.func);
@@ -2896,13 +3216,19 @@ impl Codegen {
         state: &FunctionState,
     ) -> Result<(), BackendError> {
         let mir::Type::List(element_type) = &list.type_ else {
-            return Err(BackendError::new("List.Clear receiver is not List<T>"));
+            return Err(BackendError::new(
+                codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+                "List.Clear receiver is not List<T>",
+            ));
         };
         let list_value = self.translate_operand(builder, list, state)?;
         let layout = self.layouts.type_layout(element_type)?;
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("List.Clear is missing its ExecutionContext"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "List.Clear is missing its ExecutionContext",
+            )
+        })?;
         let function_ref = self
             .jit
             .declare_func_in_func(self.runtime_ids["aster_rt_list_clear"], builder.func);
@@ -2931,18 +3257,25 @@ impl Codegen {
         state: &FunctionState,
     ) -> Result<(), BackendError> {
         let mir::Type::List(receiver_element) = &list.type_ else {
-            return Err(BackendError::new("List.ToArray receiver is not List<T>"));
+            return Err(BackendError::new(
+                codes::BACKEND_COLLECTION_TYPE_MISMATCH,
+                "List.ToArray receiver is not List<T>",
+            ));
         };
         if receiver_element.as_ref() != element_type {
             return Err(BackendError::new(
+                codes::BACKEND_COLLECTION_TYPE_MISMATCH,
                 "List.ToArray element type disagrees with receiver",
             ));
         }
         let list_value = self.translate_operand(builder, list, state)?;
         let layout = self.layouts.type_layout(element_type)?;
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("List.ToArray is missing its ExecutionContext"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "List.ToArray is missing its ExecutionContext",
+            )
+        })?;
         let function_ref = self
             .jit
             .declare_func_in_func(self.runtime_ids["aster_rt_list_to_array"], builder.func);
@@ -2999,9 +3332,12 @@ impl Codegen {
         let function_ref = self
             .jit
             .declare_func_in_func(self.runtime_ids["aster_rt_list_get"], builder.func);
-        let context = state
-            .execution_context
-            .ok_or_else(|| BackendError::new("list.Get is missing its ExecutionContext"))?;
+        let context = state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "list.Get is missing its ExecutionContext",
+            )
+        })?;
         let size = builder.ins().iconst(types::I32, i64::from(layout.size));
         let align = builder
             .ins()
@@ -3065,7 +3401,10 @@ impl Codegen {
             builder.func,
         );
         let context = state.execution_context.ok_or_else(|| {
-            BackendError::new("string foreach decode is missing its ExecutionContext")
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "string foreach decode is missing its ExecutionContext",
+            )
         })?;
         let call = builder.ins().call(
             function_ref,
@@ -3099,6 +3438,7 @@ fn function_symbol(operand: &mir::Operand) -> Result<i64, BackendError> {
     match &operand.kind {
         mir::OperandKind::Function(symbol) => Ok(i64::from(symbol.0)),
         _ => Err(BackendError::new(
+            codes::BACKEND_CALL_SIGNATURE_MISMATCH,
             "expected a resolved function operand for a concurrency intrinsic",
         )),
     }
@@ -3119,6 +3459,7 @@ fn dictionary_key_kind(type_: &mir::Type) -> Result<i64, BackendError> {
         mir::Type::String => aster_runtime::DictionaryKeyKind::String,
         _ => {
             return Err(BackendError::new(
+                codes::BACKEND_UNSUPPORTED_DICTIONARY_KEY,
                 "unsupported concrete Dictionary key type reached codegen",
             ));
         }

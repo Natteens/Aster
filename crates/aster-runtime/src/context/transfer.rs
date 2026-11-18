@@ -324,6 +324,17 @@ impl ExecutionContext {
                 }
                 Ok(())
             }
+            TransferShape::NicheEnum { payload, .. } => {
+                // SAFETY: niche enum holds a pointer-width word at offset 0.
+                let pointer = unsafe { ptr::read_unaligned(image.cast::<*const u8>()) };
+                if pointer.is_null() {
+                    out.put(&[0])
+                } else {
+                    out.put(&[1])?;
+                    // SAFETY: non-null payload sits at offset 0.
+                    unsafe { self.pack_value(payload, image, out) }
+                }
+            }
         }
     }
 
@@ -533,6 +544,15 @@ impl ExecutionContext {
                     unsafe { self.unpack_value(field, input, dest.add(*offset as usize))? };
                 }
                 Ok(())
+            }
+            TransferShape::NicheEnum { payload, .. } => {
+                if input.u8()? == 0 {
+                    // SAFETY: niche enum holds a pointer-width word at `dest`.
+                    unsafe { ptr::write_unaligned(dest.cast::<*const u8>(), ptr::null()) };
+                    return Ok(());
+                }
+                // SAFETY: non-null payload sits at offset 0 of `dest`.
+                unsafe { self.unpack_value(payload, input, dest) }
             }
         }
     }

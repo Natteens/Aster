@@ -10,7 +10,7 @@ comments before parsing. This proposal extends beyond the bootstrap lexer.
 ```aster
 // A line comment
 int playerCount = 10;
-float gravity = 9.81;
+double gravity = 9.81;
 string greeting = "Hello, Aster";
 bool enabled = true;
 ```
@@ -54,7 +54,7 @@ bool enabled = true;
   identifier, never a literal. Separators do not change the value.
 - An exponent (`e` or `E`, an optional `+` or `-`, and one or more decimal digits) may follow the
   integer or fractional digits of a decimal literal and makes it a real literal: `1e3`, `2.5E-3`,
-  `1_0e1_0`. An unsuffixed real literal keeps its existing type (`float`); `f`, `d`, and `m` suffixes
+  `1_0e1_0`. An unsuffixed real literal defaults to `double`; `f`, `d`, and `m` suffixes
   apply after the exponent, and integer suffixes do not. A missing exponent digit (`1e`, `1e+`) is a
   controlled lexer error.
 - Proposed strings use double quotes and proposed character literals use single quotes.
@@ -68,11 +68,11 @@ Octal notation and hexadecimal floating-point literals are not implemented.
 ```aster
 int caféCount = 2;
 int _temporary = 0;
-float ratio = 0.5;
+double ratio = 0.5;
 // comment until end of line
 /* block comment */
 int million = 1_000_000;
-float tiny = 2.5E-3;
+float tiny = 2.5E-3f;
 ```
 
 ## Invalid design examples

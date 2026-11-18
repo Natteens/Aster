@@ -143,6 +143,17 @@ Normal output, including program output and HIR/MIR dumps, goes to stdout. Usage
 compiler, runtime, manifest, and standard-library errors go to stderr. A failed dump does not emit
 partial IR.
 
+Compiler and runtime diagnostics use `{severity}[Axxxx]: {message}` (for example
+`error[A2001]: ...` or `warning[A2435]: ...`), while operational CLI usage and filesystem failures use
+`error: ...`. Diagnostic codes are grouped by layer and never reused once assigned:
+
+| Range | Layer | Scope |
+| --- | --- | --- |
+| `A1xxx` | Syntax | Lexer and parser errors |
+| `A2xxx` | Semantic | Type checking, name/member resolution, safety rules, manifest/package errors, and warnings |
+| `A3xxx` | Lowering | HIR/MIR lowering, subregion lowering, and MIR validation |
+| `A4xxx` | Backend | Cranelift validation, JIT compilation, and runtime traps/execution errors |
+
 ## Compiler checkout
 
 Contributors can run the local binary by replacing `aster` with

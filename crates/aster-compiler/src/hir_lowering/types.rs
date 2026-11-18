@@ -115,6 +115,7 @@ pub(super) fn literal_value(literal: &ast::Literal) -> (hir::Literal, hir::Type)
         ast::Literal::String(value) => (hir::Literal::String(value.clone()), hir::Type::String),
         ast::Literal::Character(value) => (hir::Literal::Character(*value), hir::Type::Char),
         ast::Literal::Boolean(value) => (hir::Literal::Boolean(*value), hir::Type::Bool),
+        ast::Literal::Null => unreachable!("target-typed `null` lowers via `model.null_literals`"),
     }
 }
 

@@ -84,11 +84,26 @@ pub enum ExpressionKind {
         operand: Box<Expression>,
     },
     /// Postfix `?`: propagate the `Error` case of an `aster.core.Result<T, E>`,
-    /// continuing with the `Ok` payload. This is the only meaning of a trailing
-    /// `?` today; ternary `?:`, `?.`, and `??` are separate constructs.
+    /// continuing with the `Ok` payload, or propagate the `None` case of an
+    /// `aster.core.Option<T>`. Ternary `?:`, `?.`, and `??` are separate
+    /// constructs.
     Try {
         operand: Box<Expression>,
     },
+    /// Null-coalescing operator: `value ?? fallback` (`LANG-003`).
+    NullCoalesce {
+        value: Box<Expression>,
+        fallback: Box<Expression>,
+    },
+    /// Null-conditional member/call/index chain: `receiver?.access` (`LANG-003`).
+    /// `access` is a postfix chain rooted at [`Self::NullConditionalReceiver`].
+    NullConditional {
+        receiver: Box<Expression>,
+        access: Box<Expression>,
+    },
+    /// Sentinel receiver inside [`Self::NullConditional::access`] representing
+    /// the unwrapped `Some` value of `receiver`.
+    NullConditionalReceiver,
     /// Prefix `await`: suspend on an `aster.core.Task<T>` operand and continue
     /// with its `T` result. Kept as its own node, not a `UnaryOperator`, so the
     /// `Task<T> -> T` type change is preserved through lowering.
@@ -201,15 +216,16 @@ pub enum Literal {
     UInt(String),
     /// An integer literal with the `ul`/`lu` suffix.
     ULong(String),
-    /// A decimal literal, optionally with the `f` suffix.
+    /// A real literal with the `f`/`F` suffix.
     Float(String),
-    /// A decimal literal with the `d` suffix.
+    /// An unsuffixed real literal, or a real literal with the `d`/`D` suffix.
     Double(String),
     /// A base-10 exact literal with the `m` suffix.
     Decimal(String),
     String(String),
     Character(char),
     Boolean(bool),
+    Null,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

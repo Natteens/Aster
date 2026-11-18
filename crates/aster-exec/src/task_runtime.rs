@@ -29,6 +29,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use aster_diagnostics::codes;
+
 use crate::completion_queue::{CompletionQueue, CompletionToken};
 use crate::worker_pool::{
     AsyncInnerPhaseGate, AsyncMemoryDomain, ChunkOutcome, ExecutionPool, JobKind,
@@ -442,19 +444,23 @@ impl TaskRuntime {
 
     fn fresh_id(&mut self) -> Result<TaskHandleId, BackendError> {
         let id = TaskHandleId(self.next_id);
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .ok_or_else(|| BackendError::new("task handle id space is exhausted"))?;
+        self.next_id = self.next_id.checked_add(1).ok_or_else(|| {
+            BackendError::new(
+                codes::EXEC_TASK_ID_OR_TOKEN_EXHAUSTED,
+                "task handle id space is exhausted",
+            )
+        })?;
         Ok(id)
     }
 
     fn fresh_token(&mut self) -> Result<CompletionToken, BackendError> {
         let token = self.next_token;
-        self.next_token = self
-            .next_token
-            .checked_add(1)
-            .ok_or_else(|| BackendError::new("async completion token space is exhausted"))?;
+        self.next_token = self.next_token.checked_add(1).ok_or_else(|| {
+            BackendError::new(
+                codes::EXEC_TASK_ID_OR_TOKEN_EXHAUSTED,
+                "async completion token space is exhausted",
+            )
+        })?;
         Ok(token)
     }
 
@@ -522,6 +528,7 @@ impl TaskRuntime {
             return Ok(task.resolved.is_none() && task.control.cancel());
         }
         Err(BackendError::new(
+            codes::EXEC_TASK_UNKNOWN_HANDLE,
             "Task.Cancel received an unknown task handle",
         ))
     }
@@ -533,45 +540,76 @@ impl TaskRuntime {
         if let Some(domain) = &self.task_memory_domain {
             return Ok(Arc::clone(domain));
         }
-        let governor = self
-            .task_governor
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or_else(|| BackendError::new("task memory governor is unavailable"))?;
+        let governor = self.task_governor.as_ref().map(Arc::clone).ok_or_else(|| {
+            BackendError::new(
+                codes::EXEC_GOVERNOR_UNAVAILABLE_OR_MISMATCH,
+                "task memory governor is unavailable",
+            )
+        })?;
         if !main_context.is_governed_by(&governor) {
             return Err(BackendError::new(
+                codes::EXEC_GOVERNOR_UNAVAILABLE_OR_MISMATCH,
                 "main context does not use the Task.Run memory governor",
             ));
         }
         let snapshot = governor.telemetry();
         let main_retained = main_context
             .retained_arena_capacity_bytes()
-            .ok_or_else(|| BackendError::new("main retained arena capacity overflow"))?;
-        let main_retained_u64 = u64::try_from(main_retained)
-            .map_err(|_| BackendError::new("main retained arena capacity exceeds telemetry"))?;
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
+                    "main retained arena capacity overflow",
+                )
+            })?;
+        let main_retained_u64 = u64::try_from(main_retained).map_err(|_| {
+            BackendError::new(
+                codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
+                "main retained arena capacity exceeds telemetry",
+            )
+        })?;
         if snapshot.current_capacity_bytes < main_retained_u64 {
             return Err(BackendError::new(
+                codes::EXEC_GOVERNOR_UNAVAILABLE_OR_MISMATCH,
                 "governed main capacity is not owned by the Task.Run memory governor",
             ));
         }
         let available_headroom_bytes = snapshot
             .hard_limit_bytes
             .checked_sub(snapshot.current_capacity_bytes)
-            .ok_or_else(|| BackendError::new("memory governor capacity exceeds its hard limit"))?;
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
+                    "memory governor capacity exceeds its hard limit",
+                )
+            })?;
         let plan = plan_task_memory_domain(
             available_headroom_bytes,
             main_retained_u64,
             self.worker_count,
         )?;
-        let main_future_growth = usize::try_from(plan.main_future_growth_bytes)
-            .map_err(|_| BackendError::new("main Task.Run entitlement exceeds host limits"))?;
+        let main_future_growth = usize::try_from(plan.main_future_growth_bytes).map_err(|_| {
+            BackendError::new(
+                codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
+                "main Task.Run entitlement exceeds host limits",
+            )
+        })?;
         let main_local_capacity_ceiling = main_context
             .freeze_task_domain_main_limit(main_future_growth)
-            .ok_or_else(|| BackendError::new("main Task.Run entitlement exceeds host limits"))?;
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
+                    "main Task.Run entitlement exceeds host limits",
+                )
+            })?;
         #[cfg(not(feature = "aarm-telemetry"))]
         let _ = main_local_capacity_ceiling;
-        let task_context_ceiling = usize::try_from(plan.task_context_ceiling_bytes)
-            .map_err(|_| BackendError::new("Task.Run entitlement exceeds host limits"))?;
+        let task_context_ceiling =
+            usize::try_from(plan.task_context_ceiling_bytes).map_err(|_| {
+                BackendError::new(
+                    codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
+                    "Task.Run entitlement exceeds host limits",
+                )
+            })?;
         let domain = Arc::new(TaskMemoryDomain::new(
             governor,
             task_context_ceiling,
@@ -606,42 +644,49 @@ impl TaskRuntime {
             .async_governor
             .as_ref()
             .map(Arc::clone)
-            .ok_or_else(|| BackendError::new("async memory governor is unavailable"))?;
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::EXEC_GOVERNOR_UNAVAILABLE_OR_MISMATCH,
+                    "async memory governor is unavailable",
+                )
+            })?;
         if !main_context.is_governed_by(&governor) {
             return Err(BackendError::new(
+                codes::EXEC_GOVERNOR_UNAVAILABLE_OR_MISMATCH,
                 "main context does not use the async memory governor",
             ));
         }
-        let snapshot = governor.telemetry();
-        let main_retained = main_context
-            .retained_arena_capacity_bytes()
-            .ok_or_else(|| BackendError::new("main retained arena capacity overflow"))?;
-        let main_retained_u64 = u64::try_from(main_retained)
-            .map_err(|_| BackendError::new("main retained arena capacity exceeds telemetry"))?;
-        if snapshot.current_capacity_bytes < main_retained_u64 {
-            return Err(BackendError::new(
-                "governed main capacity is not owned by the async memory governor",
-            ));
-        }
-        let available_headroom_bytes = snapshot
-            .hard_limit_bytes
-            .checked_sub(snapshot.current_capacity_bytes)
-            .ok_or_else(|| BackendError::new("memory governor capacity exceeds its hard limit"))?;
+        let (snapshot, main_retained_u64, available_headroom_bytes) =
+            Self::governor_headroom(&governor, main_context)?;
+        #[cfg(not(feature = "aarm-telemetry"))]
+        let _ = snapshot;
         let plan = plan_async_memory_domain(available_headroom_bytes, main_retained_u64)?;
-        let main_future_growth = usize::try_from(plan.main_future_growth)
-            .map_err(|_| BackendError::new("main async entitlement exceeds host limits"))?;
+        let main_future_growth = Self::entitlement_to_usize(
+            plan.main_future_growth,
+            "main async entitlement exceeds host limits",
+        )?;
         let main_local_capacity_ceiling = main_context
             .freeze_async_domain_main_limit(main_future_growth)
-            .ok_or_else(|| BackendError::new("main async entitlement exceeds host limits"))?;
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
+                    "main async entitlement exceeds host limits",
+                )
+            })?;
         #[cfg(not(feature = "aarm-telemetry"))]
         let _ = main_local_capacity_ceiling;
-        let phase_limit = usize::try_from(plan.phase_context_ceiling)
-            .map_err(|_| BackendError::new("async phase entitlement exceeds host limits"))?;
-        let fixed_move_next_limit = usize::try_from(plan.fixed_move_next_ceiling)
-            .map_err(|_| BackendError::new("async MoveNext entitlement exceeds host limits"))?;
-        let fixed_inner_limit = usize::try_from(plan.fixed_inner_ceiling).map_err(|_| {
-            BackendError::new("async awaited-inner entitlement exceeds host limits")
-        })?;
+        let phase_limit = Self::entitlement_to_usize(
+            plan.phase_context_ceiling,
+            "async phase entitlement exceeds host limits",
+        )?;
+        let fixed_move_next_limit = Self::entitlement_to_usize(
+            plan.fixed_move_next_ceiling,
+            "async MoveNext entitlement exceeds host limits",
+        )?;
+        let fixed_inner_limit = Self::entitlement_to_usize(
+            plan.fixed_inner_ceiling,
+            "async awaited-inner entitlement exceeds host limits",
+        )?;
         let domain = Arc::new(AsyncMemoryDomain::new(
             governor,
             phase_limit,
@@ -674,12 +719,56 @@ impl TaskRuntime {
         self.async_tasks.contains_key(&id)
     }
 
+    fn entitlement_to_usize(bytes: u64, message: &str) -> Result<usize, BackendError> {
+        usize::try_from(bytes)
+            .map_err(|_| BackendError::new(codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED, message))
+    }
+
+    fn governor_headroom(
+        governor: &aster_runtime::MemoryGovernor,
+        main_context: &aster_runtime::ExecutionContext,
+    ) -> Result<(aster_runtime::MemoryGovernorTelemetry, u64, u64), BackendError> {
+        let snapshot = governor.telemetry();
+        let main_retained = main_context
+            .retained_arena_capacity_bytes()
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
+                    "main retained arena capacity overflow",
+                )
+            })?;
+        let main_retained_u64 = u64::try_from(main_retained).map_err(|_| {
+            BackendError::new(
+                codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
+                "main retained arena capacity exceeds telemetry",
+            )
+        })?;
+        if snapshot.current_capacity_bytes < main_retained_u64 {
+            return Err(BackendError::new(
+                codes::EXEC_GOVERNOR_UNAVAILABLE_OR_MISMATCH,
+                "governed main capacity is not owned by the async memory governor",
+            ));
+        }
+        let available_headroom_bytes = snapshot
+            .hard_limit_bytes
+            .checked_sub(snapshot.current_capacity_bytes)
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
+                    "memory governor capacity exceeds its hard limit",
+                )
+            })?;
+        Ok((snapshot, main_retained_u64, available_headroom_bytes))
+    }
+
     /// `task.Wait()` for a plain task: join once, cache, replay on every call.
     pub fn wait(&mut self, id: TaskHandleId) -> Result<TaskOutcome, BackendError> {
-        let entry = self
-            .entries
-            .remove(&id)
-            .ok_or_else(|| BackendError::new("Task<T>.Wait received an unknown task handle"))?;
+        let entry = self.entries.remove(&id).ok_or_else(|| {
+            BackendError::new(
+                codes::EXEC_TASK_UNKNOWN_HANDLE,
+                "Task<T>.Wait received an unknown task handle",
+            )
+        })?;
         let result = match entry {
             TaskEntry::Resolved(result) => result,
             // Master plan §8.4: only a worker thread may run other domains' work
@@ -718,10 +807,13 @@ impl TaskRuntime {
                 resolved: None,
             },
         );
-        self.async_handles_created = self
-            .async_handles_created
-            .checked_add(1)
-            .ok_or_else(|| BackendError::new("async handle telemetry overflow"))?;
+        self.async_handles_created =
+            self.async_handles_created.checked_add(1).ok_or_else(|| {
+                BackendError::new(
+                    codes::EXEC_TASK_ID_OR_TOKEN_EXHAUSTED,
+                    "async handle telemetry overflow",
+                )
+            })?;
         Ok(id)
     }
 
@@ -739,28 +831,33 @@ impl TaskRuntime {
     }
 
     pub fn async_state(&self, id: TaskHandleId) -> Result<i32, BackendError> {
-        let task = self
-            .async_tasks
-            .get(&id)
-            .ok_or_else(|| BackendError::new("async state received an unknown task handle"))?;
+        let task = self.async_tasks.get(&id).ok_or_else(|| {
+            BackendError::new(
+                codes::EXEC_TASK_UNKNOWN_HANDLE,
+                "async state received an unknown task handle",
+            )
+        })?;
         if !matches!(task.state, 0 | 1) {
-            return Err(BackendError::new(format!(
-                "async task has invalid state {}",
-                task.state
-            )));
+            return Err(BackendError::new(
+                codes::EXEC_ASYNC_INVALID_STATE,
+                format!("async task has invalid state {}", task.state),
+            ));
         }
         Ok(task.state)
     }
 
     pub fn async_set_state(&mut self, id: TaskHandleId, state: i32) -> Result<(), BackendError> {
         let task = self.async_tasks.get_mut(&id).ok_or_else(|| {
-            BackendError::new("async state update received an unknown task handle")
+            BackendError::new(
+                codes::EXEC_TASK_UNKNOWN_HANDLE,
+                "async state update received an unknown task handle",
+            )
         })?;
         if task.resolved.is_some() || task.state != 0 || state != 1 {
-            return Err(BackendError::new(format!(
-                "invalid async state transition {} -> {state}",
-                task.state
-            )));
+            return Err(BackendError::new(
+                codes::EXEC_ASYNC_INVALID_STATE,
+                format!("invalid async state transition {} -> {state}", task.state),
+            ));
         }
         task.state = state;
         Ok(())
@@ -772,44 +869,62 @@ impl TaskRuntime {
         index: usize,
         value: ExecutionValue,
     ) -> Result<(), BackendError> {
-        let task = self
-            .async_tasks
-            .get_mut(&id)
-            .ok_or_else(|| BackendError::new("async slot store received an unknown task handle"))?;
+        let task = self.async_tasks.get_mut(&id).ok_or_else(|| {
+            BackendError::new(
+                codes::EXEC_TASK_UNKNOWN_HANDLE,
+                "async slot store received an unknown task handle",
+            )
+        })?;
         if task.resolved.is_some() || task.state != 0 {
             return Err(BackendError::new(
+                codes::EXEC_ASYNC_FRAME_SLOT_ERROR,
                 "async slot store is only valid in state 0",
             ));
         }
         let slot = task.frame.get_mut(index).ok_or_else(|| {
-            BackendError::new(format!("async frame slot {index} is out of range"))
+            BackendError::new(
+                codes::EXEC_ASYNC_FRAME_SLOT_ERROR,
+                format!("async frame slot {index} is out of range"),
+            )
         })?;
         if slot.is_some() {
-            return Err(BackendError::new(format!(
-                "async frame slot {index} was stored more than once"
-            )));
+            return Err(BackendError::new(
+                codes::EXEC_ASYNC_FRAME_SLOT_ERROR,
+                format!("async frame slot {index} was stored more than once"),
+            ));
         }
         *slot = Some(value);
         Ok(())
     }
 
     pub fn async_load_slot(&self, id: TaskHandleId, index: usize) -> Result<i64, BackendError> {
-        let task = self
-            .async_tasks
-            .get(&id)
-            .ok_or_else(|| BackendError::new("async slot load received an unknown task handle"))?;
+        let task = self.async_tasks.get(&id).ok_or_else(|| {
+            BackendError::new(
+                codes::EXEC_TASK_UNKNOWN_HANDLE,
+                "async slot load received an unknown task handle",
+            )
+        })?;
         if task.resolved.is_some() || task.state != 1 {
             return Err(BackendError::new(
+                codes::EXEC_ASYNC_FRAME_SLOT_ERROR,
                 "async slot load is only valid in state 1",
             ));
         }
         let value = task
             .frame
             .get(index)
-            .ok_or_else(|| BackendError::new(format!("async frame slot {index} is out of range")))?
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::EXEC_ASYNC_FRAME_SLOT_ERROR,
+                    format!("async frame slot {index} is out of range"),
+                )
+            })?
             .as_ref()
             .ok_or_else(|| {
-                BackendError::new(format!("async frame slot {index} is uninitialized"))
+                BackendError::new(
+                    codes::EXEC_ASYNC_FRAME_SLOT_ERROR,
+                    format!("async frame slot {index} is uninitialized"),
+                )
             })?;
         Ok(scalar::to_bits(value))
     }
@@ -833,7 +948,10 @@ impl TaskRuntime {
         payload: TaskPayload,
     ) -> Result<(), BackendError> {
         let task = self.async_tasks.get(&id).ok_or_else(|| {
-            BackendError::new("async inner spawn received an unknown task handle")
+            BackendError::new(
+                codes::EXEC_TASK_UNKNOWN_HANDLE,
+                "async inner spawn received an unknown task handle",
+            )
         })?;
         if task.resolved.is_some()
             || task.state != 0
@@ -841,6 +959,7 @@ impl TaskRuntime {
             || task.inner_token.is_some()
         {
             return Err(BackendError::new(
+                codes::EXEC_ASYNC_SPAWN_ERROR,
                 "async task attempted to spawn more than one awaited inner task",
             ));
         }
@@ -865,10 +984,12 @@ impl TaskRuntime {
                 None,
             ),
         };
-        let task = self
-            .async_tasks
-            .get_mut(&id)
-            .ok_or_else(|| BackendError::new("async task disappeared during inner spawn"))?;
+        let task = self.async_tasks.get_mut(&id).ok_or_else(|| {
+            BackendError::new(
+                codes::EXEC_ASYNC_SPAWN_ERROR,
+                "async task disappeared during inner spawn",
+            )
+        })?;
         task.inner = Some(handle);
         task.inner_token = Some(token);
         task.inner_phase_gate = phase_gate;
@@ -900,17 +1021,26 @@ impl TaskRuntime {
 
     pub fn async_await_result(&self, id: TaskHandleId) -> Result<i64, BackendError> {
         let task = self.async_tasks.get(&id).ok_or_else(|| {
-            BackendError::new("async await result received an unknown task handle")
+            BackendError::new(
+                codes::EXEC_TASK_UNKNOWN_HANDLE,
+                "async await result received an unknown task handle",
+            )
         })?;
         if task.resolved.is_some() || task.state != 1 {
             return Err(BackendError::new(
+                codes::EXEC_ASYNC_RESULT_ERROR,
                 "async await result is only available while resuming state 1",
             ));
         }
         task.inner_result
             .as_ref()
             .map(scalar::to_bits)
-            .ok_or_else(|| BackendError::new("async awaited result is not ready"))
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::EXEC_ASYNC_RESULT_ERROR,
+                    "async awaited result is not ready",
+                )
+            })
     }
 
     pub fn async_set_result(
@@ -918,17 +1048,21 @@ impl TaskRuntime {
         id: TaskHandleId,
         value: ExecutionValue,
     ) -> Result<(), BackendError> {
-        let task = self
-            .async_tasks
-            .get_mut(&id)
-            .ok_or_else(|| BackendError::new("async result received an unknown task handle"))?;
+        let task = self.async_tasks.get_mut(&id).ok_or_else(|| {
+            BackendError::new(
+                codes::EXEC_TASK_UNKNOWN_HANDLE,
+                "async result received an unknown task handle",
+            )
+        })?;
         if task.resolved.is_some() || task.state != 1 {
             return Err(BackendError::new(
+                codes::EXEC_ASYNC_RESULT_ERROR,
                 "async result can only be published from state 1",
             ));
         }
         if task.candidate.is_some() {
             return Err(BackendError::new(
+                codes::EXEC_ASYNC_RESULT_ERROR,
                 "async result was published more than once",
             ));
         }
@@ -958,6 +1092,7 @@ impl TaskRuntime {
         // driver step runs.
         let Some(driver) = (unsafe { (*runtime).driver.take() }) else {
             return Err(BackendError::new(
+                codes::EXEC_ASYNC_PUMP_ERROR,
                 "the async pump cannot be re-entered (nested pumping is not supported)",
             ));
         };
@@ -969,7 +1104,10 @@ impl TaskRuntime {
             // SAFETY: same contract; each reborrow inside is short-lived and
             // never spans a driver step.
             Some(driver) => unsafe { Self::pump_loop(runtime, driver.as_ref(), target) },
-            None => Err(BackendError::new("the async pump lost its driver")),
+            None => Err(BackendError::new(
+                codes::EXEC_ASYNC_PUMP_ERROR,
+                "the async pump lost its driver",
+            )),
         };
         drop(guard);
         outcome
@@ -1071,6 +1209,7 @@ impl TaskRuntime {
                 // SAFETY: short reborrow, immediately dropped.
                 unsafe { (*runtime).settle_governed_inner(target) };
                 return Err(BackendError::new(
+                    codes::EXEC_ASYNC_PUMP_ERROR,
                     "the async completion queue closed while a task was still pending",
                 ));
             }
@@ -1079,10 +1218,12 @@ impl TaskRuntime {
 
     /// Queue `target`'s first `MoveNext` step if it has not started yet.
     fn seed_ready(&mut self, target: TaskHandleId) -> Result<(), BackendError> {
-        let task = self
-            .async_tasks
-            .get(&target)
-            .ok_or_else(|| BackendError::new("async pump received an unknown task handle"))?;
+        let task = self.async_tasks.get(&target).ok_or_else(|| {
+            BackendError::new(
+                codes::EXEC_TASK_UNKNOWN_HANDLE,
+                "async pump received an unknown task handle",
+            )
+        })?;
         if task.resolved.is_none() && task.state == 0 && !self.ready.contains(&target) {
             self.ready.push_back(target);
         }
@@ -1172,6 +1313,7 @@ impl TaskRuntime {
             Ok((ExecutionValue::Int(PENDING), _)) => {
                 if task.state != 1 || task.inner.is_none() || task.inner_token.is_none() {
                     let error = BackendError::new(
+                        codes::EXEC_ASYNC_INVALID_STATE,
                         "an async task suspended without a registered awaited operation",
                     );
                     let _ = task.control.finish(TaskOutcome::Failed(error.clone()));
@@ -1189,6 +1331,7 @@ impl TaskRuntime {
                         Ok(TaskOutcome::Completed(value, MemoryStats::default()))
                     }
                     _ => Err(BackendError::new(
+                        codes::EXEC_ASYNC_INVALID_STATE,
                         "an async task completed from an invalid state or without producing a result",
                     )),
                 };
@@ -1201,7 +1344,10 @@ impl TaskRuntime {
                 });
             }
             Ok(_) => {
-                let error = BackendError::new("an async MoveNext step returned an invalid status");
+                let error = BackendError::new(
+                    codes::EXEC_ASYNC_INVALID_STATE,
+                    "an async MoveNext step returned an invalid status",
+                );
                 let _ = task.control.finish(TaskOutcome::Failed(error.clone()));
                 task.resolved = Some(Err(error));
             }
@@ -1214,17 +1360,20 @@ impl TaskRuntime {
     /// runtime errors so the pump cannot silently lose its only wakeup.
     fn on_completion(&mut self, token: CompletionToken) -> Result<(), BackendError> {
         let Some(handle) = self.token_to_async.remove(&token) else {
-            return Err(BackendError::new(format!(
-                "async completion queue produced unknown token {token}"
-            )));
+            return Err(BackendError::new(
+                codes::EXEC_ASYNC_TOKEN_MISMATCH,
+                format!("async completion queue produced unknown token {token}"),
+            ));
         };
         let Some(task) = self.async_tasks.get_mut(&handle) else {
             return Err(BackendError::new(
+                codes::EXEC_ASYNC_TOKEN_MISMATCH,
                 "async completion token referenced a missing task",
             ));
         };
         if task.inner_token != Some(token) {
             return Err(BackendError::new(
+                codes::EXEC_ASYNC_TOKEN_MISMATCH,
                 "async completion token did not match the suspended task",
             ));
         }
@@ -1236,6 +1385,7 @@ impl TaskRuntime {
         let outcome = match task.inner.take() {
             Some(inner) => inner.join(),
             None => Err(BackendError::new(
+                codes::EXEC_ASYNC_RESULT_ERROR,
                 "an awaited inner task was lost before completion",
             )),
         };
@@ -1266,7 +1416,12 @@ impl TaskRuntime {
         let available_headroom_bytes = snapshot
             .hard_limit_bytes
             .checked_sub(snapshot.current_capacity_bytes)
-            .ok_or_else(|| BackendError::new("memory governor capacity exceeds its hard limit"))?;
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
+                    "memory governor capacity exceeds its hard limit",
+                )
+            })?;
         let shares = parallel_chunk_budgets(available_headroom_bytes, chunk_count)?;
         #[cfg(feature = "aarm-telemetry")]
         self.parallel_plans.push(AarmParallelPlanningTelemetry {
@@ -1288,7 +1443,10 @@ impl TaskRuntime {
                         })
                     })
                     .map_err(|_| {
-                        BackendError::new("Parallel memory budget exceeds the addressable range")
+                        BackendError::new(
+                            codes::EXEC_PARALLEL_ARRAY_BOUNDS_OR_OVERFLOW,
+                            "Parallel memory budget exceeds the addressable range",
+                        )
                     })
             })
             .collect()
@@ -1328,13 +1486,17 @@ impl TaskRuntime {
         body: mir::SymbolId,
     ) -> Result<(), BackendError> {
         if end < start {
-            return Err(BackendError::new(format!(
-                "Parallel.For range end {end} is before start {start}"
-            )));
+            return Err(BackendError::new(
+                codes::EXEC_PARALLEL_RANGE_INVALID,
+                format!("Parallel.For range end {end} is before start {start}"),
+            ));
         }
         let total = i64::from(end) - i64::from(start);
         let total = usize::try_from(total).map_err(|_| {
-            BackendError::new("Parallel.For range exceeds the addressable iteration count")
+            BackendError::new(
+                codes::EXEC_PARALLEL_RANGE_INVALID,
+                "Parallel.For range exceeds the addressable iteration count",
+            )
         })?;
         if total == 0 {
             return Ok(());
@@ -1345,16 +1507,31 @@ impl TaskRuntime {
         let mut receivers = Vec::with_capacity(boundaries.len());
         let mut cursor = i64::from(start);
         for (length, memory_budget) in boundaries.into_iter().zip(budgets) {
-            let chunk_start = i32::try_from(cursor)
-                .map_err(|_| BackendError::new("Parallel.For chunk start exceeds `int`"))?;
-            cursor =
-                cursor
-                    .checked_add(i64::try_from(length).map_err(|_| {
-                        BackendError::new("Parallel.For chunk length exceeds `long`")
-                    })?)
-                    .ok_or_else(|| BackendError::new("Parallel.For chunk boundary overflow"))?;
-            let chunk_end = i32::try_from(cursor)
-                .map_err(|_| BackendError::new("Parallel.For chunk end exceeds `int`"))?;
+            let chunk_start = i32::try_from(cursor).map_err(|_| {
+                BackendError::new(
+                    codes::EXEC_PARALLEL_RANGE_INVALID,
+                    "Parallel.For chunk start exceeds `int`",
+                )
+            })?;
+            cursor = cursor
+                .checked_add(i64::try_from(length).map_err(|_| {
+                    BackendError::new(
+                        codes::EXEC_PARALLEL_RANGE_INVALID,
+                        "Parallel.For chunk length exceeds `long`",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    BackendError::new(
+                        codes::EXEC_PARALLEL_RANGE_INVALID,
+                        "Parallel.For chunk boundary overflow",
+                    )
+                })?;
+            let chunk_end = i32::try_from(cursor).map_err(|_| {
+                BackendError::new(
+                    codes::EXEC_PARALLEL_RANGE_INVALID,
+                    "Parallel.For chunk end exceeds `int`",
+                )
+            })?;
             let submission = self.pool.submit_parallel(JobKind::ForChunk {
                 symbol: body,
                 start: chunk_start,
@@ -1486,7 +1663,10 @@ impl TaskRuntime {
                 memory_budget,
             })?;
             let outcome = receiver.recv().map_err(|_| {
-                BackendError::new("a Parallel.Reduce combine worker disconnected before finishing")
+                BackendError::new(
+                    codes::EXEC_PARALLEL_WORKER_DISCONNECTED,
+                    "a Parallel.Reduce combine worker disconnected before finishing",
+                )
             })?;
             #[cfg(feature = "aarm-telemetry")]
             if let Some(telemetry) = outcome.telemetry {
@@ -1517,6 +1697,7 @@ fn plan_task_memory_domain(
 ) -> Result<TaskMemoryDomainPlan, BackendError> {
     if worker_count == 0 {
         return Err(BackendError::new(
+            codes::EXEC_POOL_INVALID_WORKER_CONFIG,
             "Task.Run memory planning requires at least one worker",
         ));
     }
@@ -1533,8 +1714,12 @@ fn plan_task_memory_domain(
             .unwrap_or(usize::MAX)
             .min(worker_count)
     };
-    let concurrency = u64::try_from(concurrency_limit)
-        .map_err(|_| BackendError::new("Task.Run memory concurrency exceeds telemetry"))?;
+    let concurrency = u64::try_from(concurrency_limit).map_err(|_| {
+        BackendError::new(
+            codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
+            "Task.Run memory concurrency exceeds telemetry",
+        )
+    })?;
     let initial_task_ceiling = if usable_page_slots == 0 {
         available_headroom_bytes.min(local_limit)
     } else {
@@ -1542,25 +1727,54 @@ fn plan_task_memory_domain(
     };
     let initial_task_total = initial_task_ceiling
         .checked_mul(concurrency)
-        .ok_or_else(|| BackendError::new("Task.Run memory plan overflow"))?;
+        .ok_or_else(|| {
+            BackendError::new(
+                codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
+                "Task.Run memory plan overflow",
+            )
+        })?;
     let remaining = available_headroom_bytes
         .checked_sub(initial_task_total)
-        .ok_or_else(|| BackendError::new("Task.Run memory plan exceeds available headroom"))?;
-    let participants = concurrency
-        .checked_add(1)
-        .ok_or_else(|| BackendError::new("Task.Run memory participant count overflow"))?;
+        .ok_or_else(|| {
+            BackendError::new(
+                codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
+                "Task.Run memory plan exceeds available headroom",
+            )
+        })?;
+    let participants = concurrency.checked_add(1).ok_or_else(|| {
+        BackendError::new(
+            codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
+            "Task.Run memory participant count overflow",
+        )
+    })?;
     let uniform_extra =
         (remaining / participants).min(local_limit.saturating_sub(initial_task_ceiling));
-    let task_context_ceiling_bytes = initial_task_ceiling
-        .checked_add(uniform_extra)
-        .ok_or_else(|| BackendError::new("Task.Run context entitlement overflow"))?;
+    let task_context_ceiling_bytes =
+        initial_task_ceiling
+            .checked_add(uniform_extra)
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
+                    "Task.Run context entitlement overflow",
+                )
+            })?;
     let task_total = task_context_ceiling_bytes
         .checked_mul(concurrency)
-        .ok_or_else(|| BackendError::new("Task.Run aggregate entitlement overflow"))?;
+        .ok_or_else(|| {
+            BackendError::new(
+                codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
+                "Task.Run aggregate entitlement overflow",
+            )
+        })?;
     let main_local_headroom = local_limit.saturating_sub(main_retained_capacity_bytes);
     let main_future_growth_bytes = available_headroom_bytes
         .checked_sub(task_total)
-        .ok_or_else(|| BackendError::new("Task.Run aggregate entitlement exceeds headroom"))?
+        .ok_or_else(|| {
+            BackendError::new(
+                codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
+                "Task.Run aggregate entitlement exceeds headroom",
+            )
+        })?
         .min(main_local_headroom);
 
     Ok(TaskMemoryDomainPlan {
@@ -1587,9 +1801,12 @@ fn plan_async_memory_domain(
     let mut excess = 0_u64;
     for (index, share) in raw.into_iter().enumerate() {
         budgets[index] = share.min(caps[index]);
-        excess = excess
-            .checked_add(share - budgets[index])
-            .ok_or_else(|| BackendError::new("async memory plan overflow"))?;
+        excess = excess.checked_add(share - budgets[index]).ok_or_else(|| {
+            BackendError::new(
+                codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
+                "async memory plan overflow",
+            )
+        })?;
     }
     for (budget, cap) in budgets.iter_mut().zip(caps) {
         let additional = excess.min(cap - *budget);
@@ -1617,8 +1834,12 @@ pub fn parallel_chunk_budgets(
     if chunk_count == 0 {
         return Ok(Vec::new());
     }
-    let chunks = u64::try_from(chunk_count)
-        .map_err(|_| BackendError::new("Parallel chunk count exceeds the addressable range"))?;
+    let chunks = u64::try_from(chunk_count).map_err(|_| {
+        BackendError::new(
+            codes::EXEC_PARALLEL_ARRAY_BOUNDS_OR_OVERFLOW,
+            "Parallel chunk count exceeds the addressable range",
+        )
+    })?;
     let minimum_page = u64::try_from(aster_runtime::ExecutionContext::AARM_MIN_PAGE_CAPACITY_BYTES)
         .expect("minimum arena page capacity fits u64");
     let page_winners = (available_headroom_bytes / minimum_page).min(chunks);
@@ -1629,9 +1850,12 @@ pub fn parallel_chunk_budgets(
     let winner_count =
         usize::try_from(page_winners).expect("page winner count is bounded by the chunk count");
     let mut budgets = Vec::new();
-    budgets
-        .try_reserve_exact(chunk_count)
-        .map_err(|_| BackendError::new("Parallel memory plan exceeds host limits"))?;
+    budgets.try_reserve_exact(chunk_count).map_err(|_| {
+        BackendError::new(
+            codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
+            "Parallel memory plan exceeds host limits",
+        )
+    })?;
     budgets.resize(chunk_count, 0);
     budgets[..winner_count].fill(minimum_page);
     if winner_count < chunk_count {
@@ -1721,6 +1945,7 @@ fn collect_chunks_observed(
     let result = match first_error {
         Some((_, error)) => Err(error),
         None if disconnected => Err(BackendError::new(
+            codes::EXEC_PARALLEL_WORKER_DISCONNECTED,
             "a Parallel worker disconnected before finishing",
         )),
         None => Ok(()),
@@ -1781,6 +2006,7 @@ fn collect_reduce_chunks_observed(
     let result = match first_error {
         Some((_, error)) => Err(error),
         None if disconnected => Err(BackendError::new(
+            codes::EXEC_PARALLEL_WORKER_DISCONNECTED,
             "a Parallel.Reduce worker disconnected before finishing",
         )),
         None => Ok(partials),
@@ -2360,7 +2586,10 @@ mod tests {
         let (logical_tx, logical_rx) = mpsc::channel();
         logical_tx
             .send(ChunkOutcome {
-                first_error: Some((7, BackendError::new("later logical failure"))),
+                first_error: Some((
+                    7,
+                    BackendError::new(codes::EXEC_WORKER_EXECUTION_FAILED, "later logical failure"),
+                )),
                 #[cfg(feature = "aarm-telemetry")]
                 telemetry: None,
             })
@@ -2421,13 +2650,22 @@ mod tests {
         let (tx1, rx1) = mpsc::channel();
         // The chunk covering the *later* logical position reports first.
         tx1.send(ReduceChunkOutcome {
-            result: Err((5, BackendError::new("late position failure"))),
+            result: Err((
+                5,
+                BackendError::new(codes::EXEC_WORKER_EXECUTION_FAILED, "late position failure"),
+            )),
             #[cfg(feature = "aarm-telemetry")]
             telemetry: None,
         })
         .expect("chunk 1 sends first");
         tx0.send(ReduceChunkOutcome {
-            result: Err((2, BackendError::new("early position failure"))),
+            result: Err((
+                2,
+                BackendError::new(
+                    codes::EXEC_WORKER_EXECUTION_FAILED,
+                    "early position failure",
+                ),
+            )),
             #[cfg(feature = "aarm-telemetry")]
             telemetry: None,
         })
@@ -2447,7 +2685,10 @@ mod tests {
         let (logical_tx, logical_rx) = mpsc::channel();
         logical_tx
             .send(ReduceChunkOutcome {
-                result: Err((7, BackendError::new("later logical failure"))),
+                result: Err((
+                    7,
+                    BackendError::new(codes::EXEC_WORKER_EXECUTION_FAILED, "later logical failure"),
+                )),
                 #[cfg(feature = "aarm-telemetry")]
                 telemetry: None,
             })

@@ -178,6 +178,24 @@ pub struct DictionaryEntryLayout {
     pub value_field: SymbolId,
 }
 
+/// How a null-conditional `?.` expression turns its inner access result into
+/// the overall `?.` result after unwrapping a `Some` receiver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NullConditionalResult {
+    /// Statement-only `void` access (`a?.Reset();`): returns `void`.
+    Void,
+    /// Non-optional inner access `V` wrapped into `Option<V>`.
+    Wrap {
+        some_case: SymbolId,
+        some_field: SymbolId,
+        some_tag: u32,
+        none_case: SymbolId,
+        none_tag: u32,
+    },
+    /// Inner access already produces `Option<V>` and flattens into `Option<V>`.
+    Flatten { none_case: SymbolId, none_tag: u32 },
+}
+
 impl FileIoResultLayout {
     /// Sentinel used only as a placeholder in
     /// `StandardLibrary::intrinsic_bindings()`, before HIR lowering resolves
@@ -838,6 +856,38 @@ pub enum ExpressionKind {
         return_type: Type,
         return_none_case: SymbolId,
         return_none_tag: u32,
+    },
+    /// `expr == null` (`negated == false`) or `expr != null` (`negated == true`)
+    /// on an `aster.core.Option<T>`.
+    IsNull {
+        operand: Box<Expression>,
+        none_tag: u32,
+        negated: bool,
+    },
+    /// Short-circuiting `value ?? fallback`: evaluates `value` once, and either
+    /// returns its `Some` payload (`unwraps == true`) / `value` (`unwraps == false`),
+    /// or evaluates `fallback`.
+    NullCoalesce {
+        value: Box<Expression>,
+        fallback: Box<Expression>,
+        some_case: SymbolId,
+        some_field: SymbolId,
+        some_tag: u32,
+        none_tag: u32,
+        unwraps: bool,
+    },
+    /// Short-circuiting `receiver?.access`: evaluates `receiver` once, binds the
+    /// unwrapped payload to `receiver_symbol` for `access`, and wraps/flattens
+    /// into `Option<V>` (or runs as statement `void`).
+    NullConditional {
+        receiver: Box<Expression>,
+        receiver_symbol: SymbolId,
+        receiver_some_case: SymbolId,
+        receiver_some_field: SymbolId,
+        receiver_some_tag: u32,
+        receiver_none_tag: u32,
+        access: Box<Expression>,
+        result: NullConditionalResult,
     },
     Binary {
         left: Box<Expression>,

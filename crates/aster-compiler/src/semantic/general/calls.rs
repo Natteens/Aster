@@ -5,6 +5,7 @@ use super::{
     ResolvedParallelReduce, ResolvedStringBuilderOperation, ResolvedTaskRun, Signature, Span, Type,
     TypeKind, TypeRef, Visibility, resolve_type_readonly,
 };
+use aster_diagnostics::codes;
 use aster_hir::StringOperation;
 
 impl Analyzer<'_> {
@@ -18,9 +19,12 @@ impl Analyzer<'_> {
         if type_name == "List" || type_name.starts_with("List<") {
             if !arguments.is_empty() {
                 self.diagnostics.push(
-                    Diagnostic::error("`new List<T>()` takes no arguments", span).with_help(
-                        "remove the arguments; `List<T>` has no constructor parameters yet",
-                    ),
+                    Diagnostic::error(
+                        codes::SEM_CALL_LIST_CTOR_ARGS,
+                        "`new List<T>()` takes no arguments",
+                        span,
+                    )
+                    .with_help("remove the arguments; `List<T>` has no constructor parameters yet"),
                 );
                 for argument in arguments {
                     self.expression(argument);
@@ -41,6 +45,7 @@ impl Analyzer<'_> {
         if type_name == "Dictionary" || type_name.starts_with("Dictionary<") {
             if !arguments.is_empty() {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_DICT_CTOR_ARGS,
                     "`new Dictionary<K, V>()` takes no arguments",
                     span,
                 ));
@@ -51,12 +56,17 @@ impl Analyzer<'_> {
             }
             let type_ = resolve_type_readonly(&TypeRef::new(type_name, span), self.context);
             if type_ == Type::Unknown {
-                self.diagnostics.push(Diagnostic::error(format!("type `{type_name}` is not a valid concrete `Dictionary<K, V>` specialization"), span));
+                self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_DICT_INVALID_SPEC,
+                    format!("type `{type_name}` is not a valid concrete `Dictionary<K, V>` specialization"),
+                    span,
+                ));
             }
             return type_;
         }
         let Some(info) = self.context.types.get(type_name) else {
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_CALL_UNKNOWN_TYPE,
                 format!("unknown type `{type_name}`"),
                 span,
             ));
@@ -65,6 +75,7 @@ impl Analyzer<'_> {
         if info.is_static {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_CALL_NEW_STATIC_CLASS,
                     format!("static class `{type_name}` cannot be instantiated"),
                     span,
                 )
@@ -78,6 +89,7 @@ impl Analyzer<'_> {
         if info.kind != Some(TypeKind::Class) {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_CALL_NEW_NON_CLASS,
                     format!("`new` requires a class, but `{type_name}` is not a class"),
                     span,
                 )
@@ -91,6 +103,7 @@ impl Analyzer<'_> {
         if info.is_abstract {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_CALL_NEW_ABSTRACT_CLASS,
                     format!("abstract class `{type_name}` cannot be instantiated"),
                     span,
                 )
@@ -103,8 +116,12 @@ impl Analyzer<'_> {
         }
         if info.constructors.is_empty() {
             self.diagnostics.push(
-                Diagnostic::error(format!("class `{type_name}` has no constructor"), span)
-                    .with_help(format!("declare `{type_name}(...)` inside the class")),
+                Diagnostic::error(
+                    codes::SEM_CALL_NO_CONSTRUCTOR,
+                    format!("class `{type_name}` has no constructor"),
+                    span,
+                )
+                .with_help(format!("declare `{type_name}(...)` inside the class")),
             );
             for argument in arguments {
                 self.expression(argument);
@@ -127,11 +144,16 @@ impl Analyzer<'_> {
                 .all(|constructor| constructor.visibility == Visibility::Protected);
             if all_protected {
                 self.diagnostics.push(
-                    Diagnostic::error(format!("constructor `{type_name}` is protected"), span)
-                        .with_help("a protected constructor is reached only through `base(...)` from a derived class"),
+                    Diagnostic::error(
+                        codes::SEM_CALL_PROTECTED_CONSTRUCTOR,
+                        format!("constructor `{type_name}` is protected"),
+                        span,
+                    )
+                    .with_help("a protected constructor is reached only through `base(...)` from a derived class"),
                 );
             } else {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_PRIVATE_CONSTRUCTOR,
                     format!("constructor `{type_name}` is private"),
                     span,
                 ));
@@ -171,6 +193,7 @@ impl Analyzer<'_> {
             if !binding.initialized {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_CALL_UNINITIALIZED_VARIABLE,
                         format!("variable `{name}` is used before initialization"),
                         span,
                     )
@@ -189,6 +212,7 @@ impl Analyzer<'_> {
         {
             let Some(getter) = &property.getter else {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_PROPERTY_UNREADABLE,
                     format!("property `{owner}.{name}` cannot be read"),
                     span,
                 ));
@@ -230,6 +254,7 @@ impl Analyzer<'_> {
             };
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_CALL_INSTANCE_IN_STATIC,
                     format!("instance {member_kind} `{name}` cannot be used in {context}"),
                     span,
                 )
@@ -245,8 +270,12 @@ impl Analyzer<'_> {
                 return Type::Unknown;
             }
             self.diagnostics.push(
-                Diagnostic::error(format!("unknown name `{name}`"), span)
-                    .with_help("declare the name before using it"),
+                Diagnostic::error(
+                    codes::SEM_CALL_UNKNOWN_NAME,
+                    format!("unknown name `{name}`"),
+                    span,
+                )
+                .with_help("declare the name before using it"),
             );
             Type::Unknown
         }
@@ -265,6 +294,7 @@ impl Analyzer<'_> {
                 .find(|(_, case)| case.name == name)
             else {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_UNKNOWN_ENUM_CASE,
                     format!("enum `{enum_name}` has no case `{name}`"),
                     span,
                 ));
@@ -273,6 +303,7 @@ impl Analyzer<'_> {
             if !case.fields.is_empty() {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_CALL_ENUM_PAYLOAD_REQUIRED,
                         format!("enum case `{enum_name}.{name}` requires payload arguments"),
                         span,
                     )
@@ -298,6 +329,7 @@ impl Analyzer<'_> {
                 return Type::Int;
             }
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_CALL_NO_MEMBER,
                 format!("array has no member `{name}`"),
                 span,
             ));
@@ -308,6 +340,7 @@ impl Analyzer<'_> {
                 return Type::Int;
             }
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_CALL_NO_MEMBER,
                 format!("string has no member `{name}`"),
                 span,
             ));
@@ -318,6 +351,7 @@ impl Analyzer<'_> {
                 return Type::Int;
             }
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_CALL_NO_MEMBER,
                 format!("list has no member `{name}`"),
                 span,
             ));
@@ -328,6 +362,7 @@ impl Analyzer<'_> {
                 return Type::Int;
             }
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_CALL_NO_MEMBER,
                 format!("dictionary has no member `{name}`"),
                 span,
             ));
@@ -338,6 +373,7 @@ impl Analyzer<'_> {
             Type::Unknown => return Type::Unknown,
             other => {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_NO_MEMBER,
                     format!("type `{}` has no member `{name}`", other.display()),
                     span,
                 ));
@@ -352,6 +388,7 @@ impl Analyzer<'_> {
                 .is_some_and(|binding| !binding.initialized)
         {
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_CALL_UNINITIALIZED_FIELD,
                 format!("field `{name}` is used before initialization"),
                 span,
             ));
@@ -367,6 +404,7 @@ impl Analyzer<'_> {
                 if let Some(property) = info.properties.get(name) {
                     let Some(getter) = &property.getter else {
                         self.diagnostics.push(Diagnostic::error(
+                            codes::SEM_CALL_PROPERTY_UNREADABLE,
                             format!("property `{type_name}.{name}` cannot be read"),
                             span,
                         ));
@@ -397,6 +435,7 @@ impl Analyzer<'_> {
                     if receiver_is_base && getter.dispatch == MemberDispatch::Abstract {
                         self.diagnostics.push(
                             Diagnostic::error(
+                                codes::SEM_CALL_ABSTRACT_BASE_MEMBER,
                                 format!(
                                     "`base.{name}` is abstract and has no implementation to call"
                                 ),
@@ -428,6 +467,7 @@ impl Analyzer<'_> {
                         return Type::Unknown;
                     }
                     self.diagnostics.push(Diagnostic::error(
+                        codes::SEM_CALL_NO_FIELD,
                         format!("type `{type_name}` has no field `{name}`"),
                         span,
                     ));
@@ -471,6 +511,7 @@ impl Analyzer<'_> {
                 .find(|(_, case)| case.name == *name)
             else {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_UNKNOWN_ENUM_CASE,
                     format!("enum `{enum_name}` has no case `{name}`"),
                     callee.span,
                 ));
@@ -524,6 +565,7 @@ impl Analyzer<'_> {
         if is_task_cancellation_requested_callee(callee) {
             if !arguments.is_empty() {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_TASK_PROP_ARGS,
                     "`Task.IsCancellationRequested` accepts no arguments",
                     span,
                 ));
@@ -550,6 +592,7 @@ impl Analyzer<'_> {
                 if name == "Wait" && self.async_state != super::AsyncAnalysisState::OutsideAsync {
                     self.diagnostics.push(
                         Diagnostic::error(
+                            codes::SEM_CALL_WAIT_IN_ASYNC,
                             "`Wait()` is not supported inside an `async` function in this version",
                             span,
                         )
@@ -558,6 +601,7 @@ impl Analyzer<'_> {
                 }
                 if !arguments.is_empty() {
                     self.diagnostics.push(Diagnostic::error(
+                        codes::SEM_CALL_TASK_PROP_ARGS,
                         format!("`Task<T>.{name}` accepts no arguments"),
                         span,
                     ));
@@ -642,6 +686,7 @@ impl Analyzer<'_> {
                         .collect::<Vec<_>>();
                     if candidates.is_empty() {
                         self.diagnostics.push(Diagnostic::error(
+                            codes::SEM_CALL_NO_STATIC_METHOD,
                             format!("type `{type_name}` has no static method `{name}`"),
                             callee.span,
                         ));
@@ -685,8 +730,14 @@ impl Analyzer<'_> {
                     if let Type::List(element_type) = &receiver {
                         if name == "Add" {
                             if arguments.len() != 1 {
+                                for argument in arguments {
+                                    if super::expressions::needs_contextual_type(argument) {
+                                        self.expression(argument);
+                                    }
+                                }
                                 self.diagnostics.push(
                                     Diagnostic::error(
+                                        codes::SEM_CALL_LIST_METHOD_ARITY,
                                         format!(
                                             "`List<T>.Add` expects 1 argument, found {}",
                                             arguments.len()
@@ -697,17 +748,19 @@ impl Analyzer<'_> {
                                 );
                                 return Type::Unknown;
                             }
-                            self.require_assignable_value(
-                                element_type,
-                                &argument_types[0],
+                            let actual = self.resolve_contextual_argument(
                                 &arguments[0],
+                                &argument_types[0],
+                                Some(element_type),
                             );
+                            self.require_assignable_value(element_type, &actual, &arguments[0]);
                             return Type::Void;
                         }
                         if name == "Get" {
                             if arguments.len() != 1 {
                                 self.diagnostics.push(
                                     Diagnostic::error(
+                                        codes::SEM_CALL_LIST_METHOD_ARITY,
                                         format!(
                                             "`List<T>.Get` expects 1 argument, found {}",
                                             arguments.len()
@@ -722,6 +775,7 @@ impl Analyzer<'_> {
                             {
                                 self.diagnostics.push(
                                     Diagnostic::error(
+                                        codes::SEM_CALL_LIST_METHOD_ARG_TYPE,
                                         format!(
                                             "`List<T>.Get` requires an `int` index, found `{}`",
                                             argument_types[0].display()
@@ -738,6 +792,7 @@ impl Analyzer<'_> {
                             if arguments.len() != 1 {
                                 self.diagnostics.push(
                                     Diagnostic::error(
+                                        codes::SEM_CALL_LIST_METHOD_ARITY,
                                         format!(
                                             "`List<T>.RemoveAt` expects 1 argument, found {}",
                                             arguments.len()
@@ -752,6 +807,7 @@ impl Analyzer<'_> {
                             {
                                 self.diagnostics.push(
                                     Diagnostic::error(
+                                        codes::SEM_CALL_LIST_METHOD_ARG_TYPE,
                                         format!(
                                             "`List<T>.RemoveAt` requires an `int` index, found `{}`",
                                             argument_types[0].display()
@@ -767,6 +823,7 @@ impl Analyzer<'_> {
                         if name == "Set" {
                             if arguments.len() != 2 {
                                 self.diagnostics.push(Diagnostic::error(
+                                    codes::SEM_CALL_LIST_METHOD_ARITY,
                                     format!(
                                         "`List<T>.Set` expects 2 arguments, found {}",
                                         arguments.len()
@@ -775,27 +832,34 @@ impl Analyzer<'_> {
                                 ));
                                 return Type::Unknown;
                             }
-                            if argument_types[0] != Type::Int && argument_types[0] != Type::Unknown
-                            {
+                            let index_type = self.resolve_contextual_argument(
+                                &arguments[0],
+                                &argument_types[0],
+                                None,
+                            );
+                            if index_type != Type::Int && index_type != Type::Unknown {
                                 self.diagnostics.push(Diagnostic::error(
+                                    codes::SEM_CALL_LIST_METHOD_ARG_TYPE,
                                     format!(
                                         "`List<T>.Set` requires an `int` index, found `{}`",
-                                        argument_types[0].display()
+                                        index_type.display()
                                     ),
                                     arguments[0].span,
                                 ));
                                 return Type::Unknown;
                             }
-                            self.require_assignable_value(
-                                element_type,
-                                &argument_types[1],
+                            let actual = self.resolve_contextual_argument(
                                 &arguments[1],
+                                &argument_types[1],
+                                Some(element_type),
                             );
+                            self.require_assignable_value(element_type, &actual, &arguments[1]);
                             return Type::Void;
                         }
                         if name == "Clear" {
                             if !arguments.is_empty() {
                                 self.diagnostics.push(Diagnostic::error(
+                                    codes::SEM_CALL_LIST_METHOD_ARITY,
                                     format!(
                                         "`List<T>.Clear` expects 0 arguments, found {}",
                                         arguments.len()
@@ -809,6 +873,7 @@ impl Analyzer<'_> {
                         if name == "ToArray" {
                             if !arguments.is_empty() {
                                 self.diagnostics.push(Diagnostic::error(
+                                    codes::SEM_CALL_LIST_METHOD_ARITY,
                                     format!(
                                         "`List<T>.ToArray` expects 0 arguments, found {}",
                                         arguments.len()
@@ -827,6 +892,7 @@ impl Analyzer<'_> {
                                 )
                             {
                                 self.diagnostics.push(Diagnostic::error(
+                                    codes::SEM_CALL_LIST_METHOD_ARG_TYPE,
                                     "`List<T>.EnsureCapacity` expects one `int` argument",
                                     span,
                                 ));
@@ -835,10 +901,19 @@ impl Analyzer<'_> {
                             return Type::Int;
                         }
                         if name == "AddRange" {
+                            let expected_array = Type::Array(element_type.clone());
+                            let arg0 = arguments.first().map(|argument| {
+                                self.resolve_contextual_argument(
+                                    argument,
+                                    &argument_types[0],
+                                    Some(&expected_array),
+                                )
+                            });
                             if arguments.len() != 1
-                                || !matches!(argument_types.first(), Some(Type::Array(found)) if found.as_ref() == element_type.as_ref())
+                                || !matches!(arg0.as_ref(), Some(Type::Array(found)) if found.as_ref() == element_type.as_ref())
                             {
                                 self.diagnostics.push(Diagnostic::error(
+                                    codes::SEM_CALL_LIST_METHOD_ARG_TYPE,
                                     format!(
                                         "`List<T>.AddRange` expects one `{}[]` argument",
                                         element_type.display()
@@ -850,23 +925,25 @@ impl Analyzer<'_> {
                             return Type::Void;
                         }
                         if name == "Insert" {
+                            let index_type = arguments.first().map(|argument| {
+                                self.resolve_contextual_argument(argument, &argument_types[0], None)
+                            });
                             if arguments.len() != 2
-                                || !matches!(
-                                    argument_types.first(),
-                                    Some(Type::Int | Type::Unknown)
-                                )
+                                || !matches!(index_type.as_ref(), Some(Type::Int | Type::Unknown))
                             {
                                 self.diagnostics.push(Diagnostic::error(
+                                    codes::SEM_CALL_LIST_METHOD_ARG_TYPE,
                                     "`List<T>.Insert` expects an `int` index and one element",
                                     span,
                                 ));
                                 return Type::Unknown;
                             }
-                            self.require_assignable_value(
-                                element_type,
-                                &argument_types[1],
+                            let actual = self.resolve_contextual_argument(
                                 &arguments[1],
+                                &argument_types[1],
+                                Some(element_type),
                             );
+                            self.require_assignable_value(element_type, &actual, &arguments[1]);
                             return Type::Void;
                         }
                         if name == "RemoveRange" {
@@ -876,6 +953,7 @@ impl Analyzer<'_> {
                                     .all(|type_| matches!(type_, Type::Int | Type::Unknown))
                             {
                                 self.diagnostics.push(Diagnostic::error(
+                                    codes::SEM_CALL_LIST_METHOD_ARG_TYPE,
                                     "`List<T>.RemoveRange` expects `int` index and count arguments",
                                     span,
                                 ));
@@ -886,6 +964,7 @@ impl Analyzer<'_> {
                         if name == "Reverse" {
                             if !arguments.is_empty() {
                                 self.diagnostics.push(Diagnostic::error(
+                                    codes::SEM_CALL_LIST_METHOD_ARITY,
                                     "`List<T>.Reverse` expects 0 arguments",
                                     span,
                                 ));
@@ -900,6 +979,7 @@ impl Analyzer<'_> {
                                     .all(|type_| matches!(type_, Type::Int | Type::Unknown))
                             {
                                 self.diagnostics.push(Diagnostic::error(
+                                    codes::SEM_CALL_LIST_METHOD_ARG_TYPE,
                                     "`List<T>.GetRange` expects `int` index and count arguments",
                                     span,
                                 ));
@@ -908,6 +988,7 @@ impl Analyzer<'_> {
                             return Type::Array(element_type.clone());
                         }
                         self.diagnostics.push(Diagnostic::error(
+                            codes::SEM_CALL_NO_MEMBER,
                             format!("list has no member `{name}`"),
                             callee.span,
                         ));
@@ -922,6 +1003,7 @@ impl Analyzer<'_> {
                         };
                         let Some(expected_arity) = expected_arity else {
                             self.diagnostics.push(Diagnostic::error(
+                                codes::SEM_CALL_NO_MEMBER,
                                 format!("dictionary has no member `{name}`"),
                                 callee.span,
                             ));
@@ -929,6 +1011,7 @@ impl Analyzer<'_> {
                         };
                         if arguments.len() != expected_arity {
                             self.diagnostics.push(Diagnostic::error(
+                                codes::SEM_CALL_DICT_METHOD_ARITY,
                                 format!(
                                     "`Dictionary<K, V>.{name}` expects {expected_arity} argument(s), found {}",
                                     arguments.len()
@@ -939,21 +1022,28 @@ impl Analyzer<'_> {
                         }
                         if let Some(argument) = arguments.first() {
                             if name == "EnsureCapacity" {
-                                self.require_assignable_value(
-                                    &Type::Int,
-                                    &argument_types[0],
+                                let actual = self.resolve_contextual_argument(
                                     argument,
+                                    &argument_types[0],
+                                    Some(&Type::Int),
                                 );
+                                self.require_assignable_value(&Type::Int, &actual, argument);
                             } else {
-                                self.require_assignable_value(
-                                    key_type,
-                                    &argument_types[0],
+                                let actual = self.resolve_contextual_argument(
                                     argument,
+                                    &argument_types[0],
+                                    Some(key_type),
                                 );
+                                self.require_assignable_value(key_type, &actual, argument);
                             }
                         }
                         if let Some(argument) = arguments.get(1) {
-                            self.require_assignable_value(value_type, &argument_types[1], argument);
+                            let actual = self.resolve_contextual_argument(
+                                argument,
+                                &argument_types[1],
+                                Some(value_type),
+                            );
+                            self.require_assignable_value(value_type, &actual, argument);
                         }
                         match name.as_str() {
                             "EnsureCapacity" => {
@@ -1006,6 +1096,7 @@ impl Analyzer<'_> {
                                 let Some(option) = self.option_cases(&option_name) else {
                                     self.diagnostics.push(
                                         Diagnostic::error(
+                                            codes::SEM_CALL_DICT_MISSING_STDLIB_TYPE,
                                             format!(
                                                 "`Dictionary<K, V>.TryGet` requires the official `{option_name}` type"
                                             ),
@@ -1017,6 +1108,7 @@ impl Analyzer<'_> {
                                 };
                                 if !self.is_official_option(&option_name) {
                                     self.diagnostics.push(Diagnostic::error(
+                                        codes::SEM_CALL_DICT_MISSING_STDLIB_TYPE,
                                         "`Dictionary<K, V>.TryGet` requires the official `aster.core.Option<V>`",
                                         span,
                                     ));
@@ -1041,6 +1133,7 @@ impl Analyzer<'_> {
                                 if !self.context.types.contains_key(&entry_name) {
                                     self.diagnostics.push(
                                         Diagnostic::error(
+                                            codes::SEM_CALL_DICT_MISSING_STDLIB_TYPE,
                                             format!(
                                                 "`Dictionary<K, V>.Entries` requires the official `{entry_name}` type"
                                             ),
@@ -1083,6 +1176,7 @@ impl Analyzer<'_> {
                             return Type::Unknown;
                         }
                         self.diagnostics.push(Diagnostic::error(
+                            codes::SEM_CALL_NO_METHOD,
                             format!("type `{type_name}` has no method `{name}`"),
                             callee.span,
                         ));
@@ -1099,6 +1193,7 @@ impl Analyzer<'_> {
                         if receiver_is_base && callable.dispatch == MemberDispatch::Abstract {
                             self.diagnostics.push(
                                 Diagnostic::error(
+                                    codes::SEM_CALL_ABSTRACT_BASE_MEMBER,
                                     format!("`base.{name}` is abstract and has no implementation to call"),
                                     span,
                                 )
@@ -1144,6 +1239,7 @@ impl Analyzer<'_> {
             {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_CALL_INSTANCE_METHOD_NO_RECEIVER,
                         format!("instance method `{name}` requires an object"),
                         callee.span,
                     )
@@ -1155,8 +1251,12 @@ impl Analyzer<'_> {
                 return Type::Unknown;
             }
             self.diagnostics.push(
-                Diagnostic::error("expression is not a known callable", callee.span)
-                    .with_help("call a declared namespace function or method"),
+                Diagnostic::error(
+                    codes::SEM_CALL_NOT_CALLABLE,
+                    "expression is not a known callable",
+                    callee.span,
+                )
+                .with_help("call a declared namespace function or method"),
             );
             return Type::Unknown;
         };
@@ -1166,6 +1266,7 @@ impl Analyzer<'_> {
             if self.unsafe_depth == 0 {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_CALL_FOREIGN_REQUIRES_UNSAFE,
                         format!(
                             "foreign call `{}` requires an `unsafe` block",
                             callable_key.name
@@ -1240,6 +1341,7 @@ impl Analyzer<'_> {
     ) -> Type {
         if name != "ToString" {
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_CALL_NO_METHOD,
                 format!("`{}` has no method `{name}`", receiver.display()),
                 span,
             ));
@@ -1247,6 +1349,7 @@ impl Analyzer<'_> {
         }
         if !argument_types.is_empty() {
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_CALL_ARG_COUNT_MISMATCH,
                 format!(
                     "`{}.ToString` expects 0 arguments, found {}",
                     receiver.display(),
@@ -1284,6 +1387,7 @@ impl Analyzer<'_> {
             ),
             ("Contains" | "StartsWith" | "EndsWith" | "IndexOf", found) => {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_STRING_METHOD_ARITY,
                     format!("`string.{name}` expects 1 argument, found {found}"),
                     span,
                 ));
@@ -1291,6 +1395,7 @@ impl Analyzer<'_> {
             }
             ("Substring", found) => {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_STRING_METHOD_ARITY,
                     format!("`string.Substring` expects 1 or 2 arguments, found {found}"),
                     span,
                 ));
@@ -1312,6 +1417,7 @@ impl Analyzer<'_> {
                 found,
             ) => {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_STRING_METHOD_ARITY,
                     format!("`string.{name}` expects 0 arguments, found {found}"),
                     span,
                 ));
@@ -1319,6 +1425,7 @@ impl Analyzer<'_> {
             }
             _ => {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_NO_METHOD,
                     format!("string has no method `{name}`"),
                     span,
                 ));
@@ -1332,6 +1439,7 @@ impl Analyzer<'_> {
             if actual != expected && *actual != Type::Unknown {
                 incompatible = true;
                 self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_ARG_TYPE_MISMATCH,
                     format!(
                         "expected `{}`, found `{}`",
                         expected.display(),
@@ -1382,6 +1490,7 @@ impl Analyzer<'_> {
         if self.context.official_option.is_none() {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_CALL_STRING_TRYPARSE_OPTION,
                     format!("`string.{name}` requires `aster.core.Option<{target}>`"),
                     span,
                 )
@@ -1393,6 +1502,7 @@ impl Analyzer<'_> {
         if !self.context.types.contains_key(&option_name) {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_CALL_STRING_TRYPARSE_OPTION,
                     format!(
                         "`string.{name}` requires the `Option<{target}>` specialization, which was not generated"
                     ),
@@ -1442,6 +1552,7 @@ impl Analyzer<'_> {
                 for (expected, actual) in candidate.signature.parameters.iter().zip(arguments) {
                     if !self.compatible(expected, actual) {
                         self.diagnostics.push(Diagnostic::error(
+                            codes::SEM_CALL_ARG_TYPE_MISMATCH,
                             format!(
                                 "expected `{}`, found `{}`",
                                 expected.display(),
@@ -1455,6 +1566,7 @@ impl Analyzer<'_> {
             }
             if let [candidate] = candidates {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_ARG_COUNT_MISMATCH,
                     format!(
                         "expected {} argument(s), found {}",
                         candidate.signature.parameters.len(),
@@ -1466,6 +1578,7 @@ impl Analyzer<'_> {
             }
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_CALL_NO_OVERLOAD_MATCH,
                     format!("no overload of `{name}` accepts these argument types"),
                     span,
                 )
@@ -1475,8 +1588,12 @@ impl Analyzer<'_> {
         };
         if ranked.get(1).is_some_and(|(score, _)| score == best_score) {
             self.diagnostics.push(
-                Diagnostic::error(format!("call to `{name}` is ambiguous"), span)
-                    .with_help("cast an argument explicitly to select one overload"),
+                Diagnostic::error(
+                    codes::SEM_CALL_AMBIGUOUS_OVERLOAD,
+                    format!("call to `{name}` is ambiguous"),
+                    span,
+                )
+                .with_help("cast an argument explicitly to select one overload"),
             );
             return None;
         }
@@ -1522,6 +1639,20 @@ impl Analyzer<'_> {
                                 // `byte b = 10;`) is applicable, but ranks below every implicit
                                 // conversion so existing overload choices do not change.
                                 Some(score + 3)
+                            } else if let Type::Enum(opt_name) = expected
+                                && self.is_official_option(opt_name)
+                                && let Some(cases) = self.option_cases(opt_name)
+                                && self
+                                    .integer_constant_conversion(
+                                        &cases.success,
+                                        actual,
+                                        &arguments[source],
+                                    )
+                                    .is_some_and(|(constant, minimum, maximum)| {
+                                        (minimum..=maximum).contains(&constant)
+                                    })
+                            {
+                                Some(score + 4)
                             } else {
                                 None
                             }
@@ -1548,6 +1679,7 @@ impl Analyzer<'_> {
             } else {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_CALL_NO_OVERLOAD_MATCH,
                         format!("no overload of `{name}` accepts these arguments"),
                         span,
                     )
@@ -1561,8 +1693,12 @@ impl Analyzer<'_> {
             .is_some_and(|(score, _, _)| *score == best_score)
         {
             self.diagnostics.push(
-                Diagnostic::error(format!("call to `{name}` is ambiguous"), span)
-                    .with_help("use explicit argument types or names that select one overload"),
+                Diagnostic::error(
+                    codes::SEM_CALL_AMBIGUOUS_OVERLOAD,
+                    format!("call to `{name}` is ambiguous"),
+                    span,
+                )
+                .with_help("use explicit argument types or names that select one overload"),
             );
             return None;
         }
@@ -1637,6 +1773,8 @@ impl Analyzer<'_> {
             base_access: false,
             base_arguments: self.base_arguments,
             chain_label: self.chain_label,
+            null_conditional_receiver_types: self.null_conditional_receiver_types.clone(),
+            allow_void_null_conditional: false,
         };
         let actual = analyzer.expression_expected(argument, Some(expected));
         analyzer.require_assignable_value(expected, &actual, argument);
@@ -1661,6 +1799,7 @@ impl Analyzer<'_> {
                     .position(|parameter| parameter == name)
                 else {
                     self.diagnostics.push(Diagnostic::error(
+                        codes::SEM_CALL_UNKNOWN_NAMED_ARG,
                         format!("unknown named argument `{name}`"),
                         argument.span,
                     ));
@@ -1670,6 +1809,7 @@ impl Analyzer<'_> {
             } else {
                 if saw_named {
                     self.diagnostics.push(Diagnostic::error(
+                        codes::SEM_CALL_POSITIONAL_AFTER_NAMED,
                         "positional arguments must precede named arguments",
                         argument.span,
                     ));
@@ -1679,6 +1819,7 @@ impl Analyzer<'_> {
                 }
                 if next == occupied.len() {
                     self.diagnostics.push(Diagnostic::error(
+                        codes::SEM_CALL_TOO_MANY_ARGS,
                         "too many arguments for this callable",
                         argument.span,
                     ));
@@ -1690,6 +1831,7 @@ impl Analyzer<'_> {
             };
             if std::mem::replace(&mut occupied[parameter], true) {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_DUPLICATE_NAMED_ARG,
                     format!(
                         "parameter `{}` is supplied more than once",
                         candidate.parameter_names[parameter]
@@ -1701,6 +1843,7 @@ impl Analyzer<'_> {
         for (parameter, supplied) in occupied.into_iter().enumerate() {
             if !supplied && candidate.defaults[parameter].is_none() {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_MISSING_REQUIRED_ARG,
                     format!(
                         "missing required argument `{}`",
                         candidate.parameter_names[parameter]
@@ -1733,12 +1876,17 @@ impl Analyzer<'_> {
     fn logging_call(&mut self, level: LogLevel<'_>, arguments: &[Argument], span: Span) -> Type {
         if matches!(level, LogLevel::Unknown("Info" | "Debug")) {
             self.diagnostics.push(
-                Diagnostic::error(format!("`Log.{}` does not exist", level.name()), span)
-                    .with_help("use `Log`, `Log.Warning`, or `Log.Error`"),
+                Diagnostic::error(
+                    codes::SEM_CALL_UNKNOWN_LOG_METHOD,
+                    format!("`Log.{}` does not exist", level.name()),
+                    span,
+                )
+                .with_help("use `Log`, `Log.Warning`, or `Log.Error`"),
             );
         } else if matches!(level, LogLevel::Unknown(_)) {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_CALL_UNKNOWN_LOG_METHOD,
                     format!("unknown logging method `Log.{}`", level.name()),
                     span,
                 )
@@ -1759,14 +1907,30 @@ impl Analyzer<'_> {
     fn task_run(&mut self, arguments: &[Argument], span: Span) -> Type {
         let Some((target, values)) = arguments.split_first() else {
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_CALL_TASK_RUN_SIGNATURE,
                 "`Task.Run` expects a function argument",
                 span,
             ));
             return Type::Unknown;
         };
+        let candidates = self.task_run_candidates(target);
         let value_types = values
             .iter()
-            .map(|argument| self.expression(argument))
+            .enumerate()
+            .map(|(index, argument)| {
+                if super::expressions::needs_contextual_type(argument) {
+                    let mut matching_types = candidates
+                        .iter()
+                        .filter(|candidate| candidate.signature.parameters.len() == values.len())
+                        .filter_map(|candidate| candidate.signature.parameters.get(index));
+                    if let Some(first) = matching_types.next()
+                        && matching_types.all(|other| other == first)
+                    {
+                        return self.expression_expected(argument, Some(first));
+                    }
+                }
+                self.expression(argument)
+            })
             .collect::<Vec<_>>();
         let Some(candidate) = self.resolve_task_run_target(target, &value_types) else {
             return Type::Unknown;
@@ -1774,6 +1938,7 @@ impl Analyzer<'_> {
         if !self.worker_transferable_layout(&candidate.signature.result, &mut HashSet::new()) {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_CALL_TASK_RESULT_NOT_TRANSFERABLE,
                     format!(
                         "`Task<{}>` cannot cross a worker boundary",
                         candidate.signature.result.display()
@@ -1790,6 +1955,7 @@ impl Analyzer<'_> {
             if !self.worker_transferable_layout(type_, &mut HashSet::new()) {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_CALL_TASK_ARG_NOT_TRANSFERABLE,
                         format!(
                             "`{}` cannot cross a worker boundary as a `Task.Run` argument",
                             type_.display()
@@ -1817,6 +1983,64 @@ impl Analyzer<'_> {
             },
         );
         Type::Task(Box::new(result_type))
+    }
+
+    fn resolve_contextual_argument(
+        &mut self,
+        argument: &Expression,
+        already_checked: &Type,
+        expected: Option<&Type>,
+    ) -> Type {
+        if super::expressions::needs_contextual_type(argument) {
+            if let Some(expected) = expected {
+                self.expression_expected(argument, Some(expected))
+            } else {
+                self.expression(argument)
+            }
+        } else {
+            already_checked.clone()
+        }
+    }
+
+    fn task_run_candidates(&self, argument: &Expression) -> Vec<Callable> {
+        match &argument.kind {
+            ExpressionKind::Name(name) => {
+                let mut candidates = self
+                    .context
+                    .functions
+                    .get(name)
+                    .into_iter()
+                    .flatten()
+                    .filter(|candidate| candidate.is_static)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                candidates.extend(
+                    self.methods
+                        .get(name)
+                        .into_iter()
+                        .flatten()
+                        .filter(|candidate| candidate.is_static)
+                        .cloned(),
+                );
+                candidates
+            }
+            ExpressionKind::Member { object, name } => {
+                let ExpressionKind::Name(type_name) = &object.kind else {
+                    return Vec::new();
+                };
+                let Some(info) = self.context.types.get(type_name) else {
+                    return Vec::new();
+                };
+                info.methods
+                    .get(name)
+                    .into_iter()
+                    .flatten()
+                    .filter(|candidate| candidate.is_static)
+                    .cloned()
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// Resolve `Task.Run`'s target against the concrete runtime argument
@@ -1852,6 +2076,7 @@ impl Analyzer<'_> {
             ExpressionKind::Member { object, name } => {
                 let ExpressionKind::Name(type_name) = &object.kind else {
                     self.diagnostics.push(Diagnostic::error(
+                        codes::SEM_CALL_TASK_RUN_SIGNATURE,
                         "`Task.Run` argument must directly name a static method or free function",
                         argument.span,
                     ));
@@ -1859,6 +2084,7 @@ impl Analyzer<'_> {
                 };
                 let Some(info) = self.context.types.get(type_name) else {
                     self.diagnostics.push(Diagnostic::error(
+                        codes::SEM_CALL_UNKNOWN_TYPE,
                         format!("unknown type `{type_name}`"),
                         argument.span,
                     ));
@@ -1876,6 +2102,7 @@ impl Analyzer<'_> {
             }
             _ => {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_TASK_RUN_SIGNATURE,
                     "`Task.Run` argument must directly name a static method or free function",
                     argument.span,
                 ));
@@ -1887,6 +2114,7 @@ impl Analyzer<'_> {
     fn task_wait_all(&mut self, arguments: &[Argument], span: Span) -> Type {
         let [tasks] = arguments else {
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_CALL_WAITALL_ARGS,
                 format!(
                     "`Task.WaitAll` expects exactly one task-array argument, found {}",
                     arguments.len()
@@ -1901,6 +2129,7 @@ impl Analyzer<'_> {
         let type_ = self.expression(tasks);
         let Type::Array(element) = type_ else {
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_CALL_WAITALL_ARGS,
                 "`Task.WaitAll` requires a homogeneous `Task<T>[]` array",
                 tasks.span,
             ));
@@ -1908,6 +2137,7 @@ impl Analyzer<'_> {
         };
         let Type::Task(result) = *element else {
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_CALL_WAITALL_ARGS,
                 "`Task.WaitAll` requires a homogeneous `Task<T>[]` array",
                 tasks.span,
             ));
@@ -1915,6 +2145,7 @@ impl Analyzer<'_> {
         };
         if !self.worker_transferable_layout(&result, &mut HashSet::new()) {
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_CALL_WAITALL_RESULT_TYPE,
                 format!(
                     "`Task.WaitAll` cannot compose `Task<{}>` results",
                     result.display()
@@ -2006,6 +2237,7 @@ impl Analyzer<'_> {
     fn parallel_for(&mut self, arguments: &[Argument], span: Span) -> Type {
         let [start, end, body] = arguments else {
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_CALL_PARALLEL_FOR_ARITY,
                 format!(
                     "`Parallel.For` expects exactly 3 arguments, found {}",
                     arguments.len()
@@ -2039,6 +2271,7 @@ impl Analyzer<'_> {
     fn parallel_for_each(&mut self, arguments: &[Argument], span: Span) -> Type {
         let [values, body] = arguments else {
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_CALL_PARALLEL_FOREACH_ARGS,
                 format!(
                     "`Parallel.ForEach` expects exactly 2 arguments, found {}",
                     arguments.len()
@@ -2053,6 +2286,7 @@ impl Analyzer<'_> {
         let values_type = self.expression(values);
         let Type::Array(element_type) = values_type else {
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_CALL_PARALLEL_FOREACH_ARGS,
                 "`Parallel.ForEach` requires an array argument",
                 values.span,
             ));
@@ -2062,6 +2296,7 @@ impl Analyzer<'_> {
         if !transferable(&element_type) {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_CALL_PARALLEL_FOREACH_ARGS,
                     format!(
                         "`Parallel.ForEach` over `{}[]` requires a scalar element type in this version",
                         element_type.display()
@@ -2099,6 +2334,7 @@ impl Analyzer<'_> {
     fn parallel_reduce(&mut self, arguments: &[Argument], span: Span) -> Type {
         let [values, identity, accumulate_argument, combine_argument] = arguments else {
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_CALL_PARALLEL_REDUCE_ARGS,
                 format!(
                     "`Parallel.Reduce` expects exactly 4 arguments, found {}",
                     arguments.len()
@@ -2113,6 +2349,7 @@ impl Analyzer<'_> {
         let values_type = self.expression(values);
         let Type::Array(element_type) = values_type else {
             self.diagnostics.push(Diagnostic::error(
+                codes::SEM_CALL_PARALLEL_REDUCE_ARGS,
                 "`Parallel.Reduce` requires an array argument",
                 values.span,
             ));
@@ -2124,6 +2361,7 @@ impl Analyzer<'_> {
         if !transferable(&element_type) {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_CALL_PARALLEL_REDUCE_ARGS,
                     format!(
                         "`Parallel.Reduce` over `{}[]` requires a scalar element type in this version",
                         element_type.display()
@@ -2141,6 +2379,7 @@ impl Analyzer<'_> {
         if !transferable(&identity_type) {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_CALL_PARALLEL_REDUCE_ARGS,
                     format!(
                         "`Parallel.Reduce` identity of type `{}` cannot cross a worker boundary in this version",
                         identity_type.display()
@@ -2217,6 +2456,7 @@ impl Analyzer<'_> {
             ExpressionKind::Member { object, name } => {
                 let ExpressionKind::Name(type_name) = &object.kind else {
                     self.diagnostics.push(Diagnostic::error(
+                        codes::SEM_CALL_PARALLEL_REDUCE_OPERATOR,
                         format!(
                             "a `Parallel.Reduce` {operator_name} must directly name a static method or free function"
                         ),
@@ -2226,6 +2466,7 @@ impl Analyzer<'_> {
                 };
                 let Some(info) = self.context.types.get(type_name) else {
                     self.diagnostics.push(Diagnostic::error(
+                        codes::SEM_CALL_UNKNOWN_TYPE,
                         format!("unknown type `{type_name}`"),
                         argument.span,
                     ));
@@ -2241,6 +2482,7 @@ impl Analyzer<'_> {
             }
             _ => {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_PARALLEL_REDUCE_OPERATOR,
                     format!(
                         "a `Parallel.Reduce` {operator_name} must directly name a static method or free function"
                     ),
@@ -2260,6 +2502,7 @@ impl Analyzer<'_> {
             0 => {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_CALL_PARALLEL_REDUCE_OPERATOR,
                         format!(
                             "no static method or free function with signature `{}({})` is available for this `Parallel.Reduce` {operator_name}",
                             expected_return.display(),
@@ -2280,6 +2523,7 @@ impl Analyzer<'_> {
             1 => matching.into_iter().next(),
             _ => {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_PARALLEL_REDUCE_OPERATOR,
                     format!(
                         "this `Parallel.Reduce` {operator_name} is ambiguous among multiple candidates"
                     ),
@@ -2324,6 +2568,7 @@ impl Analyzer<'_> {
             ExpressionKind::Member { object, name } => {
                 let ExpressionKind::Name(type_name) = &object.kind else {
                     self.diagnostics.push(Diagnostic::error(
+                        codes::SEM_CALL_PARALLEL_BODY,
                         "a `Parallel` body must directly name a static method or free function",
                         argument.span,
                     ));
@@ -2331,6 +2576,7 @@ impl Analyzer<'_> {
                 };
                 let Some(info) = self.context.types.get(type_name) else {
                     self.diagnostics.push(Diagnostic::error(
+                        codes::SEM_CALL_UNKNOWN_TYPE,
                         format!("unknown type `{type_name}`"),
                         argument.span,
                     ));
@@ -2346,6 +2592,7 @@ impl Analyzer<'_> {
             }
             _ => {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_PARALLEL_BODY,
                     "a `Parallel` body must directly name a static method or free function",
                     argument.span,
                 ));
@@ -2363,6 +2610,7 @@ impl Analyzer<'_> {
             0 => {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::SEM_CALL_PARALLEL_BODY,
                         format!(
                             "no static method or free function with signature `void({})` is available for this `Parallel` body",
                             expected_parameters
@@ -2380,6 +2628,7 @@ impl Analyzer<'_> {
             1 => matching.into_iter().next(),
             _ => {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_PARALLEL_BODY,
                     "this `Parallel` body is ambiguous among multiple candidates",
                     argument.span,
                 ));
@@ -2392,6 +2641,7 @@ impl Analyzer<'_> {
         if arguments.len() != signature.parameters.len() {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::SEM_CALL_ARG_COUNT_MISMATCH,
                     format!(
                         "expected {} argument(s), found {}",
                         signature.parameters.len(),
@@ -2489,6 +2739,7 @@ fn diagnose_enum_arguments(
 ) {
     if arguments.len() != fields.len() {
         diagnostics.push(Diagnostic::error(
+            codes::SEM_CALL_ENUM_PAYLOAD_ARITY,
             format!(
                 "enum case `{enum_name}.{case_name}` expects {} argument(s), found {}",
                 fields.len(),
@@ -2503,6 +2754,7 @@ fn diagnose_enum_arguments(
         let parameter = if let Some(name) = &argument.name {
             let Some(parameter) = fields.iter().position(|(field, _)| field == name) else {
                 diagnostics.push(Diagnostic::error(
+                    codes::SEM_CALL_ENUM_PAYLOAD_UNKNOWN_NAME,
                     format!("unknown enum payload argument `{name}`"),
                     argument.span,
                 ));
@@ -2522,6 +2774,7 @@ fn diagnose_enum_arguments(
         };
         if std::mem::replace(&mut occupied[parameter], true) {
             diagnostics.push(Diagnostic::error(
+                codes::SEM_CALL_ENUM_PAYLOAD_DUPLICATE,
                 format!(
                     "enum payload `{}` is supplied more than once",
                     fields[parameter].0
@@ -2533,6 +2786,7 @@ fn diagnose_enum_arguments(
     for (index, supplied) in occupied.into_iter().enumerate() {
         if !supplied {
             diagnostics.push(Diagnostic::error(
+                codes::SEM_CALL_ENUM_PAYLOAD_MISSING,
                 format!("missing enum payload argument `{}`", fields[index].0),
                 span,
             ));

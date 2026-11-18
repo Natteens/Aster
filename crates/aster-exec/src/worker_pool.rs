@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
+use aster_diagnostics::codes;
+
 use crate::completion_queue::{CompletionQueue, CompletionToken};
 use crate::{BackendError, CodeProvider, ExecutableProgram, ExecutionValue, mir};
 
@@ -54,14 +56,18 @@ impl TaskPayload {
             || !(pointer as usize).is_multiple_of(std::mem::align_of::<u64>())
         {
             return Err(BackendError::new(
+                codes::EXEC_TASK_ARG_FRAME_INVALID,
                 "Task.Run received an invalid argument frame",
             ));
         }
         let words = size / 8;
         let mut owned = Vec::new();
-        owned
-            .try_reserve_exact(words)
-            .map_err(|_| BackendError::new("Task.Run could not allocate its argument payload"))?;
+        owned.try_reserve_exact(words).map_err(|_| {
+            BackendError::new(
+                codes::EXEC_TASK_ARG_FRAME_INVALID,
+                "Task.Run could not allocate its argument payload",
+            )
+        })?;
         owned.resize(words, 0);
         // SAFETY: generated code passes a live stack frame of exactly `size`
         // bytes and this function copies it before returning to generated code.
@@ -896,7 +902,10 @@ impl JobQueue {
         let origin = self.current_worker();
         let mut state = self.state.lock().expect("job queue mutex is not poisoned");
         if state.closed {
-            return Err(BackendError::new("execution pool is shut down"));
+            return Err(BackendError::new(
+                codes::EXEC_POOL_SHUTDOWN,
+                "execution pool is shut down",
+            ));
         }
         match origin {
             Some(index) if index < state.locals.len() => state.locals[index].push_back(job),
@@ -1183,10 +1192,13 @@ impl TaskHandle {
     /// instead of blocking forever or panicking.
     pub fn join(self) -> Result<TaskOutcome, BackendError> {
         self.receiver.recv().map_err(|_| {
-            BackendError::new(format!(
-                "task {:?}'s worker disconnected before sending a result",
-                self.id
-            ))
+            BackendError::new(
+                codes::EXEC_WORKER_DISCONNECTED,
+                format!(
+                    "task {:?}'s worker disconnected before sending a result",
+                    self.id
+                ),
+            )
         })
     }
 
@@ -1249,14 +1261,18 @@ impl ExecutionPool {
     ) -> Result<Self, BackendError> {
         if worker_count == 0 {
             return Err(BackendError::new(
+                codes::EXEC_POOL_INVALID_WORKER_CONFIG,
                 "execution pool requires at least one worker",
             ));
         }
         provider.validate(&module)?;
         let mut workers = Vec::new();
-        workers
-            .try_reserve(worker_count)
-            .map_err(|_| BackendError::new("execution pool worker capacity exceeds host limits"))?;
+        workers.try_reserve(worker_count).map_err(|_| {
+            BackendError::new(
+                codes::EXEC_POOL_INVALID_WORKER_CONFIG,
+                "execution pool worker capacity exceeds host limits",
+            )
+        })?;
         Ok(Self {
             shared: std::sync::OnceLock::new(),
             provider,
@@ -1337,7 +1353,10 @@ impl ExecutionPool {
         failing_index: Option<usize>,
     ) -> Result<(), BackendError> {
         if self.queue.is_closed() {
-            return Err(BackendError::new("execution pool is shut down"));
+            return Err(BackendError::new(
+                codes::EXEC_POOL_SHUTDOWN,
+                "execution pool is shut down",
+            ));
         }
         let target = worker_count.max(1).min(self.max_workers);
         let mut workers = self.workers.lock().expect("workers mutex is not poisoned");
@@ -1348,7 +1367,12 @@ impl ExecutionPool {
         let mut ready_receivers = Vec::new();
         ready_receivers
             .try_reserve(additional_workers)
-            .map_err(|_| BackendError::new("worker preparation capacity exceeds host limits"))?;
+            .map_err(|_| {
+                BackendError::new(
+                    codes::EXEC_POOL_INVALID_WORKER_CONFIG,
+                    "worker preparation capacity exceeds host limits",
+                )
+            })?;
         let shared = self.shared_program()?;
         for index in workers.len()..target {
             self.queue.register_worker(index);
@@ -1361,6 +1385,7 @@ impl ExecutionPool {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     if simulate_this_worker_failing {
                         let _ = ready_tx.send(Err(BackendError::new(
+                            codes::EXEC_POOL_INVALID_WORKER_CONFIG,
                             "simulated worker preparation failure",
                         )));
                         return;
@@ -1381,6 +1406,7 @@ impl ExecutionPool {
         for ready_rx in ready_receivers {
             let outcome = ready_rx.recv().unwrap_or_else(|_| {
                 Err(BackendError::new(
+                    codes::EXEC_WORKER_DISCONNECTED,
                     "a worker thread terminated before completing initialization",
                 ))
             });
@@ -1590,9 +1616,10 @@ impl ExecutionPool {
     /// waiter's own domain: each job runs in a fresh `ExecutionContext`.
     pub fn join_helping(&self, handle: TaskHandle) -> Result<TaskOutcome, BackendError> {
         let disconnected = |id: TaskId| {
-            BackendError::new(format!(
-                "task {id:?}'s worker disconnected before sending a result"
-            ))
+            BackendError::new(
+                codes::EXEC_WORKER_DISCONNECTED,
+                format!("task {id:?}'s worker disconnected before sending a result"),
+            )
         };
         let Some(program) = self.shared.get() else {
             return handle.join();
@@ -1839,7 +1866,10 @@ mod tests {
         let failed = TaskControl::new();
         assert!(failed.begin_or_resume());
         assert!(failed.cancel());
-        let outcome = failed.finish(TaskOutcome::Failed(BackendError::new("real failure")));
+        let outcome = failed.finish(TaskOutcome::Failed(BackendError::new(
+            codes::EXEC_WORKER_EXECUTION_FAILED,
+            "real failure",
+        )));
         assert!(matches!(
             outcome,
             TaskOutcome::Failed(error) if !error.is_cancellation() && error.message() == "real failure"
@@ -1917,7 +1947,10 @@ mod tests {
             let finish_barrier = Arc::clone(&barrier);
             let finish = thread::spawn(move || {
                 finish_barrier.wait();
-                finish_control.finish(TaskOutcome::Failed(BackendError::new("real failure")))
+                finish_control.finish(TaskOutcome::Failed(BackendError::new(
+                    codes::EXEC_WORKER_EXECUTION_FAILED,
+                    "real failure",
+                )))
             });
 
             barrier.wait();
@@ -1995,10 +2028,12 @@ mod tests {
         let governor = Arc::new(aster_runtime::MemoryGovernor::new(0));
         let domain = AsyncMemoryDomain::new(governor, 0, 0, 0);
         let move_error = Err(BackendError::new(
+            codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
             "Aster runtime error: allocation exceeds the deterministic async MoveNext memory entitlement of 0 bytes",
         ));
         domain.record_move_next_outcome(&move_error, None);
         let inner_error = TaskOutcome::Failed(BackendError::new(
+            codes::EXEC_ENTITLEMENT_OR_CAPACITY_EXCEEDED,
             "Aster runtime error: allocation exceeds the deterministic async awaited-inner memory entitlement of 0 bytes",
         ));
         domain.record_inner_outcome(&inner_error, None);

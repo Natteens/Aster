@@ -17,8 +17,9 @@ Option<string> name = ReadLine();
 WriteLine("done");
 ```
 
-`Write` and `WriteLine` accept `string`. `ReadLine` returns `Option<string>` so end-of-input does not
-require `null` or an exception.
+`Write` and `WriteLine` accept `string`. `ReadLine` returns `Option<string>` (`string?`) so
+end-of-input is represented as typed absence (`None` / `null`) rather than an untyped null pointer
+or an exception.
 
 Terminal I/O is rejected inside worker bodies.
 

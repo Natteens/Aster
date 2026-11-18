@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use aster_diagnostics::Diagnostic;
+use aster_diagnostics::{Diagnostic, codes};
 use aster_syntax::{Item, Member, Module, TypeDeclaration, TypeRef};
 
 /// Rewrite `module` in place. Returns the diagnostics of invalid interface
@@ -131,6 +131,7 @@ fn validate_bases(
         if !seen.insert(base.name.as_str()) {
             diagnostics.push(
                 Diagnostic::error(
+                    codes::INTERFACE_DUPLICATE_BASE,
                     format!(
                         "interface `{}` is listed more than once as a base of `{}`",
                         base.name, declaration.name
@@ -143,11 +144,16 @@ fn validate_bases(
         }
         match kinds.get(&base.name) {
             None => diagnostics.push(
-                Diagnostic::error(format!("unknown interface `{}`", base.name), base.span)
-                    .with_help("declare the interface or add a using for its namespace"),
+                Diagnostic::error(
+                    codes::INTERFACE_UNKNOWN_BASE,
+                    format!("unknown interface `{}`", base.name),
+                    base.span,
+                )
+                .with_help("declare the interface or add a using for its namespace"),
             ),
             Some(false) => diagnostics.push(
                 Diagnostic::error(
+                    codes::INTERFACE_NON_INTERFACE_BASE,
                     format!(
                         "`{}` is not an interface and cannot be a base of interface `{}`",
                         base.name, declaration.name
@@ -183,6 +189,7 @@ fn close(
         path.push(name.to_owned());
         diagnostics.push(
             Diagnostic::error(
+                codes::INTERFACE_INHERITANCE_CYCLE,
                 format!("interface inheritance cycle: {}", path.join(" -> ")),
                 declaration.span,
             )
@@ -248,6 +255,7 @@ fn add_inherited(
                     if existing.return_type.name != method.return_type.name {
                         diagnostics.push(
                             Diagnostic::error(
+                                codes::INTERFACE_CONFLICTING_METHOD,
                                 format!(
                                     "interface `{owner}` inherits conflicting declarations of `{}` (returns `{}` and `{}`)",
                                     method.name, existing.return_type.name, method.return_type.name
@@ -272,6 +280,7 @@ fn add_inherited(
                 if existing.name == property.name {
                     if existing.type_ref.name != property.type_ref.name {
                         diagnostics.push(Diagnostic::error(
+                            codes::INTERFACE_CONFLICTING_PROPERTY,
                             format!(
                                 "interface `{owner}` inherits conflicting declarations of `{}` from `{}`",
                                 property.name, base.name

@@ -1,6 +1,5 @@
 use super::types::{
-    binary_type, conditional_type, constant_expression, convert, literal_value, promoted,
-    unary_promoted,
+    binary_type, conditional_type, constant_expression, literal_value, promoted, unary_promoted,
 };
 use super::{Lowerer, ast, hir};
 
@@ -22,9 +21,14 @@ impl Lowerer<'_> {
                         right,
                     } = &expression.kind
                     {
-                        work.push(Work::Combine(*operator, expression.span));
-                        work.push(Work::Visit(right));
-                        work.push(Work::Visit(left));
+                        let key = self.model.node_key(&self.model_context, expression.span);
+                        if let Some(resolved) = self.model.null_checks.get(&key).cloned() {
+                            values.push(self.null_check_expression(left, right, &resolved));
+                        } else {
+                            work.push(Work::Combine(*operator, expression.span));
+                            work.push(Work::Visit(right));
+                            work.push(Work::Visit(left));
+                        }
                     } else {
                         values.push(self.expression(expression));
                     }
@@ -51,8 +55,8 @@ impl Lowerer<'_> {
                         "semantic analysis and the promotion table disagree on a binary operand type"
                     );
                     if let Some(operand) = &operand {
-                        left = convert(left, operand);
-                        right = convert(right, operand);
+                        left = self.convert_to(left, operand);
+                        right = self.convert_to(right, operand);
                     }
                     // An identity comparison across a base chain compares the
                     // same object through the base class: upcast the derived
@@ -60,15 +64,27 @@ impl Lowerer<'_> {
                     if matches!(
                         operator,
                         ast::BinaryOperator::Equal | ast::BinaryOperator::NotEqual
-                    ) && let (hir::Type::Class(l), hir::Type::Class(r)) =
-                        (&left.type_, &right.type_)
-                    {
-                        if self.derives_from(*l, *r) {
-                            let target = right.type_.clone();
-                            left = convert(left, &target);
-                        } else if self.derives_from(*r, *l) {
-                            let target = left.type_.clone();
-                            right = convert(right, &target);
+                    ) {
+                        if let (hir::Type::Class(l), hir::Type::Class(r)) =
+                            (&left.type_, &right.type_)
+                        {
+                            if self.derives_from(*l, *r) {
+                                let target = right.type_.clone();
+                                left = self.convert_to(left, &target);
+                            } else if self.derives_from(*r, *l) {
+                                let target = left.type_.clone();
+                                right = self.convert_to(right, &target);
+                            }
+                        } else if left.type_ != right.type_ {
+                            let left_depth = self.option_depth(&left.type_);
+                            let right_depth = self.option_depth(&right.type_);
+                            if left_depth > right_depth {
+                                let target = left.type_.clone();
+                                right = self.convert_to(right, &target);
+                            } else if right_depth > left_depth {
+                                let target = right.type_.clone();
+                                left = self.convert_to(left, &target);
+                            }
                         }
                     }
                     let type_ = binary_type(operator, operand.as_ref(), &left.type_);
@@ -91,7 +107,11 @@ impl Lowerer<'_> {
     #[allow(clippy::too_many_lines)]
     pub(super) fn expression(&mut self, expression: &ast::Expression) -> hir::Expression {
         let model_key = self.model.node_key(&self.model_context, expression.span);
-        if let Some(resolved) = self.model.enum_values.get(&model_key).cloned() {
+        if matches!(
+            expression.kind,
+            ast::ExpressionKind::Call { .. } | ast::ExpressionKind::Member { .. }
+        ) && let Some(resolved) = self.model.enum_values.get(&model_key).cloned()
+        {
             let enum_symbol = self.types[&resolved.enum_name];
             let (case_symbol, field_symbols) =
                 self.enum_cases[&(resolved.enum_name, resolved.case_index)].clone();
@@ -111,7 +131,7 @@ impl Lowerer<'_> {
                     let target = self.symbol_types[&field].clone();
                     hir::FieldValue {
                         field,
-                        value: convert(self.expression(argument), &target),
+                        value: self.convert_expression(argument, &target),
                     }
                 })
                 .collect();
@@ -165,6 +185,21 @@ impl Lowerer<'_> {
                         object: Box::new(object),
                         receiver,
                         assignments,
+                    },
+                }
+            }
+            ast::ExpressionKind::Literal(ast::Literal::Null) => {
+                let resolved = &self.model.null_literals[&model_key];
+                let enum_symbol = self.types[&resolved.option_type];
+                let (none_case, _) =
+                    self.enum_cases[&(resolved.option_type.clone(), resolved.none_index)].clone();
+                hir::Expression {
+                    type_: hir::Type::Enum(enum_symbol),
+                    kind: hir::ExpressionKind::EnumValue {
+                        enum_symbol,
+                        case: none_case,
+                        tag: tag(resolved.none_index),
+                        fields: Vec::new(),
                     },
                 }
             }
@@ -281,7 +316,7 @@ impl Lowerer<'_> {
                             members[&ast::auto_property_backing_field(&field.name)]
                         });
                         let target = self.symbol_types[&field_symbol].clone();
-                        let value = convert(self.expression(&field.value), &target);
+                        let value = self.convert_expression(&field.value, &target);
                         hir::FieldValue {
                             field: field_symbol,
                             value,
@@ -302,8 +337,14 @@ impl Lowerer<'_> {
                     .map(|value| self.expression(value))
                     .collect::<Vec<_>>();
                 let element_type = elements
-                    .first()
-                    .map(|value| value.type_.clone())
+                    .iter()
+                    .enumerate()
+                    .max_by(|(i, a), (j, b)| {
+                        self.option_depth(&a.type_)
+                            .cmp(&self.option_depth(&b.type_))
+                            .then_with(|| j.cmp(i))
+                    })
+                    .map(|(_, value)| value.type_.clone())
                     .or_else(|| {
                         self.model
                             .contextual_empty_array_elements
@@ -314,7 +355,7 @@ impl Lowerer<'_> {
                     })
                     .unwrap_or(hir::Type::Unknown);
                 for element in &mut elements {
-                    *element = convert(element.clone(), &element_type);
+                    *element = self.convert_to(element.clone(), &element_type);
                 }
                 hir::Expression {
                     type_: hir::Type::Array(Box::new(element_type)),
@@ -404,12 +445,12 @@ impl Lowerer<'_> {
                     .iter()
                     .zip(&plan.source_to_parameter)
                     .map(|(argument, parameter)| {
-                        convert(self.expression(argument), &parameter_types[*parameter])
+                        self.convert_expression(argument, &parameter_types[*parameter])
                     })
                     .collect::<Vec<_>>();
                 let mut argument_order = plan.source_to_parameter;
                 for default in plan.defaults {
-                    lowered.push(convert(
+                    lowered.push(self.convert_to(
                         constant_expression(&default.value),
                         &parameter_types[default.parameter],
                     ));
@@ -562,7 +603,7 @@ impl Lowerer<'_> {
                         .iter()
                         .skip(1)
                         .zip(parameter_types)
-                        .map(|(argument, target)| convert(self.expression(argument), &target))
+                        .map(|(argument, target)| self.convert_expression(argument, &target))
                         .collect();
                     return hir::Expression {
                         type_: hir::Type::Task(Box::new(return_type.clone())),
@@ -710,10 +751,9 @@ impl Lowerer<'_> {
                                 kind: hir::ExpressionKind::ListInsert {
                                     list: Box::new(object),
                                     index: Box::new(self.expression(&arguments[0])),
-                                    value: Box::new(convert(
-                                        self.expression(&arguments[1]),
-                                        &element_type,
-                                    )),
+                                    value: Box::new(
+                                        self.convert_expression(&arguments[1], &element_type),
+                                    ),
                                 },
                             },
                             "RemoveRange" => hir::Expression {
@@ -749,7 +789,7 @@ impl Lowerer<'_> {
                 {
                     let object = self.expression(object);
                     if let hir::Type::List(element_type) = object.type_.clone() {
-                        let value = convert(self.expression(&arguments[0]), &element_type);
+                        let value = self.convert_expression(&arguments[0], &element_type);
                         return hir::Expression {
                             type_: hir::Type::Void,
                             kind: hir::ExpressionKind::ListAdd {
@@ -770,10 +810,9 @@ impl Lowerer<'_> {
                             kind: hir::ExpressionKind::ListSet {
                                 list: Box::new(object),
                                 index: Box::new(self.expression(&arguments[0])),
-                                value: Box::new(convert(
-                                    self.expression(&arguments[1]),
-                                    &element_type,
-                                )),
+                                value: Box::new(
+                                    self.convert_expression(&arguments[1], &element_type),
+                                ),
                             },
                         };
                     }
@@ -855,10 +894,10 @@ impl Lowerer<'_> {
                             } else {
                                 (*key_type).clone()
                             };
-                            *first = convert(first.clone(), &expected);
+                            *first = self.convert_to(first.clone(), &expected);
                         }
                         if let Some(value) = lowered_arguments.get_mut(1) {
-                            *value = convert(value.clone(), &value_type);
+                            *value = self.convert_to(value.clone(), &value_type);
                         }
                         let mut lowered_arguments = lowered_arguments.into_iter();
                         let mut key = || {
@@ -1128,14 +1167,14 @@ impl Lowerer<'_> {
                     .map(|(value, parameter)| {
                         let mut argument = self.expression(value);
                         if let Some(target) = parameter_types.get(*parameter) {
-                            argument = convert(argument, target);
+                            argument = self.convert_to(argument, target);
                         }
                         argument
                     })
                     .collect::<Vec<_>>();
                 let mut argument_order = plan.source_to_parameter;
                 for default in plan.defaults {
-                    lowered.push(convert(
+                    lowered.push(self.convert_to(
                         constant_expression(&default.value),
                         &parameter_types[default.parameter],
                     ));
@@ -1208,7 +1247,7 @@ impl Lowerer<'_> {
                 if *operator == ast::UnaryOperator::BitwiseNot
                     && let Some(promoted) = unary_promoted(&operand.type_)
                 {
-                    operand = convert(operand, &promoted);
+                    operand = self.convert_to(operand, &promoted);
                 }
                 let type_ = operand.type_.clone();
                 hir::Expression {
@@ -1366,10 +1405,20 @@ impl Lowerer<'_> {
                             .find(|class| right_chain.contains(class))
                             .map_or_else(|| when_true.type_.clone(), hir::Type::Class)
                     }
-                    _ => conditional_type(&when_true.type_, &when_false.type_),
+                    _ => {
+                        let true_depth = self.option_depth(&when_true.type_);
+                        let false_depth = self.option_depth(&when_false.type_);
+                        match true_depth.cmp(&false_depth) {
+                            std::cmp::Ordering::Greater => when_true.type_.clone(),
+                            std::cmp::Ordering::Less => when_false.type_.clone(),
+                            std::cmp::Ordering::Equal => {
+                                conditional_type(&when_true.type_, &when_false.type_)
+                            }
+                        }
+                    }
                 };
-                let when_true = convert(when_true, &type_);
-                let when_false = convert(when_false, &type_);
+                let when_true = self.convert_to(when_true, &type_);
+                let when_false = self.convert_to(when_false, &type_);
                 hir::Expression {
                     type_,
                     kind: hir::ExpressionKind::Conditional {
@@ -1413,9 +1462,9 @@ impl Lowerer<'_> {
                 let result_type =
                     self.resolve_type(&ast::TypeRef::new(result_type_name, expression.span));
                 for case in &mut lowered_cases {
-                    case.value = convert(case.value.clone(), &result_type);
+                    case.value = self.convert_to(case.value.clone(), &result_type);
                 }
-                lowered_default = lowered_default.map(|arm| convert(arm, &result_type));
+                lowered_default = lowered_default.map(|arm| self.convert_to(arm, &result_type));
                 hir::Expression {
                     type_: result_type,
                     kind: hir::ExpressionKind::Switch {
@@ -1447,7 +1496,7 @@ impl Lowerer<'_> {
                             list: Box::new(list),
                             index: Box::new(self.expression(index)),
                             operator: assignment(*operator),
-                            value: Box::new(convert(self.expression(value), &element_type)),
+                            value: Box::new(self.convert_expression(value, &element_type)),
                             element_type,
                         },
                     };
@@ -1469,7 +1518,7 @@ impl Lowerer<'_> {
                     let setter = self.callable_symbols[&resolved.setter];
                     let object = self.upcast_receiver(object, setter);
                     let target_type = self.callable_parameters[&setter][0].clone();
-                    let value = convert(self.expression(value), &target_type);
+                    let value = self.convert_expression(value, &target_type);
                     return hir::Expression {
                         type_: target_type,
                         kind: hir::ExpressionKind::PropertyAssignment {
@@ -1486,7 +1535,7 @@ impl Lowerer<'_> {
                 }
                 let target = self.expression(target);
                 let type_ = target.type_.clone();
-                let value = convert(self.expression(value), &type_);
+                let value = self.convert_expression(value, &type_);
                 hir::Expression {
                     type_,
                     kind: hir::ExpressionKind::Assignment {
@@ -1581,15 +1630,93 @@ impl Lowerer<'_> {
             ast::ExpressionKind::Cast { target, operand } => {
                 let type_ = self.resolve_type(target);
                 let operand = self.expression(operand);
-                if operand.type_ == type_ {
-                    operand
-                } else {
-                    hir::Expression {
-                        type_,
-                        kind: hir::ExpressionKind::Convert {
-                            operand: Box::new(operand),
-                        },
+                self.convert_to(operand, &type_)
+            }
+            ast::ExpressionKind::NullCoalesce { value, fallback } => {
+                let resolved = self.model.null_coalesces[&model_key].clone();
+                let (some_case, some_fields) =
+                    self.enum_cases[&(resolved.option_type.clone(), resolved.some_index)].clone();
+                let value = self.expression(value);
+                let result_type =
+                    self.resolve_type(&ast::TypeRef::new(resolved.result_type, expression.span));
+                let fallback = self.convert_expression(fallback, &result_type);
+                hir::Expression {
+                    type_: result_type,
+                    kind: hir::ExpressionKind::NullCoalesce {
+                        value: Box::new(value),
+                        fallback: Box::new(fallback),
+                        some_case,
+                        some_field: some_fields[0],
+                        some_tag: tag(resolved.some_index),
+                        none_tag: tag(resolved.none_index),
+                        unwraps: !resolved.result_is_option,
+                    },
+                }
+            }
+            ast::ExpressionKind::NullConditional { receiver, access } => {
+                let resolved = self.model.null_conditionals[&model_key].clone();
+                let receiver_expr = self.expression(receiver);
+                let (rec_some_case, rec_some_fields) = self.enum_cases[&(
+                    resolved.receiver_option_type.clone(),
+                    resolved.receiver_some_index,
+                )]
+                    .clone();
+                let rec_some_field = rec_some_fields[0];
+                let receiver_inner_type = self.symbol_types[&rec_some_field].clone();
+                let receiver_symbol = self.allocate();
+                self.symbol_types
+                    .insert(receiver_symbol, receiver_inner_type);
+                self.null_conditional_receivers.push(receiver_symbol);
+                let access_expr = self.expression(access);
+                self.null_conditional_receivers.pop();
+                let (type_, result) = match resolved.result {
+                    None => (hir::Type::Void, hir::NullConditionalResult::Void),
+                    Some(res) => {
+                        let opt_symbol = self.types[&res.option_type];
+                        let opt_type = hir::Type::Enum(opt_symbol);
+                        let (some_case, some_fields) =
+                            self.enum_cases[&(res.option_type.clone(), res.some_index)].clone();
+                        let (none_case, _) =
+                            self.enum_cases[&(res.option_type.clone(), res.none_index)].clone();
+                        let result = if res.flattened {
+                            hir::NullConditionalResult::Flatten {
+                                none_case,
+                                none_tag: tag(res.none_index),
+                            }
+                        } else {
+                            hir::NullConditionalResult::Wrap {
+                                some_case,
+                                some_field: some_fields[0],
+                                some_tag: tag(res.some_index),
+                                none_case,
+                                none_tag: tag(res.none_index),
+                            }
+                        };
+                        (opt_type, result)
                     }
+                };
+                hir::Expression {
+                    type_,
+                    kind: hir::ExpressionKind::NullConditional {
+                        receiver: Box::new(receiver_expr),
+                        receiver_symbol,
+                        receiver_some_case: rec_some_case,
+                        receiver_some_field: rec_some_field,
+                        receiver_some_tag: tag(resolved.receiver_some_index),
+                        receiver_none_tag: tag(resolved.receiver_none_index),
+                        access: Box::new(access_expr),
+                        result,
+                    },
+                }
+            }
+            ast::ExpressionKind::NullConditionalReceiver => {
+                let symbol = *self
+                    .null_conditional_receivers
+                    .last()
+                    .expect("NullConditionalReceiver lowered inside NullConditional");
+                hir::Expression {
+                    type_: self.symbol_types[&symbol].clone(),
+                    kind: hir::ExpressionKind::Symbol(symbol),
                 }
             }
             ast::ExpressionKind::InterpolatedString { parts } => {
@@ -1656,6 +1783,24 @@ impl Lowerer<'_> {
         hir::Expression {
             type_: hir::Type::Bool,
             kind,
+        }
+    }
+
+    fn null_check_expression(
+        &mut self,
+        left: &ast::Expression,
+        right: &ast::Expression,
+        resolved: &crate::semantic::ResolvedNullCheck,
+    ) -> hir::Expression {
+        let other = if resolved.null_on_left { right } else { left };
+        let operand = self.expression(other);
+        hir::Expression {
+            type_: hir::Type::Bool,
+            kind: hir::ExpressionKind::IsNull {
+                operand: Box::new(operand),
+                none_tag: tag(resolved.none_index),
+                negated: resolved.negated,
+            },
         }
     }
 

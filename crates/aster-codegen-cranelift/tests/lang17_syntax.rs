@@ -208,9 +208,13 @@ fn separators_and_exponent_literals_execute() {
         }
     ";
     assert_eq!(int(source), 1_000_000 + 65_535 + 170 + 10 + 255);
-    // Today an unsuffixed real literal is a `float`; an exponent keeps that.
+    // An unsuffixed real literal defaults to `double`; `f` selects `float`.
     assert_eq!(
-        run("public float Run() { return 1e3; }", "Run"),
+        run("public double Run() { return 1e3; }", "Run"),
+        Ok(ExecutionValue::Double(1000.0))
+    );
+    assert_eq!(
+        run("public float Run() { return 1e3f; }", "Run"),
         Ok(ExecutionValue::Float(1000.0))
     );
     assert_eq!(
@@ -222,7 +226,11 @@ fn separators_and_exponent_literals_execute() {
         Ok(ExecutionValue::Double(10e10))
     );
     assert_eq!(
-        run("public float Run() { return 2.5E-3; }", "Run"),
+        run("public double Run() { return 2.5E-3; }", "Run"),
+        Ok(ExecutionValue::Double(0.0025))
+    );
+    assert_eq!(
+        run("public float Run() { return 2.5E-3f; }", "Run"),
         Ok(ExecutionValue::Float(0.0025))
     );
     assert_eq!(

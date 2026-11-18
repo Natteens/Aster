@@ -1,3 +1,5 @@
+use aster_diagnostics::codes;
+
 use super::{
     AbiParam, BackendError, Codegen, DataDescription, FuncId, FunctionBuilder, FunctionState,
     HashMap, InstBuilder, MemFlags, Module, Signature, is_aggregate, mir, module_error,
@@ -16,20 +18,38 @@ impl Codegen {
                 .map_err(module_error)?;
             let mut description = DataDescription::new();
             let size = usize::try_from(self.pointer_type.bytes())
-                .map_err(|_| BackendError::new("pointer size is not addressable"))?
+                .map_err(|_| {
+                    BackendError::new(
+                        codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                        "pointer size is not addressable",
+                    )
+                })?
                 .checked_mul(implementation.methods.len())
-                .ok_or_else(|| BackendError::new("interface table is too large"))?;
+                .ok_or_else(|| {
+                    BackendError::new(
+                        codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                        "interface table is too large",
+                    )
+                })?;
             description.define_zeroinit(size);
             description.set_align(u64::from(self.pointer_type.bytes()));
             for (slot, method) in implementation.methods.iter().enumerate() {
                 let function_id = function_ids.get(method).copied().ok_or_else(|| {
-                    BackendError::new("interface table references an unknown concrete method")
+                    BackendError::new(
+                        codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                        "interface table references an unknown concrete method",
+                    )
                 })?;
                 let function = self.jit.declare_func_in_data(function_id, &mut description);
                 let offset = u32::try_from(slot)
                     .ok()
                     .and_then(|slot| slot.checked_mul(self.pointer_type.bytes()))
-                    .ok_or_else(|| BackendError::new("interface table offset is too large"))?;
+                    .ok_or_else(|| {
+                        BackendError::new(
+                            codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                            "interface table offset is too large",
+                        )
+                    })?;
                 description.write_function_addr(offset, function);
             }
             self.jit
@@ -85,17 +105,23 @@ impl Codegen {
         else {
             unreachable!("interface call translator received another instruction")
         };
-        let (_, slot, definition) = self
-            .interface_methods
-            .get(method)
-            .cloned()
-            .ok_or_else(|| BackendError::new("unknown interface method in MIR"))?;
+        let (_, slot, definition) =
+            self.interface_methods.get(method).cloned().ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_UNKNOWN_TYPE_OR_OWNER,
+                    "unknown interface method in MIR",
+                )
+            })?;
         let interface = self.translate_operand(builder, receiver, state)?;
         let object = builder
             .ins()
             .load(self.pointer_type, MemFlags::new(), interface, 0);
-        let pointer_bytes = i32::try_from(self.pointer_type.bytes())
-            .map_err(|_| BackendError::new("pointer offset is too large"))?;
+        let pointer_bytes = i32::try_from(self.pointer_type.bytes()).map_err(|_| {
+            BackendError::new(
+                codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                "pointer offset is too large",
+            )
+        })?;
         let table =
             builder
                 .ins()
@@ -103,18 +129,28 @@ impl Codegen {
         let method_offset = i32::try_from(slot)
             .ok()
             .and_then(|slot| slot.checked_mul(pointer_bytes))
-            .ok_or_else(|| BackendError::new("interface method offset is too large"))?;
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    "interface method offset is too large",
+                )
+            })?;
         let method_pointer =
             builder
                 .ins()
                 .load(self.pointer_type, MemFlags::new(), table, method_offset);
-        let mut values =
-            vec![state.execution_context.ok_or_else(|| {
-                BackendError::new("interface call is missing its ExecutionContext")
-            })?];
+        let mut values = vec![state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "interface call is missing its ExecutionContext",
+            )
+        })?];
         if is_aggregate(return_type) {
             let destination = destination.as_ref().ok_or_else(|| {
-                BackendError::new("aggregate interface call requires a destination")
+                BackendError::new(
+                    codes::BACKEND_MISSING_DESTINATION_OR_RESULT,
+                    "aggregate interface call requires a destination",
+                )
             })?;
             values.push(self.place_address(builder, destination, state)?);
         }
@@ -132,10 +168,12 @@ impl Codegen {
         if let Some(destination) = destination.as_ref()
             && !is_aggregate(return_type)
         {
-            let result =
-                builder.inst_results(call).first().copied().ok_or_else(|| {
-                    BackendError::new("indirect interface call produced no result")
-                })?;
+            let result = builder.inst_results(call).first().copied().ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_MISSING_DESTINATION_OR_RESULT,
+                    "indirect interface call produced no result",
+                )
+            })?;
             self.store_scalar(builder, destination, result, state)?;
         }
         Ok(())

@@ -2,6 +2,7 @@
 
 use std::{error::Error, fmt};
 
+use aster_diagnostics::{DiagnosticCode, codes};
 use aster_mir as mir;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -62,26 +63,36 @@ impl fmt::Display for ExecutionValue {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackendError {
+    code: DiagnosticCode,
     message: String,
     cancellation: bool,
 }
 
 impl BackendError {
     #[must_use]
-    pub fn new(message: impl Into<String>) -> Self {
+    pub fn new(code: DiagnosticCode, message: impl Into<String>) -> Self {
         Self {
+            code,
             message: message.into(),
             cancellation: false,
         }
     }
 
+    #[must_use]
     pub fn cancellation() -> Self {
         Self {
+            code: codes::EXEC_TASK_CANCELLED,
             message: "task was cancelled".to_owned(),
             cancellation: true,
         }
     }
 
+    #[must_use]
+    pub const fn code(&self) -> DiagnosticCode {
+        self.code
+    }
+
+    #[must_use]
     pub fn is_cancellation(&self) -> bool {
         self.cancellation
     }
@@ -102,10 +113,14 @@ impl Error for BackendError {}
 
 impl From<mir::validate::ValidationError> for BackendError {
     fn from(error: mir::validate::ValidationError) -> Self {
+        let code = error.code();
         match error {
-            mir::validate::ValidationError::Invalid(message)
-            | mir::validate::ValidationError::Rejected(message) => Self::new(message),
-            mir::validate::ValidationError::Unsupported { function, feature } => Self::new(
+            mir::validate::ValidationError::Invalid { message, .. }
+            | mir::validate::ValidationError::Rejected { message, .. } => Self::new(code, message),
+            mir::validate::ValidationError::Unsupported {
+                function, feature, ..
+            } => Self::new(
+                code,
                 format!("Cranelift JIT does not yet support {feature} in function `{function}`"),
             ),
         }

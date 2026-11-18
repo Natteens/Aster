@@ -350,7 +350,8 @@ fn mark_generics(atoms: &[Atom<'_>], roles: &mut [Roles]) {
                 | TokenKind::Dot
                 | TokenKind::LeftBracket
                 | TokenKind::RightBracket
-                | TokenKind::Question => {}
+                | TokenKind::Question
+                | TokenKind::QuestionQuestion => {}
                 kind if is_type_keyword(kind) => {}
                 _ => break,
             }
@@ -368,6 +369,8 @@ fn mark_generics(atoms: &[Atom<'_>], roles: &mut [Roles]) {
                     | TokenKind::Comma
                     | TokenKind::Dot
                     | TokenKind::Question
+                    | TokenKind::QuestionQuestion
+                    | TokenKind::QuestionDot
                     | TokenKind::LeftBracket
                     | TokenKind::LeftBrace
                     | TokenKind::Identifier(_)
@@ -380,6 +383,8 @@ fn mark_generics(atoms: &[Atom<'_>], roles: &mut [Roles]) {
         if follows {
             roles[start].generic_open = true;
             roles[close].generic_close = true;
+            roles[start].partner = Some(close);
+            roles[close].partner = Some(start);
         }
     }
 }
@@ -419,16 +424,43 @@ fn mark_casts(atoms: &[Atom<'_>], roles: &mut [Roles]) {
             && content[1..].iter().all(|atom| {
                 matches!(
                     atom.kind,
-                    TokenKind::LeftBracket | TokenKind::RightBracket | TokenKind::Question
+                    TokenKind::LeftBracket
+                        | TokenKind::RightBracket
+                        | TokenKind::Question
+                        | TokenKind::QuestionQuestion
                 )
             });
-        let named = content.len() % 2 == 1
-            && content.iter().enumerate().all(|(position, atom)| {
+        let suffix_start = content
+            .iter()
+            .position(|atom| {
+                matches!(
+                    atom.kind,
+                    TokenKind::LeftBracket
+                        | TokenKind::RightBracket
+                        | TokenKind::Question
+                        | TokenKind::QuestionQuestion
+                )
+            })
+            .unwrap_or(content.len());
+        let name_part = &content[..suffix_start];
+        let suffix_part = &content[suffix_start..];
+        let named = !name_part.is_empty()
+            && name_part.len() % 2 == 1
+            && name_part.iter().enumerate().all(|(position, atom)| {
                 if position % 2 == 0 {
                     matches!(atom.kind, TokenKind::Identifier(_))
                 } else {
                     atom.kind == TokenKind::Dot
                 }
+            })
+            && suffix_part.iter().all(|atom| {
+                matches!(
+                    atom.kind,
+                    TokenKind::LeftBracket
+                        | TokenKind::RightBracket
+                        | TokenKind::Question
+                        | TokenKind::QuestionQuestion
+                )
             })
             && atoms.get(close + 1).is_some_and(|next| {
                 matches!(
@@ -438,6 +470,7 @@ fn mark_casts(atoms: &[Atom<'_>], roles: &mut [Roles]) {
                         | TokenKind::New
                         | TokenKind::True
                         | TokenKind::False
+                        | TokenKind::Null
                 ) || is_literal(&next.kind)
             });
         roles[close].cast_close = primitive || named;
@@ -526,9 +559,365 @@ fn mark_unary(atoms: &[Atom<'_>], roles: &mut [Roles]) {
                 }
             }
             TokenKind::Question => roles[index].postfix = !roles[index].ternary,
+            TokenKind::QuestionQuestion if is_qq_postfix(atoms, roles, index) => {
+                roles[index].postfix = true;
+            }
             _ => {}
         }
     }
+}
+
+fn is_qq_postfix(atoms: &[Atom<'_>], roles: &[Roles], index: usize) -> bool {
+    let Some(prev) = index.checked_sub(1) else {
+        return false;
+    };
+    let prev_kind = &atoms[prev].kind;
+    if is_type_keyword(prev_kind) || *prev_kind == TokenKind::Void {
+        return true;
+    }
+    if *prev_kind == TokenKind::Greater && roles[prev].generic_close {
+        return true;
+    }
+    if *prev_kind == TokenKind::QuestionQuestion && roles[prev].postfix {
+        return true;
+    }
+    if *prev_kind == TokenKind::RightBracket {
+        return roles[prev].partner == Some(prev.wrapping_sub(1))
+            && prev >= 2
+            && is_type_suffix_base(&atoms[prev - 2].kind, &roles[prev - 2]);
+    }
+    if !matches!(prev_kind, TokenKind::Identifier(_)) {
+        return false;
+    }
+    let Some(next) = atoms.get(index + 1) else {
+        return false;
+    };
+    match &next.kind {
+        TokenKind::RightParen
+        | TokenKind::RightBracket
+        | TokenKind::Greater
+        | TokenKind::Comma
+        | TokenKind::Semicolon
+        | TokenKind::Colon
+        | TokenKind::Equal
+        | TokenKind::FatArrow
+        | TokenKind::Question
+        | TokenKind::QuestionQuestion => true,
+        TokenKind::LeftBracket => {
+            if preceded_by_new(atoms, prev) {
+                return true;
+            }
+            if !atoms
+                .get(index + 2)
+                .is_some_and(|after| after.kind == TokenKind::RightBracket)
+            {
+                return false;
+            }
+            let mut end = index + 3;
+            let mut crossed_qq = false;
+            while end < atoms.len() {
+                match atoms[end].kind {
+                    TokenKind::LeftBracket
+                        if atoms
+                            .get(end + 1)
+                            .is_some_and(|after| after.kind == TokenKind::RightBracket) =>
+                    {
+                        end += 2;
+                    }
+                    TokenKind::Question | TokenKind::QuestionQuestion => {
+                        crossed_qq = true;
+                        end += 1;
+                    }
+                    _ => break,
+                }
+            }
+            atoms.get(end).is_some_and(|after| match after.kind {
+                TokenKind::Identifier(_) => {
+                    !crossed_qq || is_type_decl_followed_by_ident(atoms, roles, prev, end)
+                }
+                TokenKind::RightParen => roles[end].cast_close,
+                TokenKind::Greater | TokenKind::Comma => inside_generic_args(atoms, roles, index),
+                _ => false,
+            })
+        }
+        TokenKind::Identifier(_) => is_ident_qq_ident_type(atoms, roles, index),
+        _ => false,
+    }
+}
+
+fn is_type_suffix_base(kind: &TokenKind, roles: &Roles) -> bool {
+    is_type_keyword(kind)
+        || matches!(
+            kind,
+            TokenKind::Void | TokenKind::Identifier(_) | TokenKind::RightBracket
+        )
+        || (*kind == TokenKind::Greater && roles.generic_close)
+        || (matches!(kind, TokenKind::Question | TokenKind::QuestionQuestion) && roles.postfix)
+}
+
+fn is_declaration_modifier(kind: &TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Public
+            | TokenKind::Internal
+            | TokenKind::Protected
+            | TokenKind::Private
+            | TokenKind::Static
+            | TokenKind::Async
+            | TokenKind::Const
+    ) || matches!(
+        kind,
+        TokenKind::Identifier(name)
+            if matches!(
+                name.as_str(),
+                "virtual" | "override" | "abstract" | "sealed" | "readonly"
+            )
+    )
+}
+
+fn is_declaration_boundary(atoms: &[Atom<'_>], ident_index: usize) -> bool {
+    if ident_index == 0 {
+        return true;
+    }
+    let before = &atoms[ident_index - 1].kind;
+    matches!(
+        before,
+        TokenKind::Semicolon | TokenKind::LeftBrace | TokenKind::RightBrace
+    ) || is_declaration_modifier(before)
+        || (*before == TokenKind::LeftParen
+            && ident_index >= 2
+            && matches!(
+                atoms[ident_index - 2].kind,
+                TokenKind::For | TokenKind::Foreach
+            ))
+}
+
+fn preceded_by_new(atoms: &[Atom<'_>], mut ident_index: usize) -> bool {
+    while ident_index >= 2
+        && atoms[ident_index - 1].kind == TokenKind::Dot
+        && matches!(atoms[ident_index - 2].kind, TokenKind::Identifier(_))
+    {
+        ident_index -= 2;
+    }
+    ident_index >= 1 && atoms[ident_index - 1].kind == TokenKind::New
+}
+
+fn inside_generic_args(atoms: &[Atom<'_>], roles: &[Roles], index: usize) -> bool {
+    let mut cursor = index;
+    while cursor > 0 {
+        cursor -= 1;
+        let kind = &atoms[cursor].kind;
+        if is_closer(kind) || (*kind == TokenKind::Greater && roles[cursor].generic_close) {
+            let Some(open) = roles[cursor].partner else {
+                return false;
+            };
+            cursor = open;
+        } else if *kind == TokenKind::Less && roles[cursor].generic_open {
+            return true;
+        } else if is_opener(kind)
+            || matches!(
+                kind,
+                TokenKind::Semicolon | TokenKind::Equal | TokenKind::FatArrow
+            )
+        {
+            return false;
+        }
+    }
+    false
+}
+
+fn is_ident_qq_ident_type(atoms: &[Atom<'_>], roles: &[Roles], qq_index: usize) -> bool {
+    is_type_decl_followed_by_ident(atoms, roles, qq_index - 1, qq_index + 1)
+}
+
+fn is_type_decl_followed_by_ident(
+    atoms: &[Atom<'_>],
+    roles: &[Roles],
+    type_ident: usize,
+    name_ident: usize,
+) -> bool {
+    let mut type_start = type_ident;
+    while type_start >= 2
+        && atoms[type_start - 1].kind == TokenKind::Dot
+        && matches!(atoms[type_start - 2].kind, TokenKind::Identifier(_))
+    {
+        type_start -= 2;
+    }
+    if let Some(open_paren) = enclosing_open_paren(atoms, roles, type_start)
+        && is_parameter_list_open(atoms, roles, open_paren)
+    {
+        return type_start == open_paren + 1 || atoms[type_start - 1].kind == TokenKind::Comma;
+    }
+    let Some(after_name) = atoms.get(name_ident + 1) else {
+        return false;
+    };
+    match after_name.kind {
+        TokenKind::Equal | TokenKind::In | TokenKind::FatArrow => true,
+        TokenKind::Semicolon | TokenKind::LeftBrace => is_declaration_boundary(atoms, type_start),
+        TokenKind::LeftParen | TokenKind::Less => {
+            is_declaration_boundary(atoms, type_start)
+                && is_method_header_after_name(atoms, roles, type_start, name_ident)
+        }
+        _ => false,
+    }
+}
+
+fn enclosing_open_paren(atoms: &[Atom<'_>], roles: &[Roles], before_index: usize) -> Option<usize> {
+    let mut cursor = before_index;
+    while cursor > 0 {
+        cursor -= 1;
+        let kind = &atoms[cursor].kind;
+        if is_closer(kind) {
+            cursor = roles[cursor].partner?;
+        } else if *kind == TokenKind::LeftParen {
+            return Some(cursor);
+        } else if matches!(
+            kind,
+            TokenKind::LeftBrace | TokenKind::RightBrace | TokenKind::Semicolon
+        ) {
+            return None;
+        }
+    }
+    None
+}
+
+fn is_parameter_list_open(atoms: &[Atom<'_>], roles: &[Roles], open_paren: usize) -> bool {
+    if open_paren == 0 {
+        return false;
+    }
+    let Some(close_paren) = roles[open_paren].partner else {
+        return false;
+    };
+    let name_idx = if atoms[open_paren - 1].kind == TokenKind::Greater
+        && roles[open_paren - 1].generic_close
+    {
+        let mut depth = 0i32;
+        let mut pos = open_paren - 1;
+        loop {
+            match atoms[pos].kind {
+                TokenKind::Greater => depth += 1,
+                TokenKind::Less => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            if pos == 0 {
+                return false;
+            }
+            pos -= 1;
+        }
+        if pos == 0 || !matches!(atoms[pos - 1].kind, TokenKind::Identifier(_)) {
+            return false;
+        }
+        pos - 1
+    } else if matches!(atoms[open_paren - 1].kind, TokenKind::Identifier(_)) {
+        open_paren - 1
+    } else {
+        return false;
+    };
+
+    let body_follows = atoms.get(close_paren + 1).is_some_and(|next| {
+        matches!(next.kind, TokenKind::LeftBrace | TokenKind::FatArrow)
+            || (next.kind == TokenKind::Colon
+                && roles[close_paren + 1].colon == Some(ColonKind::Ctor))
+            || matches!(&next.kind, TokenKind::Identifier(word) if word == "where")
+    });
+    let decl_prefix = name_idx > 0 && {
+        let before_name = &atoms[name_idx - 1].kind;
+        is_declaration_modifier(before_name)
+            || is_type_keyword(before_name)
+            || matches!(
+                before_name,
+                TokenKind::Void | TokenKind::Identifier(_) | TokenKind::RightBracket
+            )
+            || (*before_name == TokenKind::Greater && roles[name_idx - 1].generic_close)
+            || (matches!(
+                before_name,
+                TokenKind::Question | TokenKind::QuestionQuestion
+            ) && roles[name_idx - 1].postfix)
+    };
+    body_follows || decl_prefix
+}
+
+fn is_method_header_after_name(
+    atoms: &[Atom<'_>],
+    roles: &[Roles],
+    type_ident: usize,
+    name_ident: usize,
+) -> bool {
+    if type_ident > 0 && is_declaration_modifier(&atoms[type_ident - 1].kind) {
+        return true;
+    }
+    let paren_open = match atoms.get(name_ident + 1).map(|atom| &atom.kind) {
+        Some(TokenKind::LeftParen) => name_ident + 1,
+        Some(TokenKind::Less) => {
+            let mut depth = 0i32;
+            let mut pos = name_ident + 1;
+            let mut after_generic = None;
+            while pos < atoms.len() {
+                match atoms[pos].kind {
+                    TokenKind::Less => depth += 1,
+                    TokenKind::Greater => {
+                        depth -= 1;
+                        if depth == 0 {
+                            after_generic = Some(pos + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                pos += 1;
+            }
+            let Some(paren) = after_generic else {
+                return false;
+            };
+            if atoms.get(paren).map(|atom| &atom.kind) != Some(&TokenKind::LeftParen) {
+                return false;
+            }
+            paren
+        }
+        _ => return false,
+    };
+    let Some(close_paren) = roles[paren_open].partner else {
+        return false;
+    };
+    if atoms.get(close_paren + 1).is_some_and(|next| {
+        matches!(next.kind, TokenKind::LeftBrace | TokenKind::FatArrow)
+            || matches!(&next.kind, TokenKind::Identifier(word) if word == "where")
+    }) {
+        return true;
+    }
+    inside_interface_body(atoms, roles, type_ident)
+}
+
+fn inside_interface_body(atoms: &[Atom<'_>], roles: &[Roles], index: usize) -> bool {
+    let mut cursor = index;
+    while cursor > 0 {
+        cursor -= 1;
+        if is_closer(&atoms[cursor].kind) {
+            let Some(open) = roles[cursor].partner else {
+                return false;
+            };
+            cursor = open;
+        } else if atoms[cursor].kind == TokenKind::LeftBrace {
+            let mut header = cursor;
+            while header > 0 {
+                header -= 1;
+                match atoms[header].kind {
+                    TokenKind::Interface => return true,
+                    TokenKind::Semicolon | TokenKind::LeftBrace | TokenKind::RightBrace => {
+                        return false;
+                    }
+                    _ => {}
+                }
+            }
+            return false;
+        }
+    }
+    false
 }
 
 fn ends_operand(kind: &TokenKind, roles: &Roles) -> bool {
@@ -538,7 +927,8 @@ fn ends_operand(kind: &TokenKind, roles: &Roles) -> bool {
         | TokenKind::This
         | TokenKind::Base
         | TokenKind::True
-        | TokenKind::False => true,
+        | TokenKind::False
+        | TokenKind::Null => true,
         TokenKind::RightParen => !roles.cast_close,
         TokenKind::Greater => roles.generic_close,
         TokenKind::PlusPlus | TokenKind::MinusMinus | TokenKind::Question => roles.postfix,
@@ -570,14 +960,24 @@ fn space_between(atoms: &[Atom<'_>], roles: &[Roles], next: usize) -> bool {
 
 /// Would two glued texts risk lexing differently (operator characters)?
 fn merges(left: &str, right: &str) -> bool {
-    const OPERATOR_CHARACTERS: &str = "+-*/%&|^<>=!~?:";
-    left.chars()
-        .next_back()
-        .is_some_and(|c| OPERATOR_CHARACTERS.contains(c))
-        && right
-            .chars()
-            .next()
-            .is_some_and(|c| OPERATOR_CHARACTERS.contains(c))
+    let Some(last) = left.chars().next_back() else {
+        return false;
+    };
+    let Some(first) = right.chars().next() else {
+        return false;
+    };
+    matches!(
+        (last, first),
+        ('/', '/' | '*' | '=')
+            | ('?', '?' | '.')
+            | ('+', '+' | '=')
+            | ('-', '-' | '=')
+            | ('=', '=' | '>')
+            | ('<', '<' | '=')
+            | ('&', '&' | '=')
+            | ('|', '|' | '=')
+            | ('*' | '%' | '!' | '>' | '^', '=')
+    )
 }
 
 fn glues_before_open(kind: &TokenKind, roles: &Roles, for_paren: bool) -> bool {
@@ -587,6 +987,7 @@ fn glues_before_open(kind: &TokenKind, roles: &Roles, for_paren: bool) -> bool {
         | TokenKind::This
         | TokenKind::RightParen => true,
         TokenKind::Greater => roles.generic_close,
+        TokenKind::Question | TokenKind::QuestionQuestion => !for_paren && roles.postfix,
         TokenKind::New | TokenKind::Base | TokenKind::Default => for_paren,
         other => is_type_keyword(other),
     }
@@ -597,7 +998,7 @@ fn decide_space(atoms: &[Atom<'_>], roles: &[Roles], previous: usize, next: usiz
     let (pr, nr) = (&roles[previous], &roles[next]);
     if matches!(
         pk,
-        TokenKind::LeftParen | TokenKind::LeftBracket | TokenKind::Dot
+        TokenKind::LeftParen | TokenKind::LeftBracket | TokenKind::Dot | TokenKind::QuestionDot
     ) {
         return false;
     }
@@ -608,6 +1009,7 @@ fn decide_space(atoms: &[Atom<'_>], roles: &[Roles], previous: usize, next: usiz
             | TokenKind::Comma
             | TokenKind::Semicolon
             | TokenKind::Dot
+            | TokenKind::QuestionDot
     ) {
         return false;
     }

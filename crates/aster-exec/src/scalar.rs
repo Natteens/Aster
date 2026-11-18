@@ -9,6 +9,8 @@
 //! `calls::scalar_to_bits`/`scalar_from_bits`), so the kind tag and the bit
 //! pattern together always name a fully concrete value.
 
+use aster_diagnostics::codes;
+
 use crate::{BackendError, ExecutionValue};
 
 // Kind tags shared by codegen (`calls::scalar_kind`) and the runtime ABI.
@@ -31,7 +33,10 @@ pub fn byte_width(kind: i32) -> Result<usize, BackendError> {
         SHORT | USHORT => Ok(2),
         INT | UINT | FLOAT | CHAR => Ok(4),
         LONG | ULONG | DOUBLE => Ok(8),
-        _ => Err(BackendError::new(format!("unknown scalar kind tag {kind}"))),
+        _ => Err(BackendError::new(
+            codes::EXEC_UNKNOWN_SCALAR_TAG,
+            format!("unknown scalar kind tag {kind}"),
+        )),
     }
 }
 
@@ -77,15 +82,21 @@ pub fn from_bits(kind: i32, bits: i64) -> Result<ExecutionValue, BackendError> {
                 .ok()
                 .and_then(char::from_u32)
                 .ok_or_else(|| {
-                    BackendError::new(format!(
-                        "invalid Unicode scalar value 0x{bits:016X} in scalar transport"
-                    ))
+                    BackendError::new(
+                        codes::EXEC_INVALID_UNICODE_SCALAR,
+                        format!("invalid Unicode scalar value 0x{bits:016X} in scalar transport"),
+                    )
                 })?;
             ExecutionValue::Char(value)
         }
         ULONG => ExecutionValue::ULong(bits),
         LONG => ExecutionValue::Long(i64::from_ne_bytes(bits.to_ne_bytes())),
-        _ => return Err(BackendError::new(format!("unknown scalar kind tag {kind}"))),
+        _ => {
+            return Err(BackendError::new(
+                codes::EXEC_UNKNOWN_SCALAR_TAG,
+                format!("unknown scalar kind tag {kind}"),
+            ));
+        }
     })
 }
 

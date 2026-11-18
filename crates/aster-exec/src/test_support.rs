@@ -5,6 +5,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use aster_diagnostics::codes;
 use aster_mir as mir;
 
 use crate::worker_pool::{
@@ -61,7 +62,10 @@ impl ExecutableProgram for FakeProgram {
         Option<aster_runtime::AarmMemoryTelemetry>,
     ) {
         (
-            Err(BackendError::new("fake program has no async steps")),
+            Err(BackendError::new(
+                codes::EXEC_ASYNC_NO_STEPS,
+                "fake program has no async steps",
+            )),
             None,
         )
     }
@@ -161,7 +165,12 @@ impl CodeProvider for FakeProvider {
             .iter()
             .find(|function| function.name == function_name)
             .map(|function| function.symbol)
-            .ok_or_else(|| BackendError::new(format!("no function `{function_name}`")))
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::EXEC_PROVIDER_MISSING_FUNCTION,
+                    format!("no function `{function_name}`"),
+                )
+            })
     }
 
     fn prepare(
@@ -171,7 +180,10 @@ impl CodeProvider for FakeProvider {
     ) -> Result<Arc<dyn ExecutableProgram>, BackendError> {
         self.prepared.fetch_add(1, Ordering::SeqCst);
         if self.fail_prepare {
-            return Err(BackendError::new("provider cannot prepare code"));
+            return Err(BackendError::new(
+                codes::EXEC_PROVIDER_MISSING_FUNCTION,
+                "provider cannot prepare code",
+            ));
         }
         Ok(Arc::clone(&self.program) as Arc<dyn ExecutableProgram>)
     }

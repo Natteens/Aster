@@ -6,6 +6,8 @@ public int Run()
 {
     long wide = 4000000000L;
     float speed = 1.5f;
+    double gravity = 9.81;
+    double large = 1e9;
     double ratio = speed * 2;
     char separator = ',';
 
@@ -13,6 +15,8 @@ public int Run()
     long scaled = wide / 1000000000;
 
     bool checks = separator == ','
+        && gravity > 9.0
+        && large == 1000000000.0
         && ratio == 3.0d
         && scaled == 4
         && Threshold > truncated;

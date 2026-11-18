@@ -44,9 +44,9 @@ against a class (`area is Square sq`) or another interface; see
 [downcast and interface tests](classes.md#downcast-and-interface-tests).
 
 Interface values can be used in locals, parameters, class fields, arrays and returns between ASTER
-functions. They are non-null in the current language because `null` does not exist. Equality uses
-the identity of the underlying object. Interface inheritance, default methods and struct
-implementations are not implemented yet.
+functions. Non-optional interface values are always non-null; optional absence uses `I?` /
+`Option<I>`. Equality uses the identity of the underlying object. Interface inheritance, default
+methods and struct implementations are not implemented yet.
 
 Interfaces may declare type parameters. A closed contract such as `IValue<int>` receives its own
 resolved method table and is distinct from `IValue<string>`. Classes implement a concrete contract

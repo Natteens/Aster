@@ -2,6 +2,7 @@
 //! through the class descriptor's virtual table and the stubs that fill the
 //! abstract slots.
 
+use aster_diagnostics::codes;
 use aster_runtime::descriptor::ClassDescriptor;
 
 use super::{
@@ -129,29 +130,48 @@ impl Codegen {
         let descriptor = builder
             .ins()
             .load(self.pointer_type, MemFlags::new(), object, 0);
-        let table_offset = i32::try_from(std::mem::offset_of!(ClassDescriptor, vtable))
-            .map_err(|_| BackendError::new("descriptor virtual table offset is too large"))?;
+        let table_offset =
+            i32::try_from(std::mem::offset_of!(ClassDescriptor, vtable)).map_err(|_| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    "descriptor virtual table offset is too large",
+                )
+            })?;
         let table =
             builder
                 .ins()
                 .load(self.pointer_type, MemFlags::new(), descriptor, table_offset);
-        let pointer_bytes = i32::try_from(self.pointer_type.bytes())
-            .map_err(|_| BackendError::new("pointer offset is too large"))?;
+        let pointer_bytes = i32::try_from(self.pointer_type.bytes()).map_err(|_| {
+            BackendError::new(
+                codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                "pointer offset is too large",
+            )
+        })?;
         let slot_offset = i32::try_from(*slot)
             .ok()
             .and_then(|slot| slot.checked_mul(pointer_bytes))
-            .ok_or_else(|| BackendError::new("virtual slot offset is too large"))?;
+            .ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_LAYOUT_OR_OFFSET_OVERFLOW,
+                    "virtual slot offset is too large",
+                )
+            })?;
         let function_pointer =
             builder
                 .ins()
                 .load(self.pointer_type, MemFlags::new(), table, slot_offset);
-        let mut values =
-            vec![state.execution_context.ok_or_else(|| {
-                BackendError::new("virtual call is missing its ExecutionContext")
-            })?];
+        let mut values = vec![state.execution_context.ok_or_else(|| {
+            BackendError::new(
+                codes::BACKEND_MISSING_EXECUTION_CONTEXT,
+                "virtual call is missing its ExecutionContext",
+            )
+        })?];
         if is_aggregate(return_type) {
             let destination = destination.as_ref().ok_or_else(|| {
-                BackendError::new("aggregate virtual call requires a destination")
+                BackendError::new(
+                    codes::BACKEND_MISSING_DESTINATION_OR_RESULT,
+                    "aggregate virtual call requires a destination",
+                )
             })?;
             values.push(self.place_address(builder, destination, state)?);
         }
@@ -174,11 +194,12 @@ impl Codegen {
         if let Some(destination) = destination.as_ref()
             && !is_aggregate(return_type)
         {
-            let result = builder
-                .inst_results(call)
-                .first()
-                .copied()
-                .ok_or_else(|| BackendError::new("indirect virtual call produced no result"))?;
+            let result = builder.inst_results(call).first().copied().ok_or_else(|| {
+                BackendError::new(
+                    codes::BACKEND_MISSING_DESTINATION_OR_RESULT,
+                    "indirect virtual call produced no result",
+                )
+            })?;
             self.store_scalar(builder, destination, result, state)?;
         }
         Ok(())

@@ -1,4 +1,4 @@
-use super::types::{constant_expression, convert};
+use super::types::constant_expression;
 use super::{HashMap, Lowerer, ast, hir};
 use crate::constexpr::evaluate;
 
@@ -105,6 +105,12 @@ impl Lowerer<'_> {
                 | ast::Item::Struct(declaration)
                 | ast::Item::Interface(declaration) => self.predeclare_members(declaration),
                 ast::Item::Enum(declaration) => {
+                    let is_official_option = declaration.name.starts_with(&format!(
+                        "{}::Option<",
+                        crate::standard_library::CORE_NAMESPACE
+                    ));
+                    let mut some_info = None;
+                    let mut has_none = false;
                     for (index, case) in declaration.cases.iter().enumerate() {
                         let case_symbol = self.allocate();
                         let mut fields = Vec::new();
@@ -114,6 +120,14 @@ impl Lowerer<'_> {
                                 .insert(symbol, self.resolve_type(&field.type_ref));
                             fields.push(symbol);
                         }
+                        if is_official_option {
+                            let tag = u32::try_from(index).expect("validated enum tag");
+                            if case.name == "Some" && fields.len() == 1 {
+                                some_info = Some((case_symbol, tag, fields[0]));
+                            } else if case.name == "None" && fields.is_empty() {
+                                has_none = true;
+                            }
+                        }
                         self.enum_cases.insert(
                             (declaration.name.clone(), index),
                             (case_symbol, fields.clone()),
@@ -121,6 +135,19 @@ impl Lowerer<'_> {
                         self.enum_case_by_name.insert(
                             (declaration.name.clone(), case.name.clone()),
                             (case_symbol, fields),
+                        );
+                    }
+                    if let (Some((some_case, some_tag, some_field)), true) = (some_info, has_none) {
+                        let enum_symbol = self.types[&declaration.name];
+                        let inner_type = self.symbol_types[&some_field].clone();
+                        self.option_meta.insert(
+                            enum_symbol,
+                            super::OptionMeta {
+                                some_case,
+                                some_tag,
+                                some_field,
+                                inner_type,
+                            },
                         );
                     }
                 }
@@ -706,15 +733,12 @@ impl Lowerer<'_> {
             .iter()
             .zip(&resolved.arguments.source_to_parameter)
             .map(|(argument, parameter)| {
-                convert(
-                    self.expression(&argument.value),
-                    &parameter_types[*parameter],
-                )
+                self.convert_expression(&argument.value, &parameter_types[*parameter])
             })
             .collect::<Vec<_>>();
         let mut argument_order = resolved.arguments.source_to_parameter.clone();
         for default in &resolved.arguments.defaults {
-            lowered.push(convert(
+            lowered.push(self.convert_to(
                 constant_expression(&default.value),
                 &parameter_types[default.parameter],
             ));
@@ -788,7 +812,7 @@ impl Lowerer<'_> {
                             },
                         }),
                         operator: hir::AssignmentOperator::Assign,
-                        value: Box::new(convert(initializer, &field_type)),
+                        value: Box::new(self.convert_to(initializer, &field_type)),
                     },
                 }))
             })

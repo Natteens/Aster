@@ -19,9 +19,10 @@ values[1] = 20;
 ```
 
 For a positive or runtime-known length, `new` requires an element type with a valid all-zero value.
-In particular, `new string[1]`, `new string[length]`, and zeroed structs containing references are
-rejected because ASTER does not have `null`; use an array literal that initializes every element
-instead.
+In particular, `new string[1]`, `new string[length]`, `new int?[3]`, and zeroed structs containing
+references are rejected because non-optional references are non-null and `Option<T>` (`T?`) has no
+implicit zero default; use an array literal such as `int?[] items = [1, null];` that initializes
+every element instead.
 
 A length proven to be constant zero is different: `new T[0]` is valid for every otherwise-valid
 element type because it creates no element slots and therefore no invalid default value. The result
@@ -58,7 +59,8 @@ entry function should consume the result.
 from index zero upward. The iteration variable is a read-only copy. Array elements can still be
 changed through an explicit index, and later iterations observe those changes.
 
-There is no `null`, resizing, slicing, rectangular multidimensional array, or independent freeing.
+Non-optional array variables are always non-null (use `T[]?` / `Option<T[]>` for an optional array
+reference). There is no resizing, slicing, rectangular multidimensional array, or independent freeing.
 Nested jagged arrays such as `T[][]` are ordinary arrays whose elements are array references. `==` and
 `!=` compare array reference identity; elements are not compared implicitly. All storage belongs
 to the current JIT execution context.

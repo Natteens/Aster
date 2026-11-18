@@ -1,5 +1,5 @@
 use super::declarations::visibility;
-use super::types::{constant_expression, convert, is_scalar_switch_type};
+use super::types::{constant_expression, is_scalar_switch_type};
 use super::{HashMap, Lowerer, ast, hir};
 use crate::constexpr::evaluate;
 
@@ -31,7 +31,7 @@ impl Lowerer<'_> {
                 hir::Statement::Return(
                     value
                         .as_ref()
-                        .map(|value| convert(self.expression(value), &target)),
+                        .map(|value| self.convert_expression(value, &target)),
                 )
             }
             ast::Statement::Expression(expression) => {
@@ -187,7 +187,7 @@ impl Lowerer<'_> {
         Option<hir::Expression>,
     ) {
         let label = label.expect("validated scalar switch case has a label");
-        let label = convert(self.expression(label), subject);
+        let label = self.convert_expression(label, subject);
         (self.allocate(), 0, Vec::new(), Some(label))
     }
 
@@ -267,7 +267,7 @@ impl Lowerer<'_> {
                 self.resolve_type(type_ref)
             }
         };
-        initializer = initializer.map(|value| convert(value, &type_));
+        initializer = initializer.map(|value| self.convert_to(value, &type_));
         self.symbol_types.insert(symbol, type_.clone());
         hir::Variable {
             symbol,

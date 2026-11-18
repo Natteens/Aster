@@ -344,7 +344,7 @@ fn run_test_command(arguments: &mut impl Iterator<Item = String>) -> CliResult {
     ) {
         Ok(prepared) => prepared,
         Err(error) => {
-            eprintln!("error: {error}");
+            eprintln!("error[{}]: {error}", error.code());
             return Err(CliError::Failure);
         }
     };
@@ -579,7 +579,7 @@ fn process_file(
             // same validator `execute*` runs, never a second call-graph
             // analysis.
             if let Err(error) = aster_codegen_cranelift::validate(&compilation.mir) {
-                eprintln!("error: {error}");
+                eprintln!("error[{}]: {error}", error.code());
                 return Err(());
             }
             match command {
@@ -675,7 +675,7 @@ pub(crate) fn execute_project(
             symbol,
         )
         .map(|(value, stats)| (value, function_name.to_owned(), stats))
-        .map_err(|error| eprintln!("error: {error}"));
+        .map_err(|error| eprintln!("error[{}]: {error}", error.code()));
     }
 
     let entry =
@@ -691,7 +691,7 @@ pub(crate) fn execute_project(
         None,
     )
     .map(|(value, stats)| (value, entry.display_name, stats))
-    .map_err(|error| eprintln!("error: {error}"))
+    .map_err(|error| eprintln!("error[{}]: {error}", error.code()))
 }
 
 pub(crate) fn project_diagnostics(

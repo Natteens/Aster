@@ -16,6 +16,7 @@
 //! combined result cross the same way a `Task<T>.Wait` result or async frame
 //! slot does: as a `(kind, bits)` pair, never a pointer.
 
+use aster_diagnostics::codes;
 use aster_runtime::{ExecutionContext, aster_rt_array_element, aster_rt_array_length};
 
 use crate::task_runtime::{TaskHandleId, TaskRuntime};
@@ -357,10 +358,14 @@ fn copy_scalar_array(
     kind: i32,
 ) -> Result<Vec<ExecutionValue>, BackendError> {
     if array.is_null() {
-        return Err(BackendError::new("Parallel.ForEach received a null array"));
+        return Err(BackendError::new(
+            codes::EXEC_PARALLEL_ARRAY_NULL_OR_MISALIGNED,
+            "Parallel.ForEach received a null array",
+        ));
     }
     if !(array as usize).is_multiple_of(std::mem::align_of::<aster_runtime::AsterArray>()) {
         return Err(BackendError::new(
+            codes::EXEC_PARALLEL_ARRAY_NULL_OR_MISALIGNED,
             "Parallel.ForEach received a misaligned array header",
         ));
     }
@@ -372,32 +377,54 @@ fn copy_scalar_array(
     // SAFETY: the pointer is non-null and alignment-checked above. Valid Aster
     // MIR obtains it from this live context's array allocator; no pointer is
     // retained after this host-side copy.
-    let actual_size = usize::try_from(unsafe { (&*header).element_size() })
-        .map_err(|_| BackendError::new("Parallel.ForEach element size exceeds the platform"))?;
+    let actual_size = usize::try_from(unsafe { (&*header).element_size() }).map_err(|_| {
+        BackendError::new(
+            codes::EXEC_PARALLEL_ELEMENT_SIZE_MISMATCH,
+            "Parallel.ForEach element size exceeds the platform",
+        )
+    })?;
     if actual_size != expected_size {
-        return Err(BackendError::new(format!(
-            "Parallel.ForEach element size mismatch: header has {actual_size} bytes, scalar kind requires {expected_size}"
-        )));
+        return Err(BackendError::new(
+            codes::EXEC_PARALLEL_ELEMENT_SIZE_MISMATCH,
+            format!(
+                "Parallel.ForEach element size mismatch: header has {actual_size} bytes, scalar kind requires {expected_size}"
+            ),
+        ));
     }
     let length = aster_rt_array_length(context, header);
-    let length = usize::try_from(length)
-        .map_err(|_| BackendError::new("Parallel.ForEach array has a negative length"))?;
+    let length = usize::try_from(length).map_err(|_| {
+        BackendError::new(
+            codes::EXEC_PARALLEL_ARRAY_BOUNDS_OR_OVERFLOW,
+            "Parallel.ForEach array has a negative length",
+        )
+    })?;
     length.checked_mul(expected_size).ok_or_else(|| {
-        BackendError::new("Parallel.ForEach array byte length exceeds the addressable range")
+        BackendError::new(
+            codes::EXEC_PARALLEL_ARRAY_BOUNDS_OR_OVERFLOW,
+            "Parallel.ForEach array byte length exceeds the addressable range",
+        )
     })?;
     let mut values = Vec::new();
     values.try_reserve_exact(length).map_err(|_| {
-        BackendError::new("Parallel.ForEach scalar copy exceeds available host memory")
+        BackendError::new(
+            codes::EXEC_PARALLEL_ARRAY_BOUNDS_OR_OVERFLOW,
+            "Parallel.ForEach scalar copy exceeds available host memory",
+        )
     })?;
     for index in 0..length {
         let element = aster_rt_array_element(
             context,
             header,
-            i32::try_from(index)
-                .map_err(|_| BackendError::new("Parallel.ForEach array index exceeds `int`"))?,
+            i32::try_from(index).map_err(|_| {
+                BackendError::new(
+                    codes::EXEC_PARALLEL_ARRAY_BOUNDS_OR_OVERFLOW,
+                    "Parallel.ForEach array index exceeds `int`",
+                )
+            })?,
         );
         if element.is_null() {
             return Err(BackendError::new(
+                codes::EXEC_PARALLEL_ARRAY_READ_FAILED,
                 "Parallel.ForEach could not read an array element",
             ));
         }
@@ -431,13 +458,21 @@ unsafe fn read_scalar(pointer: *const u8, kind: i32) -> Result<ExecutionValue, B
             scalar::CHAR => {
                 let bits = pointer.cast::<u32>().read_unaligned();
                 ExecutionValue::Char(char::from_u32(bits).ok_or_else(|| {
-                    BackendError::new(format!(
-                        "invalid Unicode scalar value U+{bits:08X} in Parallel.ForEach array"
-                    ))
+                    BackendError::new(
+                        codes::EXEC_INVALID_UNICODE_SCALAR,
+                        format!(
+                            "invalid Unicode scalar value U+{bits:08X} in Parallel.ForEach array"
+                        ),
+                    )
                 })?)
             }
             scalar::LONG => ExecutionValue::Long(pointer.cast::<i64>().read_unaligned()),
-            _ => return Err(BackendError::new(format!("unknown scalar kind tag {kind}"))),
+            _ => {
+                return Err(BackendError::new(
+                    codes::EXEC_UNKNOWN_SCALAR_TAG,
+                    format!("unknown scalar kind tag {kind}"),
+                ));
+            }
         })
     }
 }

@@ -1,6 +1,6 @@
 use std::mem::discriminant;
 
-use aster_diagnostics::{Diagnostic, Span};
+use aster_diagnostics::{Diagnostic, DiagnosticCode, Span, codes};
 
 use crate::{
     Accessor, Argument, AssignmentOperator, BaseCall, BinaryOperator, Block, EnumCase,
@@ -16,6 +16,12 @@ use crate::{
 /// at which recursive parser and visitor paths become unsafe.
 pub const MAX_SOURCE_NESTING: usize = 64;
 
+enum PostfixStep {
+    Done,
+    Continue(Expression),
+    Error,
+}
+
 /// Build an AST from a positioned token stream.
 ///
 /// # Errors
@@ -28,6 +34,7 @@ pub fn parse(tokens: Vec<Token>) -> Result<Module, Vec<Diagnostic>> {
         diagnostics: Vec::new(),
         nesting_depth: 0,
         nesting_reported: false,
+        suppress_pattern_ternary_check: false,
         pending_members: Vec::new(),
     };
     let module = parser.module();
@@ -44,6 +51,7 @@ struct Parser {
     diagnostics: Vec<Diagnostic>,
     nesting_depth: usize,
     nesting_reported: bool,
+    suppress_pattern_ternary_check: bool,
     /// Members synthesized next to the one `member` returns (the backing
     /// field of an auto-property); the type body pushes them first.
     pending_members: Vec<Member>,
@@ -107,6 +115,7 @@ impl Parser {
         self.nesting_reported = true;
         self.diagnostics.push(
             Diagnostic::error(
+                codes::PARSE_NESTING_LIMIT,
                 format!("source nesting exceeds the compiler limit of {MAX_SOURCE_NESTING}"),
                 span,
             )
@@ -114,6 +123,7 @@ impl Parser {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     fn expression_within_limit(&mut self, expression: &Expression, span: Span) -> bool {
         let mut pending = vec![(expression, 1_usize)];
         while let Some((expression, depth)) = pending.pop() {
@@ -158,6 +168,14 @@ impl Parser {
                     left: array,
                     right: index,
                     ..
+                }
+                | ExpressionKind::NullCoalesce {
+                    value: array,
+                    fallback: index,
+                }
+                | ExpressionKind::NullConditional {
+                    receiver: array,
+                    access: index,
                 }
                 | ExpressionKind::Assignment {
                     target: array,
@@ -207,7 +225,8 @@ impl Parser {
                 ExpressionKind::Literal(_)
                 | ExpressionKind::Name(_)
                 | ExpressionKind::This
-                | ExpressionKind::Base => {}
+                | ExpressionKind::Base
+                | ExpressionKind::NullConditionalReceiver => {}
             }
         }
         true
@@ -218,8 +237,12 @@ impl Parser {
             self.namespace_declaration(&TokenKind::Namespace)
         } else if self.at(&TokenKind::Module) {
             self.diagnostics.push(
-                Diagnostic::error("`module` was replaced by `namespace`", self.current().span)
-                    .with_help("write `namespace name;` at the beginning of the file"),
+                Diagnostic::error(
+                    codes::PARSE_LEGACY_MODULE,
+                    "`module` was replaced by `namespace`",
+                    self.current().span,
+                )
+                .with_help("write `namespace name;` at the beginning of the file"),
             );
             self.namespace_declaration(&TokenKind::Module)
         } else {
@@ -230,8 +253,12 @@ impl Parser {
             let legacy = self.at(&TokenKind::Import);
             if legacy {
                 self.diagnostics.push(
-                    Diagnostic::error("`import` was replaced by `using`", self.current().span)
-                        .with_help("write `using namespace.name;` before declarations"),
+                    Diagnostic::error(
+                        codes::PARSE_LEGACY_IMPORT,
+                        "`import` was replaced by `using`",
+                        self.current().span,
+                    )
+                    .with_help("write `using namespace.name;` before declarations"),
                 );
             }
             let keyword = if legacy {
@@ -247,24 +274,31 @@ impl Parser {
         while !self.at(&TokenKind::Eof) {
             if self.at(&TokenKind::Module) {
                 self.diagnostics.push(
-                    Diagnostic::error("`module` was replaced by `namespace`", self.current().span)
-                        .with_help(
-                            "write one `namespace name;` before every using and declaration",
-                        ),
+                    Diagnostic::error(
+                        codes::PARSE_LEGACY_MODULE,
+                        "`module` was replaced by `namespace`",
+                        self.current().span,
+                    )
+                    .with_help("write one `namespace name;` before every using and declaration"),
                 );
                 self.synchronize_declaration();
                 continue;
             }
             if self.at(&TokenKind::Import) {
                 self.diagnostics.push(
-                    Diagnostic::error("`import` was replaced by `using`", self.current().span)
-                        .with_help("write `using namespace.name;` before declarations"),
+                    Diagnostic::error(
+                        codes::PARSE_LEGACY_IMPORT,
+                        "`import` was replaced by `using`",
+                        self.current().span,
+                    )
+                    .with_help("write `using namespace.name;` before declarations"),
                 );
                 self.synchronize_declaration();
                 continue;
             }
             if self.at(&TokenKind::Namespace) || self.at(&TokenKind::Using) {
                 self.error_here(
+                    codes::PARSE_MISPLACED_HEADER_DECL,
                     "namespace declarations and usings must appear before declarations",
                 );
                 self.synchronize_declaration();
@@ -275,7 +309,7 @@ impl Parser {
                 items.push(item);
             } else {
                 if self.cursor == cursor {
-                    self.error_here("expected a declaration");
+                    self.error_here(codes::PARSE_EXPECTED_DECLARATION, "expected a declaration");
                     self.advance();
                 }
                 self.synchronize_declaration();
@@ -370,8 +404,12 @@ impl Parser {
             && !self.is_type_start()
         {
             self.diagnostics.push(
-                Diagnostic::error("only free functions can be `async`", token.span)
-                    .with_help("`async` applies to a function returning `Task<T>`"),
+                Diagnostic::error(
+                    codes::PARSE_ASYNC_ONLY_FREE_FN,
+                    "only free functions can be `async`",
+                    token.span,
+                )
+                .with_help("`async` applies to a function returning `Task<T>`"),
             );
         }
         if is_static
@@ -382,6 +420,7 @@ impl Parser {
         {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::PARSE_STATIC_TOP_LEVEL_CLASS_ONLY,
                     "`static` at namespace level is valid only on a class",
                     self.current().span,
                 )
@@ -401,6 +440,7 @@ impl Parser {
         {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::PARSE_FOREIGN_TOP_LEVEL_FN_ONLY,
                     "`unsafe foreign` applies only to a top-level function declaration",
                     self.current().span,
                 )
@@ -458,6 +498,7 @@ impl Parser {
         if (modifiers.is_abstract || modifiers.is_sealed) && kind != TypeKind::Class {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::PARSE_ABSTRACT_SEALED_CLASS_ONLY,
                     "`abstract` and `sealed` are valid only on a class",
                     self.current().span,
                 )
@@ -467,6 +508,7 @@ impl Parser {
         if modifiers.is_abstract && modifiers.is_sealed {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::PARSE_ABSTRACT_AND_SEALED,
                     "a class cannot be both `abstract` and `sealed`",
                     self.current().span,
                 )
@@ -476,6 +518,7 @@ impl Parser {
         if is_static && (modifiers.is_abstract || modifiers.is_sealed) && kind == TypeKind::Class {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::PARSE_STATIC_CLASS_ABSTRACT_SEALED,
                     "a `static` class cannot be `abstract` or `sealed`",
                     self.current().span,
                 )
@@ -484,8 +527,12 @@ impl Parser {
         }
         if is_static && kind != TypeKind::Class {
             self.diagnostics.push(
-                Diagnostic::error("only classes can be static", self.current().span)
-                    .with_help("remove `static` from this type declaration"),
+                Diagnostic::error(
+                    codes::PARSE_ONLY_CLASSES_STATIC,
+                    "only classes can be static",
+                    self.current().span,
+                )
+                .with_help("remove `static` from this type declaration"),
             );
         }
         let (name, _) = self.identifier()?;
@@ -494,6 +541,7 @@ impl Parser {
             if kind == TypeKind::Struct {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::PARSE_ONLY_CLASSES_INTERFACES,
                         "only classes can declare implemented interfaces",
                         colon.span,
                     )
@@ -568,8 +616,12 @@ impl Parser {
             });
             if self.take(&TokenKind::Comma).is_none() && !self.at(&TokenKind::RightBrace) {
                 self.diagnostics.push(
-                    Diagnostic::error("expected `,` between enum cases", self.current().span)
-                        .with_help("separate enum cases with commas"),
+                    Diagnostic::error(
+                        codes::PARSE_EXPECTED_ENUM_COMMA,
+                        "expected `,` between enum cases",
+                        self.current().span,
+                    )
+                    .with_help("separate enum cases with commas"),
                 );
                 return None;
             }
@@ -601,6 +653,7 @@ impl Parser {
         if owner == TypeKind::Interface && dispatch != MemberDispatch::None {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::PARSE_INTERFACE_DISPATCH_MODIFIER,
                     "interface members cannot have dispatch modifiers",
                     modifier_start,
                 )
@@ -616,19 +669,28 @@ impl Parser {
         {
             if is_static {
                 self.diagnostics.push(
-                    Diagnostic::error("constructors cannot be static", self.current().span)
-                        .with_help("remove `static` from the constructor"),
+                    Diagnostic::error(
+                        codes::PARSE_CTOR_STATIC,
+                        "constructors cannot be static",
+                        self.current().span,
+                    )
+                    .with_help("remove `static` from the constructor"),
                 );
             }
             if let Some(token) = &async_token {
                 self.diagnostics.push(
-                    Diagnostic::error("constructors cannot be `async`", token.span)
-                        .with_help("remove `async` from the constructor"),
+                    Diagnostic::error(
+                        codes::PARSE_CTOR_ASYNC,
+                        "constructors cannot be `async`",
+                        token.span,
+                    )
+                    .with_help("remove `async` from the constructor"),
                 );
             }
             if dispatch != MemberDispatch::None {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::PARSE_CTOR_DISPATCH,
                         "constructors cannot be `virtual`, `override` or `abstract`",
                         modifier_start,
                     )
@@ -682,31 +744,38 @@ impl Parser {
         } else if self.at(&TokenKind::LeftBrace) {
             if let Some(token) = &async_token {
                 self.diagnostics.push(
-                    Diagnostic::error("only methods can be `async`", token.span)
-                        .with_help("remove `async` from the property"),
+                    Diagnostic::error(
+                        codes::PARSE_ONLY_METHODS_ASYNC,
+                        "only methods can be `async`",
+                        token.span,
+                    )
+                    .with_help("remove `async` from the property"),
                 );
             }
             let property = self.property_after_name(visibility, dispatch, type_ref, name, start)?;
             if is_static {
-                let (message, help) = if self.pending_members.is_empty() {
+                let (code, message, help) = if self.pending_members.is_empty() {
                     (
+                        codes::PARSE_STATIC_PROPERTY,
                         "static properties are not implemented",
                         "remove `static` from the property",
                     )
                 } else {
                     (
+                        codes::PARSE_STATIC_AUTO_PROPERTY,
                         "static auto-properties are not supported yet",
                         "they need static fields; write an explicit property or a static method",
                     )
                 };
                 self.diagnostics
-                    .push(Diagnostic::error(message, property.span).with_help(help));
+                    .push(Diagnostic::error(code, message, property.span).with_help(help));
             }
             Some(Member::Property(property))
         } else {
             if dispatch != MemberDispatch::None {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::PARSE_FIELD_DISPATCH,
                         "fields cannot be `virtual`, `override` or `abstract`",
                         modifier_start,
                     )
@@ -715,14 +784,22 @@ impl Parser {
             }
             if let Some(token) = &async_token {
                 self.diagnostics.push(
-                    Diagnostic::error("only methods can be `async`", token.span)
-                        .with_help("remove `async` from the field"),
+                    Diagnostic::error(
+                        codes::PARSE_ONLY_METHODS_ASYNC,
+                        "only methods can be `async`",
+                        token.span,
+                    )
+                    .with_help("remove `async` from the field"),
                 );
             }
             if is_static {
                 self.diagnostics.push(
-                    Diagnostic::error("static fields are not implemented", self.current().span)
-                        .with_help("remove `static` from the field"),
+                    Diagnostic::error(
+                        codes::PARSE_STATIC_FIELD_UNIMPLEMENTED,
+                        "static fields are not implemented",
+                        self.current().span,
+                    )
+                    .with_help("remove `static` from the field"),
                 );
             }
             self.field_after_name(visibility, type_ref, name, start)
@@ -761,6 +838,7 @@ impl Parser {
             if is_test {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::PARSE_TEST_FN_SHAPE,
                         "`test` applies only to a parameterless void function",
                         type_ref.span,
                     )
@@ -770,6 +848,7 @@ impl Parser {
             if is_foreign {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::PARSE_FOREIGN_TOP_LEVEL_FN_ONLY,
                         "`unsafe foreign` applies only to a top-level function declaration",
                         type_ref.span,
                     )
@@ -778,8 +857,12 @@ impl Parser {
             }
             if is_async {
                 self.diagnostics.push(
-                    Diagnostic::error("only functions can be `async`", type_ref.span)
-                        .with_help("remove `async`; variables cannot be `async`"),
+                    Diagnostic::error(
+                        codes::PARSE_ONLY_METHODS_ASYNC,
+                        "only functions can be `async`",
+                        type_ref.span,
+                    )
+                    .with_help("remove `async`; variables cannot be `async`"),
                 );
             }
             self.variable_after_name(
@@ -823,8 +906,12 @@ impl Parser {
         };
         if is_foreign && !type_parameters.is_empty() {
             self.diagnostics.push(
-                Diagnostic::error("foreign functions cannot be generic", self.current().span)
-                    .with_help("declare one concrete foreign signature per host binding"),
+                Diagnostic::error(
+                    codes::PARSE_FOREIGN_GENERIC,
+                    "foreign functions cannot be generic",
+                    self.current().span,
+                )
+                .with_help("declare one concrete foreign signature per host binding"),
             );
         }
         if signature_only || is_foreign {
@@ -901,6 +988,7 @@ impl Parser {
         if self.at(&TokenKind::Colon) {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::PARSE_CTOR_MULTIPLE_INITIALIZERS,
                     "a constructor can have only one initializer, `: this(...)` or `: base(...)`",
                     self.current().span,
                 )
@@ -971,19 +1059,28 @@ impl Parser {
                 {
                     setter = Some(accessor);
                 }
-                TokenKind::Identifier(ref value) if value == "get" => self.diagnostics.push(
-                    Diagnostic::error("a property can declare only one getter", kind.span),
-                ),
+                TokenKind::Identifier(ref value) if value == "get" => {
+                    self.diagnostics.push(Diagnostic::error(
+                        codes::PARSE_PROPERTY_DUPLICATE_GETTER,
+                        "a property can declare only one getter",
+                        kind.span,
+                    ));
+                }
                 TokenKind::Identifier(ref value) if value == "set" || value == "init" => {
                     self.diagnostics.push(Diagnostic::error(
+                        codes::PARSE_PROPERTY_DUPLICATE_SETTER,
                         "a property can declare only one setter",
                         kind.span,
                     ));
                 }
                 _ => {
                     self.diagnostics.push(
-                        Diagnostic::error("expected `get`, `set` or `init` accessor", kind.span)
-                            .with_help("declare an explicit accessor body"),
+                        Diagnostic::error(
+                            codes::PARSE_PROPERTY_EXPECTED_ACCESSOR,
+                            "expected `get`, `set` or `init` accessor",
+                            kind.span,
+                        )
+                        .with_help("declare an explicit accessor body"),
                     );
                 }
             }
@@ -993,6 +1090,7 @@ impl Parser {
         if auto && bodyless_count != accessor_count {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::PARSE_AUTO_PROPERTY_MIXED_BODIES,
                     "an auto-property cannot mix accessors with and without bodies",
                     Span::new(start, end),
                 )
@@ -1004,6 +1102,7 @@ impl Parser {
         {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::PARSE_VIRTUAL_INIT_UNSUPPORTED,
                     "`init` accessors are not supported yet on `virtual`, `override` or `abstract` properties",
                     Span::new(start, end),
                 )
@@ -1018,10 +1117,12 @@ impl Parser {
                 end = self.expect(&TokenKind::Semicolon)?.span.end;
             } else {
                 self.diagnostics.push(
-                    Diagnostic::error("only an auto-property can have an initializer", equal)
-                        .with_help(
-                            "remove the initializer, or declare the accessors as `get;`/`set;`",
-                        ),
+                    Diagnostic::error(
+                        codes::PARSE_PROPERTY_INIT_AUTO_ONLY,
+                        "only an auto-property can have an initializer",
+                        equal,
+                    )
+                    .with_help("remove the initializer, or declare the accessors as `get;`/`set;`"),
                 );
                 self.expression()?;
                 self.expect(&TokenKind::Semicolon)?;
@@ -1131,6 +1232,7 @@ impl Parser {
             if clauses.contains(&name) {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::PARSE_DUPLICATE_WHERE_CLAUSE,
                         format!("duplicate `where` clause for type parameter `{name}`"),
                         name_span,
                     )
@@ -1147,6 +1249,7 @@ impl Parser {
             else {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::PARSE_UNKNOWN_WHERE_TYPE_PARAM,
                         format!("unknown type parameter `{name}` in `where` clause"),
                         name_span,
                     )
@@ -1494,6 +1597,7 @@ impl Parser {
                 if default.is_some() {
                     self.diagnostics.push(
                         Diagnostic::error(
+                            codes::PARSE_SWITCH_CASE_AFTER_DEFAULT,
                             "case after `default` is unreachable",
                             self.current().span,
                         )
@@ -1518,12 +1622,14 @@ impl Parser {
                 let body = self.switch_case_body();
                 if default.replace(body).is_some() {
                     self.diagnostics.push(Diagnostic::error(
+                        codes::PARSE_SWITCH_DUPLICATE_DEFAULT,
                         "a switch can declare only one default case",
                         default_span,
                     ));
                 }
             } else {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::PARSE_SWITCH_EXPECTED_CASE,
                     "expected `case` or `default` in switch",
                     self.current().span,
                 ));
@@ -1627,7 +1733,11 @@ impl Parser {
     /// contextual keyword: it is an ordinary identifier everywhere else.
     fn switch_guard(&mut self) -> Option<Expression> {
         self.advance();
-        self.with_nesting(Self::logical_or)
+        let saved = self.suppress_pattern_ternary_check;
+        self.suppress_pattern_ternary_check = true;
+        let result = self.with_nesting(Self::logical_or);
+        self.suppress_pattern_ternary_check = saved;
+        result
     }
 
     fn switch_case_body(&mut self) -> Block {
@@ -1714,9 +1824,9 @@ impl Parser {
     }
 
     /// `condition ? whenTrue : whenFalse`, right-associative, above assignment
-    /// and below `||` in precedence.
+    /// and below `??` in precedence.
     fn conditional(&mut self) -> Option<Expression> {
-        let mut condition = self.logical_or()?;
+        let mut condition = self.null_coalescing()?;
         if self.at(&TokenKind::Switch) {
             condition = self.switch_expression(condition)?;
         }
@@ -1737,6 +1847,23 @@ impl Parser {
         })
     }
 
+    /// `value ?? fallback`, right-associative, tighter than `?:` and looser than `||`.
+    fn null_coalescing(&mut self) -> Option<Expression> {
+        let value = self.logical_or()?;
+        if self.take(&TokenKind::QuestionQuestion).is_none() {
+            return Some(value);
+        }
+        let fallback = self.with_nesting(Self::null_coalescing)?;
+        let span = Span::new(value.span.start, fallback.span.end);
+        Some(Expression {
+            kind: ExpressionKind::NullCoalesce {
+                value: Box::new(value),
+                fallback: Box::new(fallback),
+            },
+            span,
+        })
+    }
+
     fn switch_expression(&mut self, value: Expression) -> Option<Expression> {
         let start = value.span.start;
         self.expect(&TokenKind::Switch)?;
@@ -1750,6 +1877,7 @@ impl Parser {
                 let arm = self.with_nesting(Self::assignment_expression)?;
                 if default.replace(Box::new(arm)).is_some() {
                     self.diagnostics.push(Diagnostic::error(
+                        codes::PARSE_SWITCH_EXPR_DUPLICATE_DEFAULT,
                         "a switch expression can declare only one default arm",
                         default_span,
                     ));
@@ -1758,6 +1886,7 @@ impl Parser {
                 if default.is_some() {
                     self.diagnostics.push(
                         Diagnostic::error(
+                            codes::PARSE_SWITCH_EXPR_ARM_AFTER_DEFAULT,
                             "switch expression arm after `default` is unreachable",
                             self.current().span,
                         )
@@ -1782,6 +1911,7 @@ impl Parser {
             if self.take(&TokenKind::Comma).is_none() && !self.at(&TokenKind::RightBrace) {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::PARSE_SWITCH_EXPR_EXPECTED_COMMA,
                         "expected `,` between switch expression arms",
                         self.current().span,
                     )
@@ -1904,7 +2034,7 @@ impl Parser {
     fn type_pattern_suffix(&mut self, mut expression: Expression) -> Option<Expression> {
         while self.at_identifier("as") {
             self.advance();
-            let target = self.type_ref()?;
+            let target = self.type_ref_in_pattern()?;
             let span = Span::new(expression.span.start, target.span.end);
             expression = Expression {
                 kind: ExpressionKind::TypeAs {
@@ -1916,7 +2046,7 @@ impl Parser {
         }
         while self.at_identifier("is") {
             self.advance();
-            let target = self.type_ref()?;
+            let target = self.type_ref_in_pattern()?;
             let mut end = target.span.end;
             let binding = if let TokenKind::Identifier(name) = &self.current().kind {
                 let name = name.clone();
@@ -2070,11 +2200,15 @@ impl Parser {
                 span,
             });
         }
-        if let Some(target) = self.cast_target() {
+        if let Some((target, token_count)) = self.cast_target() {
             let start = self.advance().span.start;
-            let type_token = self.advance().clone();
+            let type_start = self.current().span.start;
+            let mut type_end = self.current().span.end;
+            for _ in 0..token_count {
+                type_end = self.advance().span.end;
+            }
             self.expect(&TokenKind::RightParen)?;
-            let target = TypeRef::new(target, type_token.span);
+            let target = TypeRef::new(target, Span::new(type_start, type_end));
             let operand = self.with_nesting(Self::unary)?;
             let span = Span::new(start, operand.span.end);
             return Some(Expression {
@@ -2122,47 +2256,53 @@ impl Parser {
     fn postfix(&mut self) -> Option<Expression> {
         let mut expression = self.primary()?;
         loop {
-            if self.take(&TokenKind::Dot).is_some() {
+            if self.take(&TokenKind::QuestionDot).is_some() {
                 let (name, name_span) = self.identifier()?;
-                let span = Span::new(expression.span.start, name_span.end);
-                expression = Expression {
+                let receiver_span = expression.span;
+                let sentinel = Expression {
+                    kind: ExpressionKind::NullConditionalReceiver,
+                    span: Span::new(receiver_span.start, receiver_span.start),
+                };
+                let mut access = Expression {
                     kind: ExpressionKind::Member {
-                        object: Box::new(expression),
+                        object: Box::new(sentinel),
                         name,
+                    },
+                    span: Span::new(receiver_span.start, name_span.end),
+                };
+                if !self.expression_within_limit(&access, name_span) {
+                    return None;
+                }
+                access = self.postfix_chain(access, false)?;
+                let span = Span::new(receiver_span.start, access.span.end);
+                expression = Expression {
+                    kind: ExpressionKind::NullConditional {
+                        receiver: Box::new(expression),
+                        access: Box::new(access),
                     },
                     span,
                 };
                 if !self.expression_within_limit(&expression, name_span) {
                     return None;
                 }
-            } else if self.take(&TokenKind::LeftBracket).is_some() {
-                let start = expression.span.start;
-                let index = self.expression()?;
-                let end = self.expect(&TokenKind::RightBracket)?.span.end;
-                expression = Expression {
-                    kind: ExpressionKind::Index {
-                        array: Box::new(expression),
-                        index: Box::new(index),
-                    },
-                    span: Span::new(start, end),
-                };
-                if !self.expression_within_limit(&expression, Span::new(end - 1, end)) {
-                    return None;
+            } else {
+                match self.postfix_step(expression.clone()) {
+                    PostfixStep::Continue(next) => expression = next,
+                    PostfixStep::Done => break,
+                    PostfixStep::Error => return None,
                 }
-            } else if self.at(&TokenKind::Less) && self.generic_call_ahead() {
-                let type_arguments = self.type_arguments()?;
-                let call_span = self.expect(&TokenKind::LeftParen)?.span;
-                expression = self.call_after_arguments(expression, type_arguments)?;
-                if !self.expression_within_limit(&expression, call_span) {
-                    return None;
-                }
-            } else if let Some(call) = self.take(&TokenKind::LeftParen) {
-                let call_span = call.span;
-                expression = self.call_after_arguments(expression, Vec::new())?;
-                if !self.expression_within_limit(&expression, call_span) {
-                    return None;
-                }
-            } else if let Some(operator) = self.increment_operator() {
+            }
+        }
+        Some(expression)
+    }
+
+    fn postfix_chain(
+        &mut self,
+        mut expression: Expression,
+        allow_incdec: bool,
+    ) -> Option<Expression> {
+        loop {
+            if allow_incdec && let Some(operator) = self.increment_operator() {
                 let operator_span = self.advance().span;
                 let end = operator_span.end;
                 let span = Span::new(expression.span.start, end);
@@ -2177,24 +2317,125 @@ impl Parser {
                 if !self.expression_within_limit(&expression, operator_span) {
                     return None;
                 }
-            } else if self.at_try_propagation() {
-                let operator_span = self.advance().span;
-                let end = operator_span.end;
-                let span = Span::new(expression.span.start, end);
-                expression = Expression {
-                    kind: ExpressionKind::Try {
-                        operand: Box::new(expression),
-                    },
-                    span,
-                };
-                if !self.expression_within_limit(&expression, operator_span) {
-                    return None;
-                }
-            } else {
-                break;
+                continue;
+            }
+            match self.postfix_chain_step(expression.clone()) {
+                PostfixStep::Continue(next) => expression = next,
+                PostfixStep::Done => break,
+                PostfixStep::Error => return None,
             }
         }
         Some(expression)
+    }
+
+    fn postfix_step(&mut self, expression: Expression) -> PostfixStep {
+        match self.postfix_chain_step(expression.clone()) {
+            PostfixStep::Done => {}
+            step => return step,
+        }
+        if let Some(operator) = self.increment_operator() {
+            let operator_span = self.advance().span;
+            let end = operator_span.end;
+            let span = Span::new(expression.span.start, end);
+            let next = Expression {
+                kind: ExpressionKind::IncrementDecrement {
+                    operator,
+                    prefix: false,
+                    operand: Box::new(expression),
+                },
+                span,
+            };
+            return if self.expression_within_limit(&next, operator_span) {
+                PostfixStep::Continue(next)
+            } else {
+                PostfixStep::Error
+            };
+        }
+        if self.at_try_propagation() {
+            let operator_span = self.advance().span;
+            let end = operator_span.end;
+            let span = Span::new(expression.span.start, end);
+            let next = Expression {
+                kind: ExpressionKind::Try {
+                    operand: Box::new(expression),
+                },
+                span,
+            };
+            return if self.expression_within_limit(&next, operator_span) {
+                PostfixStep::Continue(next)
+            } else {
+                PostfixStep::Error
+            };
+        }
+        PostfixStep::Done
+    }
+
+    fn postfix_chain_step(&mut self, expression: Expression) -> PostfixStep {
+        if self.take(&TokenKind::Dot).is_some() {
+            let Some((name, name_span)) = self.identifier() else {
+                return PostfixStep::Error;
+            };
+            let span = Span::new(expression.span.start, name_span.end);
+            let next = Expression {
+                kind: ExpressionKind::Member {
+                    object: Box::new(expression),
+                    name,
+                },
+                span,
+            };
+            if self.expression_within_limit(&next, name_span) {
+                PostfixStep::Continue(next)
+            } else {
+                PostfixStep::Error
+            }
+        } else if self.take(&TokenKind::LeftBracket).is_some() {
+            let start = expression.span.start;
+            let Some(index) = self.expression() else {
+                return PostfixStep::Error;
+            };
+            let Some(end) = self.expect(&TokenKind::RightBracket).map(|t| t.span.end) else {
+                return PostfixStep::Error;
+            };
+            let next = Expression {
+                kind: ExpressionKind::Index {
+                    array: Box::new(expression),
+                    index: Box::new(index),
+                },
+                span: Span::new(start, end),
+            };
+            if self.expression_within_limit(&next, Span::new(end - 1, end)) {
+                PostfixStep::Continue(next)
+            } else {
+                PostfixStep::Error
+            }
+        } else if self.at(&TokenKind::Less) && self.generic_call_ahead() {
+            let Some(type_arguments) = self.type_arguments() else {
+                return PostfixStep::Error;
+            };
+            let Some(call_span) = self.expect(&TokenKind::LeftParen).map(|t| t.span) else {
+                return PostfixStep::Error;
+            };
+            let Some(next) = self.call_after_arguments(expression, type_arguments) else {
+                return PostfixStep::Error;
+            };
+            if self.expression_within_limit(&next, call_span) {
+                PostfixStep::Continue(next)
+            } else {
+                PostfixStep::Error
+            }
+        } else if let Some(call) = self.take(&TokenKind::LeftParen) {
+            let call_span = call.span;
+            let Some(next) = self.call_after_arguments(expression, Vec::new()) else {
+                return PostfixStep::Error;
+            };
+            if self.expression_within_limit(&next, call_span) {
+                PostfixStep::Continue(next)
+            } else {
+                PostfixStep::Error
+            }
+        } else {
+            PostfixStep::Done
+        }
     }
 
     fn call_after_arguments(
@@ -2275,30 +2516,50 @@ impl Parser {
                     | TokenKind::StarEqual
                     | TokenKind::SlashEqual
                     | TokenKind::PercentEqual
+                    | TokenKind::QuestionQuestion
             )
     }
 
-    /// Detect `(type)` for the builtin value types. Type keywords are never
-    /// expressions, so this is unambiguous with parenthesized expressions.
-    fn cast_target(&self) -> Option<&'static str> {
-        if !self.at(&TokenKind::LeftParen) || self.peek(2).kind != TokenKind::RightParen {
+    /// Detect `(type)` (including `(int?)`, `(double?)`, `(int??)`) for the
+    /// builtin value types. Type keywords are never expressions, so this is
+    /// unambiguous with parenthesized expressions.
+    fn cast_target(&self) -> Option<(String, usize)> {
+        if !self.at(&TokenKind::LeftParen) {
             return None;
         }
-        match self.peek(1).kind {
-            TokenKind::SByte => Some("sbyte"),
-            TokenKind::Byte => Some("byte"),
-            TokenKind::Short => Some("short"),
-            TokenKind::UShort => Some("ushort"),
-            TokenKind::Int => Some("int"),
-            TokenKind::UInt => Some("uint"),
-            TokenKind::Long => Some("long"),
-            TokenKind::ULong => Some("ulong"),
-            TokenKind::Float => Some("float"),
-            TokenKind::Double => Some("double"),
-            TokenKind::Decimal => Some("decimal"),
-            TokenKind::Char => Some("char"),
-            _ => None,
+        let base = match self.peek(1).kind {
+            TokenKind::SByte => "sbyte",
+            TokenKind::Byte => "byte",
+            TokenKind::Short => "short",
+            TokenKind::UShort => "ushort",
+            TokenKind::Int => "int",
+            TokenKind::UInt => "uint",
+            TokenKind::Long => "long",
+            TokenKind::ULong => "ulong",
+            TokenKind::Float => "float",
+            TokenKind::Double => "double",
+            TokenKind::Decimal => "decimal",
+            TokenKind::Char => "char",
+            TokenKind::Bool => "bool",
+            TokenKind::String => "string",
+            _ => return None,
+        };
+        let mut name = base.to_owned();
+        let mut offset = 2;
+        loop {
+            match self.peek(offset).kind {
+                TokenKind::Question => {
+                    name.push('?');
+                    offset += 1;
+                }
+                TokenKind::QuestionQuestion => {
+                    name.push_str("??");
+                    offset += 1;
+                }
+                _ => break,
+            }
         }
+        (self.peek(offset).kind == TokenKind::RightParen).then_some((name, offset - 1))
     }
 
     fn increment_operator(&self) -> Option<IncrementOperator> {
@@ -2328,14 +2589,19 @@ impl Parser {
             }
             TokenKind::True => ExpressionKind::Literal(Literal::Boolean(true)),
             TokenKind::False => ExpressionKind::Literal(Literal::Boolean(false)),
+            TokenKind::Null => ExpressionKind::Literal(Literal::Null),
             TokenKind::LeftBracket => return self.array_literal(token.span.start),
             TokenKind::New => return self.new_expression(token.span.start),
             TokenKind::This => ExpressionKind::This,
             TokenKind::Base => {
                 if !self.at(&TokenKind::Dot) {
                     self.diagnostics.push(
-                        Diagnostic::error("`base` must be followed by a member access", token.span)
-                            .with_help("write `base.Method(...)` or `base.Property`"),
+                        Diagnostic::error(
+                            codes::PARSE_BASE_REQUIRES_MEMBER,
+                            "`base` must be followed by a member access",
+                            token.span,
+                        )
+                        .with_help("write `base.Method(...)` or `base.Property`"),
                     );
                     return None;
                 }
@@ -2372,7 +2638,11 @@ impl Parser {
             }
             TokenKind::Identifier(name) => ExpressionKind::Name(name),
             TokenKind::LeftParen => {
-                let expression = self.expression()?;
+                let saved = self.suppress_pattern_ternary_check;
+                self.suppress_pattern_ternary_check = false;
+                let expression = self.expression();
+                self.suppress_pattern_ternary_check = saved;
+                let expression = expression?;
                 let end = self.expect(&TokenKind::RightParen)?.span.end;
                 return Some(Expression {
                     span: Span::new(token.span.start, end),
@@ -2382,6 +2652,7 @@ impl Parser {
             _ => {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::PARSE_EXPECTED_EXPRESSION,
                         format!("expected expression, found {}", token.kind.description()),
                         token.span,
                     )
@@ -2415,6 +2686,7 @@ impl Parser {
                     if self.at(&TokenKind::InterpolatedExpressionEnd) {
                         self.diagnostics.push(
                             Diagnostic::error(
+                                codes::PARSE_EMPTY_INTERP_EXPR,
                                 "interpolated expression is empty",
                                 self.current().span,
                             )
@@ -2437,6 +2709,7 @@ impl Parser {
                 }
                 _ => {
                     self.diagnostics.push(Diagnostic::error(
+                        codes::PARSE_MALFORMED_INTERP_STRING,
                         "malformed interpolated string",
                         self.current().span,
                     ));
@@ -2459,6 +2732,7 @@ impl Parser {
             TokenKind::Colon => {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::PARSE_INTERP_FORMAT_UNSUPPORTED,
                         "format specifiers are not supported in string interpolation",
                         self.current().span,
                     )
@@ -2470,6 +2744,7 @@ impl Parser {
             TokenKind::Comma => {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::PARSE_INTERP_ALIGNMENT_UNSUPPORTED,
                         "alignment is not supported in string interpolation",
                         self.current().span,
                     )
@@ -2481,6 +2756,7 @@ impl Parser {
             _ => {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::PARSE_INTERP_EXPECTED_RBRACE,
                         format!("expected `}}`, found {}", self.current().kind.description()),
                         self.current().span,
                     )
@@ -2551,7 +2827,22 @@ impl Parser {
             };
             return self.object_initializer(creation);
         }
-        let element_type = self.type_ref_base()?;
+        let mut element_type = self.type_ref_base()?;
+        loop {
+            match self.current().kind {
+                TokenKind::Question => {
+                    let end = self.advance().span.end;
+                    element_type.name.push('?');
+                    element_type.span.end = end;
+                }
+                TokenKind::QuestionQuestion => {
+                    let end = self.advance().span.end;
+                    element_type.name.push_str("??");
+                    element_type.span.end = end;
+                }
+                _ => break,
+            }
+        }
         if self.take(&TokenKind::LeftBracket).is_some() {
             let length = self.expression()?;
             let end = self.expect(&TokenKind::RightBracket)?.span.end;
@@ -2601,6 +2892,7 @@ impl Parser {
             if !self.at(&TokenKind::Equal) {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::PARSE_INITIALIZER_EXPECTED_ASSIGN,
                         format!(
                             "expected `=` after `{name}` in an object initializer, found {}",
                             self.current().kind.description()
@@ -2617,6 +2909,7 @@ impl Parser {
             if self.at(&TokenKind::LeftBrace) {
                 self.diagnostics.push(
                     Diagnostic::error(
+                        codes::PARSE_NESTED_INITIALIZER_UNSUPPORTED,
                         "nested object and collection initializers are not supported yet",
                         self.current().span,
                     )
@@ -2665,6 +2958,7 @@ impl Parser {
                 if saw_named {
                     self.diagnostics.push(
                         Diagnostic::error(
+                            codes::PARSE_POSITIONAL_AFTER_NAMED_ARG,
                             "positional arguments cannot follow named arguments",
                             self.current().span,
                         )
@@ -2705,8 +2999,12 @@ impl Parser {
             let span = self.advance().span;
             if visibility.is_some() {
                 self.diagnostics.push(
-                    Diagnostic::error("only one visibility modifier is allowed", span)
-                        .with_help("remove the extra visibility modifier"),
+                    Diagnostic::error(
+                        codes::PARSE_MULTIPLE_VISIBILITY,
+                        "only one visibility modifier is allowed",
+                        span,
+                    )
+                    .with_help("remove the extra visibility modifier"),
                 );
             } else {
                 visibility = Some(current);
@@ -2726,17 +3024,106 @@ impl Parser {
     }
 
     fn type_ref(&mut self) -> Option<TypeRef> {
-        self.with_nesting(Self::type_ref_inner)
+        self.with_nesting(|parser| parser.type_ref_inner(false, false))
     }
 
-    fn type_ref_inner(&mut self) -> Option<TypeRef> {
+    fn type_ref_in_pattern(&mut self) -> Option<TypeRef> {
+        let check_ternary = !self.suppress_pattern_ternary_check;
+        self.with_nesting(|parser| parser.type_ref_inner(check_ternary, true))
+    }
+
+    fn type_ref_inner(&mut self, check_ternary_colon: bool, in_pattern: bool) -> Option<TypeRef> {
         let mut type_ref = self.type_ref_base()?;
-        while self.take(&TokenKind::LeftBracket).is_some() {
-            let end = self.expect(&TokenKind::RightBracket)?.span.end;
-            type_ref.name.push_str("[]");
-            type_ref.span.end = end;
+        loop {
+            if self.take(&TokenKind::LeftBracket).is_some() {
+                let end = self.expect(&TokenKind::RightBracket)?.span.end;
+                type_ref.name.push_str("[]");
+                type_ref.span.end = end;
+            } else if self.at(&TokenKind::Question) {
+                if check_ternary_colon && self.has_matching_ternary_colon(1) {
+                    break;
+                }
+                let end = self.advance().span.end;
+                type_ref.name.push('?');
+                type_ref.span.end = end;
+            } else if self.at(&TokenKind::QuestionQuestion) {
+                if in_pattern && self.starts_expression_at(1) {
+                    break;
+                }
+                let end = self.advance().span.end;
+                type_ref.name.push_str("??");
+                type_ref.span.end = end;
+            } else {
+                break;
+            }
         }
         Some(type_ref)
+    }
+
+    fn starts_expression_at(&self, offset: usize) -> bool {
+        matches!(
+            self.peek(offset).kind,
+            TokenKind::Await
+                | TokenKind::New
+                | TokenKind::This
+                | TokenKind::Base
+                | TokenKind::True
+                | TokenKind::False
+                | TokenKind::Null
+                | TokenKind::Identifier(_)
+                | TokenKind::IntegerLiteral(_)
+                | TokenKind::LongLiteral(_)
+                | TokenKind::UIntLiteral(_)
+                | TokenKind::ULongLiteral(_)
+                | TokenKind::FloatLiteral(_)
+                | TokenKind::DoubleLiteral(_)
+                | TokenKind::DecimalLiteral(_)
+                | TokenKind::StringLiteral(_)
+                | TokenKind::CharacterLiteral(_)
+                | TokenKind::InterpolatedStringStart
+                | TokenKind::LeftParen
+                | TokenKind::LeftBracket
+                | TokenKind::PlusPlus
+                | TokenKind::MinusMinus
+                | TokenKind::Bang
+                | TokenKind::Minus
+                | TokenKind::Tilde
+        )
+    }
+
+    /// Returns `true` when the `?` immediately before `start` has a matching
+    /// top-level `:` before any enclosing delimiter or statement separator.
+    fn has_matching_ternary_colon(&self, start: usize) -> bool {
+        if self.peek(start).kind == TokenKind::Colon {
+            return false;
+        }
+        let mut depth = 0i32;
+        let mut nested = 0i32;
+        let mut offset = start;
+        loop {
+            match self.peek(offset).kind {
+                TokenKind::LeftParen | TokenKind::LeftBracket | TokenKind::LeftBrace => depth += 1,
+                TokenKind::RightParen | TokenKind::RightBracket | TokenKind::RightBrace => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                }
+                TokenKind::Semicolon | TokenKind::Comma | TokenKind::Eof if depth == 0 => {
+                    return false;
+                }
+                TokenKind::Eof => return false,
+                TokenKind::Question if depth == 0 => nested += 1,
+                TokenKind::Colon if depth == 0 => {
+                    if nested == 0 {
+                        return true;
+                    }
+                    nested -= 1;
+                }
+                _ => {}
+            }
+            offset += 1;
+        }
     }
 
     fn type_ref_base(&mut self) -> Option<TypeRef> {
@@ -2760,6 +3147,7 @@ impl Parser {
             TokenKind::Identifier(name) => name,
             _ => {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::PARSE_EXPECTED_TYPE,
                     format!("expected type, found {}", token.kind.description()),
                     token.span,
                 ));
@@ -2792,24 +3180,48 @@ impl Parser {
 
     fn is_typed_variable_start(&self) -> bool {
         match self.current().kind {
-            TokenKind::Identifier(_) => self
-                .type_ref_end(0)
-                .is_some_and(|offset| matches!(self.peek(offset).kind, TokenKind::Identifier(_))),
+            TokenKind::Identifier(_) => {
+                let Some((offset, first_question)) = self.type_ref_end(0) else {
+                    return false;
+                };
+                if !matches!(self.peek(offset).kind, TokenKind::Identifier(_)) {
+                    return false;
+                }
+                let Some(question_offset) = first_question else {
+                    return true;
+                };
+                match self.peek(offset + 1).kind {
+                    TokenKind::Semicolon => true,
+                    TokenKind::Equal => !self.has_matching_ternary_colon(question_offset + 1),
+                    _ => false,
+                }
+            }
+            TokenKind::Void => self.type_ref_end(0).is_some_and(|(offset, _)| {
+                matches!(self.peek(offset).kind, TokenKind::Identifier(_))
+            }),
             _ => self.is_value_type_keyword(),
         }
     }
 
-    fn type_ref_end(&self, start: usize) -> Option<usize> {
+    fn type_ref_end(&self, start: usize) -> Option<(usize, Option<usize>)> {
         let mut offset = start + 1;
         if self.peek(offset).kind == TokenKind::Less {
             offset = self.generic_arguments_end(offset)?;
         }
-        while self.peek(offset).kind == TokenKind::LeftBracket
-            && self.peek(offset + 1).kind == TokenKind::RightBracket
-        {
-            offset += 2;
+        let mut first_question = None;
+        loop {
+            match self.peek(offset).kind {
+                TokenKind::LeftBracket if self.peek(offset + 1).kind == TokenKind::RightBracket => {
+                    offset += 2;
+                }
+                TokenKind::Question | TokenKind::QuestionQuestion => {
+                    first_question.get_or_insert(offset);
+                    offset += 1;
+                }
+                _ => break,
+            }
         }
-        Some(offset)
+        Some((offset, first_question))
     }
 
     /// Returns the offset immediately after a balanced generic argument list.
@@ -2866,6 +3278,7 @@ impl Parser {
             };
             if std::mem::replace(flag, true) {
                 self.diagnostics.push(Diagnostic::error(
+                    codes::PARSE_DUPLICATE_MODIFIER,
                     format!("duplicate `{name}` modifier"),
                     token.span,
                 ));
@@ -2928,6 +3341,7 @@ impl Parser {
                     ) || *dispatch == MemberDispatch::Override;
                     let diagnostic = if overriding {
                         Diagnostic::error(
+                            codes::PARSE_SEALED_OVERRIDE,
                             "`sealed override` is not supported: an override stays overridable",
                             token.span,
                         )
@@ -2935,8 +3349,12 @@ impl Parser {
                             "remove `sealed`; B1 uses exact signatures and no `sealed override`",
                         )
                     } else {
-                        Diagnostic::error("`sealed` applies to classes, not to members", token.span)
-                            .with_help("remove `sealed` from the member, or seal the whole class")
+                        Diagnostic::error(
+                            codes::PARSE_SEALED_ON_MEMBER,
+                            "`sealed` applies to classes, not to members",
+                            token.span,
+                        )
+                        .with_help("remove `sealed` from the member, or seal the whole class")
                     };
                     self.diagnostics.push(diagnostic);
                     continue;
@@ -2945,16 +3363,21 @@ impl Parser {
             if *dispatch == MemberDispatch::None {
                 *dispatch = requested;
             } else {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        if *dispatch == requested {
-                            format!("duplicate `{name}` modifier")
-                        } else {
-                            format!("`{name}` cannot be combined with another dispatch modifier")
-                        },
-                        token.span,
+                let (code, message) = if *dispatch == requested {
+                    (
+                        codes::PARSE_DUPLICATE_MODIFIER,
+                        format!("duplicate `{name}` modifier"),
                     )
-                    .with_help("a member is at most one of `virtual`, `override` and `abstract`"),
+                } else {
+                    (
+                        codes::PARSE_CONFLICTING_DISPATCH_MODIFIER,
+                        format!("`{name}` cannot be combined with another dispatch modifier"),
+                    )
+                };
+                self.diagnostics.push(
+                    Diagnostic::error(code, message, token.span).with_help(
+                        "a member is at most one of `virtual`, `override` and `abstract`",
+                    ),
                 );
             }
         }
@@ -2986,13 +3409,18 @@ impl Parser {
             Some((name, token.span))
         } else if token.kind == TokenKind::Base {
             self.diagnostics.push(
-                Diagnostic::error("`base` is a reserved word", token.span)
-                    .with_help("`base` is valid only as the `: base(...)` constructor initializer; choose another name"),
+                Diagnostic::error(
+                    codes::PARSE_BASE_RESERVED_IDENT,
+                    "`base` is a reserved word",
+                    token.span,
+                )
+                .with_help("`base` is valid only as the `: base(...)` constructor initializer; choose another name"),
             );
             None
         } else {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::PARSE_EXPECTED_IDENTIFIER,
                     format!("expected identifier, found {}", token.kind.description()),
                     token.span,
                 )
@@ -3008,6 +3436,7 @@ impl Parser {
         } else {
             self.diagnostics.push(
                 Diagnostic::error(
+                    codes::PARSE_EXPECTED_TOKEN,
                     format!(
                         "expected {}, found {}",
                         expected.description(),
@@ -3049,9 +3478,9 @@ impl Parser {
         &self.tokens[index]
     }
 
-    fn error_here(&mut self, message: impl Into<String>) {
+    fn error_here(&mut self, code: DiagnosticCode, message: impl Into<String>) {
         self.diagnostics
-            .push(Diagnostic::error(message, self.current().span));
+            .push(Diagnostic::error(code, message, self.current().span));
     }
 
     /// Skip to the next statement boundary after a statement-level parse error,
