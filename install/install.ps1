@@ -590,8 +590,14 @@ function Test-InstalledCli {
     $projectDirectory = Join-Path ([IO.Path]::GetTempPath()) ("aster-install-project-" + [Guid]::NewGuid().ToString("N"))
     [void][IO.Directory]::CreateDirectory($projectDirectory)
     $source = Join-Path $projectDirectory "main.aster"
+    $exitSource = Join-Path $projectDirectory "exit_status.aster"
     [IO.File]::WriteAllText(
         $source,
+        "using aster.io; using aster.math; public class Program { public static void Main() { WriteLine(Math.Max(40, 2).ToString()); } }`n",
+        [Text.UTF8Encoding]::new($false)
+    )
+    [IO.File]::WriteAllText(
+        $exitSource,
         "using aster.math; public class Program { public static int Main() { return Math.Max(40, 2); } }`n",
         [Text.UTF8Encoding]::new($false)
     )
@@ -611,6 +617,10 @@ function Test-InstalledCli {
         $runResult = Invoke-AsterProcess $binary @("run", $source) $projectDirectory
         if ($runResult.Status -ne 0 -or $runResult.Output.Trim() -ne "40") {
             Throw-InstallerError "Installed ASTER failed run validation."
+        }
+        $exitResult = Invoke-AsterProcess $binary @("run", $exitSource) $projectDirectory
+        if ($exitResult.Status -ne 40 -or -not [string]::IsNullOrWhiteSpace($exitResult.Output)) {
+            Throw-InstallerError "Installed ASTER failed exit-status validation."
         }
     }
     finally {

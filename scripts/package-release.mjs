@@ -726,10 +726,22 @@ function compareArchiveToBundle(entries, bundleEntries) {
     }
 }
 
+const CLI_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
+
 function environmentWithoutAsterStdlib() {
     return Object.fromEntries(
         Object.entries(process.env).filter(([key]) => key.toUpperCase() !== "ASTER_STDLIB"),
     );
+}
+
+function formatProcessDiagnostics(result) {
+    return [
+        `status=${result.status}`,
+        `signal=${result.signal ?? "none"}`,
+        `error=${result.error?.message ?? "none"}`,
+        `stdout=${JSON.stringify(result.stdout ?? "")}`,
+        `stderr=${JSON.stringify(result.stderr ?? "")}`,
+    ].join(", ");
 }
 
 export function verifyRelocatableInstall({
@@ -741,8 +753,14 @@ export function verifyRelocatableInstall({
     const relocatedBundle = join(relocationParent, "instalação ASTER com espaços");
     const projectDirectory = mkdtempSync(join(tmpdir(), "aster-release-project-"));
     const sourcePath = join(projectDirectory, "main.aster");
+    const exitStatusSourcePath = join(projectDirectory, "exit_status.aster");
     writeFileSync(
         sourcePath,
+        "using aster.io; using aster.math; public class Program { public static void Main() { WriteLine(Math.Max(40, 2).ToString()); } }\n",
+        "utf8",
+    );
+    writeFileSync(
+        exitStatusSourcePath,
         "using aster.math; public class Program { public static int Main() { return Math.Max(40, 2); } }\n",
         "utf8",
     );
@@ -755,24 +773,45 @@ export function verifyRelocatableInstall({
             cwd: projectDirectory,
             env: environment,
             encoding: "utf8",
+            maxBuffer: CLI_MAX_BUFFER_BYTES,
             windowsHide: true,
         });
 
     try {
         const versionResult = run(["--version"]);
         if (versionResult.status !== 0 || !versionResult.stdout.includes(version)) {
-            throw new Error(`Relocated aster --version failed: ${versionResult.stderr.trim()}`);
+            throw new Error(
+                `Relocated aster --version failed: ${formatProcessDiagnostics(versionResult)}`,
+            );
         }
-        for (const command of ["check", "dump-hir", "dump-mir"]) {
-            const result = run([command, sourcePath]);
-            if (result.status !== 0) {
-                throw new Error(`Relocated aster ${command} failed: ${result.stderr.trim()}`);
-            }
+        const checkResult = run(["check", sourcePath]);
+        if (checkResult.status !== 0) {
+            throw new Error(
+                `Relocated aster check failed: ${formatProcessDiagnostics(checkResult)}`,
+            );
+        }
+        const hirResult = run(["dump-hir", sourcePath]);
+        if (hirResult.status !== 0) {
+            throw new Error(
+                `Relocated aster dump-hir failed: ${formatProcessDiagnostics(hirResult)}`,
+            );
+        }
+        const mirResult = run(["dump-mir", sourcePath]);
+        if (mirResult.status !== 0) {
+            throw new Error(
+                `Relocated aster dump-mir failed: ${formatProcessDiagnostics(mirResult)}`,
+            );
         }
         const runResult = run(["run", sourcePath]);
         if (runResult.status !== 0 || runResult.stdout.trim() !== "40") {
             throw new Error(
-                `Relocated aster run failed: ${runResult.stderr.trim() || runResult.stdout.trim()}`,
+                `Relocated aster run failed: ${formatProcessDiagnostics(runResult)}`,
+            );
+        }
+        const exitRunResult = run(["run", exitStatusSourcePath]);
+        if (exitRunResult.status !== 40 || exitRunResult.stdout !== "") {
+            throw new Error(
+                `Relocated aster int Main exit-status check failed: ${formatProcessDiagnostics(exitRunResult)}`,
             );
         }
 
@@ -787,11 +826,15 @@ export function verifyRelocatableInstall({
         try {
             const broken = run(["check", sourcePath]);
             if (broken.status === 0) {
-                throw new Error("Relocated CLI silently fell back after external stdlib removal");
+                throw new Error(
+                    `Relocated CLI silently fell back after external stdlib removal: ${formatProcessDiagnostics(broken)}`,
+                );
             }
             const error = broken.stderr.toLowerCase();
             if (!error.includes("stdlib") && !error.includes("incomplete")) {
-                throw new Error("Relocated CLI did not report an explicit external stdlib error");
+                throw new Error(
+                    `Relocated CLI did not report an explicit external stdlib error: ${formatProcessDiagnostics(broken)}`,
+                );
             }
         } finally {
             renameSync(backup, modulePath);
@@ -802,6 +845,9 @@ export function verifyRelocatableInstall({
             projectDirectory,
             version: versionResult.stdout.trim(),
             runOutput: runResult.stdout.trim(),
+            exitStatus: exitRunResult.status,
+            hirOutputBytes: Buffer.byteLength(hirResult.stdout, "utf8"),
+            mirOutputBytes: Buffer.byteLength(mirResult.stdout, "utf8"),
         };
     } finally {
         rmSync(relocationParent, { recursive: true, force: true });

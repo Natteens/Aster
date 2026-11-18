@@ -404,6 +404,27 @@ test("two consecutive bundles produce identical manifests and file list", () => 
 // (LANG-018), so a success value of 1 would be indistinguishable from a failure.
 const STDLIB_PROGRAM =
     "using aster.io; using aster.math; public class Program { public static void Main() { WriteLine(Math.Max(0, 1).ToString()); } }";
+const EXIT_STATUS_PROGRAM =
+    "using aster.math; public class Program { public static int Main() { return Math.Max(40, 2); } }";
+const CLI_MAX_BUFFER_BYTES = 64 * 1024 * 1024;
+
+function envWithoutAsterStdlib() {
+    return Object.fromEntries(
+        Object.entries(process.env).filter(
+            ([k]) => k.toUpperCase() !== "ASTER_STDLIB",
+        ),
+    );
+}
+
+function formatSpawnDiagnostics(result) {
+    return [
+        `status=${result.status}`,
+        `signal=${result.signal ?? "none"}`,
+        `error=${result.error?.message ?? "none"}`,
+        `stdout=${JSON.stringify(result.stdout ?? "")}`,
+        `stderr=${JSON.stringify(result.stderr ?? "")}`,
+    ].join(", ");
+}
 
 test(
     "relocatable bundle: stdlib found via exe-relative path, not cwd or ASTER_STDLIB",
@@ -432,6 +453,8 @@ test(
         const projectDir = tempDir("reloc-project");
         const srcFile = join(projectDir, "main.aster");
         writeFileSync(srcFile, STDLIB_PROGRAM);
+        const exitSrcFile = join(projectDir, "exit_status.aster");
+        writeFileSync(exitSrcFile, EXIT_STATUS_PROGRAM);
 
         // 4. Locate the binary inside the relocated bundle.
         const relocatedBinary = join(relocDir, "bin", binName);
@@ -440,14 +463,9 @@ test(
             function runBundleBinary(args) {
                 return spawnSync(relocatedBinary, args, {
                     cwd: projectDir,
-                    env: {
-                        ...Object.fromEntries(
-                            Object.entries(process.env).filter(
-                                ([k]) => k !== "ASTER_STDLIB",
-                            ),
-                        ),
-                    },
+                    env: envWithoutAsterStdlib(),
                     encoding: "utf8",
+                    maxBuffer: CLI_MAX_BUFFER_BYTES,
                 });
             }
 
@@ -456,7 +474,7 @@ test(
             assert.equal(
                 versionResult.status,
                 0,
-                `--version failed: ${versionResult.stderr}`,
+                `--version failed: ${formatSpawnDiagnostics(versionResult)}`,
             );
             assert.match(
                 versionResult.stdout,
@@ -469,7 +487,7 @@ test(
             assert.equal(
                 checkResult.status,
                 0,
-                `aster check failed — stdlib likely not found via exe-relative path:\n${checkResult.stderr}`,
+                `aster check failed — stdlib likely not found via exe-relative path: ${formatSpawnDiagnostics(checkResult)}`,
             );
 
             // aster dump-hir
@@ -477,7 +495,7 @@ test(
             assert.equal(
                 hirResult.status,
                 0,
-                `aster dump-hir failed:\n${hirResult.stderr}`,
+                `aster dump-hir failed: ${formatSpawnDiagnostics(hirResult)}`,
             );
 
             // aster dump-mir
@@ -485,20 +503,33 @@ test(
             assert.equal(
                 mirResult.status,
                 0,
-                `aster dump-mir failed:\n${mirResult.stderr}`,
+                `aster dump-mir failed: ${formatSpawnDiagnostics(mirResult)}`,
             );
 
-            // aster run
+            // aster run (void Main -> exit 0, stdout "1")
             const runResult = runBundleBinary(["run", srcFile]);
             assert.equal(
                 runResult.status,
                 0,
-                `aster run failed:\n${runResult.stderr}`,
+                `aster run failed: ${formatSpawnDiagnostics(runResult)}`,
             );
             assert.equal(
                 runResult.stdout.trim(),
                 "1",
-                "program output must be 1",
+                `program output must be 1: ${formatSpawnDiagnostics(runResult)}`,
+            );
+
+            // aster run (LANG-018 int Main -> exit status 40, empty stdout)
+            const exitStatusResult = runBundleBinary(["run", exitSrcFile]);
+            assert.equal(
+                exitStatusResult.status,
+                40,
+                `LANG-018 int Main exit status mismatch: ${formatSpawnDiagnostics(exitStatusResult)}`,
+            );
+            assert.equal(
+                exitStatusResult.stdout,
+                "",
+                `LANG-018 int Main must produce empty stdout: ${formatSpawnDiagnostics(exitStatusResult)}`,
             );
 
             // Removing this file must fail instead of falling back to the embedded stdlib.
@@ -512,7 +543,7 @@ test(
                 assert.equal(
                     versionAfter.status,
                     0,
-                    "--version must not need stdlib",
+                    `--version must not need stdlib: ${formatSpawnDiagnostics(versionAfter)}`,
                 );
 
                 // aster check must fail with explicit stdlib error (not silently fall back)
@@ -520,14 +551,14 @@ test(
                 assert.notEqual(
                     checkBroken.status,
                     0,
-                    "check must fail when required stdlib file is removed",
+                    `check must fail when required stdlib file is removed: ${formatSpawnDiagnostics(checkBroken)}`,
                 );
                 assert.ok(
                     checkBroken.stderr.includes("stdlib") ||
                         checkBroken.stderr.includes("math") ||
                         checkBroken.stderr.includes("incomplete") ||
                         checkBroken.stderr.includes("invalid"),
-                    `expected explicit stdlib error, got: ${checkBroken.stderr}`,
+                    `expected explicit stdlib error, got: ${formatSpawnDiagnostics(checkBroken)}`,
                 );
             } finally {
                 // Restore the file so cleanup can proceed cleanly.
@@ -536,6 +567,54 @@ test(
         } finally {
             rmSync(tempDist, { recursive: true, force: true });
             rmSync(dirname(relocDir), { recursive: true, force: true });
+            rmSync(projectDir, { recursive: true, force: true });
+        }
+    },
+);
+
+test(
+    "relocated bundle dump-hir and dump-mir handle > 1 MiB stdout without ENOBUFS",
+    {
+        skip: hasReleaseBinary
+            ? false
+            : "release binary not built",
+    },
+    () => {
+        const tempDist = tempDir("large-ir-dist");
+        const { bundleDir } = buildBundle({
+            workspaceRoot: repositoryRoot,
+            distRoot: tempDist,
+            version: readVersion(join(repositoryRoot, "Cargo.toml")),
+            bundleTarget,
+            binaryName,
+        });
+        const projectDir = tempDir("large-ir-project");
+        const srcFile = join(projectDir, "main.aster");
+        writeFileSync(srcFile, STDLIB_PROGRAM);
+        const binary = join(bundleDir, "bin", binaryName);
+
+        try {
+            for (const subcommand of ["dump-hir", "dump-mir"]) {
+                const result = spawnSync(binary, [subcommand, srcFile], {
+                    cwd: projectDir,
+                    env: envWithoutAsterStdlib(),
+                    encoding: "utf8",
+                    maxBuffer: CLI_MAX_BUFFER_BYTES,
+                });
+                assert.equal(
+                    result.status,
+                    0,
+                    `${subcommand} failed: ${formatSpawnDiagnostics(result)}`,
+                );
+                assert.equal(result.signal, null, `${subcommand} unexpected signal`);
+                assert.equal(result.error, undefined, `${subcommand} unexpected error`);
+                assert.ok(
+                    Buffer.byteLength(result.stdout, "utf8") > 1024 * 1024,
+                    `${subcommand} stdout expected > 1 MiB to exercise large IR buffer handling`,
+                );
+            }
+        } finally {
+            rmSync(tempDist, { recursive: true, force: true });
             rmSync(projectDir, { recursive: true, force: true });
         }
     },
@@ -570,17 +649,14 @@ test(
         try {
             const result = spawnSync(join(bundleDir, "bin", binaryName), ["run", srcFile], {
                 cwd: unrelatedCwd,
-                env: {
-                    ...Object.fromEntries(
-                        Object.entries(process.env).filter(([k]) => k !== "ASTER_STDLIB"),
-                    ),
-                },
+                env: envWithoutAsterStdlib(),
                 encoding: "utf8",
+                maxBuffer: CLI_MAX_BUFFER_BYTES,
             });
             assert.equal(
                 result.status,
                 0,
-                `aster run failed with unrelated cwd:\n${result.stderr}`,
+                `aster run failed with unrelated cwd: ${formatSpawnDiagnostics(result)}`,
             );
             assert.equal(result.stdout.trim(), "1");
         } finally {
